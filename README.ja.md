@@ -98,9 +98,49 @@ UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk
 </picture>
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
+  <img alt="Temps の構造化ログ —— 重大度、サービス、メッセージをトレースと相関" src="assets/screenshots/otel-logs-light.png">
+</picture>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Temps のアラート —— メトリクス、コンテナ、稼働監視、データベースにまたがる発火中・確認済み・解決済みのアラーム" src="assets/screenshots/alerts-light.png">
 </picture>
+
+### AI ゲートウェイ —— 1 つのエンドポイント、自分の API キー
+
+自分のプロバイダーキー（OpenAI、Anthropic、xAI、Google Gemini）を持ち込み、すべてを 1 つの OpenAI 互換エンドポイント経由で呼び出せます —— base URL を差し替えるだけで、今使っている SDK はそのまま。キーは自分のサーバー上で暗号化して保管され、リクエストごとにトークン数、レイテンシ、エラー率、モデル別の推定コストが記録されます。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="Temps AI ゲートウェイ —— OpenAI 互換エンドポイントの背後に自分のプロバイダーキー（BYOK）" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Temps AI ゲートウェイの使用状況分析 —— リクエスト数、トークン、レイテンシ、エラー率、推定コスト" src="assets/screenshots/ai-usage-light.png">
+</picture>
+
+### AI チャット —— 自分のテレメトリに基づく回答
+
+プロジェクトについて尋ねれば、答えは汎用モデルの推測ではなく、あなた自身のデータ —— トレース、メトリクス、アラーム、デプロイ、収益 —— から返ってきます。**デフォルトは読み取り専用**で、書き込み操作はオプトイン。有効にしても、アシスタントは変更を提案してあなたの確認を待ちます。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Temps の AI チャットが、プロジェクト自身のトレース、メトリクス、収益データからチェックアウトのレイテンシ急増を診断" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### CLI とスキル —— あらゆる AI ハーネスから利用可能
+
+CLI はプラットフォーム全体をカバーしています —— 69 グループ、440 以上のコマンド。ダッシュボードでできることは、エージェントがターミナルで実行できます:
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps は [skills](skills/) も同梱しています —— Claude Code、Cursor、あるいは `.claude/skills/` を読むあらゆるハーネスにそのまま入る自己完結型の手順書で、デプロイ、アナリティクス、エラートラッキング、カスタムドメイン、CLI の完全リファレンスをカバーします。スキルと MCP サーバーはプラットフォーム全体に登録でき、エージェントのワークフローサンドボックスへ自動的に注入されます。
 
 ### AI サンドボックス —— 隔離されたコード実行
 
@@ -167,6 +207,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | マネージド Postgres/Redis/S3 | AWS RDS / ElastiCache（月額 $50〜） |
 | トランザクションメール + DKIM | Resend / SendGrid（月額 $20〜100） |
 | AI コード実行サンドボックス | E2B / Daytona / Vercel Sandbox（$150+/月 + 従量課金） |
+| AI ゲートウェイ + 使用量/コスト追跡 | OpenRouter / Helicone / LangSmith（月額 $0〜200+） |
 | リクエストログ + プロキシ | Cloudflare（月額 $0〜200） |
 | **Temps での合計** | **$0（セルフホスト）** |
 
@@ -190,6 +231,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 稼働監視 | あり | なし | なし | なし | なし | なし | なし |
 | トランザクションメール + DKIM | あり | なし | なし | なし | なし | なし | なし |
 | コード実行サンドボックス（API） | あり | なし | なし | なし | なし | なし | Sandbox（従量課金） |
+| AI ゲートウェイ（BYOK）+ アシスタント | あり | なし | なし | なし | なし | なし | AI Gateway（有料） |
 | マネージド Postgres / Redis | あり | あり | あり | なし | あり | あり | パートナーアドオン |
 | S3 互換ストレージ | あり | なし | なし | なし | なし | なし | Blob（有料） |
 | マルチノード / クラスタリング | あり | あり | Swarm | あり | マネージド | マネージド | マネージド |

@@ -98,9 +98,49 @@ Pointez n'importe quel exporter OTLP vers Temps et vous obtenez les traces distr
 </picture>
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
+  <img alt="Logs structurés Temps — sévérité, service et message, corrélés aux traces" src="assets/screenshots/otel-logs-light.png">
+</picture>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Alertes Temps — alarmes actives, acquittées et résolues sur les métriques, conteneurs, disponibilité et bases de données" src="assets/screenshots/alerts-light.png">
 </picture>
+
+### AI Gateway — un seul endpoint, vos propres clés
+
+Apportez vos propres clés de fournisseur (OpenAI, Anthropic, xAI, Google Gemini) et appelez-les toutes via un unique endpoint compatible OpenAI — changez la base URL, gardez le SDK que vous utilisez déjà. Les clés restent chiffrées sur votre serveur, et chaque requête est attribuée : tokens, latence, taux d'erreur et coût estimé par modèle.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="AI Gateway de Temps — clés de fournisseur personnelles (BYOK) derrière un endpoint compatible OpenAI" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Analytique d'usage de l'AI Gateway de Temps — requêtes, tokens, latence, taux d'erreur et coût estimé" src="assets/screenshots/ai-usage-light.png">
+</picture>
+
+### AI Chat — ancré dans votre propre télémétrie
+
+Posez une question sur votre projet et la réponse vient de vos données — traces, métriques, alarmes, déploiements et revenus — pas de la supposition d'un modèle générique. C'est **en lecture seule par défaut** : les actions d'écriture sont opt-in et, même activées, l'assistant propose la modification et attend votre confirmation.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Le chat IA de Temps diagnostiquant un pic de latence au checkout à partir des traces, métriques et revenus du projet lui-même" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### CLI & Skills — utilisables depuis n'importe quel environnement IA
+
+La CLI couvre toute la plateforme — plus de 440 commandes réparties en 69 groupes — donc tout ce que vous faites dans le tableau de bord, un agent peut le faire dans un terminal :
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps fournit aussi des [skills](skills/) — des instructions autonomes qui s'intègrent à Claude Code, Cursor ou tout environnement lisant `.claude/skills/`, couvrant les déploiements, les analytics, le suivi d'erreurs, les domaines personnalisés et la référence complète de la CLI. Les skills et les serveurs MCP peuvent être enregistrés au niveau de la plateforme et sont injectés automatiquement dans les sandboxes des workflows d'agents.
 
 ### Sandboxes IA — exécution de code isolée
 
@@ -167,6 +207,7 @@ Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricin
 | Postgres/Redis/S3 managés | AWS RDS / ElastiCache (50 $+/mois) |
 | Emails transactionnels + DKIM | Resend / SendGrid (20-100 $/mois) |
 | Sandboxes d'exécution de code IA | E2B / Daytona / Vercel Sandbox (150 $+/mois + usage) |
+| AI gateway + suivi d'usage/coût | OpenRouter / Helicone / LangSmith (0-200 $+/mois) |
 | Logs de requêtes + proxy | Cloudflare (0-200 $/mois) |
 | **Total avec Temps** | **0 $ (auto-hébergé)** |
 
@@ -190,6 +231,7 @@ Vous préférez ne pas gérer de serveur ? [Temps Cloud](https://temps.sh/pricin
 | Monitoring de disponibilité | Oui | Non | Non | Non | Non | Non | Non |
 | Emails transactionnels + DKIM | Oui | Non | Non | Non | Non | Non | Non |
 | Sandboxes d'exécution de code (API) | Oui | Non | Non | Non | Non | Non | Sandbox (à l'usage) |
+| AI gateway (BYOK) + assistant | Oui | Non | Non | Non | Non | Non | AI Gateway (payant) |
 | Postgres / Redis managés | Oui | Oui | Oui | Non | Oui | Oui | Add-ons partenaires |
 | Stockage compatible S3 | Oui | Non | Non | Non | Non | Non | Blob (payant) |
 | Multi-nœud / clustering | Oui | Oui | Swarm | Oui | Managé | Managé | Managé |

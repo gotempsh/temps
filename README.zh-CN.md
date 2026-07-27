@@ -98,9 +98,49 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 </picture>
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
+  <img alt="Temps 结构化日志 —— 严重级别、服务与消息，并与链路追踪关联" src="assets/screenshots/otel-logs-light.png">
+</picture>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Temps 告警 —— 覆盖指标、容器、可用性与数据库的触发中、已确认与已解决告警" src="assets/screenshots/alerts-light.png">
 </picture>
+
+### AI 网关 —— 一个端点，用你自己的密钥
+
+自带各家服务商的密钥（OpenAI、Anthropic、xAI、Google Gemini），全部通过一个兼容 OpenAI 的端点调用 —— 只需替换 base URL，继续用你现在的 SDK。密钥加密存放在你自己的服务器上，每个请求都有归因：token 数、延迟、错误率和按模型估算的成本。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="Temps AI 网关 —— 自带密钥（BYOK）的服务商统一在一个兼容 OpenAI 的端点后面" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Temps AI 网关用量分析 —— 请求数、token、延迟、错误率与估算成本" src="assets/screenshots/ai-usage-light.png">
+</picture>
+
+### AI 对话 —— 基于你自己的可观测数据
+
+询问你的项目，答案来自你自己的数据 —— 链路追踪、指标、告警、部署和收入 —— 而不是通用模型的猜测。默认**只读**：写操作需要显式开启，且即使开启后，助手也会先提出变更方案并等你确认。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Temps AI 对话正在依据项目自身的链路追踪、指标与收入数据诊断结账延迟骤增" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### CLI 与技能 —— 可在任意 AI 环境中使用
+
+CLI 覆盖整个平台 —— 69 个命令组、440+ 条命令 —— 所以你在控制台能做的事，智能体都能在终端里完成：
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps 还提供 [skills](skills/) —— 可直接放入 Claude Code、Cursor 或任何读取 `.claude/skills/` 的环境的自包含说明，涵盖部署、网站分析、错误追踪、自定义域名以及完整的 CLI 参考。技能和 MCP 服务器可以在平台级注册，并会自动注入到智能体工作流沙箱中。
 
 ### AI 沙箱 —— 隔离的代码执行
 
@@ -167,6 +207,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 托管 Postgres/Redis/S3 | AWS RDS / ElastiCache（$50+/月） |
 | 事务性邮件 + DKIM | Resend / SendGrid（$20-100/月） |
 | AI 代码执行沙箱 | E2B / Daytona / Vercel Sandbox（$150+/月 + 用量） |
+| AI 网关 + 用量/成本追踪 | OpenRouter / Helicone / LangSmith（$0-200+/月） |
 | 请求日志 + 代理 | Cloudflare（$0-200/月） |
 | **使用 Temps 的总成本** | **$0（自托管）** |
 
@@ -190,6 +231,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | 可用性监控 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 事务性邮件 + DKIM | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 代码执行沙箱（API） | 是 | 否 | 否 | 否 | 否 | 否 | Sandbox（按用量计费） |
+| AI 网关（自带密钥）+ 助手 | 是 | 否 | 否 | 否 | 否 | 否 | AI Gateway（付费） |
 | 托管 Postgres / Redis | 是 | 是 | 是 | 否 | 是 | 是 | 合作方插件 |
 | S3 兼容存储 | 是 | 否 | 否 | 否 | 否 | 否 | Blob（付费） |
 | 多节点 / 集群 | 是 | 是 | Swarm | 是 | 平台托管 | 平台托管 | 平台托管 |

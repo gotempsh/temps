@@ -98,9 +98,49 @@ Apunta cualquier exporter OTLP a Temps y tendrás trazas distribuidas, métricas
 </picture>
 
 <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/otel-logs-dark.png">
+  <img alt="Logs estructurados de Temps — severidad, servicio y mensaje, correlacionados con las trazas" src="assets/screenshots/otel-logs-light.png">
+</picture>
+
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Alertas de Temps — alarmas activas, reconocidas y resueltas de métricas, contenedores, disponibilidad y bases de datos" src="assets/screenshots/alerts-light.png">
 </picture>
+
+### AI Gateway — un endpoint, tus propias claves
+
+Trae tus propias claves de proveedor (OpenAI, Anthropic, xAI, Google Gemini) y llámalas todas a través de un único endpoint compatible con OpenAI — cambia la base URL y sigue usando el SDK que ya tienes. Las claves quedan cifradas en tu servidor, y cada petición queda atribuida: tokens, latencia, tasa de error y coste estimado por modelo.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="AI Gateway de Temps — claves de proveedor propias (BYOK) detrás de un endpoint compatible con OpenAI" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Analítica de uso del AI Gateway de Temps — peticiones, tokens, latencia, tasa de error y coste estimado" src="assets/screenshots/ai-usage-light.png">
+</picture>
+
+### AI Chat — basado en tu propia telemetría
+
+Pregunta por tu proyecto y la respuesta sale de tus datos — trazas, métricas, alarmas, despliegues e ingresos — no de la suposición de un modelo genérico. Es **de solo lectura por defecto**: las acciones de escritura son opt-in y, aun así, el asistente propone el cambio y espera tu confirmación.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="El chat de IA de Temps diagnosticando un pico de latencia en el checkout a partir de las trazas, métricas e ingresos del propio proyecto" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### CLI y Skills — utilizables desde cualquier entorno de IA
+
+La CLI cubre toda la plataforma — más de 440 comandos en 69 grupos — así que lo que puedes hacer en el panel, un agente puede hacerlo en una terminal:
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps también incluye [skills](skills/) — instrucciones autocontenidas que encajan en Claude Code, Cursor o cualquier entorno que lea `.claude/skills/`, y que cubren despliegues, analítica, seguimiento de errores, dominios propios y la referencia completa de la CLI. Las skills y los servidores MCP pueden registrarse a nivel de plataforma y se inyectan automáticamente en los sandboxes de los flujos de agentes.
 
 ### Sandboxes de IA — ejecución de código aislada
 
@@ -167,6 +207,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Postgres/Redis/S3 gestionados | AWS RDS / ElastiCache ($50+/mes) |
 | Email transaccional + DKIM | Resend / SendGrid ($20-100/mes) |
 | Sandboxes de ejecución de código para IA | E2B / Daytona / Vercel Sandbox ($150+/mes + uso) |
+| AI gateway + seguimiento de uso/coste | OpenRouter / Helicone / LangSmith ($0-200+/mes) |
 | Registro de peticiones + proxy | Cloudflare ($0-200/mes) |
 | **Total con Temps** | **$0 (autoalojado)** |
 
@@ -190,6 +231,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 | Monitorización de disponibilidad | Sí | No | No | No | No | No | No |
 | Email transaccional + DKIM | Sí | No | No | No | No | No | No |
 | Sandboxes de ejecución de código (API) | Sí | No | No | No | No | No | Sandbox (según uso) |
+| AI gateway (BYOK) + asistente | Sí | No | No | No | No | No | AI Gateway (de pago) |
 | Postgres / Redis gestionados | Sí | Sí | Sí | No | Sí | Sí | Complementos de partners |
 | Almacenamiento compatible con S3 | Sí | No | No | No | No | No | Blob (de pago) |
 | Multinodo / clustering | Sí | Sí | Swarm | Sí | Gestionado | Gestionado | Gestionado |
