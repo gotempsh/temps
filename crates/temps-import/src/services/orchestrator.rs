@@ -37,6 +37,92 @@ struct ImportSession {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Shared by every operation that reads or acts on a session
+/// (`execute_import`, `get_status`): a session's plan carries the source
+/// platform's env vars, so leaking one cross-user is a real credential
+/// exposure, not just a privacy nicety. Returning `SessionNotFound` rather
+/// than a distinct "forbidden" error deliberately avoids confirming to a
+/// non-owner that the session id exists at all.
+fn check_session_ownership(
+    session: &ImportSession,
+    user_id: i32,
+    session_id: &str,
+) -> ImportServiceResult<()> {
+    if session.user_id != user_id {
+        warn!(
+            "User {} attempted to access session {} owned by user {}",
+            user_id, session_id, session.user_id
+        );
+        return Err(ImportServiceError::SessionNotFound(session_id.to_string()));
+    }
+    Ok(())
+}
+
+/// Text to substitute for any secret value returned to a client. Matches the
+/// `***` convention used everywhere else in the codebase (API keys, tokens).
+const MASKED_SECRET: &str = "***";
+
+/// How long an import session (plan + real, unmasked source credentials —
+/// including a full kubeconfig with its private key, for Kubernetes) is
+/// kept in memory before being pruned. A session only needs to survive long
+/// enough for the user to review the plan and click execute; there's no
+/// reason to hold a live credential set indefinitely for a plan nobody ever
+/// executed.
+const SESSION_TTL: chrono::Duration = chrono::Duration::hours(1);
+
+/// Redact secrets out of a plan before it leaves the process as an HTTP
+/// response — `CreatePlanResponse`/`ImportStatusResponse` return the whole
+/// plan, and a plan built from a real platform carries the source
+/// database's connection URL (with its password) and every captured env
+/// var, `is_secret` ones included. The plan kept in the in-memory session
+/// (used to actually run the import) is a separate clone and is untouched.
+fn mask_plan_secrets(plan: &ImportPlan) -> ImportPlan {
+    let mut masked = plan.clone();
+
+    for service in &mut masked.services {
+        let raw_source_url = service
+            .parameters
+            .get(super::resource_executor::SOURCE_URL_PARAM)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(source_url) = service
+            .parameters
+            .get_mut(super::resource_executor::SOURCE_URL_PARAM)
+        {
+            *source_url = serde_json::json!(MASKED_SECRET);
+        }
+
+        // Every importer's dump_command() embeds this same URL verbatim
+        // into a copy-pasteable pg_dump/mysqldump/mongodump command in
+        // recommended_action — redact it there too, or the password leaks
+        // right back out through this sibling field.
+        if let Some(raw_url) = raw_source_url {
+            for implication in &mut service.data_implications {
+                if let Some(action) = &mut implication.recommended_action {
+                    if action.contains(raw_url.as_str()) {
+                        *action = action.replace(raw_url.as_str(), MASKED_SECRET);
+                    }
+                }
+            }
+        }
+    }
+
+    let mask_env_vars = |deployment: &mut temps_import_types::plan::DeploymentConfiguration| {
+        for env_var in &mut deployment.env_vars {
+            if env_var.is_secret {
+                env_var.value = MASKED_SECRET.to_string();
+            }
+        }
+    };
+    mask_env_vars(&mut masked.deployment);
+    for deployment in &mut masked.additional_deployments {
+        mask_env_vars(deployment);
+    }
+
+    masked
+}
+
 /// Import orchestrator coordinating all import operations
 pub struct ImportOrchestrator {
     db: Arc<DatabaseConnection>,
@@ -44,6 +130,11 @@ pub struct ImportOrchestrator {
     git_provider_manager: Arc<temps_git::GitProviderManager>,
     project_service: Arc<temps_projects::ProjectService>,
     deployment_service: Arc<temps_deployments::DeploymentService>,
+    /// Executes the platform-generic plan resources (services, data
+    /// population, domains) around the importer's own execute.
+    resource_executor: Arc<super::ResourceExecutor>,
+    /// Settings access for the preview domain used in env-var rewriting.
+    config_service: Arc<temps_config::ConfigService>,
     /// In-memory session storage (will be replaced with database storage later)
     sessions: Arc<RwLock<HashMap<String, ImportSession>>>,
 }
@@ -74,6 +165,8 @@ impl ImportOrchestrator {
         git_provider_manager: Arc<temps_git::GitProviderManager>,
         project_service: Arc<temps_projects::ProjectService>,
         deployment_service: Arc<temps_deployments::DeploymentService>,
+        resource_executor: Arc<super::ResourceExecutor>,
+        config_service: Arc<temps_config::ConfigService>,
     ) -> Self {
         Self {
             db,
@@ -81,6 +174,8 @@ impl ImportOrchestrator {
             git_provider_manager,
             project_service,
             deployment_service,
+            resource_executor,
+            config_service,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -90,6 +185,72 @@ impl ImportOrchestrator {
         let source = importer.source();
         info!("Registering importer for source: {}", source);
         self.importers.insert(source, importer);
+    }
+
+    /// Read-lock the session map. A `.unwrap()` here would poison the lock on
+    /// panic and wedge every subsequent import call until the process
+    /// restarts — return a typed error instead so a single bad session can't
+    /// take down the whole import subsystem.
+    fn sessions_read(
+        &self,
+    ) -> ImportServiceResult<std::sync::RwLockReadGuard<'_, HashMap<String, ImportSession>>> {
+        self.sessions.read().map_err(|_| {
+            ImportServiceError::Internal(
+                "import session store lock was poisoned by a prior panic".to_string(),
+            )
+        })
+    }
+
+    /// Write-locked counterpart of [`Self::sessions_read`].
+    fn sessions_write(
+        &self,
+    ) -> ImportServiceResult<std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>> {
+        self.sessions.write().map_err(|_| {
+            ImportServiceError::Internal(
+                "import session store lock was poisoned by a prior panic".to_string(),
+            )
+        })
+    }
+
+    /// Drop every session older than [`SESSION_TTL`] — a plan the user never
+    /// executed (or a real-time browser tab they closed) must not keep its
+    /// source credentials resident in memory forever. Piggybacks on
+    /// `create_plan`'s own write-lock rather than a background task: import
+    /// volume is low control-plane traffic, so an O(live sessions) sweep on
+    /// every new plan is cheap and needs no extra lifecycle to manage.
+    fn prune_expired_sessions(
+        sessions: &mut std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>,
+    ) {
+        let now = chrono::Utc::now();
+        let before = sessions.len();
+        sessions.retain(|_, session| now - session.created_at < SESSION_TTL);
+        let pruned = before - sessions.len();
+        if pruned > 0 {
+            info!(
+                "Pruned {} expired import session(s) older than {}h",
+                pruned,
+                SESSION_TTL.num_hours()
+            );
+        }
+    }
+
+    /// Clear the real, unmasked source credentials (for Kubernetes, a full
+    /// kubeconfig including its client private key) from a stored session
+    /// once `execute_import` has read them to build its execution context.
+    /// Nothing downstream of that one read site -- the importers' own
+    /// `execute()`, the resource executor, the deployment verifier, or a
+    /// later `get_status` call -- ever reads them again, including on a
+    /// retry after a failed real run (the session is deliberately kept
+    /// around for exactly that). So there's no reason to leave them
+    /// resident for the rest of `SESSION_TTL`; a no-op if the session is
+    /// already gone (e.g. a concurrent successful-run eviction raced this).
+    fn clear_session_credentials(
+        sessions: &mut std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>,
+        session_id: &str,
+    ) {
+        if let Some(stored) = sessions.get_mut(session_id) {
+            stored.credentials = temps_import_types::ImportCredentials::default();
+        }
     }
 
     /// Get an importer for a source
@@ -124,6 +285,7 @@ impl ImportOrchestrator {
                     supports_services: capabilities.supports_services,
                     supports_domains: capabilities.supports_domains,
                     supports_project_snapshot: capabilities.supports_project_snapshot,
+                    supports_cost_analysis: capabilities.supports_cost_analysis,
                     requires_credentials: source.requires_credentials(),
                 },
             });
@@ -182,11 +344,39 @@ impl ImportOrchestrator {
 
         let importer = self.get_importer(source)?;
 
-        // Get detailed snapshot
-        let snapshot = importer.describe(credentials, &workload_id).await?;
+        // Get detailed snapshot and generate the plan. Importers that support
+        // project-level snapshots (platform/cluster migrations) go through
+        // describe_project/generate_project_plan so attached services, domains,
+        // and cost analysis make it into the plan; workload-level importers
+        // (Docker) keep the original describe/generate_plan path.
+        let (snapshot, mut plan) = if importer.capabilities().supports_project_snapshot {
+            let project_snapshot = importer.describe_project(credentials, &workload_id).await?;
+            let plan = importer.generate_project_plan(project_snapshot.clone())?;
+            (project_snapshot.primary_workload, plan)
+        } else {
+            let snapshot = importer.describe(credentials, &workload_id).await?;
+            let plan = importer.generate_plan(snapshot.clone())?;
+            (snapshot, plan)
+        };
 
-        // Generate plan
-        let mut plan = importer.generate_plan(snapshot.clone())?;
+        // Skipped domains are IP-tied (sslip.io & friends) and would keep
+        // pointing at the source machine — show the user the temps address
+        // that replaces them, right in the reviewable plan.
+        match self.config_service.get_settings().await {
+            Ok(settings) => {
+                let preview_host = super::resource_executor::preview_hostname(
+                    &settings.preview_domain,
+                    &plan.environment.subdomain,
+                );
+                super::resource_executor::annotate_skipped_domains(&mut plan, &preview_host);
+            }
+            Err(e) => {
+                warn!(
+                    "Could not load settings to annotate replacement domains in the plan: {}",
+                    e
+                );
+            }
+        }
 
         // Fetch repository information if repository ID is provided
         let (git_provider_connection_id, repo_owner, repo_name) = if let Some(repo_id) =
@@ -297,7 +487,8 @@ impl ImportOrchestrator {
         };
 
         {
-            let mut sessions = self.sessions.write().unwrap();
+            let mut sessions = self.sessions_write()?;
+            Self::prune_expired_sessions(&mut sessions);
             sessions.insert(session_id.clone(), session);
         }
 
@@ -307,9 +498,13 @@ impl ImportOrchestrator {
             validation.can_proceed()
         );
 
+        // The session keeps the real, unmasked plan above (it's what
+        // execute_import reads to actually connect to the source database
+        // and inject env vars) — the response the client sees is a
+        // separately masked copy.
         Ok(CreatePlanResponse {
             session_id,
-            plan,
+            plan: mask_plan_secrets(&plan),
             validation: validation.clone(),
             can_execute: validation.can_proceed(),
         })
@@ -334,7 +529,7 @@ impl ImportOrchestrator {
 
         // Retrieve session from memory
         let session = {
-            let sessions = self.sessions.read().unwrap();
+            let sessions = self.sessions_read()?;
             sessions
                 .get(&session_id)
                 .cloned()
@@ -342,12 +537,15 @@ impl ImportOrchestrator {
         };
 
         // Verify user owns this session
-        if session.user_id != user_id {
-            warn!(
-                "User {} attempted to execute session {} owned by user {}",
-                user_id, session_id, session.user_id
-            );
-            return Err(ImportServiceError::SessionNotFound(session_id));
+        check_session_ownership(&session, user_id, &session_id)?;
+
+        // See clear_session_credentials's doc comment for the full rationale.
+        match self.sessions_write() {
+            Ok(mut sessions) => Self::clear_session_credentials(&mut sessions, &session_id),
+            Err(e) => warn!(
+                "Could not clear credentials from import session {} after use: {} — they will still expire via SESSION_TTL",
+                session_id, e
+            ),
         }
 
         // Check if validation passed
@@ -363,7 +561,9 @@ impl ImportOrchestrator {
         let source = ImportSource::from_str(&session.plan.source)?;
         let importer = self.get_importer(source)?;
 
-        // Create execution context
+        // Create execution context (keep the branch around — the context is
+        // moved into the importer, but the deploy phase needs it too)
+        let deploy_branch = main_branch.clone();
         let context = temps_import_types::ImportContext {
             session_id: session_id.clone(),
             user_id,
@@ -379,43 +579,210 @@ impl ImportOrchestrator {
             metadata: std::collections::HashMap::new(),
         };
 
-        // Delegate execution to the importer
-        let outcome = importer
+        let mut plan = session.plan.clone();
+        let mut pre_steps: Vec<temps_import_types::StepResult> = Vec::new();
+
+        // Phase 1 (real runs only): create managed services BEFORE the
+        // project so env vars can point at them from the first deployment.
+        let created_services = if dry_run {
+            Vec::new()
+        } else {
+            let (steps, created, _resources) = self
+                .resource_executor
+                .create_services(&plan, &context.project_name)
+                .await;
+            pre_steps.extend(steps);
+
+            // Phase 2: rewrite env vars — source database URLs point at the
+            // new managed services, source-generated domains point at the
+            // environment's preview hostname.
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let preview_host = super::resource_executor::preview_hostname(
+                        &settings.preview_domain,
+                        &plan.environment.subdomain,
+                    );
+                    let rewrites = super::resource_executor::build_env_rewrites(
+                        &plan,
+                        &created,
+                        &preview_host,
+                    );
+                    let changed =
+                        super::resource_executor::apply_env_rewrites(&mut plan, &rewrites);
+                    if changed > 0 {
+                        pre_steps.push(temps_import_types::StepResult {
+                            step_id: "rewrite-env-vars".to_string(),
+                            step_title: "Rewrite environment variables for temps".to_string(),
+                            success: true,
+                            skipped: false,
+                            message: format!(
+                                "Rewrote {} environment variable(s): source database URLs now point at the new managed service(s) and source-generated domains at '{}'",
+                                changed, preview_host
+                            ),
+                            created_resources: vec![],
+                            duration_seconds: 0.0,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not load settings for env-var rewriting during import {}: {} — imported values are unchanged",
+                        session_id, e
+                    );
+                }
+            }
+            created
+        };
+
+        // Delegate project/environment/deployment creation to the importer
+        let mut outcome = importer
             .execute(
                 context,
-                session.plan.clone(),
+                plan.clone(),
                 self as &dyn temps_import_types::ImportServiceProvider,
             )
             .await
             .map_err(|e| ImportServiceError::ExecutionFailed(e.to_string()))?;
 
-        // Convert ImportOutcome to ExecuteImportResponse
+        // Phase 3 (real runs only, once the environment exists): custom
+        // domains and data population.
+        if !dry_run && outcome.success {
+            if let (Some(project_id), Some(environment_id)) =
+                (outcome.project_id, outcome.environment_id)
+            {
+                let (domain_steps, domain_resources) = self
+                    .resource_executor
+                    .create_domains(&plan, project_id, environment_id)
+                    .await;
+                outcome.step_results.extend(domain_steps);
+                outcome.created_resources.extend(domain_resources);
+            }
+            let populate_steps = self
+                .resource_executor
+                .populate_services(&created_services)
+                .await;
+            outcome.step_results.extend(populate_steps);
+        }
+
+        // Phase 4 (real runs only): actually deploy the imported project and
+        // verify it answers. Creating rows is not a migration — until the app
+        // has been built, started, and responded, nothing has moved.
+        let mut operational = false;
+        if !dry_run && outcome.success {
+            if let (Some(project_id), Some(environment_id)) =
+                (outcome.project_id, outcome.environment_id)
+            {
+                let app_url = self.environment_url(environment_id).await;
+                let verifier = super::DeploymentVerifier::new(
+                    self.db.clone(),
+                    self.deployment_service.clone(),
+                );
+                let verification = verifier
+                    .deploy_and_verify(
+                        project_id,
+                        environment_id,
+                        Some(
+                            plan.deployment
+                                .git
+                                .as_ref()
+                                .map(|g| g.branch.clone())
+                                .filter(|b| !b.is_empty())
+                                .unwrap_or_else(|| deploy_branch.clone()),
+                        ),
+                        app_url,
+                        outcome.deployment_id,
+                    )
+                    .await;
+                operational = verification.operational;
+                outcome.step_results.extend(verification.steps);
+                outcome.warnings.extend(verification.warnings);
+                // The pipeline's deployment is the real one; the importer's
+                // placeholder row is only a record of what was imported.
+                if let Some(deployment_id) = verification.deployment_id {
+                    outcome.deployment_id = Some(deployment_id);
+                }
+            }
+        }
+
+        // Pre-execution steps (services, env rewrite) come first in the report
+        let mut step_results = pre_steps;
+        step_results.extend(outcome.step_results);
+
+        // An import only counts as completed when the application is actually
+        // running. Everything else is reported as failed so the user is never
+        // told a migration succeeded while the app is down — the created
+        // resources are listed in the steps either way.
+        let status = if outcome.success && (dry_run || operational) {
+            ImportExecutionStatus::Completed
+        } else {
+            ImportExecutionStatus::Failed
+        };
+
+        // A completed real import has no further use for its source
+        // credentials — evict it now rather than waiting out SESSION_TTL.
+        // Failed real runs and dry runs are left in place: a failure may be
+        // worth retrying against the same reviewed plan, and a dry run is
+        // explicitly a rehearsal for a real execute call that follows.
+        if !dry_run && status == ImportExecutionStatus::Completed {
+            match self.sessions_write() {
+                Ok(mut sessions) => {
+                    sessions.remove(&session_id);
+                }
+                Err(e) => warn!(
+                    "Could not evict completed import session {}: {} — it will still expire via SESSION_TTL",
+                    session_id, e
+                ),
+            }
+        }
+
         Ok(ExecuteImportResponse {
             session_id: outcome.session_id,
-            status: if outcome.success {
-                ImportExecutionStatus::Completed
-            } else {
-                ImportExecutionStatus::Failed
-            },
+            status,
             project_id: outcome.project_id,
             environment_id: outcome.environment_id,
             deployment_id: outcome.deployment_id,
-            step_results: outcome.step_results,
+            step_results,
         })
     }
 
+    /// The address the imported app should answer on, used for the post-deploy
+    /// check. Always the environment's own preview URL: it is served by this
+    /// proxy immediately, while imported custom domains only resolve here
+    /// after the user cuts DNS over — probing those would report a healthy
+    /// app as down.
+    async fn environment_url(&self, environment_id: i32) -> Option<String> {
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()?;
+        self.deployment_service
+            .compute_environment_url(&environment.subdomain)
+            .await
+            .ok()
+    }
+
     /// Get import status
-    pub async fn get_status(&self, session_id: &str) -> ImportServiceResult<ImportStatusResponse> {
+    pub async fn get_status(
+        &self,
+        user_id: i32,
+        session_id: &str,
+    ) -> ImportServiceResult<ImportStatusResponse> {
         debug!("Getting status for import session: {}", session_id);
 
         // Retrieve session from memory
         let session = {
-            let sessions = self.sessions.read().unwrap();
+            let sessions = self.sessions_read()?;
             sessions
                 .get(session_id)
                 .cloned()
                 .ok_or_else(|| ImportServiceError::SessionNotFound(session_id.to_string()))?
         };
+
+        // Verify user owns this session — the plan it carries includes the
+        // source platform's env vars, so leaking it cross-user is a real
+        // credential exposure, not just a privacy nicety.
+        check_session_ownership(&session, user_id, session_id)?;
 
         // Extract errors and warnings from validation
         let errors: Vec<String> = session
@@ -437,7 +804,7 @@ impl ImportOrchestrator {
         Ok(ImportStatusResponse {
             session_id: session_id.to_string(),
             status: ImportExecutionStatus::Pending,
-            plan: Some(session.plan),
+            plan: Some(mask_plan_secrets(&session.plan)),
             validation: Some(session.validation),
             project_id: None,
             environment_id: None,
@@ -515,6 +882,7 @@ mod tests {
                 entrypoint: None,
                 working_dir: None,
                 health_check: None,
+                git: None,
             },
             services: vec![],
             domains: vec![],
@@ -534,6 +902,7 @@ mod tests {
                 complexity: PlanComplexity::Low,
                 warnings: vec![],
             },
+            cost_analysis: None,
         }
     }
 
@@ -555,6 +924,214 @@ mod tests {
                 critical_count: 0,
             },
         }
+    }
+
+    fn test_session(user_id: i32) -> ImportSession {
+        ImportSession {
+            session_id: "sess-1".to_string(),
+            user_id,
+            plan: create_test_plan(),
+            validation: create_test_validation(true),
+            repository_id: None,
+            git_provider_connection_id: None,
+            repo_owner: None,
+            repo_name: None,
+            credentials: temps_import_types::ImportCredentials::default(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    // Pure — no orchestrator/DB/service construction needed, unlike the
+    // integration-shaped tests below that require full service wiring.
+    #[test]
+    fn check_session_ownership_allows_the_owner() {
+        let session = test_session(7);
+        assert!(check_session_ownership(&session, 7, "sess-1").is_ok());
+    }
+
+    #[test]
+    fn check_session_ownership_rejects_a_different_user() {
+        let session = test_session(7);
+        let result = check_session_ownership(&session, 8, "sess-1");
+        assert!(
+            matches!(result, Err(ImportServiceError::SessionNotFound(id)) if id == "sess-1"),
+            "a non-owner must see the same 'not found' error a truly missing \
+             session would produce — never a distinct 'forbidden' response \
+             that would confirm the session id exists"
+        );
+    }
+
+    /// Regression test: import sessions hold the real, unmasked source
+    /// credentials (a full kubeconfig with its private key, for
+    /// Kubernetes) and used to have no eviction at all — a plan nobody ever
+    /// executed stayed resident in memory for the life of the process.
+    /// `prune_expired_sessions` bounds that to `SESSION_TTL`.
+    #[test]
+    fn prune_expired_sessions_drops_only_stale_entries() {
+        let mut fresh = test_session(1);
+        fresh.session_id = "fresh".to_string();
+        fresh.created_at = chrono::Utc::now();
+
+        let mut stale = test_session(1);
+        stale.session_id = "stale".to_string();
+        stale.created_at = chrono::Utc::now() - (SESSION_TTL + chrono::Duration::minutes(1));
+
+        let lock = std::sync::RwLock::new(HashMap::from([
+            ("fresh".to_string(), fresh),
+            ("stale".to_string(), stale),
+        ]));
+        {
+            let mut sessions = lock.write().unwrap();
+            ImportOrchestrator::prune_expired_sessions(&mut sessions);
+        }
+
+        let sessions = lock.read().unwrap();
+        assert!(
+            sessions.contains_key("fresh"),
+            "a session within the TTL must survive pruning"
+        );
+        assert!(
+            !sessions.contains_key("stale"),
+            "a session older than SESSION_TTL must be evicted, credentials and all"
+        );
+    }
+
+    /// Regression test: execute_import used to read a session's real,
+    /// unmasked credentials once and then leave them sitting in the stored
+    /// session for the rest of SESSION_TTL (up to an hour), even though
+    /// nothing ever reads them again -- including on a retry after a failed
+    /// real run, which keeps the session around for exactly that.
+    #[test]
+    fn clear_session_credentials_zeroes_credentials_but_keeps_the_rest_of_the_session() {
+        let mut session = test_session(7);
+        session.credentials = temps_import_types::ImportCredentials {
+            token: Some("real-token".to_string()),
+            team_id: None,
+            base_url: Some("https://coolify.example.com".to_string()),
+            extra: HashMap::from([("username".to_string(), "admin".to_string())]),
+        };
+        let lock = std::sync::RwLock::new(HashMap::from([("sess-1".to_string(), session)]));
+
+        {
+            let mut sessions = lock.write().unwrap();
+            ImportOrchestrator::clear_session_credentials(&mut sessions, "sess-1");
+        }
+
+        let sessions = lock.read().unwrap();
+        let stored = sessions.get("sess-1").expect("session must still exist");
+        assert!(
+            stored.credentials.token.is_none()
+                && stored.credentials.base_url.is_none()
+                && stored.credentials.extra.is_empty(),
+            "credentials must be cleared after use, got {:?}",
+            stored.credentials
+        );
+        assert_eq!(
+            stored.user_id, 7,
+            "clearing credentials must not disturb the rest of the session \
+             (get_status and a retry after failure still need plan/validation/ownership)"
+        );
+    }
+
+    /// A missing session id must be a safe no-op, not a panic -- the caller
+    /// (execute_import) has already handled SessionNotFound by this point,
+    /// but a concurrent eviction could still race this call.
+    #[test]
+    fn clear_session_credentials_is_a_noop_for_a_missing_session() {
+        let lock = std::sync::RwLock::new(HashMap::<String, ImportSession>::new());
+        let mut sessions = lock.write().unwrap();
+        ImportOrchestrator::clear_session_credentials(&mut sessions, "nonexistent");
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn mask_plan_secrets_redacts_source_url_and_secret_env_vars_only() {
+        let mut plan = create_test_plan();
+        plan.services.push(ServicePlan {
+            name: "lab-db".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("16".to_string()),
+            parameters: HashMap::from([
+                (
+                    crate::services::resource_executor::SOURCE_URL_PARAM.to_string(),
+                    serde_json::json!("postgres://lab:hunter2@1.2.3.4:5432/labdb"),
+                ),
+                ("database".to_string(), serde_json::json!("labdb")),
+            ]),
+            env_var_mappings: HashMap::new(),
+            action: ServiceAction::Create,
+            action_description: "Create a new managed service".to_string(),
+            data_implications: vec![DataImplication {
+                severity: DataImplicationSeverity::Warning,
+                message: "Database 'lab-db' contains data that will be copied automatically"
+                    .to_string(),
+                recommended_action: Some(format!(
+                    "pg_dump --no-owner --format=custom \"{}\" -f lab-db.dump",
+                    "postgres://lab:hunter2@1.2.3.4:5432/labdb"
+                )),
+            }],
+        });
+        plan.deployment.env_vars = vec![
+            EnvironmentVariable {
+                key: "DATABASE_URL".to_string(),
+                value: "postgres://lab:hunter2@1.2.3.4:5432/labdb".to_string(),
+                is_secret: true,
+                source_description: None,
+            },
+            EnvironmentVariable {
+                key: "PUBLIC_APP_NAME".to_string(),
+                value: "lab-shop".to_string(),
+                is_secret: false,
+                source_description: None,
+            },
+        ];
+
+        let masked = mask_plan_secrets(&plan);
+
+        let masked_param = masked.services[0]
+            .parameters
+            .get(crate::services::resource_executor::SOURCE_URL_PARAM)
+            .unwrap();
+        assert_eq!(masked_param, &serde_json::json!(MASKED_SECRET));
+        assert_eq!(
+            masked.services[0].parameters.get("database").unwrap(),
+            &serde_json::json!("labdb"),
+            "non-secret parameters must pass through unchanged"
+        );
+        assert_eq!(masked.deployment.env_vars[0].value, MASKED_SECRET);
+        assert_eq!(
+            masked.deployment.env_vars[1].value, "lab-shop",
+            "non-secret env vars must pass through unchanged"
+        );
+
+        let masked_action = masked.services[0].data_implications[0]
+            .recommended_action
+            .as_ref()
+            .unwrap();
+        assert!(
+            !masked_action.contains("hunter2"),
+            "recommended_action must not leak the source DB password: {}",
+            masked_action
+        );
+        assert_eq!(
+            masked_action,
+            &format!(
+                "pg_dump --no-owner --format=custom \"{}\" -f lab-db.dump",
+                MASKED_SECRET
+            )
+        );
+
+        // The original, unmasked plan (what execute_import actually uses)
+        // must be untouched — masking must only ever operate on a copy.
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://lab:hunter2@1.2.3.4:5432/labdb"
+        );
+        assert!(plan.services[0].data_implications[0]
+            .recommended_action
+            .as_ref()
+            .unwrap()
+            .contains("hunter2"));
     }
 
     // Tests commented out - they require full service initialization which is complex in unit tests.
@@ -1020,7 +1597,7 @@ mod tests {
         }
 
         // Act
-        let result = orchestrator.get_status(&session_id).await;
+        let result = orchestrator.get_status(1, &session_id).await;
 
         // Assert
         assert!(result.is_ok(), "Should return status for existing session");

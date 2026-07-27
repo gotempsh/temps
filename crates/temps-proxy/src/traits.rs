@@ -89,6 +89,17 @@ pub trait UpstreamResolver: Send + Sync {
 
     /// Get load balancing strategy for a host (for future use)
     async fn get_lb_strategy(&self, host: &str) -> Option<String>;
+
+    /// The console/control-plane API's own bind address (`host:port`), as a
+    /// bare string comparable against `HttpPeer::address().to_string()`.
+    /// Lets the proxy give console-bound requests (long-running admin
+    /// operations, e.g. triggering an import) a longer upstream read
+    /// timeout than customer-app traffic — see `LoadBalancer::upstream_peer`.
+    /// Default is empty, which never matches a real peer address, so test
+    /// mocks that don't override it keep the normal hot-path timeout.
+    fn console_address(&self) -> &str {
+        ""
+    }
 }
 
 /// Trait for resolving project context from request information

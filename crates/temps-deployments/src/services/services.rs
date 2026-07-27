@@ -2631,7 +2631,7 @@ impl DeploymentService {
         Ok(url)
     }
 
-    async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
+    pub async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
         let domain = PublicHostnameStrategy::Standard

@@ -544,10 +544,13 @@ impl WorkflowExecutionService {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                // Get commit_sha from job config (for specific commit deployments)
+                // Get commit_sha from job config (for specific commit
+                // deployments). An empty string is "no commit", never a ref —
+                // older deployments stored '' for manual triggers.
                 let commit_sha = config
                     .get("commit_sha")
                     .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
                 let mut builder = DownloadRepoBuilder::new()
@@ -1143,14 +1146,13 @@ impl WorkflowExecutionService {
                     })?
                     .to_string();
 
+                // Manual triggers (redeploy, import) have no commit — the
+                // scan still runs against the built image; the commit is
+                // only recorded as scan metadata when known.
                 let commit_hash = config
                     .get("commit_hash")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "commit_hash is required".to_string(),
-                        )
-                    })?
+                    .unwrap_or_default()
                     .to_string();
 
                 let download_job_id = config

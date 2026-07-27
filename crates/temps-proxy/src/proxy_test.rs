@@ -203,6 +203,10 @@ pub mod proxy_tests {
         async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
             Some("round_robin".to_string())
         }
+
+        fn console_address(&self) -> &str {
+            &self.console_addr
+        }
     }
 
     #[tokio::test]

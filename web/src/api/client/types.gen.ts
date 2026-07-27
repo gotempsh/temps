@@ -2048,6 +2048,11 @@ export type CliLoginRequest = {
 };
 
 /**
+ * Cloud provider detected from node metadata
+ */
+export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
+
+/**
  * Configuration for a Cloudflare Email Sending notification provider.
  *
  * Notifications are delivered through Cloudflare's transactional Email Sending
@@ -2078,6 +2083,24 @@ export type CloudflareConfig = {
      * Recipients that should receive the notification.
      */
     to_addresses: Array<string>;
+};
+
+/**
+ * Total cluster capacity (sum of node allocatable resources)
+ */
+export type ClusterCapacity = {
+    /**
+     * Total allocatable CPU in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Total allocatable memory in MB
+     */
+    memory_mb: number;
+    /**
+     * Number of nodes
+     */
+    node_count: number;
 };
 
 /**
@@ -2899,6 +2922,54 @@ export type CopyBlobRequest = {
      * Destination pathname
      */
     toPathname: string;
+};
+
+/**
+ * Full cluster cost + rightsizing analysis attached to an import plan.
+ */
+export type CostAnalysis = {
+    actual_usage?: null | ResourceFootprint;
+    /**
+     * Total cluster capacity (sum of node allocatable resources)
+     */
+    capacity: ClusterCapacity;
+    /**
+     * Managed control-plane fee included in `current_monthly_usd` (EKS/GKE
+     * charge ~$73/mo per cluster). `None` when not applicable/unknown.
+     */
+    control_plane_monthly_usd?: number | null;
+    /**
+     * Estimated total infrastructure cost per month in USD (compute nodes +
+     * control-plane fee). `None` when no node could be priced.
+     */
+    current_monthly_usd?: number | null;
+    /**
+     * Per-node inventory with price estimates where the instance type is known
+     */
+    nodes: Array<NodeCostInfo>;
+    /**
+     * Honesty notes: what could not be measured, which numbers are
+     * estimates, and any assumptions made. Always shown to the user.
+     */
+    notes: Array<string>;
+    /**
+     * Requests-vs-capacity-vs-usage assessment
+     */
+    overprovisioning: OverprovisioningAssessment;
+    provider?: null | CloudProvider;
+    /**
+     * The temps/Hetzner target sizing and savings estimate
+     */
+    recommendation: TargetRecommendation;
+    /**
+     * Sum of pod resource *requests* across running pods — what the
+     * scheduler has reserved, i.e. what the cluster is sized for.
+     */
+    requested: ResourceFootprint;
+    /**
+     * How the usage numbers were obtained (drives UI wording)
+     */
+    usage_source: UsageSource;
 };
 
 export type CreateAlertRuleRequest = {
@@ -4330,6 +4401,7 @@ export type DeploymentConfiguration = {
      * Environment variables
      */
     env_vars: Array<EnvironmentVariable>;
+    git?: null | GitSourcePlan;
     health_check?: null | HealthCheckConfiguration;
     /**
      * Image to deploy
@@ -5286,6 +5358,15 @@ export type DomainPlan = {
      * Redirect target (if this is a redirect domain)
      */
     redirect_to?: string | null;
+    /**
+     * The temps-side address that replaces this domain when it is skipped.
+     *
+     * Source-generated domains (sslip.io / traefik.me / platform subdomains)
+     * embed the source server's IP and would keep pointing at the old
+     * machine — this tells the user where the app will be reachable on
+     * temps instead.
+     */
+    replacement?: string | null;
     /**
      * Redirect status code
      */
@@ -7559,6 +7640,34 @@ export type GitRefResponse = {
 };
 
 /**
+ * Git repository the source platform deploys from
+ */
+export type GitSourcePlan = {
+    /**
+     * Branch the source platform deploys
+     */
+    branch: string;
+    /**
+     * Full clone URL, e.g. `https://github.com/owner/repo.git`
+     */
+    clone_url?: string | null;
+    /**
+     * True when the repository is public (no credentials on the source
+     * platform) — the project can then build without a git provider
+     * connection.
+     */
+    is_public: boolean;
+    /**
+     * Repository owner (organization or user)
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
+};
+
+/**
  * A conversation in the unified cross-project switcher: carries the project it
  * belongs to (name/slug) so the UI can show where the chat was started and
  * link back to the source.
@@ -8003,6 +8112,7 @@ export type ImportPlan = {
      * Additional deployments (workers, cron jobs, etc.)
      */
     additional_deployments?: Array<DeploymentConfiguration>;
+    cost_analysis?: null | CostAnalysis;
     /**
      * Primary deployment configuration
      */
@@ -8092,7 +8202,7 @@ export type ImportSelector = {
 /**
  * Import source identifier
  */
-export type ImportSource = 'docker' | 'coolify' | 'dokploy' | 'vercel' | 'netlify' | 'railway' | 'render' | 'fly' | 'custom';
+export type ImportSource = 'docker' | 'coolify' | 'dokploy' | 'vercel' | 'netlify' | 'railway' | 'render' | 'fly' | 'kubernetes' | 'caprover' | 'portainer' | 'kamal' | 'custom';
 
 /**
  * Source capabilities
@@ -8103,6 +8213,10 @@ export type ImportSourceCapabilities = {
      */
     requires_credentials: boolean;
     supports_build: boolean;
+    /**
+     * Supports cluster cost + overprovisioning analysis in the plan
+     */
+    supports_cost_analysis: boolean;
     /**
      * Supports custom domain migration
      */
@@ -9798,6 +9912,37 @@ export type NodeContainerResponse = {
     status: string;
 };
 
+/**
+ * One cluster node with capacity and (when priceable) a cost estimate
+ */
+export type NodeCostInfo = {
+    /**
+     * CPU capacity in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Instance type from `node.kubernetes.io/instance-type` (e.g. "m5.xlarge")
+     */
+    instance_type?: string | null;
+    /**
+     * Memory capacity in MB
+     */
+    memory_mb: number;
+    /**
+     * Estimated on-demand monthly price in USD. `None` when the instance
+     * type is unknown or not in the price table.
+     */
+    monthly_usd?: number | null;
+    /**
+     * Node name
+     */
+    name: string;
+    /**
+     * Region from `topology.kubernetes.io/region`
+     */
+    region?: string | null;
+};
+
 export type NodeInfoResponse = {
     address: string;
     /**
@@ -10286,6 +10431,51 @@ export type OutlierParams = {
      */
     tolerance?: number;
 };
+
+/**
+ * Requests-vs-capacity-vs-usage assessment
+ */
+export type OverprovisioningAssessment = {
+    /**
+     * Ratio of requested CPU to measured CPU usage (e.g. 40.0 = requests
+     * reserve 40× what the workloads actually use). `None` without metrics.
+     */
+    cpu_request_inflation_ratio?: number | null;
+    /**
+     * Requested CPU as % of cluster capacity
+     */
+    cpu_requested_pct?: number | null;
+    /**
+     * Measured CPU usage as % of cluster capacity (`None` without metrics)
+     */
+    cpu_utilization_pct?: number | null;
+    /**
+     * Human-readable explanation of the verdict, e.g. "Cluster capacity is
+     * 8 vCPU but measured usage is 0.3 vCPU (3.7%) — severely overprovisioned"
+     */
+    explanation: string;
+    /**
+     * Ratio of requested memory to measured memory usage
+     */
+    memory_request_inflation_ratio?: number | null;
+    /**
+     * Requested memory as % of cluster capacity
+     */
+    memory_requested_pct?: number | null;
+    /**
+     * Measured memory usage as % of cluster capacity (`None` without metrics)
+     */
+    memory_utilization_pct?: number | null;
+    /**
+     * Overall verdict
+     */
+    verdict: OverprovisioningVerdict;
+};
+
+/**
+ * Overall overprovisioning verdict
+ */
+export type OverprovisioningVerdict = 'severe' | 'moderate' | 'reasonable' | 'unknown';
 
 /**
  * Time bucket data point for page activity graph
@@ -12753,6 +12943,20 @@ export type ResourceCounts = {
     environments: number;
     projects: number;
     services: number;
+};
+
+/**
+ * A CPU + memory footprint (requests or measured usage)
+ */
+export type ResourceFootprint = {
+    /**
+     * CPU in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Memory in MB
+     */
+    memory_mb: number;
 };
 
 /**
@@ -15537,6 +15741,52 @@ export type TailLogsRequest = {
 };
 
 /**
+ * The temps/Hetzner target sizing and savings estimate
+ */
+export type TargetRecommendation = {
+    /**
+     * Whether the workloads fit a single recommended server. When `false`,
+     * the rationale explains the multi-node option (temps worker nodes).
+     */
+    fits_single_node: boolean;
+    /**
+     * Memory (GB) of the recommended server
+     */
+    memory_gb: number;
+    /**
+     * Estimated monthly price of the recommended server in EUR
+     */
+    monthly_eur: number;
+    /**
+     * Estimated monthly savings in USD (current cost minus target cost,
+     * treating EUR≈USD for the rough comparison — disclaimed in `notes`).
+     * `None` when the current cost is unknown.
+     */
+    monthly_savings_usd?: number | null;
+    /**
+     * Human-readable recommendation summary
+     */
+    rationale: string;
+    /**
+     * Recommended Hetzner server type (e.g. "cpx32")
+     */
+    server_type: string;
+    /**
+     * What the sizing was based on, e.g. "2× measured usage + temps
+     * platform overhead" or "resource requests (no metrics available)"
+     */
+    sizing_basis: string;
+    /**
+     * vCPUs of the recommended server
+     */
+    vcpus: number;
+    /**
+     * `monthly_savings_usd × 12`
+     */
+    yearly_savings_usd?: number | null;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
@@ -17209,6 +17459,11 @@ export type UsageQueryParams = {
      */
     user_id?: number | null;
 };
+
+/**
+ * How the "actual usage" numbers were obtained
+ */
+export type UsageSource = 'metrics-api' | 'requests-only' | 'unavailable';
 
 export type UsageSummary = {
     avg_latency_ms: number;

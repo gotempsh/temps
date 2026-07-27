@@ -5,8 +5,6 @@ export default defineConfig({
   // input: 'http://localhost:3000/api-docs/openapi.json',
   output: {
     path: 'src/api',
-    format: 'prettier',
-    lint: 'eslint',
   },
   client: '@hey-api/client-fetch',
   plugins: [
