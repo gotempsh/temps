@@ -1798,7 +1798,12 @@ impl DeploymentService {
                 let mut active_container: deployment_containers::ActiveModel = container.into();
                 active_container.deleted_at = Set(Some(chrono::Utc::now()));
                 active_container.status = Set(Some("removed".to_string()));
-                let _ = active_container.update(self.db.as_ref()).await;
+                if let Err(e) = active_container.update(self.db.as_ref()).await {
+                    warn!(
+                        "Failed to mark container {} deleted before pre-rollback stop: {}",
+                        container_id, e
+                    );
+                }
 
                 if let Err(e) = self.deployer.stop_container(&container_id).await {
                     warn!(
@@ -5748,5 +5753,112 @@ mod tests {
             DeploymentService::resolve_resource_usage(Some(&empty_env), Some(&cfg(None, None)));
         assert_eq!(still_none.cpu_limit, None);
         assert_eq!(still_none.memory_limit, None);
+    }
+
+    /// `stop_environment_containers` (pre-rollback cleanup) has the same
+    /// deleted-before-stopped ordering requirement as
+    /// `WorkflowExecutionService::teardown_previous_deployment`. Uses
+    /// `block_in_place` to run a real DB check from inside the mock's
+    /// `stop_container` expectation, which requires the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stop_environment_containers_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, environment, old_deployment) = setup_test_data(&db).await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(old_deployment.id),
+            container_id: Set("old-env-container-1".to_string()),
+            container_name: Set("old-env-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Deployment state must be one of the active states
+        // `stop_environment_containers` scans for; a nonexistent id is enough
+        // for the "exclude current deployment" filter.
+        let exclude_deployment_id = old_deployment.id + 1_000_000;
+
+        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                test_db_url.to_string(),
+                None,
+                None,
+            )
+            .expect("Failed to create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+
+        let mut queue_service = MockQueueService::new();
+        queue_service.expect_send().returning(|_| Ok(()));
+        queue_service
+            .expect_subscribe()
+            .returning(|| Box::new(MockJobReceiver::new()));
+        let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
+
+        let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker));
+
+        let db_for_check = db.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_stop_container()
+            .returning(move |container_id| {
+                let db_for_check = db_for_check.clone();
+                let container_id = container_id.to_string();
+                let refreshed = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::ContainerId.eq(container_id))
+                            .one(db_for_check.as_ref())
+                            .await
+                    })
+                })
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+                assert!(
+                    refreshed.deleted_at.is_some(),
+                    "container must be marked deleted before stop_container() is called \
+                     during pre-rollback cleanup — otherwise ContainerHealthMonitor's \
+                     concurrent poll can observe it mid-exit with no signal the exit is \
+                     intentional, and fires a false ContainerCrash alarm"
+                );
+                Ok(())
+            });
+        deployer.expect_remove_container().returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let service = DeploymentService {
+            db: db.clone(),
+            log_service,
+            config_service,
+            queue_service,
+            docker_log_service,
+            deployer,
+            encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
+            env_resolver: std::sync::OnceLock::new(),
+        };
+
+        service
+            .stop_environment_containers(environment.id, exclude_deployment_id)
+            .await;
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("removed"));
+
+        Ok(())
     }
 }
