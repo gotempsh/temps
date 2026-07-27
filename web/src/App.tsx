@@ -303,6 +303,12 @@ const AiGateway = lazy(() =>
     default: m.AiGatewayPage,
   }))
 )
+
+const AiChat = lazy(() =>
+  import('./pages/AiChat').then((m) => ({
+    default: m.AiChat,
+  }))
+)
 const AgentSandboxLayout = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
     default: m.AgentSandboxLayout,
@@ -545,6 +551,7 @@ const FullAppRoutes = () => {
                 <Route path="/email/providers/:id" element={<EmailProviderDetail />} />
                 <Route path="/email/:id" element={<EmailDetail />} />
                 <Route path="/ai-gateway" element={<AiGateway />} />
+                <Route path="/chat" element={<AiChat />} />
                 <Route path="/agent-sandbox" element={<AgentSandboxLayout />}>
                   <Route index element={<AgentSandboxDashboard />} />
                   <Route path="providers" element={<AgentSandboxProvidersList />} />
