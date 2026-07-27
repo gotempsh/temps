@@ -234,6 +234,25 @@ impl ImportOrchestrator {
         }
     }
 
+    /// Clear the real, unmasked source credentials (for Kubernetes, a full
+    /// kubeconfig including its client private key) from a stored session
+    /// once `execute_import` has read them to build its execution context.
+    /// Nothing downstream of that one read site -- the importers' own
+    /// `execute()`, the resource executor, the deployment verifier, or a
+    /// later `get_status` call -- ever reads them again, including on a
+    /// retry after a failed real run (the session is deliberately kept
+    /// around for exactly that). So there's no reason to leave them
+    /// resident for the rest of `SESSION_TTL`; a no-op if the session is
+    /// already gone (e.g. a concurrent successful-run eviction raced this).
+    fn clear_session_credentials(
+        sessions: &mut std::sync::RwLockWriteGuard<'_, HashMap<String, ImportSession>>,
+        session_id: &str,
+    ) {
+        if let Some(stored) = sessions.get_mut(session_id) {
+            stored.credentials = temps_import_types::ImportCredentials::default();
+        }
+    }
+
     /// Get an importer for a source
     fn get_importer(
         &self,
@@ -519,6 +538,15 @@ impl ImportOrchestrator {
 
         // Verify user owns this session
         check_session_ownership(&session, user_id, &session_id)?;
+
+        // See clear_session_credentials's doc comment for the full rationale.
+        match self.sessions_write() {
+            Ok(mut sessions) => Self::clear_session_credentials(&mut sessions, &session_id),
+            Err(e) => warn!(
+                "Could not clear credentials from import session {} after use: {} — they will still expire via SESSION_TTL",
+                session_id, e
+            ),
+        }
 
         // Check if validation passed
         if !session.validation.can_proceed() {
@@ -966,6 +994,54 @@ mod tests {
             !sessions.contains_key("stale"),
             "a session older than SESSION_TTL must be evicted, credentials and all"
         );
+    }
+
+    /// Regression test: execute_import used to read a session's real,
+    /// unmasked credentials once and then leave them sitting in the stored
+    /// session for the rest of SESSION_TTL (up to an hour), even though
+    /// nothing ever reads them again -- including on a retry after a failed
+    /// real run, which keeps the session around for exactly that.
+    #[test]
+    fn clear_session_credentials_zeroes_credentials_but_keeps_the_rest_of_the_session() {
+        let mut session = test_session(7);
+        session.credentials = temps_import_types::ImportCredentials {
+            token: Some("real-token".to_string()),
+            team_id: None,
+            base_url: Some("https://coolify.example.com".to_string()),
+            extra: HashMap::from([("username".to_string(), "admin".to_string())]),
+        };
+        let lock = std::sync::RwLock::new(HashMap::from([("sess-1".to_string(), session)]));
+
+        {
+            let mut sessions = lock.write().unwrap();
+            ImportOrchestrator::clear_session_credentials(&mut sessions, "sess-1");
+        }
+
+        let sessions = lock.read().unwrap();
+        let stored = sessions.get("sess-1").expect("session must still exist");
+        assert!(
+            stored.credentials.token.is_none()
+                && stored.credentials.base_url.is_none()
+                && stored.credentials.extra.is_empty(),
+            "credentials must be cleared after use, got {:?}",
+            stored.credentials
+        );
+        assert_eq!(
+            stored.user_id, 7,
+            "clearing credentials must not disturb the rest of the session \
+             (get_status and a retry after failure still need plan/validation/ownership)"
+        );
+    }
+
+    /// A missing session id must be a safe no-op, not a panic -- the caller
+    /// (execute_import) has already handled SessionNotFound by this point,
+    /// but a concurrent eviction could still race this call.
+    #[test]
+    fn clear_session_credentials_is_a_noop_for_a_missing_session() {
+        let lock = std::sync::RwLock::new(HashMap::<String, ImportSession>::new());
+        let mut sessions = lock.write().unwrap();
+        ImportOrchestrator::clear_session_credentials(&mut sessions, "nonexistent");
+        assert!(sessions.is_empty());
     }
 
     #[test]
