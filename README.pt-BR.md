@@ -9,6 +9,8 @@
 **A alternativa open source ao Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
 Deploys, analytics, session replay, error tracking, monitoramento de disponibilidade, e-mail transacional e sandboxes de IA -- em um único binário self-hosted.
 
+**Nativo para IA:** mais de 440 operações de CLI e skills prontas para Claude Code, Codex e OpenCode.
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ Pare de pagar por 7 ferramentas SaaS diferentes. O Temps substitui sua plataform
 ---
 
 ## Funcionalidades
+
+### Nativo para IA — mais de 440 operações que um agente pode executar
+
+Toda operação do dashboard também é um comando de CLI — **mais de 440 em 69 grupos** — e o Temps já traz as [skills](skills/) que ensinam um agente a usá-los. Coloque-as no **Claude Code**, **Codex**, **OpenCode** ou em qualquer harness que leia `.claude/skills/`, e seu agente consegue fazer deploy, inspecionar traces, rodar migrações ou adicionar um domínio sem você escrever a cola.
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+O Temps também roda esses agentes para você: os sandboxes de workflow executam Claude Code, Codex ou OpenCode no seu repositório, com as skills e servidores MCP da plataforma injetados automaticamente.
+
+### AI Chat — ancorado na sua própria telemetria
+
+Pergunte sobre o seu projeto e a resposta vem dos seus dados — traces, métricas, alarmes, deploys e receita — não do palpite de um modelo genérico. É **somente leitura por padrão**: ações de escrita são opt-in e, mesmo assim, o assistente propõe a mudança e espera a sua confirmação.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="O chat de IA do Temps diagnosticando um pico de latência no checkout a partir dos traces, métricas e dados de receita do próprio projeto" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI Gateway — um endpoint, suas próprias chaves
+
+Traga suas próprias chaves de provedor (OpenAI, Anthropic, xAI, Google Gemini) e chame todas por um único endpoint compatível com OpenAI — troque a base URL e mantenha o SDK que você já usa. As chaves ficam criptografadas no seu servidor, e cada requisição é atribuída: tokens, latência, taxa de erro e custo estimado por modelo.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="AI Gateway do Temps — chaves de provedor próprias (BYOK) atrás de um endpoint compatível com OpenAI" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Análise de uso do AI Gateway do Temps — requisições, tokens, latência, taxa de erro e custo estimado" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### Web Analytics e Session Replay
 
@@ -106,41 +143,6 @@ Aponte qualquer exporter OTLP para o Temps e tenha traces distribuídos, métric
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Alertas do Temps — alarmes disparando, reconhecidos e resolvidos de métricas, containers, disponibilidade e bancos de dados" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI Gateway — um endpoint, suas próprias chaves
-
-Traga suas próprias chaves de provedor (OpenAI, Anthropic, xAI, Google Gemini) e chame todas por um único endpoint compatível com OpenAI — troque a base URL e mantenha o SDK que você já usa. As chaves ficam criptografadas no seu servidor, e cada requisição é atribuída: tokens, latência, taxa de erro e custo estimado por modelo.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="AI Gateway do Temps — chaves de provedor próprias (BYOK) atrás de um endpoint compatível com OpenAI" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Análise de uso do AI Gateway do Temps — requisições, tokens, latência, taxa de erro e custo estimado" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI Chat — ancorado na sua própria telemetria
-
-Pergunte sobre o seu projeto e a resposta vem dos seus dados — traces, métricas, alarmes, deploys e receita — não do palpite de um modelo genérico. É **somente leitura por padrão**: ações de escrita são opt-in e, mesmo assim, o assistente propõe a mudança e espera a sua confirmação.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="O chat de IA do Temps diagnosticando um pico de latência no checkout a partir dos traces, métricas e dados de receita do próprio projeto" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI e Skills — usáveis em qualquer harness de IA
-
-A CLI cobre toda a plataforma — mais de 440 comandos em 69 grupos — então tudo o que você faz no dashboard, um agente faz no terminal:
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-O Temps também traz [skills](skills/) — instruções autocontidas que entram no Claude Code, no Cursor ou em qualquer harness que leia `.claude/skills/`, cobrindo deploys, analytics, rastreamento de erros, domínios próprios e a referência completa da CLI. Skills e servidores MCP podem ser registrados no nível da plataforma e são injetados automaticamente nos sandboxes dos workflows de agentes.
 
 ### Sandboxes de IA — execução de código isolada
 

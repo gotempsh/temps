@@ -9,6 +9,8 @@
 **L'alternative open source à Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
 Déploiements, analytics, session replay, suivi d'erreurs, monitoring de disponibilité, emails transactionnels et sandboxes IA -- en un seul binaire auto-hébergé.
 
+**Nativement IA :** plus de 440 opérations CLI et des skills prêtes pour Claude Code, Codex et OpenCode.
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ Arrêtez de payer 7 outils SaaS différents. Temps remplace votre plateforme de 
 ---
 
 ## Fonctionnalités
+
+### Nativement IA — plus de 440 opérations pilotables par un agent
+
+Chaque opération du tableau de bord est aussi une commande CLI — **plus de 440 réparties en 69 groupes** — et Temps fournit les [skills](skills/) qui apprennent à un agent à s'en servir. Placez-les dans **Claude Code**, **Codex**, **OpenCode** ou tout harness lisant `.claude/skills/`, et votre agent peut déployer, inspecter des traces, lancer des migrations ou ajouter un domaine sans que vous écriviez la glue.
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps exécute aussi ces agents pour vous : les sandboxes de workflows lancent Claude Code, Codex ou OpenCode sur votre dépôt, avec les skills et serveurs MCP de la plateforme injectés automatiquement.
+
+### AI Chat — ancré dans votre propre télémétrie
+
+Posez une question sur votre projet et la réponse vient de vos données — traces, métriques, alarmes, déploiements et revenus — pas de la supposition d'un modèle générique. C'est **en lecture seule par défaut** : les actions d'écriture sont opt-in et, même activées, l'assistant propose la modification et attend votre confirmation.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Le chat IA de Temps diagnostiquant un pic de latence au checkout à partir des traces, métriques et revenus du projet lui-même" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI Gateway — un seul endpoint, vos propres clés
+
+Apportez vos propres clés de fournisseur (OpenAI, Anthropic, xAI, Google Gemini) et appelez-les toutes via un unique endpoint compatible OpenAI — changez la base URL, gardez le SDK que vous utilisez déjà. Les clés restent chiffrées sur votre serveur, et chaque requête est attribuée : tokens, latence, taux d'erreur et coût estimé par modèle.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="AI Gateway de Temps — clés de fournisseur personnelles (BYOK) derrière un endpoint compatible OpenAI" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Analytique d'usage de l'AI Gateway de Temps — requêtes, tokens, latence, taux d'erreur et coût estimé" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### Analytics web et session replay
 
@@ -106,41 +143,6 @@ Pointez n'importe quel exporter OTLP vers Temps et vous obtenez les traces distr
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Alertes Temps — alarmes actives, acquittées et résolues sur les métriques, conteneurs, disponibilité et bases de données" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI Gateway — un seul endpoint, vos propres clés
-
-Apportez vos propres clés de fournisseur (OpenAI, Anthropic, xAI, Google Gemini) et appelez-les toutes via un unique endpoint compatible OpenAI — changez la base URL, gardez le SDK que vous utilisez déjà. Les clés restent chiffrées sur votre serveur, et chaque requête est attribuée : tokens, latence, taux d'erreur et coût estimé par modèle.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="AI Gateway de Temps — clés de fournisseur personnelles (BYOK) derrière un endpoint compatible OpenAI" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Analytique d'usage de l'AI Gateway de Temps — requêtes, tokens, latence, taux d'erreur et coût estimé" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI Chat — ancré dans votre propre télémétrie
-
-Posez une question sur votre projet et la réponse vient de vos données — traces, métriques, alarmes, déploiements et revenus — pas de la supposition d'un modèle générique. C'est **en lecture seule par défaut** : les actions d'écriture sont opt-in et, même activées, l'assistant propose la modification et attend votre confirmation.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Le chat IA de Temps diagnostiquant un pic de latence au checkout à partir des traces, métriques et revenus du projet lui-même" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI & Skills — utilisables depuis n'importe quel environnement IA
-
-La CLI couvre toute la plateforme — plus de 440 commandes réparties en 69 groupes — donc tout ce que vous faites dans le tableau de bord, un agent peut le faire dans un terminal :
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps fournit aussi des [skills](skills/) — des instructions autonomes qui s'intègrent à Claude Code, Cursor ou tout environnement lisant `.claude/skills/`, couvrant les déploiements, les analytics, le suivi d'erreurs, les domaines personnalisés et la référence complète de la CLI. Les skills et les serveurs MCP peuvent être enregistrés au niveau de la plateforme et sont injectés automatiquement dans les sandboxes des workflows d'agents.
 
 ### Sandboxes IA — exécution de code isolée
 

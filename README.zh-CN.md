@@ -9,6 +9,8 @@
 **Vercel + Sentry + PostHog + Pingdom + Resend + E2B 的开源替代品。**
 部署、分析、会话回放、错误追踪、可用性监控、事务性邮件与 AI 沙箱 —— 一个自托管的二进制文件搞定。
 
+**AI 原生：** 440+ 条 CLI 操作，以及可直接放入 Claude Code、Codex 与 OpenCode 的技能。
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ---
 
 ## 功能特性
+
+### AI 原生 —— 440+ 项可供智能体驱动的操作
+
+控制台里的每一个操作都有对应的 CLI 命令 —— **69 个命令组、440+ 条命令** —— 而且 Temps 直接提供了教智能体使用它们的 [skills](skills/)。把它们放进 **Claude Code**、**Codex**、**OpenCode** 或任何读取 `.claude/skills/` 的环境，你的智能体就能部署应用、查看链路追踪、执行迁移或添加域名，你不用再写任何胶水代码。
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps 也能替你运行这些智能体：工作流沙箱会针对你的仓库执行 Claude Code、Codex 或 OpenCode，并自动注入平台级的技能与 MCP 服务器。
+
+### AI 对话 —— 基于你自己的可观测数据
+
+询问你的项目，答案来自你自己的数据 —— 链路追踪、指标、告警、部署和收入 —— 而不是通用模型的猜测。默认**只读**：写操作需要显式开启，且即使开启后，助手也会先提出变更方案并等你确认。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Temps AI 对话正在依据项目自身的链路追踪、指标与收入数据诊断结账延迟骤增" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI 网关 —— 一个端点，用你自己的密钥
+
+自带各家服务商的密钥（OpenAI、Anthropic、xAI、Google Gemini），全部通过一个兼容 OpenAI 的端点调用 —— 只需替换 base URL，继续用你现在的 SDK。密钥加密存放在你自己的服务器上，每个请求都有归因：token 数、延迟、错误率和按模型估算的成本。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="Temps AI 网关 —— 自带密钥（BYOK）的服务商统一在一个兼容 OpenAI 的端点后面" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Temps AI 网关用量分析 —— 请求数、token、延迟、错误率与估算成本" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### 网站分析与会话回放
 
@@ -106,41 +143,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Temps 告警 —— 覆盖指标、容器、可用性与数据库的触发中、已确认与已解决告警" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI 网关 —— 一个端点，用你自己的密钥
-
-自带各家服务商的密钥（OpenAI、Anthropic、xAI、Google Gemini），全部通过一个兼容 OpenAI 的端点调用 —— 只需替换 base URL，继续用你现在的 SDK。密钥加密存放在你自己的服务器上，每个请求都有归因：token 数、延迟、错误率和按模型估算的成本。
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="Temps AI 网关 —— 自带密钥（BYOK）的服务商统一在一个兼容 OpenAI 的端点后面" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Temps AI 网关用量分析 —— 请求数、token、延迟、错误率与估算成本" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI 对话 —— 基于你自己的可观测数据
-
-询问你的项目，答案来自你自己的数据 —— 链路追踪、指标、告警、部署和收入 —— 而不是通用模型的猜测。默认**只读**：写操作需要显式开启，且即使开启后，助手也会先提出变更方案并等你确认。
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps AI 对话正在依据项目自身的链路追踪、指标与收入数据诊断结账延迟骤增" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI 与技能 —— 可在任意 AI 环境中使用
-
-CLI 覆盖整个平台 —— 69 个命令组、440+ 条命令 —— 所以你在控制台能做的事，智能体都能在终端里完成：
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps 还提供 [skills](skills/) —— 可直接放入 Claude Code、Cursor 或任何读取 `.claude/skills/` 的环境的自包含说明，涵盖部署、网站分析、错误追踪、自定义域名以及完整的 CLI 参考。技能和 MCP 服务器可以在平台级注册，并会自动注入到智能体工作流沙箱中。
 
 ### AI 沙箱 —— 隔离的代码执行
 

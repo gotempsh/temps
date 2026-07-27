@@ -10,6 +10,8 @@
 
 Deployments, analytics, session replay, error tracking, uptime monitoring, transactional email & AI sandboxes — one self-hosted binary.
 
+**AI-native:** 440+ CLI operations and drop-in skills for Claude Code, Codex & OpenCode.
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ Stop paying for 7 different SaaS tools. Temps replaces your deployment platform,
 ---
 
 ## Features
+
+### AI-native — 440+ operations any agent can drive
+
+Every operation in the dashboard is also a CLI command — **440+ of them across 69 groups** — and Temps ships the [skills](skills/) that teach an agent how to use them. Drop them into **Claude Code**, **Codex**, **OpenCode**, or any harness that reads `.claude/skills/`, and your agent can deploy, inspect traces, run migrations, or add a domain without you writing the glue.
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps runs those agents for you too: workflow sandboxes execute Claude Code, Codex, or OpenCode against your repository, with platform-wide skills and MCP servers injected automatically.
+
+### AI Chat — grounded in your own telemetry
+
+Ask about your project and the answer comes from your data — traces, metrics, alarms, deployments, and revenue — not from a generic model guess. It is **read-only by default**: write actions are opt-in, and even then the assistant proposes the change and waits for you to confirm.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Temps AI chat diagnosing a checkout latency spike from the project's own traces, metrics and revenue data" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI Gateway — one endpoint, your own keys
+
+Bring your own provider keys (OpenAI, Anthropic, xAI, Google Gemini) and call them all through one OpenAI-compatible endpoint — swap the base URL, keep the SDK you already use. Keys stay encrypted on your server, and every request is attributed: tokens, latency, error rate, and estimated cost per model.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="Temps AI Gateway — BYOK provider keys behind one OpenAI-compatible endpoint" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Temps AI Gateway usage analytics — requests, tokens, latency, error rate and estimated cost" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### Web Analytics & Session Replay
 
@@ -106,41 +143,6 @@ Point any OTLP exporter at Temps and get distributed traces, metrics, and struct
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Temps alerts — firing, acknowledged and resolved alarms across metrics, containers, uptime and databases" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI Gateway — one endpoint, your own keys
-
-Bring your own provider keys (OpenAI, Anthropic, xAI, Google Gemini) and call them all through one OpenAI-compatible endpoint — swap the base URL, keep the SDK you already use. Keys stay encrypted on your server, and every request is attributed: tokens, latency, error rate, and estimated cost per model.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="Temps AI Gateway — BYOK provider keys behind one OpenAI-compatible endpoint" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Temps AI Gateway usage analytics — requests, tokens, latency, error rate and estimated cost" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI Chat — grounded in your own telemetry
-
-Ask about your project and the answer comes from your data — traces, metrics, alarms, deployments, and revenue — not from a generic model guess. It is **read-only by default**: write actions are opt-in, and even then the assistant proposes the change and waits for you to confirm.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps AI chat diagnosing a checkout latency spike from the project's own traces, metrics and revenue data" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI & Skills — usable from any AI harness
-
-The CLI covers the whole platform — 440+ commands across 69 groups — so anything you can do in the dashboard, an agent can do in a terminal:
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps also ships [skills](skills/) — self-contained instructions that drop into Claude Code, Cursor, or any harness that reads `.claude/skills/`, covering deployment, analytics, error tracking, custom domains, and the full CLI reference. Skills and MCP servers can be registered platform-wide and are injected into agent workflow sandboxes automatically.
 
 ### AI Sandboxes — isolated code execution
 

@@ -9,6 +9,8 @@
 **Vercel + Sentry + PostHog + Pingdom + Resend + E2B のオープンソース代替。**
 デプロイ、アナリティクス、セッションリプレイ、エラートラッキング、アップタイム監視、トランザクションメール、AI サンドボックス —— すべてをセルフホストの単一バイナリで。
 
+**AI ネイティブ:** 440 以上の CLI 操作と、Claude Code・Codex・OpenCode にそのまま入るスキル。
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 ---
 
 ## 機能
+
+### AI ネイティブ —— エージェントが実行できる 440 以上の操作
+
+ダッシュボードでできる操作はすべて CLI コマンドにもなっています —— **69 グループ、440 以上** —— しかも Temps には、その使い方をエージェントに教える [skills](skills/) が同梱されています。**Claude Code**、**Codex**、**OpenCode**、あるいは `.claude/skills/` を読むあらゆるハーネスに入れれば、エージェントはデプロイ、トレースの調査、マイグレーションの実行、ドメインの追加まで、接着コードなしでこなせます。
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps はそれらのエージェントの実行環境も提供します。ワークフローサンドボックスがあなたのリポジトリに対して Claude Code、Codex、OpenCode を実行し、プラットフォーム全体のスキルと MCP サーバーが自動的に注入されます。
+
+### AI チャット —— 自分のテレメトリに基づく回答
+
+プロジェクトについて尋ねれば、答えは汎用モデルの推測ではなく、あなた自身のデータ —— トレース、メトリクス、アラーム、デプロイ、収益 —— から返ってきます。**デフォルトは読み取り専用**で、書き込み操作はオプトイン。有効にしても、アシスタントは変更を提案してあなたの確認を待ちます。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="Temps の AI チャットが、プロジェクト自身のトレース、メトリクス、収益データからチェックアウトのレイテンシ急増を診断" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI ゲートウェイ —— 1 つのエンドポイント、自分の API キー
+
+自分のプロバイダーキー（OpenAI、Anthropic、xAI、Google Gemini）を持ち込み、すべてを 1 つの OpenAI 互換エンドポイント経由で呼び出せます —— base URL を差し替えるだけで、今使っている SDK はそのまま。キーは自分のサーバー上で暗号化して保管され、リクエストごとにトークン数、レイテンシ、エラー率、モデル別の推定コストが記録されます。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="Temps AI ゲートウェイ —— OpenAI 互換エンドポイントの背後に自分のプロバイダーキー（BYOK）" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Temps AI ゲートウェイの使用状況分析 —— リクエスト数、トークン、レイテンシ、エラー率、推定コスト" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### ウェブアナリティクス & セッションリプレイ
 
@@ -106,41 +143,6 @@ UI から DKIM レコード付きの送信ドメインを追加し、`@temps-sdk
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Temps のアラート —— メトリクス、コンテナ、稼働監視、データベースにまたがる発火中・確認済み・解決済みのアラーム" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI ゲートウェイ —— 1 つのエンドポイント、自分の API キー
-
-自分のプロバイダーキー（OpenAI、Anthropic、xAI、Google Gemini）を持ち込み、すべてを 1 つの OpenAI 互換エンドポイント経由で呼び出せます —— base URL を差し替えるだけで、今使っている SDK はそのまま。キーは自分のサーバー上で暗号化して保管され、リクエストごとにトークン数、レイテンシ、エラー率、モデル別の推定コストが記録されます。
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="Temps AI ゲートウェイ —— OpenAI 互換エンドポイントの背後に自分のプロバイダーキー（BYOK）" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Temps AI ゲートウェイの使用状況分析 —— リクエスト数、トークン、レイテンシ、エラー率、推定コスト" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI チャット —— 自分のテレメトリに基づく回答
-
-プロジェクトについて尋ねれば、答えは汎用モデルの推測ではなく、あなた自身のデータ —— トレース、メトリクス、アラーム、デプロイ、収益 —— から返ってきます。**デフォルトは読み取り専用**で、書き込み操作はオプトイン。有効にしても、アシスタントは変更を提案してあなたの確認を待ちます。
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="Temps の AI チャットが、プロジェクト自身のトレース、メトリクス、収益データからチェックアウトのレイテンシ急増を診断" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI とスキル —— あらゆる AI ハーネスから利用可能
-
-CLI はプラットフォーム全体をカバーしています —— 69 グループ、440 以上のコマンド。ダッシュボードでできることは、エージェントがターミナルで実行できます:
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps は [skills](skills/) も同梱しています —— Claude Code、Cursor、あるいは `.claude/skills/` を読むあらゆるハーネスにそのまま入る自己完結型の手順書で、デプロイ、アナリティクス、エラートラッキング、カスタムドメイン、CLI の完全リファレンスをカバーします。スキルと MCP サーバーはプラットフォーム全体に登録でき、エージェントのワークフローサンドボックスへ自動的に注入されます。
 
 ### AI サンドボックス —— 隔離されたコード実行
 

@@ -9,6 +9,8 @@
 **La alternativa open source a Vercel + Sentry + PostHog + Pingdom + Resend + E2B.**
 Despliegues, analítica, session replay, error tracking, monitorización de disponibilidad, email transaccional y sandboxes de IA -- en un único binario autoalojado.
 
+**Nativo para IA:** más de 440 operaciones de CLI y skills listas para Claude Code, Codex y OpenCode.
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -37,6 +39,41 @@ Deja de pagar 7 herramientas SaaS distintas. Temps sustituye tu plataforma de de
 ---
 
 ## Características
+
+### Nativo para IA — más de 440 operaciones que un agente puede ejecutar
+
+Cada operación del panel es también un comando de la CLI — **más de 440 repartidos en 69 grupos** — y Temps incluye las [skills](skills/) que enseñan a un agente a usarlos. Ponlas en **Claude Code**, **Codex**, **OpenCode** o cualquier harness que lea `.claude/skills/`, y tu agente podrá desplegar, revisar trazas, ejecutar migraciones o añadir un dominio sin que escribas el pegamento.
+
+```bash
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deploy my-app --environment production
+bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
+```
+
+Temps también ejecuta esos agentes por ti: los sandboxes de workflows lanzan Claude Code, Codex u OpenCode sobre tu repositorio, con las skills y los servidores MCP de la plataforma inyectados automáticamente.
+
+### AI Chat — basado en tu propia telemetría
+
+Pregunta por tu proyecto y la respuesta sale de tus datos — trazas, métricas, alarmas, despliegues e ingresos — no de la suposición de un modelo genérico. Es **de solo lectura por defecto**: las acciones de escritura son opt-in y, aun así, el asistente propone el cambio y espera tu confirmación.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
+  <img alt="El chat de IA de Temps diagnosticando un pico de latencia en el checkout a partir de las trazas, métricas e ingresos del propio proyecto" src="assets/screenshots/ai-chat-light.png">
+</picture>
+
+### AI Gateway — un endpoint, tus propias claves
+
+Trae tus propias claves de proveedor (OpenAI, Anthropic, xAI, Google Gemini) y llámalas todas a través de un único endpoint compatible con OpenAI — cambia la base URL y sigue usando el SDK que ya tienes. Las claves quedan cifradas en tu servidor, y cada petición queda atribuida: tokens, latencia, tasa de error y coste estimado por modelo.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
+  <img alt="AI Gateway de Temps — claves de proveedor propias (BYOK) detrás de un endpoint compatible con OpenAI" src="assets/screenshots/ai-gateway-light.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
+  <img alt="Analítica de uso del AI Gateway de Temps — peticiones, tokens, latencia, tasa de error y coste estimado" src="assets/screenshots/ai-usage-light.png">
+</picture>
 
 ### Analítica web y reproducción de sesiones
 
@@ -106,41 +143,6 @@ Apunta cualquier exporter OTLP a Temps y tendrás trazas distribuidas, métricas
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/alerts-dark.png">
   <img alt="Alertas de Temps — alarmas activas, reconocidas y resueltas de métricas, contenedores, disponibilidad y bases de datos" src="assets/screenshots/alerts-light.png">
 </picture>
-
-### AI Gateway — un endpoint, tus propias claves
-
-Trae tus propias claves de proveedor (OpenAI, Anthropic, xAI, Google Gemini) y llámalas todas a través de un único endpoint compatible con OpenAI — cambia la base URL y sigue usando el SDK que ya tienes. Las claves quedan cifradas en tu servidor, y cada petición queda atribuida: tokens, latencia, tasa de error y coste estimado por modelo.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-gateway-dark.png">
-  <img alt="AI Gateway de Temps — claves de proveedor propias (BYOK) detrás de un endpoint compatible con OpenAI" src="assets/screenshots/ai-gateway-light.png">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-usage-dark.png">
-  <img alt="Analítica de uso del AI Gateway de Temps — peticiones, tokens, latencia, tasa de error y coste estimado" src="assets/screenshots/ai-usage-light.png">
-</picture>
-
-### AI Chat — basado en tu propia telemetría
-
-Pregunta por tu proyecto y la respuesta sale de tus datos — trazas, métricas, alarmas, despliegues e ingresos — no de la suposición de un modelo genérico. Es **de solo lectura por defecto**: las acciones de escritura son opt-in y, aun así, el asistente propone el cambio y espera tu confirmación.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-chat-dark.png">
-  <img alt="El chat de IA de Temps diagnosticando un pico de latencia en el checkout a partir de las trazas, métricas e ingresos del propio proyecto" src="assets/screenshots/ai-chat-light.png">
-</picture>
-
-### CLI y Skills — utilizables desde cualquier entorno de IA
-
-La CLI cubre toda la plataforma — más de 440 comandos en 69 grupos — así que lo que puedes hacer en el panel, un agente puede hacerlo en una terminal:
-
-```bash
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli deploy my-app --environment production
-bunx @temps-sdk/cli analytics ai-agents -p my-app --period 7d
-```
-
-Temps también incluye [skills](skills/) — instrucciones autocontenidas que encajan en Claude Code, Cursor o cualquier entorno que lea `.claude/skills/`, y que cubren despliegues, analítica, seguimiento de errores, dominios propios y la referencia completa de la CLI. Las skills y los servidores MCP pueden registrarse a nivel de plataforma y se inyectan automáticamente en los sandboxes de los flujos de agentes.
 
 ### Sandboxes de IA — ejecución de código aislada
 
