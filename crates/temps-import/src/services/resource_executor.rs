@@ -284,87 +284,92 @@ impl ResourceExecutor {
     /// Copy data into each created service that has a reachable source URL,
     /// using a one-off container on the host network (so both the external
     /// source machine and the local service port are reachable).
+    ///
+    /// Runs every service's transfer concurrently rather than one at a time:
+    /// with N services each individually bounded by `TRANSFER_TIMEOUT`, a
+    /// sequential loop's worst case is `N * TRANSFER_TIMEOUT`, which grows
+    /// unboundedly with the number of services and can exceed the proxy's
+    /// request timeout even though each transfer is itself bounded. Running
+    /// them concurrently keeps the worst case at a single `TRANSFER_TIMEOUT`
+    /// regardless of how many services the import creates.
     pub async fn populate_services(&self, created: &[CreatedServiceRecord]) -> Vec<StepResult> {
-        let mut steps = Vec::new();
+        let futures = created
+            .iter()
+            .map(|record| self.populate_one_service(record));
+        futures_util::future::join_all(futures).await
+    }
 
-        for record in created {
-            let step_id = format!("populate-service-{}", sanitize_slug(&record.plan_name));
-            let started = std::time::Instant::now();
+    async fn populate_one_service(&self, record: &CreatedServiceRecord) -> StepResult {
+        let step_id = format!("populate-service-{}", sanitize_slug(&record.plan_name));
+        let started = std::time::Instant::now();
 
-            let (Some(source_url), Some(local_url)) =
-                (record.source_url.as_deref(), record.local_url.as_deref())
-            else {
-                steps.push(StepResult {
+        let (Some(source_url), Some(local_url)) =
+            (record.source_url.as_deref(), record.local_url.as_deref())
+        else {
+            return StepResult {
+                step_id,
+                step_title: format!("Copy data into '{}'", record.plan_name),
+                success: true,
+                skipped: true,
+                message: format!(
+                    "Data for '{}' was not copied automatically — the source database is not reachable from this server (see the plan's data implications for the manual dump/restore path)",
+                    record.plan_name
+                ),
+                created_resources: vec![],
+                duration_seconds: started.elapsed().as_secs_f64(),
+            };
+        };
+
+        let Some((image, command)) = dump_restore_command(&record.plan_type) else {
+            return StepResult {
+                step_id,
+                step_title: format!("Copy data into '{}'", record.plan_name),
+                success: true,
+                skipped: true,
+                message: format!(
+                    "Automatic data copy is not supported for {} — copy the data manually",
+                    record.plan_type
+                ),
+                created_resources: vec![],
+                duration_seconds: started.elapsed().as_secs_f64(),
+            };
+        };
+
+        match self
+            .run_transfer_container(&image, &command, source_url, local_url)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Populated imported service '{}' from source platform",
+                    record.plan_name
+                );
+                StepResult {
                     step_id,
                     step_title: format!("Copy data into '{}'", record.plan_name),
                     success: true,
-                    skipped: true,
+                    skipped: false,
                     message: format!(
-                        "Data for '{}' was not copied automatically — the source database is not reachable from this server (see the plan's data implications for the manual dump/restore path)",
-                        record.plan_name
+                        "Copied data from the source platform into managed service '{}'",
+                        record.info.name
                     ),
                     created_resources: vec![],
                     duration_seconds: started.elapsed().as_secs_f64(),
-                });
-                continue;
-            };
-
-            let Some((image, command)) = dump_restore_command(&record.plan_type) else {
-                steps.push(StepResult {
-                    step_id,
-                    step_title: format!("Copy data into '{}'", record.plan_name),
-                    success: true,
-                    skipped: true,
-                    message: format!(
-                        "Automatic data copy is not supported for {} — copy the data manually",
-                        record.plan_type
-                    ),
-                    created_resources: vec![],
-                    duration_seconds: started.elapsed().as_secs_f64(),
-                });
-                continue;
-            };
-
-            match self
-                .run_transfer_container(&image, &command, source_url, local_url)
-                .await
-            {
-                Ok(()) => {
-                    info!(
-                        "Populated imported service '{}' from source platform",
-                        record.plan_name
-                    );
-                    steps.push(StepResult {
-                        step_id,
-                        step_title: format!("Copy data into '{}'", record.plan_name),
-                        success: true,
-                        skipped: false,
-                        message: format!(
-                            "Copied data from the source platform into managed service '{}'",
-                            record.info.name
-                        ),
-                        created_resources: vec![],
-                        duration_seconds: started.elapsed().as_secs_f64(),
-                    });
-                }
-                Err(e) => {
-                    steps.push(StepResult {
-                        step_id,
-                        step_title: format!("Copy data into '{}'", record.plan_name),
-                        success: false,
-                        skipped: false,
-                        message: format!(
-                            "Data copy into '{}' failed: {} — the service was created empty; run the dump/restore from the plan manually",
-                            record.info.name, e
-                        ),
-                        created_resources: vec![],
-                        duration_seconds: started.elapsed().as_secs_f64(),
-                    });
                 }
             }
+            Err(e) => StepResult {
+                step_id,
+                step_title: format!("Copy data into '{}'", record.plan_name),
+                success: false,
+                skipped: false,
+                message: format!(
+                    "Data copy into '{}' failed: {} — the service was created empty; run the dump/restore from the plan manually",
+                    record.info.name, e
+                ),
+                created_resources: vec![],
+                duration_seconds: started.elapsed().as_secs_f64(),
+            },
         }
-
-        steps
     }
 
     /// Run a one-off transfer container: `<command>` with SRC/DST env vars.

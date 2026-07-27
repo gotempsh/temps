@@ -2288,11 +2288,25 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
 /// Selects the upstream read/write/idle timeout for a proxied request.
 /// `default_timeout` is the caller's already-computed websocket-aware value
 /// (3600s for websocket upgrades, 60s otherwise); this only widens it
-/// further, to 600s, for non-websocket traffic bound for the console
-/// address — long-running admin operations (e.g. triggering an import)
-/// routinely exceed the 60s hot-path bound tuned for customer-app traffic.
-/// See the call site in `LoadBalancer::upstream_peer` for the full
-/// rationale.
+/// further, to [`CONSOLE_IO_TIMEOUT_SECS`], for non-websocket traffic bound
+/// for the console address — long-running admin operations (e.g.
+/// triggering an import) routinely exceed the 60s hot-path bound tuned for
+/// customer-app traffic. See the call site in `LoadBalancer::upstream_peer`
+/// for the full rationale.
+///
+/// [`CONSOLE_IO_TIMEOUT_SECS`] must cover the real worst case of the
+/// slowest known console operation (import execute), not just look
+/// generous: `POST /imports/execute` runs service creation, then every
+/// created service's data transfer concurrently (each individually bounded
+/// by `temps_import::resource_executor::TRANSFER_TIMEOUT` = 1800s), then
+/// deploy-and-verify (`temps_import::deployment_verifier`'s
+/// `TRIGGER_GRACE`(15s) + `DEPLOY_TIMEOUT`(600s) + `HTTP_TIMEOUT`(90s) =
+/// 705s) — all inside the one HTTP request the handler awaits directly. A
+/// timeout shorter than `1800 + 705` would reintroduce, at a longer time
+/// constant, the exact "import succeeds server-side, browser sees a dead
+/// connection" bug this timeout extension exists to fix.
+const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
+
 fn upstream_io_timeout(
     peer_addr: &str,
     console_addr: &str,
@@ -2301,7 +2315,7 @@ fn upstream_io_timeout(
 ) -> std::time::Duration {
     let is_console = !console_addr.is_empty() && peer_addr == console_addr;
     if is_console && !is_websocket {
-        std::time::Duration::from_secs(600)
+        std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)
     } else {
         default_timeout
     }
@@ -2321,7 +2335,28 @@ mod upstream_io_timeout_tests {
     fn console_traffic_gets_the_extended_timeout() {
         let console = "10.0.0.5:8081";
         let timeout = upstream_io_timeout(console, console, false, Duration::from_secs(60));
-        assert_eq!(timeout, Duration::from_secs(600));
+        assert_eq!(timeout, Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS));
+    }
+
+    /// The console timeout must actually cover the real worst case of the
+    /// slowest console operation (import execute), not just be "generous".
+    #[test]
+    fn console_timeout_covers_the_worst_case_import_execute_duration() {
+        const TRIGGER_GRACE_SECS: u64 = 15;
+        const DEPLOY_TIMEOUT_SECS: u64 = 600;
+        const HTTP_TIMEOUT_SECS: u64 = 90;
+        const TRANSFER_TIMEOUT_SECS: u64 = 30 * 60;
+
+        let worst_case_execute_duration =
+            TRANSFER_TIMEOUT_SECS + TRIGGER_GRACE_SECS + DEPLOY_TIMEOUT_SECS + HTTP_TIMEOUT_SECS;
+
+        assert!(
+            CONSOLE_IO_TIMEOUT_SECS > worst_case_execute_duration,
+            "console timeout ({CONSOLE_IO_TIMEOUT_SECS}s) must exceed the worst-case import \
+             execute duration ({worst_case_execute_duration}s) — service data transfers run \
+             concurrently (see populate_services), so the worst case no longer scales with the \
+             number of services, but it must still fit inside one timeout window"
+        );
     }
 
     #[test]
@@ -2338,11 +2373,13 @@ mod upstream_io_timeout_tests {
     #[test]
     fn websocket_upgrade_to_the_console_keeps_the_websocket_timeout() {
         // Console traffic never upgrades to websocket today, but the
-        // extended 600s console bound must never override the 1h websocket
-        // bound if that combination ever occurs.
+        // extended console bound must never override the caller's own
+        // websocket-specific timeout if that combination ever occurs. Uses
+        // a value distinct from CONSOLE_IO_TIMEOUT_SECS so the assertion
+        // can't pass by coincidence.
         let console = "10.0.0.5:8081";
-        let timeout = upstream_io_timeout(console, console, true, Duration::from_secs(3600));
-        assert_eq!(timeout, Duration::from_secs(3600));
+        let timeout = upstream_io_timeout(console, console, true, Duration::from_secs(7200));
+        assert_eq!(timeout, Duration::from_secs(7200));
     }
 
     #[test]
