@@ -633,6 +633,14 @@ impl PostgresService {
                 ),
                 "-c".to_string(),
                 "archive_timeout=60".to_string(),
+                // Enable pg_stat_statements at provision time so the extension
+                // can be created after startup. A restart (not just a reload)
+                // is required to change shared_preload_libraries, so this is
+                // set once at container-creation time. Existing services
+                // provisioned before this change need a container restart
+                // (via the restart endpoint) for the change to take effect.
+                "-c".to_string(),
+                "shared_preload_libraries=pg_stat_statements".to_string(),
             ]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
