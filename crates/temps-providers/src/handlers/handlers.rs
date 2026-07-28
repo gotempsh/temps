@@ -706,18 +706,27 @@ async fn reveal_service_parameter(
         service_id: id,
         parameter_name: param_name,
     };
-    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
         error!(service_id = id, error = %error, "Failed to audit service parameter reveal");
-        return Err(internal_server_error()
-            .detail("The parameter could not be revealed because its audit record failed")
-            .build());
     }
+    require_reveal_audit(
+        audit_result,
+        "The parameter could not be revealed because its audit record failed",
+    )?;
 
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveValueResponse { value }),
     ))
+}
+
+fn require_reveal_audit(
+    result: std::result::Result<(), temps_core::anyhow::Error>,
+    detail: &'static str,
+) -> Result<(), Problem> {
+    result.map_err(|_| internal_server_error().detail(detail).build())
 }
 
 /// Canonical HTTP mapping for the upgrade/guard-related `ExternalServiceError`
@@ -1966,19 +1975,19 @@ async fn get_service_environment_variable(
                 project_id,
                 variable_name: var_name,
             };
-            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+            let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+            if let Err(error) = &audit_result {
                 error!(
                     service_id = id,
                     project_id,
                     error = %error,
                     "Failed to audit service environment-variable reveal"
                 );
-                return Err(internal_server_error()
-                    .detail(
-                        "The environment variable could not be revealed because its audit record failed",
-                    )
-                    .build());
             }
+            require_reveal_audit(
+                audit_result,
+                "The environment variable could not be revealed because its audit record failed",
+            )?;
             Ok((
                 StatusCode::OK,
                 [(header::CACHE_CONTROL, "no-store")],
@@ -2596,5 +2605,19 @@ mod tests {
             name: "n".to_string()
         })
         .is_none());
+    }
+
+    #[test]
+    fn credential_reveal_fails_closed_when_audit_write_fails() {
+        assert!(require_reveal_audit(Ok(()), "audit failed").is_ok());
+        let problem = require_reveal_audit(
+            Err(temps_core::anyhow::anyhow!("database unavailable")),
+            "audit failed",
+        )
+        .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

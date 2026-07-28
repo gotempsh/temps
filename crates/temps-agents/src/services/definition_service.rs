@@ -1,6 +1,6 @@
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -119,16 +119,22 @@ impl DefinitionService {
         };
 
         for section_name in ["env", "headers"] {
-            let Some(section) = config
-                .get_mut(section_name)
-                .and_then(serde_json::Value::as_object_mut)
-            else {
+            let Some(section_value) = config.get_mut(section_name) else {
                 continue;
             };
+            let section = section_value
+                .as_object_mut()
+                .ok_or_else(|| AgentError::Validation {
+                    message: format!(
+                        "MCP config '{}' must be an object of string values",
+                        section_name
+                    ),
+                })?;
             for (name, value) in section {
-                if let Some(raw) = value.as_str() {
-                    *value = serde_json::Value::String(transform(name, raw)?);
-                }
+                let raw = value.as_str().ok_or_else(|| AgentError::Validation {
+                    message: format!("MCP config '{}.{}' must be a string", section_name, name),
+                })?;
+                *value = serde_json::Value::String(transform(name, raw)?);
             }
         }
         Ok(())
@@ -176,13 +182,25 @@ impl DefinitionService {
     }
 
     pub fn mask_sensitive_config(config: &mut serde_json::Value) {
-        let _ = Self::transform_sensitive_config_values(config, |_name, value| {
-            if value.is_empty() {
-                Ok(String::new())
-            } else {
-                Ok(MASKED_VALUE.to_string())
+        let Some(config) = config.as_object_mut() else {
+            return;
+        };
+        for section_name in ["env", "headers"] {
+            let Some(section_value) = config.get_mut(section_name) else {
+                continue;
+            };
+            let Some(section) = section_value.as_object_mut() else {
+                *section_value = serde_json::Value::String(MASKED_VALUE.to_string());
+                continue;
+            };
+            for value in section.values_mut() {
+                if value.as_str().is_some_and(str::is_empty) {
+                    *value = serde_json::Value::String(String::new());
+                } else {
+                    *value = serde_json::Value::String(MASKED_VALUE.to_string());
+                }
             }
-        });
+        }
     }
 
     fn merge_masked_config(existing: &serde_json::Value, replacement: &mut serde_json::Value) {
@@ -709,10 +727,15 @@ impl DefinitionService {
             Some(project_id) => self.get_mcp(project_id, slug).await?,
             None => self.get_global_mcp(slug).await?,
         };
-        let mut segments = field_path.split('.');
-        let section = segments.next().unwrap_or_default();
-        let name = segments.next().unwrap_or_default();
-        if !matches!(section, "env" | "headers") || name.is_empty() || segments.next().is_some() {
+        let Some((section, name)) = field_path.split_once('.') else {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "MCP config field '{}' must identify one env or headers value",
+                    field_path
+                ),
+            });
+        };
+        if !matches!(section, "env" | "headers") || name.is_empty() {
             return Err(AgentError::Validation {
                 message: format!(
                     "MCP config field '{}' must identify one env or headers value",
@@ -725,11 +748,9 @@ impl DefinitionService {
             .get(section)
             .and_then(|section| section.get(name))
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| AgentError::Validation {
-                message: format!(
-                    "MCP config field '{}' was not found for server '{}'",
-                    field_path, slug
-                ),
+            .ok_or_else(|| AgentError::McpConfigFieldNotFound {
+                slug: slug.to_string(),
+                field: field_path.to_string(),
             })?;
         Ok(value.to_string())
     }
@@ -740,16 +761,25 @@ impl DefinitionService {
         let models = project_mcp_definitions::Entity::find()
             .all(self.db.as_ref())
             .await?;
-        let mut updated = 0;
+        let mut pending = Vec::new();
         for model in models {
             let protected = self.encrypt_sensitive_config(&model.config)?;
             if protected != model.config {
-                let mut active: project_mcp_definitions::ActiveModel = model.into();
-                active.config = Set(protected);
-                active.update(self.db.as_ref()).await?;
-                updated += 1;
+                pending.push((model, protected));
             }
         }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let transaction = self.db.begin().await?;
+        let updated = pending.len() as u64;
+        for (model, protected) in pending {
+            let mut active: project_mcp_definitions::ActiveModel = model.into();
+            active.config = Set(protected);
+            active.update(&transaction).await?;
+        }
+        transaction.commit().await?;
         Ok(updated)
     }
 }
@@ -844,5 +874,25 @@ mod tests {
         assert_eq!(replacement["env"]["API_TOKEN"], "old-secret");
         assert_eq!(replacement["env"]["REGION"], "eu-west-1");
         assert_eq!(replacement["headers"]["Authorization"], "Bearer old");
+    }
+
+    #[test]
+    fn malformed_sensitive_mcp_values_are_rejected_and_fail_safe_masked() {
+        let service = service();
+        for malformed in [
+            json!({"env": "API_TOKEN=plaintext"}),
+            json!({"env": {"API_TOKEN": 12345}}),
+            json!({"headers": ["Authorization", "Bearer plaintext"]}),
+        ] {
+            assert!(matches!(
+                service.encrypt_sensitive_config(&malformed),
+                Err(AgentError::Validation { .. })
+            ));
+
+            let mut masked = malformed;
+            DefinitionService::mask_sensitive_config(&mut masked);
+            assert!(!masked.to_string().contains("plaintext"));
+            assert!(!masked.to_string().contains("12345"));
+        }
     }
 }

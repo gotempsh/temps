@@ -604,6 +604,7 @@ pub async fn get_mcp(
         (status = 400, description = "Field is not revealable"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "MCP server or field not found"),
+        (status = 500, description = "Configuration read or audit failed"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -622,7 +623,7 @@ pub async fn reveal_mcp_config(
         .reveal_mcp_config_value(Some(project_id), &slug, &field)
         .await
         .map_err(Problem::from)?;
-    if let Err(error) = app_state
+    let audit_result = app_state
         .audit_service
         .create_audit_log(&McpConfigRevealedAudit {
             context: audit_ctx(&auth, &metadata),
@@ -631,17 +632,25 @@ pub async fn reveal_mcp_config(
             slug,
             field,
         })
-        .await
-    {
+        .await;
+    if let Err(error) = &audit_result {
         tracing::error!(project_id, error = %error, "Failed to audit MCP config reveal");
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("MCP configuration value could not be revealed")
-            .with_detail("The audit record for this reveal could not be written"));
     }
+    require_mcp_reveal_audit(audit_result)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveMcpConfigValueResponse { value }),
     ))
+}
+
+fn require_mcp_reveal_audit(
+    result: std::result::Result<(), temps_core::anyhow::Error>,
+) -> Result<(), Problem> {
+    result.map_err(|_| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("MCP configuration value could not be revealed")
+            .with_detail("The audit record for this reveal could not be written")
+    })
 }
 
 #[utoipa::path(
@@ -1085,6 +1094,7 @@ pub async fn get_global_mcp(
         (status = 400, description = "Field is not revealable"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "MCP server or field not found"),
+        (status = 500, description = "Configuration read or audit failed"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1101,7 +1111,7 @@ pub async fn reveal_global_mcp_config(
         .reveal_mcp_config_value(None, &slug, &field)
         .await
         .map_err(Problem::from)?;
-    if let Err(error) = app_state
+    let audit_result = app_state
         .audit_service
         .create_audit_log(&McpConfigRevealedAudit {
             context: audit_ctx(&auth, &metadata),
@@ -1110,13 +1120,11 @@ pub async fn reveal_global_mcp_config(
             slug,
             field,
         })
-        .await
-    {
+        .await;
+    if let Err(error) = &audit_result {
         tracing::error!(error = %error, "Failed to audit global MCP config reveal");
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("MCP configuration value could not be revealed")
-            .with_detail("The audit record for this reveal could not be written"));
     }
+    require_mcp_reveal_audit(audit_result)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveMcpConfigValueResponse { value }),
@@ -1546,4 +1554,21 @@ pub async fn download_global_skill_archive(
         ],
         archive,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_reveal_fails_closed_when_audit_write_fails() {
+        assert!(require_mcp_reveal_audit(Ok(())).is_ok());
+        let problem =
+            require_mcp_reveal_audit(Err(temps_core::anyhow::anyhow!("database unavailable")))
+                .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

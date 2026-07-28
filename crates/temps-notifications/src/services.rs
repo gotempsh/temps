@@ -56,6 +56,36 @@ pub enum NotificationProviderRevealError {
     },
 }
 
+fn is_provider_config_field_revealable(provider_type: &str, field: &str) -> bool {
+    match provider_type {
+        "slack" => field == "webhook_url",
+        "email" => field == "password",
+        "webhook" => {
+            field == "url"
+                || field
+                    .strip_prefix("headers.")
+                    .is_some_and(|name| !name.is_empty())
+        }
+        "cloudflare" => field == "api_token",
+        _ => false,
+    }
+}
+
+fn provider_config_field<'a>(
+    config: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    match field
+        .strip_prefix("headers.")
+        .filter(|name| !name.is_empty())
+    {
+        Some(header_name) => config
+            .get("headers")
+            .and_then(|headers| headers.get(header_name)),
+        None => config.get(field),
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
@@ -1573,14 +1603,7 @@ impl NotificationService {
             })?
             .ok_or(NotificationProviderRevealError::ProviderNotFound { provider_id })?;
 
-        let permitted = match provider.provider_type.as_str() {
-            "slack" => matches!(field, "webhook_url"),
-            "email" => matches!(field, "password"),
-            "webhook" => matches!(field, "url" | "headers"),
-            "cloudflare" => matches!(field, "api_token"),
-            _ => false,
-        };
-        if !permitted {
+        if !is_provider_config_field_revealable(&provider.provider_type, field) {
             return Err(NotificationProviderRevealError::FieldNotRevealable {
                 provider_id,
                 provider_type: provider.provider_type,
@@ -1594,13 +1617,12 @@ impl NotificationService {
                 provider_id,
                 reason: error.to_string(),
             })?;
-        let value =
-            config
-                .get(field)
-                .ok_or_else(|| NotificationProviderRevealError::FieldNotFound {
-                    provider_id,
-                    field: field.to_string(),
-                })?;
+        let value = provider_config_field(&config, field).ok_or_else(|| {
+            NotificationProviderRevealError::FieldNotFound {
+                provider_id,
+                field: field.to_string(),
+            }
+        })?;
         let value = match value {
             serde_json::Value::String(value) => value.clone(),
             other => serde_json::to_string(other).map_err(|error| {
@@ -3559,5 +3581,30 @@ mod tests {
         assert_eq!(replacement["url"], "https://example.com/webhook/secret");
         assert_eq!(replacement["headers"]["Authorization"], "Bearer secret");
         assert_eq!(replacement["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn webhook_headers_are_revealed_one_at_a_time() {
+        let config = serde_json::json!({
+            "url": "https://example.com/webhook",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "second secret"
+            }
+        });
+
+        assert!(!is_provider_config_field_revealable("webhook", "headers"));
+        assert!(is_provider_config_field_revealable(
+            "webhook",
+            "headers.Authorization"
+        ));
+        assert_eq!(
+            provider_config_field(&config, "headers.Authorization"),
+            Some(&serde_json::json!("Bearer secret"))
+        );
+        assert_eq!(
+            provider_config_field(&config, "headers.X-Webhook-Secret"),
+            Some(&serde_json::json!("second secret"))
+        );
     }
 }

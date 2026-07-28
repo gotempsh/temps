@@ -101,6 +101,9 @@ impl From<AgentError> for Problem {
             AgentError::McpDefinitionNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("MCP Definition Not Found")
                 .with_detail(error.to_string()),
+            AgentError::McpConfigFieldNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("MCP Config Field Not Found")
+                .with_detail(error.to_string()),
             AgentError::SkillDefinitionAlreadyExists { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Skill Already Exists")

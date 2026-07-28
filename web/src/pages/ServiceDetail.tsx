@@ -188,9 +188,9 @@ export function ServiceDetail() {
   const [revealedParameters, setRevealedParameters] = useState<
     Record<string, string>
   >({})
-  const [revealingParameter, setRevealingParameter] = useState<string | null>(
-    null
-  )
+  const [revealingParameters, setRevealingParameters] = useState<
+    Record<string, string>
+  >({})
 
   const {
     data: service,
@@ -211,7 +211,7 @@ export function ServiceDetail() {
   useEffect(() => {
     setVisibleParameters(new Set())
     setRevealedParameters({})
-    setRevealingParameter(null)
+    setRevealingParameters({})
   }, [id])
 
   // Query for PostgreSQL major-version upgrades. Only relevant for postgres
@@ -1169,7 +1169,7 @@ export function ServiceDetail() {
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 shrink-0"
-                                disabled={revealingParameter === key}
+                                disabled={Boolean(revealingParameters[key])}
                                 onClick={async () => {
                                   if (isVisible) {
                                     setVisibleParameters((prev) => {
@@ -1188,7 +1188,11 @@ export function ServiceDetail() {
                                   const requestedServiceId = String(
                                     service.service.id
                                   )
-                                  setRevealingParameter(key)
+                                  const requestToken = crypto.randomUUID()
+                                  setRevealingParameters((prev) => ({
+                                    ...prev,
+                                    [key]: requestToken,
+                                  }))
                                   try {
                                     const response =
                                       await revealServiceParameter({
@@ -1218,12 +1222,19 @@ export function ServiceDetail() {
                                       `Failed to reveal ${key.replace(/_/g, ' ')}`
                                     )
                                   } finally {
-                                    setRevealingParameter(null)
+                                    setRevealingParameters((prev) => {
+                                      if (prev[key] !== requestToken) {
+                                        return prev
+                                      }
+                                      const next = { ...prev }
+                                      delete next[key]
+                                      return next
+                                    })
                                   }
                                 }}
                                 title={isVisible ? 'Hide value' : 'Reveal value'}
                               >
-                                {revealingParameter === key ? (
+                                {revealingParameters[key] ? (
                                   <Loader2 className="h-4 w-4 animate-spin" />
                                 ) : isVisible ? (
                                   <EyeOff className="h-4 w-4" />

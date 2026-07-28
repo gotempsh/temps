@@ -510,7 +510,7 @@ async fn get_notification_provider(
     ),
     params(
         ("id" = i32, Path, description = "Provider ID"),
-        ("field" = String, Path, description = "Sensitive configuration field")
+        ("field" = String, Path, description = "Sensitive field, such as password or headers.Authorization")
     ),
     tag = "Notification Providers",
     security(("bearer_auth" = []))
@@ -559,19 +559,28 @@ async fn reveal_notification_provider_config(
         provider_type,
         field,
     };
-    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
         error!(provider_id = id, error = %error, "Failed to audit notification config reveal");
-        return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .title("Configuration value could not be revealed")
-            .detail("The audit record for this reveal could not be written")
-            .build());
     }
+    require_notification_reveal_audit(audit_result)?;
 
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveConfigValueResponse { value }),
     ))
+}
+
+fn require_notification_reveal_audit(
+    result: std::result::Result<(), anyhow::Error>,
+) -> Result<(), Problem> {
+    result.map_err(|_| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Configuration value could not be revealed")
+            .detail("The audit record for this reveal could not be written")
+            .build()
+    })
 }
 
 /// Create a new notification provider
@@ -1917,6 +1926,18 @@ mod tests {
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
+
+    #[test]
+    fn credential_reveal_fails_closed_when_audit_write_fails() {
+        assert!(require_notification_reveal_audit(Ok(())).is_ok());
+        let problem =
+            require_notification_reveal_audit(Err(anyhow::anyhow!("database unavailable")))
+                .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     struct TestSetup {
         pub test_db: TestDatabase,
