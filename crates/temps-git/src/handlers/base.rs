@@ -830,6 +830,18 @@ pub async fn sync_repositories(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesSync);
 
+    // Ownership check, mirroring list_repositories_by_connection below:
+    // without this, any authenticated user could trigger a background sync
+    // (including an OAuth token refresh) on another user's git connection by
+    // guessing/enumerating an integer connection_id.
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+    if connection.user_id != Some(auth.user_id()) {
+        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
+    }
+
     // Fire and forget: the manager spawns a detached task owning a drop
     // guard that resets `syncing=false` on every exit path. We can
     // safely respond 202 the moment the `syncing=true` write lands.
