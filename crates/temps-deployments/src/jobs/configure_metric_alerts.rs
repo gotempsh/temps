@@ -30,6 +30,23 @@ use tracing::warn;
 
 use crate::jobs::RepositoryOutput;
 
+/// Hard cap on the number of `alerts:` entries a single `.temps.yaml` may
+/// declare. See the check in `configure_alerts` for why this exists.
+const MAX_ALERTS_PER_TEMPS_YAML: usize = 100;
+
+/// Pure validation for the cap, split out from `configure_alerts` so it's
+/// unit-testable without a `RepositoryOutput`/DB fixture.
+fn validate_alert_count(count: usize) -> Result<(), String> {
+    if count > MAX_ALERTS_PER_TEMPS_YAML {
+        Err(format!(
+            ".temps.yaml declares {} alert(s), exceeding the limit of {}",
+            count, MAX_ALERTS_PER_TEMPS_YAML
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The parsed detector for a [`MetricAlertConfig`] — either a static
 /// threshold or an anomaly band. `forecast`/`outlier`/`auto_watch` are not
 /// representable here: they're rejected at YAML-parse time (see
@@ -272,6 +289,17 @@ impl ConfigureMetricAlertsJob {
             alert_yaml_configs.len()
         ))
         .await?;
+
+        // Cap the number of rules a single .temps.yaml can declare. Without
+        // this, an unbounded `alerts:` list would fan out into that many
+        // serial DB upserts on every deploy — a self-inflicted control-plane
+        // DoS vector unique to config-as-code (the UI/API path is naturally
+        // rate-limited by a human clicking "create"; a git commit is not).
+        if let Err(e) = validate_alert_count(alert_yaml_configs.len()) {
+            let error_msg = format!("❌ {}", e);
+            self.log(error_msg.clone()).await?;
+            return Err(WorkflowError::JobExecutionFailed(error_msg));
+        }
 
         // Parse YAML configs into service-layer DTOs; fail early on parse errors.
         let mut alert_configs: Vec<MetricAlertConfig> =
@@ -845,5 +873,18 @@ alerts:
             }
             AlertDetectionSpec::Static { .. } => panic!("expected Anomaly detection"),
         }
+    }
+
+    #[test]
+    fn test_validate_alert_count_within_limit() {
+        assert!(validate_alert_count(0).is_ok());
+        assert!(validate_alert_count(MAX_ALERTS_PER_TEMPS_YAML).is_ok());
+    }
+
+    #[test]
+    fn test_validate_alert_count_rejects_over_limit() {
+        let err = validate_alert_count(MAX_ALERTS_PER_TEMPS_YAML + 1).unwrap_err();
+        assert!(err.contains(&(MAX_ALERTS_PER_TEMPS_YAML + 1).to_string()));
+        assert!(err.contains(&MAX_ALERTS_PER_TEMPS_YAML.to_string()));
     }
 }
