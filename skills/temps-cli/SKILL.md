@@ -1567,6 +1567,42 @@ bunx @temps-sdk/cli services env-var --id 1 --project my-app --var DATABASE_URL
 | `--var <name>` | Environment variable name |
 | `--json` | Output in JSON format |
 
+### Service Logs
+
+`services logs` — fetch and display the persisted log history for an external service (Postgres, Redis, MongoDB, etc.). The logs are stored by the log-aggregator and searched via the same `/logs/search` pipeline used by the web UI. The time range defaults to the last 24 hours; use `--from`/`--to` to narrow or widen it.
+
+```bash
+# Default: last 24 hours for service 1
+bunx @temps-sdk/cli services logs --id 1
+
+# Relative time shorthands: 15m, 1h, 24h, 7d
+bunx @temps-sdk/cli services logs --id 1 --from 1h
+bunx @temps-sdk/cli services logs --id 1 --from 7d
+
+# Absolute ISO 8601 range
+bunx @temps-sdk/cli services logs --id 1 \
+  --from 2026-07-28T00:00:00Z --to 2026-07-28T06:00:00Z
+
+# Filter by level and text
+bunx @temps-sdk/cli services logs --id 1 --level ERROR,WARN --text "connection refused"
+
+# Tail more lines (default 200, max 1000)
+bunx @temps-sdk/cli services logs --id 1 --tail 500
+
+# Machine-readable JSON output (full SearchLogsResponse)
+bunx @temps-sdk/cli services logs --id 1 --json
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `--from <datetime>` | Start of time range. ISO 8601 timestamp or relative shorthand: `15m`, `1h`, `24h`, `7d`. Default: 24 hours ago. |
+| `--to <datetime>` | End of time range. ISO 8601 timestamp. Default: now. |
+| `-l, --level <levels>` | Comma-separated log levels to include: `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. |
+| `-n, --tail <lines>` | Maximum log lines to fetch (default: 200, max: 1000). |
+| `-t, --text <query>` | Case-insensitive text filter applied to log messages. |
+| `--json` | Output raw JSON (full `SearchLogsResponse` with `lines`, `next_cursor`, `total_scanned`). |
+
 ### Backups & Restore
 
 Inspect a service's restore capabilities, browse backups stored on an S3 source, and restore in-place, into a new service, or via point-in-time recovery (PITR). PITR requires a WAL-G backup (PostgreSQL).

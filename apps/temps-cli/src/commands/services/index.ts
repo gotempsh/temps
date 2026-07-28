@@ -349,6 +349,31 @@ export function registerServicesCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(envVarAction)
 
+  services
+    .command('logs')
+    .description('View persisted logs for an external service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option(
+      '--from <datetime>',
+      'Start of time range. ISO 8601 timestamp or a relative duration like "1h", "24h", "7d" (default: 24h ago)',
+    )
+    .option(
+      '--to <datetime>',
+      'End of time range. ISO 8601 timestamp (default: now)',
+    )
+    .option(
+      '-l, --level <levels>',
+      'Comma-separated log levels to include: ERROR,WARN,INFO,DEBUG,TRACE',
+    )
+    .option(
+      '-n, --tail <lines>',
+      'Maximum number of log lines to fetch (default: 200, max: 1000)',
+      '200',
+    )
+    .option('-t, --text <query>', 'Filter log lines by text (case-insensitive)')
+    .option('--json', 'Output raw JSON instead of formatted lines')
+    .action(serviceLogsAction)
+
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
@@ -1252,4 +1277,148 @@ async function connectAction(name: string, options: { project?: string; json?: b
     }
   }
   newline()
+}
+
+// ── services logs ────────────────────────────────────────────────────────────
+
+interface ServiceLogsOptions {
+  id: string
+  from?: string
+  to?: string
+  level?: string
+  tail?: string
+  text?: string
+  json?: boolean
+}
+
+/** Parse a relative duration string ("15m", "1h", "24h", "7d") into the
+ *  equivalent Date in the past, or return null if it is not a recognised
+ *  relative format (assumed to be an ISO 8601 string instead). */
+function parseFromFlag(value: string): Date | null {
+  const match = value.match(/^(\d+)(m|h|d)$/)
+  if (!match || !match[1] || !match[2]) return null
+  const n = parseInt(match[1], 10)
+  const unit = match[2]
+  const ms =
+    unit === 'm' ? n * 60_000 :
+    unit === 'h' ? n * 3_600_000 :
+    n * 86_400_000
+  return new Date(Date.now() - ms)
+}
+
+interface SearchLogsLine {
+  timestamp: string
+  level: string
+  message: string
+  service?: string
+  fields?: Record<string, unknown> | null
+}
+
+interface SearchLogsResponse {
+  lines: SearchLogsLine[]
+  next_cursor: string | null
+  total_scanned: number
+}
+
+const LEVEL_COLORS: Record<string, (s: string) => string> = {
+  ERROR: (s: string) => colors.error(s),
+  WARN: (s: string) => colors.warning(s),
+  INFO: (s: string) => s,
+  DEBUG: (s: string) => colors.muted(s),
+  TRACE: (s: string) => colors.muted(s),
+}
+
+function formatLogTs(ts: string): string {
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ts
+  return d.toISOString().replace('T', ' ').slice(0, 19)
+}
+
+async function serviceLogsAction(options: ServiceLogsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  // Resolve start time: relative shorthand or ISO string (default: last 24h).
+  let startTime: string
+  if (options.from) {
+    const relative = parseFromFlag(options.from)
+    startTime = relative ? relative.toISOString() : options.from
+  } else {
+    startTime = new Date(Date.now() - 24 * 3_600_000).toISOString()
+  }
+
+  // Resolve end time: ISO string (default: omit → server defaults to now).
+  let endTime: string | undefined
+  if (options.to) {
+    endTime = options.to
+  }
+
+  // Resolve level filter.
+  const levels =
+    options.level
+      ? options.level
+          .toUpperCase()
+          .split(',')
+          .map((l) => l.trim())
+          .filter(Boolean)
+      : undefined
+
+  // Clamp tail between 1 and 1000.
+  const tail = Math.min(1000, Math.max(1, parseInt(options.tail ?? '200', 10)))
+
+  const result = await withSpinner('Fetching logs…', async () => {
+    const body: Record<string, unknown> = {
+      project_id: 0,
+      external_service_id: id,
+      start_time: startTime,
+      page_size: tail,
+    }
+    if (endTime) body.end_time = endTime
+    if (levels?.length) body.levels = levels
+    if (options.text) body.text = options.text
+
+    const { data, error } = await client.post<SearchLogsResponse>({
+      url: '/logs/search',
+      body,
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (!result) {
+    warning('No log data returned')
+    return
+  }
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const lines = result.lines
+  if (lines.length === 0) {
+    info(`No logs found for service ${id} in the specified time range.`)
+    return
+  }
+
+  // Print formatted log lines.
+  for (const line of lines) {
+    const ts = colors.muted(formatLogTs(line.timestamp))
+    const lvl = line.level?.toUpperCase() ?? 'INFO'
+    const colorFn = LEVEL_COLORS[lvl] ?? ((s: string) => s)
+    const levelTag = colorFn(lvl.padEnd(5))
+    console.log(`${ts}  ${levelTag}  ${line.message}`)
+  }
+
+  newline()
+  info(
+    `${lines.length} line${lines.length === 1 ? '' : 's'} shown` +
+      (result.next_cursor ? ' (more available — use a narrower time range or --tail)' : ''),
+  )
 }
