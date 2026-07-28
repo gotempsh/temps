@@ -1,12 +1,6 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/logo/temps-logo-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="web/public/logo/temps-logo-light.png">
-  <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="180">
-</picture>
-
-<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/hero/stop-paying-dark.svg">
   <img alt="Stop paying for 7 SaaS tools: Vercel, Sentry, PostHog, Pingdom, Resend, E2B and Datadog, replaced by one self-hosted Temps binary" src="assets/hero/stop-paying-light.svg" width="700">
 </picture>
