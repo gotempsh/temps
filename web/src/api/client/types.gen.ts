@@ -26225,6 +26225,50 @@ export type GetServiceResponses = {
 
 export type GetServiceResponse = GetServiceResponses[keyof GetServiceResponses];
 
+export type SensitiveValueResponse = {
+    value: string;
+};
+
+export type RevealServiceParameterData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Sensitive parameter name
+         */
+        param_name: string;
+    };
+    query?: never;
+    url: '/external-services/{id}/parameters/{param_name}';
+};
+
+export type RevealServiceParameterErrors = {
+    /**
+     * Parameter is not sensitive
+     */
+    400: unknown;
+    /**
+     * Service or parameter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceParameterResponses = {
+    /**
+     * Sensitive parameter value
+     */
+    200: SensitiveValueResponse;
+};
+
+export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
+
 export type UpdateServiceData = {
     body: UpdateExternalServiceRequest;
     path: {

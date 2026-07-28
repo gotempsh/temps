@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SensitiveValueResponse {
+    pub value: String,
+}
+
 use sea_orm::DatabaseConnection;
 use temps_auth::ApiKeyService;
 use temps_core::AuditLogger;

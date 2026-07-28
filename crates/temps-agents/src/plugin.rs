@@ -577,7 +577,21 @@ impl TempsPlugin for AgentsPlugin {
             let definition_service =
                 Arc::new(crate::services::definition_service::DefinitionService::new(
                     context.require_service::<sea_orm::DatabaseConnection>(),
+                    encryption_service.clone(),
                 ));
+            match definition_service.encrypt_legacy_mcp_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy MCP environment and header credentials"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy MCP credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(definition_service.clone());
             let executor = Arc::new(AgentExecutor::new(
                 db.clone(),

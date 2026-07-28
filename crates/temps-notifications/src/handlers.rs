@@ -1,10 +1,11 @@
 use crate::digest::DigestService;
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderRevealError,
+    NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -57,6 +58,14 @@ struct NotificationPreferencesAudit {
     action: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct NotificationProviderConfigRevealedAudit {
+    context: AuditContext,
+    provider_id: i32,
+    provider_type: String,
+    field: String,
+}
+
 impl AuditOperation for NotificationProviderAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
@@ -95,6 +104,25 @@ impl AuditOperation for NotificationPreferencesAudit {
     }
 }
 
+impl AuditOperation for NotificationProviderConfigRevealedAudit {
+    fn operation_type(&self) -> String {
+        "NOTIFICATION_PROVIDER_CONFIG_REVEALED".to_string()
+    }
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
@@ -108,6 +136,7 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
     paths(
         list_notification_providers,
         get_notification_provider,
+        reveal_notification_provider_config,
         create_notification_provider,
         update_notification_provider,
         delete_notification_provider,
@@ -131,6 +160,7 @@ fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata
             CreateProviderRequest,
             UpdateProviderRequest,
             TestProviderResponse,
+            SensitiveConfigValueResponse,
             SlackConfig,
             EmailConfig,
             WebhookConfig,
@@ -171,6 +201,11 @@ pub struct NotificationProviderResponse {
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SensitiveConfigValueResponse {
+    pub value: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -310,8 +345,7 @@ pub struct CloudflareConfig {
     #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
     pub account_id: String,
     /// Cloudflare API token with the Email Sending permission. Encrypted at
-    /// rest; like the other notification providers, it is returned decrypted to
-    /// authorized callers so the edit form can prefill (not masked).
+    /// rest and masked in normal API responses.
     pub api_token: String,
     /// Verified sender address (must belong to a domain enabled for Cloudflare
     /// Email Sending).
@@ -463,6 +497,81 @@ async fn get_notification_provider(
                 .build())
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/notification-providers/{id}/config/{field}",
+    responses(
+        (status = 200, description = "Sensitive provider configuration value", body = SensitiveConfigValueResponse),
+        (status = 400, description = "Field is not revealable"),
+        (status = 404, description = "Provider or field not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID"),
+        ("field" = String, Path, description = "Sensitive configuration field")
+    ),
+    tag = "Notification Providers",
+    security(("bearer_auth" = []))
+)]
+async fn reveal_notification_provider_config(
+    State(app_state): State<Arc<NotificationState>>,
+    Path((id, field)): Path<(i32, String)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationProvidersRead);
+
+    let revealed = app_state
+        .notification_service
+        .reveal_provider_config_value(id, &field)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                NotificationProviderRevealError::ProviderNotFound { .. }
+                | NotificationProviderRevealError::FieldNotFound { .. } => StatusCode::NOT_FOUND,
+                NotificationProviderRevealError::FieldNotRevealable { .. } => {
+                    StatusCode::BAD_REQUEST
+                }
+                NotificationProviderRevealError::Database { .. }
+                | NotificationProviderRevealError::Decryption { .. }
+                | NotificationProviderRevealError::Serialization { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            let detail = if status == StatusCode::INTERNAL_SERVER_ERROR {
+                error!(provider_id = id, error = %error, "Notification config reveal failed");
+                "The provider configuration could not be read".to_string()
+            } else {
+                error.to_string()
+            };
+            ErrorBuilder::new(status)
+                .title("Configuration field could not be revealed")
+                .detail(detail)
+                .build()
+        })?;
+    let (provider_type, value) = revealed;
+
+    let audit = NotificationProviderConfigRevealedAudit {
+        context: make_audit_context(&auth, &metadata),
+        provider_id: id,
+        provider_type,
+        field,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(provider_id = id, error = %error, "Failed to audit notification config reveal");
+        return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Configuration value could not be revealed")
+            .detail("The audit record for this reveal could not be written")
+            .build());
+    }
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveConfigValueResponse { value }),
+    ))
 }
 
 /// Create a new notification provider
@@ -1175,7 +1284,10 @@ async fn update_webhook_provider(
     info!("Updating Webhook notification provider {}", id);
 
     // Validate URL format
-    if !request.config.url.starts_with("http://") && !request.config.url.starts_with("https://") {
+    if request.config.url != "***"
+        && !request.config.url.starts_with("http://")
+        && !request.config.url.starts_with("https://")
+    {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid webhook URL")
             .detail("Webhook URL must start with http:// or https://")
@@ -1756,6 +1868,10 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         .route(
             "/notification-providers/{id}",
             get(get_notification_provider),
+        )
+        .route(
+            "/notification-providers/{id}/config/{field}",
+            get(reveal_notification_provider_config),
         )
         .route(
             "/notification-providers/{id}",

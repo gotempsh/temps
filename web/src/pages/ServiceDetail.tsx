@@ -8,6 +8,7 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealServiceParameter } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
@@ -103,7 +104,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { format } from 'date-fns'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -158,6 +159,8 @@ function memberDisplayRole(member: {
 
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
+  const routeServiceIdRef = useRef(id)
+  routeServiceIdRef.current = id
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -182,6 +185,12 @@ export function ServiceDetail() {
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
     new Set()
   )
+  const [revealedParameters, setRevealedParameters] = useState<
+    Record<string, string>
+  >({})
+  const [revealingParameter, setRevealingParameter] = useState<string | null>(
+    null
+  )
 
   const {
     data: service,
@@ -198,6 +207,12 @@ export function ServiceDetail() {
       return status === 'creating' ? 2000 : false
     },
   })
+
+  useEffect(() => {
+    setVisibleParameters(new Set())
+    setRevealedParameters({})
+    setRevealingParameter(null)
+  }, [id])
 
   // Query for PostgreSQL major-version upgrades. Only relevant for postgres
   // services; harmless for others (the query is enabled conditionally below).
@@ -1124,8 +1139,10 @@ export function ServiceDetail() {
                           ? JSON.stringify(value)
                           : value
                       const displayValue =
-                        isSensitive && !isVisible
-                          ? maskValue(safeValue)
+                        isSensitive
+                          ? isVisible
+                            ? revealedParameters[key] ?? maskValue(safeValue)
+                            : maskValue(safeValue)
                           : safeValue
                       const hasValue = Boolean(safeValue)
 
@@ -1152,20 +1169,63 @@ export function ServiceDetail() {
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 shrink-0"
-                                onClick={() => {
-                                  setVisibleParameters((prev) => {
-                                    const next = new Set(prev)
-                                    if (next.has(key)) {
+                                disabled={revealingParameter === key}
+                                onClick={async () => {
+                                  if (isVisible) {
+                                    setVisibleParameters((prev) => {
+                                      const next = new Set(prev)
                                       next.delete(key)
-                                    } else {
-                                      next.add(key)
+                                      return next
+                                    })
+                                    setRevealedParameters((prev) => {
+                                      const next = { ...prev }
+                                      delete next[key]
+                                      return next
+                                    })
+                                    return
+                                  }
+
+                                  const requestedServiceId = String(
+                                    service.service.id
+                                  )
+                                  setRevealingParameter(key)
+                                  try {
+                                    const response =
+                                      await revealServiceParameter({
+                                        path: {
+                                          id: service.service.id,
+                                          param_name: key,
+                                        },
+                                        throwOnError: true,
+                                      })
+                                    if (
+                                      routeServiceIdRef.current !==
+                                      requestedServiceId
+                                    ) {
+                                      return
                                     }
-                                    return next
-                                  })
+                                    setRevealedParameters((prev) => ({
+                                      ...prev,
+                                      [key]: response.data.value,
+                                    }))
+                                    setVisibleParameters((prev) => {
+                                      const next = new Set(prev)
+                                      next.add(key)
+                                      return next
+                                    })
+                                  } catch {
+                                    toast.error(
+                                      `Failed to reveal ${key.replace(/_/g, ' ')}`
+                                    )
+                                  } finally {
+                                    setRevealingParameter(null)
+                                  }
                                 }}
-                                title={isVisible ? 'Hide value' : 'Show value'}
+                                title={isVisible ? 'Hide value' : 'Reveal value'}
                               >
-                                {isVisible ? (
+                                {revealingParameter === key ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : isVisible ? (
                                   <EyeOff className="h-4 w-4" />
                                 ) : (
                                   <Eye className="h-4 w-4" />
@@ -1174,7 +1234,11 @@ export function ServiceDetail() {
                             )}
                             {hasValue && (!isSensitive || isVisible) && (
                               <CopyButton
-                                value={String(value)}
+                                value={
+                                  isSensitive
+                                    ? (revealedParameters[key] ?? '')
+                                    : String(value)
+                                }
                                 minimal
                                 className="h-8 w-8 shrink-0"
                               />
@@ -1192,7 +1256,6 @@ export function ServiceDetail() {
               )}
             </CardContent>
           </Card>
-
           {/* Backups Section */}
           <Card>
             <CardHeader>

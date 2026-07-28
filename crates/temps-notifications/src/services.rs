@@ -24,6 +24,38 @@ use temps_entities::{
 use tracing::{error, info};
 use utoipa::ToSchema;
 
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderRevealError {
+    #[error("Notification provider {provider_id} was not found")]
+    ProviderNotFound { provider_id: i32 },
+    #[error(
+        "Field '{field}' is not a sensitive field for notification provider {provider_id} ({provider_type})"
+    )]
+    FieldNotRevealable {
+        provider_id: i32,
+        provider_type: String,
+        field: String,
+    },
+    #[error("Sensitive field '{field}' was not found in notification provider {provider_id}")]
+    FieldNotFound { provider_id: i32, field: String },
+    #[error("Failed to load notification provider {provider_id}: {source}")]
+    Database {
+        provider_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to decrypt notification provider {provider_id} configuration: {reason}")]
+    Decryption { provider_id: i32, reason: String },
+    #[error(
+        "Failed to serialize field '{field}' for notification provider {provider_id}: {reason}"
+    )]
+    Serialization {
+        provider_id: i32,
+        field: String,
+        reason: String,
+    },
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
@@ -1462,8 +1494,14 @@ impl NotificationService {
         Ok(providers)
     }
 
-    /// Decrypt the provider config for safe return to API
+    /// Decrypt and mask the provider config for API responses.
     pub fn decrypt_provider_config(&self, encrypted_config: &str) -> Result<serde_json::Value> {
+        let mut config_value = self.decrypt_provider_config_raw(encrypted_config)?;
+        Self::mask_provider_config(&mut config_value);
+        Ok(config_value)
+    }
+
+    fn decrypt_provider_config_raw(&self, encrypted_config: &str) -> Result<serde_json::Value> {
         let decrypted_config = self
             .encryption_service
             .decrypt_string(encrypted_config)
@@ -1473,6 +1511,107 @@ impl NotificationService {
             .map_err(|e| anyhow::anyhow!("Failed to parse decrypted config: {}", e))?;
 
         Ok(config_value)
+    }
+
+    fn mask_provider_config(config: &mut serde_json::Value) {
+        let Some(object) = config.as_object_mut() else {
+            return;
+        };
+
+        for (name, value) in object {
+            if name == "headers" {
+                if let Some(headers) = value.as_object_mut() {
+                    for header_value in headers.values_mut() {
+                        *header_value = serde_json::Value::String("***".to_string());
+                    }
+                }
+                continue;
+            }
+
+            if matches!(
+                name.as_str(),
+                "password" | "webhook_url" | "api_token" | "api_key" | "token" | "secret" | "url"
+            ) && !value.is_null()
+            {
+                *value = serde_json::Value::String("***".to_string());
+            }
+        }
+    }
+
+    fn merge_masked_values(existing: &serde_json::Value, replacement: &mut serde_json::Value) {
+        match (existing, replacement) {
+            (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
+                for (key, new_value) in replacement {
+                    if let Some(old_value) = existing.get(key) {
+                        Self::merge_masked_values(old_value, new_value);
+                    }
+                }
+            }
+            (existing, serde_json::Value::String(value)) if value == "***" => {
+                *value = match existing {
+                    serde_json::Value::String(existing) => existing.clone(),
+                    other => other.to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Reveal a single sensitive configuration field after the HTTP layer has
+    /// applied authorization. The caller must audit every successful result.
+    pub async fn reveal_provider_config_value(
+        &self,
+        provider_id: i32,
+        field: &str,
+    ) -> std::result::Result<(String, String), NotificationProviderRevealError> {
+        let provider = notification_providers::Entity::find_by_id(provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| NotificationProviderRevealError::Database {
+                provider_id,
+                source,
+            })?
+            .ok_or(NotificationProviderRevealError::ProviderNotFound { provider_id })?;
+
+        let permitted = match provider.provider_type.as_str() {
+            "slack" => matches!(field, "webhook_url"),
+            "email" => matches!(field, "password"),
+            "webhook" => matches!(field, "url" | "headers"),
+            "cloudflare" => matches!(field, "api_token"),
+            _ => false,
+        };
+        if !permitted {
+            return Err(NotificationProviderRevealError::FieldNotRevealable {
+                provider_id,
+                provider_type: provider.provider_type,
+                field: field.to_string(),
+            });
+        }
+
+        let config = self
+            .decrypt_provider_config_raw(&provider.config)
+            .map_err(|error| NotificationProviderRevealError::Decryption {
+                provider_id,
+                reason: error.to_string(),
+            })?;
+        let value =
+            config
+                .get(field)
+                .ok_or_else(|| NotificationProviderRevealError::FieldNotFound {
+                    provider_id,
+                    field: field.to_string(),
+                })?;
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => serde_json::to_string(other).map_err(|error| {
+                NotificationProviderRevealError::Serialization {
+                    provider_id,
+                    field: field.to_string(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        Ok((provider.provider_type, value))
     }
 
     async fn load_provider(
@@ -1561,13 +1700,16 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            let existing_config = provider.config.clone();
             let mut active_model: notification_providers::ActiveModel = provider.into();
 
             // Update fields if provided
             if let Some(new_name) = update.name {
                 active_model.name = Set(new_name);
             }
-            if let Some(new_config) = update.config {
+            if let Some(mut new_config) = update.config {
+                let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
+                Self::merge_masked_values(&decrypted_existing, &mut new_config);
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
                 let encrypted_config = self
@@ -3366,5 +3508,56 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[test]
+    fn provider_config_masking_covers_each_credential_shape() {
+        let mut config = serde_json::json!({
+            "password": "smtp-secret",
+            "webhook_url": "https://hooks.example/secret",
+            "api_token": "cloudflare-secret",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "secret"
+            },
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::mask_provider_config(&mut config);
+
+        assert_eq!(config["password"], "***");
+        assert_eq!(config["webhook_url"], "***");
+        assert_eq!(config["api_token"], "***");
+        assert_eq!(config["headers"]["Authorization"], "***");
+        assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_preserves_masked_credentials() {
+        let existing = serde_json::json!({
+            "password": "smtp-secret",
+            "webhook_url": "https://hooks.slack.com/services/secret",
+            "url": "https://example.com/webhook/secret",
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let mut replacement = serde_json::json!({
+            "password": "***",
+            "webhook_url": "***",
+            "url": "***",
+            "headers": {"Authorization": "***"},
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::merge_masked_values(&existing, &mut replacement);
+
+        assert_eq!(replacement["password"], "smtp-secret");
+        assert_eq!(
+            replacement["webhook_url"],
+            "https://hooks.slack.com/services/secret"
+        );
+        assert_eq!(replacement["url"], "https://example.com/webhook/secret");
+        assert_eq!(replacement["headers"]["Authorization"], "Bearer secret");
+        assert_eq!(replacement["smtp_host"], "smtp.example.com");
     }
 }

@@ -36,7 +36,7 @@ import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderForm } from './ProviderForm'
-import { ProviderFormData, providerSchema } from './schemas'
+import { ProviderFormData, providerUpdateSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
   provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
@@ -165,7 +165,7 @@ export function ProvidersManagement() {
   })
 
   const editForm = useForm<ProviderFormData>({
-    resolver: zodResolver(providerSchema),
+    resolver: zodResolver(providerUpdateSchema),
     defaultValues: {
       name: '',
       provider_type: 'email',

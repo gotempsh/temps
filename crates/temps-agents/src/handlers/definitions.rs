@@ -1,6 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Extension, Json, Router,
@@ -81,17 +81,24 @@ pub struct McpDefinitionResponse {
 
 impl From<temps_entities::project_mcp_definitions::Model> for McpDefinitionResponse {
     fn from(m: temps_entities::project_mcp_definitions::Model) -> Self {
+        let mut config = m.config;
+        crate::services::definition_service::DefinitionService::mask_sensitive_config(&mut config);
         Self {
             id: m.id,
             project_id: m.project_id,
             slug: m.slug,
             name: m.name,
             description: m.description,
-            config: m.config,
+            config,
             created_at: m.created_at.to_rfc3339(),
             updated_at: m.updated_at.to_rfc3339(),
         }
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensitiveMcpConfigValueResponse {
+    pub value: String,
 }
 
 // ── Request DTOs (re-export for OpenAPI) ────────────────────────────────────
@@ -158,6 +165,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/mcp-servers/{slug}",
             get(get_mcp).put(update_mcp).delete(delete_mcp),
         )
+        .route(
+            "/projects/{project_id}/mcp-servers/{slug}/config/{field}",
+            get(reveal_mcp_config),
+        )
         // Global skills (platform-wide)
         .route(
             "/settings/skills",
@@ -188,6 +199,10 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .put(update_global_mcp)
                 .delete(delete_global_mcp),
         )
+        .route(
+            "/settings/mcp-servers/{slug}/config/{field}",
+            get(reveal_global_mcp_config),
+        )
 }
 
 // ── Audit ───────────────────────────────────────────────────────────────────
@@ -203,9 +218,37 @@ struct DefinitionAudit {
     name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct McpConfigRevealedAudit {
+    context: AuditContext,
+    scope: &'static str,
+    project_id: Option<i32>,
+    slug: String,
+    field: String,
+}
+
 impl AuditOperation for DefinitionAudit {
     fn operation_type(&self) -> String {
         format!("{}_{}", self.resource_kind, self.operation)
+    }
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    }
+}
+
+impl AuditOperation for McpConfigRevealedAudit {
+    fn operation_type(&self) -> String {
+        "MCP_CONFIG_VALUE_REVEALED".to_string()
     }
     fn user_id(&self) -> i32 {
         self.context.user_id
@@ -545,6 +588,60 @@ pub async fn get_mcp(
         .map_err(Problem::from)?;
 
     Ok(Json(McpDefinitionResponse::from(mcp)))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    get,
+    path = "/projects/{project_id}/mcp-servers/{slug}/config/{field}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "MCP server slug"),
+        ("field" = String, Path, description = "Sensitive field path, such as env.API_TOKEN"),
+    ),
+    responses(
+        (status = 200, body = SensitiveMcpConfigValueResponse),
+        (status = 400, description = "Field is not revealable"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "MCP server or field not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reveal_mcp_config(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, slug, field)): Path<(i32, String, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let value = app_state
+        .definition_service
+        .reveal_mcp_config_value(Some(project_id), &slug, &field)
+        .await
+        .map_err(Problem::from)?;
+    if let Err(error) = app_state
+        .audit_service
+        .create_audit_log(&McpConfigRevealedAudit {
+            context: audit_ctx(&auth, &metadata),
+            scope: "project",
+            project_id: Some(project_id),
+            slug,
+            field,
+        })
+        .await
+    {
+        tracing::error!(project_id, error = %error, "Failed to audit MCP config reveal");
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("MCP configuration value could not be revealed")
+            .with_detail("The audit record for this reveal could not be written"));
+    }
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveMcpConfigValueResponse { value }),
+    ))
 }
 
 #[utoipa::path(
@@ -973,6 +1070,57 @@ pub async fn get_global_mcp(
         .map_err(Problem::from)?;
 
     Ok(Json(McpDefinitionResponse::from(mcp)))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    get,
+    path = "/settings/mcp-servers/{slug}/config/{field}",
+    params(
+        ("slug" = String, Path, description = "MCP server slug"),
+        ("field" = String, Path, description = "Sensitive field path, such as env.API_TOKEN"),
+    ),
+    responses(
+        (status = 200, body = SensitiveMcpConfigValueResponse),
+        (status = 400, description = "Field is not revealable"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "MCP server or field not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reveal_global_mcp_config(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((slug, field)): Path<(String, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let value = app_state
+        .definition_service
+        .reveal_mcp_config_value(None, &slug, &field)
+        .await
+        .map_err(Problem::from)?;
+    if let Err(error) = app_state
+        .audit_service
+        .create_audit_log(&McpConfigRevealedAudit {
+            context: audit_ctx(&auth, &metadata),
+            scope: "global",
+            project_id: None,
+            slug,
+            field,
+        })
+        .await
+    {
+        tracing::error!(error = %error, "Failed to audit global MCP config reveal");
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("MCP configuration value could not be revealed")
+            .with_detail("The audit record for this reveal could not be written"));
+    }
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveMcpConfigValueResponse { value }),
+    ))
 }
 
 #[utoipa::path(

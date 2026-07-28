@@ -4244,6 +4244,7 @@ mod tests {
     ) -> Arc<crate::services::definition_service::DefinitionService> {
         Arc::new(crate::services::definition_service::DefinitionService::new(
             db,
+            make_encryption_service(),
         ))
     }
 

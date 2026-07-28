@@ -116,6 +116,12 @@ pub enum ExternalServiceError {
     #[error("Environment variable '{var_name}' not found for service {service_id}")]
     EnvironmentVariableNotFound { service_id: i32, var_name: String },
 
+    #[error("Parameter '{param_name}' not found for service {service_id}")]
+    ParameterNotFound { service_id: i32, param_name: String },
+
+    #[error("Parameter '{param_name}' for service {service_id} is not sensitive")]
+    ParameterNotSensitive { service_id: i32, param_name: String },
+
     #[error("Access denied for encrypted variable '{var_name}' in service {service_id}")]
     EncryptedVariableAccessDenied { service_id: i32, var_name: String },
 
@@ -1653,11 +1659,45 @@ impl ExternalServiceManager {
             service_type,
             &parameters,
         )?;
+        let parameter_schema = service_instance.get_parameter_schema();
+        Self::mask_sensitive_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameter_schema: service_instance.get_parameter_schema(),
+            parameter_schema,
             current_parameters: Some(parameters),
+        })
+    }
+
+    /// Decrypt a single sensitive service parameter for an explicit reveal request.
+    ///
+    /// Normal detail responses are always masked. Keeping plaintext access in this
+    /// narrowly-scoped service method makes it possible for the HTTP layer to apply
+    /// authorization and write an audit event for every reveal.
+    pub async fn get_sensitive_parameter_value(
+        &self,
+        service_id: i32,
+        param_name: &str,
+    ) -> Result<String, ExternalServiceError> {
+        if !Self::is_sensitive_variable(param_name) {
+            return Err(ExternalServiceError::ParameterNotSensitive {
+                service_id,
+                param_name: param_name.to_string(),
+            });
+        }
+
+        let parameters = self.get_service_parameters(service_id).await?;
+        let value =
+            parameters
+                .get(param_name)
+                .ok_or_else(|| ExternalServiceError::ParameterNotFound {
+                    service_id,
+                    param_name: param_name.to_string(),
+                })?;
+
+        Ok(match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
         })
     }
 
@@ -1794,6 +1834,13 @@ impl ExternalServiceManager {
 
         // Prepare update parameters (merge docker_image if provided)
         let mut update_params = request.parameters.clone();
+        // Detail responses use "***" for sensitive parameters. Treat that
+        // sentinel as "leave unchanged" so opening and saving an edit form
+        // cannot replace a real credential with the mask.
+        update_params.retain(|name, value| {
+            !(Self::is_sensitive_variable(name)
+                && value.as_str().is_some_and(|value| value == "***"))
+        });
         if let Some(docker_image) = &request.docker_image {
             info!(
                 "Updating service {} with new Docker image: {}",
@@ -8142,7 +8189,7 @@ echo "[restore] Pre-seed complete"
     ) -> Result<ExternalServiceDetails, ExternalServiceError> {
         // Get service info
         let service_info = self.get_service_info(service.id).await?;
-        let parameters = self.get_service_parameters(service.id).await?;
+        let mut parameters = self.get_service_parameters(service.id).await?;
         let service_type = ServiceType::from_str(&service_info.service_type.to_string())?;
 
         let service_instance = self.create_service_instance_for_parameters(
@@ -8150,10 +8197,12 @@ echo "[restore] Pre-seed complete"
             service_type,
             &parameters,
         )?;
+        let parameter_schema = service_instance.get_parameter_schema();
+        Self::mask_sensitive_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameter_schema: service_instance.get_parameter_schema(),
+            parameter_schema,
             current_parameters: Some(parameters),
         })
     }
@@ -8424,7 +8473,7 @@ echo "[restore] Pre-seed complete"
     }
 
     /// Determine if a variable name indicates sensitive data
-    fn is_sensitive_variable(var_name: &str) -> bool {
+    pub(crate) fn is_sensitive_variable(var_name: &str) -> bool {
         let sensitive_patterns = [
             "password",
             "pass",
@@ -8438,12 +8487,24 @@ echo "[restore] Pre-seed complete"
             "cert",
             "ssl",
             "tls",
+            "url",
+            "uri",
+            "connection",
+            "dsn",
         ];
 
         let var_lower = var_name.to_lowercase();
         sensitive_patterns
             .iter()
             .any(|pattern| var_lower.contains(pattern))
+    }
+
+    fn mask_sensitive_values(parameters: &mut HashMap<String, serde_json::Value>) {
+        for (name, value) in parameters {
+            if Self::is_sensitive_variable(name) && !value.is_null() {
+                *value = serde_json::Value::String("***".to_string());
+            }
+        }
     }
 
     /// List available Docker containers that can be imported as services
@@ -10812,11 +10873,54 @@ mod tests {
         assert!(ExternalServiceManager::is_sensitive_variable(
             "auth_credential"
         ));
+        assert!(ExternalServiceManager::is_sensitive_variable(
+            "DATABASE_URL"
+        ));
+        assert!(ExternalServiceManager::is_sensitive_variable("MONGODB_URI"));
+        assert!(ExternalServiceManager::is_sensitive_variable(
+            "CONNECTION_STRING"
+        ));
+        assert!(ExternalServiceManager::is_sensitive_variable("SENTRY_DSN"));
 
         assert!(!ExternalServiceManager::is_sensitive_variable("database"));
         assert!(!ExternalServiceManager::is_sensitive_variable("username"));
         assert!(!ExternalServiceManager::is_sensitive_variable("port"));
         assert!(!ExternalServiceManager::is_sensitive_variable("host"));
+    }
+
+    #[test]
+    fn test_mask_sensitive_values_only_masks_secret_parameters() {
+        let mut parameters = HashMap::from([
+            ("password".to_string(), serde_json::json!("database-secret")),
+            ("api_token".to_string(), serde_json::json!("token-secret")),
+            ("username".to_string(), serde_json::json!("temps")),
+            ("port".to_string(), serde_json::json!(5432)),
+        ]);
+
+        ExternalServiceManager::mask_sensitive_values(&mut parameters);
+
+        assert_eq!(parameters["password"], serde_json::json!("***"));
+        assert_eq!(parameters["api_token"], serde_json::json!("***"));
+        assert_eq!(parameters["username"], serde_json::json!("temps"));
+        assert_eq!(parameters["port"], serde_json::json!(5432));
+    }
+
+    #[test]
+    fn test_masked_sensitive_updates_are_ignored() {
+        let mut parameters = HashMap::from([
+            ("password".to_string(), serde_json::json!("***")),
+            ("api_token".to_string(), serde_json::json!("replacement")),
+            ("username".to_string(), serde_json::json!("temps")),
+        ]);
+
+        parameters.retain(|name, value| {
+            !(ExternalServiceManager::is_sensitive_variable(name)
+                && value.as_str().is_some_and(|value| value == "***"))
+        });
+
+        assert!(!parameters.contains_key("password"));
+        assert_eq!(parameters["api_token"], serde_json::json!("replacement"));
+        assert_eq!(parameters["username"], serde_json::json!("temps"));
     }
 
     #[cfg(feature = "docker-tests")]

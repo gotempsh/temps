@@ -16,7 +16,7 @@ import {
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
-  providerSchema,
+  providerUpdateSchema,
 } from '@/components/monitoring/schemas'
 import { Button } from '@/components/ui/button'
 import {
@@ -71,7 +71,7 @@ export function EditNotificationProvider() {
   }, [setBreadcrumbs, provider])
 
   const form = useForm<ProviderFormData>({
-    resolver: zodResolver(providerSchema),
+    resolver: zodResolver(providerUpdateSchema),
     defaultValues: {
       name: '',
       provider_type: 'email',

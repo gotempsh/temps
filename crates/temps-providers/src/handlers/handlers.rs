@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::types::AppState;
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Json, Router,
@@ -25,17 +25,19 @@ use utoipa::OpenApi;
 use super::audit::{
     ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
     ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
-    ExternalServiceDeletedAudit, ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit,
-    ServiceHealthChecked,
+    ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
+    ExternalServiceParameterRevealedAudit, ExternalServiceStatusChangedAudit,
+    ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
     ClusterMemberHealthResponse, CreateExternalServiceRequest, EnvironmentVariableInfo,
     ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
-    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
-    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    RetryClusterRequest, SensitiveValueResponse, ServiceHealthResponse,
+    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -300,6 +302,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/projects/{project_id}/environment/{var_name}",
             get(get_service_environment_variable),
+        )
+        .route(
+            "/external-services/{id}/parameters/{param_name}",
+            get(reveal_service_parameter),
         )
         .route(
             "/external-services/{id}/projects/{project_id}/environment",
@@ -612,21 +618,9 @@ async fn update_service(
         .await
     {
         Ok(service) => {
-            // Convert parameters to strings for audit log
-            let params_as_strings: HashMap<String, String> = request
-                .parameters
-                .iter()
-                .map(|(k, v)| {
-                    let v_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Null => String::new(),
-                        _ => v.to_string(),
-                    };
-                    (k.clone(), v_str)
-                })
-                .collect();
+            let mut updated_parameter_names =
+                request.parameters.keys().cloned().collect::<Vec<_>>();
+            updated_parameter_names.sort();
 
             // Create audit log with metadata
             let audit = ExternalServiceUpdatedAudit {
@@ -638,7 +632,7 @@ async fn update_service(
                 service_id: service.id,
                 name: service.name.clone(),
                 service_type: service.service_type.to_string(),
-                updated_parameters: params_as_strings,
+                updated_parameter_names,
             };
 
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -660,6 +654,70 @@ async fn update_service(
             }
         }
     }
+}
+
+/// Reveal one sensitive service parameter. Service detail responses never
+/// contain plaintext values; every successful reveal is recorded separately.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/parameters/{param_name}",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Sensitive parameter value", body = SensitiveValueResponse),
+        (status = 400, description = "Parameter is not sensitive"),
+        (status = 404, description = "Service or parameter not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+        ("param_name" = String, Path, description = "Sensitive parameter name")
+    )
+)]
+async fn reveal_service_parameter(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((id, param_name)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    let value = app_state
+        .external_service_manager
+        .get_sensitive_parameter_value(id, &param_name)
+        .await
+        .map_err(|error| match error {
+            crate::services::ExternalServiceError::ServiceNotFound { .. }
+            | crate::services::ExternalServiceError::ParameterNotFound { .. } => {
+                not_found().detail(error.to_string()).build()
+            }
+            crate::services::ExternalServiceError::ParameterNotSensitive { .. } => {
+                bad_request().detail(error.to_string()).build()
+            }
+            _ => internal_server_error().detail(error.to_string()).build(),
+        })?;
+
+    let audit = ExternalServiceParameterRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: id,
+        parameter_name: param_name,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(service_id = id, error = %error, "Failed to audit service parameter reveal");
+        return Err(internal_server_error()
+            .detail("The parameter could not be revealed because its audit record failed")
+            .build());
+    }
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveValueResponse { value }),
+    ))
 }
 
 /// Canonical HTTP mapping for the upgrade/guard-related `ExternalServiceError`
@@ -721,10 +779,7 @@ async fn upgrade_service(
                 service_id: service.id,
                 name: service.name.clone(),
                 service_type: service.service_type.to_string(),
-                updated_parameters: HashMap::from([(
-                    "docker_image".to_string(),
-                    request.docker_image,
-                )]),
+                updated_parameter_names: vec!["docker_image".to_string()],
             };
 
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -1888,6 +1943,7 @@ async fn get_service_environment_variable(
     State(app_state): State<Arc<AppState>>,
     Path((id, project_id, var_name)): Path<(i32, i32, String)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     project_scope_guard!(auth, project_id);
@@ -1899,7 +1955,36 @@ async fn get_service_environment_variable(
         .get_service_environment_variable(id, project_id, &var_name)
         .await
     {
-        Ok(var_info) => Ok((StatusCode::OK, Json(var_info))),
+        Ok(var_info) => {
+            let audit = ExternalServiceEnvironmentVariableRevealedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: id,
+                project_id,
+                variable_name: var_name,
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(
+                    service_id = id,
+                    project_id,
+                    error = %error,
+                    "Failed to audit service environment-variable reveal"
+                );
+                return Err(internal_server_error()
+                    .detail(
+                        "The environment variable could not be revealed because its audit record failed",
+                    )
+                    .build());
+            }
+            Ok((
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(var_info),
+            ))
+        }
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" | "Variable not found" => {
                 Err(not_found().detail(e.to_string()).build())
@@ -1942,9 +2027,9 @@ async fn get_service_environment_variables(
     let options = EnvironmentVariableOptions {
         include_docker: false,
         include_runtime: false,
-        // Only an admin may read plaintext connection strings / passwords.
-        // Non-admin owners get masked values to prevent credential exfiltration.
-        mask_sensitive: !auth.is_admin(),
+        // Bulk reads are always masked. Plaintext is available only through
+        // the audited single-variable reveal endpoint.
+        mask_sensitive: true,
         names_only: false,
     };
 
@@ -1993,7 +2078,16 @@ async fn get_project_service_environment_variables(
         .get_project_service_environment_variables(project_id)
         .await
     {
-        Ok(variables) => Ok((StatusCode::OK, Json(variables))),
+        Ok(mut variables) => {
+            for service_variables in variables.values_mut() {
+                for (name, value) in service_variables {
+                    if crate::services::ExternalServiceManager::is_sensitive_variable(name) {
+                        *value = "***".to_string();
+                    }
+                }
+            }
+            Ok((StatusCode::OK, Json(variables)))
+        }
         Err(e) => match e.to_string().as_str() {
             "Project not found" => Err(not_found().detail(e.to_string()).build()),
             _ => Err(internal_server_error()
@@ -2284,39 +2378,6 @@ async fn update_service_resources(
         .await
     {
         Ok(response) => {
-            let applied_limits = &response.limits;
-            // Audit: capture the new caps as flat strings so the existing
-            // ExternalServiceUpdatedAudit shape works.
-            let mut params = HashMap::new();
-            params.insert(
-                "memory_mb".to_string(),
-                applied_limits
-                    .memory_mb
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "memory_swap_mb".to_string(),
-                applied_limits
-                    .memory_swap_mb
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "nano_cpus".to_string(),
-                applied_limits
-                    .nano_cpus
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "cpu_shares".to_string(),
-                applied_limits
-                    .cpu_shares
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-
             // Look up the service for context fields the audit log needs.
             // If this fails, log but don't fail the response — the limits
             // are already saved.
@@ -2330,7 +2391,12 @@ async fn update_service_resources(
                     service_id: service.id,
                     name: service.name.clone(),
                     service_type: service.service_type.clone(),
-                    updated_parameters: params,
+                    updated_parameter_names: vec![
+                        "cpu_shares".to_string(),
+                        "memory_mb".to_string(),
+                        "memory_swap_mb".to_string(),
+                        "nano_cpus".to_string(),
+                    ],
                 };
                 if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
                     error!("Failed to create audit log for resource update: {}", e);
@@ -2360,6 +2426,7 @@ async fn update_service_resources(
         get_service_type_parameters,
         list_services,
         get_service,
+        reveal_service_parameter,
         create_service,
         list_available_containers,
         import_external_service,
@@ -2431,6 +2498,7 @@ async fn update_service_resources(
         LinkServiceRequest,
         ProjectServiceInfo,
         EnvironmentVariableInfo,
+        SensitiveValueResponse,
         ServiceHealthResponse,
         HealthCheckEntryResponse,
         ServiceHealthStatusBatchResponse,
