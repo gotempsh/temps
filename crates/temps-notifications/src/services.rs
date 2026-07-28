@@ -1545,6 +1545,7 @@ impl NotificationService {
 
     fn mask_provider_config(config: &mut serde_json::Value) {
         let Some(object) = config.as_object_mut() else {
+            *config = serde_json::Value::String("***".to_string());
             return;
         };
 
@@ -1554,6 +1555,8 @@ impl NotificationService {
                     for header_value in headers.values_mut() {
                         *header_value = serde_json::Value::String("***".to_string());
                     }
+                } else if !value.is_null() {
+                    *value = serde_json::Value::String("***".to_string());
                 }
                 continue;
             }
@@ -3606,5 +3609,18 @@ mod tests {
             provider_config_field(&config, "headers.X-Webhook-Secret"),
             Some(&serde_json::json!("second secret"))
         );
+    }
+
+    #[test]
+    fn malformed_provider_configs_are_fail_safe_masked() {
+        for malformed in [
+            serde_json::json!("Bearer plaintext"),
+            serde_json::json!({"headers": "Bearer plaintext"}),
+            serde_json::json!({"headers": ["Authorization", "Bearer plaintext"]}),
+        ] {
+            let mut masked = malformed;
+            NotificationService::mask_provider_config(&mut masked);
+            assert!(!masked.to_string().contains("plaintext"));
+        }
     }
 }

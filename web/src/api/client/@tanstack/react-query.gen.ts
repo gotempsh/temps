@@ -15261,7 +15261,9 @@ export const revealServiceParameterOptions = (options: Options<RevealServicePara
         });
         return data;
     },
-    queryKey: revealServiceParameterQueryKey(options)
+    queryKey: revealServiceParameterQueryKey(options),
+    staleTime: 0,
+    gcTime: 0
 });
 
 export const revealNotificationProviderConfigQueryKey = (options: Options<RevealNotificationProviderConfigData>) => createQueryKey('revealNotificationProviderConfig', options);
@@ -15276,7 +15278,9 @@ export const revealNotificationProviderConfigOptions = (options: Options<RevealN
         });
         return data;
     },
-    queryKey: revealNotificationProviderConfigQueryKey(options)
+    queryKey: revealNotificationProviderConfigQueryKey(options),
+    staleTime: 0,
+    gcTime: 0
 });
 
 export const revealMcpConfigQueryKey = (options: Options<RevealMcpConfigData>) => createQueryKey('revealMcpConfig', options);
@@ -15291,7 +15295,9 @@ export const revealMcpConfigOptions = (options: Options<RevealMcpConfigData>) =>
         });
         return data;
     },
-    queryKey: revealMcpConfigQueryKey(options)
+    queryKey: revealMcpConfigQueryKey(options),
+    staleTime: 0,
+    gcTime: 0
 });
 
 export const revealGlobalMcpConfigQueryKey = (options: Options<RevealGlobalMcpConfigData>) => createQueryKey('revealGlobalMcpConfig', options);
@@ -15306,5 +15312,7 @@ export const revealGlobalMcpConfigOptions = (options: Options<RevealGlobalMcpCon
         });
         return data;
     },
-    queryKey: revealGlobalMcpConfigQueryKey(options)
+    queryKey: revealGlobalMcpConfigQueryKey(options),
+    staleTime: 0,
+    gcTime: 0
 });

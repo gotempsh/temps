@@ -114,9 +114,11 @@ impl DefinitionService {
     where
         F: FnMut(&str, &str) -> Result<String, AgentError>,
     {
-        let Some(config) = config.as_object_mut() else {
-            return Ok(());
-        };
+        let config = config
+            .as_object_mut()
+            .ok_or_else(|| AgentError::Validation {
+                message: "MCP config must be an object".to_string(),
+            })?;
 
         for section_name in ["env", "headers"] {
             let Some(section_value) = config.get_mut(section_name) else {
@@ -182,11 +184,12 @@ impl DefinitionService {
     }
 
     pub fn mask_sensitive_config(config: &mut serde_json::Value) {
-        let Some(config) = config.as_object_mut() else {
+        let Some(config_object) = config.as_object_mut() else {
+            *config = serde_json::Value::String(MASKED_VALUE.to_string());
             return;
         };
         for section_name in ["env", "headers"] {
-            let Some(section_value) = config.get_mut(section_name) else {
+            let Some(section_value) = config_object.get_mut(section_name) else {
                 continue;
             };
             let Some(section) = section_value.as_object_mut() else {
@@ -880,6 +883,8 @@ mod tests {
     fn malformed_sensitive_mcp_values_are_rejected_and_fail_safe_masked() {
         let service = service();
         for malformed in [
+            json!("API_TOKEN=plaintext"),
+            json!(["Authorization", "Bearer plaintext"]),
             json!({"env": "API_TOKEN=plaintext"}),
             json!({"env": {"API_TOKEN": 12345}}),
             json!({"headers": ["Authorization", "Bearer plaintext"]}),
