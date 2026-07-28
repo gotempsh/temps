@@ -67,6 +67,19 @@ export function register() {
 
 `@vercel/otel` reads the same `OTEL_EXPORTER_OTLP_*` env vars — no Temps-specific config needed.
 
+**Critical gotcha if the app also uses `@sentry/nextjs`**: Sentry's Next.js SDK registers its own global `TracerProvider`/`ContextManager` by default. If `Sentry.init()` runs before `registerOTel()` — which it normally does, since Sentry's config files load ahead of `instrumentation.ts`'s `register()` — every span becomes non-recording and **traces silently stop reaching Temps with no error anywhere**. Fix by passing `skipOpenTelemetrySetup: true` to `Sentry.init()` in `sentry.server.config.ts` (and `sentry.edge.config.ts` if used) so `@vercel/otel` remains the sole tracer provider:
+
+```ts
+// sentry.server.config.ts
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  skipOpenTelemetrySetup: true, // let @vercel/otel own tracing — see gotcha above
+  tracesSampleRate: 1.0,
+});
+```
+
+This is a real, previously-hit bug, not a hypothetical: a Temps example app went through several iterations before landing on this fix (`observability-starter` in `temps-examples`, commits fixing "let @vercel/otel own tracing so traces reach Temps"). If error tracking and traces are both being wired up on the same Next.js app, apply this from the start.
+
 ### Python
 
 Zero-code via `opentelemetry-instrument`:

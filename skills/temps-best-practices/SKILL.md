@@ -25,6 +25,7 @@ Goal: an app in any language gets error tracking and traces flowing with minimal
 |---|---|
 | `SENTRY_DSN` | Server-side/generic error tracking DSN, always present |
 | `NEXT_PUBLIC_SENTRY_DSN` / `NUXT_PUBLIC_SENTRY_DSN` / `VITE_SENTRY_DSN` / `PUBLIC_SENTRY_DSN` / `REACT_APP_SENTRY_DSN` | Framework-specific public DSN, added when the detected build preset needs a public-prefixed var to expose it client-side (Next.js/Nuxt/Vite,React,Vue,SolidStart,Remix/SvelteKit,Astro,Rsbuild/Docusaurus respectively) — not added for Angular or backend/generic presets, which just use `SENTRY_DSN` |
+| `SENTRY_RELEASE` | Commit SHA — every Sentry SDK reads this automatically when `release` isn't set explicitly; don't hardcode `release` in `Sentry.init()` or you override this and break source-context lookup |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (always `http/protobuf`), `OTEL_EXPORTER_OTLP_HEADERS` (deployment token auth) | Traces, auto-configured |
 | `OTEL_SERVICE_NAME` (project name), `OTEL_SERVICE_VERSION` (commit SHA when available) | Auto-populated span metadata |
 

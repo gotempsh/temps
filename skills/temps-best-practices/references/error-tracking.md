@@ -16,6 +16,10 @@ https://<public_key>@<temps-host>/<project_id>
 
 The `public_key` is per-project and derived from the DB; the `secret_key` (if any) is never exposed in API responses.
 
+## Release auto-injection
+
+Temps also auto-injects `SENTRY_RELEASE` (the deployment's commit SHA) alongside `SENTRY_DSN` for apps deployed through Temps (`workflow_planner.rs:1066-1070,1895-1920`) — every official Sentry SDK reads `SENTRY_RELEASE` from the environment when `release` isn't explicitly set in `Sentry.init()`, tagging events with the correct release automatically. **Don't hardcode a `release` value in `Sentry.init()`** — doing so overrides the injected value and breaks the dashboard's ability to join a stack frame back to its source (**Error Tracking → Source Context**). Leave `release` unset and let the SDK pick up `SENTRY_RELEASE` on its own.
+
 ## Ingestion endpoints
 
 Routes are registered as `/{project_id}/store/` etc. inside the crate, but the console server nests every plugin's routes under `/api` (`temps-cli/src/commands/serve/console.rs`), so the real externally-reachable paths are:
