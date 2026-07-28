@@ -4,6 +4,7 @@ import { create } from './create.js'
 import { show } from './show.js'
 import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
+import { registerProjectSecretsCommands } from './secrets.js'
 
 export function registerProjectsCommands(program: Command): void {
   const projects = program
@@ -11,6 +12,8 @@ export function registerProjectsCommands(program: Command): void {
     .alias('project')
     .alias('p')
     .description('Manage projects')
+
+  registerProjectSecretsCommands(projects)
 
   projects
     .command('list')
