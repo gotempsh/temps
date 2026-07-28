@@ -1234,6 +1234,7 @@ impl ProjectService {
     pub async fn update_git_settings(
         &self,
         project_id: i32,
+        caller_user_id: i32,
         git_provider_connection_id: Option<i32>,
         main_branch: String,
         repo_owner: String,
@@ -1275,6 +1276,13 @@ impl ProjectService {
                         "Git provider connection {} not found",
                         connection_id
                     )))?;
+
+                if connection.user_id != Some(caller_user_id) {
+                    return Err(ProjectError::NotFound(format!(
+                        "Git provider connection {} not found",
+                        connection_id
+                    )));
+                }
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(

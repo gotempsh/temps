@@ -781,7 +781,7 @@ pub async fn list_connections(
 
     let (connections, total_count) = state
         .git_provider_manager
-        .get_user_connections_paginated(page, per_page, sort, direction)
+        .get_user_connections_paginated(auth.user_id(), page, per_page, sort, direction)
         .await?;
 
     let response_connections: Vec<ConnectionResponse> = connections
@@ -885,6 +885,14 @@ pub async fn list_repositories_by_connection(
     Query(query): Query<RepositoryListQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+    if connection.user_id != Some(auth.user_id()) {
+        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
+    }
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(30).min(100);
