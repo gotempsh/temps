@@ -605,11 +605,16 @@ impl WorkflowYamlConfig {
 
 /// A metric alert rule declared in `.temps.yaml`.
 ///
-/// Only the `static` detection kind (threshold comparisons) is supported from
-/// YAML in v1. Anomaly, forecast, outlier, and `auto_watch` detectors are
-/// UI/API-only and are ignored if specified here.
+/// Exactly one of `condition` or `detection` must be set:
+/// - `condition` declares a `static` threshold rule (the common case).
+/// - `detection` declares an advanced detector. Only `kind: anomaly` is
+///   accepted — it's the only non-static detector `temps-otel`'s evaluator
+///   actually runs. `forecast`/`outlier`/`auto_watch` are typed in the
+///   database schema for forward-compat but have no evaluator implementation
+///   yet, so a rule using them would be silently dead (created, never fired);
+///   declaring one here is therefore a parse error, not a no-op.
 ///
-/// ## Example
+/// ## Examples
 /// ```yaml
 /// alerts:
 ///   - name: High error rate
@@ -619,6 +624,20 @@ impl WorkflowYamlConfig {
 ///     window: 5m
 ///     for: 2m
 ///     severity: warning
+///
+///   - name: CPU usage anomaly
+///     metric: system.cpu.utilization
+///     aggregation: avg
+///     window: 5m
+///     severity: warning
+///     detection:
+///       kind: anomaly
+///       algorithm: robust      # robust | basic (agile/ewma have no evaluator yet)
+///       deviations: 3.0
+///       direction: both        # both | above | below
+///       seasonality: daily     # none | hourly | daily | weekly
+///       pct_anomalous: 1.0
+///       baseline_lookback_days: 14
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricAlertYamlConfig {
@@ -640,8 +659,16 @@ pub struct MetricAlertYamlConfig {
     /// Threshold condition in the form `"<op> <value>"`, e.g. `"> 0.05"`,
     /// `"< 100"`, `">= 500"`, `"<= 0"`, `"== 42"`. Only `>`, `<`, `>=`,
     /// `<=`, and `==` are recognised. Parsed into a `static` detection config
-    /// (comparator + threshold). **Required** for v1 YAML alerts.
-    pub condition: String,
+    /// (comparator + threshold). Mutually exclusive with `detection`; exactly
+    /// one of the two must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+
+    /// Advanced detector, alternative to `condition`. See the type docs for
+    /// which kinds are actually evaluable. Mutually exclusive with
+    /// `condition`; exactly one of the two must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<AlertDetectionYamlConfig>,
 
     /// Evaluation window expressed as a duration string, e.g. `5m`, `30s`,
     /// `1h`. Parsed to `window_secs`. Required field; no default.
@@ -672,6 +699,49 @@ pub struct MetricAlertYamlConfig {
     /// `[endpoint, region]`. Defaults to empty (single aggregate stream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_by: Option<Vec<String>>,
+}
+
+/// Advanced detector declared under `alerts[].detection`.
+///
+/// Only `kind: anomaly` is accepted by [`MetricAlertYamlConfig::parsed_detection`]
+/// today. `forecast`/`outlier`/`auto_watch` are typed on the `metric_alert_rules`
+/// schema (via `temps_otel::detectors::DetectionConfig`) but have no evaluator
+/// implementation, so they are rejected here with an explicit error rather than
+/// silently accepted as a dead rule. Fields beyond `kind` only apply to `anomaly`
+/// and are ignored (with defaults) otherwise — validated at parse time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertDetectionYamlConfig {
+    /// Detector kind. Only `"anomaly"` is currently evaluable.
+    pub kind: String,
+
+    /// Baseline algorithm: `robust` (default) or `basic`. `agile`/`ewma` are
+    /// typed but not yet evaluated and are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<String>,
+
+    /// Band width in robust standard deviations. Defaults to `3.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deviations: Option<f64>,
+
+    /// Which side(s) of the band count as a deviation: `both` (default),
+    /// `above`, or `below`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+
+    /// Seasonality model for the baseline: `none` (default), `hourly`,
+    /// `daily`, or `weekly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seasonality: Option<String>,
+
+    /// Fraction (0, 1] of points in the window that must be anomalous to
+    /// fire. Defaults to `1.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct_anomalous: Option<f64>,
+
+    /// How far back (days, 1–90) to build the baseline. `None` = evaluator
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_lookback_days: Option<i32>,
 }
 
 fn default_alert_aggregation() -> String {
@@ -763,9 +833,43 @@ impl MetricAlertYamlConfig {
         parse_duration_secs(&self.for_duration)
     }
 
-    /// Parse `condition` into `(comparator, threshold)`.
+    /// Parse `condition` into `(comparator, threshold)`. Only meaningful when
+    /// `detection` is unset — callers should check [`Self::detection_source`]
+    /// first.
     pub fn parsed_condition(&self) -> Result<(String, f64), String> {
-        parse_condition(&self.condition)
+        match &self.condition {
+            Some(c) => parse_condition(c),
+            None => Err("no `condition` set on this alert".to_string()),
+        }
+    }
+
+    /// Validate that exactly one of `condition`/`detection` is set, and that
+    /// `detection.kind` (if set) is a currently-evaluable kind. Returns a
+    /// human-readable error naming the rule otherwise.
+    pub fn detection_source(&self) -> Result<(), String> {
+        match (&self.condition, &self.detection) {
+            (Some(_), Some(_)) => Err(format!(
+                "alert '{}' sets both `condition` and `detection`; exactly one is allowed",
+                self.name
+            )),
+            (None, None) => Err(format!(
+                "alert '{}' sets neither `condition` nor `detection`; exactly one is required",
+                self.name
+            )),
+            (Some(_), None) => Ok(()),
+            (None, Some(d)) => {
+                if d.kind == "anomaly" {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "alert '{}' declares detection kind '{}', which has no evaluator yet \
+                         (only 'anomaly' is currently supported from .temps.yaml; \
+                         forecast/outlier/auto_watch remain UI/API-only)",
+                        self.name, d.kind
+                    ))
+                }
+            }
+        }
     }
 
     /// Label filters as `Vec<(String, String)>`.
@@ -1365,7 +1469,7 @@ alerts:
         assert_eq!(a.name, "High error rate");
         assert_eq!(a.metric, "http.server.errors");
         assert_eq!(a.aggregation, "rate");
-        assert_eq!(a.condition, "> 0.05");
+        assert_eq!(a.condition.as_deref(), Some("> 0.05"));
         assert_eq!(a.window, "5m");
         assert_eq!(a.for_duration, "2m");
         assert_eq!(a.severity, "warning");

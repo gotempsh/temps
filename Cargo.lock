@@ -11513,6 +11513,7 @@ dependencies = [
  "temps-logs",
  "temps-metrics",
  "temps-network",
+ "temps-otel",
  "temps-presets",
  "temps-providers",
  "temps-queue",

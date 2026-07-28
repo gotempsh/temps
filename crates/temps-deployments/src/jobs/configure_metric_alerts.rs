@@ -30,6 +30,27 @@ use tracing::warn;
 
 use crate::jobs::RepositoryOutput;
 
+/// The parsed detector for a [`MetricAlertConfig`] — either a static
+/// threshold or an anomaly band. `forecast`/`outlier`/`auto_watch` are not
+/// representable here: they're rejected at YAML-parse time (see
+/// `MetricAlertYamlConfig::detection_source`) since `temps-otel` has no
+/// evaluator for them yet.
+#[derive(Debug, Clone)]
+pub enum AlertDetectionSpec {
+    Static {
+        comparator: String,
+        threshold: f64,
+    },
+    Anomaly {
+        algorithm: String,
+        deviations: f64,
+        direction: String,
+        seasonality: String,
+        pct_anomalous: f64,
+        baseline_lookback_days: Option<i32>,
+    },
+}
+
 /// A metric alert rule in the service-layer DTO format.
 #[derive(Debug, Clone)]
 pub struct MetricAlertConfig {
@@ -39,10 +60,8 @@ pub struct MetricAlertConfig {
     pub metric_name: String,
     /// Aggregation function: `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
     pub aggregation: String,
-    /// Comparator for static detection: `>`, `<`, `>=`, `<=`, `==`.
-    pub comparator: String,
-    /// Threshold value for static detection.
-    pub threshold: f64,
+    /// The detector for this rule.
+    pub detection: AlertDetectionSpec,
     /// Evaluation window in seconds.
     pub window_secs: i32,
     /// Minimum breach duration in seconds before the rule fires.
@@ -274,20 +293,39 @@ impl ConfigureMetricAlertsJob {
                     ))
                 })?;
 
-            let (comparator, threshold) =
-                temps_core::repo_config::parse_condition(&alert.condition).map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Invalid `condition` for alert '{}': {}",
-                        alert.name, e
-                    ))
-                })?;
+            alert
+                .detection_source()
+                .map_err(WorkflowError::JobExecutionFailed)?;
+
+            let detection = match &alert.detection {
+                None => {
+                    // detection_source() already guaranteed condition.is_some().
+                    let (comparator, threshold) = alert.parsed_condition().map_err(|e| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Invalid `condition` for alert '{}': {}",
+                            alert.name, e
+                        ))
+                    })?;
+                    AlertDetectionSpec::Static {
+                        comparator,
+                        threshold,
+                    }
+                }
+                Some(d) => AlertDetectionSpec::Anomaly {
+                    algorithm: d.algorithm.clone().unwrap_or_else(|| "robust".to_string()),
+                    deviations: d.deviations.unwrap_or(3.0),
+                    direction: d.direction.clone().unwrap_or_else(|| "both".to_string()),
+                    seasonality: d.seasonality.clone().unwrap_or_else(|| "none".to_string()),
+                    pct_anomalous: d.pct_anomalous.unwrap_or(1.0),
+                    baseline_lookback_days: d.baseline_lookback_days,
+                },
+            };
 
             alert_configs.push(MetricAlertConfig {
                 name: alert.name.clone(),
                 metric_name: alert.metric.clone(),
                 aggregation: alert.aggregation.clone(),
-                comparator,
-                threshold,
+                detection,
                 window_secs,
                 for_duration_secs,
                 severity: alert.severity.clone(),
@@ -542,8 +580,10 @@ mod tests {
             name: "High error rate".to_string(),
             metric_name: "http.server.errors".to_string(),
             aggregation: "rate".to_string(),
-            comparator: ">".to_string(),
-            threshold: 0.05,
+            detection: AlertDetectionSpec::Static {
+                comparator: ">".to_string(),
+                threshold: 0.05,
+            },
             window_secs: 300,
             for_duration_secs: 120,
             severity: "warning".to_string(),
@@ -559,7 +599,16 @@ mod tests {
         let captured = service.captured_configs();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].name, "High error rate");
-        assert!((captured[0].threshold - 0.05).abs() < f64::EPSILON);
+        match &captured[0].detection {
+            AlertDetectionSpec::Static {
+                comparator,
+                threshold,
+            } => {
+                assert_eq!(comparator, ">");
+                assert!((threshold - 0.05).abs() < f64::EPSILON);
+            }
+            AlertDetectionSpec::Anomaly { .. } => panic!("expected Static detection"),
+        }
     }
 
     #[tokio::test]
@@ -670,5 +719,131 @@ alerts:
         use temps_core::repo_config::parse_condition;
         assert!(parse_condition("!= 5").is_err());
         assert!(parse_condition("> abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_anomaly_alert_yaml_config() {
+        use temps_core::TempsConfig;
+
+        let yaml = r#"
+alerts:
+  - name: CPU usage anomaly
+    metric: system.cpu.utilization
+    aggregation: avg
+    window: 5m
+    severity: warning
+    detection:
+      kind: anomaly
+      algorithm: robust
+      deviations: 3.0
+      direction: both
+      seasonality: daily
+      pct_anomalous: 1.0
+      baseline_lookback_days: 14
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let alerts = config.alert_configs();
+        assert_eq!(alerts.len(), 1);
+        let a0 = alerts[0];
+        assert!(a0.condition.is_none());
+        assert!(a0.detection_source().is_ok());
+        let d = a0.detection.as_ref().unwrap();
+        assert_eq!(d.kind, "anomaly");
+        assert_eq!(d.algorithm.as_deref(), Some("robust"));
+        assert_eq!(d.baseline_lookback_days, Some(14));
+    }
+
+    #[test]
+    fn test_detection_source_rejects_both_and_neither() {
+        use temps_core::TempsConfig;
+
+        let both = r#"
+alerts:
+  - name: Bad rule
+    metric: http.server.errors
+    condition: "> 0.05"
+    window: 5m
+    detection:
+      kind: anomaly
+"#;
+        let config = TempsConfig::from_yaml(both).unwrap();
+        let err = config.alert_configs()[0].detection_source().unwrap_err();
+        assert!(err.contains("both"), "unexpected error: {err}");
+
+        let neither = r#"
+alerts:
+  - name: Bad rule
+    metric: http.server.errors
+    window: 5m
+"#;
+        let config = TempsConfig::from_yaml(neither).unwrap();
+        let err = config.alert_configs()[0].detection_source().unwrap_err();
+        assert!(err.contains("neither"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_detection_source_rejects_unevaluated_kinds() {
+        use temps_core::TempsConfig;
+
+        for kind in ["forecast", "outlier", "auto_watch"] {
+            let yaml = format!(
+                r#"
+alerts:
+  - name: Unsupported rule
+    metric: http.server.errors
+    window: 5m
+    detection:
+      kind: {kind}
+"#
+            );
+            let config = TempsConfig::from_yaml(&yaml).unwrap();
+            let err = config.alert_configs()[0].detection_source().unwrap_err();
+            assert!(
+                err.contains("no evaluator yet"),
+                "kind '{kind}' should be rejected: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configure_alerts_builds_anomaly_detection_spec() {
+        // End-to-end through the job's parsing path: YAML detection block ->
+        // AlertDetectionSpec::Anomaly with the right fields threaded through.
+        use temps_core::TempsConfig;
+
+        let yaml = r#"
+alerts:
+  - name: CPU usage anomaly
+    metric: system.cpu.utilization
+    window: 5m
+    detection:
+      kind: anomaly
+      deviations: 4.0
+      direction: above
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let alert = &config.alert_configs()[0];
+        assert!(alert.detection_source().is_ok());
+
+        let d = alert.detection.as_ref().unwrap();
+        let spec = AlertDetectionSpec::Anomaly {
+            algorithm: d.algorithm.clone().unwrap_or_else(|| "robust".to_string()),
+            deviations: d.deviations.unwrap_or(3.0),
+            direction: d.direction.clone().unwrap_or_else(|| "both".to_string()),
+            seasonality: d.seasonality.clone().unwrap_or_else(|| "none".to_string()),
+            pct_anomalous: d.pct_anomalous.unwrap_or(1.0),
+            baseline_lookback_days: d.baseline_lookback_days,
+        };
+        match spec {
+            AlertDetectionSpec::Anomaly {
+                deviations,
+                direction,
+                ..
+            } => {
+                assert_eq!(deviations, 4.0);
+                assert_eq!(direction, "above");
+            }
+            AlertDetectionSpec::Static { .. } => panic!("expected Anomaly detection"),
+        }
     }
 }

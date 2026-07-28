@@ -17,10 +17,14 @@ use sea_orm::{
 use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::metric_alert_rules;
+use temps_otel::detectors::{
+    AnomalyAlgorithm, AnomalyParams, Comparator, DetectionConfig, Direction, Seasonality,
+    StaticParams,
+};
 use tracing::{debug, info, warn};
 
 use crate::jobs::configure_metric_alerts::{
-    MetricAlertConfig, MetricAlertConfigError, MetricAlertConfigService,
+    AlertDetectionSpec, MetricAlertConfig, MetricAlertConfigError, MetricAlertConfigService,
 };
 
 /// Database-backed metric alert reconciliation service.
@@ -33,13 +37,100 @@ impl DatabaseMetricAlertConfigService {
         Self { db }
     }
 
-    /// Build the `detection_config` jsonb value for a static rule.
-    fn static_detection_config(comparator: &str, threshold: f64) -> serde_json::Value {
-        serde_json::json!({
-            "kind": "static",
-            "comparator": comparator,
-            "threshold": threshold
-        })
+    /// Build and validate the typed [`DetectionConfig`] for a rule's spec.
+    /// Rejects malformed comparator/algorithm/direction/seasonality strings
+    /// (which can only come from a bug in this crate's own parsing — the
+    /// YAML layer already restricts these to known keywords) and invalid
+    /// hyperparameters (e.g. non-finite threshold, `pct_anomalous` outside
+    /// `(0, 1]`) via `DetectionConfig::validate`.
+    fn build_detection_config(
+        name: &str,
+        spec: &AlertDetectionSpec,
+    ) -> Result<DetectionConfig, MetricAlertConfigError> {
+        let config = match spec {
+            AlertDetectionSpec::Static {
+                comparator,
+                threshold,
+            } => {
+                let comparator = match comparator.as_str() {
+                    ">" => Comparator::Gt,
+                    ">=" => Comparator::Gte,
+                    "<" => Comparator::Lt,
+                    "<=" => Comparator::Lte,
+                    other => {
+                        return Err(MetricAlertConfigError::InvalidConfig {
+                            name: name.to_string(),
+                            message: format!("unsupported comparator '{}'", other),
+                        })
+                    }
+                };
+                DetectionConfig::Static(StaticParams {
+                    comparator,
+                    threshold: *threshold,
+                })
+            }
+            AlertDetectionSpec::Anomaly {
+                algorithm,
+                deviations,
+                direction,
+                seasonality,
+                pct_anomalous,
+                baseline_lookback_days,
+            } => {
+                let algorithm = match algorithm.as_str() {
+                    "robust" => AnomalyAlgorithm::Robust,
+                    "basic" => AnomalyAlgorithm::Basic,
+                    "agile" => AnomalyAlgorithm::Agile,
+                    "ewma" => AnomalyAlgorithm::Ewma,
+                    other => {
+                        return Err(MetricAlertConfigError::InvalidConfig {
+                            name: name.to_string(),
+                            message: format!("unknown anomaly algorithm '{}'", other),
+                        })
+                    }
+                };
+                let direction = match direction.as_str() {
+                    "both" => Direction::Both,
+                    "above" => Direction::Above,
+                    "below" => Direction::Below,
+                    other => {
+                        return Err(MetricAlertConfigError::InvalidConfig {
+                            name: name.to_string(),
+                            message: format!("unknown anomaly direction '{}'", other),
+                        })
+                    }
+                };
+                let seasonality = match seasonality.as_str() {
+                    "none" => Seasonality::None,
+                    "hourly" => Seasonality::Hourly,
+                    "daily" => Seasonality::Daily,
+                    "weekly" => Seasonality::Weekly,
+                    other => {
+                        return Err(MetricAlertConfigError::InvalidConfig {
+                            name: name.to_string(),
+                            message: format!("unknown anomaly seasonality '{}'", other),
+                        })
+                    }
+                };
+                DetectionConfig::Anomaly(AnomalyParams {
+                    algorithm,
+                    deviations: *deviations,
+                    direction,
+                    seasonality,
+                    pct_anomalous: *pct_anomalous,
+                    baseline_lookback_days: *baseline_lookback_days,
+                })
+            }
+        };
+
+        config
+            .validate()
+            .map_err(|e| MetricAlertConfigError::InvalidConfig {
+                name: name.to_string(),
+                message: e.to_string(),
+            })?;
+
+        Ok(config)
     }
 }
 
@@ -92,7 +183,15 @@ impl MetricAlertConfigService for DatabaseMetricAlertConfigService {
                     message: format!("Failed to serialise group_by: {}", e),
                 }
             })?;
-            let detection_config = Self::static_detection_config(&cfg.comparator, cfg.threshold);
+            let detection = Self::build_detection_config(&cfg.name, &cfg.detection)?;
+            let detection_kind = detection.kind_str().to_string();
+            let detection_config =
+                detection
+                    .to_value()
+                    .map_err(|e| MetricAlertConfigError::InvalidConfig {
+                        name: cfg.name.clone(),
+                        message: e.to_string(),
+                    })?;
 
             if let Some(existing_rule) = existing_by_name.get(cfg.name.as_str()) {
                 // Update the existing row.
@@ -104,8 +203,8 @@ impl MetricAlertConfigService for DatabaseMetricAlertConfigService {
                 let mut active: metric_alert_rules::ActiveModel = (*existing_rule).clone().into();
                 active.metric_name = Set(cfg.metric_name.clone());
                 active.aggregation = Set(cfg.aggregation.trim().to_ascii_lowercase());
-                active.detection_kind = Set("static".to_string());
-                active.detection_config = Set(detection_config);
+                active.detection_kind = Set(detection_kind.clone());
+                active.detection_config = Set(detection_config.clone());
                 active.window_secs = Set(cfg.window_secs);
                 active.for_duration_secs = Set(cfg.for_duration_secs);
                 active.severity = Set(cfg.severity.trim().to_ascii_lowercase());
@@ -131,7 +230,7 @@ impl MetricAlertConfigService for DatabaseMetricAlertConfigService {
                     name: Set(cfg.name.clone()),
                     metric_name: Set(cfg.metric_name.clone()),
                     aggregation: Set(cfg.aggregation.trim().to_ascii_lowercase()),
-                    detection_kind: Set("static".to_string()),
+                    detection_kind: Set(detection_kind),
                     detection_config: Set(detection_config),
                     window_secs: Set(cfg.window_secs),
                     for_duration_secs: Set(cfg.for_duration_secs),
@@ -206,7 +305,7 @@ impl MetricAlertConfigService for DatabaseMetricAlertConfigService {
 mod tests {
     use super::*;
     use crate::jobs::configure_metric_alerts::{
-        MetricAlertConfig, MetricAlertConfigError, MetricAlertConfigService,
+        AlertDetectionSpec, MetricAlertConfig, MetricAlertConfigError, MetricAlertConfigService,
     };
 
     /// Helper to create a minimal MetricAlertConfig for tests.
@@ -215,8 +314,10 @@ mod tests {
             name: name.to_string(),
             metric_name: metric.to_string(),
             aggregation: "avg".to_string(),
-            comparator: ">".to_string(),
-            threshold: 0.5,
+            detection: AlertDetectionSpec::Static {
+                comparator: ">".to_string(),
+                threshold: 0.5,
+            },
             window_secs: 300,
             for_duration_secs: 0,
             severity: "warning".to_string(),
@@ -227,11 +328,69 @@ mod tests {
     }
 
     #[test]
-    fn test_static_detection_config_shape() {
-        let v = DatabaseMetricAlertConfigService::static_detection_config(">=", 90.0);
+    fn test_build_detection_config_static_shape() {
+        let spec = AlertDetectionSpec::Static {
+            comparator: ">=".to_string(),
+            threshold: 90.0,
+        };
+        let config = DatabaseMetricAlertConfigService::build_detection_config("rule", &spec)
+            .expect("valid static spec");
+        let v = config.to_value().unwrap();
         assert_eq!(v["kind"], "static");
-        assert_eq!(v["comparator"], ">=");
+        assert_eq!(v["comparator"], "gte");
         assert!((v["threshold"].as_f64().unwrap() - 90.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_detection_config_anomaly_shape() {
+        let spec = AlertDetectionSpec::Anomaly {
+            algorithm: "robust".to_string(),
+            deviations: 3.0,
+            direction: "both".to_string(),
+            seasonality: "daily".to_string(),
+            pct_anomalous: 1.0,
+            baseline_lookback_days: Some(14),
+        };
+        let config = DatabaseMetricAlertConfigService::build_detection_config("rule", &spec)
+            .expect("valid anomaly spec");
+        let v = config.to_value().unwrap();
+        assert_eq!(v["kind"], "anomaly");
+        assert_eq!(v["algorithm"], "robust");
+        assert_eq!(v["seasonality"], "daily");
+        assert_eq!(v["baseline_lookback_days"], 14);
+    }
+
+    #[test]
+    fn test_build_detection_config_rejects_unknown_algorithm() {
+        let spec = AlertDetectionSpec::Anomaly {
+            algorithm: "quantum".to_string(),
+            deviations: 3.0,
+            direction: "both".to_string(),
+            seasonality: "none".to_string(),
+            pct_anomalous: 1.0,
+            baseline_lookback_days: None,
+        };
+        let err =
+            DatabaseMetricAlertConfigService::build_detection_config("rule", &spec).unwrap_err();
+        assert!(matches!(
+            err,
+            MetricAlertConfigError::InvalidConfig { name, .. } if name == "rule"
+        ));
+    }
+
+    #[test]
+    fn test_build_detection_config_rejects_invalid_hyperparameters() {
+        // deviations <= 0 is caught by DetectionConfig::validate, not our
+        // string-matching — proving the two layers compose.
+        let spec = AlertDetectionSpec::Anomaly {
+            algorithm: "robust".to_string(),
+            deviations: 0.0,
+            direction: "both".to_string(),
+            seasonality: "none".to_string(),
+            pct_anomalous: 1.0,
+            baseline_lookback_days: None,
+        };
+        assert!(DatabaseMetricAlertConfigService::build_detection_config("rule", &spec).is_err());
     }
 
     #[tokio::test]
@@ -275,8 +434,16 @@ mod tests {
         let cfg = make_config("High CPU", "system.cpu");
         assert_eq!(cfg.name, "High CPU");
         assert_eq!(cfg.metric_name, "system.cpu");
-        assert_eq!(cfg.comparator, ">");
-        assert!((cfg.threshold - 0.5).abs() < f64::EPSILON);
+        match cfg.detection {
+            AlertDetectionSpec::Static {
+                comparator,
+                threshold,
+            } => {
+                assert_eq!(comparator, ">");
+                assert!((threshold - 0.5).abs() < f64::EPSILON);
+            }
+            AlertDetectionSpec::Anomaly { .. } => panic!("expected Static detection"),
+        }
         assert!(cfg.enabled);
     }
 }
