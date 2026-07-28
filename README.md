@@ -3,23 +3,15 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="web/public/logo/temps-logo-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="web/public/logo/temps-logo-light.png">
-  <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="280">
+  <img alt="Temps" src="web/public/logo/temps-logo-dark.png" width="180">
 </picture>
 
-**The open-source alternative to Vercel + Sentry + PostHog + Pingdom + Resend + E2B**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/hero/stop-paying-dark.svg">
+  <img alt="Stop paying for 7 SaaS tools: Vercel, Sentry, PostHog, Pingdom, Resend, E2B and Datadog, replaced by one self-hosted Temps binary" src="assets/hero/stop-paying-light.svg" width="700">
+</picture>
 
-Deployments, analytics, session replay, error tracking, uptime monitoring, transactional email & AI sandboxes — one self-hosted binary.
-
-**AI-native:** 440+ CLI operations and drop-in skills for Claude Code, Codex & OpenCode.
-
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
-
-[Website](https://temps.sh) · [Documentation](https://temps.sh/docs) · [Quick Start](https://temps.sh/docs/introduction) · [Discussions](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
-
-English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
+[Website](https://temps.sh) · [Docs](https://temps.sh/docs) · [Discussions](https://github.com/gotempsh/temps/discussions)
 
 </div>
 
@@ -33,8 +25,6 @@ curl -fsSL https://temps.sh/deploy.sh | bash
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/create-dark.png">
   <img alt="Importing a public repository in Temps — framework presets are auto-detected before deploy" src="assets/screenshots/create-light.png">
 </picture>
-
-Stop paying for 7 different SaaS tools. Temps replaces your deployment platform, analytics, error tracking, session replay, uptime monitoring, transactional email, and AI code-execution sandboxes -- all self-hosted, all in one binary.
 
 ---
 
@@ -412,10 +402,17 @@ cargo build --release
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
 
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
+
 ---
 
 <div align="center">
 
 [temps.sh](https://temps.sh) | [Documentation](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+
+English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
 </div>
