@@ -2788,6 +2788,7 @@ mod tests {
         AlertRule {
             id: 1,
             project_id: 1,
+            environment_id: None,
             name: "test-rule".to_string(),
             metric_name: "test.metric".to_string(),
             aggregation: "avg".to_string(),

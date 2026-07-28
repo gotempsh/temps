@@ -145,6 +145,13 @@ impl TempsPlugin for DeploymentsPlugin {
             // Register database_cron_service for handlers
             context.register_service(database_cron_service.clone());
 
+            // Create DatabaseMetricAlertConfigService for reconciling .temps.yaml alerts.
+            let database_alert_service = Arc::new(
+                crate::services::DatabaseMetricAlertConfigService::new(db.clone()),
+            );
+            let alert_service =
+                database_alert_service.clone() as Arc<dyn crate::jobs::MetricAlertConfigService>;
+
             // Start cron scheduler in background
             let scheduler_service = database_cron_service.clone();
             tokio::spawn(async move {
@@ -195,6 +202,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 static_deployer,
                 log_service.clone(),
                 cron_service,
+                alert_service,
                 context
                     .get_service::<dyn crate::jobs::AgentSyncService>()
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),

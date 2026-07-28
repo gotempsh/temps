@@ -1494,6 +1494,28 @@ impl WorkflowPlanner {
                 "Added configure_crons job to workflow (runs after deployment is marked complete)"
             );
 
+            // Job: Reconcile metric alert rules from .temps.yaml alerts: section.
+            // Runs in parallel with configure_crons, after deployment is complete.
+            // NOT required for deployment completion.
+            jobs.push(JobDefinition {
+                job_id: "configure_metric_alerts".to_string(),
+                job_type: "ConfigureMetricAlertsJob".to_string(),
+                name: "Configure Metric Alerts".to_string(),
+                description: Some(
+                    "Reconcile metric alert rules from .temps.yaml with the database".to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "download_job_id": "download_repo"
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
+            );
+
             // Job: Sync agent definitions from .temps/agents/*.yaml
             // Runs in parallel with configure_crons, after deployment is complete
             jobs.push(JobDefinition {

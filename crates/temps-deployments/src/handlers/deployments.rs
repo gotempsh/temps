@@ -3619,6 +3619,8 @@ mod tests {
                 as Arc<dyn temps_deployer::static_deployer::StaticDeployer>,
             log_service.clone(),
             Arc::new(MockCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             Arc::new(ConfigService::new(
                 Arc::new(

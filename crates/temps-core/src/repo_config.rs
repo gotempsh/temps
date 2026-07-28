@@ -36,6 +36,29 @@ pub struct TempsConfig {
     /// Error-tracking source-context capture configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_context: Option<SourceContextConfig>,
+
+    /// Metric alert rules to reconcile after each deployment.
+    ///
+    /// Only `static` detection (threshold comparisons) is supported from YAML in
+    /// v1; `anomaly`, `forecast`, `outlier`, and `auto_watch` detectors are
+    /// UI/API-only for now. Rules are upserted by name, scoped to the
+    /// `(project, environment)` pair that was deployed. A rule present in the DB
+    /// for that environment but absent from `.temps.yaml` is **disabled** (not
+    /// deleted) so alert history and evaluator state are preserved.
+    ///
+    /// Example:
+    /// ```yaml
+    /// alerts:
+    ///   - name: High error rate
+    ///     metric: http.server.errors
+    ///     aggregation: rate
+    ///     condition: "> 0.05"
+    ///     window: 5m
+    ///     for: 2m
+    ///     severity: warning
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerts: Option<Vec<MetricAlertYamlConfig>>,
 }
 
 /// `.temps.yaml` `sourceContext` block — controls which source the
@@ -578,6 +601,189 @@ impl WorkflowYamlConfig {
     }
 }
 
+// ── Metric alert YAML config ──────────────────────────────────────────────────
+
+/// A metric alert rule declared in `.temps.yaml`.
+///
+/// Only the `static` detection kind (threshold comparisons) is supported from
+/// YAML in v1. Anomaly, forecast, outlier, and `auto_watch` detectors are
+/// UI/API-only and are ignored if specified here.
+///
+/// ## Example
+/// ```yaml
+/// alerts:
+///   - name: High error rate
+///     metric: http.server.errors
+///     aggregation: rate
+///     condition: "> 0.05"
+///     window: 5m
+///     for: 2m
+///     severity: warning
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricAlertYamlConfig {
+    /// Human-readable name for the rule. Used as the upsert key within
+    /// `(project_id, environment_id)` — rules are matched by name when
+    /// reconciling; rename = delete-old + create-new.
+    pub name: String,
+
+    /// Metric name to evaluate (e.g. `http.server.duration`,
+    /// `http.server.errors`, `system.cpu.utilization`).
+    pub metric: String,
+
+    /// Aggregation function applied to the metric over the window.
+    /// One of: `avg`, `sum`, `min`, `max`, `count`, `rate`,
+    /// `p50`, `p90`, `p95`, `p99`.
+    #[serde(default = "default_alert_aggregation")]
+    pub aggregation: String,
+
+    /// Threshold condition in the form `"<op> <value>"`, e.g. `"> 0.05"`,
+    /// `"< 100"`, `">= 500"`, `"<= 0"`, `"== 42"`. Only `>`, `<`, `>=`,
+    /// `<=`, and `==` are recognised. Parsed into a `static` detection config
+    /// (comparator + threshold). **Required** for v1 YAML alerts.
+    pub condition: String,
+
+    /// Evaluation window expressed as a duration string, e.g. `5m`, `30s`,
+    /// `1h`. Parsed to `window_secs`. Required field; no default.
+    pub window: String,
+
+    /// How long the breach must persist before the rule fires, e.g. `2m`,
+    /// `30s`. Parsed to `for_duration_secs`. Defaults to `"0s"` (fire
+    /// immediately on first breaching evaluation).
+    #[serde(rename = "for", default = "default_alert_for_duration")]
+    pub for_duration: String,
+
+    /// Severity used when the rule fires. One of: `info`, `warning`,
+    /// `critical`. Defaults to `warning`.
+    #[serde(default = "default_alert_severity")]
+    pub severity: String,
+
+    /// Whether the rule is active. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// AND-combined label equality filters. Each entry is a two-element list
+    /// `[key, value]`, e.g. `[[method, GET], [status, "500"]]`. Defaults to
+    /// empty (no filtering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_filters: Option<Vec<[String; 2]>>,
+
+    /// Label keys to group by for per-series evaluation, e.g.
+    /// `[endpoint, region]`. Defaults to empty (single aggregate stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<Vec<String>>,
+}
+
+fn default_alert_aggregation() -> String {
+    "avg".to_string()
+}
+
+fn default_alert_for_duration() -> String {
+    "0s".to_string()
+}
+
+fn default_alert_severity() -> String {
+    "warning".to_string()
+}
+
+/// Parse a human-readable duration string to seconds.
+///
+/// Supports: `Ns` (seconds), `Nm` (minutes), `Nh` (hours).
+/// Returns an error string when the format is unrecognised.
+pub fn parse_duration_secs(s: &str) -> Result<i32, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1i32)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60i32)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600i32)
+    } else {
+        return Err(format!(
+            "unrecognised duration unit in '{}'; expected 's', 'm', or 'h'",
+            s
+        ));
+    };
+    let n: i32 = num_str.trim().parse().map_err(|_| {
+        format!(
+            "invalid duration '{}': '{}' is not a valid integer",
+            s, num_str
+        )
+    })?;
+    if n < 0 {
+        return Err(format!("duration '{}' must not be negative", s));
+    }
+    Ok(n * unit)
+}
+
+/// Parse a condition string like `"> 0.05"` into `(comparator, threshold)`.
+///
+/// Recognised comparators: `>`, `<`, `>=`, `<=`, `==`.
+/// Returns an error string when the format is unrecognised.
+pub fn parse_condition(condition: &str) -> Result<(String, f64), String> {
+    let condition = condition.trim();
+    // Try two-char operators first so `>=` isn't misparsed as `>`.
+    let (comparator, rest) = if let Some(r) = condition.strip_prefix(">=") {
+        (">=", r)
+    } else if let Some(r) = condition.strip_prefix("<=") {
+        ("<=", r)
+    } else if let Some(r) = condition.strip_prefix("==") {
+        ("==", r)
+    } else if let Some(r) = condition.strip_prefix('>') {
+        (">", r)
+    } else if let Some(r) = condition.strip_prefix('<') {
+        ("<", r)
+    } else {
+        return Err(format!(
+            "unrecognised comparator in condition '{}'; expected one of >, <, >=, <=, ==",
+            condition
+        ));
+    };
+    let threshold: f64 = rest.trim().parse().map_err(|_| {
+        format!(
+            "invalid threshold in condition '{}': '{}' is not a valid number",
+            condition,
+            rest.trim()
+        )
+    })?;
+    Ok((comparator.to_string(), threshold))
+}
+
+impl MetricAlertYamlConfig {
+    /// Parse `window` to seconds.
+    pub fn window_secs(&self) -> Result<i32, String> {
+        parse_duration_secs(&self.window)
+    }
+
+    /// Parse `for` to seconds.
+    pub fn for_duration_secs(&self) -> Result<i32, String> {
+        parse_duration_secs(&self.for_duration)
+    }
+
+    /// Parse `condition` into `(comparator, threshold)`.
+    pub fn parsed_condition(&self) -> Result<(String, f64), String> {
+        parse_condition(&self.condition)
+    }
+
+    /// Label filters as `Vec<(String, String)>`.
+    pub fn label_filters_pairs(&self) -> Vec<(String, String)> {
+        self.label_filters
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|[k, v]| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Group-by keys as `Vec<String>`.
+    pub fn group_by_keys(&self) -> Vec<String> {
+        self.group_by.clone().unwrap_or_default()
+    }
+}
+
 impl TempsConfig {
     /// Parse configuration from YAML string
     pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
@@ -602,6 +808,16 @@ impl TempsConfig {
     /// Check if configuration has custom build settings
     pub fn has_build_config(&self) -> bool {
         self.build.is_some()
+    }
+
+    /// Check if the configuration declares any metric alert rules.
+    pub fn has_alerts(&self) -> bool {
+        self.alerts.as_ref().is_some_and(|a| !a.is_empty())
+    }
+
+    /// Return the declared metric alert configs (empty slice if none).
+    pub fn alert_configs(&self) -> Vec<&MetricAlertYamlConfig> {
+        self.alerts.as_ref().map_or(vec![], |a| a.iter().collect())
     }
 }
 
@@ -731,6 +947,7 @@ build:
             agents: None,
             workflows: None,
             source_context: None,
+            alerts: None,
         };
 
         let yaml = config.to_yaml().unwrap();
@@ -1118,5 +1335,192 @@ mcp_servers: [browser, github]
         assert!(agent.mcp_servers.is_none());
         assert!(agent.skills_config_json().is_none());
         assert!(agent.mcp_servers_json().is_none());
+    }
+
+    // ── Metric alert YAML parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_alert_config_full() {
+        let yaml = r#"
+alerts:
+  - name: High error rate
+    metric: http.server.errors
+    aggregation: rate
+    condition: "> 0.05"
+    window: 5m
+    for: 2m
+    severity: warning
+    enabled: true
+    label_filters:
+      - [method, GET]
+    group_by: [endpoint]
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        assert!(config.has_alerts());
+
+        let alerts = config.alert_configs();
+        assert_eq!(alerts.len(), 1);
+
+        let a = &alerts[0];
+        assert_eq!(a.name, "High error rate");
+        assert_eq!(a.metric, "http.server.errors");
+        assert_eq!(a.aggregation, "rate");
+        assert_eq!(a.condition, "> 0.05");
+        assert_eq!(a.window, "5m");
+        assert_eq!(a.for_duration, "2m");
+        assert_eq!(a.severity, "warning");
+        assert!(a.enabled);
+
+        assert_eq!(a.window_secs().unwrap(), 300);
+        assert_eq!(a.for_duration_secs().unwrap(), 120);
+
+        let (cmp, threshold) = a.parsed_condition().unwrap();
+        assert_eq!(cmp, ">");
+        assert!((threshold - 0.05).abs() < f64::EPSILON);
+
+        assert_eq!(
+            a.label_filters_pairs(),
+            vec![("method".to_string(), "GET".to_string())]
+        );
+        assert_eq!(a.group_by_keys(), vec!["endpoint".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_alert_config_minimal_defaults() {
+        let yaml = r#"
+alerts:
+  - name: CPU spike
+    metric: system.cpu.utilization
+    condition: ">= 90"
+    window: 1m
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let alerts = config.alert_configs();
+        assert_eq!(alerts.len(), 1);
+
+        let a = &alerts[0];
+        // Default aggregation
+        assert_eq!(a.aggregation, "avg");
+        // Default for_duration
+        assert_eq!(a.for_duration, "0s");
+        assert_eq!(a.for_duration_secs().unwrap(), 0);
+        // Default severity
+        assert_eq!(a.severity, "warning");
+        // Default enabled
+        assert!(a.enabled);
+        // No filters
+        assert!(a.label_filters_pairs().is_empty());
+        assert!(a.group_by_keys().is_empty());
+
+        let (cmp, threshold) = a.parsed_condition().unwrap();
+        assert_eq!(cmp, ">=");
+        assert!((threshold - 90.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_has_alerts_false_when_absent() {
+        let yaml = "cron:\n  - path: /health\n    schedule: \"* * * * *\"\n";
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        assert!(!config.has_alerts());
+        assert!(config.alert_configs().is_empty());
+    }
+
+    #[test]
+    fn test_has_alerts_false_when_empty_list() {
+        let yaml = "alerts: []\n";
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        assert!(!config.has_alerts());
+    }
+
+    #[test]
+    fn test_parse_multiple_alerts() {
+        let yaml = r#"
+alerts:
+  - name: High latency
+    metric: http.server.duration
+    aggregation: p95
+    condition: "> 2000"
+    window: 5m
+    severity: critical
+  - name: Low throughput
+    metric: http.server.request_count
+    aggregation: rate
+    condition: "< 10"
+    window: 10m
+    severity: info
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let alerts = config.alert_configs();
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].name, "High latency");
+        assert_eq!(alerts[0].aggregation, "p95");
+        assert_eq!(alerts[1].name, "Low throughput");
+        assert_eq!(alerts[1].severity, "info");
+    }
+
+    #[test]
+    fn test_parse_duration_secs_valid() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("5m").unwrap(), 300);
+        assert_eq!(parse_duration_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("0s").unwrap(), 0);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn test_parse_duration_secs_invalid() {
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("5d").is_err()); // unsupported unit
+        assert!(parse_duration_secs("abc").is_err());
+        assert!(parse_duration_secs("-1m").is_err()); // negative
+        assert!(parse_duration_secs("m").is_err()); // missing number
+    }
+
+    #[test]
+    fn test_parse_condition_valid() {
+        let (cmp, t) = parse_condition("> 0.05").unwrap();
+        assert_eq!(cmp, ">");
+        assert!((t - 0.05).abs() < f64::EPSILON);
+
+        let (cmp, t) = parse_condition("< 100").unwrap();
+        assert_eq!(cmp, "<");
+        assert!((t - 100.0).abs() < f64::EPSILON);
+
+        let (cmp, t) = parse_condition(">= 500").unwrap();
+        assert_eq!(cmp, ">=");
+        assert!((t - 500.0).abs() < f64::EPSILON);
+
+        let (cmp, t) = parse_condition("<= 0").unwrap();
+        assert_eq!(cmp, "<=");
+        assert!((t - 0.0).abs() < f64::EPSILON);
+
+        let (cmp, t) = parse_condition("== 42").unwrap();
+        assert_eq!(cmp, "==");
+        assert!((t - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_condition_invalid() {
+        assert!(parse_condition("!= 5").is_err()); // unsupported operator
+        assert!(parse_condition("> abc").is_err()); // non-numeric threshold
+        assert!(parse_condition("").is_err());
+        assert!(parse_condition("5").is_err()); // missing operator
+    }
+
+    #[test]
+    fn test_alert_config_alongside_cron() {
+        let yaml = r#"
+cron:
+  - path: /health
+    schedule: "* * * * *"
+alerts:
+  - name: Error rate
+    metric: errors
+    condition: "> 10"
+    window: 5m
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        assert!(config.has_crons());
+        assert!(config.has_alerts());
     }
 }

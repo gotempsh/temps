@@ -18,9 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
-    CronConfigService, DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, PullExternalImageJob, ResourceUsage,
-    VerifyLocalImageJob,
+    ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
+    DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
+    MetricAlertConfigService, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -72,6 +72,7 @@ pub struct WorkflowExecutionService {
     static_deployer: Arc<dyn StaticDeployer>,
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
+    alert_service: Arc<dyn MetricAlertConfigService>,
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
@@ -97,6 +98,7 @@ impl WorkflowExecutionService {
         static_deployer: Arc<dyn StaticDeployer>,
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
+        alert_service: Arc<dyn MetricAlertConfigService>,
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
@@ -111,6 +113,7 @@ impl WorkflowExecutionService {
             static_deployer,
             log_service,
             cron_service,
+            alert_service,
             agent_sync_service,
             config_service,
             screenshot_service,
@@ -1000,6 +1003,43 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
                     .build(self.db.clone(), cron_service)?;
+
+                Ok(Arc::new(job))
+            }
+
+            "ConfigureMetricAlertsJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download_repo")
+                    .to_string();
+
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let deploy_container_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "mark_deployment_complete".to_string());
+
+                let alert_service = self.alert_service.clone();
+
+                let job = ConfigureMetricAlertsJobBuilder::new()
+                    .job_id(db_job.job_id.clone())
+                    .download_job_id(download_job_id)
+                    .deploy_container_job_id(deploy_container_job_id)
+                    .project_id(project.id)
+                    .environment_id(environment.id)
+                    .log_id(db_job.log_id.clone())
+                    .log_service(self.log_service.clone())
+                    .build(self.db.clone(), alert_service)?;
 
                 Ok(Arc::new(job))
             }
@@ -2722,6 +2762,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2764,6 +2806,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2871,6 +2915,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -3130,6 +3176,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
