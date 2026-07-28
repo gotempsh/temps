@@ -2,7 +2,7 @@
 
 For step-by-step SDK init per language/framework, use the **add-error-tracking** skill — it covers Next.js, React, Vue, Svelte, Angular, Node, React Native, Python, Go, Rust, Ruby, Java, PHP, .NET, Flutter with copy-paste snippets. This file covers the ingestion internals worth knowing when debugging or reviewing that setup.
 
-**Apps deployed on Temps get the DSN for free**: every deployment automatically has `SENTRY_DSN` injected (plus a framework-specific public-prefixed variant when the build preset needs one — see the top-level [SKILL.md](../SKILL.md) quickstart for the exact mapping). No dashboard copy-paste needed for those apps.
+**Apps deployed on Temps get the DSN for free, with no build-time-vs-runtime gap**: every deployment automatically has `SENTRY_DSN` injected — and, when the build preset needs one, the framework-specific public-prefixed variant (`NEXT_PUBLIC_SENTRY_DSN`, `VITE_SENTRY_DSN`, etc.) too. Temps injects both as a Docker `--build-arg` *and* as a container runtime env var (`temps-deployments::workflow_planner::gather_environment_variables`, threaded to `docker.rs`'s `buildargs` and `env` respectively), so client bundlers that inline public env vars at build time see the real value — there's no scenario where the DSN "isn't available yet" during the build. No dashboard copy-paste needed, and never hardcode a DSN or ask the user for one to hardcode — see the top-level [SKILL.md](../SKILL.md) quickstart for the exact framework mapping and the scope of this auto-injection (it doesn't cover apps built outside Temps' own deploy pipeline, including Temps' own console).
 
 ## How it works
 

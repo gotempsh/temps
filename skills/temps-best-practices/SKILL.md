@@ -19,7 +19,7 @@ Temps replaces Sentry + Datadog/Honeycomb + PostHog with one ingestion surface. 
 
 Goal: an app in any language gets error tracking and traces flowing with minimal setup. Both signals use the same shape — one env var pointing at Temps, and the language's own official SDK does the rest.
 
-**If the app is deployed on Temps, most of this is already done.** Every deployment automatically gets these env vars injected — no manual DSN copy-paste or token minting required:
+**If the app is deployed as a project on Temps (i.e. through Temps' own build/deploy pipeline), this is already done — zero configuration, by any user.** Every such deployment automatically gets these env vars injected, at **both** Docker build time (as `--build-arg`, so frontend bundlers can inline them) **and** container runtime (as `-e`, for server-side/SSR code reading `process.env` at request time):
 
 | Env var | What it's for |
 |---|---|
@@ -28,11 +28,13 @@ Goal: an app in any language gets error tracking and traces flowing with minimal
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (always `http/protobuf`), `OTEL_EXPORTER_OTLP_HEADERS` (deployment token auth) | Traces, auto-configured |
 | `OTEL_SERVICE_NAME` (project name), `OTEL_SERVICE_VERSION` (commit SHA when available) | Auto-populated span metadata |
 
-Implemented in `temps-deployments` crate: `src/services/workflow_planner.rs` (`gather_environment_variables`). If any of these are missing on a running deployment, that's a platform bug, not something to work around by hand-rolling credentials.
+Implemented in `temps-deployments` crate: `src/services/workflow_planner.rs` (`gather_environment_variables` collects them; the same map is threaded to both the build job as `build_args` — `workflow_planner.rs:1164-1198`/`1264-1306` → `docker.rs:960-988`'s `buildargs` — and the deploy job as runtime `env` — `docker.rs:1778-1784`). There is **no build-time-vs-runtime gap** for apps going through this pipeline: a `NEXT_PUBLIC_SENTRY_DSN`-style var is genuinely present when the client bundle is compiled, not just after the container starts. If a variable from the table is missing on a running deployment, that's a platform bug — investigate the deployment's build/deploy logs, don't work around it by hardcoding a value.
 
-For an app **not** deployed on Temps (running elsewhere, only sending telemetry to a self-hosted Temps instance), get credentials manually:
+**This auto-injection is scoped to apps deployed *through* Temps.** It does not apply to: an app running elsewhere and only sending telemetry to a self-hosted Temps instance, or to Temps' own console/dashboard (which is built by its own CI, not through this deploy pipeline — self-referential, since Temps doesn't deploy itself as a project on itself). For those cases, get the real credential from the dashboard and wire it through whatever env var / build-arg / secrets mechanism that project's *own* build system already uses:
 - Error tracking DSN: **Error Tracking → DSN & Setup** (`https://<public_key>@<temps-host>/<project_id>`)
 - A deployment token (`dt_...`) or API key (`tk_...`) for OTLP: **Project Settings → API Keys**
+
+**Never hardcode a DSN, token, or endpoint value into source code, a Dockerfile, or CI config — and never ask the user to supply one so it can be hardcoded.** The fix for "this needs to be available at build time" is always to pass it as a build arg / build-time env var through the project's existing mechanism (matching the dual-injection pattern above), never to bake a literal secret into a file. If the real value is genuinely unknown, the answer is "go get it from **Error Tracking → DSN & Setup**" or "go get it from **Project Settings → API Keys**" — not "paste it here so I can commit it."
 
 Either way, the app-side steps are the same:
 

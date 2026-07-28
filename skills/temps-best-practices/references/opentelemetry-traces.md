@@ -2,7 +2,7 @@
 
 Temps ingests standard OTLP/HTTP (protobuf) trace exports — any language's OpenTelemetry SDK works unmodified, there is no Temps-specific tracing SDK. Point the standard OTLP exporter env vars at Temps instead of hand-writing requests.
 
-**Apps deployed on Temps get this for free**: every deployment automatically has `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` injected — see the top-level [SKILL.md](../SKILL.md) quickstart. The manual config below is for apps sending telemetry to a self-hosted Temps instance from outside the platform.
+**Apps deployed on Temps get this for free, no configuration needed by the user**: every deployment automatically has `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` injected — at both Docker build time (`--build-arg`) and container runtime (`-e`), so this is available however the app's OTEL SDK reads it. Never hardcode these values or ask the user for a token/endpoint to hardcode; if they're missing on a running deployment, that's a platform bug, not something to work around manually. See the top-level [SKILL.md](../SKILL.md) quickstart for the exact injection mechanism and its scope (apps deployed *through* Temps only — not Temps' own console, and not apps hosted elsewhere). The manual config below is for apps sending telemetry to a self-hosted Temps instance from outside the platform.
 
 ## Endpoints
 
