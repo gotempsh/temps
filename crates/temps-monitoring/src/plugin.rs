@@ -61,7 +61,11 @@ impl TempsPlugin for MonitoringPlugin {
                 context.require_service::<dyn temps_core::notifications::NotificationService>();
             let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
-            let alarm_service = Arc::new(AlarmService::new(db, notification_service, job_queue));
+            let alarm_service = Arc::new(AlarmService::new(
+                db.clone(),
+                notification_service,
+                job_queue,
+            ));
 
             // Register so both:
             //   1. Background loops (outage/container-health/evaluator) can get it
@@ -79,14 +83,16 @@ impl TempsPlugin for MonitoringPlugin {
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
-        let app_state = Arc::new(AlarmAppState {
+        let alarm_state = Arc::new(AlarmAppState {
             alarm_service,
             audit_service,
             project_access_checker,
         });
 
-        let router = crate::handlers::alarm_handlers::configure_routes().with_state(app_state);
-        Some(PluginRoutes::new(router))
+        let alarm_router =
+            crate::handlers::alarm_handlers::configure_routes().with_state(alarm_state);
+
+        Some(PluginRoutes::new(alarm_router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
