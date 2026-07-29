@@ -86,6 +86,7 @@ export function registerProjectsCommands(program: Command): void {
     .option('--branch <branch>', 'Main branch')
     .option('--directory <directory>', 'App directory path')
     .option('--preset <preset>', 'Build preset (auto, nextjs, nodejs, static, docker, rust, go, python)')
+    .option('--connection <id>', 'Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged)')
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts, use provided/existing values (for automation)')
     .action(updateGitAction)
