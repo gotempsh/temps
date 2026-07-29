@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **temps-cli skill:** Use an integrity-pinned, lifecycle-script-disabled CLI installation and the installed `temps` binary so agents no longer download mutable package code on every command; add explicit context, confirmation, secret-handling, credential-reveal, and untrusted-output boundaries.
+- **agent skills:** Make platform setup stop at human-controlled installation and secret boundaries, remove mutable package runners and credential-bearing examples, and clarify the unavailable React analytics identity API without prompt-injection phrasing.
 
 ## [0.1.0-beta.55] - 2026-07-28
 

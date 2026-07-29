@@ -167,7 +167,7 @@ function SubscribeButton() {
 
 ### Identify Users — status: NOT YET FUNCTIONAL
 
-`identify(userId, traits)` is exposed on the context (`useTempsAnalytics().identify`) **but the current SDK implements it as a no-op placeholder** ("implement when identity endpoint is available"). Do not tell the user identification works yet. Attach user attributes as `event_data` on `trackEvent` calls instead:
+`identify(userId, traits)` is exposed on the context (`useTempsAnalytics().identify`), but the current SDK implements it as a no-op placeholder while the identity endpoint is unavailable. Treat identification as unsupported for now and attach user attributes as `event_data` on `trackEvent` calls instead:
 
 ```tsx
 'use client';
