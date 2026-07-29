@@ -13,12 +13,12 @@ Best practices for application code that runs on Temps. This skill owns the **ru
 1. For any deployable application, read [references/runtime-contract.md](references/runtime-contract.md).
 2. When any telemetry or replay is enabled, read [references/telemetry-hygiene.md](references/telemetry-hygiene.md).
 3. Read only the reference for each observability pillar in scope.
-4. Inspect the existing application and `.temps.yaml` before editing. Merge configuration; do not overwrite unrelated keys.
+4. Determine the deployment source. For repository builds, inspect and merge `.temps.yaml`; for image/static deployments, inspect the deployment health-path override because no repository config is available.
 5. Run the runtime and telemetry verification checklists before considering the work complete.
 
 ## Runtime contract summary
 
-Every web application should expose a dedicated readiness endpoint and configure it in `.temps.yaml` under the project's effective Temps Root Directory / Docker build context:
+Every web application should expose a dedicated health endpoint. Repository builds configure it in `.temps.yaml` under the project's effective Temps Root Directory / Docker build context:
 
 ```yaml
 health:
@@ -26,6 +26,8 @@ health:
 ```
 
 Use `health.path`; do not rely on the currently parsed-but-unapplied `status`, `interval`, `timeout`, or `retries` fields. If OpenTelemetry server tracing is enabled, exclude the exact health path from incoming spans and routine access-log/request-metric noise. Keep the route, `.temps.yaml`, and filters synchronized.
+
+Image and static deployments cannot read `.temps.yaml`; set the same route through their deployment `health_check_path` / CLI `--health-check-path` override instead.
 
 Also require the app to read `PORT`, bind to `HOST`/`0.0.0.0`, align a custom image's `EXPOSE`, handle `SIGTERM`, flush telemetry, and exit inside Temps' 10-second shutdown window. See the runtime reference for readiness semantics, scale-to-zero caveats, replicas, migrations, stdout/stderr, and cron authentication.
 
@@ -35,7 +37,6 @@ Temps replaces Sentry + Datadog/Honeycomb + PostHog with one ingestion surface. 
 
 - **add-error-tracking** — step-by-step Sentry SDK init per language/framework
 - **add-react-analytics** — step-by-step `@temps-sdk/react-analytics` hook usage
-- **add-session-recording** — privacy-aware session replay setup and verification
 
 ## Quickstart: wire up any app end to end
 
@@ -105,7 +106,7 @@ Temps OTLP ingestion shares a rate-limit/quota model, but token support differs 
 
 ## Definition of done
 
-1. Runtime: app listens on the injected port/interface; readiness is configured in the effective app root; `SIGTERM` drains and exits within 10 seconds.
+1. Runtime: app listens on the injected port/interface; the health route is configured through `.temps.yaml` for repository builds or the deployment override for image/static deploys; `SIGTERM` drains and exits within 10 seconds.
 2. Health noise: repeated health requests succeed without routine server spans, access logs, or request metrics; a normal route remains observable.
 3. Error tracking: a deliberate test error appears in **Error Tracking → Error Groups** with the expected release and no sensitive data.
 4. Traces: a normal request appears in **Observe → Traces**, uses a route-template name, propagates context downstream, and has a sane `duration_ms`.

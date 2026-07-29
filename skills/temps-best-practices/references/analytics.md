@@ -64,7 +64,7 @@ Treat public browser analytics as untrusted input:
 
 - Never drive billing, authorization, entitlements, inventory, or authoritative revenue from `/api/_temps/event`.
 - Send conversion-critical events from authenticated server code after the business transaction commits.
-- Add a stable business-event identifier when retries can create duplicates.
+- Deduplicate in application business storage or an outbox before calling Temps when retries can create duplicates. Temps does not enforce idempotency from an identifier placed in `event_data`.
 - Validate event names and allowlist bounded properties server-side for authoritative events.
 
 ## Quickstart: send analytics from any language
@@ -103,13 +103,15 @@ Do not place secrets, emails, raw identifiers, payment data, or sensitive URL qu
 
 ## Session replay acceptance criteria
 
-Use the dedicated **add-session-recording** skill, but do not enable replay until all of these hold:
+Do not enable replay until all of these hold:
 
 - Recording is off until the required consent exists.
 - `maskAllInputs` is enabled.
 - Authentication, payment, medical, account, admin, and secrets-management routes/elements are blocked or masked.
 - The recorder that is actually mounted responds to consent changes; a separate control-hook state is not sufficient evidence.
 - A replay containing synthetic sensitive values has been inspected in Temps and the values are absent.
+
+Do not treat the current standalone `useSessionRecordingControl` hook as the consent boundary: it owns state independently from the mounted recorder. Consent must mount/start and stop/unmount the actual recording provider until the SDK exposes one shared control path.
 
 ## Gotchas
 

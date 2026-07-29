@@ -59,10 +59,10 @@ health:
 
 Filter the exact URL pathname before its server span is created or exported. Do not assume the generic `OTEL_EXPORTER_OTLP_*` variables do this: they configure export, not request filtering, and OTel does not define one cross-language health-path exclusion variable. Use the current request-ignore mechanism provided by the app's language/framework instrumentation.
 
-For Node.js auto-instrumentation, use the HTTP instrumentation's `ignoreIncomingRequestHook`. The zero-code `@opentelemetry/auto-instrumentations-node/register` preload cannot accept programmatic instrumentation options, so use a small preload file when health filtering is required:
+For Node.js auto-instrumentation, use the HTTP instrumentation's `ignoreIncomingRequestHook`. The zero-code `@opentelemetry/auto-instrumentations-node/register` preload cannot accept programmatic instrumentation options, so use a small preload file when health filtering is required. Add dependencies through the application's reviewed dependency workflow, commit the lockfile, and use exact versions; disable lifecycle scripts where compatible:
 
 ```bash
-npm install @opentelemetry/sdk-node \
+npm install --ignore-scripts --save-exact @opentelemetry/sdk-node \
   @opentelemetry/exporter-trace-otlp-proto \
   @opentelemetry/auto-instrumentations-node
 ```

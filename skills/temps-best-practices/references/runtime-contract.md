@@ -2,9 +2,9 @@
 
 Read this file whenever preparing or reviewing an application that will run on Temps. It owns application behavior; use `temps-cli` for the commands that create projects, deploy images, or manage resources.
 
-## Effective application root
+## Deployment source and effective application root
 
-Place `.temps.yaml` in the application's effective Temps **Root Directory / Docker build context**. That is the repository root for a single-app repository, but it is usually an app subdirectory in a monorepo:
+For a repository build, place `.temps.yaml` in the application's effective Temps **Root Directory / Docker build context**. That is the repository root for a single-app repository, but it is usually an app subdirectory in a monorepo:
 
 ```text
 repository/
@@ -20,7 +20,9 @@ If the Temps project Root Directory is `apps/api`, the health configuration belo
 
 Merge known keys instead of replacing the file. Preserve existing `build`, `cron`, `env`, `agents`, `workflows`, `sourceContext`, and health settings.
 
-## Health is readiness
+Image and static deployments do not have repository contents from which Temps can read `.temps.yaml`. Configure their health route through the deployment request's `health_check_path` or the CLI `--health-check-path` option.
+
+## Deployment health
 
 Create a dedicated unauthenticated `GET` endpoint such as `/healthz` and configure it:
 
@@ -33,19 +35,19 @@ Current implementation facts:
 
 - `health.path` is the only `.temps.yaml` health field that reliably changes deployment and monitor behavior today.
 - Do not add or rely on `health.status`, `health.interval`, `health.timeout`, or `health.retries` until their runtime consumers are implemented.
-- A deploy-time `--health-check-path` override wins over `.temps.yaml`; avoid passing it unless the divergence is intentional.
+- A deploy-time `--health-check-path` override wins over `.temps.yaml`. Avoid an accidental override for repository builds; supply it deliberately for image/static deployments.
 - Temps configuration parsing does not reject every unknown key, and an unreadable/invalid file can be treated as absent. Verify the deployment log names the intended health path and confirm the environment's uptime monitor uses it.
 
-The endpoint gates traffic, so it is a readiness check:
+Temps uses the endpoint for deployment health and monitoring. It is not a continuous live-traffic gate, so returning `503` does not by itself remove a running container from routing:
 
 - Return `200` only when the process can serve normal requests.
-- Return `503` while starting, draining, or missing a dependency required by most requests.
+- Return `503` while starting or missing a dependency required by most requests. It may also describe a draining process while the endpoint remains reachable, but do not rely on that response to stop new traffic.
 - Check only essential dependencies, use short timeouts, and never mutate state.
 - Return a constant minimal body such as `{"status":"ok"}`. Do not expose hostnames, versions, commit SHAs, dependency errors, configuration, or secrets.
 
 Temps is permissive about some non-5xx responses during probing, so an explicit `200` is important: it prevents a typo that returns `404` from looking intentionally healthy.
 
-For OpenTelemetry-enabled applications, exclude the exact `health.path` from incoming server spans. Suppress routine health requests from access logs and request metrics where the framework supports it. Keep the application route, `.temps.yaml`, and filters synchronized.
+For OpenTelemetry-enabled applications, exclude the exact configured health path from incoming server spans. Suppress routine health requests from access logs and request metrics where the framework supports it. Keep the application route, repository `.temps.yaml` or deployment override, and filters synchronized.
 
 ### Scale-to-zero caveat
 
@@ -65,12 +67,11 @@ Temps injects `HOST=0.0.0.0` and `PORT`. The application must:
 
 Temps stops containers with the normal termination signal and a 10-second grace period. On `SIGTERM`:
 
-1. Mark readiness unavailable so new work stops arriving.
-2. Stop accepting new requests and jobs.
-3. Let in-flight requests finish within a bounded deadline.
-4. Close database, queue, and cache clients.
-5. flush and shut down OpenTelemetry processors/exporters.
-6. Exit successfully before the 10-second deadline.
+1. Stop accepting new requests and jobs; do not assume a health-response change removes the container from routing.
+2. Let in-flight requests finish within a bounded deadline.
+3. Close database, queue, and cache clients.
+4. Flush and shut down OpenTelemetry processors/exporters.
+5. Exit successfully before the 10-second deadline.
 
 Use an exec-form container command, or `exec` from an entrypoint script, so the application receives signals directly.
 
@@ -98,7 +99,7 @@ Do not depend on in-memory sessions, local uploads, or a single process receivin
 
 Write application logs to stdout/stderr so Temps can capture them. Use OTLP logs when structured trace correlation is required; do not depend on container-local log files.
 
-If `.temps.yaml` defines `cron` routes, validate `Authorization: Bearer <CRON_SECRET>` in every handler and fail closed when either the environment value or header is missing or malformed. Keep handlers idempotent and return a non-success response when authentication or work fails.
+If `.temps.yaml` defines `cron` routes, validate `Authorization: Bearer <CRON_SECRET>` in every handler and fail closed when either the environment value or header is missing or malformed. Use a vetted constant-time comparison helper that safely handles unequal lengths. Keep handlers idempotent and return a non-success response when authentication or work fails.
 
 Treat `CRON_SECRET` as a high-impact server credential: Temps currently supplies the deployment token, which is non-expiring and broadly scoped. Compare the presented value without echoing it, never record the authorization header in logs/traces/errors, and rotate the deployment credential after suspected exposure.
 
@@ -107,8 +108,8 @@ Treat `CRON_SECRET` as a high-impact server credential: Temps currently supplies
 Before considering the app deployable:
 
 1. Confirm the server listens on the injected `PORT` on `0.0.0.0`.
-2. Confirm `.temps.yaml` is in the effective application root and the deploy log uses its `health.path`.
-3. Confirm readiness returns `200`, returns no sensitive details, and produces no routine trace/log/metric noise.
+2. Confirm a repository build reads `.temps.yaml` from the effective application root, or an image/static deployment receives the intended health-path override; verify the deploy log uses that path.
+3. Confirm the health route returns `200`, returns no sensitive details, and produces no routine trace/log/metric noise.
 4. Send `SIGTERM`; confirm the process drains, flushes telemetry, and exits within 10 seconds.
 5. Exercise two replicas or reason explicitly about every mutable in-memory/local-file dependency.
 6. Confirm migrations cannot race and a rollback remains schema-compatible.

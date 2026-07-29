@@ -52,7 +52,7 @@ Session replay is the highest-risk signal because the backend stores captured rr
 - Verify the active recorder actually responds to the consent state; do not claim compliance from a disconnected control hook.
 - Inspect a replay made with synthetic sensitive values before production rollout.
 
-Use the dedicated `add-session-recording` skill for implementation, but retain these acceptance criteria.
+Do not use the current standalone `useSessionRecordingControl` hook as proof that recording stopped: its state is independent from the mounted recorder. Consent must control the actual provider lifecycle until the SDK exposes one shared control path.
 
 ## Cardinality and naming
 
@@ -98,7 +98,7 @@ The public analytics endpoint is intentionally unauthenticated. Treat browser ev
 
 - Do not use them as the source of truth for billing, authorization, entitlements, inventory, or authoritative revenue.
 - Send conversion-critical events from the authenticated backend endpoint after the server has committed the business action.
-- Deduplicate backend events with a stable business-event identifier where retries are possible.
+- Deduplicate in application business storage or an outbox before posting where retries are possible. Temps analytics ingest does not enforce idempotency from a business-event identifier in `event_data`.
 
 ## Hygiene verification
 
