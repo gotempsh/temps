@@ -55,8 +55,17 @@ There is no `project_id` field — the project is resolved server-side from the 
 
 ## Auth
 
-- `/api/_temps/event` is intentionally public/unauthenticated — gated by Host-header project resolution, not a token. Don't add auth headers to it; there's nothing to check.
+- `/api/_temps/event` is intentionally public/unauthenticated. Host-header project resolution attributes an event to a project; it does not prove the event came from a genuine browser/user.
 - `/api/projects/{project_id}/events/ingest` requires a bearer token (session cookie, `tk_` API key, or `dt_` deployment token — all three work) with `AnalyticsWrite` permission scoped to that project. A token bound to a different project is rejected.
+
+### Trust boundary
+
+Treat public browser analytics as untrusted input:
+
+- Never drive billing, authorization, entitlements, inventory, or authoritative revenue from `/api/_temps/event`.
+- Send conversion-critical events from authenticated server code after the business transaction commits.
+- Add a stable business-event identifier when retries can create duplicates.
+- Validate event names and allowlist bounded properties server-side for authoritative events.
 
 ## Quickstart: send analytics from any language
 
@@ -76,11 +85,15 @@ curl -X POST "$TEMPS_API_URL/projects/$TEMPS_PROJECT_ID/events/ingest" \
   }'
 ```
 
+`TEMPS_API_TOKEN` is currently a non-expiring deployment token with broad permissions, not an analytics-only key. Keep it server-side, never log or forward it, and never reuse it in browser code. Prefer a separately managed, purpose-scoped credential when the endpoint and deployment workflow support one; otherwise limit this call site and rotate the deployment credential after suspected exposure.
+
 The equivalent in any language is just an authenticated JSON POST — Python (`requests.post(...)`), Go (`net/http` + `encoding/json`), Ruby (`Net::HTTP` or `httparty`), PHP (`curl_init`/Guzzle), Java (`HttpClient`), .NET (`HttpClient`), Rust (`reqwest`): no client library is needed because this is a plain REST call, not a protocol requiring a purpose-built SDK.
 
 `environment_id`/`deployment_id`/`project_id` are **not** currently among the auto-injected env vars (unlike `TEMPS_API_URL`/`TEMPS_API_TOKEN`) — read them from the Temps dashboard (**Project Settings**) or from whatever IDs your deployment automation already has on hand, and set them yourself (e.g. as regular env vars) if a backend needs to call this endpoint repeatedly.
 
 For browser-side tracking in a non-React frontend (vanilla JS, Vue, Svelte, a mobile app's WebView), POST directly to `/api/_temps/event` with `fetch`/`XMLHttpRequest`/equivalent using the `EventMetricsPayload` shape above — no auth needed, but it only resolves a project when the request's `Host` matches a routed deployment domain, so this only works called from code actually running on/against the deployed app's own origin.
+
+Do not place secrets, emails, raw identifiers, payment data, or sensitive URL query values in `event_data`, `request_query`, URLs, or referrers. The endpoint stores application-provided event data; see [telemetry-hygiene.md](telemetry-hygiene.md).
 
 ## What belongs here vs. other pillars
 
@@ -88,8 +101,20 @@ For browser-side tracking in a non-React frontend (vanilla JS, Vue, Svelte, a mo
 - Session replay is bundled under analytics (`SessionRecordingProvider` in the React SDK), separate from error-tracking's replay-on-error integration — the two are independent capture paths even though both are called "replay."
 - Don't route business events through OTEL logs or traces — analytics has its own dashboard, retention, and ClickHouse fan-out tuned for high-volume event data; OTEL logs/traces are not.
 
+## Session replay acceptance criteria
+
+Use the dedicated **add-session-recording** skill, but do not enable replay until all of these hold:
+
+- Recording is off until the required consent exists.
+- `maskAllInputs` is enabled.
+- Authentication, payment, medical, account, admin, and secrets-management routes/elements are blocked or masked.
+- The recorder that is actually mounted responds to consent changes; a separate control-hook state is not sufficient evidence.
+- A replay containing synthetic sensitive values has been inspected in Temps and the values are absent.
+
 ## Gotchas
 
 - **Browser events not appearing**: check the Network tab for calls to `/api/_temps/event` first — if the request never fires, it's a client wiring issue (provider not mounted, `basePath` misconfigured), not a server-side ingestion problem. If it fires but 404s, the request's Host header doesn't match a routed deployment.
 - **Server-side events silently rejected**: `/api/projects/{project_id}/events/ingest` requires real auth with `AnalyticsWrite` permission — a missing/expired token, or a token scoped to a different project, returns an auth error, unlike the public beacon endpoint.
 - **ClickHouse-backed views lagging**: events land in the Postgres outbox immediately but ClickHouse fan-out is asynchronous via a background worker — a just-fired event may take a few seconds to appear in ClickHouse-backed dashboard views even though it's already durably recorded.
+- **Public event totals disagree with revenue/orders**: expected if the browser endpoint was blocked, retried, or forged. Use authenticated backend events as the authoritative source.
+- **Consent UI says replay is off but events still arrive**: verify the mounted recorder and the consent control share the same state; do not rely on UI state alone.

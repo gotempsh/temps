@@ -1,12 +1,33 @@
 ---
 name: temps-best-practices
 description: |
-  Best-practices reference for building apps on Temps — currently covers observability (error tracking, traces, metrics, logs, analytics), with room to grow into other pillars later. Use to: design how an app should emit telemetry to Temps, debug why errors/traces/metrics/logs/events aren't showing up, choose which pillar a signal belongs in, wire up multiple pillars at once, or check ingestion endpoints/auth tokens (tk_/dt_/si_)/rate limits/quotas for Temps' OTLP/Sentry/analytics APIs. Triggers: "temps best practices", "temps observability", "wire up telemetry", "why isn't this showing up in traces/metrics/logs", "otel best practices for temps", "instrument this app for temps". For single-pillar setup prefer add-error-tracking or add-react-analytics. For anything outside observability (deploy, services/databases, domains, CI automation), use the temps-cli skill instead.
+  Best-practices reference for preparing and instrumenting applications on Temps. Covers the app runtime contract (`.temps.yaml` health, HOST/PORT, readiness, SIGTERM, replicas, migrations) and production observability (errors, traces, metrics, logs, analytics, privacy, sampling, cardinality, credential boundaries). Use whenever building or reviewing an app for Temps, configuring health checks, adding telemetry, diagnosing missing/noisy signals, or checking OTLP/Sentry/analytics ingestion. Triggers include "temps best practices", "prepare this app for Temps", ".temps.yaml health", "temps health check", "ignore health checks in otel", "temps observability", "wire up telemetry", and "instrument this app for temps". Prefer focused setup skills for a single SDK. Use temps-cli for executing deploy and resource-management commands.
 ---
 
 # Temps Best Practices
 
-Best practices for building on Temps. Today this covers the **observability** pillar end to end (error tracking, traces, metrics, logs, analytics) — everything else an app needs from the platform (deploy, provisioning databases/caches, domains, CI/CD automation, notifications) is CLI-driven and covered by the **temps-cli** skill, not duplicated here.
+Best practices for application code that runs on Temps. This skill owns the **runtime contract** and **production observability**; use `temps-cli` for platform operations.
+
+## Required workflow
+
+1. For any deployable application, read [references/runtime-contract.md](references/runtime-contract.md).
+2. When any telemetry or replay is enabled, read [references/telemetry-hygiene.md](references/telemetry-hygiene.md).
+3. Read only the reference for each observability pillar in scope.
+4. Inspect the existing application and `.temps.yaml` before editing. Merge configuration; do not overwrite unrelated keys.
+5. Run the runtime and telemetry verification checklists before considering the work complete.
+
+## Runtime contract summary
+
+Every web application should expose a dedicated readiness endpoint and configure it in `.temps.yaml` under the project's effective Temps Root Directory / Docker build context:
+
+```yaml
+health:
+  path: /healthz
+```
+
+Use `health.path`; do not rely on the currently parsed-but-unapplied `status`, `interval`, `timeout`, or `retries` fields. If OpenTelemetry server tracing is enabled, exclude the exact health path from incoming spans and routine access-log/request-metric noise. Keep the route, `.temps.yaml`, and filters synchronized.
+
+Also require the app to read `PORT`, bind to `HOST`/`0.0.0.0`, align a custom image's `EXPOSE`, handle `SIGTERM`, flush telemetry, and exit inside Temps' 10-second shutdown window. See the runtime reference for readiness semantics, scale-to-zero caveats, replicas, migrations, stdout/stderr, and cron authentication.
 
 ## Observability
 
@@ -14,34 +35,38 @@ Temps replaces Sentry + Datadog/Honeycomb + PostHog with one ingestion surface. 
 
 - **add-error-tracking** — step-by-step Sentry SDK init per language/framework
 - **add-react-analytics** — step-by-step `@temps-sdk/react-analytics` hook usage
+- **add-session-recording** — privacy-aware session replay setup and verification
 
 ## Quickstart: wire up any app end to end
 
-Goal: an app in any language gets error tracking and traces flowing with minimal setup. Both signals use the same shape — one env var pointing at Temps, and the language's own official SDK does the rest.
+Goal: an app in any language gets runtime health, error tracking, and traces working safely.
 
-**If the app is deployed as a project on Temps (i.e. through Temps' own build/deploy pipeline), this is already done — zero configuration, by any user.** Every such deployment automatically gets these env vars injected, at **both** Docker build time (as `--build-arg`, so frontend bundlers can inline them) **and** container runtime (as `-e`, for server-side/SSR code reading `process.env` at request time):
+**Temps auto-injects exporter destinations and credentials; it does not install or initialize an SDK.** Apps deployed through Temps receive these variables at Docker build time and container runtime, but application instrumentation still has to be installed, initialized, filtered, and verified:
 
-| Env var | What it's for |
-|---|---|
-| `SENTRY_DSN` | Server-side/generic error tracking DSN, always present |
-| `NEXT_PUBLIC_SENTRY_DSN` / `NUXT_PUBLIC_SENTRY_DSN` / `VITE_SENTRY_DSN` / `PUBLIC_SENTRY_DSN` / `REACT_APP_SENTRY_DSN` | Framework-specific public DSN, added when the detected build preset needs a public-prefixed var to expose it client-side (Next.js/Nuxt/Vite,React,Vue,SolidStart,Remix/SvelteKit,Astro,Rsbuild/Docusaurus respectively) — not added for Angular or backend/generic presets, which just use `SENTRY_DSN` |
-| `SENTRY_RELEASE` | Commit SHA — every Sentry SDK reads this automatically when `release` isn't set explicitly; don't hardcode `release` in `Sentry.init()` or you override this and break source-context lookup |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (always `http/protobuf`), `OTEL_EXPORTER_OTLP_HEADERS` (deployment token auth) | Traces, auto-configured |
-| `OTEL_SERVICE_NAME` (project name), `OTEL_SERVICE_VERSION` (commit SHA when available) | Auto-populated span metadata |
+| Env var | What it's for | Client-safe? |
+|---|---|---:|
+| `SENTRY_DSN` | Server-side/generic error-tracking DSN | Server by default |
+| `NEXT_PUBLIC_SENTRY_DSN` / `NUXT_PUBLIC_SENTRY_DSN` / `VITE_SENTRY_DSN` / `PUBLIC_SENTRY_DSN` / `REACT_APP_SENTRY_DSN` | Framework-specific public Sentry write key | Yes |
+| `SENTRY_RELEASE` | Commit SHA; leave `release` unset in `Sentry.init()` so the SDK reads it | Server/build metadata |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP destination and `http/protobuf` protocol | Endpoint is non-secret |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Deployment-token authorization for OTLP | **No — server only** |
+| `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION` | Stable service and release metadata | Non-secret |
 
-Implemented in `temps-deployments` crate: `src/services/workflow_planner.rs` (`gather_environment_variables` collects them; the same map is threaded to both the build job as `build_args` — `workflow_planner.rs:1164-1198`/`1264-1306` → `docker.rs:960-988`'s `buildargs` — and the deploy job as runtime `env` — `docker.rs:1778-1784`). There is **no build-time-vs-runtime gap** for apps going through this pipeline: a `NEXT_PUBLIC_SENTRY_DSN`-style var is genuinely present when the client bundle is compiled, not just after the container starts. If a variable from the table is missing on a running deployment, that's a platform bug — investigate the deployment's build/deploy logs, don't work around it by hardcoding a value.
+Build-time availability does not make a server credential browser-safe. Never expose `OTEL_EXPORTER_OTLP_HEADERS`, `TEMPS_API_TOKEN`, `dt_`, or `tk_` through a public-prefixed variable or client bundle. Browser/mobile OTLP must use an authenticated backend or collector; see [references/telemetry-hygiene.md](references/telemetry-hygiene.md).
 
 **This auto-injection is scoped to apps deployed *through* Temps.** It does not apply to: an app running elsewhere and only sending telemetry to a self-hosted Temps instance, or to Temps' own console/dashboard (which is built by its own CI, not through this deploy pipeline — self-referential, since Temps doesn't deploy itself as a project on itself). For those cases, get the real credential from the dashboard and wire it through whatever env var / build-arg / secrets mechanism that project's *own* build system already uses:
 - Error tracking DSN: **Error Tracking → DSN & Setup** (`https://<public_key>@<temps-host>/<project_id>`)
-- A deployment token (`dt_...`) or API key (`tk_...`) for OTLP: **Project Settings → API Keys**
+- A server-side deployment token (`dt_...`) or API key (`tk_...`) for OTLP: **Project Settings → API Keys**
 
-**Never hardcode a DSN, token, or endpoint value into source code, a Dockerfile, or CI config — and never ask the user to supply one so it can be hardcoded.** The fix for "this needs to be available at build time" is always to pass it as a build arg / build-time env var through the project's existing mechanism (matching the dual-injection pattern above), never to bake a literal secret into a file. If the real value is genuinely unknown, the answer is "go get it from **Error Tracking → DSN & Setup**" or "go get it from **Project Settings → API Keys**" — not "paste it here so I can commit it."
+Never hardcode a token or endpoint into source, a Dockerfile, or CI config. Do not ask the user for a token so it can be committed. A Sentry DSN public key is designed for client writes, but should still come from the platform's supported configuration path.
 
 Either way, the app-side steps are the same:
 
-1. **Error tracking**: follow [add-error-tracking](../add-error-tracking/SKILL.md) for the app's language — install the official Sentry SDK, point it at `SENTRY_DSN` (or the framework's public variant). No Temps-specific package exists or is needed.
-2. **Traces**: follow the per-language quickstart in [references/opentelemetry-traces.md](references/opentelemetry-traces.md) — install the official OpenTelemetry SDK/agent for the language; if the three `OTEL_EXPORTER_OTLP_*` env vars are already set, most SDKs pick them up with zero additional config.
-3. **Verify** both landed using the checklist below before considering the app "instrumented."
+1. **Runtime**: apply [references/runtime-contract.md](references/runtime-contract.md).
+2. **Hygiene**: establish credential boundaries, redaction, cardinality, batching, sampling, and shutdown using [references/telemetry-hygiene.md](references/telemetry-hygiene.md).
+3. **Error tracking**: follow [add-error-tracking](../add-error-tracking/SKILL.md), leaving release metadata environment-driven.
+4. **Traces**: install and initialize the official OpenTelemetry SDK/agent using [references/opentelemetry-traces.md](references/opentelemetry-traces.md). Auto-injected env vars only configure export.
+5. **Verify** runtime and telemetry behavior before considering the app production-ready.
 
 ## The five pillars
 
@@ -55,6 +80,8 @@ Either way, the app-side steps are the same:
 
 Read the specific reference file(s) for the pillar(s) in play — don't load all five unless doing a full-stack instrumentation pass.
 
+Cross-pillar production rules live in [references/telemetry-hygiene.md](references/telemetry-hygiene.md), not duplicated in every pillar.
+
 ## Deciding which pillar a signal belongs in
 
 - **"This threw/crashed"** → error tracking, not a log line. Logs are for structured record-keeping, not exception capture.
@@ -65,24 +92,31 @@ Read the specific reference file(s) for the pillar(s) in play — don't load all
 
 ## Shared ingestion facts across pillars
 
-All Temps telemetry ingestion (OTLP traces/metrics/logs) shares one auth and rate-limit model — know this once instead of re-deriving it per pillar:
+Temps OTLP ingestion shares a rate-limit/quota model, but token support differs by signal:
 
-- **Token prefixes**: `tk_` (API key, needs `X-Temps-Project-Id` header), `dt_` (deployment token, project-scoped already), `si_` (webhook/integration token). Sentry-compatible error ingestion uses the DSN's public key instead, not these tokens.
+- **`tk_` API key**: server-side; needs `X-Temps-Project-Id`.
+- **`dt_` deployment token**: server-side and project/environment scoped. Prefer the header-based endpoint so Temps resolves attribution from the token. Do not expose it to a browser.
+- **`si_` integration token**: supported for infrastructure metrics ingestion, not general traces/logs.
+- **Sentry-compatible ingestion**: uses the DSN public key rather than these machine tokens.
 - **Auth header**: `Authorization: Bearer <token>` or `X-Temps-Api-Key: <token>`. Some OTLP exporters URL-encode the header as `Bearer%20<token>` — Temps accepts that too.
 - **Rate limit**: 1000 req/60s per token by default (`TEMPS_OTEL_RATE_LIMIT`, `TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS` — server-side config, not something the app sets).
 - **Storage quota**: off by default; a self-hosted instance can opt in via `TEMPS_OTEL_QUOTA_GB`. If ingestion suddenly starts 413'ing, that's the likely cause.
-- **Endpoint shape**: every plugin's routes are nested under `/api` by the console server — path-based `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/{traces|metrics|logs}` or header-based `POST /api/otel/v1/{traces|metrics|logs}` with project/env/deployment resolved from the token. Prefer the standard OTLP exporter env vars (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`) over hand-rolling requests — any OTLP/HTTP protobuf exporter works unmodified against these endpoints.
+- **Endpoint shape**: prefer header-based `POST /api/otel/v1/{traces|metrics|logs}` with attribution resolved from the token. Path-based endpoints exist, but should not be used to override a deployment token's intended deployment attribution.
 
-## Verification checklist for a full instrumentation pass
+## Definition of done
 
-1. Error tracking: trigger a deliberate error, confirm it appears in **Error Tracking → Error Groups**.
-2. Traces: make a request through the instrumented path, confirm a span appears in **Observe → Traces** with a sane `duration_ms` (see the unit gotcha in [references/opentelemetry-traces.md](references/opentelemetry-traces.md)).
-3. Metrics: confirm a custom metric name passes the `[a-zA-Z0-9_.:- ]` character set (see [references/metrics.md](references/metrics.md)) and shows up in **Observe → Metrics**.
-4. Logs: confirm log records with `trace_id` set join the correct trace in the UI.
-5. Analytics: confirm `/api/_temps/event` or `/api/projects/{id}/events/ingest` calls land in **Analytics** within a few seconds — see [references/analytics.md](references/analytics.md) for a language-agnostic quickstart, since analytics has no per-language SDK beyond React.
+1. Runtime: app listens on the injected port/interface; readiness is configured in the effective app root; `SIGTERM` drains and exits within 10 seconds.
+2. Health noise: repeated health requests succeed without routine server spans, access logs, or request metrics; a normal route remains observable.
+3. Error tracking: a deliberate test error appears in **Error Tracking → Error Groups** with the expected release and no sensitive data.
+4. Traces: a normal request appears in **Observe → Traces**, uses a route-template name, propagates context downstream, and has a sane `duration_ms`.
+5. Metrics: names and bounded labels pass validation; no user/session/request identifiers create cardinality explosions.
+6. Logs: a structured log inside an active span joins the correct trace and contains no secrets.
+7. Analytics: browser events are treated as untrusted; an authoritative test conversion comes from authenticated server code.
+8. Replay: recording is consent-gated, masked, path-restricted, and inspected with synthetic sensitive values.
+9. Client bundle: built assets contain no `dt_`, `tk_`, `TEMPS_API_TOKEN`, or OTLP authorization header.
 
-If a signal never appears, check auth token prefix/header first, then rate limit/quota, before assuming the SDK integration is broken — most "nothing shows up" cases are one of those two.
+If a signal never appears, check whether the SDK was actually initialized, then endpoint/protocol, token type/header, rate limit, and quota.
 
 ## Everything else
 
-Deployment, service/database provisioning, environment variables, domains, monitoring config, backups, and CI/CD automation are all reached through the Temps CLI (`bunx @temps-sdk/cli`). Use the **temps-cli** skill for those — this skill only owns the observability pillars above.
+Beyond the runtime health contract and observability guidance above, deployment, service/database provisioning, environment variables, domains, monitoring config, backups, and CI/CD automation are all reached through the Temps CLI (`bunx @temps-sdk/cli`). Use the **temps-cli** skill for those operations.

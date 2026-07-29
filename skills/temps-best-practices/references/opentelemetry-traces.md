@@ -1,8 +1,21 @@
 # OpenTelemetry Traces
 
-Temps ingests standard OTLP/HTTP (protobuf) trace exports — any language's OpenTelemetry SDK works unmodified, there is no Temps-specific tracing SDK. Point the standard OTLP exporter env vars at Temps instead of hand-writing requests.
+Temps ingests standard OTLP/HTTP (protobuf) trace exports. There is no Temps-specific tracing SDK: install and initialize the official OpenTelemetry SDK for the application's language, then point its standard exporter variables at Temps.
 
-**Apps deployed on Temps get this for free, no configuration needed by the user**: every deployment automatically has `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION` injected — at both Docker build time (`--build-arg`) and container runtime (`-e`), so this is available however the app's OTEL SDK reads it. Never hardcode these values or ask the user for a token/endpoint to hardcode; if they're missing on a running deployment, that's a platform bug, not something to work around manually. See the top-level [SKILL.md](../SKILL.md) quickstart for the exact injection mechanism and its scope (apps deployed *through* Temps only — not Temps' own console, and not apps hosted elsewhere). The manual config below is for apps sending telemetry to a self-hosted Temps instance from outside the platform.
+Apps deployed on Temps receive `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, and `OTEL_SERVICE_VERSION`. This configures export only—it does not install instrumentation, choose production sampling, filter health traffic, propagate context, or flush on shutdown. `OTEL_EXPORTER_OTLP_HEADERS` contains a live deployment token and is server-only.
+
+## Contents
+
+- [Endpoints](#endpoints)
+- [Standard OTLP exporter config](#standard-otlp-exporter-config)
+- [Required: exclude the health-check path](#required-exclude-the-health-check-path)
+- [Production baseline](#production-baseline)
+- [Quickstart: instrument any language](#quickstart-instrument-any-language)
+- [Auth](#auth)
+- [Rate limits and quota](#rate-limits-and-quota)
+- [Storage](#storage)
+- [Critical gotcha: trace duration units](#critical-gotcha-trace-duration-units)
+- [Gotchas](#gotchas)
 
 ## Endpoints
 
@@ -23,7 +36,7 @@ OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<dt_or_tk_token>
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ```
 
-Most OTLP SDKs auto-append `/v1/traces` (or `/v1/metrics`, `/v1/logs`) to `OTEL_EXPORTER_OTLP_ENDPOINT`, landing on the path above. This is exactly the value Temps auto-injects into every deployment (`{TEMPS_API_URL}/otel`, i.e. `{base_url}/api/otel` — see `temps-deployments::workflow_planner::gather_environment_variables`, `crates/temps-deployments/src/services/workflow_planner.rs:448-452`).
+Most OTLP SDKs auto-append `/v1/traces` (or `/v1/metrics`, `/v1/logs`) to `OTEL_EXPORTER_OTLP_ENDPOINT`, landing on the path above.
 
 For `tk_` tokens (not project-scoped by default), also set:
 
@@ -31,9 +44,92 @@ For `tk_` tokens (not project-scoped by default), also set:
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<tk_token>,X-Temps-Project-Id=<project_id>
 ```
 
-`dt_` (deployment token) and `si_` tokens are already project/environment/deployment-scoped and don't need the project-id header.
+`dt_` deployment tokens don't need the project-id header. `si_` integration tokens are for infrastructure metrics ingestion; do not use them for application traces or logs.
 
 **Always set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` explicitly.** Several official SDKs (Node, Python, Java, .NET) default their generic OTLP exporter to gRPC — Temps only accepts OTLP/HTTP with a protobuf body, so a gRPC export will silently fail to connect rather than fall back.
+
+## Required: exclude the health-check path
+
+OpenTelemetry server tracing is not complete until the path configured in the effective app root's `.temps.yaml` is excluded from incoming-request instrumentation:
+
+```yaml
+health:
+  path: /healthz
+```
+
+Filter the exact URL pathname before its server span is created or exported. Do not assume the generic `OTEL_EXPORTER_OTLP_*` variables do this: they configure export, not request filtering, and OTel does not define one cross-language health-path exclusion variable. Use the current request-ignore mechanism provided by the app's language/framework instrumentation.
+
+For Node.js auto-instrumentation, use the HTTP instrumentation's `ignoreIncomingRequestHook`. The zero-code `@opentelemetry/auto-instrumentations-node/register` preload cannot accept programmatic instrumentation options, so use a small preload file when health filtering is required:
+
+```bash
+npm install @opentelemetry/sdk-node \
+  @opentelemetry/exporter-trace-otlp-proto \
+  @opentelemetry/auto-instrumentations-node
+```
+
+```js
+// tracing.cjs — load before the application
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const {
+  OTLPTraceExporter,
+} = require('@opentelemetry/exporter-trace-otlp-proto');
+const {
+  getNodeAutoInstrumentations,
+} = require('@opentelemetry/auto-instrumentations-node');
+
+const HEALTH_PATH = '/healthz'; // must match .temps.yaml health.path
+
+const sdk = new NodeSDK({
+  traceExporter: new OTLPTraceExporter(), // reads OTEL_EXPORTER_OTLP_* env vars
+  instrumentations: [
+    getNodeAutoInstrumentations({
+      '@opentelemetry/instrumentation-http': {
+        ignoreIncomingRequestHook(request) {
+          const pathname = new URL(
+            request.url || '/',
+            'http://localhost',
+          ).pathname;
+          return pathname === HEALTH_PATH;
+        },
+      },
+    }),
+  ],
+});
+
+sdk.start();
+
+process.once('SIGTERM', async () => {
+  await sdk.shutdown(); // compose with the app's request/DB shutdown path
+});
+```
+
+Start with `NODE_OPTIONS="--require ./tracing.cjs"` or `node --require ./tracing.cjs app.js`.
+
+Framework wrappers may expose different filters. Confirm that the option applies to **incoming server requests**; an outbound `fetch` ignore list does not suppress the server span created when Temps calls the app. If the wrapper cannot filter incoming requests, use its supported sampler/span-processor approach or a configurable SDK bootstrap, and verify the result rather than assuming the route is ignored.
+
+Verification is behavioral: call the health route several times and confirm no corresponding server spans appear in **Observe → Traces**, then call a normal route and confirm that its span still appears. If either side fails, the exclusion is too narrow or too broad.
+
+The scale-to-zero wake probe currently calls `/` independently of `.temps.yaml`. Do not exclude `/` to hide those spans because that would also hide legitimate root-route traffic. See [runtime-contract.md](runtime-contract.md).
+
+## Production baseline
+
+Apply [telemetry-hygiene.md](telemetry-hygiene.md) before enabling production export:
+
+- Use a batch span processor with a bounded queue and export timeout.
+- Choose an environment-appropriate parent-based trace-id-ratio sampler rather than assuming 100% collection is affordable:
+
+  ```bash
+  OTEL_TRACES_SAMPLER=parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG=0.05
+  ```
+
+  `0.05` is an example. Base the real ratio on traffic volume and debugging needs.
+- Exclude health checks, static assets, and low-value middleware/socket spans at the source.
+- Use route-template span names and drop high-cardinality attributes.
+- Extract inbound and inject outbound W3C `traceparent`/`tracestate`. Temps configures export; application instrumentation remains responsible for propagation.
+- Preserve parent sampling decisions across services.
+- Flush/shut down the provider during `SIGTERM` inside Temps' 10-second container stop window.
+- Never put raw tokens, authorization/cookie headers, request bodies, sensitive query values, or unredacted GenAI prompts/completions in spans.
 
 ## Quickstart: instrument any language
 
@@ -41,7 +137,7 @@ Every OpenTelemetry SDK reads the three env vars above and needs no Temps-specif
 
 ### Node.js (and Next.js server/API routes)
 
-Zero-code, via the OpenTelemetry auto-instrumentation agent — no source changes:
+For a quick local smoke test, the zero-code OpenTelemetry auto-instrumentation agent needs no source changes:
 
 ```bash
 npm install --save-dev @opentelemetry/auto-instrumentations-node
@@ -49,6 +145,8 @@ node --require @opentelemetry/auto-instrumentations-node/register app.js
 ```
 
 Or set `NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"` in the deployment env so it applies without changing the start command.
+
+For a Temps deployment, replace this zero-code preload with the configurable `tracing.cjs` bootstrap above so the `.temps.yaml` health path is excluded.
 
 For Next.js specifically, use the built-in `instrumentation.ts` hook instead:
 
@@ -66,6 +164,8 @@ export function register() {
 ```
 
 `@vercel/otel` reads the same `OTEL_EXPORTER_OTLP_*` env vars — no Temps-specific config needed.
+
+`instrumentationConfig.fetch.ignoreUrls` controls outbound fetch instrumentation; it does not prove the incoming Next.js health request is suppressed. Use the wrapper/version's supported incoming-span filter or a custom processor/bootstrap and verify behavior in Temps. Do not mark the integration complete merely because `/healthz` appears in an outbound ignore list.
 
 **Critical gotcha if the app also uses `@sentry/nextjs`**: Sentry's Next.js SDK registers its own global `TracerProvider`/`ContextManager` by default. If `Sentry.init()` runs before `registerOTel()` — which it normally does, since Sentry's config files load ahead of `instrumentation.ts`'s `register()` — every span becomes non-recording and **traces silently stop reaching Temps with no error anywhere**. Fix by passing `skipOpenTelemetrySetup: true` to `Sentry.init()` in `sentry.server.config.ts` (and `sentry.edge.config.ts` if used) so `@vercel/otel` remains the sole tracer provider:
 
@@ -212,45 +312,29 @@ builder.Services.AddOpenTelemetry()
 
 ### Browser (React, Vue, Svelte, Angular)
 
-Traces from browser code use the OpenTelemetry Web SDK — the same packages work regardless of frontend framework, since instrumentation is framework-agnostic:
+Do not export browser traces directly to Temps with a `dt_`/`tk_` bearer token. Those are live server credentials, and putting one in JavaScript or a public build-time variable exposes it to every visitor. Temps' OTLP routes are not a public browser-ingest surface.
 
-```bash
-npm install @opentelemetry/sdk-trace-web @opentelemetry/exporter-trace-otlp-http @opentelemetry/instrumentation-fetch
-```
+If browser tracing is required:
 
-```ts
-// src/otel.ts — import this first in your app entrypoint
-import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
-import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
-import { registerInstrumentations } from '@opentelemetry/instrumentation';
+1. Collect with the OpenTelemetry Web SDK.
+2. Send to a same-origin application backend or trusted collector.
+3. Validate and rate-limit the public request there.
+4. Add the Temps OTLP credential only on the server-side hop.
 
-const provider = new WebTracerProvider({
-  spanProcessors: [
-    new BatchSpanProcessor(
-      new OTLPTraceExporter({
-        url: 'https://<temps-host>/api/otel/v1/traces',
-        headers: { Authorization: 'Bearer <dt_or_tk_token>' },
-      })
-    ),
-  ],
-});
-provider.register();
-registerInstrumentations({ instrumentations: [new FetchInstrumentation()] });
-```
-
-Browser exporters can't read process env vars, so the endpoint/headers must be passed explicitly in code (via a build-time env var like other bundler-injected config, not hardcoded) rather than through `OTEL_EXPORTER_OTLP_*`.
+For most browser applications, use Temps analytics/Web Vitals plus Sentry-compatible error tracking and keep full OTLP export on the server. See [telemetry-hygiene.md](telemetry-hygiene.md).
 
 ### React Native / Flutter
 
-Mobile OpenTelemetry SDKs are less mature than the backend/browser ecosystem and package availability changes — check the [OpenTelemetry registry](https://opentelemetry.io/ecosystem/registry/) for the current state before committing to one. For most apps it's more reliable to send mobile telemetry through your own backend (which is already instrumented per above) rather than exporting OTLP directly from the device. Error tracking is the more mature signal for mobile — see [add-error-tracking](../../add-error-tracking/SKILL.md), which has dedicated React Native and Flutter setup.
+Never embed a Temps `dt_`/`tk_` token in a mobile binary. Send mobile telemetry through an authenticated application backend/collector. Error tracking is the more mature direct-device signal — see [add-error-tracking](../../add-error-tracking/SKILL.md).
 
 ## Auth
 
-- `Authorization: Bearer <token>` (percent-encoded `Bearer%20<token>` is also accepted — some OTLP exporters encode headers that way)
-- `X-Temps-Api-Key: <token>` as an alternative to the `Authorization` header
-- `X-Temps-Project-Id: <id>` — required alongside `tk_` tokens, optional/ignored for `dt_`/`si_`
+- `Authorization: Bearer <token>` (Temps also accepts literal `Bearer%20<token>` produced by some exporters)
+- `X-Temps-Api-Key: <token>` as an alternative
+- `X-Temps-Project-Id: <id>` — required with `tk_`; unnecessary with `dt_`
+- `si_` — infrastructure metrics only, not application traces/logs
+
+Prefer the header-based endpoint with a `dt_` so Temps resolves project/environment/deployment attribution from authentication. Do not expose machine tokens to untrusted clients.
 
 ## Rate limits and quota
 

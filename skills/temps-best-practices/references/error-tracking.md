@@ -16,6 +16,8 @@ https://<public_key>@<temps-host>/<project_id>
 
 The `public_key` is per-project and derived from the DB; the `secret_key` (if any) is never exposed in API responses.
 
+The DSN public key is intentionally safe for browser write-only ingestion. It is not equivalent to a `dt_` deployment token or `tk_` API key, which are server-only machine credentials.
+
 ## Release auto-injection
 
 Temps also auto-injects `SENTRY_RELEASE` (the deployment's commit SHA) alongside `SENTRY_DSN` for apps deployed through Temps (`workflow_planner.rs:1066-1070,1895-1920`) — every official Sentry SDK reads `SENTRY_RELEASE` from the environment when `release` isn't explicitly set in `Sentry.init()`, tagging events with the correct release automatically. **Don't hardcode a `release` value in `Sentry.init()`** — doing so overrides the injected value and breaks the dashboard's ability to join a stack frame back to its source (**Error Tracking → Source Context**). Leave `release` unset and let the SDK pick up `SENTRY_RELEASE` on its own.
@@ -45,6 +47,18 @@ Any of these are accepted, in priority order:
 - Request body: 2 MiB compressed, 10 MiB decompressed (`SENTRY_INGEST_BODY_LIMIT`) — guards against decompression bombs.
 - gzip `Content-Encoding` is supported and decoded with a size guard.
 
+## Sensitive data
+
+Temps stores the event the SDK sends, so scrub it before export:
+
+- Keep legacy `sendDefaultPii` false/undefined, or use the SDK's current granular `dataCollection` allow/deny configuration.
+- Do not collect authorization/cookie headers, HTTP bodies, sensitive query parameters, database parameter values, passwords, tokens, payment data, or raw GenAI inputs/outputs by default.
+- Use `beforeSend` (or the language SDK's equivalent event processor) to remove unsafe request, user, breadcrumb, context, and extra fields after integrations have populated the event.
+- Prefer allowlisting required fields. Returning `null` from `beforeSend` should drop an event that cannot be made safe.
+- Test with synthetic canary secrets and inspect the stored event in Temps.
+
+See [telemetry-hygiene.md](telemetry-hygiene.md) for the cross-pillar policy.
+
 ## Response shape
 
 - Store/Envelope: `{"id": "<event_uuid>"}`, HTTP 200
@@ -56,3 +70,4 @@ Any of these are accepted, in priority order:
 - **Browser apps not reporting**: the DSN env var needs the bundler's public prefix (`NEXT_PUBLIC_`, `VITE_`, `PUBLIC_`) to reach the client bundle; a plain `SENTRY_DSN` won't be inlined into browser code.
 - **Minified stack traces**: upload source maps via `sentry-cli sourcemaps upload` in CI, or through **Error Tracking → Source Maps** in the dashboard — the release version passed to the SDK must match the release the source maps were uploaded under.
 - **Production events missing but local ones work**: the deployment's env vars are separate from local `.env` files — confirm the DSN is actually set in the deployed environment, not just locally.
+- **Unexpected PII**: inspect the SDK's resolved data-collection settings and the post-integration `beforeSend` event; initializing the SDK with defaults does not prove application-added extras/breadcrumbs are safe.

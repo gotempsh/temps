@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis, a high-severity merge gate, and fail-closed symlink validation.
+- **temps-best-practices skill:** Add an application runtime contract covering `.temps.yaml` readiness paths, OpenTelemetry health-request suppression, port binding, graceful shutdown, replica-safe state, migrations, telemetry privacy, and browser credential boundaries so generated deployment guidance is safe and production-ready.
 
 ### Fixed
 
