@@ -21,6 +21,9 @@ grep -Fq -- '--repo "$REPOSITORY"' "$nightly_workflow" ||
 grep -Fq -- '--ref "$TAG"' "$nightly_workflow" ||
   fail "nightly tags are not explicitly dispatched to the release workflow"
 
+grep -Fq -- '--field dry_run=false' "$nightly_workflow" ||
+  fail "nightly release dispatches would use the safe dry-run default"
+
 # The active-run query must be scoped to the nightly tag, not merely the SHA;
 # an unrelated branch dry-run can share the same commit.
 # shellcheck disable=SC2016
