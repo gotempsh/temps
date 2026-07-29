@@ -10787,7 +10787,14 @@ mod tests {
         let service = manager.create_service(request).await.unwrap();
         let service_id = service.id;
 
-        // Get service details and verify parameters are properly handled
+        // The persisted config must remain encrypted at rest.
+        let stored_service = manager.get_service(service_id).await.unwrap();
+        let encrypted_config = stored_service
+            .config
+            .expect("service config should be stored");
+        assert!(!encrypted_config.contains("super_secret_password"));
+
+        // Normal service details must mask sensitive parameters.
         let details = manager.get_service_details(service_id).await;
         assert!(details.is_ok());
 
@@ -10795,11 +10802,17 @@ mod tests {
         assert!(service_details.current_parameters.is_some());
 
         let current_params = service_details.current_parameters.unwrap();
-        // Password should be decrypted for authorized access
         assert_eq!(
             current_params.get("password"),
-            Some(&JsonValue::String("super_secret_password".to_string()))
+            Some(&JsonValue::String("***".to_string()))
         );
+
+        // Plaintext is available only through the explicit reveal path.
+        let revealed_password = manager
+            .get_sensitive_parameter_value(service_id, "password")
+            .await
+            .expect("explicit reveal should decrypt the password");
+        assert_eq!(revealed_password, "super_secret_password");
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
