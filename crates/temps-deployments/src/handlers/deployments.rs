@@ -4079,7 +4079,10 @@ mod tests {
         .await
         .expect("Failed to create test deployment");
 
-        // Create deployment jobs
+        // Create deployment jobs. The first row deliberately uses the legacy
+        // plaintext format to prove an authorized same-project read cannot
+        // receive secrets from historical/queued workflow configuration.
+        const SAME_PROJECT_SECRET: &str = "same-project-legacy-build-secret";
         let _job1 = deployment_jobs::ActiveModel {
             deployment_id: Set(deployment.id),
             job_id: Set("build-job".to_string()),
@@ -4087,6 +4090,10 @@ mod tests {
             name: Set("Build Job".to_string()),
             log_id: Set("build-log".to_string()),
             status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": SAME_PROJECT_SECRET},
+                "build_args_encrypted": "legacy-ciphertext-must-not-leave-api"
+            }))),
             ..Default::default()
         }
         .insert(&*db)
@@ -4208,6 +4215,17 @@ mod tests {
         let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
         assert!(body["jobs"].is_array());
         assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        let body_json = body.to_string();
+        assert!(!body_json.contains(SAME_PROJECT_SECRET));
+        assert!(!body_json.contains("legacy-ciphertext-must-not-leave-api"));
+        assert!(
+            body["jobs"]
+                .as_array()
+                .expect("jobs must be an array")
+                .iter()
+                .all(|job| job["job_config"].is_null()),
+            "external job responses must redact executor-internal configuration",
+        );
 
         let foreign_jobs_response = client
             .get(format!(
