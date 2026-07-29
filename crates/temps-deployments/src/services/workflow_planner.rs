@@ -1203,14 +1203,17 @@ impl WorkflowPlanner {
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
 
-            // Convert environment variables to build args
-            let mut build_args_map = serde_json::Map::new();
-            for (key, value) in &env_vars {
-                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
+            // Build args contain every resolved environment value, including
+            // secrets. Keep the static-deployment path aligned with container
+            // deployments: store only an encrypted envelope plus a plaintext
+            // key index for diagnostics.
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
             build_args_map.insert(
                 BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
-                serde_json::Value::String(buildkit_cache_namespace.clone()),
+                buildkit_cache_namespace.clone(),
             );
 
             // Parse preset_config if present (for Dockerfile preset)
@@ -1228,6 +1231,20 @@ impl WorkflowPlanner {
                 }
             }
 
+            let mut build_job_config = serde_json::json!({
+                "dockerfile_path": dockerfile_path,
+                "build_context": build_context,
+            });
+            if let Some(obj) = build_job_config.as_object_mut() {
+                crate::services::sensitive_envelope::write_sealed(
+                    obj,
+                    self.encryption_service.as_ref(),
+                    "build_args",
+                    &build_args_map,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to seal static build_args: {}", e))?;
+            }
+
             // Job 2: Build image (for static deployments, this builds the static files inside container)
             jobs.push(JobDefinition {
                 job_id: "build_image".to_string(),
@@ -1235,11 +1252,7 @@ impl WorkflowPlanner {
                 name: "Build Container Image".to_string(),
                 description: Some("Build Docker image and compile static files".to_string()),
                 dependencies: build_dependencies.clone(),
-                job_config: Some(serde_json::json!({
-                    "dockerfile_path": dockerfile_path,
-                    "build_args": build_args_map,
-                    "build_context": build_context
-                })),
+                job_config: Some(build_job_config),
                 required_for_completion: true,
             });
 
@@ -2729,6 +2742,83 @@ mod tests {
             assert!(config_obj.get("port").is_some());
             assert!(config_obj.get("replicas").is_some());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_build_args_are_sealed() -> Result<(), Box<dyn std::error::Error>> {
+        const STATIC_SECRET: &str = "static-build-secret-must-not-leak";
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Docker unavailable; skipping static build-args sealing test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "STATIC_DATABASE_PASSWORD".to_string(),
+            STATIC_SECRET.to_string(),
+        );
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(SucceedingSecretsResolver { secrets });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::Static).await?;
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .expect("static deployment must include build_image");
+        let config = build_job
+            .job_config
+            .as_ref()
+            .expect("build_image must include job_config");
+
+        assert!(
+            config.get("build_args").is_none(),
+            "static build args must never be persisted in plaintext",
+        );
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_arg_keys = config
+            .get("build_args_keys")
+            .and_then(serde_json::Value::as_array)
+            .expect("static build args must include a plaintext key index");
+        assert!(
+            build_arg_keys
+                .iter()
+                .any(|key| key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)),
+            "static builds must receive the BuildKit cache namespace",
+        );
+        assert!(
+            !config.to_string().contains(STATIC_SECRET),
+            "sealed static job_config must not contain secret values",
+        );
+
+        let opened = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        assert_eq!(
+            opened.get("STATIC_DATABASE_PASSWORD").map(String::as_str),
+            Some(STATIC_SECRET),
+            "executor must recover static build args from the sealed envelope",
+        );
 
         Ok(())
     }
