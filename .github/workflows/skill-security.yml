@@ -1,0 +1,144 @@
+name: Skill Security
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "skills/**"
+      - ".github/skill-scanner-requirements.in"
+      - ".github/skill-scanner-requirements.txt"
+      - ".github/workflows/skill-security.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  changed-skills:
+    name: Find changed agent skills
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      skill-paths: ${{ steps.changed.outputs.skill-paths }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build changed-skill matrix
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          changed = subprocess.check_output(
+              [
+                  "git",
+                  "diff",
+                  "--name-only",
+                  "-z",
+                  "--no-renames",
+                  "--diff-filter=ACMT",
+                  os.environ["BASE_SHA"],
+                  os.environ["HEAD_SHA"],
+                  "--",
+                  "skills",
+              ]
+          ).decode("utf-8").split("\0")
+
+          skill_paths = set()
+          for path in filter(None, changed):
+              parts = path.split("/")
+              if len(parts) < 2:
+                  continue
+              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", parts[1]):
+                  raise SystemExit(f"Invalid skill directory name: {parts[1]!r}")
+              skill_paths.add(f"skills/{parts[1]}")
+
+          with open(
+              os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8"
+          ) as output:
+              print(
+                  "skill-paths="
+                  + json.dumps(sorted(skill_paths), separators=(",", ":")),
+                  file=output,
+              )
+          PY
+
+  skill-security:
+    name: Scan ${{ matrix.skill-path }}
+    needs: changed-skills
+    if: needs.changed-skills.outputs.skill-paths != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        skill-path: ${{ fromJSON(needs.changed-skills.outputs.skill-paths) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install hash-locked Cisco Skill Scanner
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install
+          --require-hashes
+          --only-binary=:all:
+          --requirement .github/skill-scanner-requirements.txt
+
+      - name: Scan changed skill
+        env:
+          SKILL_PATH: ${{ matrix.skill-path }}
+        run: >-
+          skill-scanner scan "$SKILL_PATH"
+          --policy balanced
+          --use-behavioral
+          --format table
+          --fail-on-severity high
+
+  skill-security-gate:
+    name: Skill security gate
+    needs:
+      - changed-skills
+      - skill-security
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      CHANGED_RESULT: ${{ needs.changed-skills.result }}
+      SCAN_RESULT: ${{ needs.skill-security.result }}
+      SKILL_PATHS: ${{ needs.changed-skills.outputs.skill-paths }}
+    steps:
+      - name: Enforce scan result
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGED_RESULT" != "success" ]]; then
+            echo "Changed-skill discovery failed." >&2
+            exit 1
+          fi
+          if [[ "$SKILL_PATHS" != "[]" && "$SCAN_RESULT" != "success" ]]; then
+            echo "At least one changed skill failed security scanning." >&2
+            exit 1
+          fi
+          echo "Skill security gate passed."
