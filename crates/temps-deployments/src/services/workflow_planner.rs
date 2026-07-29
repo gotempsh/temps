@@ -33,6 +33,26 @@ pub struct JobDefinition {
 
 use super::deployment_token_service::DeploymentTokenService;
 
+const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
+
+/// Derive an opaque, stable namespace for BuildKit cache mounts.
+///
+/// Cache mounts are writable and live on a shared builder. A public namespace
+/// would allow an unrelated project to mount or poison another project's
+/// cache. The HMAC-derived value is stable for warm builds of the same ref but
+/// cannot be derived by tenants that do not hold the Temps master key.
+fn buildkit_cache_mount_namespace(
+    encryption_service: &EncryptionService,
+    project_id: i32,
+    environment_id: i32,
+    cache_ref: &str,
+) -> String {
+    let domain = format!(
+        "temps-buildkit-cache-v1:project={project_id}:environment={environment_id}:ref={cache_ref}"
+    );
+    hex::encode(encryption_service.derive_subkey(&domain))
+}
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -1063,6 +1083,28 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
+        // BuildKit's predefined BUILDKIT_CACHE_MOUNT_NS argument is applied to
+        // every RUN --mount=type=cache ID. Scope it by project, environment,
+        // and checked-out ref so unrelated tenants and preview branches cannot
+        // read or poison each other's writable compiler/package caches.
+        //
+        // Tags take precedence during checkout, followed by branches and
+        // direct commit deployments. Branch deployments therefore retain a
+        // stable namespace across commits, while detached commits remain
+        // isolated.
+        let cache_ref = deployment
+            .tag_ref
+            .as_deref()
+            .or(deployment.branch_ref.as_deref())
+            .or(deployment.commit_sha.as_deref())
+            .unwrap_or(&project.main_branch);
+        let buildkit_cache_namespace = buildkit_cache_mount_namespace(
+            self.encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            cache_ref,
+        );
+
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
         if let Some(ref commit_sha) = deployment.commit_sha {
@@ -1166,6 +1208,10 @@ impl WorkflowPlanner {
             for (key, value) in &env_vars {
                 build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
             }
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                serde_json::Value::String(buildkit_cache_namespace.clone()),
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1261,10 +1307,14 @@ impl WorkflowPlanner {
             // whole map under `build_args_encrypted` instead so an operator
             // dumping `deployment_jobs.job_config` for debugging never sees
             // an env-var value they shouldn't.
-            let build_args_map: std::collections::HashMap<String, String> = env_vars
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -2232,6 +2282,40 @@ mod tests {
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
 
     #[test]
+    fn buildkit_cache_namespace_is_stable_and_opaque() {
+        let encryption_service = create_test_encryption_service();
+
+        let first =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+        let second =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains("main"));
+        assert!(!first.contains("42"));
+    }
+
+    #[test]
+    fn buildkit_cache_namespace_isolates_tenants_and_refs() {
+        let encryption_service = create_test_encryption_service();
+        let namespace = |project_id, environment_id, cache_ref| {
+            buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project_id,
+                environment_id,
+                cache_ref,
+            )
+        };
+
+        let baseline = namespace(42, 7, "refs/heads/main");
+        assert_ne!(baseline, namespace(43, 7, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 8, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 7, "refs/heads/feature"));
+    }
+
+    #[test]
     fn image_ref_release_extracts_tag_digest_and_handles_registry_port() {
         // Simple tag.
         assert_eq!(
@@ -2616,6 +2700,16 @@ mod tests {
             assert!(
                 config_obj.get("build_args_keys").is_some(),
                 "build_image config must include build_args_keys index",
+            );
+            let build_arg_keys = config_obj
+                .get("build_args_keys")
+                .and_then(|value| value.as_array())
+                .expect("build_args_keys must be an array");
+            assert!(
+                build_arg_keys
+                    .iter()
+                    .any(|key| { key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG) }),
+                "BuildKit cache namespace must be forwarded as a build arg",
             );
             // Plaintext `build_args` must NOT appear — that would leak env-var values.
             assert!(
