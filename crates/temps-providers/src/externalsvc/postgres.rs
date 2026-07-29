@@ -5978,4 +5978,43 @@ mod tests {
             msg
         );
     }
+
+    // -----------------------------------------------------------------
+    // shared_preload_libraries_for_image
+    // -----------------------------------------------------------------
+    //
+    // Regression coverage for the bug where this value was unconditionally
+    // overwritten to just "pg_stat_statements", silently dropping any
+    // image-required library (e.g. TimescaleDB requires "timescaledb" to be
+    // preloaded for hypertables' background workers, continuous aggregates,
+    // and compression policies to function at all).
+
+    #[test]
+    fn shared_preload_libraries_default_image_is_pg_stat_statements_only() {
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "gotempsh/postgres-walg:18-bookworm",
+        );
+        assert_eq!(libs, "pg_stat_statements");
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_merges_both() {
+        let libs =
+            PostgresService::shared_preload_libraries_for_image("timescale/timescaledb-ha:pg18");
+        assert_eq!(
+            libs, "timescaledb,pg_stat_statements",
+            "timescaledb must be preloaded alongside pg_stat_statements, never dropped"
+        );
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_any_tag() {
+        // Detection is substring-based on the image name, not tag-specific —
+        // confirm a different tag still matches.
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "timescale/timescaledb-ha:pg16-ts2.15",
+        );
+        assert!(libs.contains("timescaledb"));
+        assert!(libs.contains("pg_stat_statements"));
+    }
 }
