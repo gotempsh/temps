@@ -2891,12 +2891,33 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Get all jobs for a deployment
+    /// Get all jobs for a deployment owned by the requested project.
+    ///
+    /// The project constraint is part of this service method rather than only
+    /// an HTTP guard because deployment IDs are globally enumerable and this
+    /// result includes sensitive workflow metadata.
     pub async fn get_deployment_jobs(
         &self,
+        project_id: i32,
         deployment_id: i32,
     ) -> Result<Vec<temps_entities::deployment_jobs::Model>, DeploymentError> {
         use temps_entities::deployment_jobs;
+
+        let deployment_exists = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .is_some();
+
+        if !deployment_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "deployment {} for project {} not found",
+                deployment_id, project_id
+            )));
+        }
 
         let jobs = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
@@ -5635,6 +5656,47 @@ mod tests {
         active.log_path = Set(log_path);
         let row = active.update(db.as_ref()).await?;
         Ok(row)
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_jobs_enforces_project_ownership(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                eprintln!("Docker unavailable; skipping deployment ownership test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let job = temps_entities::deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("sensitive-build".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Sensitive Build".to_string()),
+            log_id: Set("sensitive-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": "must-not-cross-projects"}
+            }))),
+            ..Default::default()
+        };
+        job.insert(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let own_jobs = service
+            .get_deployment_jobs(deployment.project_id, deployment.id)
+            .await?;
+        assert_eq!(own_jobs.len(), 1);
+
+        let foreign_result = service
+            .get_deployment_jobs(deployment.project_id + 999, deployment.id)
+            .await;
+        assert!(matches!(foreign_result, Err(DeploymentError::NotFound(_))));
+
+        Ok(())
     }
 
     #[tokio::test]
