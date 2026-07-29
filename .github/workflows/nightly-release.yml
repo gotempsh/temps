@@ -3,8 +3,9 @@ name: Nightly Release
 # Cuts a nightly prerelease build from main once a day, but only when main
 # has moved since the last nightly tag. The tag it mints
 # (v<version>-nightly.<date>.<short-sha>) contains a `-`, so it matches the
-# `release.yml` tag trigger (`v*.*.*-*`) and rides that same pipeline —
-# there is no separate nightly build/publish logic to keep in sync.
+# `release.yml` tag trigger (`v*.*.*-*`). Tags pushed with GITHUB_TOKEN do
+# not trigger other workflows, so this workflow explicitly dispatches the
+# release pipeline at the newly-created tag.
 
 on:
   schedule:
@@ -13,6 +14,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -74,3 +76,13 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Nightly build $TAG"
           git push origin "$TAG"
+
+      - name: Start release workflow for nightly tag
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref "$TAG" --field dry_run=false
+          echo "Dispatched release workflow for $TAG"

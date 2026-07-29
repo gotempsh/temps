@@ -12,6 +12,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  workflow-contracts:
+    name: Release Workflow Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Verify nightly release wiring
+        run: .github/scripts/test-nightly-release-workflows.sh
+
   compose-security:
     name: Compose Security
     runs-on: ubuntu-latest
