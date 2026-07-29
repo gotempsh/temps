@@ -374,6 +374,14 @@ export function registerServicesCommands(program: Command): void {
     .option('--json', 'Output raw JSON instead of formatted lines')
     .action(serviceLogsAction)
 
+  services
+    .command('slow-queries')
+    .description('Show slowest PostgreSQL queries from pg_stat_statements')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('-n, --limit <n>', 'Maximum number of queries to return (default: 20)', '20')
+    .option('--json', 'Output raw JSON instead of a formatted table')
+    .action(serviceSlowQueriesAction)
+
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
@@ -1421,4 +1429,115 @@ async function serviceLogsAction(options: ServiceLogsOptions): Promise<void> {
     `${lines.length} line${lines.length === 1 ? '' : 's'} shown` +
       (result.next_cursor ? ' (more available — use a narrower time range or --tail)' : ''),
   )
+}
+
+// ── services slow-queries ─────────────────────────────────────────────────────
+
+interface SlowQueryRow {
+  query: string
+  calls: number
+  total_exec_time_ms: number
+  mean_exec_time_ms: number
+  rows: number
+  cache_hit_ratio: number | null
+}
+
+interface SlowQueriesResponse {
+  queries: SlowQueryRow[]
+  limit: number
+}
+
+interface ServiceSlowQueriesOptions {
+  id: string
+  limit?: string
+  json?: boolean
+}
+
+async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  const limit = Math.min(100, Math.max(1, parseInt(options.limit ?? '20', 10)))
+
+  const result = await withSpinner('Fetching slow queries…', async () => {
+    const { data, error } = await client.get<SlowQueriesResponse>({
+      url: `/external-services/${id}/pg-stat-statements/slow-queries`,
+      query: { limit },
+    })
+    if (error) {
+      const msg = getErrorMessage(error)
+      // Surface the pg_stat_statements not-loaded error cleanly.
+      if (msg.includes('pg_stat_statements')) {
+        throw new Error(
+          `pg_stat_statements is not loaded on this service.\n` +
+            `Add it to shared_preload_libraries and restart the service, then try again.\n` +
+            `Detail: ${msg}`,
+        )
+      }
+      throw new Error(msg)
+    }
+    return data
+  })
+
+  if (!result) {
+    warning('No data returned')
+    return
+  }
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const queries = result.queries
+  if (queries.length === 0) {
+    info(`No slow-query data found for service ${id}.`)
+    return
+  }
+
+  const MAX_QUERY_LEN = 60
+  const columns: TableColumn<SlowQueryRow>[] = [
+    {
+      header: 'Query',
+      accessor: (row) => {
+        const q = row.query.replace(/\s+/g, ' ').trim()
+        return q.length > MAX_QUERY_LEN ? q.slice(0, MAX_QUERY_LEN - 1) + '…' : q
+      },
+    },
+    {
+      header: 'Calls',
+      accessor: (row) => row.calls.toLocaleString(),
+      align: 'right',
+    },
+    {
+      header: 'Total Time (ms)',
+      accessor: (row) => row.total_exec_time_ms.toFixed(2),
+      align: 'right',
+    },
+    {
+      header: 'Mean Time (ms)',
+      accessor: (row) => row.mean_exec_time_ms.toFixed(2),
+      align: 'right',
+    },
+    {
+      header: 'Rows',
+      accessor: (row) => row.rows.toLocaleString(),
+      align: 'right',
+    },
+    {
+      header: 'Cache Hit Ratio',
+      accessor: (row) => (row.cache_hit_ratio !== null ? row.cache_hit_ratio.toFixed(4) : '—'),
+      align: 'right',
+    },
+  ]
+
+  printTable(queries, columns)
+  newline()
+  info(`${queries.length} quer${queries.length === 1 ? 'y' : 'ies'} shown (limit ${limit})`)
 }

@@ -1603,6 +1603,29 @@ bunx @temps-sdk/cli services logs --id 1 --json
 | `-t, --text <query>` | Case-insensitive text filter applied to log messages. |
 | `--json` | Output raw JSON (full `SearchLogsResponse` with `lines`, `next_cursor`, `total_scanned`). |
 
+### Service Slow Queries
+
+`services slow-queries` — fetch the slowest PostgreSQL queries recorded by `pg_stat_statements` for an external Postgres service. Queries are ranked by total execution time. Requires the `pg_stat_statements` extension to be loaded via `shared_preload_libraries`; if it is not loaded, a clear error message is printed instead of a raw stack trace.
+
+```bash
+# Default: top 20 slowest queries for service 1
+bunx @temps-sdk/cli services slow-queries --id 1
+
+# Return only the top 5
+bunx @temps-sdk/cli services slow-queries --id 1 --limit 5
+
+# Machine-readable JSON output (full SlowQueriesResponse)
+bunx @temps-sdk/cli services slow-queries --id 1 --json
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `-n, --limit <n>` | Maximum number of queries to return (default: 20, max: 100). |
+| `--json` | Output raw JSON (`{ queries: [...], limit: N }`). |
+
+Table columns: **Query** (truncated at 60 chars), **Calls**, **Total Time (ms)**, **Mean Time (ms)**, **Rows**, **Cache Hit Ratio** (shown as `—` when null).
+
 ### Backups & Restore
 
 Inspect a service's restore capabilities, browse backups stored on an S3 source, and restore in-place, into a new service, or via point-in-time recovery (PITR). PITR requires a WAL-G backup (PostgreSQL).
