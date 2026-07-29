@@ -65,15 +65,19 @@ expect_decision() {
 }
 
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha "" "" false 0
+  new-sha "" "" false missing
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha old-tag old-sha true 0
+  new-sha old-tag old-sha true success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha true 0
+  same-sha nightly-tag same-sha true success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false 1
+  same-sha nightly-tag same-sha false active
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false 0
+  same-sha nightly-tag same-sha false missing
+expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
+  same-sha nightly-tag same-sha true failed
+expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
+  same-sha nightly-tag same-sha false success
 
 "$validation_script" true branch main >/dev/null
 "$validation_script" false tag v0.1.0 >/dev/null

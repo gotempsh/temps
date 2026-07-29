@@ -48,7 +48,7 @@ jobs:
           last_nightly_tag="$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -n1 || true)"
           last_nightly_sha=""
           release_exists=false
-          active_run_count=0
+          release_run_state=missing
 
           if [[ -n "$last_nightly_tag" ]]; then
             last_nightly_sha="$(git rev-list -n1 "$last_nightly_tag")"
@@ -57,18 +57,24 @@ jobs:
             if [[ "$last_nightly_sha" == "$head_sha" ]]; then
               if gh release view "$last_nightly_tag" >/dev/null 2>&1; then
                 release_exists=true
-              else
-                active_run_count="$(
-                  gh run list \
-                    --workflow release.yml \
-                    --branch "$last_nightly_tag" \
-                    --commit "$head_sha" \
-                    --event workflow_dispatch \
-                    --limit 100 \
-                    --json status \
-                    --jq '[.[] | select(.status != "completed")] | length'
-                )"
               fi
+
+              release_run_state="$(
+                gh run list \
+                  --workflow release.yml \
+                  --branch "$last_nightly_tag" \
+                  --commit "$head_sha" \
+                  --event workflow_dispatch \
+                  --limit 1 \
+                  --json conclusion,status \
+                  --jq '
+                    if length == 0 then "missing"
+                    elif .[0].status != "completed" then "active"
+                    elif .[0].conclusion == "success" then "success"
+                    else "failed"
+                    end
+                  '
+              )"
             fi
           fi
 
@@ -78,7 +84,7 @@ jobs:
               "$last_nightly_tag" \
               "$last_nightly_sha" \
               "$release_exists" \
-              "$active_run_count"
+              "$release_run_state"
           )"
           printf '%s\n' "$decision" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$decision"

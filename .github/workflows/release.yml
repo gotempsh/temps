@@ -614,24 +614,37 @@ jobs:
             echo "This is a stable release"
           fi
 
-          gh release create "$RELEASE_TAG" \
-            --title "$RELEASE_TAG" \
-            --notes-file release/release-notes.md \
-            $PRERELEASE_FLAG \
-            release/temps-linux-amd64.tar.gz \
-            release/temps-linux-amd64.tar.gz.sha256 \
-            release/temps-linux-arm64.tar.gz \
-            release/temps-linux-arm64.tar.gz.sha256 \
-            release/temps-darwin-amd64.tar.gz \
-            release/temps-darwin-amd64.tar.gz.sha256 \
-            release/temps-darwin-arm64.tar.gz \
-            release/temps-darwin-arm64.tar.gz.sha256 \
-            release/checksums.txt \
-            release/install.sh \
+          release_assets=(
+            release/temps-linux-amd64.tar.gz
+            release/temps-linux-amd64.tar.gz.sha256
+            release/temps-linux-arm64.tar.gz
+            release/temps-linux-arm64.tar.gz.sha256
+            release/temps-darwin-amd64.tar.gz
+            release/temps-darwin-amd64.tar.gz.sha256
+            release/temps-darwin-arm64.tar.gz
+            release/temps-darwin-arm64.tar.gz.sha256
+            release/checksums.txt
+            release/install.sh
             release/temps.rb
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refreshing metadata and assets."
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file release/release-notes.md \
+              $PRERELEASE_FLAG
+            gh release upload "$RELEASE_TAG" --clobber "${release_assets[@]}"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file release/release-notes.md \
+              $PRERELEASE_FLAG \
+              "${release_assets[@]}"
+          fi
 
           echo ""
-          echo "✓ Release $RELEASE_TAG created successfully!"
+          echo "✓ Release $RELEASE_TAG published successfully!"
           echo ""
           echo "View release at: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
 
