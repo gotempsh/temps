@@ -1605,26 +1605,27 @@ bunx @temps-sdk/cli services logs --id 1 --json
 
 ### Service Slow Queries
 
-`services slow-queries` — fetch the slowest PostgreSQL queries recorded by `pg_stat_statements` for an external Postgres service. Queries are ranked by total execution time. Requires the `pg_stat_statements` extension to be loaded via `shared_preload_libraries`; if it is not loaded, a clear error message is printed instead of a raw stack trace.
+`services slow-queries` — fetch the slowest PostgreSQL queries recorded by `pg_stat_statements` for an external Postgres service. Queries are ranked by total execution time and support pagination. Requires the `pg_stat_statements` extension to be loaded via `shared_preload_libraries`; if it is not loaded, a clear error message is printed instead of a raw stack trace.
 
 ```bash
-# Default: top 20 slowest queries for service 1
+# Default: page 1, 20 rows per page for service 1
 bunx @temps-sdk/cli services slow-queries --id 1
 
-# Return only the top 5
-bunx @temps-sdk/cli services slow-queries --id 1 --limit 5
+# Page 2 with 5 rows per page
+bunx @temps-sdk/cli services slow-queries --id 1 --page 2 --page-size 5
 
-# Machine-readable JSON output (full SlowQueriesResponse)
+# Machine-readable JSON output (full paginated SlowQueriesResponse)
 bunx @temps-sdk/cli services slow-queries --id 1 --json
 ```
 
 | Option | Description |
 | --- | --- |
 | `--id <id>` | Service ID (required) |
-| `-n, --limit <n>` | Maximum number of queries to return (default: 20, max: 100). |
-| `--json` | Output raw JSON (`{ queries: [...], limit: N }`). |
+| `--page <n>` | Page number, 1-based (default: 1). |
+| `--page-size <n>` | Rows per page (1–100, default: 20). |
+| `--json` | Output raw JSON (`{ queries: [...], page: N, page_size: N, total_count: N }`). |
 
-Table columns: **Query** (truncated at 60 chars), **Calls**, **Total Time (ms)**, **Mean Time (ms)**, **Rows**, **Cache Hit Ratio** (shown as `—` when null).
+Table columns: **Query** (truncated at 60 chars), **Calls**, **Total Time (ms)**, **Mean Time (ms)**, **Rows**, **Cache Hit Ratio** (shown as `—` when null). Footer shows `page N / total` and total row count.
 
 ### Backups & Restore
 
