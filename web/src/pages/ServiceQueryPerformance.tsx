@@ -16,6 +16,16 @@ import {
   getSlowQueriesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { SlowQueryRow } from '@/api/client/types.gen'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -44,18 +54,20 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
   ChevronLeft,
   ChevronRight,
+  Loader2,
   RefreshCw,
   Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
+import { toast } from 'sonner'
 
 // ---------------------------------------------------------------------------
 // Section registry — add new sections here without restructuring the page
@@ -92,6 +104,86 @@ function metricsErrorText(err: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// ExtensionNotAvailable — error state with optional self-service restart
+// ---------------------------------------------------------------------------
+
+function isExtensionNotAvailableError(err: unknown): boolean {
+  const msg = metricsErrorText(err).toLowerCase()
+  return msg.includes('not available') || msg.includes('shared_preload')
+}
+
+function ExtensionNotAvailable({
+  error,
+  serviceTopology,
+  onEnable,
+  isEnabling,
+}: {
+  error: unknown
+  serviceTopology: string
+  onEnable: () => void
+  isEnabling: boolean
+}) {
+  const isExtensionError = isExtensionNotAvailableError(error)
+  const isStandalone = serviceTopology === 'standalone'
+
+  return (
+    <div className="flex flex-col items-center gap-4 rounded-lg border border-dashed py-10 text-center">
+      <Zap className="size-6 text-muted-foreground" />
+
+      {isExtensionError ? (
+        <>
+          <div className="max-w-sm space-y-1">
+            <p className="text-sm font-medium">pg_stat_statements not loaded</p>
+            <p className="text-xs text-muted-foreground">
+              The extension requires{' '}
+              <code className="font-mono">shared_preload_libraries=pg_stat_statements</code>{' '}
+              to be set before Postgres starts.
+            </p>
+          </div>
+
+          {isStandalone ? (
+            <div className="flex flex-col items-center gap-2">
+              <Button
+                size="sm"
+                onClick={onEnable}
+                disabled={isEnabling}
+              >
+                {isEnabling ? (
+                  <>
+                    <Loader2 className="mr-2 size-3.5 animate-spin" />
+                    Restarting…
+                  </>
+                ) : (
+                  'Enable & Restart'
+                )}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                Or restart the container manually after adding the flag.
+              </p>
+            </div>
+          ) : (
+            <div className="max-w-sm space-y-1 text-left rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+              <p className="font-medium text-foreground">Manual rolling restart required</p>
+              <p>
+                This is a clustered (HA) service. To avoid data loss, restart
+                each node one at a time using your cluster management tooling.
+                Ensure{' '}
+                <code className="font-mono">shared_preload_libraries=pg_stat_statements</code>{' '}
+                is set on every node before restarting.
+              </p>
+            </div>
+          )}
+        </>
+      ) : (
+        <p className="max-w-sm text-sm text-muted-foreground">
+          {metricsErrorText(error)}
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // SlowQueriesContent
 // ---------------------------------------------------------------------------
 
@@ -105,13 +197,22 @@ type SortOrder = 'asc' | 'desc'
 
 const PAGE_SIZE_OPTIONS = [5, 10, 20, 50, 100]
 
-function SlowQueriesContent({ serviceId }: { serviceId: number }) {
+function SlowQueriesContent({
+  serviceId,
+  serviceName,
+  serviceTopology,
+}: {
+  serviceId: number
+  serviceName: string
+  serviceTopology: string
+}) {
   const queryClient = useQueryClient()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [sortKey, setSortKey] = useState<SlowQuerySortKey | null>(null)
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
   const [selectedRow, setSelectedRow] = useState<SlowQueryRow | null>(null)
+  const [confirmOpen, setConfirmOpen] = useState(false)
 
   // Reset to page 1 when page size changes
   const handlePageSizeChange = (val: string) => {
@@ -153,6 +254,34 @@ function SlowQueriesContent({ serviceId }: { serviceId: number }) {
       }),
     })
   }
+
+  const enableMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch(
+        `/api/external-services/${serviceId}/pg-stat-statements/enable`,
+        { method: 'POST', credentials: 'include' },
+      )
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(
+          body.detail ?? 'Failed to enable pg_stat_statements',
+        )
+      }
+      return response.json() as Promise<{ message: string }>
+    },
+    onSuccess: (data) => {
+      toast.success('Container restarted', {
+        description:
+          data.message ??
+          'pg_stat_statements is now active. Query data will appear shortly.',
+      })
+      // Give the container a moment, then refetch.
+      setTimeout(() => handleRefresh(), 3000)
+    },
+    onError: (err: Error) => {
+      toast.error('Enable failed', { description: err.message })
+    },
+  })
 
   const rawQueries = data?.queries ?? []
   const queries =
@@ -227,12 +356,12 @@ function SlowQueriesContent({ serviceId }: { serviceId: number }) {
           ))}
         </div>
       ) : error != null ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-10 text-center">
-          <Zap className="size-6 text-muted-foreground" />
-          <p className="max-w-sm text-sm text-muted-foreground">
-            {metricsErrorText(error)}
-          </p>
-        </div>
+        <ExtensionNotAvailable
+          error={error}
+          serviceTopology={serviceTopology}
+          onEnable={() => setConfirmOpen(true)}
+          isEnabling={enableMutation.isPending}
+        />
       ) : queries.length === 0 ? (
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-10 text-center">
           <Zap className="size-6 text-muted-foreground" />
@@ -373,6 +502,40 @@ function SlowQueriesContent({ serviceId }: { serviceId: number }) {
         open={selectedRow !== null}
         onClose={() => setSelectedRow(null)}
       />
+
+      {/* Enable & Restart confirmation dialog */}
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Enable pg_stat_statements?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will restart the{' '}
+              <strong>{serviceName}</strong> database container to load{' '}
+              <code>pg_stat_statements</code>. Active connections will be
+              briefly dropped and in-flight transactions rolled back. The
+              database will come back online in a few seconds.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmOpen(false)
+                enableMutation.mutate()
+              }}
+            >
+              {enableMutation.isPending ? (
+                <>
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                  Restarting…
+                </>
+              ) : (
+                'Enable & Restart'
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -603,7 +766,11 @@ export function ServiceQueryPerformance() {
               <Skeleton className="h-48 w-full" />
             </div>
           ) : activeSection === 'slow-queries' ? (
-            <SlowQueriesContent serviceId={serviceId} />
+            <SlowQueriesContent
+              serviceId={serviceId}
+              serviceName={serviceName}
+              serviceTopology={serviceData?.service?.topology ?? 'standalone'}
+            />
           ) : null}
         </main>
       </div>

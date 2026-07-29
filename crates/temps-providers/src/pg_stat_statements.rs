@@ -67,6 +67,16 @@ pub enum PgStatStatementsError {
     #[error("Query error on service {service_id}: {reason}")]
     QueryError { service_id: i32, reason: String },
 
+    #[error(
+        "Self-service pg_stat_statements restart is not available for clustered Postgres \
+         service {service_id}. A rolling restart across all cluster nodes is required — \
+         perform the restart manually on each node or contact your administrator."
+    )]
+    ClusteredServiceNotSupported { service_id: i32 },
+
+    #[error("Failed to restart service {service_id} to enable pg_stat_statements: {reason}")]
+    RestartFailed { service_id: i32, reason: String },
+
     #[error("Validation error: {message}")]
     Validation { message: String },
 }
@@ -237,6 +247,63 @@ impl PgStatStatementsService {
                 })?;
 
         Ok((db, service_id))
+    }
+
+    /// Enable `pg_stat_statements` on a standalone Postgres service by
+    /// stopping and restarting its container so the
+    /// `shared_preload_libraries=pg_stat_statements` CMD flag takes effect.
+    ///
+    /// # Safety constraints
+    ///
+    /// * **Standalone only.** Clustered (HA) services are rejected with
+    ///   [`PgStatStatementsError::ClusteredServiceNotSupported`] — a blind
+    ///   single-container restart bypasses controlled failover. The caller must
+    ///   surface manual instructions for that case.
+    /// * **Data-safe.** The container restart reuses the existing named Docker
+    ///   volume (`{container_name}_data`). `create_container_once` calls
+    ///   `docker.create_volume` which is idempotent — the volume is never
+    ///   recreated fresh.
+    ///
+    /// Note: the caller (handler) must perform the ownership check
+    /// (`assert_service_owned_by_caller`) before invoking this method.
+    pub async fn enable_pg_stat_statements(
+        &self,
+        service_id: i32,
+    ) -> Result<(), PgStatStatementsError> {
+        // Load the service to check type and topology.
+        let service = self
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|_| PgStatStatementsError::ServiceNotFound { service_id })?;
+
+        if service.service_type != "postgres" {
+            return Err(PgStatStatementsError::NotAPostgresService {
+                service_id,
+                actual_type: service.service_type.clone(),
+            });
+        }
+
+        if service.topology == "cluster" {
+            return Err(PgStatStatementsError::ClusteredServiceNotSupported { service_id });
+        }
+
+        // `force_recreate_service_container` hydrates the engine's config
+        // explicitly and recreates the container so the
+        // `shared_preload_libraries` CMD flag is applied — a plain
+        // stop_service()/start_service() is not sufficient here: the fresh
+        // service instance each call constructs has no in-memory config, so
+        // start()'s drift-reconciliation would have nothing to build the new
+        // container from once it detects drift.
+        self.external_service_manager
+            .force_recreate_service_container(service_id)
+            .await
+            .map_err(|e| PgStatStatementsError::RestartFailed {
+                service_id,
+                reason: format!("recreate failed: {}", e),
+            })?;
+
+        Ok(())
     }
 
     /// Return a paginated slice of queries ordered by `total_exec_time`

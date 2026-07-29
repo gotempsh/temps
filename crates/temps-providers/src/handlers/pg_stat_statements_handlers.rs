@@ -12,16 +12,19 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
+use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::handlers::types::AppState;
@@ -72,7 +75,51 @@ impl From<PgStatStatementsError> for Problem {
                     .with_title("Validation Error")
                     .with_detail(error.to_string())
             }
+            PgStatStatementsError::ClusteredServiceNotSupported { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Clustered Service Not Supported")
+                    .with_detail(error.to_string())
+            }
+            PgStatStatementsError::RestartFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Restart Failed")
+                    .with_detail(error.to_string())
+            }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct PgStatStatementsEnabledAudit {
+    context: AuditContext,
+    service_id: i32,
+    service_name: String,
+}
+
+impl AuditOperation for PgStatStatementsEnabledAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_PG_STAT_STATEMENTS_ENABLED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
     }
 }
 
@@ -105,10 +152,17 @@ pub struct SlowQueriesResponse {
 // OpenAPI doc
 // ---------------------------------------------------------------------------
 
+/// Response for the enable pg_stat_statements endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnablePgStatStatementsResponse {
+    /// Human-readable message confirming the action.
+    pub message: String,
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_slow_queries),
-    components(schemas(SlowQueriesResponse, SlowQueryRow))
+    paths(get_slow_queries, enable_pg_stat_statements),
+    components(schemas(SlowQueriesResponse, SlowQueryRow, EnablePgStatStatementsResponse))
 )]
 pub struct PgStatStatementsApiDoc;
 
@@ -164,13 +218,94 @@ async fn get_slow_queries(
     }))
 }
 
+/// Enable `pg_stat_statements` on a standalone Postgres service.
+///
+/// Stops the container and restarts it so that the
+/// `shared_preload_libraries=pg_stat_statements` CMD flag (baked into every
+/// new standalone Postgres container) takes effect. The named data volume is
+/// reused unchanged — no data is lost.
+///
+/// **Clustered (HA) services are rejected** with 422 — a blind single-container
+/// restart bypasses controlled failover. For clustered services the response
+/// body describes the manual rolling-restart steps.
+///
+/// Confirmation is the caller's responsibility (UI dialog / CLI `--yes` flag)
+/// before invoking this endpoint.
+#[utoipa::path(
+    tag = "External Services",
+    post,
+    path = "/external-services/{service_id}/pg-stat-statements/enable",
+    operation_id = "ExternalServiceEnablePgStatStatements",
+    params(
+        ("service_id" = i32, Path, description = "ID of the provisioned standalone Postgres service"),
+    ),
+    responses(
+        (status = 200, description = "Container restarted; pg_stat_statements now active", body = EnablePgStatStatementsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions (requires external_services:write)"),
+        (status = 404, description = "Service not found"),
+        (status = 422, description = "Service is not standalone Postgres (cluster or wrong type)"),
+        (status = 500, description = "Restart failed"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn enable_pg_stat_statements(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(service_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &state).await?;
+
+    let pg_stat_service = PgStatStatementsService::new(state.external_service_manager.clone());
+
+    pg_stat_service
+        .enable_pg_stat_statements(service_id)
+        .await
+        .map_err(Problem::from)?;
+
+    // Fetch service name for audit log — best-effort, don't fail the response.
+    let service_name = state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map(|s| s.name)
+        .unwrap_or_else(|_| service_id.to_string());
+
+    let audit = PgStatStatementsEnabledAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id,
+        service_name: service_name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(service_id, error = %e, "Failed to create pg_stat_statements enable audit log");
+    }
+
+    Ok(Json(EnablePgStatStatementsResponse {
+        message: format!(
+            "Service {service_name} restarted successfully. \
+             pg_stat_statements is now active — query data will appear after the next workload."
+        ),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/external-services/{service_id}/pg-stat-statements/slow-queries",
-        get(get_slow_queries),
-    )
+    Router::new()
+        .route(
+            "/external-services/{service_id}/pg-stat-statements/slow-queries",
+            get(get_slow_queries),
+        )
+        .route(
+            "/external-services/{service_id}/pg-stat-statements/enable",
+            post(enable_pg_stat_statements),
+        )
 }
