@@ -12,8 +12,8 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json,
 };
@@ -105,6 +105,10 @@ fn container_environment_response(
             is_masked: !can_read_plaintext,
         })
         .collect()
+}
+
+fn container_detail_response(response: ContainerDetailResponse) -> Response {
+    ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
 }
 
 #[derive(OpenApi)]
@@ -1805,7 +1809,7 @@ pub async fn get_container_detail(
         cpu_limit_cores: container.cpu_limit_cores,
     };
 
-    Ok(Json(response).into_response())
+    Ok(container_detail_response(response))
 }
 
 /// Stop a specific container
@@ -2619,6 +2623,44 @@ mod tests {
         assert_eq!(
             response[0].value,
             "postgres://user:secret@db/app".to_string()
+        );
+    }
+
+    #[test]
+    fn container_detail_response_prevents_secret_caching() {
+        let response = container_detail_response(ContainerDetailResponse {
+            id: 1,
+            container_id: "container-id".to_string(),
+            container_name: "container-name".to_string(),
+            image_name: "example/image:latest".to_string(),
+            status: "running".to_string(),
+            deployment_id: 2,
+            created_at: "2026-07-29T00:00:00Z".to_string(),
+            deployed_at: "2026-07-29T00:00:01Z".to_string(),
+            ready_at: Some("2026-07-29T00:00:02Z".to_string()),
+            container_port: 3000,
+            host_port: Some(30_000),
+            environment_variables: vec![EnvVarResponse {
+                key: "DATABASE_URL".to_string(),
+                value: "postgres://user:secret@example.test/db".to_string(),
+                is_masked: false,
+            }],
+            restart_count: Some(0),
+            resource_limits: None,
+            service_name: None,
+            service_url: None,
+            exit_code: None,
+            exit_reason: None,
+            oom_killed: None,
+            error_message: None,
+            finished_at: None,
+            started_at: Some("2026-07-29T00:00:01Z".to_string()),
+            cpu_limit_cores: None,
+        });
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
         );
     }
 
