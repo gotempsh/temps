@@ -20,10 +20,10 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
+use temps_auth::{Permission, RequireAuth};
 use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
@@ -85,6 +85,26 @@ fn public_service_url(
 ) -> String {
     let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
     public_url_for_hostname(settings, &hostname)
+}
+
+fn container_environment_response(
+    auth: &temps_auth::AuthContext,
+    variables: Vec<(String, String)>,
+) -> Vec<EnvVarResponse> {
+    let can_read_plaintext = auth.has_permission(&Permission::SecretsRead);
+
+    variables
+        .into_iter()
+        .map(|(key, value)| EnvVarResponse {
+            key,
+            value: if can_read_plaintext {
+                value
+            } else {
+                "***".to_string()
+            },
+            is_masked: !can_read_plaintext,
+        })
+        .collect()
 }
 
 #[derive(OpenApi)]
@@ -1650,26 +1670,16 @@ pub async fn get_container_detail(
         .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
-    // Parse environment variables and mask sensitive ones
+    // Container environments can contain credentials under arbitrary names.
+    // Without the explicit secret-reveal permission, mask every value rather
+    // than relying on an incomplete name heuristic.
     let mut env_vars = vec![];
     if let Ok(vars) = state
         .deployment_service
         .get_container_env_variables(project_id, environment_id, container_id.clone())
         .await
     {
-        let sensitive_keys = [
-            "password", "secret", "token", "key", "auth", "api_key", "npm_rc",
-        ];
-        for (key, value) in vars {
-            let is_masked = sensitive_keys
-                .iter()
-                .any(|&s| key.to_lowercase().contains(s));
-            env_vars.push(crate::handlers::types::EnvVarResponse {
-                key,
-                value: if is_masked { "***".to_string() } else { value },
-                is_masked,
-            });
-        }
+        env_vars = container_environment_response(&auth, vars);
     }
 
     let restart_count = state
@@ -2545,8 +2555,7 @@ mod tests {
         }
     }
 
-    /// Helper to create a mock AuthContext for testing
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context_for_role(role: temps_auth::Role) -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -2567,7 +2576,50 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    /// Helper to create a mock AuthContext for testing
+    fn create_test_auth_context() -> temps_auth::AuthContext {
+        create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    #[test]
+    fn reader_container_environment_response_masks_all_values() {
+        let auth = create_test_auth_context_for_role(temps_auth::Role::Reader);
+        let response = container_environment_response(
+            &auth,
+            vec![
+                (
+                    "POSTGRES_URL".to_string(),
+                    "postgres://user:secret@db/app".to_string(),
+                ),
+                ("PUBLIC_SETTING".to_string(), "visible".to_string()),
+            ],
+        );
+
+        assert_eq!(response.len(), 2);
+        assert!(response.iter().all(|variable| variable.is_masked));
+        assert!(response.iter().all(|variable| variable.value == "***"));
+    }
+
+    #[test]
+    fn secrets_reader_container_environment_response_keeps_plaintext() {
+        let auth = create_test_auth_context_for_role(temps_auth::Role::Admin);
+        let response = container_environment_response(
+            &auth,
+            vec![(
+                "POSTGRES_URL".to_string(),
+                "postgres://user:secret@db/app".to_string(),
+            )],
+        );
+
+        assert_eq!(response.len(), 1);
+        assert!(!response[0].is_masked);
+        assert_eq!(
+            response[0].value,
+            "postgres://user:secret@db/app".to_string()
+        );
     }
 
     /// Helper to create a mock RequestMetadata for testing
