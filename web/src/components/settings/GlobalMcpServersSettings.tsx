@@ -8,6 +8,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -44,6 +45,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import {
   createGlobalMcp,
+  revealGlobalMcpConfig,
   updateGlobalMcp,
 } from '@/api/client/sdk.gen'
 import {
@@ -420,9 +422,7 @@ function GlobalMcpDialog({
       onSuccess()
     } catch {
       toast.error(
-        isEdit
-          ? 'Failed to update MCP server'
-          : 'Failed to create MCP server'
+        isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
       )
     } finally {
       setIsPending(false)
@@ -500,6 +500,20 @@ function GlobalMcpDialog({
               <p className="text-xs text-destructive">{configError}</p>
             )}
           </div>
+          {isEdit && (
+            <McpCredentialRevealControls
+              key={`${mcp!.slug}:${open}`}
+              configText={configText}
+              onConfigTextChange={handleConfigChange}
+              onRevealCredential={async (field) => {
+                const { data } = await revealGlobalMcpConfig({
+                  path: { slug: mcp!.slug, field },
+                  throwOnError: true,
+                })
+                return data.value
+              }}
+            />
+          )}
           <DialogFooter>
             <Button
               type="button"
@@ -508,10 +522,7 @@ function GlobalMcpDialog({
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={isPending || configError !== null}
-            >
+            <Button type="submit" disabled={isPending || configError !== null}>
               {isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
               ) : null}

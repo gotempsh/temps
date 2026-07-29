@@ -1921,8 +1921,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::sync::Arc;
+    use sea_orm::MockDatabase;
+    use std::sync::{Arc, Mutex};
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::notification_providers;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
@@ -1936,6 +1938,133 @@ mod tests {
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingAuditLogger {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            self.operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Credential Auditor".to_string(),
+            email: "auditor@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "credential-reveal-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_reveal_returns_no_store_response_and_writes_audit() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-reveal-test",
+        ));
+        let config = serde_json::json!({
+            "oauth": {
+                "client_secret": "handler-secret",
+                "issuer": "https://issuer.example.test"
+            }
+        });
+        let provider = notification_providers::Model {
+            id: 17,
+            name: "Custom OAuth".to_string(),
+            provider_type: "custom".to_string(),
+            config: encryption_service
+                .encrypt_string(&config.to_string())
+                .expect("test config encryption should succeed"),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![provider]])
+                .into_connection(),
+        );
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let preferences_service = Arc::new(NotificationPreferencesService::new(db.clone()));
+        let digest_service = Arc::new(DigestService::new(db, notification_service.clone()));
+        let audit_logger = RecordingAuditLogger::default();
+        let state = Arc::new(NotificationState::new(
+            notification_service,
+            preferences_service,
+            digest_service,
+            Arc::new(audit_logger.clone()),
+        ));
+
+        let response = reveal_notification_provider_config(
+            State(state),
+            Path((17, "oauth.client_secret".to_string())),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+        )
+        .await
+        .expect("authorized reveal should succeed")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reveal response body should be readable");
+        let revealed: SensitiveConfigValueResponse =
+            serde_json::from_slice(&body).expect("reveal response should be JSON");
+        assert_eq!(revealed.value, "handler-secret");
+        assert_eq!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .as_slice(),
+            ["NOTIFICATION_PROVIDER_CONFIG_REVEALED"]
         );
     }
 
@@ -2049,9 +2178,21 @@ mod tests {
         }
     }
 
+    macro_rules! test_setup_or_skip {
+        () => {
+            match TestSetup::new().await {
+                Ok(setup) => setup,
+                Err(error) => {
+                    eprintln!("Skipping Docker-dependent test: {error}");
+                    return Ok(());
+                }
+            }
+        };
+    }
+
     #[tokio::test]
     async fn test_list_notification_providers() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2075,7 +2216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateNotificationEmailProviderRequest {
             name: "Test Email Provider".to_string(),
@@ -2103,7 +2244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2124,7 +2265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateProviderRequest {
             name: "Test Generic Provider".to_string(),
@@ -2155,7 +2296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_slack_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = CreateSlackProviderRequest {
             name: "Test Slack Provider".to_string(),
@@ -2182,7 +2323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateProviderRequest {
             name: Some("Updated Provider Name".to_string()),
@@ -2212,7 +2353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_slack_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateSlackProviderRequest {
             name: Some("Updated Slack Provider".to_string()),
@@ -2242,7 +2383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_notification_email_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let request_body = UpdateNotificationEmailProviderRequest {
             name: Some("Updated Email Provider".to_string()),
@@ -2280,7 +2421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2300,7 +2441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_notification_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         let app = configure_routes().with_state(setup.notification_state.clone());
 
@@ -2321,7 +2462,7 @@ mod tests {
     // Integration test that actually sends an email through Mailpit
     #[tokio::test]
     async fn test_email_integration_with_mailpit() -> Result<(), Box<dyn std::error::Error>> {
-        let setup = TestSetup::new().await?;
+        let setup = test_setup_or_skip!();
 
         // Create an email provider directly using the service
         let email_config = serde_json::to_value(setup.create_test_email_config())?;

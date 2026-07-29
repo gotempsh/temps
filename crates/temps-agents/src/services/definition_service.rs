@@ -120,6 +120,13 @@ impl DefinitionService {
                 message: "MCP config must be an object".to_string(),
             })?;
 
+        if let Some(url_value) = config.get_mut("url") {
+            let url = url_value.as_str().ok_or_else(|| AgentError::Validation {
+                message: "MCP config 'url' must be a string".to_string(),
+            })?;
+            *url_value = serde_json::Value::String(transform("url", url)?);
+        }
+
         for section_name in ["env", "headers"] {
             let Some(section_value) = config.get_mut(section_name) else {
                 continue;
@@ -188,6 +195,13 @@ impl DefinitionService {
             *config = serde_json::Value::String(MASKED_VALUE.to_string());
             return;
         };
+        if let Some(url) = config_object.get_mut("url") {
+            if url.as_str().is_some_and(str::is_empty) {
+                *url = serde_json::Value::String(String::new());
+            } else {
+                *url = serde_json::Value::String(MASKED_VALUE.to_string());
+            }
+        }
         for section_name in ["env", "headers"] {
             let Some(section_value) = config_object.get_mut(section_name) else {
                 continue;
@@ -730,10 +744,21 @@ impl DefinitionService {
             Some(project_id) => self.get_mcp(project_id, slug).await?,
             None => self.get_global_mcp(slug).await?,
         };
+        if field_path == "url" {
+            return model
+                .config
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| AgentError::McpConfigFieldNotFound {
+                    slug: slug.to_string(),
+                    field: field_path.to_string(),
+                });
+        }
         let Some((section, name)) = field_path.split_once('.') else {
             return Err(AgentError::Validation {
                 message: format!(
-                    "MCP config field '{}' must identify one env or headers value",
+                    "MCP config field '{}' must identify url or one env or headers value",
                     field_path
                 ),
             });
@@ -741,7 +766,7 @@ impl DefinitionService {
         if !matches!(section, "env" | "headers") || name.is_empty() {
             return Err(AgentError::Validation {
                 message: format!(
-                    "MCP config field '{}' must identify one env or headers value",
+                    "MCP config field '{}' must identify url or one env or headers value",
                     field_path
                 ),
             });
@@ -837,12 +862,17 @@ mod tests {
     fn sensitive_mcp_values_are_encrypted_decrypted_and_masked() {
         let service = service();
         let original = json!({
-            "command": "npx",
+            "url": "https://user:password@mcp.example.test/rpc?token=secret",
             "env": {"API_TOKEN": "secret-token", "EMPTY": ""},
             "headers": {"Authorization": "Bearer secret"}
         });
 
         let encrypted = service.encrypt_sensitive_config(&original).unwrap();
+        assert_ne!(encrypted["url"], original["url"]);
+        assert!(encrypted["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(ENCRYPTED_VALUE_PREFIX));
         assert_ne!(encrypted["env"]["API_TOKEN"], "secret-token");
         assert!(encrypted["env"]["API_TOKEN"]
             .as_str()
@@ -855,25 +885,31 @@ mod tests {
 
         let mut masked = original;
         DefinitionService::mask_sensitive_config(&mut masked);
+        assert_eq!(masked["url"], MASKED_VALUE);
         assert_eq!(masked["env"]["API_TOKEN"], MASKED_VALUE);
         assert_eq!(masked["env"]["EMPTY"], "");
         assert_eq!(masked["headers"]["Authorization"], MASKED_VALUE);
-        assert_eq!(masked["command"], "npx");
     }
 
     #[test]
     fn masked_mcp_update_preserves_existing_credentials() {
         let existing = json!({
+            "url": "https://user:old-secret@mcp.example.test/rpc",
             "env": {"API_TOKEN": "old-secret"},
             "headers": {"Authorization": "Bearer old"}
         });
         let mut replacement = json!({
+            "url": "***",
             "env": {"API_TOKEN": "***", "REGION": "eu-west-1"},
             "headers": {"Authorization": "***"}
         });
 
         DefinitionService::merge_masked_config(&existing, &mut replacement);
 
+        assert_eq!(
+            replacement["url"],
+            "https://user:old-secret@mcp.example.test/rpc"
+        );
         assert_eq!(replacement["env"]["API_TOKEN"], "old-secret");
         assert_eq!(replacement["env"]["REGION"], "eu-west-1");
         assert_eq!(replacement["headers"]["Authorization"], "Bearer old");
@@ -888,6 +924,7 @@ mod tests {
             json!({"env": "API_TOKEN=plaintext"}),
             json!({"env": {"API_TOKEN": 12345}}),
             json!({"headers": ["Authorization", "Bearer plaintext"]}),
+            json!({"url": 12345}),
         ] {
             assert!(matches!(
                 service.encrypt_sensitive_config(&malformed),
@@ -899,5 +936,75 @@ mod tests {
             assert!(!masked.to_string().contains("plaintext"));
             assert!(!masked.to_string().contains("12345"));
         }
+    }
+
+    fn mcp_model(config: serde_json::Value) -> project_mcp_definitions::Model {
+        project_mcp_definitions::Model {
+            id: 7,
+            project_id: Some(42),
+            slug: "remote-docs".to_string(),
+            name: "Remote docs".to_string(),
+            description: None,
+            config,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_mcp_config_value_returns_only_the_requested_secret() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "mcp-definition-test",
+        ));
+        let plaintext = json!({
+            "url": "https://user:password@mcp.example.test/rpc?token=secret",
+            "env": {"API_TOKEN": "env-secret"},
+            "headers": {"Authorization": "Bearer header-secret"}
+        });
+        let encryptor = DefinitionService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            encryption_service.clone(),
+        );
+        let protected = encryptor.encrypt_sensitive_config(&plaintext).unwrap();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![mcp_model(protected.clone())],
+                vec![mcp_model(protected)],
+            ])
+            .into_connection();
+        let service = DefinitionService::new(Arc::new(db), encryption_service);
+
+        let url = service
+            .reveal_mcp_config_value(Some(42), "remote-docs", "url")
+            .await
+            .unwrap();
+        let header = service
+            .reveal_mcp_config_value(Some(42), "remote-docs", "headers.Authorization")
+            .await
+            .unwrap();
+
+        assert_eq!(url, plaintext["url"]);
+        assert_eq!(header, "Bearer header-secret");
+    }
+
+    #[tokio::test]
+    async fn reveal_mcp_config_value_rejects_non_sensitive_fields() {
+        let config = json!({"command": "npx", "args": ["server-package"]});
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![mcp_model(config)]])
+            .into_connection();
+        let service = DefinitionService::new(
+            Arc::new(db),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "mcp-definition-test",
+            )),
+        );
+
+        let error = service
+            .reveal_mcp_config_value(Some(42), "remote-docs", "command")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AgentError::Validation { .. }));
     }
 }

@@ -597,7 +597,7 @@ pub async fn get_mcp(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("slug" = String, Path, description = "MCP server slug"),
-        ("field" = String, Path, description = "Sensitive field path, such as env.API_TOKEN"),
+        ("field" = String, Path, description = "Sensitive field path, such as url or env.API_TOKEN"),
     ),
     responses(
         (status = 200, body = SensitiveMcpConfigValueResponse),
@@ -618,25 +618,17 @@ pub async fn reveal_mcp_config(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
-    let value = app_state
-        .definition_service
-        .reveal_mcp_config_value(Some(project_id), &slug, &field)
-        .await
-        .map_err(Problem::from)?;
-    let audit_result = app_state
-        .audit_service
-        .create_audit_log(&McpConfigRevealedAudit {
-            context: audit_ctx(&auth, &metadata),
-            scope: "project",
-            project_id: Some(project_id),
-            slug,
-            field,
-        })
-        .await;
-    if let Err(error) = &audit_result {
-        tracing::error!(project_id, error = %error, "Failed to audit MCP config reveal");
-    }
-    require_mcp_reveal_audit(audit_result)?;
+    let value = reveal_mcp_config_value_with_audit(
+        app_state.definition_service.as_ref(),
+        app_state.audit_service.as_ref(),
+        &auth,
+        &metadata,
+        "project",
+        Some(project_id),
+        slug,
+        field,
+    )
+    .await?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveMcpConfigValueResponse { value }),
@@ -651,6 +643,37 @@ fn require_mcp_reveal_audit(
             .with_title("MCP configuration value could not be revealed")
             .with_detail("The audit record for this reveal could not be written")
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reveal_mcp_config_value_with_audit(
+    definition_service: &crate::services::definition_service::DefinitionService,
+    audit_service: &dyn temps_core::AuditLogger,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    scope: &'static str,
+    project_id: Option<i32>,
+    slug: String,
+    field: String,
+) -> Result<String, Problem> {
+    let value = definition_service
+        .reveal_mcp_config_value(project_id, &slug, &field)
+        .await
+        .map_err(Problem::from)?;
+    let audit_result = audit_service
+        .create_audit_log(&McpConfigRevealedAudit {
+            context: audit_ctx(auth, metadata),
+            scope,
+            project_id,
+            slug,
+            field,
+        })
+        .await;
+    if let Err(error) = &audit_result {
+        tracing::error!(?project_id, error = %error, "Failed to audit MCP config reveal");
+    }
+    require_mcp_reveal_audit(audit_result)?;
+    Ok(value)
 }
 
 #[utoipa::path(
@@ -1087,7 +1110,7 @@ pub async fn get_global_mcp(
     path = "/settings/mcp-servers/{slug}/config/{field}",
     params(
         ("slug" = String, Path, description = "MCP server slug"),
-        ("field" = String, Path, description = "Sensitive field path, such as env.API_TOKEN"),
+        ("field" = String, Path, description = "Sensitive field path, such as url or env.API_TOKEN"),
     ),
     responses(
         (status = 200, body = SensitiveMcpConfigValueResponse),
@@ -1106,25 +1129,17 @@ pub async fn reveal_global_mcp_config(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    let value = app_state
-        .definition_service
-        .reveal_mcp_config_value(None, &slug, &field)
-        .await
-        .map_err(Problem::from)?;
-    let audit_result = app_state
-        .audit_service
-        .create_audit_log(&McpConfigRevealedAudit {
-            context: audit_ctx(&auth, &metadata),
-            scope: "global",
-            project_id: None,
-            slug,
-            field,
-        })
-        .await;
-    if let Err(error) = &audit_result {
-        tracing::error!(error = %error, "Failed to audit global MCP config reveal");
-    }
-    require_mcp_reveal_audit(audit_result)?;
+    let value = reveal_mcp_config_value_with_audit(
+        app_state.definition_service.as_ref(),
+        app_state.audit_service.as_ref(),
+        &auth,
+        &metadata,
+        "global",
+        None,
+        slug,
+        field,
+    )
+    .await?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveMcpConfigValueResponse { value }),
@@ -1559,6 +1574,66 @@ pub async fn download_global_skill_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::Mutex;
+    use temps_entities::project_mcp_definitions;
+
+    #[derive(Clone, Default)]
+    struct RecordingAuditLogger {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            self.operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Credential Auditor".to_string(),
+            email: "auditor@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "credential-reveal-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
 
     #[test]
     fn credential_reveal_fails_closed_when_audit_write_fails() {
@@ -1569,6 +1644,61 @@ mod tests {
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_reveal_returns_value_and_writes_audit() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "mcp-handler-reveal-test",
+        ));
+        let url = "https://user:password@mcp.example.test/rpc?token=secret";
+        let protected_url = format!(
+            "temps-encrypted-v1:{}",
+            encryption_service
+                .encrypt_string(url)
+                .expect("test MCP URL encryption should succeed")
+        );
+        let model = project_mcp_definitions::Model {
+            id: 7,
+            project_id: Some(42),
+            slug: "remote-docs".to_string(),
+            name: "Remote docs".to_string(),
+            description: None,
+            config: serde_json::json!({"url": protected_url}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![model]])
+            .into_connection();
+        let definition_service = crate::services::definition_service::DefinitionService::new(
+            Arc::new(db),
+            encryption_service,
+        );
+        let audit_logger = RecordingAuditLogger::default();
+
+        let value = reveal_mcp_config_value_with_audit(
+            &definition_service,
+            &audit_logger,
+            &test_auth_context(),
+            &test_request_metadata(),
+            "project",
+            Some(42),
+            "remote-docs".to_string(),
+            "url".to_string(),
+        )
+        .await
+        .expect("authorized MCP credential reveal should succeed");
+
+        assert_eq!(value, url);
+        assert_eq!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .as_slice(),
+            ["MCP_CONFIG_VALUE_REVEALED"]
         );
     }
 }

@@ -2066,8 +2066,7 @@ export type CloudflareConfig = {
     account_id: string;
     /**
      * Cloudflare API token with the Email Sending permission. Encrypted at
-     * rest; like the other notification providers, it is returned decrypted to
-     * authorized callers so the edit form can prefill (not masked).
+     * rest and masked in normal API responses.
      */
     api_token: string;
     /**
@@ -6817,6 +6816,11 @@ export type ExternalServiceDetails = {
         [key: string]: string;
     } | null;
     parameter_schema?: unknown;
+    /**
+     * Parameter names whose values are masked in `current_parameters` and
+     * may be fetched only through the audited reveal endpoint.
+     */
+    sensitive_parameters: Array<string>;
     service: ExternalServiceInfo;
 };
 
@@ -14075,6 +14079,18 @@ export type SendMessageRequest = {
      * side; oversized values are ignored rather than rejected.
      */
     page_context?: string | null;
+};
+
+export type SensitiveConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveMcpConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveValueResponse = {
+    value: string;
 };
 
 export type SentryChunkUploadResponse = {
@@ -26225,136 +26241,6 @@ export type GetServiceResponses = {
 
 export type GetServiceResponse = GetServiceResponses[keyof GetServiceResponses];
 
-export type SensitiveValueResponse = {
-    value: string;
-};
-
-export type RevealServiceParameterData = {
-    body?: never;
-    path: {
-        /**
-         * External service ID
-         */
-        id: number;
-        /**
-         * Sensitive parameter name
-         */
-        param_name: string;
-    };
-    query?: never;
-    url: '/external-services/{id}/parameters/{param_name}';
-};
-
-export type RevealServiceParameterErrors = {
-    /**
-     * Parameter is not sensitive
-     */
-    400: unknown;
-    /**
-     * Service or parameter not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type RevealServiceParameterResponses = {
-    /**
-     * Sensitive parameter value
-     */
-    200: SensitiveValueResponse;
-};
-
-export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
-
-export type SensitiveConfigValueResponse = {
-    value: string;
-};
-
-export type RevealNotificationProviderConfigData = {
-    body?: never;
-    path: {
-        id: number;
-        /**
-         * Sensitive field, such as password or headers.Authorization
-         */
-        field: string;
-    };
-    query?: never;
-    url: '/notification-providers/{id}/config/{field}';
-};
-
-export type RevealNotificationProviderConfigErrors = {
-    400: unknown;
-    404: unknown;
-    500: unknown;
-};
-
-export type RevealNotificationProviderConfigResponses = {
-    200: SensitiveConfigValueResponse;
-};
-
-export type RevealNotificationProviderConfigResponse = RevealNotificationProviderConfigResponses[keyof RevealNotificationProviderConfigResponses];
-
-export type SensitiveMcpConfigValueResponse = {
-    value: string;
-};
-
-export type RevealMcpConfigData = {
-    body?: never;
-    path: {
-        project_id: number;
-        slug: string;
-        /**
-         * Sensitive field path, such as env.API_TOKEN
-         */
-        field: string;
-    };
-    query?: never;
-    url: '/projects/{project_id}/mcp-servers/{slug}/config/{field}';
-};
-
-export type RevealMcpConfigErrors = {
-    400: unknown;
-    401: unknown;
-    404: unknown;
-    500: unknown;
-};
-
-export type RevealMcpConfigResponses = {
-    200: SensitiveMcpConfigValueResponse;
-};
-
-export type RevealMcpConfigResponse = RevealMcpConfigResponses[keyof RevealMcpConfigResponses];
-
-export type RevealGlobalMcpConfigData = {
-    body?: never;
-    path: {
-        slug: string;
-        /**
-         * Sensitive field path, such as env.API_TOKEN
-         */
-        field: string;
-    };
-    query?: never;
-    url: '/settings/mcp-servers/{slug}/config/{field}';
-};
-
-export type RevealGlobalMcpConfigErrors = {
-    400: unknown;
-    401: unknown;
-    404: unknown;
-    500: unknown;
-};
-
-export type RevealGlobalMcpConfigResponses = {
-    200: SensitiveMcpConfigValueResponse;
-};
-
-export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
-
 export type UpdateServiceData = {
     body: UpdateExternalServiceRequest;
     path: {
@@ -27019,6 +26905,46 @@ export type ExternalServiceMetricsStatusResponses = {
 };
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
+
+export type RevealServiceParameterData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Sensitive parameter name
+         */
+        param_name: string;
+    };
+    query?: never;
+    url: '/external-services/{id}/parameters/{param_name}';
+};
+
+export type RevealServiceParameterErrors = {
+    /**
+     * Parameter is not sensitive
+     */
+    400: unknown;
+    /**
+     * Service or parameter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceParameterResponses = {
+    /**
+     * Sensitive parameter value
+     */
+    200: SensitiveValueResponse;
+};
+
+export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
 
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
@@ -31929,6 +31855,46 @@ export type UpdateNotificationProviderResponses = {
 };
 
 export type UpdateNotificationProviderResponse = UpdateNotificationProviderResponses[keyof UpdateNotificationProviderResponses];
+
+export type RevealNotificationProviderConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+        /**
+         * Sensitive field, such as password or headers.Authorization
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/notification-providers/{id}/config/{field}';
+};
+
+export type RevealNotificationProviderConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Provider or field not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealNotificationProviderConfigResponses = {
+    /**
+     * Sensitive provider configuration value
+     */
+    200: SensitiveConfigValueResponse;
+};
+
+export type RevealNotificationProviderConfigResponse = RevealNotificationProviderConfigResponses[keyof RevealNotificationProviderConfigResponses];
 
 export type TestNotificationProviderData = {
     body?: never;
@@ -40900,6 +40866,51 @@ export type UpdateMcpResponses = {
 
 export type UpdateMcpResponse = UpdateMcpResponses[keyof UpdateMcpResponses];
 
+export type RevealMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealMcpConfigResponse = RevealMcpConfigResponses[keyof RevealMcpConfigResponses];
+
 export type ListMonitorsData = {
     body?: never;
     path: {
@@ -42945,11 +42956,23 @@ export type GetProxyLogsData = {
          */
         visitor_id?: number | null;
         /**
-         * Start date for filtering (ISO 8601 format)
+         * Start date for filtering (ISO 8601 format).
+         *
+         * **Defaults to 1 hour before `end_date` (or before now) when omitted.**
+         * The listing is always time-bounded: an unbounded query would have to
+         * consider the entire retention window — 100M+ rows on a busy deployment —
+         * to return a single page. Pass an explicit `start_date` to widen the
+         * window, up to the configured retention horizon.
+         *
+         * The maximum span between `start_date` and `end_date` is 7 days when
+         * `project_id` is omitted, or 30 days when a single `project_id` is set —
+         * a project-scoped query is bounded by that project's own row count
+         * rather than the whole deployment's. A wider request is rejected with a
+         * 400 naming the applicable cap.
          */
         start_date?: string | null;
         /**
-         * End date for filtering (ISO 8601 format)
+         * End date for filtering (ISO 8601 format). Defaults to now.
          */
         end_date?: string | null;
         /**
@@ -45095,6 +45118,47 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type RevealGlobalMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/settings/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealGlobalMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealGlobalMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
 export type RefreshRouteTableData = {
     body?: never;

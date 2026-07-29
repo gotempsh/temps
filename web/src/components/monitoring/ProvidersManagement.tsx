@@ -9,6 +9,7 @@ import {
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -244,6 +245,21 @@ export function ProvidersManagement() {
     }
   }
 
+  const handleRevealCredential = async (field: string) => {
+    if (!editingProvider) {
+      throw new Error('No notification provider is selected')
+    }
+
+    const { data } = await revealNotificationProviderConfig({
+      path: {
+        id: editingProvider.id,
+        field,
+      },
+      throwOnError: true,
+    })
+    return data.value
+  }
+
   const handleDelete = async (provider: ExtendedNotificationProvider) => {
     await deleteMutation.mutateAsync({
       path: { id: provider.id },
@@ -425,6 +441,8 @@ export function ProvidersManagement() {
               onSubmit={onEditSubmit}
               isEdit
               isLoading={isLoadingProviderType}
+              revealScopeKey={editingProvider?.id}
+              onRevealCredential={handleRevealCredential}
             />
           </div>
         </DialogContent>

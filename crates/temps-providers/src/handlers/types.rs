@@ -381,6 +381,9 @@ pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
     pub parameter_schema: Option<serde_json::Value>,
     pub current_parameters: Option<HashMap<String, String>>,
+    /// Parameter names whose values are masked in `current_parameters` and
+    /// may be fetched only through the audited reveal endpoint.
+    pub sensitive_parameters: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

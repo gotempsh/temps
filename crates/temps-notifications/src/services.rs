@@ -56,19 +56,47 @@ pub enum NotificationProviderRevealError {
     },
 }
 
-fn is_provider_config_field_revealable(provider_type: &str, field: &str) -> bool {
-    match provider_type {
-        "slack" => field == "webhook_url",
-        "email" => field == "password",
-        "webhook" => {
-            field == "url"
-                || field
-                    .strip_prefix("headers.")
-                    .is_some_and(|name| !name.is_empty())
-        }
-        "cloudflare" => field == "api_token",
-        _ => false,
+const MASKED_CONFIG_VALUE: &str = "***";
+
+fn is_sensitive_config_key(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    normalized == "url"
+        || normalized.ends_with("_url")
+        || normalized == "authorization"
+        || normalized.ends_with("_authorization")
+        || [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "api_key",
+            "apikey",
+            "private_key",
+            "access_key",
+            "signing_key",
+        ]
+        .iter()
+        .any(|marker| {
+            normalized == *marker
+                || normalized.starts_with(&format!("{marker}_"))
+                || normalized.ends_with(&format!("_{marker}"))
+        })
+}
+
+fn is_provider_config_field_revealable(_provider_type: &str, field: &str) -> bool {
+    if field
+        .strip_prefix("headers.")
+        .is_some_and(|name| !name.is_empty())
+    {
+        return true;
     }
+
+    field.split('.').all(|segment| !segment.is_empty())
+        && field
+            .rsplit('.')
+            .next()
+            .is_some_and(is_sensitive_config_key)
 }
 
 fn provider_config_field<'a>(
@@ -82,7 +110,13 @@ fn provider_config_field<'a>(
         Some(header_name) => config
             .get("headers")
             .and_then(|headers| headers.get(header_name)),
-        None => config.get(field),
+        None => {
+            let mut value = config;
+            for segment in field.split('.') {
+                value = value.get(segment)?;
+            }
+            Some(value)
+        }
     }
 }
 
@@ -1545,7 +1579,7 @@ impl NotificationService {
 
     fn mask_provider_config(config: &mut serde_json::Value) {
         let Some(object) = config.as_object_mut() else {
-            *config = serde_json::Value::String("***".to_string());
+            *config = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
             return;
         };
 
@@ -1553,20 +1587,32 @@ impl NotificationService {
             if name == "headers" {
                 if let Some(headers) = value.as_object_mut() {
                     for header_value in headers.values_mut() {
-                        *header_value = serde_json::Value::String("***".to_string());
+                        if !header_value.is_null() {
+                            *header_value =
+                                serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                        }
                     }
                 } else if !value.is_null() {
-                    *value = serde_json::Value::String("***".to_string());
+                    *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
                 }
                 continue;
             }
 
-            if matches!(
-                name.as_str(),
-                "password" | "webhook_url" | "api_token" | "api_key" | "token" | "secret" | "url"
-            ) && !value.is_null()
-            {
-                *value = serde_json::Value::String("***".to_string());
+            if is_sensitive_config_key(name) && !value.is_null() {
+                *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                continue;
+            }
+
+            match value {
+                serde_json::Value::Object(_) => Self::mask_provider_config(value),
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if item.is_object() {
+                            Self::mask_provider_config(item);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1580,11 +1626,17 @@ impl NotificationService {
                     }
                 }
             }
-            (existing, serde_json::Value::String(value)) if value == "***" => {
-                *value = match existing {
-                    serde_json::Value::String(existing) => existing.clone(),
-                    other => other.to_string(),
-                };
+            (serde_json::Value::Array(existing), serde_json::Value::Array(replacement)) => {
+                for (old_value, new_value) in existing.iter().zip(replacement.iter_mut()) {
+                    Self::merge_masked_values(old_value, new_value);
+                }
+            }
+            (existing, replacement)
+                if replacement
+                    .as_str()
+                    .is_some_and(|value| value == MASKED_CONFIG_VALUE) =>
+            {
+                *replacement = existing.clone();
             }
             _ => {}
         }
@@ -2177,6 +2229,19 @@ impl NotificationPreferencesService {
 mod tests {
     use super::*;
     use sea_orm::MockDatabase;
+    use temps_database::test_utils::TestDatabase;
+
+    macro_rules! test_database_or_skip {
+        () => {
+            match TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    eprintln!("Skipping Docker-dependent notification test: {error}");
+                    return;
+                }
+            }
+        };
+    }
 
     fn create_test_notification() -> Notification {
         Notification {
@@ -2732,12 +2797,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_get_defaults() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2762,12 +2823,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2812,12 +2869,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update_existing() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2857,12 +2910,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_delete() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2938,12 +2987,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_multiple_updates() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -3539,8 +3584,17 @@ mod tests {
     fn provider_config_masking_covers_each_credential_shape() {
         let mut config = serde_json::json!({
             "password": "smtp-secret",
+            "smtp_password": "smtp-secret-alias",
             "webhook_url": "https://hooks.example/secret",
             "api_token": "cloudflare-secret",
+            "oauth": {
+                "client_secret": "oauth-secret",
+                "access_token": "oauth-token",
+                "issuer": "https://issuer.example.test"
+            },
+            "targets": [
+                {"signing_key": "nested-array-secret", "name": "primary"}
+            ],
             "headers": {
                 "Authorization": "Bearer secret",
                 "X-Webhook-Secret": "secret"
@@ -3551,8 +3605,14 @@ mod tests {
         NotificationService::mask_provider_config(&mut config);
 
         assert_eq!(config["password"], "***");
+        assert_eq!(config["smtp_password"], "***");
         assert_eq!(config["webhook_url"], "***");
         assert_eq!(config["api_token"], "***");
+        assert_eq!(config["oauth"]["client_secret"], "***");
+        assert_eq!(config["oauth"]["access_token"], "***");
+        assert_eq!(config["oauth"]["issuer"], "https://issuer.example.test");
+        assert_eq!(config["targets"][0]["signing_key"], "***");
+        assert_eq!(config["targets"][0]["name"], "primary");
         assert_eq!(config["headers"]["Authorization"], "***");
         assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
         assert_eq!(config["smtp_host"], "smtp.example.com");
@@ -3564,13 +3624,17 @@ mod tests {
             "password": "smtp-secret",
             "webhook_url": "https://hooks.slack.com/services/secret",
             "url": "https://example.com/webhook/secret",
-            "headers": {"Authorization": "Bearer secret"}
+            "headers": {"Authorization": "Bearer secret"},
+            "oauth": {"client_secret": {"primary": "nested-secret"}},
+            "targets": [{"access_token": "array-secret"}]
         });
         let mut replacement = serde_json::json!({
             "password": "***",
             "webhook_url": "***",
             "url": "***",
             "headers": {"Authorization": "***"},
+            "oauth": {"client_secret": "***"},
+            "targets": [{"access_token": "***"}],
             "smtp_host": "smtp.example.com"
         });
 
@@ -3583,6 +3647,11 @@ mod tests {
         );
         assert_eq!(replacement["url"], "https://example.com/webhook/secret");
         assert_eq!(replacement["headers"]["Authorization"], "Bearer secret");
+        assert_eq!(
+            replacement["oauth"]["client_secret"],
+            serde_json::json!({"primary": "nested-secret"})
+        );
+        assert_eq!(replacement["targets"][0]["access_token"], "array-secret");
         assert_eq!(replacement["smtp_host"], "smtp.example.com");
     }
 
@@ -3600,6 +3669,14 @@ mod tests {
         assert!(is_provider_config_field_revealable(
             "webhook",
             "headers.Authorization"
+        ));
+        assert!(is_provider_config_field_revealable(
+            "custom",
+            "oauth.client_secret"
+        ));
+        assert!(!is_provider_config_field_revealable(
+            "custom",
+            "oauth.issuer"
         ));
         assert_eq!(
             provider_config_field(&config, "headers.Authorization"),
@@ -3622,5 +3699,114 @@ mod tests {
             NotificationService::mask_provider_config(&mut masked);
             assert!(!masked.to_string().contains("plaintext"));
         }
+    }
+
+    fn notification_provider_model(
+        encryption_service: &temps_core::EncryptionService,
+        config: serde_json::Value,
+    ) -> notification_providers::Model {
+        notification_providers::Model {
+            id: 17,
+            name: "Custom OAuth".to_string(),
+            provider_type: "custom".to_string(),
+            config: encryption_service
+                .encrypt_string(&config.to_string())
+                .unwrap(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_supports_nested_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({
+                "oauth": {
+                    "client_secret": "oauth-secret",
+                    "issuer": "https://issuer.example.test"
+                }
+            }),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let (_, value) = service
+            .reveal_provider_config_value(17, "oauth.client_secret")
+            .await
+            .unwrap();
+
+        assert_eq!(value, "oauth-secret");
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_rejects_non_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({"oauth": {"issuer": "https://issuer.example.test"}}),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let error = service
+            .reveal_provider_config_value(17, "oauth.issuer")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::FieldNotRevealable {
+                provider_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_reports_not_found_and_database_errors() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let not_found_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<notification_providers::Model>::new()])
+            .into_connection();
+        let not_found_service =
+            NotificationService::new(Arc::new(not_found_db), encryption_service.clone());
+        let error = not_found_service
+            .reveal_provider_config_value(404, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::ProviderNotFound { provider_id: 404 }
+        ));
+
+        let database_error = sea_orm::DbErr::Custom("database unavailable".to_string());
+        let error_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([database_error])
+            .into_connection();
+        let error_service = NotificationService::new(Arc::new(error_db), encryption_service);
+        let error = error_service
+            .reveal_provider_config_value(17, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::Database {
+                provider_id: 17,
+                ..
+            }
+        ));
     }
 }

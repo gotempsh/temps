@@ -2565,6 +2565,66 @@ pub struct ExternalServiceApiDoc;
 mod tests {
     use super::*;
     use axum::response::IntoResponse;
+    use sea_orm::MockDatabase;
+    use std::sync::Mutex;
+    use temps_entities::external_services;
+
+    #[derive(Clone, Default)]
+    struct RecordingAuditLogger {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            self.operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Credential Auditor".to_string(),
+            email: "auditor@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "credential-reveal-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
 
     // Guards the shared error->status mapping used by update_service /
     // upgrade_service / start_service. The exact bug this class of test exists
@@ -2618,6 +2678,102 @@ mod tests {
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_reveal_returns_no_store_response_and_writes_audit() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "service-handler-reveal-test",
+        ));
+        let encrypted_config = encryption_service
+            .encrypt_string(
+                &serde_json::json!({
+                    "password": "handler-secret",
+                    "max_connections": 100
+                })
+                .to_string(),
+            )
+            .expect("test service config encryption should succeed");
+        let model = external_services::Model {
+            id: 17,
+            name: "postgres-test".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("postgres-test".to_string()),
+            config: Some(encrypted_config),
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![model.clone()], vec![model]])
+                .into_connection(),
+        );
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let audit_logger = RecordingAuditLogger::default();
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(audit_logger.clone()),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: None,
+        });
+
+        let response = reveal_service_parameter(
+            RequireAuth(test_auth_context()),
+            State(state),
+            Extension(test_request_metadata()),
+            Path((17, "password".to_string())),
+        )
+        .await
+        .expect("authorized reveal should succeed")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reveal response body should be readable");
+        let revealed: SensitiveValueResponse =
+            serde_json::from_slice(&body).expect("reveal response should be JSON");
+        assert_eq!(revealed.value, "handler-secret");
+        assert_eq!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .as_slice(),
+            ["EXTERNAL_SERVICE_PARAMETER_REVEALED"]
         );
     }
 }
