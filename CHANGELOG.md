@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **providers:** `shared_preload_libraries` was unconditionally overwritten to just `pg_stat_statements` at container-creation time, silently dropping any image-required library (e.g. `timescaledb` for the `timescale/timescaledb-ha:pg18` image option) — the value is now merged, not overwritten ([#460](https://github.com/gotempsh/temps/pull/460))
 - **providers:** Postgres container restarts never picked up a corrected `shared_preload_libraries` value — the drift-reconciliation check only compared `archive_mode`; it now also detects `shared_preload_libraries` drift and recreates the container accordingly ([#460](https://github.com/gotempsh/temps/pull/460))
 - **web:** the service Logs tab crashed with a React error boundary (`Cannot read properties of undefined (reading 'next_cursor')`) when the logs API returned a non-2xx response ([#460](https://github.com/gotempsh/temps/pull/460))
+- **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis, a high-severity merge gate, and fail-closed symlink validation.
+
+### Fixed
+
+- **temps-cli skill:** Use an integrity-pinned, lifecycle-script-disabled CLI installation and the installed `temps` binary so agents no longer download mutable package code on every command; add explicit context, confirmation, secret-handling, credential-reveal, and untrusted-output boundaries.
+- **agent skills:** Make platform setup stop at human-controlled installation and secret boundaries, remove mutable package runners and credential-bearing examples, and pin React analytics/session-recording installation to a reviewed artifact while treating downloaded package content as untrusted.
 
 ## [0.1.0-beta.55] - 2026-07-28
 

@@ -470,6 +470,15 @@ pub async fn list_metric_label_values(
 }
 
 /// Query trace spans with optional filters.
+///
+/// Each returned span has a `duration_ms` field (float, milliseconds) — this is
+/// the ONLY field guaranteed to be in milliseconds. Spans also carry an
+/// `attributes` map of raw key/value pairs exactly as reported by the
+/// instrumenting library: numeric attribute values may be seconds, milliseconds,
+/// microseconds, or nanoseconds depending on that library's convention, and
+/// nothing in this response labels the unit. Never assume an attribute's
+/// numeric value shares `duration_ms`'s unit, and never state a duration in
+/// milliseconds unless it came from a `duration_ms` field.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -665,6 +674,16 @@ pub async fn query_trace_summaries(
 }
 
 /// Get all spans for a specific trace.
+///
+/// Each span has a `duration_ms` field (float, milliseconds) — the ONLY field
+/// guaranteed to be in milliseconds — plus an `attributes` map of raw
+/// key/value pairs exactly as the instrumenting library reported them.
+/// Numeric attribute values (e.g. connection-pool wait times, queue delays)
+/// may be in seconds, milliseconds, microseconds, or nanoseconds depending on
+/// that library's own convention; this response never labels the unit. When
+/// explaining what a span spent time on, only quote milliseconds from
+/// `duration_ms` (or from `start_time`/`end_time` deltas) — never assume a raw
+/// attribute number is already in milliseconds.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -902,6 +921,11 @@ pub async fn get_pipeline_stats(
 // ── GenAI Agent Activity Handlers ──────────────────────────────────
 
 /// Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
@@ -978,6 +1002,11 @@ pub async fn query_genai_traces(
 }
 
 /// Get GenAI span details for a specific trace.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
