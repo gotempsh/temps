@@ -6,8 +6,8 @@ use super::types::AppState;
 use axum::Router;
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Json,
 };
@@ -638,7 +638,7 @@ pub async fn get_resolved_environment_variable_value(
     Path((project_id, key)): Path<(i32, String)>,
     Query(params): Query<GetEnvironmentVariablesQuery>,
     RequireAuth(auth): RequireAuth,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<Response, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
@@ -659,7 +659,13 @@ pub async fn get_resolved_environment_variable_value(
         .get_environment_variable_value(project_id, &key, params.environment_id)
         .await
     {
-        Ok(value) => return Ok(Json(EnvironmentVariableValueResponse { value })),
+        Ok(value) => {
+            return Ok((
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(EnvironmentVariableValueResponse { value }),
+            )
+                .into_response());
+        }
         Err(crate::services::env_var_service::EnvVarError::NotFound(_)) => {
             // Fall through to integration lookup.
         }
@@ -699,7 +705,11 @@ pub async fn get_resolved_environment_variable_value(
     }
 
     match resolved_value {
-        Some(value) => Ok(Json(EnvironmentVariableValueResponse { value })),
+        Some(value) => Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(EnvironmentVariableValueResponse { value }),
+        )
+            .into_response()),
         None => Err(temps_core::error_builder::not_found()
             .title("Environment variable not found")
             .detail(format!(
@@ -901,7 +911,7 @@ pub async fn get_environment_variable_value(
     Path((project_id, key)): Path<(i32, String)>,
     Query(params): Query<GetEnvironmentVariablesQuery>,
     RequireAuth(auth): RequireAuth,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<Response, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
@@ -924,7 +934,11 @@ pub async fn get_environment_variable_value(
         .get_environment_variable_value(project_id, &key, params.environment_id)
         .await?;
 
-    Ok(Json(EnvironmentVariableValueResponse { value }))
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(EnvironmentVariableValueResponse { value }),
+    )
+        .into_response())
 }
 
 /// Update environment settings

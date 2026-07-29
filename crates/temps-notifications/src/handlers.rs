@@ -505,6 +505,7 @@ async fn get_notification_provider(
     responses(
         (status = 200, description = "Sensitive provider configuration value", body = SensitiveConfigValueResponse),
         (status = 400, description = "Field is not revealable"),
+        (status = 403, description = "Missing secrets:read permission"),
         (status = 404, description = "Provider or field not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -522,6 +523,7 @@ async fn reveal_notification_provider_config(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersRead);
+    permission_guard!(auth, SecretsRead);
 
     let revealed = app_state
         .notification_service
