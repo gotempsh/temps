@@ -26,7 +26,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::handlers::types::AppState;
 use crate::pg_stat_statements::{
-    PgStatStatementsError, PgStatStatementsService, SlowQueryRow, DEFAULT_LIMIT, MAX_LIMIT,
+    PgStatStatementsError, PgStatStatementsService, SlowQueryPage, SlowQueryRow, DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,8 +82,10 @@ impl From<PgStatStatementsError> for Problem {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SlowQueryParams {
-    /// Maximum number of rows to return. Defaults to 20, max 100.
-    pub limit: Option<u32>,
+    /// Page number (1-based). Defaults to 1.
+    pub page: Option<u32>,
+    /// Number of rows per page (1–100). Defaults to 20.
+    pub page_size: Option<u32>,
 }
 
 /// Response envelope for the slow-queries list endpoint.
@@ -90,8 +93,12 @@ pub struct SlowQueryParams {
 pub struct SlowQueriesResponse {
     /// Ordered list of query stats, slowest first by total_exec_time_ms.
     pub queries: Vec<SlowQueryRow>,
-    /// Effective limit used for this request.
-    pub limit: u32,
+    /// Current page number (1-based).
+    pub page: u32,
+    /// Number of rows per page used for this request.
+    pub page_size: u32,
+    /// Total number of qualifying rows across all pages.
+    pub total_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,8 +125,8 @@ pub struct PgStatStatementsApiDoc;
         SlowQueryParams,
     ),
     responses(
-        (status = 200, description = "Top slow queries from pg_stat_statements", body = SlowQueriesResponse),
-        (status = 400, description = "Invalid limit parameter"),
+        (status = 200, description = "Paginated slow queries from pg_stat_statements", body = SlowQueriesResponse),
+        (status = 400, description = "Invalid pagination parameters"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions (requires external_services:read)"),
         (status = 404, description = "Service not found"),
@@ -136,18 +143,24 @@ async fn get_slow_queries(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
-    let effective_limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params
+        .page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
 
     let pg_stat_service = PgStatStatementsService::new(state.external_service_manager.clone());
 
-    let queries = pg_stat_service
-        .top_slow_queries(service_id, Some(effective_limit))
+    let (queries, total_count) = pg_stat_service
+        .top_slow_queries(service_id, SlowQueryPage { page, page_size })
         .await
         .map_err(Problem::from)?;
 
     Ok(Json(SlowQueriesResponse {
         queries,
-        limit: effective_limit,
+        page,
+        page_size,
+        total_count,
     }))
 }
 

@@ -111,14 +111,32 @@ pub struct SlowQueryRow {
     pub cache_hit_ratio: Option<f64>,
 }
 
+/// Pagination parameters for the slow-queries endpoint.
+#[derive(Debug, Clone)]
+pub struct SlowQueryPage {
+    /// 1-based page number.
+    pub page: u32,
+    /// Number of rows per page (1–100).
+    pub page_size: u32,
+}
+
+impl Default for SlowQueryPage {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            page_size: DEFAULT_PAGE_SIZE,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
-/// Maximum number of rows the caller may request.
-pub const MAX_LIMIT: u32 = 100;
-/// Default number of rows returned when no limit is specified.
-pub const DEFAULT_LIMIT: u32 = 20;
+/// Maximum page size the caller may request.
+pub const MAX_PAGE_SIZE: u32 = 100;
+/// Default page size returned when none is specified.
+pub const DEFAULT_PAGE_SIZE: u32 = 20;
 
 pub struct PgStatStatementsService {
     external_service_manager: Arc<ExternalServiceManager>,
@@ -221,31 +239,36 @@ impl PgStatStatementsService {
         Ok((db, service_id))
     }
 
-    /// Return the top `limit` queries ordered by `total_exec_time` descending
-    /// for the given user-provisioned Postgres service.
+    /// Return a paginated slice of queries ordered by `total_exec_time`
+    /// descending for the given user-provisioned Postgres service.
     ///
     /// Connects to the service's database using its admin credentials (stored
     /// encrypted in the control plane). Validates that the service is of type
     /// Postgres and that `pg_stat_statements` is loaded.
+    ///
+    /// Returns the page of rows together with the total count of qualifying
+    /// rows so the caller can render pagination controls.
     pub async fn top_slow_queries(
         &self,
         service_id: i32,
-        limit: Option<u32>,
-    ) -> Result<Vec<SlowQueryRow>, PgStatStatementsError> {
-        let n = match limit {
-            None => DEFAULT_LIMIT,
-            Some(0) => {
-                return Err(PgStatStatementsError::Validation {
-                    message: format!("limit must be between 1 and {MAX_LIMIT}, got 0"),
-                })
-            }
-            Some(v) if v > MAX_LIMIT => {
-                return Err(PgStatStatementsError::Validation {
-                    message: format!("limit must be between 1 and {MAX_LIMIT}, got {v}"),
-                })
-            }
-            Some(v) => v,
-        };
+        pagination: SlowQueryPage,
+    ) -> Result<(Vec<SlowQueryRow>, u64), PgStatStatementsError> {
+        if pagination.page == 0 {
+            return Err(PgStatStatementsError::Validation {
+                message: "page must be >= 1".to_owned(),
+            });
+        }
+        if pagination.page_size == 0 || pagination.page_size > MAX_PAGE_SIZE {
+            return Err(PgStatStatementsError::Validation {
+                message: format!(
+                    "page_size must be between 1 and {MAX_PAGE_SIZE}, got {}",
+                    pagination.page_size
+                ),
+            });
+        }
+
+        let limit = pagination.page_size;
+        let offset = (pagination.page - 1) * pagination.page_size;
 
         let (db, service_id) = self.connect_to_service(service_id).await?;
 
@@ -281,6 +304,30 @@ impl PgStatStatementsService {
             return Err(PgStatStatementsError::ExtensionNotAvailable { service_id });
         }
 
+        // Total count for pagination controls.
+        let count_sql = "SELECT COUNT(*)::bigint AS n FROM pg_stat_statements WHERE calls > 0";
+        let count_row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                count_sql.to_owned(),
+            ))
+            .await
+            .map_err(|e| PgStatStatementsError::QueryError {
+                service_id,
+                reason: format!("failed to count pg_stat_statements rows: {}", e),
+            })?
+            .ok_or_else(|| PgStatStatementsError::QueryError {
+                service_id,
+                reason: "COUNT query returned no rows".to_owned(),
+            })?;
+        let total_count: i64 =
+            count_row
+                .try_get("", "n")
+                .map_err(|e| PgStatStatementsError::QueryError {
+                    service_id,
+                    reason: format!("failed to read count: {}", e),
+                })?;
+
         let sql = format!(
             r#"
             SELECT
@@ -300,7 +347,8 @@ impl PgStatStatementsService {
             FROM pg_stat_statements
             WHERE calls > 0
             ORDER BY total_exec_time DESC
-            LIMIT {n}
+            LIMIT {limit}
+            OFFSET {offset}
             "#
         );
 
@@ -356,7 +404,7 @@ impl PgStatStatementsService {
             });
         }
 
-        Ok(result)
+        Ok((result, total_count as u64))
     }
 }
 
@@ -369,41 +417,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_limit_is_within_max() {
-        const { assert!(DEFAULT_LIMIT <= MAX_LIMIT) };
+    fn test_default_page_size_is_within_max() {
+        const { assert!(DEFAULT_PAGE_SIZE <= MAX_PAGE_SIZE) };
     }
 
-    /// Validate the limit-check helper logic in isolation (no external deps).
     #[test]
-    fn test_limit_validation_logic() {
-        // Zero must fail
-        assert!(matches!(
-            validate_limit(Some(0)),
-            Err(PgStatStatementsError::Validation { .. })
-        ));
-        // Over max must fail
-        assert!(matches!(
-            validate_limit(Some(MAX_LIMIT + 1)),
-            Err(PgStatStatementsError::Validation { .. })
-        ));
-        // None → DEFAULT_LIMIT
-        assert_eq!(validate_limit(None).unwrap(), DEFAULT_LIMIT);
-        // Valid value
-        assert_eq!(validate_limit(Some(10)).unwrap(), 10);
-        // Max is allowed
-        assert_eq!(validate_limit(Some(MAX_LIMIT)).unwrap(), MAX_LIMIT);
+    fn test_page_default() {
+        let p = SlowQueryPage::default();
+        assert_eq!(p.page, 1);
+        assert_eq!(p.page_size, DEFAULT_PAGE_SIZE);
     }
 
-    fn validate_limit(limit: Option<u32>) -> Result<u32, PgStatStatementsError> {
-        match limit {
-            None => Ok(DEFAULT_LIMIT),
-            Some(0) => Err(PgStatStatementsError::Validation {
-                message: format!("limit must be between 1 and {MAX_LIMIT}, got 0"),
-            }),
-            Some(v) if v > MAX_LIMIT => Err(PgStatStatementsError::Validation {
-                message: format!("limit must be between 1 and {MAX_LIMIT}, got {v}"),
-            }),
-            Some(v) => Ok(v),
+    /// Validate the page_size bounds (logic extracted from top_slow_queries).
+    #[test]
+    fn test_page_size_validation() {
+        // page_size=0 must fail
+        let result = validate_page_size(0);
+        assert!(matches!(
+            result,
+            Err(PgStatStatementsError::Validation { .. })
+        ));
+
+        // page_size > MAX must fail
+        let result = validate_page_size(MAX_PAGE_SIZE + 1);
+        assert!(matches!(
+            result,
+            Err(PgStatStatementsError::Validation { .. })
+        ));
+
+        // Valid values
+        assert!(validate_page_size(1).is_ok());
+        assert!(validate_page_size(MAX_PAGE_SIZE).is_ok());
+        assert!(validate_page_size(20).is_ok());
+    }
+
+    fn validate_page_size(page_size: u32) -> Result<(), PgStatStatementsError> {
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(PgStatStatementsError::Validation {
+                message: format!(
+                    "page_size must be between 1 and {MAX_PAGE_SIZE}, got {}",
+                    page_size
+                ),
+            });
         }
+        Ok(())
     }
 }
