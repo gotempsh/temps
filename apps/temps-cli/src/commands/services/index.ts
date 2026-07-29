@@ -378,7 +378,8 @@ export function registerServicesCommands(program: Command): void {
     .command('slow-queries')
     .description('Show slowest PostgreSQL queries from pg_stat_statements')
     .requiredOption('--id <id>', 'Service ID')
-    .option('-n, --limit <n>', 'Maximum number of queries to return (default: 20)', '20')
+    .option('--page <n>', 'Page number (1-based, default: 1)', '1')
+    .option('--page-size <n>', 'Rows per page (1–100, default: 20)', '20')
     .option('--json', 'Output raw JSON instead of a formatted table')
     .action(serviceSlowQueriesAction)
 
@@ -1444,12 +1445,15 @@ interface SlowQueryRow {
 
 interface SlowQueriesResponse {
   queries: SlowQueryRow[]
-  limit: number
+  page: number
+  page_size: number
+  total_count: number
 }
 
 interface ServiceSlowQueriesOptions {
   id: string
-  limit?: string
+  page?: string
+  pageSize?: string
   json?: boolean
 }
 
@@ -1463,12 +1467,13 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
     return
   }
 
-  const limit = Math.min(100, Math.max(1, parseInt(options.limit ?? '20', 10)))
+  const page = Math.max(1, parseInt(options.page ?? '1', 10))
+  const pageSize = Math.min(100, Math.max(1, parseInt(options.pageSize ?? '20', 10)))
 
   const result = await withSpinner('Fetching slow queries…', async () => {
     const { data, error } = await client.get<SlowQueriesResponse>({
       url: `/external-services/${id}/pg-stat-statements/slow-queries`,
-      query: { limit },
+      query: { page, page_size: pageSize },
     })
     if (error) {
       const msg = getErrorMessage(error)
@@ -1539,5 +1544,9 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
 
   printTable(queries, columns)
   newline()
-  info(`${queries.length} quer${queries.length === 1 ? 'y' : 'ies'} shown (limit ${limit})`)
+  const totalPages = pageSize > 0 ? Math.ceil((result.total_count ?? 0) / pageSize) : 1
+  info(
+    `${queries.length} quer${queries.length === 1 ? 'y' : 'ies'} shown` +
+      ` (page ${result.page} / ${totalPages}, ${result.total_count ?? 0} total)`,
+  )
 }

@@ -14907,13 +14907,21 @@ export type SlackConfig = {
  */
 export type SlowQueriesResponse = {
     /**
-     * Effective limit used for this request.
+     * Current page number (1-based).
      */
-    limit: number;
+    page: number;
+    /**
+     * Number of rows per page used for this request.
+     */
+    page_size: number;
     /**
      * Ordered list of query stats, slowest first by total_exec_time_ms.
      */
     queries: Array<SlowQueryRow>;
+    /**
+     * Total number of qualifying rows across all pages.
+     */
+    total_count: number;
 };
 
 /**
@@ -27595,9 +27603,13 @@ export type GetSlowQueriesData = {
     };
     query?: {
         /**
-         * Maximum number of rows to return. Defaults to 20, max 100.
+         * Page number (1-based). Defaults to 1.
          */
-        limit?: number | null;
+        page?: number | null;
+        /**
+         * Number of rows per page (1-100). Defaults to 20.
+         */
+        page_size?: number | null;
     };
     url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
 };

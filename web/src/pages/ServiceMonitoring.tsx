@@ -48,20 +48,15 @@ import {
   externalServiceMetricsGetAlertRulesQueryKey,
   externalServiceMetricsCreateAlertRuleMutation,
   externalServiceMetricsDeleteAlertRuleMutation,
-  getSlowQueriesOptions,
-  getSlowQueriesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
 import {
   Activity,
-  ArrowDown,
   ArrowLeft,
-  ArrowUp,
   Loader2,
   Plus,
   RefreshCw,
   Trash2,
-  Zap,
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -1001,190 +996,6 @@ function DatabasesSection({
 }
 
 // ---------------------------------------------------------------------------
-// SlowQueriesSection — pg_stat_statements top slow queries (Postgres only)
-// ---------------------------------------------------------------------------
-
-const SLOW_QUERIES_DEFAULT_LIMIT = 20
-
-type SlowQueriesSectionProps = {
-  serviceId: number
-}
-
-type SlowQuerySortKey = 'calls' | 'total_exec_time_ms' | 'mean_exec_time_ms' | 'rows' | 'cache_hit_ratio'
-type SortOrder = 'asc' | 'desc'
-
-function SlowQueriesSection({ serviceId }: SlowQueriesSectionProps) {
-  const queryClient = useQueryClient()
-  const [sortKey, setSortKey] = useState<SlowQuerySortKey | null>(null)
-  const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
-
-  const handleSort = (key: SlowQuerySortKey) => {
-    if (sortKey !== key) {
-      // Different column: start fresh at ascending
-      setSortKey(key)
-      setSortOrder('asc')
-    } else if (sortOrder === 'asc') {
-      // Same column, ascending → descending
-      setSortOrder('desc')
-    } else {
-      // Same column, descending → reset to default (API order)
-      setSortKey(null)
-    }
-  }
-
-  const { data, isLoading, error, isFetching } = useQuery({
-    ...getSlowQueriesOptions({
-      path: { service_id: serviceId },
-      query: { limit: SLOW_QUERIES_DEFAULT_LIMIT },
-    }),
-    staleTime: 30_000,
-    retry: (failureCount, err) => {
-      const msg = metricsErrorText(err).toLowerCase()
-      // Don't retry if pg_stat_statements is simply not loaded yet
-      if (msg.includes('not available') || msg.includes('shared_preload')) {
-        return false
-      }
-      return failureCount < 2
-    },
-  })
-
-  const handleRefresh = () => {
-    queryClient.invalidateQueries({
-      queryKey: getSlowQueriesQueryKey({
-        path: { service_id: serviceId },
-        query: { limit: SLOW_QUERIES_DEFAULT_LIMIT },
-      }),
-    })
-  }
-
-  const rawQueries = data?.queries ?? []
-  const queries = sortKey == null
-    ? rawQueries
-    : [...rawQueries].sort((a, b) => {
-        const aVal = a[sortKey] ?? 0
-        const bVal = b[sortKey] ?? 0
-        return sortOrder === 'asc' ? aVal - bVal : bVal - aVal
-      })
-
-  return (
-    <div>
-      <div className="mb-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
-            Slow Queries
-          </h2>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1.5"
-          onClick={handleRefresh}
-          disabled={isFetching}
-        >
-          <RefreshCw className={`size-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-          Refresh
-        </Button>
-      </div>
-
-      {isLoading ? (
-        <div className="space-y-2 rounded-lg border border-border p-4">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <div key={i} className="flex gap-3">
-              <div className="h-4 flex-1 animate-pulse rounded bg-muted" />
-              <div className="h-4 w-16 animate-pulse rounded bg-muted" />
-              <div className="h-4 w-20 animate-pulse rounded bg-muted" />
-              <div className="h-4 w-20 animate-pulse rounded bg-muted" />
-            </div>
-          ))}
-        </div>
-      ) : error != null ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border py-10 text-center">
-          <Zap className="size-6 text-muted-foreground" />
-          <p className="max-w-sm text-sm text-muted-foreground">
-            {metricsErrorText(error)}
-          </p>
-        </div>
-      ) : queries.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border py-10 text-center">
-          <Zap className="size-6 text-muted-foreground" />
-          <p className="max-w-xs text-sm text-muted-foreground">
-            No slow queries recorded yet. Queries appear here once{' '}
-            <code className="font-mono text-xs">pg_stat_statements</code> has
-            collected data.
-          </p>
-        </div>
-      ) : (
-        <div className="overflow-x-auto rounded-lg border border-border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="min-w-[200px]">Query</TableHead>
-                {(
-                  [
-                    { key: 'calls', label: 'Calls', className: 'tabular-nums' },
-                    { key: 'total_exec_time_ms', label: 'Total (ms)', className: 'tabular-nums' },
-                    { key: 'mean_exec_time_ms', label: 'Mean (ms)', className: 'tabular-nums' },
-                    { key: 'rows', label: 'Rows', className: 'hidden tabular-nums md:table-cell' },
-                    { key: 'cache_hit_ratio', label: 'Cache Hit', className: 'hidden tabular-nums md:table-cell' },
-                  ] as Array<{ key: SlowQuerySortKey; label: string; className: string }>
-                ).map(({ key, label, className }) => (
-                  <TableHead key={key} className={className}>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleSort(key)}
-                      className="-ml-3 h-8"
-                    >
-                      {label}
-                      {sortKey === key
-                        ? sortOrder === 'asc'
-                          ? <ArrowUp className="ml-1 size-3.5" />
-                          : <ArrowDown className="ml-1 size-3.5" />
-                        : null}
-                    </Button>
-                  </TableHead>
-                ))}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {queries.map((row, i) => (
-                <TableRow key={i} className="even:bg-muted/30">
-                  <TableCell className="max-w-xs">
-                    <span
-                      className="block truncate font-mono text-xs text-foreground"
-                      title={row.query}
-                    >
-                      {row.query}
-                    </span>
-                  </TableCell>
-                  <TableCell className="tabular-nums text-sm">
-                    {row.calls.toLocaleString()}
-                  </TableCell>
-                  <TableCell className="tabular-nums text-sm">
-                    {row.total_exec_time_ms.toFixed(2)}
-                  </TableCell>
-                  <TableCell className="tabular-nums text-sm">
-                    {row.mean_exec_time_ms.toFixed(2)}
-                  </TableCell>
-                  <TableCell className="hidden tabular-nums text-sm md:table-cell">
-                    {row.rows.toLocaleString()}
-                  </TableCell>
-                  <TableCell className="hidden tabular-nums text-sm md:table-cell">
-                    {row.cache_hit_ratio != null
-                      ? `${(row.cache_hit_ratio * 100).toFixed(1)}%`
-                      : '—'}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // AlertRulesSection
 // ---------------------------------------------------------------------------
 
@@ -1531,10 +1342,7 @@ function MonitoringDashboard({
         />
       )}
 
-      {/* Slow queries (Postgres only — powered by pg_stat_statements) */}
-      {engine === 'postgres' && (
-        <SlowQueriesSection serviceId={serviceId} />
-      )}
+      {/* Slow queries moved to the dedicated Query Performance page */}
 
       {/* Alert rules */}
       <AlertRulesSection serviceId={serviceId} engine={engine} />

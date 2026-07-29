@@ -101,6 +101,7 @@ import {
   Server,
   Trash2,
   XCircle,
+  BarChart2,
 } from 'lucide-react'
 import { format } from 'date-fns'
 import { useEffect, useMemo, useState } from 'react'
@@ -743,6 +744,14 @@ export function ServiceDetail() {
                 <span className="hidden sm:inline">Logs</span>
               </Button>
             </Link>
+            {service.service.service_type === 'postgres' && (
+              <Link to={`/storage/${id}/query-performance`}>
+                <Button variant="outline" size="sm" className="gap-2">
+                  <BarChart2 className="h-4 w-4" />
+                  <span className="hidden sm:inline">Query Performance</span>
+                </Button>
+              </Link>
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" className="h-8 w-8">
