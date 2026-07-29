@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **skills:** Scan every changed agent skill in pull requests with the hash-locked Cisco AI Defense Skill Scanner, using behavioral analysis and a high-severity merge gate.
+- **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis and a high-severity merge gate.
 
 ### Fixed
 
