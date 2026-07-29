@@ -2320,6 +2320,19 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    async fn database_test_prerequisites_available() -> bool {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() {
+            return true;
+        }
+
+        tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     #[derive(Clone)]
     struct MockAuditLogger;
 
@@ -4023,13 +4036,13 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::{deployment_jobs, deployments, environments, projects};
 
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(test_db) => test_db,
-            Err(error) => {
-                eprintln!("Docker unavailable; skipping deployment ownership test: {error}");
-                return;
-            }
-        };
+        if !database_test_prerequisites_available().await {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create deployment ownership test database");
         let db = test_db.connection_arc();
 
         let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
@@ -4112,6 +4125,11 @@ mod tests {
         .insert(&*db)
         .await
         .expect("Failed to create job 2");
+        std::fs::write(
+            temp_dir.join("build-log.log"),
+            "authorized same-project build log",
+        )
+        .expect("Failed to seed same-project build log");
 
         // Seed another tenant's deployment with deliberately sensitive legacy
         // job_config. Supplying the authorized project's ID with this foreign
@@ -4258,6 +4276,48 @@ mod tests {
             .expect("Failed to read foreign logs error");
         assert!(!foreign_logs_body.contains(FOREIGN_SECRET));
         assert!(!foreign_logs_body.contains("foreign-build-job"));
+
+        let own_logs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs/{}/logs",
+                addr, project.id, deployment.id, "build-job"
+            ))
+            .send()
+            .await
+            .expect("Failed to request same-project deployment job logs");
+        assert_eq!(own_logs_response.status(), StatusCode::OK);
+        assert_eq!(
+            own_logs_response
+                .text()
+                .await
+                .expect("Failed to read same-project logs"),
+            "authorized same-project build log"
+        );
+
+        let own_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, deployment.id, "build-job"
+        );
+        let (mut own_socket, own_upgrade) = connect_async(own_ws_url)
+            .await
+            .expect("same-project log tail must upgrade");
+        assert_eq!(own_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+        own_socket
+            .close(None)
+            .await
+            .expect("same-project log tail socket must close cleanly");
+
+        let foreign_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, foreign_deployment.id, "foreign-build-job"
+        );
+        let foreign_upgrade = connect_async(foreign_ws_url).await;
+        match foreign_upgrade {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+            other => panic!("foreign log tail must be rejected before upgrade: {other:?}"),
+        }
 
         println!("✅ GET /projects/{{project_id}}/deployments/{{deployment_id}}/jobs test passed");
         std::fs::remove_dir_all(&temp_dir).ok();

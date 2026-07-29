@@ -5661,13 +5661,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_deployment_jobs_enforces_project_ownership(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(test_db) => test_db,
-            Err(error) => {
-                eprintln!("Docker unavailable; skipping deployment ownership test: {error}");
-                return Ok(());
-            }
-        };
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (_project, _environment, deployment) = setup_test_data(&db).await?;
 
