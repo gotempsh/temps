@@ -26,6 +26,22 @@ permissions:
   packages: write
 
 jobs:
+  validate-release-ref:
+    name: Validate Release Ref
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release validation script
+        uses: actions/checkout@v7
+
+      - name: Reject unsafe publishing refs
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
+
   build-web-assets:
     name: Build web assets (WASM + dist)
     # The web console + captcha WASM are pure static output with no
@@ -36,6 +52,7 @@ jobs:
     # most expensive repeat was the macOS Intel job's wasm-pack step alone
     # (7m26s on the last release), on top of a redundant rsbuild build in
     # each of the other 3 jobs.
+    needs: validate-release-ref
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -576,17 +593,18 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           # workflow_dispatch dry-runs must not mint a real Release object
           # under the dispatched branch name — everything above this step
           # (artifact download, formula/checksum/notes generation) still
           # runs and is inspectable in the job logs/artifacts.
           if [[ "$DRY_RUN" == "true" ]]; then
-            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for ${{ github.ref_name }}"
+            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for $RELEASE_TAG"
             exit 0
           fi
 
-          echo "Creating release ${{ github.ref_name }}..."
+          echo "Creating release $RELEASE_TAG..."
 
           if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
@@ -596,8 +614,8 @@ jobs:
             echo "This is a stable release"
           fi
 
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --notes-file release/release-notes.md \
             $PRERELEASE_FLAG \
             release/temps-linux-amd64.tar.gz \
@@ -613,9 +631,9 @@ jobs:
             release/temps.rb
 
           echo ""
-          echo "✓ Release ${{ github.ref_name }} created successfully!"
+          echo "✓ Release $RELEASE_TAG created successfully!"
           echo ""
-          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
 
   build-and-push-docker:
     name: Build and Push Docker Image (${{ matrix.platform }})
