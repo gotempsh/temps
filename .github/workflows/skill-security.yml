@@ -3,11 +3,6 @@ name: Skill Security
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "skills/**"
-      - ".github/skill-scanner-requirements.in"
-      - ".github/skill-scanner-requirements.txt"
-      - ".github/workflows/skill-security.yml"
 
 permissions:
   contents: read
