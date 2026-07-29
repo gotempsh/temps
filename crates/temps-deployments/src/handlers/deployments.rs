@@ -1354,7 +1354,7 @@ pub async fn get_deployment_jobs(
 
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let total = jobs.len();
@@ -1396,7 +1396,7 @@ pub async fn get_deployment_job_logs(
     // Get the job to verify it exists and get its log_id
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let job = jobs
@@ -1554,7 +1554,7 @@ pub async fn tail_deployment_job_logs(
     // Get the job to verify it exists and get its log_id
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let job = jobs
@@ -2319,6 +2319,19 @@ mod tests {
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    async fn database_test_prerequisites_available() -> bool {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() {
+            return true;
+        }
+
+        tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
 
     #[derive(Clone)]
     struct MockAuditLogger;
@@ -4023,9 +4036,13 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::{deployment_jobs, deployments, environments, projects};
 
+        if !database_test_prerequisites_available().await {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return;
+        }
         let test_db = TestDatabase::with_migrations()
             .await
-            .expect("Failed to create test database");
+            .expect("Failed to create deployment ownership test database");
         let db = test_db.connection_arc();
 
         let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
@@ -4075,7 +4092,10 @@ mod tests {
         .await
         .expect("Failed to create test deployment");
 
-        // Create deployment jobs
+        // Create deployment jobs. The first row deliberately uses the legacy
+        // plaintext format to prove an authorized same-project read cannot
+        // receive secrets from historical/queued workflow configuration.
+        const SAME_PROJECT_SECRET: &str = "same-project-legacy-build-secret";
         let _job1 = deployment_jobs::ActiveModel {
             deployment_id: Set(deployment.id),
             job_id: Set("build-job".to_string()),
@@ -4083,6 +4103,10 @@ mod tests {
             name: Set("Build Job".to_string()),
             log_id: Set("build-log".to_string()),
             status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": SAME_PROJECT_SECRET},
+                "build_args_encrypted": "legacy-ciphertext-must-not-leave-api"
+            }))),
             ..Default::default()
         }
         .insert(&*db)
@@ -4101,6 +4125,73 @@ mod tests {
         .insert(&*db)
         .await
         .expect("Failed to create job 2");
+        std::fs::write(
+            temp_dir.join("build-log.log"),
+            "authorized same-project build log",
+        )
+        .expect("Failed to seed same-project build log");
+
+        // Seed another tenant's deployment with deliberately sensitive legacy
+        // job_config. Supplying the authorized project's ID with this foreign
+        // deployment ID must return 404 without exposing any job metadata.
+        let foreign_project = projects::ActiveModel {
+            name: Set("Foreign Project".to_string()),
+            slug: Set(format!("foreign-project-{}", uuid::Uuid::new_v4())),
+            repo_name: Set("foreign-repo".to_string()),
+            repo_owner: Set("foreign-owner".to_string()),
+            directory: Set("/tmp/foreign-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign project");
+
+        let foreign_subdomain = format!("foreign-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let foreign_environment = environments::ActiveModel {
+            project_id: Set(foreign_project.id),
+            name: Set("Foreign Environment".to_string()),
+            slug: Set("foreign-env".to_string()),
+            subdomain: Set(foreign_subdomain.clone()),
+            host: Set(format!("{}.localhost", foreign_subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign environment");
+
+        let foreign_deployment = deployments::ActiveModel {
+            project_id: Set(foreign_project.id),
+            environment_id: Set(foreign_environment.id),
+            slug: Set(format!("foreign-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign deployment");
+
+        const FOREIGN_SECRET: &str = "cross-project-build-secret";
+        let _foreign_job = deployment_jobs::ActiveModel {
+            deployment_id: Set(foreign_deployment.id),
+            job_id: Set("foreign-build-job".to_string()),
+            job_type: Set("build".to_string()),
+            name: Set("Foreign Build Job".to_string()),
+            log_id: Set("foreign-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": FOREIGN_SECRET}
+            }))),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign job");
 
         let auth_middleware = middleware::from_fn(
             |mut req: Request, next: axum::middleware::Next| async move {
@@ -4142,6 +4233,91 @@ mod tests {
         let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
         assert!(body["jobs"].is_array());
         assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        let body_json = body.to_string();
+        assert!(!body_json.contains(SAME_PROJECT_SECRET));
+        assert!(!body_json.contains("legacy-ciphertext-must-not-leave-api"));
+        assert!(
+            body["jobs"]
+                .as_array()
+                .expect("jobs must be an array")
+                .iter()
+                .all(|job| job["job_config"].is_null()),
+            "external job responses must redact executor-internal configuration",
+        );
+
+        let foreign_jobs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs",
+                addr, project.id, foreign_deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to request foreign deployment jobs");
+        assert_eq!(foreign_jobs_response.status(), StatusCode::NOT_FOUND);
+        let foreign_jobs_body = foreign_jobs_response
+            .text()
+            .await
+            .expect("Failed to read foreign jobs error");
+        assert!(!foreign_jobs_body.contains(FOREIGN_SECRET));
+        assert!(!foreign_jobs_body.contains("foreign-build-job"));
+
+        let foreign_logs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs/{}/logs",
+                addr, project.id, foreign_deployment.id, "foreign-build-job"
+            ))
+            .send()
+            .await
+            .expect("Failed to request foreign deployment job logs");
+        assert_eq!(foreign_logs_response.status(), StatusCode::NOT_FOUND);
+        let foreign_logs_body = foreign_logs_response
+            .text()
+            .await
+            .expect("Failed to read foreign logs error");
+        assert!(!foreign_logs_body.contains(FOREIGN_SECRET));
+        assert!(!foreign_logs_body.contains("foreign-build-job"));
+
+        let own_logs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs/{}/logs",
+                addr, project.id, deployment.id, "build-job"
+            ))
+            .send()
+            .await
+            .expect("Failed to request same-project deployment job logs");
+        assert_eq!(own_logs_response.status(), StatusCode::OK);
+        assert_eq!(
+            own_logs_response
+                .text()
+                .await
+                .expect("Failed to read same-project logs"),
+            "authorized same-project build log"
+        );
+
+        let own_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, deployment.id, "build-job"
+        );
+        let (mut own_socket, own_upgrade) = connect_async(own_ws_url)
+            .await
+            .expect("same-project log tail must upgrade");
+        assert_eq!(own_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+        own_socket
+            .close(None)
+            .await
+            .expect("same-project log tail socket must close cleanly");
+
+        let foreign_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, foreign_deployment.id, "foreign-build-job"
+        );
+        let foreign_upgrade = connect_async(foreign_ws_url).await;
+        match foreign_upgrade {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+            other => panic!("foreign log tail must be rejected before upgrade: {other:?}"),
+        }
 
         println!("✅ GET /projects/{{project_id}}/deployments/{{deployment_id}}/jobs test passed");
         std::fs::remove_dir_all(&temp_dir).ok();

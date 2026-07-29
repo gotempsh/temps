@@ -1603,6 +1603,41 @@ impl ExternalServiceManager {
             })
     }
 
+    /// Force-recreate a service's container so a CMD-baked config change
+    /// (currently: `shared_preload_libraries`) takes effect immediately,
+    /// rather than waiting for the next unrelated restart to happen to also
+    /// pick it up via drift-reconciliation.
+    ///
+    /// Unlike `store_and_apply_ingest_key`, this doesn't persist anything new
+    /// into the service's config — the desired state is already derivable
+    /// from the container's own image — it just drives the engine's
+    /// `force_recreate` (see `ExternalService::force_recreate`) with a
+    /// properly hydrated config so the recreate step has what it needs.
+    pub async fn force_recreate_service_container(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let config = self.get_service_config(service_id).await?;
+        let instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type,
+            &config.parameters,
+        )?;
+        instance
+            .force_recreate(config)
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to recreate container: {}", e),
+            })
+    }
+
     pub async fn list_services(&self) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
         let services = external_services::Entity::find()
             .order_by_desc(external_services::Column::CreatedAt)

@@ -1557,6 +1557,7 @@ impl GitProviderManager {
     /// Get connections for a user with pagination and sorting
     pub async fn get_user_connections_paginated(
         &self,
+        caller_user_id: i32,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1565,7 +1566,8 @@ impl GitProviderManager {
         use sea_orm::QueryOrder;
 
         let mut query = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true));
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(caller_user_id)));
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {

@@ -5,6 +5,7 @@ pub mod externalsvc;
 pub mod health_monitor;
 pub mod mariadb_query;
 pub mod parameter_strategies;
+pub mod pg_stat_statements;
 pub mod postgres_lifecycle;
 pub mod postgres_upgrade_service;
 pub mod query_service;
