@@ -46,7 +46,6 @@ jobs:
           from pathlib import Path
           import re
           import subprocess
-          import sys
 
           skills_root = Path("skills")
           control_files = {
@@ -54,13 +53,13 @@ jobs:
               ".github/skill-scanner-requirements.txt",
               ".github/workflows/skill-security.yml",
           }
-          legacy_symlinks = {
-              "skills/stripe-best-practices":
-                  "../.agents/skills/stripe-best-practices",
-              "skills/stripe-projects": "../.agents/skills/stripe-projects",
-              "skills/upgrade-stripe": "../.agents/skills/upgrade-stripe",
-          }
           name_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+          if skills_root.is_symlink() or not skills_root.is_dir():
+              raise SystemExit(
+                  "The skills root must be a real directory: "
+                  f"{skills_root}"
+              )
 
           def validate_skill(path: Path) -> str | None:
               if not name_pattern.fullmatch(path.name):
@@ -85,18 +84,9 @@ jobs:
               paths = []
               for entry in skills_root.iterdir():
                   if entry.is_symlink():
-                      actual_target = os.readlink(entry)
-                      expected_target = legacy_symlinks.get(entry.as_posix())
-                      if actual_target != expected_target:
-                          raise SystemExit(
-                              "Unexpected top-level skill symlink: "
-                              f"{entry} -> {actual_target}"
-                          )
-                      print(
-                          f"Skipping legacy non-skill symlink entry: {entry}",
-                          file=sys.stderr,
+                      raise SystemExit(
+                          f"Top-level skill entries cannot be symlinks: {entry}"
                       )
-                      continue
                   if not entry.is_dir():
                       continue
                   validated = validate_skill(entry)

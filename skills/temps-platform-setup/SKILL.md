@@ -201,7 +201,7 @@ Read-only verification:
 
 ```bash
 temps --target-context <CONTEXT> domains list
-temps --target-context <CONTEXT> domains verify --domain <DOMAIN>
+temps --target-context <CONTEXT> domains status --domain <DOMAIN>
 ```
 
 Adding, removing, or reassigning a domain changes live traffic. Explain the

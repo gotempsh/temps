@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis and a high-severity merge gate.
+- **skills:** Scan changed agent skills in pull requests and all skills nightly, on demand, after relevant pushes to `main`, or when scanner controls change, using the hash-locked Cisco AI Defense Skill Scanner with behavioral analysis, a high-severity merge gate, and fail-closed symlink validation.
 
 ### Fixed
 
 - **temps-cli skill:** Use an integrity-pinned, lifecycle-script-disabled CLI installation and the installed `temps` binary so agents no longer download mutable package code on every command; add explicit context, confirmation, secret-handling, credential-reveal, and untrusted-output boundaries.
-- **agent skills:** Make platform setup stop at human-controlled installation and secret boundaries, remove mutable package runners and credential-bearing examples, and clarify the unavailable React analytics identity API without prompt-injection phrasing.
+- **agent skills:** Make platform setup stop at human-controlled installation and secret boundaries, remove mutable package runners and credential-bearing examples, and pin React analytics/session-recording installation to a reviewed artifact while treating downloaded package content as untrusted.
 
 ## [0.1.0-beta.55] - 2026-07-28
 
