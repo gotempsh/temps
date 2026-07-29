@@ -9,7 +9,7 @@ use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum WorkflowPlanningError {
@@ -111,6 +111,29 @@ impl WorkflowPlanner {
             field,
             source,
         })
+    }
+
+    fn buildkit_cache_namespace_for(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+    ) -> String {
+        // Tags take precedence during checkout, followed by branches and
+        // direct commit deployments. Branch deployments retain a stable cache
+        // namespace across commits, while detached commits remain isolated.
+        let cache_ref = deployment
+            .tag_ref
+            .as_deref()
+            .or(deployment.branch_ref.as_deref())
+            .or(deployment.commit_sha.as_deref())
+            .unwrap_or(&project.main_branch);
+        buildkit_cache_mount_namespace(
+            self.encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            cache_ref,
+        )
     }
 
     pub fn new(
@@ -1022,6 +1045,20 @@ impl WorkflowPlanner {
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
+        // This is a platform-owned build argument, not a tenant runtime
+        // variable. Drop any user-controlled value before planning so it
+        // cannot override the HMAC namespace or leak into deployed containers.
+        if env_vars
+            .remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+            .is_some()
+        {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Ignoring tenant-provided reserved BuildKit cache namespace"
+            );
+        }
+
         // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
@@ -1054,8 +1091,16 @@ impl WorkflowPlanner {
 
         // Docker Compose preset uses its own deployment path
         if project.preset == temps_entities::preset::Preset::DockerCompose {
+            let buildkit_cache_namespace =
+                self.buildkit_cache_namespace_for(project, environment, deployment);
             return self
-                .plan_compose_deployment(project, environment, deployment, env_vars)
+                .plan_compose_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    buildkit_cache_namespace,
+                )
                 .await;
         }
 
@@ -1124,23 +1169,8 @@ impl WorkflowPlanner {
         // every RUN --mount=type=cache ID. Scope it by project, environment,
         // and checked-out ref so unrelated tenants and preview branches cannot
         // read or poison each other's writable compiler/package caches.
-        //
-        // Tags take precedence during checkout, followed by branches and
-        // direct commit deployments. Branch deployments therefore retain a
-        // stable namespace across commits, while detached commits remain
-        // isolated.
-        let cache_ref = deployment
-            .tag_ref
-            .as_deref()
-            .or(deployment.branch_ref.as_deref())
-            .or(deployment.commit_sha.as_deref())
-            .unwrap_or(&project.main_branch);
-        let buildkit_cache_namespace = buildkit_cache_mount_namespace(
-            self.encryption_service.as_ref(),
-            project.id,
-            environment.id,
-            cache_ref,
-        );
+        let buildkit_cache_namespace =
+            self.buildkit_cache_namespace_for(project, environment, deployment);
 
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
@@ -1777,6 +1807,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
@@ -1840,6 +1871,11 @@ impl WorkflowPlanner {
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
             self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            let build_args = std::collections::HashMap::from([(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            )]);
+            self.seal_sensitive_field(obj, deployment, "build_args", &build_args)?;
         }
 
         jobs.push(JobDefinition {
@@ -2668,6 +2704,7 @@ mod tests {
     async fn test_job_configuration() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
@@ -2678,10 +2715,10 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
-            create_test_encryption_service(),
+            encryption_service.clone(),
         );
 
-        let (_project, _environment, deployment) =
+        let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
@@ -2722,6 +2759,24 @@ mod tests {
             assert!(
                 config_obj.get("build_args").is_none(),
                 "plaintext build_args must not be present (envelope leak)",
+            );
+            let opened = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let expected_namespace = buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project.id,
+                environment.id,
+                &project.main_branch,
+            );
+            assert_eq!(
+                opened
+                    .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                    .map(String::as_str),
+                Some(expected_namespace.as_str()),
+                "planner must overwrite the reserved build arg with its HMAC namespace",
             );
         }
 
@@ -2776,7 +2831,7 @@ mod tests {
             Arc::new(SucceedingSecretsResolver { secrets });
         *planner.secrets_resolver_handle().write().await = Some(resolver);
 
-        let (_project, _environment, deployment) =
+        let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::Static).await?;
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
         let build_job = jobs
@@ -2818,6 +2873,120 @@ mod tests {
             Some(STATIC_SECRET),
             "executor must recover static build args from the sealed envelope",
         );
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            &project.main_branch,
+        );
+        assert_eq!(
+            opened
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        const TENANT_VALUE: &str = "tenant-controlled-cache-namespace";
+        const CACHE_REF: &str = "feature/compose-cache";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping Compose cache namespace test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+        let mut deployment_active: deployments::ActiveModel = deployment.into();
+        deployment_active.branch_ref = Set(Some(CACHE_REF.to_string()));
+        let deployment = deployment_active.update(db.as_ref()).await?;
+
+        let tenant_var = env_vars::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            key: Set(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string()),
+            value: Set(TENANT_VALUE.to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(tenant_var.id),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let compose_job = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("Compose deployment must include deploy_compose");
+        let config = compose_job
+            .job_config
+            .as_ref()
+            .expect("Compose job must have configuration");
+
+        assert!(config.get("build_args").is_none());
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            CACHE_REF,
+        );
+        assert_eq!(
+            build_args
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+        assert!(!config.to_string().contains(TENANT_VALUE));
+
+        let runtime_env = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "environment_vars",
+        )?;
+        assert!(
+            !runtime_env.contains_key(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG),
+            "reserved BuildKit namespace must never enter Compose service runtime environments",
+        );
+        assert!(!runtime_env
+            .values()
+            .any(|value| value == &expected_namespace));
 
         Ok(())
     }

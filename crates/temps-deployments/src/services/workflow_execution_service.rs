@@ -1671,6 +1671,12 @@ impl WorkflowExecutionService {
                     "environment_vars",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                let build_args = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "build_args",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
                 let directory = config
                     .get("directory")
@@ -1722,6 +1728,7 @@ impl WorkflowExecutionService {
                     .compose_override(compose_override)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
+                    .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
                     .build()?;
