@@ -8,7 +8,23 @@ use std::sync::Arc;
 use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
+use thiserror::Error;
 use tracing::{debug, info};
+
+#[derive(Debug, Error)]
+pub enum WorkflowPlanningError {
+    #[error(
+        "Failed to seal workflow field '{field}' for deployment {deployment_id} \
+         (project {project_id}): {source}"
+    )]
+    SealSensitiveField {
+        deployment_id: i32,
+        project_id: i32,
+        field: &'static str,
+        #[source]
+        source: crate::services::sensitive_envelope::SensitiveEnvelopeError,
+    },
+}
 
 /// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
 ///
@@ -56,6 +72,27 @@ pub struct WorkflowPlanner {
 }
 
 impl WorkflowPlanner {
+    fn seal_sensitive_field(
+        &self,
+        job_config: &mut serde_json::Map<String, serde_json::Value>,
+        deployment: &deployments::Model,
+        field: &'static str,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<(), WorkflowPlanningError> {
+        crate::services::sensitive_envelope::write_sealed(
+            job_config,
+            self.encryption_service.as_ref(),
+            field,
+            values,
+        )
+        .map_err(|source| WorkflowPlanningError::SealSensitiveField {
+            deployment_id: deployment.id,
+            project_id: deployment.project_id,
+            field,
+            source,
+        })
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         log_service: Arc<LogService>,
@@ -1190,13 +1227,7 @@ impl WorkflowPlanner {
                 "build_context": build_context,
             });
             if let Some(obj) = build_job_config.as_object_mut() {
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "build_args",
-                    &build_args_map,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal static build_args: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
             }
 
             // Job 2: Build image (for static deployments, this builds the static files inside container)
@@ -1299,13 +1330,7 @@ impl WorkflowPlanner {
                 "build_context": build_context,
             });
             if let Some(obj) = build_job_config.as_object_mut() {
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "build_args",
-                    &build_args_map,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal build_args: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
             }
 
             jobs.push(JobDefinition {
@@ -1356,28 +1381,24 @@ impl WorkflowPlanner {
                 // Seal env vars, remote env vars, and secret-file contents.
                 // None of these end up in `job_config` in plaintext anymore;
                 // the executor pulls them back through `read_sealed`.
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "environment_variables",
                     &deploy_env_vars,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+                )?;
 
                 if let Some(ref remote_vars) = remote_deploy_env_vars {
                     info!(
                         "Sealing remote_environment_variables in job config ({} keys)",
                         remote_vars.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
+                    self.seal_sensitive_field(
                         obj,
-                        self.encryption_service.as_ref(),
+                        deployment,
                         "remote_environment_variables",
                         remote_vars,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                    })?;
+                    )?;
                 } else {
                     info!("No remote_environment_variables to store (single-node mode or no active nodes)");
                 }
@@ -1387,13 +1408,7 @@ impl WorkflowPlanner {
                         "Sealing {} secret file(s) in deploy job config",
                         secrets.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
-                        obj,
-                        self.encryption_service.as_ref(),
-                        "secrets",
-                        &secrets,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                    self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
                 }
             }
 
@@ -1774,13 +1789,7 @@ impl WorkflowPlanner {
             "directory": project.directory,
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_vars",
-                &env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal compose environment_vars: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
         }
 
         jobs.push(JobDefinition {
@@ -1974,28 +1983,19 @@ impl WorkflowPlanner {
             "use_external_image": true,
         });
         if let Some(obj) = job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_variables",
-                &deploy_env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
 
             if let Some(ref remote_vars) = remote_deploy_env_vars {
                 info!(
                     "Sealing remote_environment_variables in docker image job config ({} keys)",
                     remote_vars.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "remote_environment_variables",
                     remote_vars,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                })?;
+                )?;
             } else {
                 info!("No remote_environment_variables for docker image deployment");
             }
@@ -2005,13 +2005,7 @@ impl WorkflowPlanner {
                     "Sealing {} secret file(s) in docker image deploy job config",
                     secrets.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "secrets",
-                    &secrets,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             }
         }
 
@@ -2656,13 +2650,18 @@ mod tests {
     async fn test_static_build_args_are_sealed() -> Result<(), Box<dyn std::error::Error>> {
         const STATIC_SECRET: &str = "static-build-secret-must-not-leak";
 
-        let test_db = match TestDatabase::with_migrations().await {
-            Ok(test_db) => test_db,
-            Err(error) => {
-                eprintln!("Docker unavailable; skipping static build-args sealing test: {error}");
-                return Ok(());
-            }
-        };
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping static build-args sealing test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let encryption_service = create_test_encryption_service();
         let planner = WorkflowPlanner::new(
