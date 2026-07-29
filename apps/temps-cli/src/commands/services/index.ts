@@ -383,6 +383,15 @@ export function registerServicesCommands(program: Command): void {
     .option('--json', 'Output raw JSON instead of a formatted table')
     .action(serviceSlowQueriesAction)
 
+  services
+    .command('enable-pg-stat-statements')
+    .description(
+      'Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)',
+    )
+    .requiredOption('--id <id>', 'Service ID')
+    .option('-y, --yes', 'Skip the restart confirmation prompt (for automation)')
+    .action(serviceEnablePgStatStatementsAction)
+
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
   registerRestoreCommands(services)
@@ -1549,4 +1558,58 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
     `${queries.length} quer${queries.length === 1 ? 'y' : 'ies'} shown` +
       ` (page ${result.page} / ${totalPages}, ${result.total_count ?? 0} total)`,
   )
+}
+
+// ── services enable-pg-stat-statements ──────────────────────────────────────
+
+interface ServiceEnablePgStatStatementsOptions {
+  id: string
+  yes?: boolean
+}
+
+async function serviceEnablePgStatStatementsAction(
+  options: ServiceEnablePgStatStatementsOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return
+  }
+
+  if (!options.yes) {
+    warning(
+      'This will restart the Postgres container to enable pg_stat_statements. Active connections will be briefly dropped.',
+    )
+    const confirmed = await promptConfirm({
+      message: `Enable pg_stat_statements and restart service ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Enabling pg_stat_statements and restarting container…', async () => {
+    const { error } = await client.post({
+      url: `/external-services/${id}/pg-stat-statements/enable`,
+    })
+    if (error) {
+      const msg = getErrorMessage(error)
+      if (msg.toLowerCase().includes('cluster')) {
+        throw new Error(
+          `Self-service restart is not available for clustered Postgres services.\n` +
+            `A rolling restart across all cluster nodes is required — perform it manually.\n` +
+            `Detail: ${msg}`,
+        )
+      }
+      throw new Error(msg)
+    }
+  })
+
+  success(`pg_stat_statements enabled — service ${id} has been restarted.`)
+  info(`Run "temps services slow-queries --id ${id}" to view query stats.`)
 }

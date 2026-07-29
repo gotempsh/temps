@@ -1627,6 +1627,23 @@ bunx @temps-sdk/cli services slow-queries --id 1 --json
 
 Table columns: **Query** (truncated at 60 chars), **Calls**, **Total Time (ms)**, **Mean Time (ms)**, **Rows**, **Cache Hit Ratio** (shown as `—` when null). Footer shows `page N / total` and total row count.
 
+### Enable pg_stat_statements
+
+`services enable-pg-stat-statements` — enable `pg_stat_statements` on a **standalone** Postgres service by restarting its container so `shared_preload_libraries=pg_stat_statements` takes effect. Only available for standalone services — clustered/HA services (`pg_auto_failover`) are rejected with a clear error, since a blind single-container restart bypasses controlled failover and needs a manual rolling restart instead. The container restart briefly drops active connections; a confirmation prompt is shown unless `--yes` is passed.
+
+```bash
+# Prompts for confirmation before restarting
+bunx @temps-sdk/cli services enable-pg-stat-statements --id 1
+
+# Skip the confirmation prompt (for automation/scripts)
+bunx @temps-sdk/cli services enable-pg-stat-statements --id 1 --yes
+```
+
+| Option | Description |
+| --- | --- |
+| `--id <id>` | Service ID (required) |
+| `-y, --yes` | Skip the restart confirmation prompt. |
+
 ### Backups & Restore
 
 Inspect a service's restore capabilities, browse backups stored on an S3 source, and restore in-place, into a new service, or via point-in-time recovery (PITR). PITR requires a WAL-G backup (PostgreSQL).
