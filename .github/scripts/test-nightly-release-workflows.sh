@@ -58,6 +58,9 @@ abort "dispatch-release must only have actions: write" unless
 
 abort "release builds can bypass ref validation" unless
   release.dig("jobs", "build-web-assets", "needs") == "validate-release-ref"
+
+abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
+  release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"
 RUBY
 
 expect_decision() {
