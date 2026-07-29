@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** self-service "Enable & Restart" action to load `pg_stat_statements` on standalone Postgres services that predate this feature — clustered/HA services are rejected with a clear error instead, since a blind single-container restart bypasses controlled failover ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
+
+### Fixed
+
+- **providers:** `shared_preload_libraries` was unconditionally overwritten to just `pg_stat_statements` at container-creation time, silently dropping any image-required library (e.g. `timescaledb` for the `timescale/timescaledb-ha:pg18` image option) — the value is now merged, not overwritten ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** Postgres container restarts never picked up a corrected `shared_preload_libraries` value — the drift-reconciliation check only compared `archive_mode`; it now also detects `shared_preload_libraries` drift and recreates the container accordingly ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** the service Logs tab crashed with a React error boundary (`Cannot read properties of undefined (reading 'next_cursor')`) when the logs API returned a non-2xx response ([#460](https://github.com/gotempsh/temps/pull/460))
+
 ## [0.1.0-beta.55] - 2026-07-28
 
 ### Added

@@ -159,3 +159,17 @@ If you arrive at a working tree that's already dirty (because a
 previous session left files modified), confirm with the user whether
 to include those files before staging them. Sweeping unrelated work
 into a focused PR makes review slower and history harder to bisect.
+
+## Never commit secrets, including local dev-instance artifacts
+
+Never commit `.env` files, credentials, or secrets. This explicitly
+includes local dev-instance artifacts generated while running a local
+server for manual testing/verification — encryption keys, auth
+secrets, generated tokens, `temps_data`-style data directories. These
+are easy to sweep in by accident with a broad `git add` right after
+spinning up a local test instance to verify a change, which is exactly
+when review attention is focused elsewhere. Before staging, run `git
+status` and scrutinize every path outside the files you intentionally
+edited. If a secret does get committed, treat it as compromised: at
+minimum remove it from tracking going forward, and flag to the user
+whether history needs rewriting — don't force-push without asking.
