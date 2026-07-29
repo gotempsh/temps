@@ -64,6 +64,7 @@ impl PermissionInfo {
             Permission::UsersCreate => "Create new users",
             Permission::SystemAdmin => "Full system administration access",
             Permission::SystemRead => "View system configuration",
+            Permission::SecretsRead => "Reveal plaintext credentials and environment values",
             Permission::ApiKeysRead => "View API keys",
             Permission::ApiKeysWrite => "Modify API keys",
             Permission::ApiKeysDelete => "Delete API keys",

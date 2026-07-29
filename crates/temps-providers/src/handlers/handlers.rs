@@ -9,10 +9,10 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use temps_auth::RequireAuth;
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
 };
+use temps_auth::RequireAuth;
 use temps_core::{
     error_builder::{
         bad_request, conflict, forbidden, internal_server_error, not_found, ErrorBuilder,
@@ -680,6 +680,7 @@ async fn reveal_service_parameter(
     Path((id, param_name)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let value = app_state
@@ -1938,8 +1939,8 @@ async fn list_project_services(
     tag = "External Services",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableInfo),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or variable not found"),
-        (status = 403, description = "Access denied for encrypted variable"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1955,6 +1956,7 @@ async fn get_service_environment_variable(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;

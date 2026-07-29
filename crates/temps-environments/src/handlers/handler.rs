@@ -623,6 +623,7 @@ pub async fn get_resolved_environment_variables(
     tag = "Projects",
     responses(
         (status = 200, description = "Resolved environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project, key, or integration not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -639,6 +640,7 @@ pub async fn get_resolved_environment_variable_value(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -884,6 +886,7 @@ pub async fn update_environment_variable(
     tag = "Projects",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project or variable not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -900,6 +903,7 @@ pub async fn get_environment_variable_value(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
