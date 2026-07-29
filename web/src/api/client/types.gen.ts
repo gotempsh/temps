@@ -294,6 +294,8 @@ export type AgentConfigResponse = {
     max_turns: number;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline values are write-only and appear as
+     * `***`. Omit this field on update to preserve their stored values.
      */
     mcp_servers_config?: unknown;
     name: string;
@@ -311,7 +313,9 @@ export type AgentConfigResponse = {
     source: string;
     timeout_seconds: number;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+     * are write-only and appear as `***`. Omit this field on update to
+     * preserve their stored values.
      */
     tools_config?: unknown;
     trigger_config: unknown;
@@ -2486,6 +2490,10 @@ export type ContainerDetailResponse = {
      */
     started_at?: string | null;
     status: string;
+};
+
+export type ContainerEnvironmentVariableValueResponse = {
+    value: string;
 };
 
 export type ContainerInfoResponse = {
@@ -5886,6 +5894,7 @@ export type EnvVarIntegrationInfo = {
     service_name: string;
     service_slug?: string | null;
     service_type: string;
+    service_updated_at: string;
 };
 
 /**
@@ -7539,6 +7548,16 @@ export type GetDeploymentsParams = {
 
 export type GetEnvironmentVariablesQuery = {
     environment_id?: number | null;
+    /**
+     * Required by integration-value reveals to bind the plaintext response to
+     * the exact service displayed by the client.
+     */
+    service_id?: number | null;
+    /**
+     * Exact manual env-var row to reveal. Required by the dashboard so
+     * duplicate keys on disjoint environments cannot cross-reveal.
+     */
+    var_id?: number | null;
 };
 
 export type GetFunnelMetricsQuery = {
@@ -17383,6 +17402,8 @@ export type UpsertAgentRequest = {
     max_turns?: number | null;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline objects are write-only: normal reads
+     * mask them, and updates must omit this field to preserve existing values.
      */
     mcp_servers_config?: unknown;
     name?: string | null;
@@ -17395,7 +17416,8 @@ export type UpsertAgentRequest = {
     slug?: string | null;
     timeout_seconds?: number | null;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Custom-tool webhook URLs and headers are
+     * write-only; omit this field on update to preserve them.
      */
     tools_config?: unknown;
     /**
@@ -27006,6 +27028,10 @@ export type RevealServiceParameterErrors = {
      */
     400: unknown;
     /**
+     * Caller cannot access a project linked to this service
+     */
+    403: unknown;
+    /**
      * Service or parameter not found
      */
     404: unknown;
@@ -32016,6 +32042,10 @@ export type UpdateNotificationProviderData = {
 };
 
 export type UpdateNotificationProviderErrors = {
+    /**
+     * Invalid masked provider configuration
+     */
+    400: unknown;
     /**
      * Provider not found
      */
@@ -37788,18 +37818,34 @@ export type GetResolvedEnvironmentVariableValueData = {
     };
     query?: {
         /**
-         * Optional environment ID (manual vars only)
+         * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact manual environment-variable row ID
+         */
+        var_id?: number;
+        /**
+         * Integration service ID shown by the resolved list
+         */
+        service_id?: number;
     };
     url: '/projects/{project_id}/env-vars/resolved/{key}/value';
 };
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
+     * Secret environment variables are write-only
+     */
+    403: unknown;
+    /**
      * Project, key, or integration not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -37832,15 +37878,27 @@ export type GetEnvironmentVariableValueData = {
          * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact environment-variable row ID
+         */
+        var_id?: number;
     };
     url: '/projects/{project_id}/env-vars/{key}/value';
 };
 
 export type GetEnvironmentVariableValueErrors = {
     /**
+     * Secret environment variables are write-only
+     */
+    403: unknown;
+    /**
      * Project or variable not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -38660,6 +38718,50 @@ export type GetContainerDetailResponses = {
 };
 
 export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
+export type GetContainerEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+        /**
+         * Environment variable name
+         */
+        variable_name: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}';
+};
+
+export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Container or environment variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerEnvironmentVariableResponses = {
+    /**
+     * Environment variable value
+     */
+    200: ContainerEnvironmentVariableValueResponse;
+};
+
+export type GetContainerEnvironmentVariableResponse = GetContainerEnvironmentVariableResponses[keyof GetContainerEnvironmentVariableResponses];
 
 export type GetContainerLogsByIdData = {
     body?: never;

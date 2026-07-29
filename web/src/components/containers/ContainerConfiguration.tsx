@@ -1,21 +1,31 @@
-import { ContainerDetailResponse } from '@/api/client'
+import {
+  ContainerDetailResponse,
+  getContainerEnvironmentVariable,
+} from '@/api/client'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Button } from '@/components/ui/button'
 import { formatMicrocores } from '@/lib/cpu-format'
 import {
-  maskCredentialsInValue,
-  shouldMaskValue,
-  shouldMaskValueByContent,
-} from '@/lib/masking'
-import { Eye, EyeOff } from 'lucide-react'
-import { useState } from 'react'
+  createCredentialRevealGuard,
+  credentialValueForScope,
+  type ScopedCredentialValue,
+} from '@/lib/credential-reveal-state'
+import { Eye, EyeOff, Loader2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 
 interface ContainerConfigurationProps {
   container: ContainerDetailResponse
+  projectId: number
+  environmentId: number
+  containerId: string
 }
 
 export function ContainerConfiguration({
   container,
+  projectId,
+  environmentId,
+  containerId,
 }: ContainerConfigurationProps) {
   const envVars = normalizeEnvVars(container.environment_variables)
   const hasPorts = !!(container.container_port || container.host_port)
@@ -187,8 +197,14 @@ export function ContainerConfiguration({
           description={`${envVars.length} variable${envVars.length === 1 ? '' : 's'} injected at runtime. Sensitive values are masked — click the eye to reveal.`}
         >
           <div className="divide-y divide-neutral-950/5 overflow-hidden rounded-md border border-neutral-950/10 dark:divide-white/5 dark:border-white/10">
-            {envVars.map(({ key, value }, i) => (
-              <EnvVarRow key={`${key}-${i}`} envKey={key} value={value} />
+            {envVars.map(({ key }, i) => (
+              <EnvVarRow
+                key={`${key}-${i}`}
+                envKey={key}
+                projectId={projectId}
+                environmentId={environmentId}
+                containerId={containerId}
+              />
             ))}
           </div>
         </Section>
@@ -197,27 +213,66 @@ export function ContainerConfiguration({
   )
 }
 
-function EnvVarRow({ envKey, value }: { envKey: string; value: string }) {
-  // Treat a row as sensitive when EITHER the key name matches a known
-  // pattern (POSTGRES_URL, *_TOKEN, …) OR the value itself carries a
-  // recognisable secret shape (connection-string userinfo, Bearer token,
-  // JWT). The second branch is the one that catches OTEL_EXPORTER_OTLP_
-  // HEADERS=Authorization=Bearer … and SENTRY_DSN=http://<token>@host —
-  // their keys don't trip the name patterns but the values clearly do.
-  const isSensitive =
-    !!value && (shouldMaskValue(envKey) || shouldMaskValueByContent(value))
-  const [revealed, setRevealed] = useState(false)
+function EnvVarRow({
+  envKey,
+  projectId,
+  environmentId,
+  containerId,
+}: {
+  envKey: string
+  projectId: number
+  environmentId: number
+  containerId: string
+}) {
+  const [revealedValue, setRevealedValue] = useState<
+    ScopedCredentialValue | undefined
+  >()
+  const [isRevealing, setIsRevealing] = useState(false)
+  const revealGuard = useRef(createCredentialRevealGuard())
+  const revealScope = `${projectId}:${environmentId}:${containerId}:${envKey}`
+  const value = credentialValueForScope(revealedValue, revealScope)
 
-  // Partial redaction preserves structure (scheme://user:•••@host/db) so the
-  // user can still recognize what the variable points at without leaking the
-  // password. Full bullet-out is reserved for opaque secrets where the
-  // structural mask wouldn't touch anything.
-  const masked = isSensitive
-    ? maskCredentialsInValue(value) === value
-      ? '•'.repeat(Math.min(value.length, 24))
-      : maskCredentialsInValue(value)
-    : value
-  const display = isSensitive && !revealed ? masked : value
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRevealedValue(undefined)
+    return () => guard.invalidate()
+  }, [revealScope])
+
+  const toggleReveal = async () => {
+    if (value !== undefined) {
+      revealGuard.current.cancel('value')
+      setRevealedValue(undefined)
+      return
+    }
+
+    const request = revealGuard.current.begin('value')
+    setIsRevealing(true)
+    try {
+      const response = await getContainerEnvironmentVariable({
+        path: {
+          project_id: projectId,
+          environment_id: environmentId,
+          container_id: containerId,
+          variable_name: envKey,
+        },
+        credentials: 'include',
+        cache: 'no-store',
+        throwOnError: true,
+      })
+      if (!revealGuard.current.isCurrent('value', request)) return
+      setRevealedValue({ value: response.data.value, scope: revealScope })
+    } catch {
+      if (revealGuard.current.isCurrent('value', request)) {
+        toast.error(`Failed to reveal ${envKey}`)
+      }
+    } finally {
+      if (revealGuard.current.finish('value', request)) {
+        setIsRevealing(false)
+      }
+    }
+  }
 
   return (
     <div className="grid grid-cols-1 gap-1 px-3 py-2.5 sm:grid-cols-[minmax(10rem,16rem)_1fr] sm:gap-4 sm:items-start">
@@ -226,32 +281,29 @@ function EnvVarRow({ envKey, value }: { envKey: string; value: string }) {
       </div>
       <div className="group flex items-start gap-1 min-w-0">
         <div className="font-mono text-[0.8125rem] text-neutral-600 break-all dark:text-neutral-400 min-w-0 flex-1">
-          {value ? (
-            display
-          ) : (
-            <span className="italic text-neutral-400 dark:text-neutral-500">
-              empty
-            </span>
-          )}
+          {isRevealing ? 'Revealing…' : (value ?? '••••••••••••')}
         </div>
-        {isSensitive && value && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 shrink-0 opacity-60 transition hover:opacity-100 focus:opacity-100 group-hover:opacity-100"
-            onClick={() => setRevealed((r) => !r)}
-            aria-label={revealed ? `Hide ${envKey}` : `Reveal ${envKey}`}
-            title={revealed ? 'Hide value' : 'Reveal value'}
-          >
-            {revealed ? (
-              <EyeOff className="h-3.5 w-3.5" />
-            ) : (
-              <Eye className="h-3.5 w-3.5" />
-            )}
-          </Button>
-        )}
-        {value && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6 shrink-0 opacity-60 transition hover:opacity-100 focus:opacity-100 group-hover:opacity-100"
+          onClick={() => void toggleReveal()}
+          disabled={isRevealing}
+          aria-label={
+            value !== undefined ? `Hide ${envKey}` : `Reveal ${envKey}`
+          }
+          title={value !== undefined ? 'Hide value' : 'Reveal value'}
+        >
+          {isRevealing ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : value !== undefined ? (
+            <EyeOff className="h-3.5 w-3.5" />
+          ) : (
+            <Eye className="h-3.5 w-3.5" />
+          )}
+        </Button>
+        {value !== undefined && (
           <CopyButton
             value={value}
             className="shrink-0 opacity-0 transition group-hover:opacity-100 focus:opacity-100"

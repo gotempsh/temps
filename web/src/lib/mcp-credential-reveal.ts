@@ -72,3 +72,38 @@ export function replaceMcpCredentialValue(
   ;(existing as JsonObject)[key] = value
   return JSON.stringify(config, null, 2)
 }
+
+export function revealMcpCredentialValueIfStillMasked(
+  configText: string,
+  field: string,
+  revealedValue: string
+): string | undefined {
+  let config: JsonObject
+  try {
+    config = parseConfig(configText)
+  } catch {
+    return undefined
+  }
+
+  if (field === 'url') {
+    if (config.url !== MASKED_CREDENTIAL_VALUE) return undefined
+    config.url = revealedValue
+    return JSON.stringify(config, null, 2)
+  }
+
+  const separator = field.indexOf('.')
+  if (separator === -1) return undefined
+  const objectName = field.slice(0, separator)
+  const key = field.slice(separator + 1)
+  if ((objectName !== 'env' && objectName !== 'headers') || !key) {
+    return undefined
+  }
+  const existing = config[objectName]
+  if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+    return undefined
+  }
+  const values = existing as JsonObject
+  if (values[key] !== MASKED_CREDENTIAL_VALUE) return undefined
+  values[key] = revealedValue
+  return JSON.stringify(config, null, 2)
+}

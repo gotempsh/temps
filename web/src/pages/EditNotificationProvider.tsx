@@ -409,7 +409,7 @@ export function EditNotificationProvider() {
             onSubmit={handleSubmit}
             isEdit={true}
             isLoading={isSubmitting}
-            revealScopeKey={provider.id}
+            revealScopeKey={`${provider.id}:${provider.updated_at}`}
             onRevealCredential={handleRevealCredential}
           />
         </CardContent>

@@ -955,8 +955,11 @@ mod tests {
             match setup_test_service().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    eprintln!("Skipping Docker-dependent digest test: {error}");
-                    return;
+                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                        eprintln!("Skipping Docker-dependent digest test: {error}");
+                        return;
+                    }
+                    panic!("Failed to set up digest test database: {error}");
                 }
             }
         };

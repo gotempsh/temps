@@ -65,6 +65,15 @@ pub struct ContainerActionAudit {
     pub action: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerEnvironmentVariableRevealedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub container_id: String,
+    pub variable_name: String,
+}
+
 // ── External image audits ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,6 +194,10 @@ impl_audit_operation!(DeploymentTeardownAudit, "DEPLOYMENT_TEARDOWN");
 impl_audit_operation!(DeploymentPromotedAudit, "DEPLOYMENT_PROMOTED");
 impl_audit_operation!(EnvironmentTeardownAudit, "ENVIRONMENT_TEARDOWN");
 impl_audit_operation!(ContainerActionAudit, "CONTAINER_ACTION");
+impl_audit_operation!(
+    ContainerEnvironmentVariableRevealedAudit,
+    "CONTAINER_ENVIRONMENT_VARIABLE_REVEALED"
+);
 impl_audit_operation!(ExternalImagePushedAudit, "EXTERNAL_IMAGE_PUSHED");
 impl_audit_operation!(DeploymentOperationAudit, "DEPLOYMENT_OPERATION_EXECUTED");
 impl_audit_operation!(DeployFromImageAudit, "DEPLOY_FROM_IMAGE");

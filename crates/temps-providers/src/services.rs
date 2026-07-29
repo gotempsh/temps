@@ -8404,17 +8404,9 @@ echo "[restore] Pre-seed complete"
 
         // Handle mask_sensitive option
         let variables = if options.mask_sensitive {
-            all_vars
-                .into_iter()
-                .map(|(key, value)| {
-                    let masked_value = if Self::is_sensitive_variable(&key) {
-                        "***".to_string()
-                    } else {
-                        value
-                    };
-                    (key, masked_value)
-                })
-                .collect()
+            let mut masked = all_vars;
+            Self::mask_environment_variable_values(&mut masked);
+            masked
         } else {
             all_vars
         };
@@ -8494,47 +8486,18 @@ echo "[restore] Pre-seed complete"
                     })?
             };
 
-        // Mask sensitive values based on variable names
-        let masked_vars = env_vars
-            .into_iter()
-            .map(|(key, value)| {
-                let masked_value = if Self::is_sensitive_variable(&key) {
-                    "***".to_string()
-                } else {
-                    value
-                };
-                (key, masked_value)
-            })
-            .collect();
+        // Bulk previews never return plaintext. A value can contain embedded
+        // credentials even when its variable name looks operational.
+        let mut masked_vars = env_vars;
+        Self::mask_environment_variable_values(&mut masked_vars);
 
         Ok(masked_vars)
     }
 
-    /// Determine if a variable name indicates sensitive data
-    pub(crate) fn is_sensitive_variable(var_name: &str) -> bool {
-        let sensitive_patterns = [
-            "password",
-            "pass",
-            "secret",
-            "key",
-            "token",
-            "credential",
-            "auth",
-            "api_key",
-            "private",
-            "cert",
-            "ssl",
-            "tls",
-            "url",
-            "uri",
-            "connection",
-            "dsn",
-        ];
-
-        let var_lower = var_name.to_lowercase();
-        sensitive_patterns
-            .iter()
-            .any(|pattern| var_lower.contains(pattern))
+    pub(crate) fn mask_environment_variable_values(variables: &mut HashMap<String, String>) {
+        for value in variables.values_mut() {
+            *value = "***".to_string();
+        }
     }
 
     fn is_sensitive_parameter(param_name: &str) -> bool {
@@ -8568,6 +8531,7 @@ echo "[restore] Pre-seed complete"
             || is_url
             || is_connection_secret
             || has_secret_marker
+            || normalized == "keyfile_content"
             || normalized.starts_with("private_")
     }
 
@@ -10190,8 +10154,11 @@ mod tests {
             match setup_test_manager().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    eprintln!("Skipping Docker-dependent test: {error}");
-                    return;
+                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                        eprintln!("Skipping Docker-dependent test: {error}");
+                        return;
+                    }
+                    panic!("Failed to set up provider Docker test: {error}");
                 }
             }
         };
@@ -10985,30 +10952,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_is_sensitive_variable() {
-        assert!(ExternalServiceManager::is_sensitive_variable("password"));
-        assert!(ExternalServiceManager::is_sensitive_variable("SECRET_KEY"));
-        assert!(ExternalServiceManager::is_sensitive_variable("api_token"));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "PRIVATE_CERT"
-        ));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "auth_credential"
-        ));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "DATABASE_URL"
-        ));
-        assert!(ExternalServiceManager::is_sensitive_variable("MONGODB_URI"));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "CONNECTION_STRING"
-        ));
-        assert!(ExternalServiceManager::is_sensitive_variable("SENTRY_DSN"));
+    #[test]
+    fn test_bulk_environment_variable_masking_is_content_agnostic() {
+        let mut variables = HashMap::from([
+            ("PORT".to_string(), "5432".to_string()),
+            (
+                "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS".to_string(),
+                "Authorization=Bearer%20ingest-secret".to_string(),
+            ),
+        ]);
 
-        assert!(!ExternalServiceManager::is_sensitive_variable("database"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("username"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("port"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("host"));
+        ExternalServiceManager::mask_environment_variable_values(&mut variables);
+
+        assert_eq!(variables["PORT"], "***");
+        assert_eq!(variables["RUSTFS_OBS_ENDPOINT_METRICS_HEADERS"], "***");
+        assert!(!serde_json::to_string(&variables)
+            .expect("masked environment variables should serialize")
+            .contains("ingest-secret"));
     }
 
     #[test]
@@ -11020,6 +10980,9 @@ mod tests {
         ));
         assert!(ExternalServiceManager::is_sensitive_parameter(
             "connection_string"
+        ));
+        assert!(ExternalServiceManager::is_sensitive_parameter(
+            "keyfile_content"
         ));
 
         assert!(!ExternalServiceManager::is_sensitive_parameter(
@@ -11037,6 +11000,10 @@ mod tests {
         let mut parameters = HashMap::from([
             ("password".to_string(), serde_json::json!("database-secret")),
             ("api_token".to_string(), serde_json::json!("token-secret")),
+            (
+                "keyfile_content".to_string(),
+                serde_json::json!("mongodb-replica-key"),
+            ),
             ("username".to_string(), serde_json::json!("temps")),
             ("port".to_string(), serde_json::json!(5432)),
             ("max_connections".to_string(), serde_json::json!(100)),
@@ -11046,9 +11013,13 @@ mod tests {
         let sensitive_parameters =
             ExternalServiceManager::mask_sensitive_parameter_values(&mut parameters);
 
-        assert_eq!(sensitive_parameters, vec!["api_token", "password"]);
+        assert_eq!(
+            sensitive_parameters,
+            vec!["api_token", "keyfile_content", "password"]
+        );
         assert_eq!(parameters["password"], serde_json::json!("***"));
         assert_eq!(parameters["api_token"], serde_json::json!("***"));
+        assert_eq!(parameters["keyfile_content"], serde_json::json!("***"));
         assert_eq!(parameters["username"], serde_json::json!("temps"));
         assert_eq!(parameters["port"], serde_json::json!(5432));
         assert_eq!(parameters["max_connections"], serde_json::json!(100));
@@ -11403,11 +11374,11 @@ mod tests {
         assert!(masked_vars.is_ok());
         let vars = masked_vars.unwrap();
 
-        // Password should be masked
+        // Bulk responses mask every value; credential-bearing content can
+        // appear under otherwise operational-looking keys.
         assert_eq!(vars.get("POSTGRES_PASSWORD"), Some(&"***".to_string()));
-        // Non-sensitive values should not be masked
-        assert_eq!(vars.get("POSTGRES_DB"), Some(&"testdb".to_string()));
-        assert_eq!(vars.get("POSTGRES_USER"), Some(&"user".to_string()));
+        assert_eq!(vars.get("POSTGRES_DB"), Some(&"***".to_string()));
+        assert_eq!(vars.get("POSTGRES_USER"), Some(&"***".to_string()));
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;

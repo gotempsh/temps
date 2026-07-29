@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** Mask service, notification, and MCP credentials by default and audit explicit value reveals
+- **Credential reveal boundaries:** Mask environment variables, container configuration, external-service parameters, notification providers, MCP servers, and legacy agent tool credentials by default; plaintext now requires an explicit, audited, non-cacheable reveal request
 ### Added
 
 - **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))

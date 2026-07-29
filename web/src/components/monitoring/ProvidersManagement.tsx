@@ -441,7 +441,7 @@ export function ProvidersManagement() {
               onSubmit={onEditSubmit}
               isEdit
               isLoading={isLoadingProviderType}
-              revealScopeKey={editingProvider?.id}
+              revealScopeKey={`${editingProvider?.id}:${editingProvider?.updated_at}`}
               onRevealCredential={handleRevealCredential}
             />
           </div>

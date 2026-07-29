@@ -220,12 +220,28 @@ impl DefinitionService {
         }
     }
 
-    fn merge_masked_config(existing: &serde_json::Value, replacement: &mut serde_json::Value) {
+    fn merge_masked_config(
+        existing: &serde_json::Value,
+        replacement: &mut serde_json::Value,
+        path: &str,
+    ) -> Result<(), AgentError> {
         match (existing, replacement) {
             (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
                 for (key, replacement_value) in replacement {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
                     if let Some(existing_value) = existing.get(key) {
-                        Self::merge_masked_config(existing_value, replacement_value);
+                        Self::merge_masked_config(existing_value, replacement_value, &child_path)?;
+                    } else if Self::contains_masked_config_value(replacement_value) {
+                        return Err(AgentError::Validation {
+                            message: format!(
+                                "Masked MCP config value at '{}' has no existing value to preserve",
+                                child_path
+                            ),
+                        });
                     }
                 }
             }
@@ -236,6 +252,20 @@ impl DefinitionService {
                     .unwrap_or_else(|| existing.to_string());
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn contains_masked_config_value(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(value) => value == MASKED_VALUE,
+            serde_json::Value::Object(values) => {
+                values.values().any(Self::contains_masked_config_value)
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().any(Self::contains_masked_config_value)
+            }
+            _ => false,
         }
     }
 
@@ -597,7 +627,7 @@ impl DefinitionService {
             active.description = Set(Some(description));
         }
         if let Some(mut config) = request.config {
-            Self::merge_masked_config(&existing_config, &mut config);
+            Self::merge_masked_config(&existing_config, &mut config, "")?;
             active.config = Set(self.encrypt_sensitive_config(&config)?);
         }
 
@@ -695,7 +725,7 @@ impl DefinitionService {
             active.description = Set(Some(description));
         }
         if let Some(mut config) = request.config {
-            Self::merge_masked_config(&existing_config, &mut config);
+            Self::merge_masked_config(&existing_config, &mut config, "")?;
             active.config = Set(self.encrypt_sensitive_config(&config)?);
         }
 
@@ -904,7 +934,8 @@ mod tests {
             "headers": {"Authorization": "***"}
         });
 
-        DefinitionService::merge_masked_config(&existing, &mut replacement);
+        DefinitionService::merge_masked_config(&existing, &mut replacement, "")
+            .expect("matching masked paths should preserve existing credentials");
 
         assert_eq!(
             replacement["url"],
@@ -913,6 +944,41 @@ mod tests {
         assert_eq!(replacement["env"]["API_TOKEN"], "old-secret");
         assert_eq!(replacement["env"]["REGION"], "eu-west-1");
         assert_eq!(replacement["headers"]["Authorization"], "Bearer old");
+    }
+
+    #[test]
+    fn masked_mcp_update_rejects_renamed_credential() {
+        let existing = json!({
+            "env": {"API_TOKEN": "old-secret"},
+            "headers": {"Authorization": "Bearer old"}
+        });
+        let mut replacement = json!({
+            "env": {"RENAMED_TOKEN": "***"},
+            "headers": {"X-Authorization": "***"}
+        });
+
+        let error = DefinitionService::merge_masked_config(&existing, &mut replacement, "")
+            .expect_err("a masked value cannot be moved to a new MCP config path");
+
+        assert!(matches!(error, AgentError::Validation { .. }));
+        assert!(error.to_string().contains("env.RENAMED_TOKEN"));
+    }
+
+    #[test]
+    fn masked_mcp_update_rejects_credential_in_new_section() {
+        let existing = json!({
+            "env": {"API_TOKEN": "old-secret"}
+        });
+        let mut replacement = json!({
+            "env": {"API_TOKEN": "***"},
+            "headers": {"Authorization": "***"}
+        });
+
+        let error = DefinitionService::merge_masked_config(&existing, &mut replacement, "")
+            .expect_err("a masked value cannot be added beneath a new parent path");
+
+        assert!(matches!(error, AgentError::Validation { .. }));
+        assert!(error.to_string().contains("headers"));
     }
 
     #[test]

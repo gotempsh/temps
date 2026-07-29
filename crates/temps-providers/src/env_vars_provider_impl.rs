@@ -71,6 +71,7 @@ impl ProjectEnvVarsProvider for ExternalServicesEnvProvider {
                         service_name: s.name,
                         service_type: s.service_type,
                         service_slug: s.slug,
+                        service_updated_at: s.updated_at.to_rfc3339(),
                     },
                     variables: Vec::new(),
                 })
@@ -97,6 +98,7 @@ impl ProjectEnvVarsProvider for ExternalServicesEnvProvider {
                     service_name: svc.name,
                     service_type: svc.service_type,
                     service_slug: svc.slug,
+                    service_updated_at: svc.updated_at.to_rfc3339(),
                 },
                 variables,
             });

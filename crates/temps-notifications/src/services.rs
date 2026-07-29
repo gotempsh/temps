@@ -56,10 +56,41 @@ pub enum NotificationProviderRevealError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderConfigMergeError {
+    #[error("Masked notification provider value at '{path}' has no existing value to preserve")]
+    UnmatchedMaskedValue { path: String },
+    #[error(
+        "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
+    )]
+    AmbiguousMaskedArray { path: String },
+}
+
 const MASKED_CONFIG_VALUE: &str = "***";
 
+fn normalize_config_key(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_was_lowercase_or_digit = false;
+    for character in name.chars() {
+        if matches!(character, '-' | ' ' | '.') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            previous_was_lowercase_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lowercase_or_digit {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+        previous_was_lowercase_or_digit =
+            character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    normalized
+}
+
 fn is_sensitive_config_key(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    let normalized = normalize_config_key(name);
     normalized == "url"
         || normalized.ends_with("_url")
         || normalized == "authorization"
@@ -75,6 +106,8 @@ fn is_sensitive_config_key(name: &str) -> bool {
             "private_key",
             "access_key",
             "signing_key",
+            "key",
+            "auth",
         ]
         .iter()
         .any(|marker| {
@@ -1605,30 +1638,60 @@ impl NotificationService {
 
             match value {
                 serde_json::Value::Object(_) => Self::mask_provider_config(value),
-                serde_json::Value::Array(items) => {
-                    for item in items {
-                        if item.is_object() {
-                            Self::mask_provider_config(item);
-                        }
-                    }
-                }
+                serde_json::Value::Array(_) => Self::mask_nested_provider_config(value),
                 _ => {}
             }
         }
     }
 
-    fn merge_masked_values(existing: &serde_json::Value, replacement: &mut serde_json::Value) {
+    fn mask_nested_provider_config(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(_) => Self::mask_provider_config(value),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::mask_nested_provider_config(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains_masked_value(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(value) => value == MASKED_CONFIG_VALUE,
+            serde_json::Value::Object(object) => object.values().any(Self::contains_masked_value),
+            serde_json::Value::Array(items) => items.iter().any(Self::contains_masked_value),
+            _ => false,
+        }
+    }
+
+    fn merge_masked_values(
+        existing: &serde_json::Value,
+        replacement: &mut serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
         match (existing, replacement) {
             (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
                 for (key, new_value) in replacement {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
                     if let Some(old_value) = existing.get(key) {
-                        Self::merge_masked_values(old_value, new_value);
+                        Self::merge_masked_values(old_value, new_value, &child_path)?;
+                    } else if Self::contains_masked_value(new_value) {
+                        return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                            path: child_path,
+                        });
                     }
                 }
             }
-            (serde_json::Value::Array(existing), serde_json::Value::Array(replacement)) => {
-                for (old_value, new_value) in existing.iter().zip(replacement.iter_mut()) {
-                    Self::merge_masked_values(old_value, new_value);
+            (_, serde_json::Value::Array(replacement)) => {
+                if replacement.iter().any(Self::contains_masked_value) {
+                    return Err(NotificationProviderConfigMergeError::AmbiguousMaskedArray {
+                        path: path.to_string(),
+                    });
                 }
             }
             (existing, replacement)
@@ -1638,8 +1701,15 @@ impl NotificationService {
             {
                 *replacement = existing.clone();
             }
-            _ => {}
+            (_, replacement) => {
+                if Self::contains_masked_value(replacement) {
+                    return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                        path: path.to_string(),
+                    });
+                }
+            }
         }
+        Ok(())
     }
 
     /// Reveal a single sensitive configuration field after the HTTP layer has
@@ -1786,7 +1856,7 @@ impl NotificationService {
             }
             if let Some(mut new_config) = update.config {
                 let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
-                Self::merge_masked_values(&decrypted_existing, &mut new_config);
+                Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
                 let encrypted_config = self
@@ -2236,8 +2306,12 @@ mod tests {
             match TestDatabase::with_migrations().await {
                 Ok(test_db) => test_db,
                 Err(error) => {
-                    eprintln!("Skipping Docker-dependent notification test: {error}");
-                    return;
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                        eprintln!("Skipping Docker-dependent notification test: {message}");
+                        return;
+                    }
+                    panic!("Failed to set up notification test database: {message}");
                 }
             }
         };
@@ -3590,10 +3664,15 @@ mod tests {
             "oauth": {
                 "client_secret": "oauth-secret",
                 "access_token": "oauth-token",
+                "clientSecret": "camel-secret",
+                "accessToken": "camel-token",
                 "issuer": "https://issuer.example.test"
             },
+            "webhookUrl": "https://hooks.example/camel-secret",
             "targets": [
-                {"signing_key": "nested-array-secret", "name": "primary"}
+                [
+                    {"signing_key": "nested-array-secret", "name": "primary"}
+                ]
             ],
             "headers": {
                 "Authorization": "Bearer secret",
@@ -3610,9 +3689,12 @@ mod tests {
         assert_eq!(config["api_token"], "***");
         assert_eq!(config["oauth"]["client_secret"], "***");
         assert_eq!(config["oauth"]["access_token"], "***");
+        assert_eq!(config["oauth"]["clientSecret"], "***");
+        assert_eq!(config["oauth"]["accessToken"], "***");
         assert_eq!(config["oauth"]["issuer"], "https://issuer.example.test");
-        assert_eq!(config["targets"][0]["signing_key"], "***");
-        assert_eq!(config["targets"][0]["name"], "primary");
+        assert_eq!(config["webhookUrl"], "***");
+        assert_eq!(config["targets"][0][0]["signing_key"], "***");
+        assert_eq!(config["targets"][0][0]["name"], "primary");
         assert_eq!(config["headers"]["Authorization"], "***");
         assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
         assert_eq!(config["smtp_host"], "smtp.example.com");
@@ -3625,8 +3707,7 @@ mod tests {
             "webhook_url": "https://hooks.slack.com/services/secret",
             "url": "https://example.com/webhook/secret",
             "headers": {"Authorization": "Bearer secret"},
-            "oauth": {"client_secret": {"primary": "nested-secret"}},
-            "targets": [{"access_token": "array-secret"}]
+            "oauth": {"client_secret": {"primary": "nested-secret"}}
         });
         let mut replacement = serde_json::json!({
             "password": "***",
@@ -3634,11 +3715,11 @@ mod tests {
             "url": "***",
             "headers": {"Authorization": "***"},
             "oauth": {"client_secret": "***"},
-            "targets": [{"access_token": "***"}],
             "smtp_host": "smtp.example.com"
         });
 
-        NotificationService::merge_masked_values(&existing, &mut replacement);
+        NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect("matching masked paths should preserve existing credentials");
 
         assert_eq!(replacement["password"], "smtp-secret");
         assert_eq!(
@@ -3651,8 +3732,43 @@ mod tests {
             replacement["oauth"]["client_secret"],
             serde_json::json!({"primary": "nested-secret"})
         );
-        assert_eq!(replacement["targets"][0]["access_token"], "array-secret");
         assert_eq!(replacement["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_rejects_renamed_masked_credential() {
+        let existing = serde_json::json!({
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let mut replacement = serde_json::json!({
+            "headers": {"X-Authorization": "***"}
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("a sentinel cannot be moved to a new path");
+
+        assert!(error.to_string().contains("headers.X-Authorization"));
+    }
+
+    #[test]
+    fn provider_config_update_rejects_masked_values_inside_arrays() {
+        let existing = serde_json::json!({
+            "targets": [
+                {"name": "primary", "access_token": "first-secret"},
+                {"name": "secondary", "access_token": "second-secret"}
+            ]
+        });
+        let mut replacement = serde_json::json!({
+            "targets": [
+                {"name": "secondary", "access_token": "***"},
+                {"name": "primary", "access_token": "***"}
+            ]
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("array sentinels are structurally ambiguous after edits");
+
+        assert!(error.to_string().contains("inside array 'targets'"));
     }
 
     #[test]

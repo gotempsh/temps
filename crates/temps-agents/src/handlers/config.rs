@@ -233,10 +233,14 @@ pub struct AgentConfigResponse {
     /// Branch of the config repo to use.
     pub config_repo_branch: Option<String>,
     /// MCP servers config (Claude Code settings.json mcpServers format).
+    /// Credential-bearing legacy inline values are write-only and appear as
+    /// `***`. Omit this field on update to preserve their stored values.
     pub mcp_servers_config: Option<serde_json::Value>,
     /// Skills config as JSON array.
     pub skills_config: Option<serde_json::Value>,
-    /// Tools config as JSON array.
+    /// Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+    /// are write-only and appear as `***`. Omit this field on update to
+    /// preserve their stored values.
     pub tools_config: Option<serde_json::Value>,
     /// Public webhook URL for triggering this agent externally.
     /// Only set when `on: { webhook: true }` is configured.
@@ -274,9 +278,13 @@ impl From<project_agents::Model> for AgentConfigResponse {
             sandbox_enabled: model.sandbox_enabled,
             config_repo_url: model.config_repo_url,
             config_repo_branch: model.config_repo_branch,
-            mcp_servers_config: model.mcp_servers_config.map(|v| mask_mcp_env_values(&v)),
+            mcp_servers_config: model
+                .mcp_servers_config
+                .map(|value| mask_mcp_credential_values(&value)),
             skills_config: model.skills_config,
-            tools_config: model.tools_config,
+            tools_config: model
+                .tools_config
+                .map(|value| mask_custom_tool_credential_values(&value)),
             webhook_url: model
                 .webhook_id
                 .as_ref()
@@ -301,29 +309,106 @@ pub struct ListAgentsResponse {
     pub total: usize,
 }
 
-/// Mask env var values in MCP server configs to avoid leaking secrets in API responses.
-/// Preserves keys and structure but replaces values with "***".
-fn mask_mcp_env_values(config: &serde_json::Value) -> serde_json::Value {
+/// Legacy inline MCP configs are still accepted for backward compatibility,
+/// but normal agent responses must never expose their credential-bearing
+/// URL, environment, or header fields.
+fn mask_mcp_credential_values(config: &serde_json::Value) -> serde_json::Value {
+    if let Some(slugs) = config.as_array() {
+        return if slugs.iter().all(serde_json::Value::is_string) {
+            config.clone()
+        } else {
+            serde_json::Value::String("***".to_string())
+        };
+    }
     let Some(servers) = config.as_object() else {
-        return config.clone();
+        return serde_json::Value::String("***".to_string());
     };
     let mut masked = serde_json::Map::new();
     for (server_name, server_config) in servers {
         let Some(obj) = server_config.as_object() else {
-            masked.insert(server_name.clone(), server_config.clone());
+            masked.insert(
+                server_name.clone(),
+                serde_json::Value::String("***".to_string()),
+            );
             continue;
         };
         let mut server = obj.clone();
+        if server.get("url").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "url".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
+        }
         if let Some(env) = server.get("env").and_then(|v| v.as_object()) {
             let masked_env: serde_json::Map<String, serde_json::Value> = env
                 .keys()
                 .map(|k| (k.clone(), serde_json::Value::String("***".to_string())))
                 .collect();
             server.insert("env".to_string(), serde_json::Value::Object(masked_env));
+        } else if server.get("env").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "env".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
+        }
+        if let Some(headers) = server.get("headers").and_then(|v| v.as_object()) {
+            let masked_headers = headers
+                .keys()
+                .map(|key| (key.clone(), serde_json::Value::String("***".to_string())))
+                .collect();
+            server.insert(
+                "headers".to_string(),
+                serde_json::Value::Object(masked_headers),
+            );
+        } else if server.get("headers").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "headers".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
         }
         masked.insert(server_name.clone(), serde_json::Value::Object(server));
     }
     serde_json::Value::Object(masked)
+}
+
+fn mask_custom_tool_credential_values(config: &serde_json::Value) -> serde_json::Value {
+    let Some(tools) = config.as_array() else {
+        return serde_json::Value::String("***".to_string());
+    };
+    let masked = tools
+        .iter()
+        .map(|tool| {
+            let Some(object) = tool.as_object() else {
+                return serde_json::Value::String("***".to_string());
+            };
+            let mut tool = object.clone();
+            for field in ["webhook_url", "url"] {
+                if tool.get(field).is_some_and(|value| !value.is_null()) {
+                    tool.insert(
+                        field.to_string(),
+                        serde_json::Value::String("***".to_string()),
+                    );
+                }
+            }
+            if let Some(headers) = tool.get("headers").and_then(|value| value.as_object()) {
+                let masked_headers = headers
+                    .keys()
+                    .map(|key| (key.clone(), serde_json::Value::String("***".to_string())))
+                    .collect();
+                tool.insert(
+                    "headers".to_string(),
+                    serde_json::Value::Object(masked_headers),
+                );
+            } else if tool.get("headers").is_some_and(|value| !value.is_null()) {
+                tool.insert(
+                    "headers".to_string(),
+                    serde_json::Value::String("***".to_string()),
+                );
+            }
+            serde_json::Value::Object(tool)
+        })
+        .collect();
+    serde_json::Value::Array(masked)
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -585,4 +670,79 @@ pub async fn delete_agent(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_inline_mcp_response_masks_url_env_and_headers() {
+        let config = serde_json::json!({
+            "remote": {
+                "url": "https://user:password@mcp.example.test?token=secret",
+                "env": {"API_TOKEN": "env-secret"},
+                "headers": {"Authorization": "Bearer header-secret"},
+                "command": "npx"
+            },
+            "malformed": "raw-secret"
+        });
+
+        let masked = mask_mcp_credential_values(&config);
+
+        assert_eq!(masked["remote"]["url"], "***");
+        assert_eq!(masked["remote"]["env"]["API_TOKEN"], "***");
+        assert_eq!(masked["remote"]["headers"]["Authorization"], "***");
+        assert_eq!(masked["remote"]["command"], "npx");
+        assert_eq!(masked["malformed"], "***");
+        let serialized = masked.to_string();
+        for secret in ["password", "env-secret", "header-secret", "raw-secret"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn current_mcp_slug_references_are_preserved() {
+        let config = serde_json::json!(["github", "filesystem"]);
+
+        assert_eq!(mask_mcp_credential_values(&config), config);
+        assert_eq!(
+            mask_mcp_credential_values(&serde_json::json!(["github", {"url": "secret"}])),
+            "***"
+        );
+    }
+
+    #[test]
+    fn legacy_custom_tool_response_masks_webhook_urls_and_headers() {
+        let config = serde_json::json!([
+            {
+                "type": "custom",
+                "name": "deploy",
+                "webhook_url": "https://hooks.example.test/secret",
+                "headers": {
+                    "Authorization": "Bearer secret",
+                    "X-Api-Key": "api-secret"
+                },
+                "description": "Deploy the application"
+            },
+            "malformed-secret"
+        ]);
+
+        let masked = mask_custom_tool_credential_values(&config);
+
+        assert_eq!(masked[0]["webhook_url"], "***");
+        assert_eq!(masked[0]["headers"]["Authorization"], "***");
+        assert_eq!(masked[0]["headers"]["X-Api-Key"], "***");
+        assert_eq!(masked[0]["description"], "Deploy the application");
+        assert_eq!(masked[1], "***");
+        let serialized = masked.to_string();
+        for secret in [
+            "hooks.example.test",
+            "Bearer secret",
+            "api-secret",
+            "malformed-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
 }

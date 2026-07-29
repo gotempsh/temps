@@ -19,8 +19,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { createCredentialRevealGuard } from '@/lib/credential-reveal-state'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
-import { InputHTMLAttributes, useState } from 'react'
+import { InputHTMLAttributes, useEffect, useRef, useState } from 'react'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderFormData } from './schemas'
@@ -64,12 +65,20 @@ function RevealableInput({
 }: RevealableInputProps) {
   const [isRevealed, setIsRevealed] = useState(false)
   const [isRevealing, setIsRevealing] = useState(false)
+  const revealGuard = useRef(createCredentialRevealGuard())
+
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    return () => guard.invalidate()
+  }, [])
 
   const canReveal =
     !!onRevealCredential && (value === MASKED_VALUE || isRevealed)
 
   const toggleReveal = async () => {
     if (isRevealed) {
+      revealGuard.current.cancel(fieldPath)
       onChange(MASKED_VALUE)
       setIsRevealed(false)
       return
@@ -78,14 +87,20 @@ function RevealableInput({
     if (!onRevealCredential) return
 
     setIsRevealing(true)
+    const request = revealGuard.current.begin(fieldPath)
     try {
       const revealedValue = await onRevealCredential(fieldPath)
+      if (!revealGuard.current.isCurrent(fieldPath, request)) return
       onChange(revealedValue)
       setIsRevealed(true)
     } catch {
-      toast.error('Failed to reveal credential')
+      if (revealGuard.current.isCurrent(fieldPath, request)) {
+        toast.error('Failed to reveal credential')
+      }
     } finally {
-      setIsRevealing(false)
+      if (revealGuard.current.finish(fieldPath, request)) {
+        setIsRevealing(false)
+      }
     }
   }
 
