@@ -12,10 +12,13 @@ fail() {
   exit 1
 }
 
-# The literal $TAG is the workflow contract under test.
+# The no-checkout dispatch job must identify both repository and tag explicitly.
 # shellcheck disable=SC2016
-grep -Fq 'gh workflow run release.yml --ref "$TAG" --field dry_run=false' \
-  "$nightly_workflow" ||
+grep -Fq -- '--repo "$REPOSITORY"' "$nightly_workflow" ||
+  fail "the no-checkout dispatch job cannot identify its repository"
+
+# shellcheck disable=SC2016
+grep -Fq -- '--ref "$TAG"' "$nightly_workflow" ||
   fail "nightly tags are not explicitly dispatched to the release workflow"
 
 # The active-run query must be scoped to the nightly tag, not merely the SHA;

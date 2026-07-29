@@ -139,8 +139,12 @@ jobs:
       - name: Start release workflow for nightly tag
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.check-and-tag.outputs.tag }}
         run: |
           set -euo pipefail
-          gh workflow run release.yml --ref "$TAG" --field dry_run=false
+          gh workflow run release.yml \
+            --repo "$REPOSITORY" \
+            --ref "$TAG" \
+            --field dry_run=false
           echo "Dispatched release workflow for $TAG"
