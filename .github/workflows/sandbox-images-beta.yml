@@ -64,7 +64,6 @@ env:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
@@ -76,6 +75,8 @@ jobs:
   prepare-context:
     name: Prepare sandbox build context
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       sandbox_image_version: ${{ steps.version.outputs.sandbox_image_version }}
       gateway_version: ${{ steps.version.outputs.gateway_version }}
@@ -178,6 +179,9 @@ jobs:
     name: Sandbox image (${{ matrix.runtime }})
     needs: prepare-context
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -265,6 +269,9 @@ jobs:
     name: Preview gateway image
     needs: prepare-context
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
