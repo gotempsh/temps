@@ -1,4 +1,5 @@
 import { ProjectResponse } from '@/api/client'
+import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,12 +39,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  EllipsisVertical,
-  Loader2,
-  Plus,
-  Server,
-} from 'lucide-react'
+import { EllipsisVertical, Loader2, Plus, Server } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import {
@@ -51,7 +47,7 @@ import {
   listMcpsOptions,
   listMcpsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { createMcp, updateMcp } from '@/api/client/sdk.gen'
+import { createMcp, revealMcpConfig, updateMcp } from '@/api/client/sdk.gen'
 import type { McpDefinitionResponse as McpDefinition } from '@/api/client/types.gen'
 
 interface McpServersSettingsProps {
@@ -170,11 +166,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
                     </div>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8"
-                        >
+                        <Button variant="ghost" size="icon" className="h-8 w-8">
                           <EllipsisVertical className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
@@ -346,6 +338,14 @@ function McpDialog({
     }
   }
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      setConfigText('')
+      setConfigError(null)
+    }
+    onOpenChange(nextOpen)
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim() || !slug.trim()) return
@@ -384,12 +384,11 @@ function McpDialog({
         })
         toast.success('MCP server created')
       }
+      setConfigText('')
       onSuccess()
     } catch (err) {
       toast.error(
-        isEdit
-          ? 'Failed to update MCP server'
-          : 'Failed to create MCP server'
+        isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
       )
     } finally {
       setIsPending(false)
@@ -397,7 +396,7 @@ function McpDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
@@ -467,18 +466,33 @@ function McpDialog({
               <p className="text-xs text-destructive">{configError}</p>
             )}
           </div>
+          {isEdit && (
+            <McpCredentialRevealControls
+              key={`${projectId}:${mcp!.slug}:${mcp!.updated_at}:${open}`}
+              configText={configText}
+              onConfigTextChange={handleConfigChange}
+              onRevealCredential={async (field) => {
+                const { data } = await revealMcpConfig({
+                  path: {
+                    project_id: projectId,
+                    slug: mcp!.slug,
+                    field,
+                  },
+                  throwOnError: true,
+                })
+                return data.value
+              }}
+            />
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={() => handleOpenChange(false)}
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={isPending || configError !== null}
-            >
+            <Button type="submit" disabled={isPending || configError !== null}>
               {isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
               ) : null}

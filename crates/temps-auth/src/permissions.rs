@@ -42,6 +42,9 @@ pub enum Permission {
     SystemAdmin,
     SystemRead,
 
+    // Plaintext credential access
+    SecretsRead,
+
     // API Key management
     ApiKeysRead,
     ApiKeysWrite,
@@ -253,6 +256,7 @@ impl fmt::Display for Permission {
             Permission::UsersCreate => "users:create",
             Permission::SystemAdmin => "system:admin",
             Permission::SystemRead => "system:read",
+            Permission::SecretsRead => "secrets:read",
             Permission::ApiKeysRead => "api_keys:read",
             Permission::ApiKeysWrite => "api_keys:write",
             Permission::ApiKeysDelete => "api_keys:delete",
@@ -397,6 +401,7 @@ impl Permission {
             "users:create" => Some(Permission::UsersCreate),
             "system:admin" => Some(Permission::SystemAdmin),
             "system:read" => Some(Permission::SystemRead),
+            "secrets:read" => Some(Permission::SecretsRead),
             "api_keys:read" => Some(Permission::ApiKeysRead),
             "api_keys:write" => Some(Permission::ApiKeysWrite),
             "api_keys:delete" => Some(Permission::ApiKeysDelete),
@@ -538,6 +543,7 @@ impl Permission {
             Permission::UsersCreate,
             Permission::SystemAdmin,
             Permission::SystemRead,
+            Permission::SecretsRead,
             Permission::ApiKeysRead,
             Permission::ApiKeysWrite,
             Permission::ApiKeysDelete,
@@ -779,6 +785,7 @@ impl Role {
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::SecretsRead,
                 Permission::SpeedInsightsRead,
                 Permission::SystemAdmin,
                 Permission::SystemRead,
@@ -1315,6 +1322,25 @@ mod tests {
         assert!(Role::User.has_permission(&Permission::EmailsSend));
         // Reader does NOT have email send permission
         assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn plaintext_secret_access_is_admin_only_by_default() {
+        assert!(Role::Admin.has_permission(&Permission::SecretsRead));
+        assert!(!Role::PlatformAdmin.has_permission(&Permission::SecretsRead));
+        assert!(!Role::User.has_permission(&Permission::SecretsRead));
+        assert!(!Role::Reader.has_permission(&Permission::SecretsRead));
+        assert!(!Role::ApiReader.has_permission(&Permission::SecretsRead));
+    }
+
+    #[test]
+    fn secrets_read_permission_round_trips() {
+        assert_eq!(Permission::SecretsRead.to_string(), "secrets:read");
+        assert_eq!(
+            Permission::from_str("secrets:read"),
+            Some(Permission::SecretsRead)
+        );
+        assert!(Permission::all().contains(&Permission::SecretsRead));
     }
 
     // Deployment token permission tests

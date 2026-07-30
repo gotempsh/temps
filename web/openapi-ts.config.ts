@@ -9,11 +9,19 @@ export default {
   client: '@hey-api/client-fetch',
   // input: 'https://app.localup.dev/api-docs/openapi.json',
   input: {
-    path: 'http://localhost:8080/api/api-docs/openapi.json',
+    path:
+      env.TEMPS_OPENAPI_URL ??
+      'http://localhost:8080/api/api-docs/openapi.json',
     fetch: {
-      headers: env.TEMPS_API_KEY
-        ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
-        : undefined,
+      headers:
+        env.TEMPS_API_KEY || env.TEMPS_API_COOKIE
+          ? {
+              ...(env.TEMPS_API_KEY
+                ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
+                : {}),
+              ...(env.TEMPS_API_COOKIE ? { Cookie: env.TEMPS_API_COOKIE } : {}),
+            }
+          : undefined,
     },
   },
   output: 'src/api/client',

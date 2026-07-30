@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Credential reveal boundaries:** Mask environment variables, container configuration, external-service parameters, notification providers, MCP servers, and legacy agent tool credentials by default; plaintext now requires an explicit, audited, non-cacheable reveal request
 ### Added
 
 - **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))
@@ -15,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** Require the dedicated `secrets:read` permission before returning plaintext project or provider credentials, and mask container environment values for callers without it.
 - **providers:** `shared_preload_libraries` was unconditionally overwritten to just `pg_stat_statements` at container-creation time, silently dropping any image-required library (e.g. `timescaledb` for the `timescale/timescaledb-ha:pg18` image option) — the value is now merged, not overwritten ([#460](https://github.com/gotempsh/temps/pull/460))
 - **providers:** Postgres container restarts never picked up a corrected `shared_preload_libraries` value — the drift-reconciliation check only compared `archive_mode`; it now also detects `shared_preload_libraries` drift and recreates the container accordingly ([#460](https://github.com/gotempsh/temps/pull/460))
 - **web:** the service Logs tab crashed with a React error boundary (`Cannot read properties of undefined (reading 'next_cursor')`) when the logs API returned a non-2xx response ([#460](https://github.com/gotempsh/temps/pull/460))

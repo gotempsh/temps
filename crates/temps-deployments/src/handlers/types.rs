@@ -749,6 +749,11 @@ pub struct ContainerListResponse {
     pub total: usize,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct ContainerEnvironmentVariableValueResponse {
+    pub value: String,
+}
+
 /// Detailed container information with environment variables and metrics
 #[derive(Serialize, ToSchema)]
 pub struct ContainerDetailResponse {

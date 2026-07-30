@@ -294,6 +294,8 @@ export type AgentConfigResponse = {
     max_turns: number;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline values are write-only and appear as
+     * `***`. Omit this field on update to preserve their stored values.
      */
     mcp_servers_config?: unknown;
     name: string;
@@ -311,7 +313,9 @@ export type AgentConfigResponse = {
     source: string;
     timeout_seconds: number;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+     * are write-only and appear as `***`. Omit this field on update to
+     * preserve their stored values.
      */
     tools_config?: unknown;
     trigger_config: unknown;
@@ -2066,8 +2070,7 @@ export type CloudflareConfig = {
     account_id: string;
     /**
      * Cloudflare API token with the Email Sending permission. Encrypted at
-     * rest; like the other notification providers, it is returned decrypted to
-     * authorized callers so the edit form can prefill (not masked).
+     * rest and masked in normal API responses.
      */
     api_token: string;
     /**
@@ -2487,6 +2490,10 @@ export type ContainerDetailResponse = {
      */
     started_at?: string | null;
     status: string;
+};
+
+export type ContainerEnvironmentVariableValueResponse = {
+    value: string;
 };
 
 export type ContainerInfoResponse = {
@@ -4492,6 +4499,10 @@ export type DeploymentJobResponse = {
     execution_order?: number | null;
     finished_at?: number | null;
     id: number;
+    /**
+     * Internal workflow configuration is intentionally redacted. It can
+     * contain legacy plaintext secrets or encrypted secret envelopes.
+     */
     job_config?: unknown;
     job_id: string;
     job_type: string;
@@ -5735,6 +5746,16 @@ export type EnableKvResponse = {
 };
 
 /**
+ * Response for the enable pg_stat_statements endpoint.
+ */
+export type EnablePgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the action.
+     */
+    message: string;
+};
+
+/**
  * One DNS record on the wire. Mirrors `service_endpoints::Model` but
  * keeps the API stable across entity evolution. `target_ip` is a string
  * (v4 or v6 literal, or CNAME target hostname) parsed by the resolver.
@@ -5873,6 +5894,7 @@ export type EnvVarIntegrationInfo = {
     service_name: string;
     service_slug?: string | null;
     service_type: string;
+    service_updated_at: string;
 };
 
 /**
@@ -6817,6 +6839,11 @@ export type ExternalServiceDetails = {
         [key: string]: string;
     } | null;
     parameter_schema?: unknown;
+    /**
+     * Parameter names whose values are masked in `current_parameters` and
+     * may be fetched only through the audited reveal endpoint.
+     */
+    sensitive_parameters: Array<string>;
     service: ExternalServiceInfo;
 };
 
@@ -7521,6 +7548,16 @@ export type GetDeploymentsParams = {
 
 export type GetEnvironmentVariablesQuery = {
     environment_id?: number | null;
+    /**
+     * Required by integration-value reveals to bind the plaintext response to
+     * the exact service displayed by the client.
+     */
+    service_id?: number | null;
+    /**
+     * Exact manual env-var row to reveal. Required by the dashboard so
+     * duplicate keys on disjoint environments cannot cross-reveal.
+     */
+    var_id?: number | null;
 };
 
 export type GetFunnelMetricsQuery = {
@@ -14077,6 +14114,18 @@ export type SendMessageRequest = {
     page_context?: string | null;
 };
 
+export type SensitiveConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveMcpConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveValueResponse = {
+    value: string;
+};
+
 export type SentryChunkUploadResponse = {
     accept: Array<string>;
     chunkSize: number;
@@ -15321,10 +15370,20 @@ export type SpanKind = 'UNSPECIFIED' | 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODU
  * A single trace span ready for storage.
  */
 export type SpanRecord = {
+    /**
+     * Raw key/value pairs exactly as reported by the instrumenting library.
+     * Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+     * may be seconds, milliseconds, microseconds, or nanoseconds depending on
+     * the exporter's own convention, and the unit is not labeled here.
+     */
     attributes: {
         [key: string]: string;
     };
     deployment_id?: number | null;
+    /**
+     * Span duration in milliseconds. The only field on this struct guaranteed
+     * to be in milliseconds.
+     */
     duration_ms: number;
     end_time: string;
     events: Array<SpanEvent>;
@@ -17347,6 +17406,8 @@ export type UpsertAgentRequest = {
     max_turns?: number | null;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline objects are write-only: normal reads
+     * mask them, and updates must omit this field to preserve existing values.
      */
     mcp_servers_config?: unknown;
     name?: string | null;
@@ -17359,7 +17420,8 @@ export type UpsertAgentRequest = {
     slug?: string | null;
     timeout_seconds?: number | null;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Custom-tool webhook URLs and headers are
+     * write-only; omit this field on update to preserve them.
      */
     tools_config?: unknown;
     /**
@@ -26948,6 +27010,50 @@ export type ExternalServiceMetricsStatusResponses = {
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
 
+export type RevealServiceParameterData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Sensitive parameter name
+         */
+        param_name: string;
+    };
+    query?: never;
+    url: '/external-services/{id}/parameters/{param_name}';
+};
+
+export type RevealServiceParameterErrors = {
+    /**
+     * Parameter is not sensitive
+     */
+    400: unknown;
+    /**
+     * Caller cannot access a project linked to this service
+     */
+    403: unknown;
+    /**
+     * Service or parameter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceParameterResponses = {
+    /**
+     * Sensitive parameter value
+     */
+    200: SensitiveValueResponse;
+};
+
+export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
+
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
     path: {
@@ -27597,6 +27703,50 @@ export type GetPostgresWalHealthResponses = {
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
 
+export type ExternalServiceEnablePgStatStatementsData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned standalone Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/enable';
+};
+
+export type ExternalServiceEnablePgStatStatementsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not standalone Postgres (cluster or wrong type)
+     */
+    422: unknown;
+    /**
+     * Restart failed
+     */
+    500: unknown;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponses = {
+    /**
+     * Container restarted; pg_stat_statements now active
+     */
+    200: EnablePgStatStatementsResponse;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
 export type GetSlowQueriesData = {
     body?: never;
     path: {
@@ -27611,7 +27761,7 @@ export type GetSlowQueriesData = {
          */
         page?: number | null;
         /**
-         * Number of rows per page (1-100). Defaults to 20.
+         * Number of rows per page (1–100). Defaults to 20.
          */
         page_size?: number | null;
         /**
@@ -27655,7 +27805,7 @@ export type GetSlowQueriesErrors = {
 
 export type GetSlowQueriesResponses = {
     /**
-     * Top slow queries from pg_stat_statements
+     * Paginated slow queries from pg_stat_statements
      */
     200: SlowQueriesResponse;
 };
@@ -31905,6 +32055,10 @@ export type UpdateNotificationProviderData = {
 
 export type UpdateNotificationProviderErrors = {
     /**
+     * Invalid masked provider configuration
+     */
+    400: unknown;
+    /**
      * Provider not found
      */
     404: unknown;
@@ -31922,6 +32076,46 @@ export type UpdateNotificationProviderResponses = {
 };
 
 export type UpdateNotificationProviderResponse = UpdateNotificationProviderResponses[keyof UpdateNotificationProviderResponses];
+
+export type RevealNotificationProviderConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+        /**
+         * Sensitive field, such as password or headers.Authorization
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/notification-providers/{id}/config/{field}';
+};
+
+export type RevealNotificationProviderConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Provider or field not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealNotificationProviderConfigResponses = {
+    /**
+     * Sensitive provider configuration value
+     */
+    200: SensitiveConfigValueResponse;
+};
+
+export type RevealNotificationProviderConfigResponse = RevealNotificationProviderConfigResponses[keyof RevealNotificationProviderConfigResponses];
 
 export type TestNotificationProviderData = {
     body?: never;
@@ -37636,18 +37830,34 @@ export type GetResolvedEnvironmentVariableValueData = {
     };
     query?: {
         /**
-         * Optional environment ID (manual vars only)
+         * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact manual environment-variable row ID
+         */
+        var_id?: number;
+        /**
+         * Integration service ID shown by the resolved list
+         */
+        service_id?: number;
     };
     url: '/projects/{project_id}/env-vars/resolved/{key}/value';
 };
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
+     * Secret environment variables are write-only
+     */
+    403: unknown;
+    /**
      * Project, key, or integration not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -37680,15 +37890,27 @@ export type GetEnvironmentVariableValueData = {
          * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact environment-variable row ID
+         */
+        var_id?: number;
     };
     url: '/projects/{project_id}/env-vars/{key}/value';
 };
 
 export type GetEnvironmentVariableValueErrors = {
     /**
+     * Secret environment variables are write-only
+     */
+    403: unknown;
+    /**
      * Project or variable not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -38508,6 +38730,50 @@ export type GetContainerDetailResponses = {
 };
 
 export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
+export type GetContainerEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+        /**
+         * Environment variable name
+         */
+        variable_name: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}';
+};
+
+export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Container or environment variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerEnvironmentVariableResponses = {
+    /**
+     * Environment variable value
+     */
+    200: ContainerEnvironmentVariableValueResponse;
+};
+
+export type GetContainerEnvironmentVariableResponse = GetContainerEnvironmentVariableResponses[keyof GetContainerEnvironmentVariableResponses];
 
 export type GetContainerLogsByIdData = {
     body?: never;
@@ -40892,6 +41158,51 @@ export type UpdateMcpResponses = {
 };
 
 export type UpdateMcpResponse = UpdateMcpResponses[keyof UpdateMcpResponses];
+
+export type RevealMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealMcpConfigResponse = RevealMcpConfigResponses[keyof RevealMcpConfigResponses];
 
 export type ListMonitorsData = {
     body?: never;
@@ -45100,6 +45411,47 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type RevealGlobalMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/settings/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealGlobalMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealGlobalMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
 export type RefreshRouteTableData = {
     body?: never;

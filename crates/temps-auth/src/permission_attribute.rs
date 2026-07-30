@@ -144,6 +144,7 @@ define_permissions! {
     // System
     SystemAdmin => Permission::SystemAdmin,
     SystemRead => Permission::SystemRead,
+    SecretsRead => Permission::SecretsRead,
 
     // API Keys
     ApiKeysRead => Permission::ApiKeysRead,
