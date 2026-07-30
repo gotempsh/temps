@@ -5,6 +5,9 @@ use utoipa::ToSchema;
 const DEFAULT_BASE_DOMAIN: &str = "localho.st";
 const DNS_LABEL_MAX_LEN: usize = 63;
 const SHORT_HASH_LEN: usize = 8;
+/// Appended to a generated label that would otherwise end in an IPv4 octet.
+/// See [`guard_trailing_ip_octet`].
+const OCTET_GUARD_SUFFIX: &str = "x";
 
 /// Public hostname generation mode for Temps-managed preview routes.
 ///
@@ -150,7 +153,7 @@ fn normalize_hostname(raw: &str, base_domain: &str, force_single_label: bool) ->
 }
 
 fn dns_label(label: &str, hash_seed: &str) -> String {
-    let sanitized = sanitize_label(label);
+    let sanitized = guard_trailing_ip_octet(&sanitize_label(label));
     if sanitized.len() <= DNS_LABEL_MAX_LEN {
         return sanitized;
     }
@@ -169,6 +172,54 @@ fn dns_label(label: &str, hash_seed: &str) -> String {
     } else {
         format!("{prefix}{suffix}")
     }
+}
+
+/// Append a non-numeric marker when a label would end in something a
+/// wildcard-DNS service parses as an IP octet.
+///
+/// Wildcard-DNS services (sslip.io, nip.io) resolve `<name>.<ip>.sslip.io` by
+/// scanning the hostname for four numeric components joined by a *single*
+/// separator style — all dots or all dashes — and taking the leftmost match.
+/// That match is not anchored to the base domain, so a generated label ending
+/// in a decimal octet donates its trailing number to the front of the base
+/// domain's IP and pushes the real last octet out:
+///
+/// ```text
+/// observability-starter-1.127.0.0.1.sslip.io  ->  1.127.0.0   (unreachable)
+/// pr-42.127.0.0.1.sslip.io                    ->  42.127.0.0  (unreachable)
+/// ```
+///
+/// Temps generates exactly this shape as a matter of course — deployment slugs
+/// are `{project}-{n}` and preview environments are `pr-{number}` — so on a
+/// sslip.io install (the quick-start default) every generated hostname would
+/// time out. Appending a letter makes the trailing component non-numeric, which
+/// stops the match: `observability-starter-1x.127.0.0.1.sslip.io` resolves to
+/// `127.0.0.1`.
+///
+/// Applied to every generated label, not just sslip.io installs, so a hostname
+/// is identical across deployments regardless of the operator's base domain.
+fn guard_trailing_ip_octet(label: &str) -> String {
+    let trailing = label.rsplit('-').next().unwrap_or(label);
+    if is_ip_octet(trailing) {
+        format!("{label}{OCTET_GUARD_SUFFIX}")
+    } else {
+        label.to_string()
+    }
+}
+
+/// Whether `token` is a decimal IPv4 octet as a wildcard-DNS service parses it.
+///
+/// Leading zeros (`01`) and out-of-range values (`256`) are rejected by those
+/// services, so they need no guarding — verified against live sslip.io
+/// resolution.
+fn is_ip_octet(token: &str) -> bool {
+    if token.is_empty() || token.len() > 3 || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if token.len() > 1 && token.starts_with('0') {
+        return false;
+    }
+    token.parse::<u16>().is_ok_and(|value| value <= 255)
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -231,9 +282,11 @@ mod tests {
             PublicHostnameStrategy::Standard.environment_hostname("example.com", env),
             PublicHostnameStrategy::Flat.environment_hostname("example.com", env),
         );
+        // Trailing `123` is guarded to `123x` so wildcard-DNS bases can't parse
+        // it as an IP octet — see `guard_trailing_ip_octet`.
         assert_eq!(
             PublicHostnameStrategy::Flat.environment_hostname("*.example.com", env),
-            "preview-123.example.com"
+            "preview-123x.example.com"
         );
     }
 
@@ -254,6 +307,106 @@ mod tests {
             PublicHostnameStrategy::from_db_str("bogus"),
             PublicHostnameStrategy::Standard
         );
+    }
+
+    /// A deployment slug is `{project}-{n}`, so without the guard every single
+    /// deployment on a sslip.io install produces an unreachable hostname:
+    /// `observability-starter-1.127.0.0.1.sslip.io` resolves to `1.127.0.0`.
+    #[test]
+    fn deployment_slug_hostname_does_not_end_in_an_ip_octet() {
+        assert_eq!(
+            PublicHostnameStrategy::Standard
+                .deployment_hostname("127.0.0.1.sslip.io", "observability-starter-1"),
+            "observability-starter-1x.127.0.0.1.sslip.io"
+        );
+    }
+
+    /// Preview environments are named `pr-{number}` / `preview-{number}`, which
+    /// hit the same parse.
+    #[test]
+    fn preview_environment_hostname_does_not_end_in_an_ip_octet() {
+        assert_eq!(
+            PublicHostnameStrategy::Standard.environment_hostname("127.0.0.1.sslip.io", "pr-42"),
+            "pr-42x.127.0.0.1.sslip.io"
+        );
+        assert_eq!(
+            PublicHostnameStrategy::Flat.environment_hostname("example.com", "preview-123"),
+            "preview-123x.example.com"
+        );
+    }
+
+    #[test]
+    fn guard_applies_to_every_label_of_a_multi_label_host() {
+        // Standard keeps one label per dotted component; each is guarded, so no
+        // component can donate a number to the one that follows it.
+        assert_eq!(
+            PublicHostnameStrategy::Standard
+                .deployment_hostname("127.0.0.1.sslip.io", "api-7.edge-2"),
+            "api-7x.edge-2x.127.0.0.1.sslip.io"
+        );
+    }
+
+    #[test]
+    fn flat_strategy_guards_the_joined_label() {
+        assert_eq!(
+            PublicHostnameStrategy::Flat.service_hostname("example.com", "staging", "web-2"),
+            "staging-web-2x.example.com"
+        );
+    }
+
+    #[test]
+    fn hostnames_not_ending_in_an_octet_are_untouched() {
+        // The guard must not churn the hostnames operators already depend on.
+        assert_eq!(
+            PublicHostnameStrategy::Standard
+                .environment_hostname("127.0.0.1.sslip.io", "observability-starter-production"),
+            "observability-starter-production.127.0.0.1.sslip.io"
+        );
+        assert_eq!(
+            PublicHostnameStrategy::Standard.service_hostname("example.com", "staging", "files"),
+            "files-staging.example.com"
+        );
+    }
+
+    /// Values a wildcard-DNS service already refuses to read as an octet need
+    /// no guard — verified against live sslip.io resolution.
+    #[test]
+    fn only_real_octets_are_guarded() {
+        for token in ["0", "1", "42", "255"] {
+            assert!(is_ip_octet(token), "{token} should be treated as an octet");
+        }
+        for token in ["01", "007", "256", "999", "1234", "1x", "x", ""] {
+            assert!(!is_ip_octet(token), "{token} should not be an octet");
+        }
+    }
+
+    #[test]
+    fn guard_is_idempotent() {
+        // Re-normalizing an already-guarded host must not keep appending.
+        let once = PublicHostnameStrategy::Standard
+            .deployment_hostname("127.0.0.1.sslip.io", "observability-starter-1");
+        let twice = PublicHostnameStrategy::Standard.deployment_hostname(
+            "127.0.0.1.sslip.io",
+            once.trim_end_matches(".127.0.0.1.sslip.io"),
+        );
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn guarded_label_stays_within_the_dns_length_limit() {
+        // 63 chars ending in an octet: the guard would overflow the label, so
+        // it must fall through to the hash-truncation path instead.
+        let slug = format!("{}-1", "a".repeat(61));
+        assert_eq!(slug.len(), DNS_LABEL_MAX_LEN);
+        let host = PublicHostnameStrategy::Standard.deployment_hostname("example.com", &slug);
+        let label = host.split('.').next().unwrap();
+        assert!(
+            label.len() <= DNS_LABEL_MAX_LEN,
+            "label was {}",
+            label.len()
+        );
+        // The truncation path ends in an 8-char hash, which is never an octet.
+        assert!(!is_ip_octet(label.rsplit('-').next().unwrap()));
     }
 
     #[test]

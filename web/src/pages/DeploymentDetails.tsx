@@ -29,6 +29,7 @@ import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { formatMicrocores } from '@/lib/cpu-format'
+import { resolvePrimaryUrl } from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -71,18 +72,6 @@ function statusBadgeVariant(status: string): BadgeVariant {
     default:
       return 'secondary'
   }
-}
-
-// The environment's URLs come through `environment.domains` (domains[0] is the
-// stable env URL). A deployment also has its own deployment-specific `url`.
-// The current deployment is served at the environment's stable domain, so we
-// surface that; older deployments fall back to their deployment-specific URL.
-function resolvePrimaryUrl(deployment: DeploymentResponse): string | null {
-  const normalize = (u: string) => (u.startsWith('http') ? u : `https://${u}`)
-  const envUrl = deployment.environment.domains?.[0]
-  if (deployment.is_current && envUrl) return normalize(envUrl)
-  if (deployment.url) return normalize(deployment.url)
-  return envUrl ? normalize(envUrl) : null
 }
 
 function formatDurationMs(ms?: number | null): string | null {
