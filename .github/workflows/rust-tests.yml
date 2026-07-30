@@ -39,7 +39,7 @@ jobs:
       # would, but with a cargo target dir that persists across runs — the
       # one thing an in-Docker build can never have.
       - name: Build toolchain image (GHA layer cache)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: toolchain
@@ -85,7 +85,7 @@ jobs:
       # Assemble the production runtime stage around the prebuilt binary —
       # the builder stage is skipped entirely, so this takes ~1 minute.
       - name: Build temps image from prebuilt binary
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
