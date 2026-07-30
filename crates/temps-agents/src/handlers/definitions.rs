@@ -603,6 +603,7 @@ pub async fn get_mcp(
         (status = 200, body = SensitiveMcpConfigValueResponse),
         (status = 400, description = "Field is not revealable"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing secrets:read permission"),
         (status = 404, description = "MCP server or field not found"),
         (status = 500, description = "Configuration read or audit failed"),
     ),
@@ -615,6 +616,7 @@ pub async fn reveal_mcp_config(
     Path((project_id, slug, field)): Path<(i32, String, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
@@ -1116,6 +1118,7 @@ pub async fn get_global_mcp(
         (status = 200, body = SensitiveMcpConfigValueResponse),
         (status = 400, description = "Field is not revealable"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing secrets:read permission"),
         (status = 404, description = "MCP server or field not found"),
         (status = 500, description = "Configuration read or audit failed"),
     ),
@@ -1128,6 +1131,7 @@ pub async fn reveal_global_mcp_config(
     Path((slug, field)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
+    permission_guard!(auth, SecretsRead);
 
     let value = reveal_mcp_config_value_with_audit(
         app_state.definition_service.as_ref(),

@@ -90,6 +90,12 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
     }
 }
 
+fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
+    Ok(())
+}
+
 impl From<crate::services::secret_service::SecretError> for Problem {
     fn from(err: crate::services::secret_service::SecretError) -> Self {
         use crate::services::secret_service::SecretError;
@@ -636,7 +642,7 @@ pub async fn get_resolved_environment_variables(
     tag = "Projects",
     responses(
         (status = 200, description = "Resolved environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Secret environment variables are write-only"),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project, key, or integration not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
@@ -656,7 +662,7 @@ pub async fn get_resolved_environment_variable_value(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsRead);
+    require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -938,7 +944,7 @@ pub async fn update_environment_variable(
     tag = "Projects",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Secret environment variables are write-only"),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project or variable not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
@@ -957,7 +963,7 @@ pub async fn get_environment_variable_value(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsRead);
+    require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -2208,6 +2214,44 @@ mod tests {
             ip_address: Some("127.0.0.1".to_string()),
             user_agent: "environment-reveal-test".to_string(),
         }
+    }
+
+    fn test_auth_context(role: temps_auth::Role) -> temps_auth::AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed_password".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[test]
+    fn reader_cannot_reveal_plaintext_environment_values() {
+        let problem =
+            require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Reader))
+                .expect_err("reader must not reveal plaintext environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_reveal_plaintext_environment_values() {
+        require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Admin))
+            .expect("admin should be allowed to reveal plaintext environment values");
     }
 
     #[tokio::test]

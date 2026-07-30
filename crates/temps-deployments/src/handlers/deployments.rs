@@ -77,6 +77,12 @@ fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
     }
 }
 
+fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
+    Ok(())
+}
+
 fn public_service_url(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
@@ -1806,6 +1812,7 @@ pub async fn get_container_detail(
     ),
     responses(
         (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Container or environment variable not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1822,7 +1829,7 @@ pub async fn get_container_environment_variable(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsRead);
+    require_container_environment_reveal(&auth)?;
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let variables = state
@@ -2743,8 +2750,7 @@ mod tests {
         }
     }
 
-    /// Helper to create a mock AuthContext for testing
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context_for_role(role: temps_auth::Role) -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -2765,7 +2771,30 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    /// Helper to create a mock AuthContext for testing
+    fn create_test_auth_context() -> temps_auth::AuthContext {
+        create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    #[test]
+    fn reader_cannot_reveal_plaintext_container_environment_values() {
+        let problem = require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Reader,
+        ))
+        .expect_err("reader must not reveal plaintext container environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_reveal_plaintext_container_environment_values() {
+        require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Admin,
+        ))
+        .expect("admin should be allowed to reveal plaintext container environment values");
     }
 
     /// Helper to create a mock RequestMetadata for testing
