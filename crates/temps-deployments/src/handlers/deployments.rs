@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use super::audit::{
-    ContainerActionAudit, DeploymentCancelledAudit, DeploymentPausedAudit, DeploymentPromotedAudit,
-    DeploymentResumedAudit, DeploymentRollbackAudit, DeploymentTeardownAudit,
-    EnvironmentTeardownAudit,
+    ContainerActionAudit, ContainerEnvironmentVariableRevealedAudit, DeploymentCancelledAudit,
+    DeploymentPausedAudit, DeploymentPromotedAudit, DeploymentResumedAudit,
+    DeploymentRollbackAudit, DeploymentTeardownAudit, EnvironmentTeardownAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -13,29 +13,29 @@ use axum::{
         Extension, Path, Query, State,
     },
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{delete, get, post},
     Json,
 };
 use futures::stream::{self, StreamExt};
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
-use temps_auth::{Permission, RequireAuth};
 use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
-    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
-    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
-    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
-    PromoteDeploymentRequest, ResourceLimitsResponse,
+    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerInfoResponse,
+    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
+    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
+    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -77,6 +77,12 @@ fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
     }
 }
 
+fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
+    Ok(())
+}
+
 fn public_service_url(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
@@ -85,30 +91,6 @@ fn public_service_url(
 ) -> String {
     let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
     public_url_for_hostname(settings, &hostname)
-}
-
-fn container_environment_response(
-    auth: &temps_auth::AuthContext,
-    variables: Vec<(String, String)>,
-) -> Vec<EnvVarResponse> {
-    let can_read_plaintext = auth.has_permission(&Permission::SecretsRead);
-
-    variables
-        .into_iter()
-        .map(|(key, value)| EnvVarResponse {
-            key,
-            value: if can_read_plaintext {
-                value
-            } else {
-                "***".to_string()
-            },
-            is_masked: !can_read_plaintext,
-        })
-        .collect()
-}
-
-fn container_detail_response(response: ContainerDetailResponse) -> Response {
-    ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
 }
 
 #[derive(OpenApi)]
@@ -133,6 +115,7 @@ fn container_detail_response(response: ContainerDetailResponse) -> Response {
         get_container_logs_by_id,
         get_container_logs,
         get_container_detail,
+        get_container_environment_variable,
         stop_container,
         start_container,
         restart_container,
@@ -152,6 +135,7 @@ fn container_detail_response(response: ContainerDetailResponse) -> Response {
         ContainerListResponse,
         ContainerInfoResponse,
         ContainerDetailResponse,
+        ContainerEnvironmentVariableValueResponse,
         EnvVarResponse,
         ResourceLimitsResponse,
         ContainerMetricsResponse,
@@ -267,6 +251,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
             get(get_container_detail),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}",
+            get(get_container_environment_variable),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
@@ -1659,7 +1647,8 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_container_detail(
     State(state): State<Arc<AppState>>,
@@ -1674,16 +1663,15 @@ pub async fn get_container_detail(
         .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
-    // Container environments can contain credentials under arbitrary names.
-    // Without the explicit secret-reveal permission, mask every value rather
-    // than relying on an incomplete name heuristic.
-    let mut env_vars = vec![];
+    // Container configuration is a bulk response, so every value is masked.
+    // Plaintext is available only from the audited per-variable endpoint.
+    let mut env_vars = Vec::new();
     if let Ok(vars) = state
         .deployment_service
         .get_container_env_variables(project_id, environment_id, container_id.clone())
         .await
     {
-        env_vars = container_environment_response(&auth, vars);
+        env_vars = mask_container_environment_variables(vars);
     }
 
     let restart_count = state
@@ -1809,7 +1797,118 @@ pub async fn get_container_detail(
         cpu_limit_cores: container.cpu_limit_cores,
     };
 
-    Ok(container_detail_response(response))
+    Ok(Json(response).into_response())
+}
+
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ("variable_name" = String, Path, description = "Environment variable name")
+    ),
+    responses(
+        (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 404, description = "Container or environment variable not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_container_environment_variable(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id, variable_name)): Path<(
+        i32,
+        i32,
+        String,
+        String,
+    )>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    require_container_environment_reveal(&auth)?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let variables = state
+        .deployment_service
+        .get_container_env_variables(project_id, environment_id, container_id.clone())
+        .await?;
+    let value = variables
+        .into_iter()
+        .find_map(|(key, value)| (key == variable_name).then_some(value))
+        .ok_or_else(|| {
+            temps_core::error_builder::not_found()
+                .title("Container environment variable not found")
+                .detail(format!(
+                    "Environment variable '{}' was not found in container '{}'",
+                    variable_name, container_id
+                ))
+                .build()
+        })?;
+
+    let audit = ContainerEnvironmentVariableRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        environment_id,
+        container_id,
+        variable_name,
+    };
+    audit_container_environment_variable_reveal(state.audit_service.as_ref(), &audit).await?;
+
+    Ok(container_environment_variable_value_response(value))
+}
+
+async fn audit_container_environment_variable_reveal(
+    audit_service: &dyn temps_core::AuditLogger,
+    audit: &ContainerEnvironmentVariableRevealedAudit,
+) -> Result<(), Problem> {
+    audit_service
+        .create_audit_log(audit)
+        .await
+        .map_err(|audit_error| {
+            error!(
+                project_id = audit.project_id,
+                environment_id = audit.environment_id,
+                container_id = %audit.container_id,
+                variable_name = %audit.variable_name,
+                error = %audit_error,
+                "Failed to audit container environment-variable reveal"
+            );
+            temps_core::error_builder::internal_server_error()
+                .title("Container environment variable could not be revealed")
+                .detail("The audit record for this reveal could not be written")
+                .build()
+        })
+}
+
+fn container_environment_variable_value_response(
+    value: String,
+) -> (
+    [(header::HeaderName, &'static str); 1],
+    Json<ContainerEnvironmentVariableValueResponse>,
+) {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ContainerEnvironmentVariableValueResponse { value }),
+    )
+}
+
+fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec<EnvVarResponse> {
+    variables
+        .into_iter()
+        .map(|(key, _value)| EnvVarResponse {
+            key,
+            value: "***".to_string(),
+            is_masked: true,
+        })
+        .collect()
 }
 
 /// Stop a specific container
@@ -2360,6 +2459,98 @@ mod tests {
         }
     }
 
+    struct FailingAuditLogger;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for FailingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            Err(anyhow::anyhow!("audit database unavailable"))
+        }
+    }
+
+    #[test]
+    fn container_detail_masks_every_environment_variable_value() {
+        let masked = mask_container_environment_variables(vec![
+            ("PORT".to_string(), "3000".to_string()),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                "Authorization=Bearer hidden-token".to_string(),
+            ),
+        ]);
+
+        assert_eq!(masked.len(), 2);
+        assert!(masked.iter().all(|variable| variable.is_masked));
+        assert!(masked.iter().all(|variable| variable.value == "***"));
+    }
+
+    #[test]
+    fn container_environment_reveal_audit_excludes_plaintext() {
+        let audit = ContainerEnvironmentVariableRevealedAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "container-reveal-test".to_string(),
+            },
+            project_id: 7,
+            environment_id: 8,
+            container_id: "container-9".to_string(),
+            variable_name: "DATABASE_URL".to_string(),
+        };
+
+        assert_eq!(
+            temps_core::AuditOperation::operation_type(&audit),
+            "CONTAINER_ENVIRONMENT_VARIABLE_REVEALED"
+        );
+        let serialized = temps_core::AuditOperation::serialize(&audit)
+            .expect("container reveal audit should serialize");
+        let payload: serde_json::Value =
+            serde_json::from_str(&serialized).expect("audit payload should be JSON");
+        assert_eq!(payload["project_id"], 7);
+        assert_eq!(payload["environment_id"], 8);
+        assert_eq!(payload["container_id"], "container-9");
+        assert_eq!(payload["variable_name"], "DATABASE_URL");
+        assert!(payload.get("value").is_none());
+    }
+
+    #[tokio::test]
+    async fn container_environment_reveal_fails_closed_when_audit_fails() {
+        let audit = ContainerEnvironmentVariableRevealedAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: None,
+                user_agent: "container-reveal-test".to_string(),
+            },
+            project_id: 7,
+            environment_id: 8,
+            container_id: "container-9".to_string(),
+            variable_name: "DATABASE_URL".to_string(),
+        };
+
+        let problem = audit_container_environment_variable_reveal(&FailingAuditLogger, &audit)
+            .await
+            .expect_err("credential reveal must fail if audit persistence fails");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn container_environment_reveal_response_disables_storage() {
+        let response =
+            container_environment_variable_value_response("secret".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
+    }
+
     struct MockImageBuilder;
 
     #[async_trait]
@@ -2589,79 +2780,21 @@ mod tests {
     }
 
     #[test]
-    fn reader_container_environment_response_masks_all_values() {
-        let auth = create_test_auth_context_for_role(temps_auth::Role::Reader);
-        let response = container_environment_response(
-            &auth,
-            vec![
-                (
-                    "POSTGRES_URL".to_string(),
-                    "postgres://user:secret@db/app".to_string(),
-                ),
-                ("PUBLIC_SETTING".to_string(), "visible".to_string()),
-            ],
-        );
+    fn reader_cannot_reveal_plaintext_container_environment_values() {
+        let problem = require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Reader,
+        ))
+        .expect_err("reader must not reveal plaintext container environment values");
 
-        assert_eq!(response.len(), 2);
-        assert!(response.iter().all(|variable| variable.is_masked));
-        assert!(response.iter().all(|variable| variable.value == "***"));
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
-    fn secrets_reader_container_environment_response_keeps_plaintext() {
-        let auth = create_test_auth_context_for_role(temps_auth::Role::Admin);
-        let response = container_environment_response(
-            &auth,
-            vec![(
-                "POSTGRES_URL".to_string(),
-                "postgres://user:secret@db/app".to_string(),
-            )],
-        );
-
-        assert_eq!(response.len(), 1);
-        assert!(!response[0].is_masked);
-        assert_eq!(
-            response[0].value,
-            "postgres://user:secret@db/app".to_string()
-        );
-    }
-
-    #[test]
-    fn container_detail_response_prevents_secret_caching() {
-        let response = container_detail_response(ContainerDetailResponse {
-            id: 1,
-            container_id: "container-id".to_string(),
-            container_name: "container-name".to_string(),
-            image_name: "example/image:latest".to_string(),
-            status: "running".to_string(),
-            deployment_id: 2,
-            created_at: "2026-07-29T00:00:00Z".to_string(),
-            deployed_at: "2026-07-29T00:00:01Z".to_string(),
-            ready_at: Some("2026-07-29T00:00:02Z".to_string()),
-            container_port: 3000,
-            host_port: Some(30_000),
-            environment_variables: vec![EnvVarResponse {
-                key: "DATABASE_URL".to_string(),
-                value: "postgres://user:secret@example.test/db".to_string(),
-                is_masked: false,
-            }],
-            restart_count: Some(0),
-            resource_limits: None,
-            service_name: None,
-            service_url: None,
-            exit_code: None,
-            exit_reason: None,
-            oom_killed: None,
-            error_message: None,
-            finished_at: None,
-            started_at: Some("2026-07-29T00:00:01Z".to_string()),
-            cpu_limit_cores: None,
-        });
-
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&axum::http::HeaderValue::from_static("no-store"))
-        );
+    fn admin_can_reveal_plaintext_container_environment_values() {
+        require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Admin,
+        ))
+        .expect("admin should be allowed to reveal plaintext container environment values");
     }
 
     /// Helper to create a mock RequestMetadata for testing

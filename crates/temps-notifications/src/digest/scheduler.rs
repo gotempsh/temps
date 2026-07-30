@@ -253,8 +253,11 @@ mod tests {
             match create_test_scheduler().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    eprintln!("Skipping Docker-dependent digest scheduler test: {error}");
-                    return;
+                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                        eprintln!("Skipping Docker-dependent digest scheduler test: {error}");
+                        return;
+                    }
+                    panic!("Failed to set up digest scheduler test database: {error}");
                 }
             }
         };

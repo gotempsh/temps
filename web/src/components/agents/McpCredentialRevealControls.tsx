@@ -1,11 +1,13 @@
 import { Button } from '@/components/ui/button'
+import { createCredentialRevealGuard } from '@/lib/credential-reveal-state'
 import {
   listMaskedMcpCredentialFields,
   MASKED_CREDENTIAL_VALUE,
+  revealMcpCredentialValueIfStillMasked,
   replaceMcpCredentialValue,
 } from '@/lib/mcp-credential-reveal'
 import { Eye, EyeOff, KeyRound, Loader2 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
 interface McpCredentialRevealControlsProps {
@@ -25,6 +27,23 @@ export function McpCredentialRevealControls({
   const [revealingFields, setRevealingFields] = useState<Set<string>>(
     () => new Set()
   )
+  const revealGuard = useRef(createCredentialRevealGuard())
+  const configTextRef = useRef(configText)
+  configTextRef.current = configText
+
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    return () => guard.invalidate()
+  }, [])
+
+  const updateConfigText = (
+    updater: (currentConfigText: string) => string
+  ) => {
+    const nextConfigText = updater(configTextRef.current)
+    configTextRef.current = nextConfigText
+    onConfigTextChange(nextConfigText)
+  }
   const maskedFields = useMemo(
     () => listMaskedMcpCredentialFields(configText),
     [configText]
@@ -41,8 +60,13 @@ export function McpCredentialRevealControls({
 
   const toggleField = async (field: string) => {
     if (revealedFields.has(field)) {
-      onConfigTextChange(
-        replaceMcpCredentialValue(configText, field, MASKED_CREDENTIAL_VALUE)
+      revealGuard.current.cancel(field)
+      updateConfigText((currentConfigText) =>
+        replaceMcpCredentialValue(
+          currentConfigText,
+          field,
+          MASKED_CREDENTIAL_VALUE
+        )
       )
       setRevealedFields((current) => {
         const next = new Set(current)
@@ -53,18 +77,31 @@ export function McpCredentialRevealControls({
     }
 
     setRevealingFields((current) => new Set(current).add(field))
+    const request = revealGuard.current.begin(field)
     try {
       const value = await onRevealCredential(field)
-      onConfigTextChange(replaceMcpCredentialValue(configText, field, value))
+      if (!revealGuard.current.isCurrent(field, request)) return
+      const nextConfigText = revealMcpCredentialValueIfStillMasked(
+        configTextRef.current,
+        field,
+        value
+      )
+      if (nextConfigText === undefined) return
+      configTextRef.current = nextConfigText
+      onConfigTextChange(nextConfigText)
       setRevealedFields((current) => new Set(current).add(field))
     } catch {
-      toast.error(`Failed to reveal ${field}`)
+      if (revealGuard.current.isCurrent(field, request)) {
+        toast.error(`Failed to reveal ${field}`)
+      }
     } finally {
-      setRevealingFields((current) => {
-        const next = new Set(current)
-        next.delete(field)
-        return next
-      })
+      if (revealGuard.current.finish(field, request)) {
+        setRevealingFields((current) => {
+          const next = new Set(current)
+          next.delete(field)
+          return next
+        })
+      }
     }
   }
 

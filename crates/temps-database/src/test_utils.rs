@@ -59,6 +59,24 @@ use temps_migrations::Migrator;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
 
+/// Returns true only for errors that indicate the container runtime itself
+/// cannot be reached. Test callers may skip on these infrastructure errors,
+/// while migration, schema, and image failures must still fail the test.
+pub fn is_container_runtime_unavailable(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    [
+        "hyper legacy client: client error (connect)",
+        "failed to connect to docker",
+        "error connecting to docker",
+        "docker daemon is unavailable",
+        "docker client is unavailable",
+        "could not find docker environment",
+        "docker socket",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 /// Shared test database container that lives for the duration of the test run
 static TEST_CONTAINER: OnceCell<Arc<Mutex<Option<SharedContainer>>>> = OnceCell::const_new();
 
@@ -1025,9 +1043,41 @@ where
 mod tests {
     use super::*;
 
+    async fn test_database_or_skip() -> anyhow::Result<Option<TestDatabase>> {
+        match TestDatabase::new().await {
+            Ok(database) => Ok(Some(database)),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Docker-dependent database test: {error}");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn container_runtime_error_classification_does_not_hide_test_failures() {
+        assert!(is_container_runtime_unavailable(
+            "Error in the hyper legacy client: client error (Connect)"
+        ));
+        assert!(is_container_runtime_unavailable(
+            "Docker daemon is unavailable: connection refused"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Failed to run migrations: column does not exist"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Migrations did not create expected tables"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Failed to pull timescale/timescaledb-ha: manifest unknown"
+        ));
+    }
+
     #[tokio::test]
     async fn test_database_setup() -> anyhow::Result<()> {
-        let test_db = TestDatabase::new().await?;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
 
         // Test basic connectivity
         test_db.test_connection().await?;
@@ -1041,7 +1091,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_rollback() -> anyhow::Result<()> {
-        let test_db = TestDatabase::new().await?;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
 
         // Create a test table
         test_db
@@ -1077,6 +1129,10 @@ mod tests {
     async fn test_concurrent_test_isolation() -> anyhow::Result<()> {
         use std::sync::Arc;
         use tokio::sync::Barrier;
+
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
 
         // Create a barrier to ensure all tests start at the same time
         let barrier = Arc::new(Barrier::new(5));
@@ -1132,6 +1188,10 @@ mod tests {
     /// Test that each TestDatabase instance gets a unique schema
     #[tokio::test]
     async fn test_unique_schemas() -> anyhow::Result<()> {
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
+
         let db1 = TestDatabase::new().await?;
         let db2 = TestDatabase::new().await?;
         let db3 = TestDatabase::new().await?;
@@ -1176,6 +1236,10 @@ mod tests {
     async fn test_with_migrations_concurrent() -> anyhow::Result<()> {
         use std::sync::Arc;
         use tokio::sync::Barrier;
+
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
 
         let barrier = Arc::new(Barrier::new(3));
 

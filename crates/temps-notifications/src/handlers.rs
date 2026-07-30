@@ -1,7 +1,7 @@
 use crate::digest::DigestService;
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationProviderRevealError,
-    NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
+    NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -664,6 +664,20 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
+fn update_notification_provider_problem(error: &anyhow::Error, title: &'static str) -> Problem {
+    if let Some(validation_error) = error.downcast_ref::<NotificationProviderConfigMergeError>() {
+        return ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid masked provider configuration")
+            .detail(validation_error.to_string())
+            .build();
+    }
+
+    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .title(title)
+        .detail("The notification provider could not be updated")
+        .build()
+}
+
 /// Update a notification provider
 #[utoipa::path(
     put,
@@ -671,6 +685,7 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     request_body = UpdateProviderRequest,
     responses(
         (status = 200, description = "Successfully updated provider", body = NotificationProviderResponse),
+        (status = 400, description = "Invalid masked provider configuration"),
         (status = 404, description = "Provider not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -734,10 +749,10 @@ async fn update_notification_provider(
             .build()),
         Err(e) => {
             error!("Failed to update notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(update_notification_provider_problem(
+                &e,
+                "Failed to update notification provider",
+            ))
         }
     }
 }
@@ -1080,10 +1095,10 @@ async fn update_slack_provider(
             .build()),
         Err(e) => {
             error!("Failed to update Slack notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Slack notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(update_notification_provider_problem(
+                &e,
+                "Failed to update Slack notification provider",
+            ))
         }
     }
 }
@@ -1164,10 +1179,10 @@ async fn update_notification_email_provider(
             .build()),
         Err(e) => {
             error!("Failed to update Email notification provider {}: {}", id, e);
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Email notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(update_notification_provider_problem(
+                &e,
+                "Failed to update Email notification provider",
+            ))
         }
     }
 }
@@ -1366,10 +1381,10 @@ async fn update_webhook_provider(
                 "Failed to update Webhook notification provider {}: {}",
                 id, e
             );
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Webhook notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(update_notification_provider_problem(
+                &e,
+                "Failed to update Webhook notification provider",
+            ))
         }
     }
 }
@@ -1524,10 +1539,10 @@ async fn update_cloudflare_provider(
                 "Failed to update Cloudflare notification provider {}: {}",
                 id, e
             );
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to update Cloudflare notification provider")
-                .detail(format!("Error: {}", e))
-                .build())
+            Err(update_notification_provider_problem(
+                &e,
+                "Failed to update Cloudflare notification provider",
+            ))
         }
     }
 }
@@ -1943,6 +1958,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn masked_provider_update_validation_maps_to_bad_request() {
+        let error =
+            anyhow::Error::new(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                path: "headers.X-Authorization".to_string(),
+            });
+
+        let problem =
+            update_notification_provider_problem(&error, "Failed to update notification provider");
+
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
     #[derive(Clone, Default)]
     struct RecordingAuditLogger {
         operations: Arc<Mutex<Vec<String>>>,
@@ -2185,8 +2213,12 @@ mod tests {
             match TestSetup::new().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    eprintln!("Skipping Docker-dependent test: {error}");
-                    return Ok(());
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                        eprintln!("Skipping Docker-dependent test: {message}");
+                        return Ok(());
+                    }
+                    panic!("Failed to set up notification handler test: {message}");
                 }
             }
         };

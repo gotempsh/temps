@@ -665,6 +665,7 @@ async fn update_service(
     responses(
         (status = 200, description = "Sensitive parameter value", body = SensitiveValueResponse),
         (status = 400, description = "Parameter is not sensitive"),
+        (status = 403, description = "Caller cannot access a project linked to this service"),
         (status = 404, description = "Service or parameter not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -682,6 +683,7 @@ async fn reveal_service_parameter(
     permission_guard!(auth, ExternalServicesRead);
     permission_guard!(auth, SecretsRead);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    require_service_parameter_project_access(&auth, &app_state, id).await?;
 
     let value = app_state
         .external_service_manager
@@ -721,6 +723,68 @@ async fn reveal_service_parameter(
         [(header::CACHE_CONTROL, "no-store")],
         Json(SensitiveValueResponse { value }),
     ))
+}
+
+async fn require_service_parameter_project_access(
+    auth: &temps_auth::AuthContext,
+    app_state: &AppState,
+    service_id: i32,
+) -> Result<(), Problem> {
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::Role::PlatformAdmin)
+        || app_state.project_access_checker.is_none()
+    {
+        return Ok(());
+    }
+
+    let linked_projects = app_state
+        .external_service_manager
+        .list_service_projects(service_id)
+        .await
+        .map_err(|error| {
+            error!(service_id, error = %error, "Failed to resolve linked projects for credential reveal");
+            internal_server_error()
+                .detail("Failed to verify service project access")
+                .build()
+        })?;
+    let project_ids = linked_projects
+        .into_iter()
+        .map(|link| link.project.id)
+        .collect::<Vec<_>>();
+    if let Some(checker) = app_state.project_access_checker.as_ref() {
+        require_access_to_any_linked_project(auth.user_id(), &project_ids, checker.as_ref()).await
+    } else {
+        Ok(())
+    }
+}
+
+async fn require_access_to_any_linked_project(
+    user_id: i32,
+    project_ids: &[i32],
+    checker: &dyn temps_core::ProjectAccessChecker,
+) -> Result<(), Problem> {
+    let mut infrastructure_error = None;
+    for project_id in project_ids {
+        match checker.user_can_access_project(user_id, *project_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => infrastructure_error = Some(error),
+        }
+    }
+
+    if let Some(error) = infrastructure_error {
+        error!(user_id, error = %error, "Project access check failed during credential reveal");
+        return Err(internal_server_error()
+            .title("Project Access Check Failed")
+            .detail("Could not verify project access; please try again")
+            .build());
+    }
+
+    Err(forbidden()
+        .title("Project Access Denied")
+        .detail("Your team membership does not include access to this service")
+        .build())
 }
 
 fn require_reveal_audit(
@@ -2091,11 +2155,9 @@ async fn get_project_service_environment_variables(
     {
         Ok(mut variables) => {
             for service_variables in variables.values_mut() {
-                for (name, value) in service_variables {
-                    if crate::services::ExternalServiceManager::is_sensitive_variable(name) {
-                        *value = "***".to_string();
-                    }
-                }
+                crate::services::ExternalServiceManager::mask_environment_variable_values(
+                    service_variables,
+                );
             }
             Ok((StatusCode::OK, Json(variables)))
         }
@@ -2590,6 +2652,25 @@ mod tests {
         }
     }
 
+    struct TestProjectAccessChecker {
+        allowed_project_ids: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for TestProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("project access database unavailable".into());
+            }
+            Ok(self.allowed_project_ids.contains(&project_id))
+        }
+    }
+
     fn test_auth_context() -> temps_auth::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
@@ -2677,6 +2758,49 @@ mod tests {
             "audit failed",
         )
         .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_rejects_cross_project_user() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![99],
+            fail: false,
+        };
+
+        let problem = require_access_to_any_linked_project(42, &[10, 11], &checker)
+            .await
+            .expect_err("user without access to a linked project must be denied");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_allows_access_to_any_linked_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![11],
+            fail: false,
+        };
+
+        require_access_to_any_linked_project(42, &[10, 11], &checker)
+            .await
+            .expect("access to one linked project should authorize reveal");
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_fails_closed_on_access_check_error() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: Vec::new(),
+            fail: true,
+        };
+
+        let problem = require_access_to_any_linked_project(42, &[10], &checker)
+            .await
+            .expect_err("access-check infrastructure failure must deny reveal");
+
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR

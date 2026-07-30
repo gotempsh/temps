@@ -15,7 +15,7 @@ on:
         description: "Dry-run: skip pushes, only build to verify the pipeline works"
         required: false
         type: boolean
-        default: false
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +26,22 @@ permissions:
   packages: write
 
 jobs:
+  validate-release-ref:
+    name: Validate Release Ref
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release validation script
+        uses: actions/checkout@v7
+
+      - name: Reject unsafe publishing refs
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
+
   build-web-assets:
     name: Build web assets (WASM + dist)
     # The web console + captcha WASM are pure static output with no
@@ -36,6 +52,7 @@ jobs:
     # most expensive repeat was the macOS Intel job's wasm-pack step alone
     # (7m26s on the last release), on top of a redundant rsbuild build in
     # each of the other 3 jobs.
+    needs: validate-release-ref
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -384,22 +401,25 @@ jobs:
       - name: Determine release channel
         id: channel
         # Tag pushes: prerelease iff the tag contains a `-` (e.g. `v0.1.0-beta.6`).
-        # Manual dispatches: always treated as prerelease so a dry-run or test
-        # invocation cannot promote to the stable `:<version>` ref by accident.
-        # If you ever need workflow_dispatch to mint a stable build, pass it as
-        # an explicit input (and add it to the dispatch inputs above).
+        # Dry-runs are always treated as prereleases so a test invocation
+        # cannot promote to the stable `:<version>` ref by accident. A
+        # non-dry-run dispatch at a tag (used by nightly-release.yml) follows
+        # the same tag-based channel selection as a tag push.
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "is_prerelease=true" >> $GITHUB_OUTPUT
-            echo "channel_tag=beta" >> $GITHUB_OUTPUT
-            echo "Channel: beta (workflow_dispatch — never promotes to stable)"
-          elif [[ "${{ github.ref_name }}" == *"-"* ]]; then
-            echo "is_prerelease=true" >> $GITHUB_OUTPUT
-            echo "channel_tag=beta" >> $GITHUB_OUTPUT
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
+            echo "Channel: beta (dry-run — never promotes to stable)"
+          elif [[ "$RELEASE_TAG" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
             echo "Channel: beta (prerelease)"
           else
-            echo "is_prerelease=false" >> $GITHUB_OUTPUT
-            echo "channel_tag=latest" >> $GITHUB_OUTPUT
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "channel_tag=latest" >> "$GITHUB_OUTPUT"
             echo "Channel: latest (stable)"
           fi
 
@@ -433,13 +453,13 @@ jobs:
           chmod +x release/install.sh
 
       - name: Generate Homebrew formula
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # workflow_dispatch runs against a branch, not a tag, so GITHUB_REF
-          # is refs/heads/<branch> and the prefix-strip below leaves it
-          # untouched -- if the branch name contains a `/` (as most do),
-          # that lands in VERSION and breaks the `sed -e "s/.../.../"` call
-          # below (VERSION's `/` collides with sed's own delimiter).
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          # A dry-run usually runs against a branch, so GITHUB_REF is
+          # refs/heads/<branch> and the prefix-strip below would leave it
+          # untouched. A real workflow_dispatch runs at a release tag.
+          if [[ "$DRY_RUN" == "true" ]]; then
             VERSION="dryrun-${{ github.run_id }}"
           else
             VERSION="${GITHUB_REF#refs/tags/v}"
@@ -571,18 +591,20 @@ jobs:
 
       - name: Create GitHub Release
         env:
+          DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           # workflow_dispatch dry-runs must not mint a real Release object
           # under the dispatched branch name — everything above this step
           # (artifact download, formula/checksum/notes generation) still
           # runs and is inspectable in the job logs/artifacts.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
-            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for ${{ github.ref_name }}"
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry-run (workflow_dispatch): skipping actual GitHub Release creation for $RELEASE_TAG"
             exit 0
           fi
 
-          echo "Creating release ${{ github.ref_name }}..."
+          echo "Creating release $RELEASE_TAG..."
 
           if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
@@ -592,26 +614,39 @@ jobs:
             echo "This is a stable release"
           fi
 
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
-            --notes-file release/release-notes.md \
-            $PRERELEASE_FLAG \
-            release/temps-linux-amd64.tar.gz \
-            release/temps-linux-amd64.tar.gz.sha256 \
-            release/temps-linux-arm64.tar.gz \
-            release/temps-linux-arm64.tar.gz.sha256 \
-            release/temps-darwin-amd64.tar.gz \
-            release/temps-darwin-amd64.tar.gz.sha256 \
-            release/temps-darwin-arm64.tar.gz \
-            release/temps-darwin-arm64.tar.gz.sha256 \
-            release/checksums.txt \
-            release/install.sh \
+          release_assets=(
+            release/temps-linux-amd64.tar.gz
+            release/temps-linux-amd64.tar.gz.sha256
+            release/temps-linux-arm64.tar.gz
+            release/temps-linux-arm64.tar.gz.sha256
+            release/temps-darwin-amd64.tar.gz
+            release/temps-darwin-amd64.tar.gz.sha256
+            release/temps-darwin-arm64.tar.gz
+            release/temps-darwin-arm64.tar.gz.sha256
+            release/checksums.txt
+            release/install.sh
             release/temps.rb
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refreshing metadata and assets."
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file release/release-notes.md \
+              $PRERELEASE_FLAG
+            gh release upload "$RELEASE_TAG" --clobber "${release_assets[@]}"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file release/release-notes.md \
+              $PRERELEASE_FLAG \
+              "${release_assets[@]}"
+          fi
 
           echo ""
-          echo "✓ Release ${{ github.ref_name }} created successfully!"
+          echo "✓ Release $RELEASE_TAG published successfully!"
           echo ""
-          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
 
   build-and-push-docker:
     name: Build and Push Docker Image (${{ matrix.platform }})
@@ -661,12 +696,12 @@ jobs:
 
       - name: Extract version
         id: version
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # See the matching comment in create-release's "Generate Homebrew
-          # formula" step: workflow_dispatch runs against a branch ref, so
-          # this would otherwise leave a `/`-containing string in VERSION,
-          # which is invalid in a Docker tag component.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          # formula" step: a branch-based dry-run needs a synthetic version.
+          if [[ "$DRY_RUN" == "true" ]]; then
             VERSION="dryrun-${{ github.run_id }}"
           else
             VERSION="${GITHUB_REF#refs/tags/v}"
@@ -730,12 +765,12 @@ jobs:
 
       - name: Extract version
         id: version
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # See the matching comment in create-release's "Generate Homebrew
-          # formula" step: workflow_dispatch runs against a branch ref, so
-          # this would otherwise leave a `/`-containing string in VERSION,
-          # which is invalid in a Docker tag component.
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          # formula" step: a branch-based dry-run needs a synthetic version.
+          if [[ "$DRY_RUN" == "true" ]]; then
             VERSION="dryrun-${{ github.run_id }}"
           else
             VERSION="${GITHUB_REF#refs/tags/v}"

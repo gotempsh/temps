@@ -68,7 +68,10 @@ import { ServiceLogo } from '@/components/ui/service-logo'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { credentialValueForScope } from '@/lib/credential-reveal-state'
+import {
+  createCredentialRevealGuard,
+  credentialValueForScope,
+} from '@/lib/credential-reveal-state'
 import { maskValue } from '@/lib/masking'
 import { formatBytes } from '@/lib/utils'
 import { iconForServiceType } from '@/lib/serviceIcons'
@@ -107,8 +110,8 @@ import {
   BarChart2,
 } from 'lucide-react'
 import { format } from 'date-fns'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 /**
@@ -162,6 +165,7 @@ function memberDisplayRole(member: {
 
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
+  const location = useLocation()
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -193,6 +197,7 @@ export function ServiceDetail() {
   const [revealingParameters, setRevealingParameters] = useState<
     Record<string, { token: string; scope: string }>
   >({})
+  const parameterRevealGuard = useRef(createCredentialRevealGuard())
   const clearParameterReveals = useCallback(() => {
     setVisibleParameters(new Set())
     setRevealedParameters({})
@@ -214,6 +219,15 @@ export function ServiceDetail() {
       return status === 'creating' ? 2000 : false
     },
   })
+  const parameterRevealScope = `${id}:${location.key}:${service?.service.updated_at ?? 'loading'}`
+
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    parameterRevealGuard.current = guard
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    clearParameterReveals()
+    return () => guard.invalidate()
+  }, [parameterRevealScope, clearParameterReveals])
 
   // Query for PostgreSQL major-version upgrades. Only relevant for postgres
   // services; harmless for others (the query is enabled conditionally below).
@@ -1140,7 +1154,7 @@ export function ServiceDetail() {
                     ([key, value]) => {
                       const isSensitive =
                         service.sensitive_parameters?.includes(key) ?? false
-                      const revealScope = `${service.service.id}:${service.service.updated_at}`
+                      const revealScope = parameterRevealScope
                       const revealedParameter = revealedParameters[key]
                       const revealedValue = credentialValueForScope(
                         revealedParameter,
@@ -1192,6 +1206,7 @@ export function ServiceDetail() {
                                 disabled={isRevealing}
                                 onClick={async () => {
                                   if (isVisible) {
+                                    parameterRevealGuard.current.cancel(key)
                                     setVisibleParameters((prev) => {
                                       const next = new Set(prev)
                                       next.delete(key)
@@ -1205,10 +1220,9 @@ export function ServiceDetail() {
                                     return
                                   }
 
-                                  const requestedServiceId = String(
-                                    service.service.id
-                                  )
                                   const requestToken = crypto.randomUUID()
+                                  const revealRequest =
+                                    parameterRevealGuard.current.begin(key)
                                   setRevealingParameters((prev) => ({
                                     ...prev,
                                     [key]: {
@@ -1225,11 +1239,19 @@ export function ServiceDetail() {
                                         },
                                         throwOnError: true,
                                       })
+                                    if (
+                                      !parameterRevealGuard.current.isCurrent(
+                                        key,
+                                        revealRequest
+                                      )
+                                    ) {
+                                      return
+                                    }
                                     setRevealedParameters((prev) => ({
                                       ...prev,
                                       [key]: {
                                         value: response.data.value,
-                                        scope: `${requestedServiceId}:${service.service.updated_at}`,
+                                        scope: revealScope,
                                       },
                                     }))
                                     setVisibleParameters((prev) => {
@@ -1242,14 +1264,21 @@ export function ServiceDetail() {
                                       `Failed to reveal ${key.replace(/_/g, ' ')}`
                                     )
                                   } finally {
-                                    setRevealingParameters((prev) => {
-                                      if (prev[key]?.token !== requestToken) {
-                                        return prev
-                                      }
-                                      const next = { ...prev }
-                                      delete next[key]
-                                      return next
-                                    })
+                                    if (
+                                      parameterRevealGuard.current.finish(
+                                        key,
+                                        revealRequest
+                                      )
+                                    ) {
+                                      setRevealingParameters((prev) => {
+                                        if (prev[key]?.token !== requestToken) {
+                                          return prev
+                                        }
+                                        const next = { ...prev }
+                                        delete next[key]
+                                        return next
+                                      })
+                                    }
                                   }
                                 }}
                                 title={

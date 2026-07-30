@@ -80,9 +80,13 @@ export function GlobalMcpServerDetail() {
 
   const updateMutation = useMutation({
     ...updateGlobalMcpMutation(),
-    onSuccess: () => {
+    onSuccess: (updatedMcp) => {
       toast.success('MCP server updated')
       queryClient.invalidateQueries({ queryKey: listGlobalMcpsQueryKey() })
+      setName(updatedMcp.name)
+      setDescription(updatedMcp.description ?? '')
+      setConfigText(JSON.stringify(updatedMcp.config, null, 2))
+      setConfigError(null)
       setIsEditing(false)
     },
     onError: () => toast.error('Failed to update MCP server'),
@@ -300,7 +304,7 @@ export function GlobalMcpServerDetail() {
                   )}
                 </div>
                 <McpCredentialRevealControls
-                  key={`${mcp.slug}:${isEditing}`}
+                  key={`${mcp.slug}:${mcp.updated_at}:${isEditing}`}
                   configText={configText}
                   onConfigTextChange={handleConfigChange}
                   onRevealCredential={async (field) => {

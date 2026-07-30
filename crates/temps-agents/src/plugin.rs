@@ -554,6 +554,19 @@ impl TempsPlugin for AgentsPlugin {
                 db.clone(),
                 encryption_service.clone(),
             ));
+            match config_service.encrypt_legacy_inline_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy inline agent MCP and custom-tool configurations"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy inline agent credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(config_service.clone());
 
             let secret_service =

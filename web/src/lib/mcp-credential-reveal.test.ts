@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   listMaskedMcpCredentialFields,
   MASKED_CREDENTIAL_VALUE,
+  revealMcpCredentialValueIfStillMasked,
   replaceMcpCredentialValue,
 } from './mcp-credential-reveal'
 
@@ -26,6 +27,44 @@ describe('listMaskedMcpCredentialFields', () => {
   test('fails closed for malformed or non-object JSON', () => {
     expect(listMaskedMcpCredentialFields('{')).toEqual([])
     expect(listMaskedMcpCredentialFields('[]')).toEqual([])
+  })
+})
+
+describe('revealMcpCredentialValueIfStillMasked', () => {
+  test('preserves unrelated edits made while a reveal is in flight', () => {
+    const result = revealMcpCredentialValueIfStillMasked(
+      JSON.stringify({
+        url: MASKED_CREDENTIAL_VALUE,
+        env: { MODE: 'edited-during-reveal' },
+      }),
+      'url',
+      'https://user:secret@example.test'
+    )
+
+    expect(JSON.parse(result!)).toEqual({
+      url: 'https://user:secret@example.test',
+      env: { MODE: 'edited-during-reveal' },
+    })
+  })
+
+  test('discards a reveal after its field is deleted or renamed', () => {
+    expect(
+      revealMcpCredentialValueIfStillMasked(
+        JSON.stringify({ env: { RENAMED_TOKEN: MASKED_CREDENTIAL_VALUE } }),
+        'env.API_TOKEN',
+        'secret'
+      )
+    ).toBeUndefined()
+  })
+
+  test('discards a reveal after the user replaces the sentinel', () => {
+    expect(
+      revealMcpCredentialValueIfStillMasked(
+        JSON.stringify({ env: { API_TOKEN: 'new-user-value' } }),
+        'env.API_TOKEN',
+        'old-secret'
+      )
+    ).toBeUndefined()
   })
 })
 
