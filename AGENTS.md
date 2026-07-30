@@ -5,44 +5,26 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
-## Always update `CHANGELOG.md`
+## Do not hand-edit `CHANGELOG.md`
 
-Every user-visible change in this repo lands with a `CHANGELOG.md`
-entry under `## [Unreleased]`, in the same commit as the code change.
-"User-visible" means anything an operator could notice: behaviour
-change, new flag, new endpoint, removed flag, UI change, performance
-characteristic, error-message format, dependency bump that changes
-the operator surface. Internal refactors with no observable impact
-don't need an entry, but when in doubt, write one.
+`CHANGELOG.md` is generated from Conventional Commits by
+[git-cliff](https://git-cliff.org) at release time. PRs must not edit it
+directly, because concurrent `[Unreleased]` edits caused constant merge
+conflicts.
 
-The file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/):
-- Sections: `### Added`, `### Changed`, `### Removed`, `### Fixed`,
-  `### Tests` (last is project-specific).
-- Each bullet starts with a **bolded short headline**, then a colon,
-  then a self-contained explanation. Include *why* — not just *what*.
-- Reference migration filenames, endpoint paths, env vars, and crate
-  names by their exact identifiers so the entry is greppable later.
-- Test-only changes go under `### Tests`.
+The `Changelog` workflow validates every non-merge commit in a PR and
+posts a preview of the generated entry. A non-conventional commit is
+dropped from the changelog, so use a precise `type(scope): description`
+subject and make the user or operator impact clear there.
 
-If you're touching code without writing a CHANGELOG entry, you're
-either doing the wrong thing or you forgot. Stop and add the entry
-before staging the commit.
+Preview the generated entry locally with:
 
-**This is CI-enforced on every PR to `main`.** The `changelog-check`
-workflow fails the PR unless the diff touches `CHANGELOG.md` (with a
-valid `## [Unreleased]` category) **or** the PR carries the
-`skip-changelog` label. So for every PR you open, do one of:
+```bash
+scripts/changelog.sh --unreleased
+```
 
-- **Add a `CHANGELOG.md` entry** (the default — see above). This is
-  also required for changes to the `@temps-sdk/cli` npm package, even
-  though it versions separately; tag those bullets with `(\`@temps-sdk/cli\`, #PR)`.
-- **Apply the `skip-changelog` label** (`gh pr edit <n> --add-label
-  skip-changelog`) only when the change is genuinely changelog-exempt:
-  docs/typos, CI/build config, dependency bumps with no operator
-  impact, pure refactors, or test-only changes.
-
-Don't open a PR and leave the changelog check red — resolve it the
-same way you'd resolve a failing test.
+The release process regenerates `CHANGELOG.md`; the commit history is
+the source of truth.
 
 ## Use the generated OpenAPI SDK in `web/`
 
