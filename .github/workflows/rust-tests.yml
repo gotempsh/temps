@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # The toolchain stage (apk deps, bun, wasm-pack/wasm-bindgen-cli compiled
       # from source) only changes when the Dockerfile does, so cache it as
