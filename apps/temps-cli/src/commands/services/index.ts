@@ -380,6 +380,11 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .option('--page <n>', 'Page number (1-based, default: 1)', '1')
     .option('--page-size <n>', 'Rows per page (1–100, default: 20)', '20')
+    .option(
+      '--sort-by <column>',
+      'Sort column: calls, total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio (default: mean_exec_time_ms)',
+    )
+    .option('--sort-order <order>', 'Sort direction: asc or desc (default: desc)')
     .option('--json', 'Output raw JSON instead of a formatted table')
     .action(serviceSlowQueriesAction)
 
@@ -1445,6 +1450,7 @@ async function serviceLogsAction(options: ServiceLogsOptions): Promise<void> {
 
 interface SlowQueryRow {
   query: string
+  database: string
   calls: number
   total_exec_time_ms: number
   mean_exec_time_ms: number
@@ -1463,6 +1469,8 @@ interface ServiceSlowQueriesOptions {
   id: string
   page?: string
   pageSize?: string
+  sortBy?: string
+  sortOrder?: string
   json?: boolean
 }
 
@@ -1482,7 +1490,12 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
   const result = await withSpinner('Fetching slow queries…', async () => {
     const { data, error } = await client.get<SlowQueriesResponse>({
       url: `/external-services/${id}/pg-stat-statements/slow-queries`,
-      query: { page, page_size: pageSize },
+      query: {
+        page,
+        page_size: pageSize,
+        sort_by: options.sortBy,
+        sort_order: options.sortOrder,
+      },
     })
     if (error) {
       const msg = getErrorMessage(error)
@@ -1523,6 +1536,10 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
         const q = row.query.replace(/\s+/g, ' ').trim()
         return q.length > MAX_QUERY_LEN ? q.slice(0, MAX_QUERY_LEN - 1) + '…' : q
       },
+    },
+    {
+      header: 'Database',
+      accessor: (row) => row.database,
     },
     {
       header: 'Calls',

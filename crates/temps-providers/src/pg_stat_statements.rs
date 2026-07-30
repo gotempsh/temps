@@ -104,6 +104,11 @@ pub struct SlowQueryRow {
     /// Normalized query text (parameter literals replaced with `$N`).
     pub query: String,
 
+    /// Name of the database this query ran against. `(dropped database)`
+    /// when the originating database no longer exists but
+    /// `pg_stat_statements` still holds stats for it.
+    pub database: String,
+
     /// Number of times this query was executed.
     pub calls: i64,
 
@@ -121,13 +126,95 @@ pub struct SlowQueryRow {
     pub cache_hit_ratio: Option<f64>,
 }
 
-/// Pagination parameters for the slow-queries endpoint.
+/// Column a slow-queries listing may be sorted by.
+///
+/// Deliberately a closed enum rather than a raw column-name string: the SQL
+/// `ORDER BY` clause is built by interpolating [`SlowQuerySortKey::column`]
+/// directly into the query, so only these whitelisted, hardcoded column
+/// names can ever reach it — user input never touches the SQL string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowQuerySortKey {
+    Calls,
+    TotalExecTime,
+    MeanExecTime,
+    Rows,
+    CacheHitRatio,
+}
+
+impl SlowQuerySortKey {
+    /// Parse the wire representation used by the API (matches the
+    /// corresponding `SlowQueryRow` field names).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "calls" => Ok(Self::Calls),
+            "total_exec_time_ms" => Ok(Self::TotalExecTime),
+            "mean_exec_time_ms" => Ok(Self::MeanExecTime),
+            "rows" => Ok(Self::Rows),
+            "cache_hit_ratio" => Ok(Self::CacheHitRatio),
+            other => Err(format!(
+                "invalid sort_by '{other}'; expected one of: calls, \
+                 total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio"
+            )),
+        }
+    }
+
+    /// The `pg_stat_statements` column (or `SELECT`-list alias, for
+    /// `cache_hit_ratio`) this sort key maps to.
+    fn column(self) -> &'static str {
+        match self {
+            // Qualified with the `s` alias (pg_stat_statements) since the
+            // query joins in pg_database as `d` for the database column.
+            Self::Calls => "s.calls",
+            Self::TotalExecTime => "s.total_exec_time",
+            Self::MeanExecTime => "s.mean_exec_time",
+            Self::Rows => "s.rows",
+            // Computed SELECT-list alias, not a real column — can't be
+            // qualified with a table prefix.
+            Self::CacheHitRatio => "cache_hit_ratio",
+        }
+    }
+}
+
+/// Sort direction for the slow-queries listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "asc" => Ok(Self::Asc),
+            "desc" => Ok(Self::Desc),
+            other => Err(format!(
+                "invalid sort_order '{other}'; expected 'asc' or 'desc'"
+            )),
+        }
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
+/// Pagination and sort parameters for the slow-queries endpoint.
 #[derive(Debug, Clone)]
 pub struct SlowQueryPage {
     /// 1-based page number.
     pub page: u32,
     /// Number of rows per page (1–100).
     pub page_size: u32,
+    /// Column to sort by. Applied server-side so ordering is consistent
+    /// across pages — sorting only the rows within an already-paginated
+    /// page would show different "top" queries depending on where the
+    /// page boundary happened to fall.
+    pub sort_by: SlowQuerySortKey,
+    /// Sort direction.
+    pub sort_order: SortOrder,
 }
 
 impl Default for SlowQueryPage {
@@ -135,6 +222,8 @@ impl Default for SlowQueryPage {
         Self {
             page: 1,
             page_size: DEFAULT_PAGE_SIZE,
+            sort_by: SlowQuerySortKey::MeanExecTime,
+            sort_order: SortOrder::Desc,
         }
     }
 }
@@ -306,8 +395,10 @@ impl PgStatStatementsService {
         Ok(())
     }
 
-    /// Return a paginated slice of queries ordered by `total_exec_time`
-    /// descending for the given user-provisioned Postgres service.
+    /// Return a paginated, sorted slice of queries for the given
+    /// user-provisioned Postgres service. Sorting is applied server-side,
+    /// before the `LIMIT`/`OFFSET`, so the ordering is consistent across
+    /// pages regardless of which sort column the caller picked.
     ///
     /// Connects to the service's database using its admin credentials (stored
     /// encrypted in the control plane). Validates that the service is of type
@@ -395,25 +486,33 @@ impl PgStatStatementsService {
                     reason: format!("failed to read count: {}", e),
                 })?;
 
+        // `sort_by`/`sort_order` come only from the closed enums above —
+        // never from an interpolated user string — so this is not
+        // SQL-injectable despite the `format!`.
+        let order_by_column = pagination.sort_by.column();
+        let order_by_direction = pagination.sort_order.sql();
+
         let sql = format!(
             r#"
             SELECT
-                query,
-                calls,
-                total_exec_time,
-                mean_exec_time,
-                rows,
+                s.query,
+                s.calls,
+                s.total_exec_time,
+                s.mean_exec_time,
+                s.rows,
+                COALESCE(d.datname, '(dropped database)') AS database,
                 CASE
-                    WHEN (shared_blks_hit + shared_blks_read) = 0 THEN NULL
+                    WHEN (s.shared_blks_hit + s.shared_blks_read) = 0 THEN NULL
                     ELSE ROUND(
-                        (shared_blks_hit::numeric /
-                         (shared_blks_hit + shared_blks_read)) * 100,
+                        (s.shared_blks_hit::numeric /
+                         (s.shared_blks_hit + s.shared_blks_read)) * 100,
                         2
                     ) / 100.0
                 END AS cache_hit_ratio
-            FROM pg_stat_statements
-            WHERE calls > 0
-            ORDER BY total_exec_time DESC
+            FROM pg_stat_statements s
+            LEFT JOIN pg_database d ON d.oid = s.dbid
+            WHERE s.calls > 0
+            ORDER BY {order_by_column} {order_by_direction}
             LIMIT {limit}
             OFFSET {offset}
             "#
@@ -460,9 +559,16 @@ impl PgStatStatementsService {
                         reason: format!("failed to read 'rows' column: {}", e),
                     })?;
             let cache_hit_ratio: Option<f64> = row.try_get("", "cache_hit_ratio").ok();
+            let database: String =
+                row.try_get("", "database")
+                    .map_err(|e| PgStatStatementsError::QueryError {
+                        service_id,
+                        reason: format!("failed to read 'database' column: {}", e),
+                    })?;
 
             result.push(SlowQueryRow {
                 query,
+                database,
                 calls,
                 total_exec_time_ms: total_exec_time,
                 mean_exec_time_ms: mean_exec_time,
@@ -493,6 +599,61 @@ mod tests {
         let p = SlowQueryPage::default();
         assert_eq!(p.page, 1);
         assert_eq!(p.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(p.sort_by, SlowQuerySortKey::MeanExecTime);
+        assert_eq!(p.sort_order, SortOrder::Desc);
+    }
+
+    #[test]
+    fn test_sort_key_parse_accepts_all_documented_values() {
+        assert_eq!(
+            SlowQuerySortKey::parse("calls"),
+            Ok(SlowQuerySortKey::Calls)
+        );
+        assert_eq!(
+            SlowQuerySortKey::parse("total_exec_time_ms"),
+            Ok(SlowQuerySortKey::TotalExecTime)
+        );
+        assert_eq!(
+            SlowQuerySortKey::parse("mean_exec_time_ms"),
+            Ok(SlowQuerySortKey::MeanExecTime)
+        );
+        assert_eq!(SlowQuerySortKey::parse("rows"), Ok(SlowQuerySortKey::Rows));
+        assert_eq!(
+            SlowQuerySortKey::parse("cache_hit_ratio"),
+            Ok(SlowQuerySortKey::CacheHitRatio)
+        );
+    }
+
+    #[test]
+    fn test_sort_key_parse_rejects_unknown_value() {
+        // Rejecting free-form input here is what keeps `column()`'s output
+        // restricted to the whitelisted strings interpolated into the SQL
+        // ORDER BY clause in `top_slow_queries` — an attacker-controlled
+        // sort_by must never reach that format!.
+        let result = SlowQuerySortKey::parse("query; DROP TABLE pg_stat_statements;--");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sort_key_maps_to_expected_sql_column() {
+        // Real pg_stat_statements columns are qualified with the `s` alias
+        // used in the query's FROM clause; cache_hit_ratio is a computed
+        // SELECT-list alias and can't be table-qualified.
+        assert_eq!(SlowQuerySortKey::Calls.column(), "s.calls");
+        assert_eq!(
+            SlowQuerySortKey::TotalExecTime.column(),
+            "s.total_exec_time"
+        );
+        assert_eq!(SlowQuerySortKey::MeanExecTime.column(), "s.mean_exec_time");
+        assert_eq!(SlowQuerySortKey::Rows.column(), "s.rows");
+        assert_eq!(SlowQuerySortKey::CacheHitRatio.column(), "cache_hit_ratio");
+    }
+
+    #[test]
+    fn test_sort_order_parse() {
+        assert_eq!(SortOrder::parse("asc"), Ok(SortOrder::Asc));
+        assert_eq!(SortOrder::parse("desc"), Ok(SortOrder::Desc));
+        assert!(SortOrder::parse("sideways").is_err());
     }
 
     /// Validate the page_size bounds (logic extracted from top_slow_queries).

@@ -14915,7 +14915,7 @@ export type SlowQueriesResponse = {
      */
     page_size: number;
     /**
-     * Ordered list of query stats, slowest first by total_exec_time_ms.
+     * Ordered list of query stats, slowest first by mean_exec_time_ms.
      */
     queries: Array<SlowQueryRow>;
     /**
@@ -14938,6 +14938,10 @@ export type SlowQueryRow = {
      * Number of times this query was executed.
      */
     calls: number;
+    /**
+     * Name of the database this query ran against. `(dropped database)` when the originating database no longer exists but `pg_stat_statements` still holds stats for it.
+     */
+    database: string;
     /**
      * Average wall-clock time per execution, in milliseconds.
      */
@@ -27610,13 +27614,21 @@ export type GetSlowQueriesData = {
          * Number of rows per page (1-100). Defaults to 20.
          */
         page_size?: number | null;
+        /**
+         * Column to sort by: one of `calls`, `total_exec_time_ms`, `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to `mean_exec_time_ms`. Applied server-side so ordering stays consistent across pages.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: `asc` or `desc`. Defaults to `desc`.
+         */
+        sort_order?: string | null;
     };
     url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
 };
 
 export type GetSlowQueriesErrors = {
     /**
-     * Invalid limit parameter
+     * Invalid pagination or sort parameters
      */
     400: unknown;
     /**

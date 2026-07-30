@@ -85,7 +85,7 @@ const SECTIONS: Section[] = [
   {
     id: 'slow-queries',
     label: 'Slow Queries',
-    description: 'Top queries by total execution time from pg_stat_statements',
+    description: 'Top queries by mean execution time from pg_stat_statements',
   },
 ]
 
@@ -209,7 +209,11 @@ function SlowQueriesContent({
   const queryClient = useQueryClient()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [sortKey, setSortKey] = useState<SlowQuerySortKey | null>(null)
+  // Default matches the backend default (mean_exec_time_ms desc) so the
+  // header arrow reflects the order actually applied on first load.
+  const [sortKey, setSortKey] = useState<SlowQuerySortKey | null>(
+    'mean_exec_time_ms',
+  )
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
   const [selectedRow, setSelectedRow] = useState<SlowQueryRow | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
@@ -220,7 +224,12 @@ function SlowQueriesContent({
     setPage(1)
   }
 
+  // Sorting is applied server-side (see the sort_by/sort_order query params
+  // below) so the ordering stays consistent across pages — sorting only the
+  // rows already fetched for the current page would show a different "top"
+  // query depending on where the page boundary happened to fall.
   const handleSort = (key: SlowQuerySortKey) => {
+    setPage(1)
     if (sortKey !== key) {
       setSortKey(key)
       setSortOrder('asc')
@@ -231,10 +240,16 @@ function SlowQueriesContent({
     }
   }
 
+  const queryParams = {
+    page,
+    page_size: pageSize,
+    ...(sortKey != null ? { sort_by: sortKey, sort_order: sortOrder } : {}),
+  }
+
   const { data, isLoading, error, isFetching } = useQuery({
     ...getSlowQueriesOptions({
       path: { service_id: serviceId },
-      query: { page, page_size: pageSize },
+      query: queryParams,
     }),
     staleTime: 30_000,
     retry: (failureCount, err) => {
@@ -250,7 +265,7 @@ function SlowQueriesContent({
     queryClient.invalidateQueries({
       queryKey: getSlowQueriesQueryKey({
         path: { service_id: serviceId },
-        query: { page, page_size: pageSize },
+        query: queryParams,
       }),
     })
   }
@@ -283,15 +298,7 @@ function SlowQueriesContent({
     },
   })
 
-  const rawQueries = data?.queries ?? []
-  const queries =
-    sortKey == null
-      ? rawQueries
-      : [...rawQueries].sort((a, b) => {
-          const aVal = (a[sortKey] as number | null) ?? 0
-          const bVal = (b[sortKey] as number | null) ?? 0
-          return sortOrder === 'asc' ? aVal - bVal : bVal - aVal
-        })
+  const queries = data?.queries ?? []
 
   const totalCount = data?.total_count ?? 0
   const totalPages = pageSize > 0 ? Math.max(1, Math.ceil(totalCount / pageSize)) : 1
@@ -325,7 +332,7 @@ function SlowQueriesContent({
         <div>
           <h2 className="text-base font-semibold">Slow Queries</h2>
           <p className="text-sm text-muted-foreground">
-            Aggregate stats per normalized query, ordered by total execution
+            Aggregate stats per normalized query, ordered by mean execution
             time. Click a row to see the full query text and all stats.
           </p>
         </div>
@@ -378,6 +385,9 @@ function SlowQueriesContent({
               <TableHeader>
                 <TableRow>
                   <TableHead className="min-w-[220px]">Query</TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Database
+                  </TableHead>
                   {SORT_COLUMNS.map(({ key, label, className }) => (
                     <TableHead
                       key={key}
@@ -413,6 +423,9 @@ function SlowQueriesContent({
                       <span className="block truncate font-mono text-xs text-foreground">
                         {row.query}
                       </span>
+                    </TableCell>
+                    <TableCell className="hidden text-sm md:table-cell">
+                      {row.database}
                     </TableCell>
                     <TableCell className="tabular-nums text-sm">
                       {row.calls.toLocaleString()}

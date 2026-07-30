@@ -3,7 +3,7 @@
 //! # Route
 //!
 //! ```text
-//! GET /external-services/{service_id}/pg-stat-statements/slow-queries?limit=N
+//! GET /external-services/{service_id}/pg-stat-statements/slow-queries?page=N&page_size=N&sort_by=...&sort_order=...
 //! ```
 //!
 //! Requires `ExternalServicesRead` permission. The caller must have access to
@@ -29,8 +29,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::handlers::types::AppState;
 use crate::pg_stat_statements::{
-    PgStatStatementsError, PgStatStatementsService, SlowQueryPage, SlowQueryRow, DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
+    PgStatStatementsError, PgStatStatementsService, SlowQueryPage, SlowQueryRow, SlowQuerySortKey,
+    SortOrder, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,12 +133,19 @@ pub struct SlowQueryParams {
     pub page: Option<u32>,
     /// Number of rows per page (1–100). Defaults to 20.
     pub page_size: Option<u32>,
+    /// Column to sort by: one of `calls`, `total_exec_time_ms`,
+    /// `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+    /// `mean_exec_time_ms`. Applied server-side so ordering stays
+    /// consistent across pages.
+    pub sort_by: Option<String>,
+    /// Sort direction: `asc` or `desc`. Defaults to `desc`.
+    pub sort_order: Option<String>,
 }
 
 /// Response envelope for the slow-queries list endpoint.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlowQueriesResponse {
-    /// Ordered list of query stats, slowest first by total_exec_time_ms.
+    /// Ordered list of query stats, slowest first by mean_exec_time_ms.
     pub queries: Vec<SlowQueryRow>,
     /// Current page number (1-based).
     pub page: u32,
@@ -180,7 +187,7 @@ pub struct PgStatStatementsApiDoc;
     ),
     responses(
         (status = 200, description = "Paginated slow queries from pg_stat_statements", body = SlowQueriesResponse),
-        (status = 400, description = "Invalid pagination parameters"),
+        (status = 400, description = "Invalid pagination or sort parameters"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions (requires external_services:read)"),
         (status = 404, description = "Service not found"),
@@ -203,10 +210,29 @@ async fn get_slow_queries(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
 
+    let sort_by = match &params.sort_by {
+        Some(raw) => SlowQuerySortKey::parse(raw)
+            .map_err(|message| Problem::from(PgStatStatementsError::Validation { message }))?,
+        None => SlowQuerySortKey::MeanExecTime,
+    };
+    let sort_order = match &params.sort_order {
+        Some(raw) => SortOrder::parse(raw)
+            .map_err(|message| Problem::from(PgStatStatementsError::Validation { message }))?,
+        None => SortOrder::Desc,
+    };
+
     let pg_stat_service = PgStatStatementsService::new(state.external_service_manager.clone());
 
     let (queries, total_count) = pg_stat_service
-        .top_slow_queries(service_id, SlowQueryPage { page, page_size })
+        .top_slow_queries(
+            service_id,
+            SlowQueryPage {
+                page,
+                page_size,
+                sort_by,
+                sort_order,
+            },
+        )
         .await
         .map_err(Problem::from)?;
 
