@@ -2307,14 +2307,42 @@ impl ProjectService {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding(page, per_page, &[])
+            .await
+    }
+
+    /// [`Self::get_projects_paginated`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// `hidden` comes from
+    /// [`ProjectAccessChecker::hidden_project_ids`](temps_core::ProjectAccessChecker::hidden_project_ids)
+    /// and is empty on an instance with no access grants configured, which
+    /// makes this identical to the unfiltered query in that case. The
+    /// exclusion is applied to the **count** as well as the page, so
+    /// pagination doesn't advertise rows the caller can never see.
+    pub async fn get_projects_paginated_excluding(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
         // Calculate offset
         let offset = ((page - 1) * per_page) as u64;
 
+        let filtered = || {
+            let query = projects::Entity::find();
+            if hidden.is_empty() {
+                query
+            } else {
+                query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+            }
+        };
+
         // Get total count
-        let total = projects::Entity::find()
+        let total = filtered()
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2323,7 +2351,7 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = projects::Entity::find()
+        let projects = filtered()
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,

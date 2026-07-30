@@ -101,6 +101,16 @@ pub mod upstream_config;
 pub mod user_roles;
 pub mod users;
 
+// Teams + project-scoped RBAC entities
+pub mod custom_role_permissions;
+pub mod custom_roles;
+pub mod project_team_access;
+pub mod team_members;
+pub mod team_role;
+pub mod teams;
+
+pub use team_role::{TeamRole, TeamRoleParseError};
+
 // OpenTelemetry entities
 
 pub mod events;

@@ -3103,6 +3103,16 @@ export type CreateConversationRequest = {
     context_type: string;
 };
 
+export type CreateCustomRoleRequest = {
+    description?: string | null;
+    name: string;
+    /**
+     * `Permission::to_string()` values, e.g. `"deployments:write"`.
+     */
+    permissions: Array<string>;
+    slug: string;
+};
+
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
@@ -3526,6 +3536,11 @@ export type CreatePrResponse = {
     run: AutofixerRunResponse;
 };
 
+export type CreateProjectAccessRequest = {
+    role: TeamRole;
+    team_id: number;
+};
+
 /**
  * Request to create a project from a template
  *
@@ -3812,6 +3827,17 @@ export type CreateSlackProviderRequest = {
     name: string;
 };
 
+export type CreateTeamMemberRequest = {
+    role: TeamRole;
+    user_id: number;
+};
+
+export type CreateTeamRequest = {
+    description?: string | null;
+    name: string;
+    slug: string;
+};
+
 export type CreateUserRequest = {
     email?: string | null;
     password?: string | null;
@@ -3959,6 +3985,24 @@ export type CustomDomainResponse = {
     status: string;
     status_code?: number | null;
     updated_at: number;
+};
+
+export type CustomRoleListResponse = {
+    page: number;
+    page_size: number;
+    roles: Array<CustomRoleResponse>;
+    total: number;
+};
+
+export type CustomRoleResponse = {
+    created_at: string;
+    created_by: number;
+    description?: string | null;
+    id: number;
+    name: string;
+    permissions: Array<string>;
+    slug: string;
+    updated_at: string;
 };
 
 export type CustomerMovementResponse = {
@@ -5295,6 +5339,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5314,24 +5376,6 @@ export type DockerRegistrySettingsMasked = {
     registry_url?: string | null;
     tls_verify: boolean;
     username?: string | null;
-};
-
-/**
- * Configuration for Docker Compose deployments.
- */
-export type DockerComposePresetConfig = {
-    /**
-     * User-provided docker-compose.override.yml content.
-     */
-    composeOverride?: string | null;
-    /**
-     * Path to the Compose file relative to the project directory.
-     */
-    composePath?: string | null;
-    /**
-     * Compose service ports that should be publicly routed.
-     */
-    publicPorts?: Array<ComposePublicPort>;
 };
 
 /**
@@ -11716,6 +11760,16 @@ export type ProblemDetails = {
     type?: string | null;
 };
 
+export type ProjectAccessResponse = {
+    created_at: string;
+    granted_by: number;
+    id: number;
+    project_id: number;
+    role: TeamRole;
+    team_id: number;
+    updated_at: string;
+};
+
 /**
  * Project-level configuration
  */
@@ -15045,7 +15099,9 @@ export type SlowQueryRow = {
      */
     calls: number;
     /**
-     * Name of the database this query ran against. `(dropped database)` when the originating database no longer exists but `pg_stat_statements` still holds stats for it.
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
      */
     database: string;
     /**
@@ -15960,6 +16016,69 @@ export type TargetRecommendation = {
     yearly_savings_usd?: number | null;
 };
 
+export type TeamListResponse = {
+    page: number;
+    page_size: number;
+    teams: Array<TeamResponse>;
+    total: number;
+};
+
+export type TeamMemberResponse = {
+    added_by: number;
+    created_at: string;
+    /**
+     * When `Some`, this member's effective project-scoped permissions
+     * come from this custom role's permission set instead of `role`.
+     */
+    custom_role_id?: number | null;
+    id: number;
+    /**
+     * Used when `custom_role_id` is `None` — and in that case also the
+     * source of this member's project-scoped permissions (intersected
+     * with `project_team_access.role`).
+     */
+    role: TeamRole;
+    team_id: number;
+    updated_at: string;
+    /**
+     * The member's email, joined from `users`.
+     */
+    user_email?: string | null;
+    user_id: number;
+    /**
+     * The member's display name, joined from `users`. `None` if the
+     * referenced user no longer exists.
+     */
+    user_name?: string | null;
+};
+
+export type TeamResponse = {
+    created_at: string;
+    created_by: number;
+    description?: string | null;
+    id: number;
+    name: string;
+    slug: string;
+    updated_at: string;
+};
+
+/**
+ * Role a user holds within a team, or that a team holds on a project.
+ *
+ * Named `TeamRole` rather than `Role` to keep it distinct from
+ * `temps_auth::permissions::Role`, which is the instance-wide role
+ * (Admin/User/…) attached to a session. The two are orthogonal: the
+ * instance-wide role decides whether you may touch a resource *kind* at
+ * all, `TeamRole` decides what you may do *within a project* you have
+ * team access to. See `temps_teams::fixed_role_permissions` for the
+ * project-scoped permission set each variant maps to.
+ *
+ * Stored as a `varchar(32)` rather than a Postgres enum so the role set
+ * can evolve in pure migration code without a schema-level enum
+ * alteration blocking a downgrade.
+ */
+export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
+
 /**
  * Response type for a single template
  */
@@ -16740,6 +16859,15 @@ export type UpdateCustomDomainRequest = {
     status_code?: number | null;
 };
 
+export type UpdateCustomRoleRequest = {
+    description?: string | null;
+    name?: string | null;
+    /**
+     * When `Some`, replaces the role's entire permission set.
+     */
+    permissions?: Array<string> | null;
+};
+
 export type UpdateDashboardRequest = {
     layout?: null | DashboardLayout;
     name?: string | null;
@@ -17049,6 +17177,18 @@ export type UpdateMcpRequest = {
     };
     description?: string | null;
     name?: string | null;
+};
+
+/**
+ * `role` and `custom_role_id` are mutually exclusive — exactly one must
+ * be set. Setting `role` clears any existing `custom_role_id`; setting
+ * `custom_role_id` leaves the fixed `role` column as-is (it becomes
+ * irrelevant once `custom_role_id` is non-null, per the precedence rule
+ * in [`CustomRoleService::effective_permissions`](crate::CustomRoleService::effective_permissions)).
+ */
+export type UpdateMemberRoleRequest = {
+    custom_role_id?: number | null;
+    role?: null | TeamRole;
 };
 
 export type UpdateMetricAlertRequest = {
@@ -17376,6 +17516,11 @@ export type UpdateStatusResponse = {
      * on this install's channel.
      */
     update_available: boolean;
+};
+
+export type UpdateTeamRequest = {
+    description?: string | null;
+    name?: string | null;
 };
 
 export type UpdateTokenRequest = {
@@ -23541,6 +23686,154 @@ export type BlobHeadResponses = {
     200: unknown;
 };
 
+export type ListCustomRolesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number;
+        page_size?: number;
+    };
+    url: '/custom-roles';
+};
+
+export type ListCustomRolesErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListCustomRolesResponses = {
+    /**
+     * Paginated custom roles
+     */
+    200: CustomRoleListResponse;
+};
+
+export type ListCustomRolesResponse = ListCustomRolesResponses[keyof ListCustomRolesResponses];
+
+export type CreateCustomRoleData = {
+    body: CreateCustomRoleRequest;
+    path?: never;
+    query?: never;
+    url: '/custom-roles';
+};
+
+export type CreateCustomRoleErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * A requested permission exceeds the actor's own permissions
+     */
+    403: unknown;
+    /**
+     * Slug already taken
+     */
+    409: unknown;
+};
+
+export type CreateCustomRoleResponses = {
+    /**
+     * Custom role created
+     */
+    201: CustomRoleResponse;
+};
+
+export type CreateCustomRoleResponse = CreateCustomRoleResponses[keyof CreateCustomRoleResponses];
+
+export type DeleteCustomRoleData = {
+    body?: never;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type DeleteCustomRoleErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type DeleteCustomRoleResponses = {
+    /**
+     * Custom role deleted
+     */
+    204: void;
+};
+
+export type DeleteCustomRoleResponse = DeleteCustomRoleResponses[keyof DeleteCustomRoleResponses];
+
+export type GetCustomRoleData = {
+    body?: never;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type GetCustomRoleErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type GetCustomRoleResponses = {
+    /**
+     * Custom role
+     */
+    200: CustomRoleResponse;
+};
+
+export type GetCustomRoleResponse = GetCustomRoleResponses[keyof GetCustomRoleResponses];
+
+export type UpdateCustomRoleData = {
+    body: UpdateCustomRoleRequest;
+    path: {
+        role_id: number;
+    };
+    query?: never;
+    url: '/custom-roles/{role_id}';
+};
+
+export type UpdateCustomRoleErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * A requested permission exceeds the actor's own permissions
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type UpdateCustomRoleResponses = {
+    /**
+     * Updated custom role
+     */
+    200: CustomRoleResponse;
+};
+
+export type UpdateCustomRoleResponse = UpdateCustomRoleResponses[keyof UpdateCustomRoleResponses];
+
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
     path?: never;
@@ -27346,7 +27639,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27822,7 +28115,10 @@ export type GetSlowQueriesData = {
          */
         page_size?: number | null;
         /**
-         * Column to sort by: one of `calls`, `total_exec_time_ms`, `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to `mean_exec_time_ms`. Applied server-side so ordering stays consistent across pages.
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
          */
         sort_by?: string | null;
         /**
@@ -32156,6 +32452,10 @@ export type RevealNotificationProviderConfigErrors = {
      */
     400: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * Provider or field not found
      */
     404: unknown;
@@ -34860,6 +35160,90 @@ export type TriggerProjectPipelineResponses = {
 };
 
 export type TriggerProjectPipelineResponse = TriggerProjectPipelineResponses[keyof TriggerProjectPipelineResponses];
+
+export type ListProjectAccessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access';
+};
+
+export type ListProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+};
+
+export type ListProjectAccessResponses = {
+    /**
+     * Access grants
+     */
+    200: Array<ProjectAccessResponse>;
+};
+
+export type ListProjectAccessResponse = ListProjectAccessResponses[keyof ListProjectAccessResponses];
+
+export type GrantProjectAccessData = {
+    body: CreateProjectAccessRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access';
+};
+
+export type GrantProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type GrantProjectAccessResponses = {
+    /**
+     * Access granted (idempotent upsert)
+     */
+    201: ProjectAccessResponse;
+};
+
+export type GrantProjectAccessResponse = GrantProjectAccessResponses[keyof GrantProjectAccessResponses];
+
+export type RevokeProjectAccessData = {
+    body?: never;
+    path: {
+        project_id: number;
+        team_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access/{team_id}';
+};
+
+export type RevokeProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Grant not found
+     */
+    404: unknown;
+};
+
+export type RevokeProjectAccessResponses = {
+    /**
+     * Access revoked
+     */
+    204: void;
+};
+
+export type RevokeProjectAccessResponse = RevokeProjectAccessResponses[keyof RevokeProjectAccessResponses];
 
 export type GetActiveVisitorsData = {
     body?: never;
@@ -37904,7 +38288,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -37957,7 +38341,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -38813,6 +39197,10 @@ export type GetContainerEnvironmentVariableData = {
 };
 
 export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
     /**
      * Container or environment variable not found
      */
@@ -41245,6 +41633,10 @@ export type RevealMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
@@ -45495,6 +45887,10 @@ export type RevealGlobalMcpConfigErrors = {
      */
     401: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * MCP server or field not found
      */
     404: unknown;
@@ -45870,6 +46266,328 @@ export type GetUpdateStatusResponses = {
 };
 
 export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
+export type ListTeamsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-indexed page
+         */
+        page?: number;
+        /**
+         * default 20, max 100
+         */
+        page_size?: number;
+    };
+    url: '/teams';
+};
+
+export type ListTeamsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListTeamsResponses = {
+    /**
+     * Paginated teams
+     */
+    200: TeamListResponse;
+};
+
+export type ListTeamsResponse = ListTeamsResponses[keyof ListTeamsResponses];
+
+export type CreateTeamData = {
+    body: CreateTeamRequest;
+    path?: never;
+    query?: never;
+    url: '/teams';
+};
+
+export type CreateTeamErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Slug already taken
+     */
+    409: unknown;
+};
+
+export type CreateTeamResponses = {
+    /**
+     * Team created
+     */
+    201: TeamResponse;
+};
+
+export type CreateTeamResponse = CreateTeamResponses[keyof CreateTeamResponses];
+
+export type DeleteTeamData = {
+    body?: never;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type DeleteTeamErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type DeleteTeamResponses = {
+    /**
+     * Team deleted
+     */
+    204: void;
+};
+
+export type DeleteTeamResponse = DeleteTeamResponses[keyof DeleteTeamResponses];
+
+export type GetTeamData = {
+    body?: never;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type GetTeamErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type GetTeamResponses = {
+    /**
+     * Team
+     */
+    200: TeamResponse;
+};
+
+export type GetTeamResponse = GetTeamResponses[keyof GetTeamResponses];
+
+export type UpdateTeamData = {
+    body: UpdateTeamRequest;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type UpdateTeamErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type UpdateTeamResponses = {
+    /**
+     * Updated team
+     */
+    200: TeamResponse;
+};
+
+export type UpdateTeamResponse = UpdateTeamResponses[keyof UpdateTeamResponses];
+
+export type ListTeamMembersData = {
+    body?: never;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members';
+};
+
+export type ListTeamMembersErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type ListTeamMembersResponses = {
+    /**
+     * Members
+     */
+    200: Array<TeamMemberResponse>;
+};
+
+export type ListTeamMembersResponse = ListTeamMembersResponses[keyof ListTeamMembersResponses];
+
+export type AddTeamMemberData = {
+    body: CreateTeamMemberRequest;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members';
+};
+
+export type AddTeamMemberErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+    /**
+     * User already a member
+     */
+    409: unknown;
+};
+
+export type AddTeamMemberResponses = {
+    /**
+     * Member added
+     */
+    201: TeamMemberResponse;
+};
+
+export type AddTeamMemberResponse = AddTeamMemberResponses[keyof AddTeamMemberResponses];
+
+export type RemoveTeamMemberData = {
+    body?: never;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}';
+};
+
+export type RemoveTeamMemberErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Member not found
+     */
+    404: unknown;
+};
+
+export type RemoveTeamMemberResponses = {
+    /**
+     * Member removed
+     */
+    204: void;
+};
+
+export type RemoveTeamMemberResponse = RemoveTeamMemberResponses[keyof RemoveTeamMemberResponses];
+
+export type UpdateTeamMemberRoleData = {
+    body: UpdateMemberRoleRequest;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}';
+};
+
+export type UpdateTeamMemberRoleErrors = {
+    /**
+     * Must specify exactly one of role/custom_role_id
+     */
+    400: unknown;
+    /**
+     * Assigned custom role grants a permission exceeding the actor's own
+     */
+    403: unknown;
+    /**
+     * Member or custom role not found
+     */
+    404: unknown;
+};
+
+export type UpdateTeamMemberRoleResponses = {
+    /**
+     * Updated membership
+     */
+    200: TeamMemberResponse;
+};
+
+export type UpdateTeamMemberRoleResponse = UpdateTeamMemberRoleResponses[keyof UpdateTeamMemberRoleResponses];
+
+export type ListTeamProjectsData = {
+    body?: never;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/projects';
+};
+
+export type ListTeamProjectsErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type ListTeamProjectsResponses = {
+    /**
+     * Projects this team has access to
+     */
+    200: Array<ProjectAccessResponse>;
+};
+
+export type ListTeamProjectsResponse = ListTeamProjectsResponses[keyof ListTeamProjectsResponses];
 
 export type ListProjectTemplatesData = {
     body?: never;

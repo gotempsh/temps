@@ -110,6 +110,17 @@ const Users = lazy(() =>
 const UserDetail = lazy(() =>
   import('./pages/UserDetail').then((m) => ({ default: m.UserDetail }))
 )
+const CustomRolesPage = lazy(() =>
+  import('./pages/settings/CustomRolesPage').then((m) => ({
+    default: m.CustomRolesPage,
+  }))
+)
+const Teams = lazy(() =>
+  import('./pages/Teams').then((m) => ({ default: m.Teams }))
+)
+const TeamDetail = lazy(() =>
+  import('./pages/TeamDetail').then((m) => ({ default: m.TeamDetail }))
+)
 const CustomRoutes = lazy(() =>
   import('./pages/Routes').then((m) => ({ default: m.Routes }))
 )
@@ -478,6 +489,11 @@ const FullAppRoutes = () => {
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />
                 <Route path="/sandboxes/:sandboxId" element={<SandboxDetail />} />
+                {/* Teams live at the top level, not under /settings: they're
+                    a day-to-day surface (who can reach what), and the
+                    settings layout swaps the sidebar away from projects. */}
+                <Route path="/teams" element={<Teams />} />
+                <Route path="/teams/:teamId" element={<TeamDetail />} />
                 <Route path="/monitoring" element={<Monitoring />}>
                   <Route index element={<Navigate to="resources" replace />} />
                   <Route path="alarms" element={<Alarms />} />
@@ -512,6 +528,7 @@ const FullAppRoutes = () => {
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
+                  <Route path="custom-roles" element={<CustomRolesPage />} />
                   <Route path="auth" element={<AuthSettingsPage />} />
                   <Route path="auth/new" element={<CreateOidcProviderPage />} />
                   <Route

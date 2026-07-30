@@ -64,6 +64,7 @@ use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
@@ -1829,6 +1830,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering AuditPlugin");
     let audit_plugin = Box::new(AuditPlugin::new());
     plugin_manager.register_plugin(audit_plugin);
+
+    // 5.5. TeamsPlugin - teams + project-scoped RBAC (depends on database
+    // and AuditLogger, hence after AuditPlugin).
+    //
+    // This registers the `ProjectAccessChecker` that every project-scoped
+    // plugin resolves in its own `configure_routes`. Registration order
+    // between plugins doesn't matter for that — all `register_services`
+    // calls complete before any `configure_routes` runs — but it must come
+    // after AuditPlugin, whose `AuditLogger` it requires.
+    debug!("Registering TeamsPlugin");
+    let teams_plugin = Box::new(TeamsPlugin::new());
+    plugin_manager.register_plugin(teams_plugin);
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");

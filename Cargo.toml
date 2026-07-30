@@ -57,6 +57,7 @@ members = [
     "crates/temps-import-portainer",
     "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
+    "crates/temps-teams",
     "crates/temps-webhooks",
     "crates/temps-email",
     "crates/temps-email-tracking",
