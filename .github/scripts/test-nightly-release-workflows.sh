@@ -61,6 +61,11 @@ abort "release builds can bypass ref validation" unless
 
 abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
   release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"
+
+sandbox_steps = release.dig("jobs", "prepare-sandbox-context", "steps")
+sandbox_dependencies = sandbox_steps.find { |step| step["name"] == "Install build dependencies" }
+abort "sandbox helper builds do not install protoc" unless
+  sandbox_dependencies&.fetch("run", "")&.include?("protobuf-compiler")
 RUBY
 
 expect_decision() {
