@@ -43,12 +43,13 @@ if [[ "$tag_aware_dispatch_count" -ne 5 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
-ruby - "$nightly_workflow" "$release_workflow" "$sandbox_workflow" <<'RUBY'
+ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" <<'RUBY'
 require "yaml"
 
-nightly = YAML.safe_load(File.read(ARGV[0]), aliases: true)
-release = YAML.safe_load(File.read(ARGV[1]), aliases: true)
-sandbox = YAML.safe_load(File.read(ARGV[2]), aliases: true)
+repository_root = ARGV[0]
+nightly = YAML.safe_load(File.read(ARGV[1]), aliases: true)
+release = YAML.safe_load(File.read(ARGV[2]), aliases: true)
+sandbox = YAML.safe_load(File.read(ARGV[3]), aliases: true)
 
 check_permissions = nightly.dig("jobs", "check-and-tag", "permissions")
 abort "check-and-tag permissions are not read-actions/write-contents" unless
@@ -64,56 +65,89 @@ abort "release builds can bypass ref validation" unless
 abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
   release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"
 
-publishing_workflows = ARGV.drop(1)
-mutable_action_refs = publishing_workflows.flat_map do |path|
-  File.readlines(path).map do |line|
-    action_ref = line[/^\s*uses:\s*([^\s#]+)/, 1]
-    next if action_ref.nil? || action_ref.start_with?("./")
-    "#{path}: #{action_ref}" unless action_ref.match?(/@[0-9a-f]{40}\z/)
-  end.compact
+workflow_documents = Dir[File.join(repository_root, ".github/workflows/*.{yml,yaml}")].sort.map do |path|
+  [path, YAML.safe_load(File.read(path), aliases: true)]
 end
-abort "publishing workflows contain mutable action refs:\n#{mutable_action_refs.join("\n")}" unless
+privileged_workflows = workflow_documents.select do |_path, workflow|
+  workflow_permissions = workflow.fetch("permissions", {}).values
+  job_permissions = workflow.fetch("jobs", {}).values.flat_map do |job|
+    job.fetch("permissions", {}).values
+  end
+  (workflow_permissions + job_permissions).include?("write")
+end
+privileged_action_refs = privileged_workflows.flat_map do |path, workflow|
+  workflow.fetch("jobs", {}).flat_map do |job_name, job|
+    refs = []
+    refs << ["#{path}: job #{job_name}", job["uses"]] if job["uses"]
+    job.fetch("steps", []).each_with_index do |step, index|
+      refs << ["#{path}: job #{job_name} step #{index + 1}", step["uses"]] if step["uses"]
+    end
+    refs
+  end
+end
+mutable_action_refs = privileged_action_refs.select do |_location, action_ref|
+  !action_ref.start_with?("./") && !action_ref.match?(/@[0-9a-f]{40}\z/)
+end
+abort "privileged workflows contain mutable action refs:\n#{mutable_action_refs.map { |location, ref| "#{location}: #{ref}" }.join("\n")}" unless
   mutable_action_refs.empty?
 
 abort "release workflow must deny token permissions by default" unless
   release["permissions"] == {}
-release["jobs"].each do |name, job|
-  abort "release job #{name} lacks explicit token permissions" unless job.key?("permissions")
+read_contents = {"contents" => "read"}
+publish_packages = {"contents" => "read", "packages" => "write"}
+expected_release_permissions = {
+  "validate-release-ref" => read_contents,
+  "build-web-assets" => read_contents,
+  "build-linux-amd64" => read_contents,
+  "build-linux-arm64" => read_contents,
+  "build-darwin-amd64" => read_contents,
+  "build-darwin-arm64" => read_contents,
+  "create-release" => {"contents" => "write"},
+  "build-and-push-docker" => publish_packages,
+  "create-docker-manifest" => publish_packages,
+  "prepare-sandbox-context" => read_contents,
+  "build-and-push-sandbox-images" => publish_packages,
+  "build-and-push-preview-gateway" => publish_packages,
+}
+actual_release_permissions = release.fetch("jobs").map do |name, job|
+  [name, job["permissions"]]
+end.to_h
+unless actual_release_permissions == expected_release_permissions
+  abort "release job permissions differ from the least-privilege allowlist:\n" \
+    "expected #{expected_release_permissions.inspect}\nactual #{actual_release_permissions.inspect}"
 end
-%w[
-  build-linux-amd64
-  build-linux-arm64
-  build-darwin-amd64
-  build-darwin-arm64
-].each do |name|
-  abort "#{name} has broader token permissions than contents: read" unless
-    release.dig("jobs", name, "permissions") == {"contents" => "read"}
-end
-abort "create-release lost its required contents: write permission" unless
-  release.dig("jobs", "create-release", "permissions") == {"contents" => "write"}
 
-build_web_steps = release.dig("jobs", "build-web-assets", "steps")
-bun_step = build_web_steps.find { |step| step["name"] == "Install Bun" }
+release_steps = release.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }
+bun_versions = release_steps.map { |step| step.dig("with", "bun-version") }.compact
 abort "release workflow uses an unpinned Bun version" unless
-  bun_step&.dig("with", "bun-version") == "1.3.14"
-wasm_pack_step = build_web_steps.find { |step| step["name"] == "Install wasm-pack and Build WASM" }
+  bun_versions == ["1.3.14"]
+wasm_pack_installs = release_steps.flat_map do |step|
+  step.fetch("run", "").lines.map(&:strip).select { |line| line.include?("cargo install wasm-pack") }
+end
 abort "release workflow uses an unpinned wasm-pack version" unless
-  wasm_pack_step&.fetch("run", "")&.include?("cargo install wasm-pack --version 0.13.1 --locked")
+  wasm_pack_installs == ["cargo install wasm-pack --version 0.13.1 --locked"]
 
-abort "beta workflow grants package writes globally" unless
-  sandbox["permissions"] == {"contents" => "read"}
-abort "beta context preparation has broader token permissions than contents: read" unless
-  sandbox.dig("jobs", "prepare-context", "permissions") == {"contents" => "read"}
-%w[build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
-  abort "#{name} lacks job-scoped package publishing permission" unless
-    sandbox.dig("jobs", name, "permissions") ==
-      {"contents" => "read", "packages" => "write"}
+expected_sandbox_permissions = {
+  "prepare-context" => read_contents,
+  "build-and-push-sandbox-images" => publish_packages,
+  "build-and-push-preview-gateway" => publish_packages,
+}
+actual_sandbox_permissions = sandbox.fetch("jobs").map do |name, job|
+  [name, job["permissions"]]
+end.to_h
+unless sandbox["permissions"] == read_contents &&
+    actual_sandbox_permissions == expected_sandbox_permissions
+  abort "beta workflow permissions differ from the least-privilege allowlist"
 end
 
 sandbox_steps = release.dig("jobs", "prepare-sandbox-context", "steps")
 sandbox_dependencies = sandbox_steps.find { |step| step["name"] == "Install build dependencies" }
 abort "sandbox helper builds do not install protoc" unless
   sandbox_dependencies&.fetch("run", "")&.include?("protobuf-compiler")
+
+puts "privileged workflow action pinning valid: #{privileged_action_refs.length} uses " \
+  "across #{privileged_workflows.length} workflows"
+puts "release permission allowlists and tool pins are valid"
 RUBY
 
 expect_decision() {
