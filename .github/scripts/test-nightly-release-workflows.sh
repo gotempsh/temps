@@ -4,6 +4,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 nightly_workflow="$repository_root/.github/workflows/nightly-release.yml"
 release_workflow="$repository_root/.github/workflows/release.yml"
+sandbox_workflow="$repository_root/.github/workflows/sandbox-images-beta.yml"
 decision_script="$repository_root/.github/scripts/nightly-release-decision.sh"
 validation_script="$repository_root/.github/scripts/validate-release-ref.sh"
 
@@ -42,11 +43,12 @@ if [[ "$tag_aware_dispatch_count" -ne 5 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
-ruby - "$nightly_workflow" "$release_workflow" <<'RUBY'
+ruby - "$nightly_workflow" "$release_workflow" "$sandbox_workflow" <<'RUBY'
 require "yaml"
 
 nightly = YAML.safe_load(File.read(ARGV[0]), aliases: true)
 release = YAML.safe_load(File.read(ARGV[1]), aliases: true)
+sandbox = YAML.safe_load(File.read(ARGV[2]), aliases: true)
 
 check_permissions = nightly.dig("jobs", "check-and-tag", "permissions")
 abort "check-and-tag permissions are not read-actions/write-contents" unless
@@ -61,6 +63,52 @@ abort "release builds can bypass ref validation" unless
 
 abort "release dependency fetches can fall back to Cargo's embedded Git client" unless
   release.dig("env", "CARGO_NET_GIT_FETCH_WITH_CLI") == "true"
+
+publishing_workflows = ARGV.drop(1)
+mutable_action_refs = publishing_workflows.flat_map do |path|
+  File.readlines(path).map do |line|
+    action_ref = line[/^\s*uses:\s*([^\s#]+)/, 1]
+    next if action_ref.nil? || action_ref.start_with?("./")
+    "#{path}: #{action_ref}" unless action_ref.match?(/@[0-9a-f]{40}\z/)
+  end.compact
+end
+abort "publishing workflows contain mutable action refs:\n#{mutable_action_refs.join("\n")}" unless
+  mutable_action_refs.empty?
+
+abort "release workflow must deny token permissions by default" unless
+  release["permissions"] == {}
+release["jobs"].each do |name, job|
+  abort "release job #{name} lacks explicit token permissions" unless job.key?("permissions")
+end
+%w[
+  build-linux-amd64
+  build-linux-arm64
+  build-darwin-amd64
+  build-darwin-arm64
+].each do |name|
+  abort "#{name} has broader token permissions than contents: read" unless
+    release.dig("jobs", name, "permissions") == {"contents" => "read"}
+end
+abort "create-release lost its required contents: write permission" unless
+  release.dig("jobs", "create-release", "permissions") == {"contents" => "write"}
+
+build_web_steps = release.dig("jobs", "build-web-assets", "steps")
+bun_step = build_web_steps.find { |step| step["name"] == "Install Bun" }
+abort "release workflow uses an unpinned Bun version" unless
+  bun_step&.dig("with", "bun-version") == "1.3.14"
+wasm_pack_step = build_web_steps.find { |step| step["name"] == "Install wasm-pack and Build WASM" }
+abort "release workflow uses an unpinned wasm-pack version" unless
+  wasm_pack_step&.fetch("run", "")&.include?("cargo install wasm-pack --version 0.13.1 --locked")
+
+abort "beta workflow grants package writes globally" unless
+  sandbox["permissions"] == {"contents" => "read"}
+abort "beta context preparation has broader token permissions than contents: read" unless
+  sandbox.dig("jobs", "prepare-context", "permissions") == {"contents" => "read"}
+%w[build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
+  abort "#{name} lacks job-scoped package publishing permission" unless
+    sandbox.dig("jobs", name, "permissions") ==
+      {"contents" => "read", "packages" => "write"}
+end
 
 sandbox_steps = release.dig("jobs", "prepare-sandbox-context", "steps")
 sandbox_dependencies = sandbox_steps.find { |step| step["name"] == "Install build dependencies" }
@@ -106,4 +154,4 @@ if "$validation_script" false tag latest >/dev/null 2>&1; then
   fail "a malformed release tag was accepted for publishing"
 fi
 
-echo "nightly release workflow wiring is valid"
+echo "nightly release workflow wiring and publishing workflow security are valid"
