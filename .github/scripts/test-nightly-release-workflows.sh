@@ -90,6 +90,14 @@ mutable_action_refs = privileged_action_refs.select do |_location, action_ref|
 end
 abort "privileged workflows contain mutable action refs:\n#{mutable_action_refs.map { |location, ref| "#{location}: #{ref}" }.join("\n")}" unless
   mutable_action_refs.empty?
+inconsistent_action_pins = privileged_action_refs
+  .reject { |_location, action_ref| action_ref.start_with?("./") }
+  .group_by { |_location, action_ref| action_ref.split("@", 2).first }
+  .select { |_action, refs| refs.map(&:last).uniq.length > 1 }
+unless inconsistent_action_pins.empty?
+  abort "privileged workflows pin the same action to different commits:\n" \
+    "#{inconsistent_action_pins.inspect}"
+end
 
 abort "release workflow must deny token permissions by default" unless
   release["permissions"] == {}
