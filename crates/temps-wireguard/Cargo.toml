@@ -13,7 +13,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rand = { workspace = true }
 base64 = { workspace = true }
 temps-core = { path = "../temps-core" }
 

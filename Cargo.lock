@@ -11589,7 +11589,6 @@ dependencies = [
  "pingora-http",
  "pingora-openssl",
  "pingora-proxy",
- "rand 0.8.6",
  "reqwest 0.12.28",
  "rustls-pemfile",
  "sea-orm",
@@ -13161,7 +13160,6 @@ version = "0.1.0-beta.55"
 dependencies = [
  "base64 0.22.1",
  "defguard_wireguard_rs",
- "rand 0.8.6",
  "serde",
  "serde_json",
  "temps-core",

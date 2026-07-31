@@ -77,7 +77,7 @@ pub fn encrypt_for_edge(
     let recipient_pk = x25519_dalek::PublicKey::from(pk_array);
 
     // Generate ephemeral key pair
-    let ephemeral_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let ephemeral_secret = generate_x25519_static_secret();
     let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral_secret);
 
     // ECDH: derive shared secret
@@ -134,7 +134,7 @@ impl EncryptionSession {
         pk_array.copy_from_slice(&recipient_pk_bytes);
         let recipient_pk = x25519_dalek::PublicKey::from(pk_array);
 
-        let ephemeral_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let ephemeral_secret = generate_x25519_static_secret();
         let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral_secret);
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
         let aes_key = derive_aes_key(shared_secret.as_bytes())?;
@@ -247,6 +247,17 @@ fn derive_aes_key(shared_secret: &[u8]) -> Result<[u8; 32], EciesError> {
     Ok(key)
 }
 
+/// Generate a static X25519 secret with the workspace's OS-backed CSPRNG.
+///
+/// x25519-dalek 3 uses rand_core 0.10, while the workspace currently uses
+/// rand 0.8 and rand_core 0.6. Constructing from random bytes avoids coupling
+/// this security boundary to either rand_core trait version.
+pub fn generate_x25519_static_secret() -> x25519_dalek::StaticSecret {
+    let mut secret_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret_bytes);
+    x25519_dalek::StaticSecret::from(secret_bytes)
+}
+
 /// Compute SHA-256 fingerprint of certificate DER bytes (hex-encoded).
 pub fn cert_fingerprint(cert_pem: &str) -> String {
     use sha2::Digest;
@@ -261,7 +272,7 @@ mod tests {
     use super::*;
 
     fn generate_test_keypair() -> (String, String) {
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let secret = generate_x25519_static_secret();
         let public = x25519_dalek::PublicKey::from(&secret);
         (
             BASE64.encode(secret.as_bytes()),
@@ -277,6 +288,19 @@ mod tests {
         let (bundle, ephemeral_pk) = encrypt_for_edge(&public_key, plaintext).unwrap();
 
         let decrypted = decrypt_bundle(&private_key, &ephemeral_pk, &bundle).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encryption_session_roundtrip() {
+        let (private_key, public_key) = generate_test_keypair();
+        let plaintext = b"certificate bundle encrypted in a session";
+
+        let session = EncryptionSession::new(&public_key).unwrap();
+        let bundle = session.encrypt(plaintext).unwrap();
+        let decrypted =
+            decrypt_bundle(&private_key, session.ephemeral_public_key(), &bundle).unwrap();
+
         assert_eq!(decrypted, plaintext);
     }
 
