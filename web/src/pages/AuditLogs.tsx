@@ -21,11 +21,13 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
+import { Navigate } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 
@@ -71,7 +73,10 @@ const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'PROJECT_UPDATED', label: 'Project Updated' },
       { value: 'PROJECT_DELETED', label: 'Project Deleted' },
       { value: 'PROJECT_SETTINGS_UPDATED', label: 'Project Settings Updated' },
-      { value: 'DEPLOYMENT_CONFIG_UPDATED', label: 'Deployment Config Updated' },
+      {
+        value: 'DEPLOYMENT_CONFIG_UPDATED',
+        label: 'Deployment Config Updated',
+      },
       { value: 'ENVIRONMENT_DELETED', label: 'Environment Deleted' },
       {
         value: 'ENVIRONMENT_SETTINGS_UPDATED',
@@ -116,9 +121,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
   },
   {
     label: 'Containers',
-    operations: [
-      { value: 'CONTAINER_ACTION', label: 'Container Action' },
-    ],
+    operations: [{ value: 'CONTAINER_ACTION', label: 'Container Action' }],
   },
   {
     label: 'Workspaces',
@@ -298,6 +301,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
 const ALL_FILTER = '__all__'
 
 export function AuditLogs() {
+  const canViewAuditLogs = useCanViewAuditLogs()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [dateRange, setDateRange] = useState<DateRange | undefined>()
   const [operation, setOperation] = useState<string>(ALL_FILTER)
@@ -310,14 +314,15 @@ export function AuditLogs() {
 
   usePageTitle('Audit Logs')
 
-  const { data: users, isLoading: isLoadingUsers } = useQuery(
-    listUsersOptions({
+  const { data: users, isLoading: isLoadingUsers } = useQuery({
+    ...listUsersOptions({
       query: { include_deleted: false },
-    })
-  )
+    }),
+    enabled: canViewAuditLogs,
+  })
 
-  const { data, isLoading } = useQuery(
-    listAuditLogsOptions({
+  const { data, isLoading } = useQuery({
+    ...listAuditLogsOptions({
       query: {
         limit: ITEMS_PER_PAGE,
         offset: (page - 1) * ITEMS_PER_PAGE,
@@ -327,8 +332,9 @@ export function AuditLogs() {
         user_id:
           selectedUserId !== ALL_FILTER ? Number(selectedUserId) : undefined,
       },
-    })
-  )
+    }),
+    enabled: canViewAuditLogs,
+  })
 
   const hasMore = useMemo(() => data?.length === ITEMS_PER_PAGE, [data])
   const showEmptyState = useMemo(
@@ -374,6 +380,12 @@ export function AuditLogs() {
     setOperation(ALL_FILTER)
     setSelectedUserId(ALL_FILTER)
     setPage(1)
+  }
+
+  // Direct navigation guard: only the administration roles may read audit
+  // logs, so redirect anyone else away instead of surfacing 403s.
+  if (!canViewAuditLogs) {
+    return <Navigate to="/projects" replace />
   }
 
   return (
@@ -493,9 +505,7 @@ export function AuditLogs() {
                     audit_date={log.audit_date}
                     user={log.user ?? undefined}
                     ip_address={log.ip_address ?? undefined}
-                    data={
-                      log.data as Record<string, unknown> | undefined
-                    }
+                    data={log.data as Record<string, unknown> | undefined}
                   />
                 ))
               )}

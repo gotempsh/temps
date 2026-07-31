@@ -188,7 +188,10 @@ impl WorkflowExecutionService {
                 temps_core::telemetry::TelemetryEventKind::DeployAttempted,
             )
             .with("source_type", project.source_type.to_string())
-            .with("preset", project.preset.to_string())
+            .with(
+                "preset",
+                temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+            )
             .with("is_preview", environment.is_preview),
         );
 
@@ -315,7 +318,10 @@ impl WorkflowExecutionService {
                         temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
                     )
                     .with("source_type", project.source_type.to_string())
-                    .with("preset", project.preset.to_string())
+                    .with(
+                        "preset",
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    )
                     .with("is_preview", environment.is_preview),
                 );
                 // Once-per-instance: "this instance shipped its first deploy".
@@ -325,7 +331,10 @@ impl WorkflowExecutionService {
                         temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
                     )
                     .with("source_type", project.source_type.to_string())
-                    .with("preset", project.preset.to_string()),
+                    .with(
+                        "preset",
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    ),
                 );
 
                 // NOW teardown previous deployment for zero-downtime deployment
@@ -630,10 +639,9 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass preset (always available since it's required)
-                // Convert preset enum to string for builder
-                let preset_str = format!("{:?}", project.preset).to_lowercase();
-                builder = builder.preset(preset_str);
+                builder = builder
+                    .preset(project.preset)
+                    .preset_config(project.preset_config.clone());
 
                 // Unseal build args from job_config. The planner derives build
                 // args from env vars and stores them encrypted (build_args
@@ -1819,7 +1827,13 @@ impl WorkflowExecutionService {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(p)) => (Some(p.source_type.to_string()), Some(p.preset.to_string())),
+                Ok(Some(p)) => (
+                    Some(p.source_type.to_string()),
+                    Some(temps_presets::runtime_slug(
+                        p.preset,
+                        p.preset_config.as_ref(),
+                    )),
+                ),
                 _ => (None, None),
             };
 

@@ -37,6 +37,12 @@ pub enum Permission {
     UsersWrite,
     UsersDelete,
     UsersCreate,
+    /// Elevated user administration: create/update/delete/restore users and
+    /// assign or remove their roles. Held only by `Role::Admin` so that a
+    /// weaker role such as `PlatformAdmin` (which still has UsersWrite) cannot
+    /// mint or promote an `admin` account. Can also be granted directly to an
+    /// API key that needs to manage users without being a full admin.
+    UsersManage,
 
     // System admin permissions
     SystemAdmin,
@@ -254,6 +260,7 @@ impl fmt::Display for Permission {
             Permission::UsersWrite => "users:write",
             Permission::UsersDelete => "users:delete",
             Permission::UsersCreate => "users:create",
+            Permission::UsersManage => "users:manage",
             Permission::SystemAdmin => "system:admin",
             Permission::SystemRead => "system:read",
             Permission::SecretsRead => "secrets:read",
@@ -399,6 +406,7 @@ impl Permission {
             "users:write" => Some(Permission::UsersWrite),
             "users:delete" => Some(Permission::UsersDelete),
             "users:create" => Some(Permission::UsersCreate),
+            "users:manage" => Some(Permission::UsersManage),
             "system:admin" => Some(Permission::SystemAdmin),
             "system:read" => Some(Permission::SystemRead),
             "secrets:read" => Some(Permission::SecretsRead),
@@ -541,6 +549,7 @@ impl Permission {
             Permission::UsersWrite,
             Permission::UsersDelete,
             Permission::UsersCreate,
+            Permission::UsersManage,
             Permission::SystemAdmin,
             Permission::SystemRead,
             Permission::SecretsRead,
@@ -793,6 +802,7 @@ impl Role {
                 Permission::UsersDelete,
                 Permission::UsersRead,
                 Permission::UsersWrite,
+                Permission::UsersManage,
                 Permission::WebSocketProxyConnect,
                 Permission::WebhooksCreate,
                 Permission::WebhooksDelete,
@@ -1008,7 +1018,6 @@ impl Role {
                 Permission::ApiKeysRead,
                 Permission::ApiKeysWrite,
                 Permission::ApiKeysCreate,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::BackupsWrite,
                 Permission::BackupsCreate,
@@ -1101,7 +1110,6 @@ impl Role {
                 Permission::DomainsRead,
                 Permission::EnvironmentsRead,
                 Permission::AnalyticsRead,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::CronsRead,
                 Permission::ExternalServicesRead,
@@ -1343,6 +1351,27 @@ mod tests {
         assert!(Permission::all().contains(&Permission::SecretsRead));
     }
 
+    #[test]
+    fn test_only_admin_holds_users_manage() {
+        // `users:manage` is the elevated gate for user administration. It must be
+        // held by `Admin` alone; if any weaker role (notably `PlatformAdmin`,
+        // which still holds `UsersWrite`) gains it, the privilege-escalation hole
+        // it was created to close reopens.
+        assert!(Role::Admin.has_permission(&Permission::UsersManage));
+        for role in [
+            Role::PlatformAdmin,
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&Permission::UsersManage),
+                "role {role:?} must not hold users:manage"
+            );
+        }
+    }
+
     // Deployment token permission tests
     #[test]
     fn test_deployment_token_permissions_exist() {
@@ -1421,6 +1450,27 @@ mod tests {
         assert!(user_permissions.contains(&Permission::DeploymentTokensWrite));
         assert!(user_permissions.contains(&Permission::DeploymentTokensCreate));
         assert!(!user_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_audit_read_is_restricted_to_administration_roles() {
+        // The audit log is a platform-wide, security-sensitive view (every
+        // user's and admin's actions, IP addresses, emails). Only the
+        // administration roles may read it; lower-privilege roles must not (an
+        // operator can still grant `audit:read` to a specific API key).
+        assert!(Role::Admin.has_permission(&Permission::AuditRead));
+        assert!(Role::PlatformAdmin.has_permission(&Permission::AuditRead));
+        for role in [
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&Permission::AuditRead),
+                "role {role:?} must not hold audit:read"
+            );
+        }
     }
 
     #[test]

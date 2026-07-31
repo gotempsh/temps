@@ -159,6 +159,9 @@ impl TempsPlugin for BlobPlugin {
         let rustfs_service = context.require_service::<RustfsService>();
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
+        // Optional team-based access checker (present only when a plugin
+        // registers one); confines data-plane access to reachable projects.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         // Create app state
         let app_state = Arc::new(BlobAppState {
@@ -166,6 +169,7 @@ impl TempsPlugin for BlobPlugin {
             rustfs_service,
             external_service_manager,
             audit_service,
+            project_access_checker,
         });
 
         // Configure routes with state

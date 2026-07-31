@@ -13,6 +13,7 @@ use temps_core::{
     WorkflowTask,
 };
 use temps_deployer::{BuildRequest, ImageBuilder};
+use temps_entities::preset::{Preset as StoredPreset, PresetConfig as StoredPresetConfig};
 use temps_logs::{LogLevel, LogService};
 use temps_presets;
 use tokio::time::{sleep, Duration};
@@ -148,7 +149,8 @@ pub struct BuildImageJob {
     image_builder: Arc<dyn ImageBuilder>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
-    preset: Option<String>, // Preset slug to generate Dockerfile if missing
+    preset: Option<StoredPreset>,
+    preset_config: Option<StoredPresetConfig>,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -179,6 +181,7 @@ impl BuildImageJob {
             log_id: None,
             log_service: None,
             preset: None,
+            preset_config: None,
         }
     }
 
@@ -212,8 +215,13 @@ impl BuildImageJob {
         self
     }
 
-    pub fn with_preset(mut self, preset: String) -> Self {
+    pub fn with_preset(mut self, preset: StoredPreset) -> Self {
         self.preset = Some(preset);
+        self
+    }
+
+    pub fn with_preset_config(mut self, preset_config: Option<StoredPresetConfig>) -> Self {
+        self.preset_config = preset_config;
         self
     }
 
@@ -348,17 +356,29 @@ impl BuildImageJob {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Determine preset: either use provided slug or auto-detect
-        let preset_slug = if let Some(slug) = &self.preset {
-            // Use provided preset
+        // Resolve the canonical stored preset and typed config, or auto-detect
+        // a catalog preset when the job did not receive an explicit selection.
+        let preset = if let Some(stored_preset) = self.preset {
+            let runtime_slug =
+                temps_presets::runtime_slug(stored_preset, self.preset_config.as_ref());
             self.log(
                 context,
-                format!("Dockerfile not found, generating from preset: {}", slug),
+                format!(
+                    "Dockerfile not found, generating from preset: {}",
+                    runtime_slug
+                ),
             )
             .await?;
-            slug.clone()
+
+            temps_presets::get_preset_for_storage(stored_preset, self.preset_config.as_ref())
+                .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?
+                .ok_or_else(|| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "No build preset registered for stored preset '{}'",
+                        stored_preset
+                    ))
+                })?
         } else {
-            // Auto-detect preset from project files
             self.log(
                 context,
                 "No preset specified, auto-detecting project type...".to_string(),
@@ -424,13 +444,15 @@ impl BuildImageJob {
                 slug
             };
 
-            detected_slug
+            temps_presets::get_preset_by_slug(&detected_slug).ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Unknown detected preset: {}",
+                    detected_slug
+                ))
+            })?
         };
 
-        // Get the preset
-        let preset = temps_presets::get_preset_by_slug(&preset_slug).ok_or_else(|| {
-            WorkflowError::JobExecutionFailed(format!("Unknown preset: {}", preset_slug))
-        })?;
+        let preset_slug = preset.slug();
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
         let build_vars: Vec<String> = self
@@ -867,7 +889,8 @@ pub struct BuildImageJobBuilder {
     build_config: BuildConfig,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
-    preset: Option<String>,
+    preset: Option<StoredPreset>,
+    preset_config: Option<StoredPresetConfig>,
 }
 
 impl BuildImageJobBuilder {
@@ -880,6 +903,7 @@ impl BuildImageJobBuilder {
             log_id: None,
             log_service: None,
             preset: None,
+            preset_config: None,
         }
     }
 
@@ -938,8 +962,13 @@ impl BuildImageJobBuilder {
         self
     }
 
-    pub fn preset(mut self, preset: String) -> Self {
+    pub fn preset(mut self, preset: StoredPreset) -> Self {
         self.preset = Some(preset);
+        self
+    }
+
+    pub fn preset_config(mut self, preset_config: Option<StoredPresetConfig>) -> Self {
+        self.preset_config = preset_config;
         self
     }
 
@@ -967,6 +996,7 @@ impl BuildImageJobBuilder {
         if let Some(preset) = self.preset {
             job = job.with_preset(preset);
         }
+        job = job.with_preset_config(self.preset_config);
 
         Ok(job)
     }
@@ -1081,6 +1111,29 @@ mod tests {
         assert_eq!(job.download_job_id, "download_repo");
         assert_eq!(job.image_tag, "myapp:latest");
         assert_eq!(job.depends_on(), vec!["download_repo".to_string()]);
+    }
+
+    #[test]
+    fn test_build_image_job_builder_preserves_typed_preset_config() {
+        let image_builder: Arc<dyn ImageBuilder> = Arc::new(MockImageBuilder);
+        let config = StoredPresetConfig::Nixpacks(temps_entities::preset::NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![
+                temps_entities::preset::NixpacksProvider::Auto,
+                temps_entities::preset::NixpacksProvider::Python,
+            ],
+        });
+
+        let job = BuildImageJobBuilder::new()
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .preset(StoredPreset::Nixpacks)
+            .preset_config(Some(config.clone()))
+            .build(image_builder)
+            .unwrap();
+
+        assert_eq!(job.preset, Some(StoredPreset::Nixpacks));
+        assert_eq!(job.preset_config, Some(config));
     }
 
     #[test]

@@ -38,6 +38,7 @@ import GitlabIcon from '@/icons/Gitlab'
 import { cn } from '@/lib/utils'
 import {
   normalizePresetPath,
+  presetConfigForSelection,
   presetSelectionKey,
   splitPresetSelection,
 } from '@/lib/preset-selection'
@@ -218,13 +219,19 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
     }>
   ) => {
     const presetCfg: any = (project?.preset_config as any) || {}
+    const selectedPreset = overrides.preset ?? project.preset
+    const selectedPresetConfig =
+      overrides.preset === 'nixpacks' &&
+      overrides.preset_config === undefined
+        ? presetConfigForSelection('nixpacks', presetCfg)
+        : (overrides.preset_config ?? presetCfg ?? undefined)
     const body: Record<string, unknown> = {
       main_branch: overrides.main_branch ?? project.main_branch,
-      preset: overrides.preset ?? project.preset,
+      preset: selectedPreset,
       directory: overrides.directory ?? project.directory ?? './',
       repo_owner: overrides.repo_owner ?? project.repo_owner!,
       repo_name: overrides.repo_name ?? project.repo_name!,
-      preset_config: overrides.preset_config ?? presetCfg ?? undefined,
+      preset_config: selectedPresetConfig,
     }
     if (isPublicRepo) {
       body.git_url =

@@ -2318,6 +2318,20 @@ export type CommitListResponse = {
  */
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
+/**
+ * A port that should be exposed publicly through the proxy for a compose service.
+ */
+export type ComposePublicPort = {
+    /**
+     * Container port to expose (e.g. 8123)
+     */
+    port: number;
+    /**
+     * Compose service name (e.g. "web", "clickhouse")
+     */
+    service: string;
+};
+
 export type ConnectionListQuery = {
     direction?: string | null;
     page?: number | null;
@@ -5281,6 +5295,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5317,7 +5349,16 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    variant?: null | DockerfileVariant;
 };
+
+/**
+ * Catalog variant persisted under the canonical Dockerfile preset.
+ *
+ * Existing rows predate this discriminator and therefore deserialize as
+ * [`DockerfileVariant::File`].
+ */
+export type DockerfileVariant = 'file' | 'custom';
 
 /**
  * What to do with a domain during migration
@@ -9921,12 +9962,28 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 
 /**
  * Configuration for Nixpacks preset
- * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
- * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ * Nixpacks provider and inline build-plan configuration.
  */
 export type NixpacksPresetConfig = {
-    [key: string]: unknown;
+    /**
+     * Optional inline nixpacks.toml contents.
+     */
+    nixpacksConfig?: string | null;
+    /**
+     * Ordered Nixpacks providers. Empty means repository config or auto-detect;
+     * include `...` to combine auto-detection with explicit providers.
+     */
+    providers?: Array<NixpacksProvider>;
 };
+
+/**
+ * A Nixpacks build provider.
+ *
+ * `Auto` serializes as the native Nixpacks `...` marker, which includes the
+ * provider detected from the project alongside any explicitly listed
+ * providers.
+ */
+export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
@@ -11500,7 +11557,7 @@ export type PostgresWalHealth = {
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
-export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+export type PresetConfigSchema = DockerfilePresetConfig | DockerComposePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
 
 /**
  * Detected preset information
@@ -14964,7 +15021,7 @@ export type SlowQueriesResponse = {
      */
     page_size: number;
     /**
-     * Ordered list of query stats, slowest first by total_exec_time_ms.
+     * Ordered list of query stats, slowest first by mean_exec_time_ms.
      */
     queries: Array<SlowQueryRow>;
     /**
@@ -14987,6 +15044,12 @@ export type SlowQueryRow = {
      * Number of times this query was executed.
      */
     calls: number;
+    /**
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
+     */
+    database: string;
     /**
      * Average wall-clock time per execution, in milliseconds.
      */
@@ -16248,7 +16311,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -27285,7 +27354,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27760,13 +27829,24 @@ export type GetSlowQueriesData = {
          * Number of rows per page (1–100). Defaults to 20.
          */
         page_size?: number | null;
+        /**
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: `asc` or `desc`. Defaults to `desc`.
+         */
+        sort_order?: string | null;
     };
     url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
 };
 
 export type GetSlowQueriesErrors = {
     /**
-     * Invalid pagination parameters
+     * Invalid pagination or sort parameters
      */
     400: unknown;
     /**
@@ -32087,6 +32167,10 @@ export type RevealNotificationProviderConfigErrors = {
      */
     400: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * Provider or field not found
      */
     404: unknown;
@@ -33333,6 +33417,10 @@ export type QueryTraceSummariesData = {
          * Sort direction: 'asc' or 'desc' (default)
          */
         sort_order?: string;
+        /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -37835,7 +37923,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -37888,7 +37976,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -38744,6 +38832,10 @@ export type GetContainerEnvironmentVariableData = {
 };
 
 export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
     /**
      * Container or environment variable not found
      */
@@ -41176,6 +41268,10 @@ export type RevealMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
@@ -45426,6 +45522,10 @@ export type RevealGlobalMcpConfigErrors = {
      */
     401: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * MCP server or field not found
      */
     404: unknown;
@@ -47828,6 +47928,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -47856,6 +47960,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */

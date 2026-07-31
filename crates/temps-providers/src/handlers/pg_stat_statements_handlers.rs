@@ -3,7 +3,7 @@
 //! # Route
 //!
 //! ```text
-//! GET /external-services/{service_id}/pg-stat-statements/slow-queries?limit=N
+//! GET /external-services/{service_id}/pg-stat-statements/slow-queries?page=N&page_size=N&sort_by=...&sort_order=...
 //! ```
 //!
 //! Requires `ExternalServicesRead` permission. The caller must have access to
@@ -29,8 +29,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::handlers::types::AppState;
 use crate::pg_stat_statements::{
-    PgStatStatementsError, PgStatStatementsService, SlowQueryPage, SlowQueryRow, DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
+    PgStatStatementsError, PgStatStatementsService, SlowQueryPage, SlowQueryRow, SlowQuerySortKey,
+    SortOrder, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,12 +133,19 @@ pub struct SlowQueryParams {
     pub page: Option<u32>,
     /// Number of rows per page (1–100). Defaults to 20.
     pub page_size: Option<u32>,
+    /// Column to sort by: one of `calls`, `total_exec_time_ms`,
+    /// `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+    /// `mean_exec_time_ms`. Applied server-side so ordering stays
+    /// consistent across pages.
+    pub sort_by: Option<String>,
+    /// Sort direction: `asc` or `desc`. Defaults to `desc`.
+    pub sort_order: Option<String>,
 }
 
 /// Response envelope for the slow-queries list endpoint.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlowQueriesResponse {
-    /// Ordered list of query stats, slowest first by total_exec_time_ms.
+    /// Ordered list of query stats, slowest first by mean_exec_time_ms.
     pub queries: Vec<SlowQueryRow>,
     /// Current page number (1-based).
     pub page: u32,
@@ -180,7 +187,7 @@ pub struct PgStatStatementsApiDoc;
     ),
     responses(
         (status = 200, description = "Paginated slow queries from pg_stat_statements", body = SlowQueriesResponse),
-        (status = 400, description = "Invalid pagination parameters"),
+        (status = 400, description = "Invalid pagination or sort parameters"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions (requires external_services:read)"),
         (status = 404, description = "Service not found"),
@@ -196,6 +203,7 @@ async fn get_slow_queries(
     Query(params): Query<SlowQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &state).await?;
 
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params
@@ -203,10 +211,29 @@ async fn get_slow_queries(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
 
+    let sort_by = match &params.sort_by {
+        Some(raw) => SlowQuerySortKey::parse(raw)
+            .map_err(|message| Problem::from(PgStatStatementsError::Validation { message }))?,
+        None => SlowQuerySortKey::MeanExecTime,
+    };
+    let sort_order = match &params.sort_order {
+        Some(raw) => SortOrder::parse(raw)
+            .map_err(|message| Problem::from(PgStatStatementsError::Validation { message }))?,
+        None => SortOrder::Desc,
+    };
+
     let pg_stat_service = PgStatStatementsService::new(state.external_service_manager.clone());
 
     let (queries, total_count) = pg_stat_service
-        .top_slow_queries(service_id, SlowQueryPage { page, page_size })
+        .top_slow_queries(
+            service_id,
+            SlowQueryPage {
+                page,
+                page_size,
+                sort_by,
+                sort_order,
+            },
+        )
         .await
         .map_err(Problem::from)?;
 
@@ -308,4 +335,95 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/external-services/{service_id}/pg-stat-statements/enable",
             post(enable_pg_stat_statements),
         )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::MockDatabase;
+
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    fn test_deployment_token_auth(project_id: i32) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_deployment_token(
+            project_id,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+        )
+    }
+
+    /// A deployment token can never satisfy `ExternalServicesRead` — the
+    /// deployment-token permission bridge in `AuthContext::has_permission`
+    /// only maps a small explicit whitelist (analytics/email/AI-gateway),
+    /// deliberately excluding external-services access. `get_slow_queries`
+    /// must reject it at the permission gate (403) regardless of the
+    /// service/project it targets, and never reach
+    /// `assert_service_owned_by_caller`'s DB-touching ownership check —
+    /// this is why `state.db` here is a bare, empty `MockDatabase`: any
+    /// unexpected query beyond the permission check would panic the mock.
+    #[tokio::test]
+    async fn get_slow_queries_rejects_deployment_token_at_permission_gate() {
+        let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "pg-stat-statements-idor-test",
+        ));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(NoopAuditLogger),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: None,
+        });
+
+        let result = get_slow_queries(
+            RequireAuth(test_deployment_token_auth(100)),
+            State(state),
+            Path(7),
+            Query(SlowQueryParams {
+                page: None,
+                page_size: None,
+                sort_by: None,
+                sort_order: None,
+            }),
+        )
+        .await;
+
+        let problem = match result {
+            Ok(_) => panic!("deployment tokens must never be granted ExternalServicesRead"),
+            Err(problem) => problem,
+        };
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
 }

@@ -231,9 +231,9 @@ export function ImportProject() {
                     ),
                     preset_config:
                       data.preset === 'dockerfile' && data.dockerfilePath
-                        ? { preset: 'dockerfile', dockerfilePath: data.dockerfilePath }
+                        ? { dockerfilePath: data.dockerfilePath }
                         : data.preset === 'docker-compose'
-                          ? { preset: 'docker-compose', composePath: (data as any).composePath || 'docker-compose.yml' }
+                          ? { composePath: (data as any).composePath || 'docker-compose.yml' }
                           : undefined,
                     exposed_port: data.preset === 'docker-compose' ? undefined : data.port,
                   },
