@@ -42,7 +42,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found, ErrorBuilder},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
@@ -1251,13 +1251,20 @@ fn validate_severity(sev: &str) -> Result<(), Problem> {
 /// - The service exists but is not linked to the user's project (return 404
 ///   — do not distinguish these cases to avoid leaking service existence).
 ///
-/// For session-based users, the user's project is identified via the
-/// `project_services` table — the user must have a project that owns the
-/// service.  For deployment tokens, the token's `project_id` is used.
+/// For deployment tokens, the token's bound `project_id` is checked directly
+/// against `project_services`. For session/API-key/CLI callers there is no
+/// single bound project, so ownership is expressed through team-based access:
+/// the caller must be able to access at least one of the projects the
+/// service is linked to, via the [`temps_core::ProjectAccessChecker`]
+/// extension point (ADR-028) — a no-op in OSS (no team-access concept
+/// exists), real enforcement in EE when a team-access checker is registered.
+/// This mirrors [`require_service_parameter_project_access`] in
+/// `handlers.rs`, which enforces the same rule for the credential-reveal
+/// endpoint.
 ///
 /// Returns `Ok(())` if the caller may access the service, or `Err(Problem)`
-/// with a 404 response (does not distinguish "not found" from "forbidden"
-/// to avoid leaking the existence of services in other projects).
+/// with a 404 (service not found / not linked to caller's project) or 403
+/// (linked, but caller's team has no grant on any of its projects).
 pub(crate) async fn assert_service_owned_by_caller(
     service_id: i32,
     auth: &temps_auth::AuthContext,
@@ -1287,30 +1294,116 @@ pub(crate) async fn assert_service_owned_by_caller(
         return Ok(());
     }
 
-    // For session users: check that the service exists at all (the user may
-    // have access to all projects on this server).
+    // Session/API-key/CLI caller: verify the service exists (same check as
+    // before this fix), then resolve which projects it's linked to for the
+    // access decision below.
     //
-    // FIXME(metrics-security-6): When multi-tenancy (teams/projects) is fully
-    // enforced, this must check that the user is a member of at least one
-    // project that owns this service.  For the current single-project model,
-    // any session user with the appropriate permission may access any service.
-    // A strict multi-tenant check would be:
-    //   SELECT 1 FROM project_services ps
-    //   JOIN project_members pm ON pm.project_id = ps.project_id
-    //   WHERE ps.service_id = $service_id AND pm.user_id = $user_id
+    // Deliberately a direct `project_services` query, not
+    // `ExternalServiceManager::list_service_projects` — that also fetches
+    // full project metadata with a `projects` table lookup per linked row,
+    // which is unneeded N+1 cost here (only the IDs matter) on a path now
+    // shared by every session/API-key/CLI request across 30+ handlers.
     let service_exists = state
         .external_service_manager
         .get_service(service_id)
         .await
         .is_ok();
-
     if !service_exists {
         return Err(not_found()
             .detail(format!("External service {} not found", service_id))
             .build());
     }
 
-    Ok(())
+    let project_ids: Vec<i32> = project_services::Entity::find()
+        .filter(project_services::Column::ServiceId.eq(service_id))
+        .all(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(service_id, error = %e, "assert_service_owned: failed to resolve linked projects");
+            internal_server_error()
+                .detail("Failed to verify service ownership")
+                .build()
+        })?
+        .into_iter()
+        .map(|link| link.project_id)
+        .collect();
+
+    session_caller_may_access_linked_projects(
+        auth,
+        &project_ids,
+        state.project_access_checker.as_deref(),
+    )
+    .await
+}
+
+/// Pure authorization decision for the session/API-key/CLI branch of
+/// [`assert_service_owned_by_caller`]: given the projects a service is
+/// linked to, may this caller access it?
+///
+/// * Instance-wide Admin/PlatformAdmin bypasses, matching the documented
+///   contract of [`temps_core::ProjectAccessChecker`] (implementations are
+///   not required to duplicate that check themselves).
+/// * No checker registered (plain OSS, or EE before any team-access grant
+///   exists) → allow. This "fail-open-when-unconfigured" behaviour is a
+///   documented property of the extension point, not a bug: it's what keeps
+///   an EE binary with no grants configured yet behaving identically to OSS.
+/// * Checker registered → allow iff the caller can access at least one of
+///   the linked projects.
+///
+/// Extracted as its own function — taking already-resolved data instead of
+/// `AppState` — so the decision is unit-testable without a database round
+/// trip, the same reasoning as [`deployment_visible_to_caller`] below.
+async fn session_caller_may_access_linked_projects(
+    auth: &temps_auth::AuthContext,
+    project_ids: &[i32],
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    match checker {
+        Some(checker) => {
+            require_access_to_any_linked_project(auth.user_id(), project_ids, checker).await
+        }
+        None => Ok(()),
+    }
+}
+
+/// Allow iff `user_id` can access at least one of `project_ids`, per the
+/// registered [`temps_core::ProjectAccessChecker`]. Fails closed (denies) on
+/// any infrastructure error from the checker — a checker that can't verify
+/// access must never be treated as "access granted".
+///
+/// Shared with the credential-reveal path
+/// (`handlers::require_service_parameter_project_access`), which enforces
+/// the identical rule for a different endpoint.
+pub(crate) async fn require_access_to_any_linked_project(
+    user_id: i32,
+    project_ids: &[i32],
+    checker: &dyn temps_core::ProjectAccessChecker,
+) -> Result<(), Problem> {
+    let mut infrastructure_error = None;
+    for project_id in project_ids {
+        match checker.user_can_access_project(user_id, *project_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => infrastructure_error = Some(error),
+        }
+    }
+
+    if let Some(error) = infrastructure_error {
+        error!(user_id, error = %error, "Project access check failed");
+        return Err(internal_server_error()
+            .title("Project Access Check Failed")
+            .detail("Could not verify project access; please try again")
+            .build());
+    }
+
+    Err(forbidden()
+        .title("Project Access Denied")
+        .detail("Your team membership does not include access to this service")
+        .build())
 }
 
 /// Pure authorization policy: may a caller see/act on a deployment?
@@ -1560,5 +1653,141 @@ mod tests {
         // single-project model, regardless of the deployment's project.
         assert!(deployment_visible_to_caller(1, None));
         assert!(deployment_visible_to_caller(999, None));
+    }
+
+    // ── session-caller project access (SECURITY metrics-security-6) ────────
+    //
+    // `session_caller_may_access_linked_projects` is the pure policy behind
+    // the session/API-key/CLI branch of `assert_service_owned_by_caller`.
+    // Unlike deployment tokens (checked above via a direct project_services
+    // row match), these callers have no single bound project, so ownership
+    // is expressed through the `ProjectAccessChecker` EE extension point —
+    // a no-op in OSS, real team-based enforcement in EE.
+
+    struct TestProjectAccessChecker {
+        allowed_project_ids: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for TestProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("checker infrastructure failure".into());
+            }
+            Ok(self.allowed_project_ids.contains(&project_id))
+        }
+    }
+
+    fn test_session_auth(role: temps_auth::Role) -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[tokio::test]
+    async fn session_user_allowed_with_no_checker_registered() {
+        // OSS has no team-access concept: an unregistered checker must
+        // fail open, identical to the pre-fix behaviour (existence-only).
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_admin_bypasses_a_denying_checker() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![],
+            fail: false,
+        };
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::Admin),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_user_denied_when_checker_grants_no_linked_project() {
+        // This is the actual EE-enforced fix: a non-admin member whose team
+        // has no grant on any project the service is linked to is denied,
+        // instead of the pre-fix behaviour of "any session user may access
+        // any service that exists".
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![99],
+            fail: false,
+        };
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await
+        .expect_err("no linked project is accessible — must deny");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_user_allowed_when_checker_grants_one_linked_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![11],
+            fail: false,
+        };
+        let result = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10, 11],
+            Some(&checker),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_user_denied_when_checker_infrastructure_fails() {
+        // Fail-closed: a checker that cannot verify access must never be
+        // treated as "access granted".
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![],
+            fail: true,
+        };
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[10],
+            Some(&checker),
+        )
+        .await
+        .expect_err("checker infrastructure failure must deny, not allow");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

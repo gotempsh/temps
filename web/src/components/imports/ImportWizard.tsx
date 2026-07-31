@@ -22,6 +22,7 @@ import { shouldMaskValue } from '@/lib/masking'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Card,
   CardContent,
@@ -88,6 +89,9 @@ const SOURCE_CREDENTIALS: Record<
     fields: Array<'base_url' | 'token' | 'kubeconfig' | 'deploy_yml'>
     baseUrlPlaceholder?: string
     tokenHelp?: string
+    /** Source ships a self-signed cert by default (e.g. Portainer's :9443) —
+     *  show an explicit opt-out checkbox instead of silently trusting it. */
+    allowSkipTlsVerify?: boolean
   }
 > = {
   coolify: {
@@ -113,6 +117,7 @@ const SOURCE_CREDENTIALS: Record<
     baseUrlPlaceholder: 'https://your-portainer-host:9443',
     tokenHelp:
       'Enter the Portainer admin password. A non-admin username can be supplied via the API (credentials.extra.username); the default is "admin".',
+    allowSkipTlsVerify: true,
   },
   kamal: {
     fields: ['deploy_yml'],
@@ -144,7 +149,7 @@ const STEP_CONFIG = {
   },
   'select-repository': {
     title: 'Select Repository',
-    description: 'Link to an existing repository',
+    description: 'Link to an existing repository (optional)',
     icon: GitBranch,
   },
   'configure-project': {
@@ -183,6 +188,7 @@ export function ImportWizard({
   const [credentialToken, setCredentialToken] = useState('')
   const [credentialKubeconfig, setCredentialKubeconfig] = useState('')
   const [credentialDeployYml, setCredentialDeployYml] = useState('')
+  const [credentialSkipTlsVerify, setCredentialSkipTlsVerify] = useState(false)
   const [selectedRepository, setSelectedRepository] =
     useState<RepositoryResponse | null>(null)
   const [selectedConnectionId, setSelectedConnectionId] = useState<
@@ -472,6 +478,14 @@ export function ImportWizard({
     if (credentialFields.includes('deploy_yml')) {
       extra.deploy_yml = credentialDeployYml
     }
+    if (
+      SOURCE_CREDENTIALS[selectedSource ?? '']?.allowSkipTlsVerify &&
+      credentialSkipTlsVerify
+    ) {
+      // Only ever sent when the user has explicitly opted in — the importer
+      // verifies certs by default (see temps-import-portainer/src/client.rs).
+      extra.verify_tls = 'false'
+    }
     return {
       base_url: credentialFields.includes('base_url')
         ? credentialBaseUrl.trim()
@@ -576,7 +590,13 @@ export function ImportWizard({
       case 'discover-workloads':
         return !!selectedWorkload
       case 'select-repository':
-        return !!selectedRepository && !!selectedConnectionId // Only repository is required
+        // Optional: create_plan's own describe/describe_project call already
+        // discovers the workload's git source (if any) independently of this
+        // selection — linking a Temps-tracked repository here only adds
+        // preset auto-detection and future git-push deploys. Image-only
+        // workloads and public repos with no connected provider both proceed
+        // without one.
+        return true
       case 'configure-project':
         return (
           !!projectName &&
@@ -767,6 +787,26 @@ export function ImportWizard({
                         value={credentialDeployYml}
                         onChange={(e) => setCredentialDeployYml(e.target.value)}
                       />
+                    </div>
+                  )}
+                  {SOURCE_CREDENTIALS[selectedSource]?.allowSkipTlsVerify && (
+                    <div className="flex items-start gap-2">
+                      <Checkbox
+                        id="import-skip-tls-verify"
+                        checked={credentialSkipTlsVerify}
+                        onCheckedChange={(checked) =>
+                          setCredentialSkipTlsVerify(checked === true)
+                        }
+                      />
+                      <Label
+                        htmlFor="import-skip-tls-verify"
+                        className="text-xs font-normal text-muted-foreground leading-tight"
+                      >
+                        Skip TLS certificate verification — needed for a
+                        self-signed certificate (e.g. Portainer's default
+                        install). Only enable this if you trust the network
+                        path to this instance.
+                      </Label>
                     </div>
                   )}
                   {SOURCE_CREDENTIALS[selectedSource]?.tokenHelp && (
@@ -984,9 +1024,10 @@ export function ImportWizard({
             <Alert>
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                Select a repository to link with the imported workload. This is
-                required for automatic preset detection and deployment
-                integration.
+                Optionally link a repository for automatic preset detection
+                and future git-push deploys. Image-only workloads and public
+                repositories deploy fine without one — the framework preset
+                and branch can be set manually on the next step.
               </AlertDescription>
             </Alert>
 

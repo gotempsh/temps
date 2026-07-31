@@ -94,6 +94,12 @@ pub struct TraceQueryParams {
     pub sort_by: Option<String>,
     /// Sort direction: "asc" or "desc" (default).
     pub sort_order: Option<String>,
+    /// Whether to compute `total` on the trace-summaries list. Defaults to
+    /// true. Set false when the caller only needs the page itself (an
+    /// existence probe, a poll, an infinite-scroll feed): the total is a
+    /// second aggregation over the whole window, and skipping it removes one
+    /// of the two queries the endpoint would otherwise issue.
+    pub include_total: Option<bool>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -155,7 +161,12 @@ pub struct TracesResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TraceSummariesResponse {
     pub data: Vec<TraceSummary>,
-    pub total: u64,
+    /// Total traces matching the filters, ignoring pagination. Omitted when
+    /// the request passed `include_total=false`, in which case the caller
+    /// asked not to pay for the count — treat its absence as "unknown", not
+    /// as zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -570,6 +581,7 @@ pub async fn query_traces(
         ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("sort_by" = Option<String>, Query, description = "Sort field: 'start_time' (default) or 'duration'"),
         ("sort_order" = Option<String>, Query, description = "Sort direction: 'asc' or 'desc' (default)"),
+        ("include_total" = Option<bool>, Query, description = "Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -629,15 +641,24 @@ pub async fn query_trace_summaries(
         offset: params.offset,
     };
 
-    // Clone query for the count call (which ignores limit/offset)
-    let count_query = TraceQuery {
-        limit: None,
-        offset: None,
-        ..query.clone()
+    // The page and the total are independent aggregations over the same
+    // window, so issue them concurrently rather than paying for both in
+    // series. `include_total=false` skips the second one entirely.
+    let (mut data, total) = if params.include_total.unwrap_or(true) {
+        // Clone query for the count call (which ignores limit/offset)
+        let count_query = TraceQuery {
+            limit: None,
+            offset: None,
+            ..query.clone()
+        };
+        let (data, total) = tokio::try_join!(
+            state.otel_service.query_trace_summaries(query),
+            state.otel_service.count_traces(count_query),
+        )?;
+        (data, Some(total))
+    } else {
+        (state.otel_service.query_trace_summaries(query).await?, None)
     };
-
-    let mut data = state.otel_service.query_trace_summaries(query).await?;
-    let total = state.otel_service.count_traces(count_query).await?;
 
     // Name cross-project trace rows whose root span lives in a sibling project:
     // when this project holds only child spans, the summary has no root and would
@@ -1282,6 +1303,38 @@ pub async fn get_unified_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `include_total=false` must OMIT the key rather than report 0. A client
+    /// that reads `total ?? 0` would otherwise render "0 traces" over a full
+    /// page of results.
+    #[test]
+    fn trace_summaries_response_omits_total_when_not_requested() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: None,
+        })
+        .expect("serialize");
+
+        assert!(
+            json.get("total").is_none(),
+            "absent total must mean 'not computed', never zero: {json}"
+        );
+    }
+
+    #[test]
+    fn trace_summaries_response_includes_total_when_computed() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: Some(0),
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            json.get("total").and_then(|t| t.as_u64()),
+            Some(0),
+            "a genuinely-zero total must still be serialized: {json}"
+        );
+    }
 
     #[test]
     fn test_parse_attributes_single_pair() {

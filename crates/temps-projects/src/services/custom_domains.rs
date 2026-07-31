@@ -1,7 +1,8 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_core::url_validation;
-use temps_entities::project_custom_domains;
+use temps_core::AppSettings;
+use temps_entities::{project_custom_domains, settings};
 use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
@@ -31,6 +32,29 @@ pub struct CustomDomainService {
 impl CustomDomainService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    /// Rejects domains that the platform itself serves (issue #478).
+    ///
+    /// Pointing a project at the console hostname (`external_url`) or the
+    /// preview-domain apex hijacks the proxy route for the control plane, and
+    /// the only way back in is the server's public IP — so the assignment is
+    /// refused up front instead of being made and then undone.
+    async fn ensure_domain_not_reserved(&self, domain: &str) -> Result<(), CustomDomainError> {
+        let settings = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+
+        if settings.is_reserved_hostname(domain) {
+            return Err(CustomDomainError::InvalidDomain(format!(
+                "'{}' is reserved by Temps itself (console or preview domain) and cannot be assigned to a project",
+                domain
+            )));
+        }
+
+        Ok(())
     }
 
     /// Normalizes a redirect URL by adding https:// scheme if missing
@@ -204,6 +228,9 @@ impl CustomDomainService {
             domain, project_id
         );
 
+        // Refuse hostnames the platform serves itself (console, preview apex)
+        self.ensure_domain_not_reserved(&domain).await?;
+
         // Check if domain already exists
         if let Some(_existing) = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.eq(&domain))
@@ -328,6 +355,9 @@ impl CustomDomainService {
 
         // Determine the final domain name for validation
         let final_domain = if let Some(ref new_domain) = domain {
+            // Refuse hostnames the platform serves itself (console, preview apex)
+            self.ensure_domain_not_reserved(new_domain).await?;
+
             // Check if new domain already exists (for a different record)
             if let Some(existing) = project_custom_domains::Entity::find()
                 .filter(project_custom_domains::Column::Domain.eq(new_domain))
@@ -538,6 +568,96 @@ mod tests {
         assert_eq!(domain.project_id, project_id);
         assert_eq!(domain.environment_id, env_id);
         assert_eq!(domain.status, "pending");
+    }
+
+    /// Issue #478: assigning the console hostname to a project made the
+    /// console unreachable — only the raw public IP could get the operator
+    /// back in. Create and update must both refuse it.
+    #[tokio::test]
+    async fn test_console_domain_is_rejected() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let app_settings = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..sea_orm::ActiveModelBehavior::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        for reserved in [
+            "console.example.com",
+            "CONSOLE.example.com",
+            "apps.example.com",
+        ] {
+            let result = service
+                .create_custom_domain(
+                    project_id,
+                    env_id,
+                    reserved.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            match result {
+                Err(CustomDomainError::InvalidDomain(msg)) => assert!(
+                    msg.contains("reserved"),
+                    "expected a reserved-domain message, got: {msg}"
+                ),
+                other => panic!("expected InvalidDomain for '{reserved}', got: {other:?}"),
+            }
+        }
+
+        // A normal domain still works, and cannot be renamed onto the console.
+        let created = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "shop.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = service
+            .update_custom_domain(
+                created.id,
+                Some("console.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CustomDomainError::InvalidDomain(_))),
+            "renaming a domain onto the console hostname must be refused"
+        );
     }
 
     #[tokio::test]
