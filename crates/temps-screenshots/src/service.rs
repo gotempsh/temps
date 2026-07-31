@@ -85,10 +85,11 @@ impl ScreenshotService {
         };
 
         // Check if provider is available
-        if !provider.is_available().await {
+        if let Err(e) = provider.check_availability().await {
             warn!(
-                "Screenshot provider '{}' may not be available",
-                provider.provider_name()
+                "Screenshot provider '{}' may not be available: {}",
+                provider.provider_name(),
+                e
             );
         }
 
@@ -202,5 +203,10 @@ impl ScreenshotService {
     /// Check if the provider is available
     pub async fn is_provider_available(&self) -> bool {
         self.provider.is_available().await
+    }
+
+    /// Check whether the provider is available, returning the reason if it is not
+    pub async fn check_provider_availability(&self) -> ScreenshotResult<()> {
+        self.provider.check_availability().await
     }
 }

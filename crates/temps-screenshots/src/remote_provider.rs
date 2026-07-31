@@ -11,6 +11,33 @@ use tracing::{debug, error, info};
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::provider::ScreenshotProvider;
 
+/// Strip credentials and query parameters from a URL before it appears in an
+/// error message.
+///
+/// The remote screenshot service URL is operator-supplied free text and is the
+/// only place credentials for that service can be configured (`api_key` is not
+/// wired through from settings), so it routinely contains userinfo
+/// (`https://user:pass@host`) or a key in the query string. Availability errors
+/// are persisted to `deployment_jobs.error_message` and rendered to every
+/// project member, so only scheme, host, port and path may survive.
+///
+/// An unparsable URL yields a placeholder rather than the raw string — falling
+/// back to the original would defeat the whole point.
+fn redact_url(raw: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return "<invalid screenshot service URL>".to_string();
+    };
+
+    // Errors here only occur for URLs that cannot have credentials (e.g. `data:`),
+    // in which case there is nothing to strip.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+
+    parsed.to_string()
+}
+
 /// Remote screenshot provider that calls an external API
 pub struct RemoteScreenshotProvider {
     /// Base URL of the screenshot service
@@ -147,22 +174,82 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
         "remote-api"
     }
 
-    async fn is_available(&self) -> bool {
+    async fn check_availability(&self) -> ScreenshotResult<()> {
         // Try a simple health check to the service URL
         let health_url = format!("{}/health", self.service_url.trim_end_matches('/'));
-        self.client
+        // This error reaches the deployment job's error_message, which is visible to
+        // every project member — never let the configured URL through verbatim, it
+        // is the only place an operator can put credentials for the remote service.
+        let safe_url = redact_url(&health_url);
+
+        let response = self
+            .client
             .get(&health_url)
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .map_err(|e| {
+                // `without_url()` strips the request URL from reqwest's own Display
+                // output, which would otherwise re-introduce the unredacted URL.
+                ScreenshotError::ProviderError(format!(
+                    "Remote screenshot service health check failed for {}: {}. \
+                     Verify the service URL is correct and reachable from this server.",
+                    safe_url,
+                    e.without_url()
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            return Err(ScreenshotError::ProviderError(format!(
+                "Remote screenshot service health check for {} returned HTTP {}. \
+                 Verify the service is healthy and the API key is valid.",
+                safe_url,
+                response.status()
+            )));
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Availability errors are stored in `deployment_jobs.error_message` and shown
+    /// to every project member, so credentials configured in the service URL must
+    /// never survive into them.
+    #[test]
+    fn test_redact_url_strips_credentials_and_query() {
+        assert_eq!(
+            redact_url("https://admin:hunter2@shots.internal:8443/health"),
+            "https://shots.internal:8443/health"
+        );
+        assert_eq!(
+            redact_url("https://shots.example.com/health?api_key=sk_live_secret"),
+            "https://shots.example.com/health"
+        );
+        assert_eq!(
+            redact_url("https://token@shots.example.com/health"),
+            "https://shots.example.com/health"
+        );
+        // Host, port and path are preserved — the operator still needs to know
+        // which endpoint failed.
+        assert_eq!(
+            redact_url("http://127.0.0.1:9000/api/v1/health"),
+            "http://127.0.0.1:9000/api/v1/health"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_does_not_echo_unparsable_input() {
+        let redacted = redact_url("not a url with pass:word@ in it");
+        assert!(
+            !redacted.contains("pass:word"),
+            "unparsable input must not be echoed back, got: {}",
+            redacted
+        );
+    }
 
     #[tokio::test]
     async fn test_remote_provider_creation() {

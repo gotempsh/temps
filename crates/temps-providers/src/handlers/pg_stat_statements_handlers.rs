@@ -203,6 +203,7 @@ async fn get_slow_queries(
     Query(params): Query<SlowQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &state).await?;
 
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params
@@ -334,4 +335,95 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/external-services/{service_id}/pg-stat-statements/enable",
             post(enable_pg_stat_statements),
         )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::MockDatabase;
+
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    fn test_deployment_token_auth(project_id: i32) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_deployment_token(
+            project_id,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+        )
+    }
+
+    /// A deployment token can never satisfy `ExternalServicesRead` — the
+    /// deployment-token permission bridge in `AuthContext::has_permission`
+    /// only maps a small explicit whitelist (analytics/email/AI-gateway),
+    /// deliberately excluding external-services access. `get_slow_queries`
+    /// must reject it at the permission gate (403) regardless of the
+    /// service/project it targets, and never reach
+    /// `assert_service_owned_by_caller`'s DB-touching ownership check —
+    /// this is why `state.db` here is a bare, empty `MockDatabase`: any
+    /// unexpected query beyond the permission check would panic the mock.
+    #[tokio::test]
+    async fn get_slow_queries_rejects_deployment_token_at_permission_gate() {
+        let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "pg-stat-statements-idor-test",
+        ));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(NoopAuditLogger),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: None,
+        });
+
+        let result = get_slow_queries(
+            RequireAuth(test_deployment_token_auth(100)),
+            State(state),
+            Path(7),
+            Query(SlowQueryParams {
+                page: None,
+                page_size: None,
+                sort_by: None,
+                sort_order: None,
+            }),
+        )
+        .await;
+
+        let problem = match result {
+            Ok(_) => panic!("deployment tokens must never be granted ExternalServicesRead"),
+            Err(problem) => problem,
+        };
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
 }

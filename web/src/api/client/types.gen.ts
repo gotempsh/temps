@@ -5295,6 +5295,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5314,24 +5332,6 @@ export type DockerRegistrySettingsMasked = {
     registry_url?: string | null;
     tls_verify: boolean;
     username?: string | null;
-};
-
-/**
- * Configuration for Docker Compose deployments.
- */
-export type DockerComposePresetConfig = {
-    /**
-     * User-provided docker-compose.override.yml content.
-     */
-    composeOverride?: string | null;
-    /**
-     * Path to the Compose file relative to the project directory.
-     */
-    composePath?: string | null;
-    /**
-     * Compose service ports that should be publicly routed.
-     */
-    publicPorts?: Array<ComposePublicPort>;
 };
 
 /**
@@ -15045,7 +15045,9 @@ export type SlowQueryRow = {
      */
     calls: number;
     /**
-     * Name of the database this query ran against. `(dropped database)` when the originating database no longer exists but `pg_stat_statements` still holds stats for it.
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
      */
     database: string;
     /**
@@ -16309,7 +16311,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -27346,7 +27354,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27822,7 +27830,10 @@ export type GetSlowQueriesData = {
          */
         page_size?: number | null;
         /**
-         * Column to sort by: one of `calls`, `total_exec_time_ms`, `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to `mean_exec_time_ms`. Applied server-side so ordering stays consistent across pages.
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
          */
         sort_by?: string | null;
         /**
@@ -32156,6 +32167,10 @@ export type RevealNotificationProviderConfigErrors = {
      */
     400: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * Provider or field not found
      */
     404: unknown;
@@ -33402,6 +33417,10 @@ export type QueryTraceSummariesData = {
          * Sort direction: 'asc' or 'desc' (default)
          */
         sort_order?: string;
+        /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -37904,7 +37923,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -37957,7 +37976,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -38813,6 +38832,10 @@ export type GetContainerEnvironmentVariableData = {
 };
 
 export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
     /**
      * Container or environment variable not found
      */
@@ -41245,6 +41268,10 @@ export type RevealMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
@@ -45495,6 +45522,10 @@ export type RevealGlobalMcpConfigErrors = {
      */
     401: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * MCP server or field not found
      */
     404: unknown;
@@ -47897,6 +47928,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -47925,6 +47960,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */
