@@ -20,175 +20,221 @@ use nixpacks::nixpacks::{
     logger::Logger,
     plan::{
         generator::{GeneratePlanOptions, NixpacksBuildPlanGenerator},
+        BuildPlan,
         PlanGenerator,
     },
 };
 use std::collections::HashMap;
 use std::path::Path;
+pub use temps_entities::preset::NixpacksProvider;
+use temps_entities::preset::NixpacksConfig;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-/// Nixpacks provider type - represents which language/framework nixpacks will use
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NixpacksProvider {
-    Auto,     // Auto-detect (default)
-    Node,     // Node.js / JavaScript
-    Python,   // Python
-    Rust,     // Rust
-    Go,       // Go
-    Java,     // Java
-    Php,      // PHP
-    Ruby,     // Ruby
-    Deno,     // Deno
-    Elixir,   // Elixir
-    CSharp,   // C# / .NET
-    FSharp,   // F# / .NET
-    Dart,     // Dart
-    Swift,    // Swift
-    Zig,      // Zig
-    Scala,    // Scala
-    Haskell,  // Haskell
-    Clojure,  // Clojure
-    Crystal,  // Crystal
-    Cobol,    // COBOL
-    Gleam,    // Gleam
-    Lunatic,  // Lunatic
-    Scheme,   // Scheme (Haunt)
-    Static,   // Static files
+fn provider_name(provider: NixpacksProvider) -> &'static str {
+    match provider {
+        NixpacksProvider::Auto => "Auto-detect",
+        NixpacksProvider::Node => "Node.js",
+        NixpacksProvider::Python => "Python",
+        NixpacksProvider::Rust => "Rust",
+        NixpacksProvider::Go => "Go",
+        NixpacksProvider::Java => "Java",
+        NixpacksProvider::Php => "PHP",
+        NixpacksProvider::Ruby => "Ruby",
+        NixpacksProvider::Deno => "Deno",
+        NixpacksProvider::Elixir => "Elixir",
+        NixpacksProvider::CSharp => "C# / .NET",
+        NixpacksProvider::FSharp => "F# / .NET",
+        NixpacksProvider::Dart => "Dart",
+        NixpacksProvider::Swift => "Swift",
+        NixpacksProvider::Zig => "Zig",
+        NixpacksProvider::Scala => "Scala",
+        NixpacksProvider::Haskell => "Haskell",
+        NixpacksProvider::Clojure => "Clojure",
+        NixpacksProvider::Crystal => "Crystal",
+        NixpacksProvider::Cobol => "COBOL",
+        NixpacksProvider::Gleam => "Gleam",
+        NixpacksProvider::Lunatic => "Lunatic",
+        NixpacksProvider::Scheme => "Scheme",
+        NixpacksProvider::Static => "Static Files",
+    }
 }
 
-impl NixpacksProvider {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Auto => "Auto-detect",
-            Self::Node => "Node.js",
-            Self::Python => "Python",
-            Self::Rust => "Rust",
-            Self::Go => "Go",
-            Self::Java => "Java",
-            Self::Php => "PHP",
-            Self::Ruby => "Ruby",
-            Self::Deno => "Deno",
-            Self::Elixir => "Elixir",
-            Self::CSharp => "C# / .NET",
-            Self::FSharp => "F# / .NET",
-            Self::Dart => "Dart",
-            Self::Swift => "Swift",
-            Self::Zig => "Zig",
-            Self::Scala => "Scala",
-            Self::Haskell => "Haskell",
-            Self::Clojure => "Clojure",
-            Self::Crystal => "Crystal",
-            Self::Cobol => "COBOL",
-            Self::Gleam => "Gleam",
-            Self::Lunatic => "Lunatic",
-            Self::Scheme => "Scheme",
-            Self::Static => "Static Files",
-        }
+fn provider_icon_url(provider: NixpacksProvider) -> &'static str {
+    match provider {
+        NixpacksProvider::Auto => "/presets/nixpacks.svg",
+        NixpacksProvider::Node => "/presets/nodejs.svg",
+        NixpacksProvider::Python => "/presets/python.svg",
+        NixpacksProvider::Rust => "/presets/rust.svg",
+        NixpacksProvider::Go => "/presets/go.svg",
+        NixpacksProvider::Java => "/presets/java.svg",
+        NixpacksProvider::Php => "/presets/php.svg",
+        NixpacksProvider::Ruby => "/presets/ruby.svg",
+        NixpacksProvider::Deno => "/presets/deno.svg",
+        NixpacksProvider::Elixir => "/presets/elixir.svg",
+        NixpacksProvider::CSharp => "/presets/dotnet.svg",
+        NixpacksProvider::FSharp => "/presets/fsharp.svg",
+        NixpacksProvider::Dart => "/presets/dart.svg",
+        NixpacksProvider::Swift => "/presets/swift.svg",
+        NixpacksProvider::Zig => "/presets/zig.svg",
+        NixpacksProvider::Scala => "/presets/scala.svg",
+        NixpacksProvider::Haskell => "/presets/haskell.svg",
+        NixpacksProvider::Clojure => "/presets/clojure.svg",
+        NixpacksProvider::Crystal => "/presets/crystal.svg",
+        NixpacksProvider::Cobol => "/presets/cobol.svg",
+        NixpacksProvider::Gleam => "/presets/gleam.svg",
+        NixpacksProvider::Lunatic => "/presets/lunatic.svg",
+        NixpacksProvider::Scheme => "/presets/scheme.svg",
+        NixpacksProvider::Static => "/presets/static.svg",
     }
+}
 
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Self::Auto => "nixpacks",
-            Self::Node => "nixpacks-node",
-            Self::Python => "nixpacks-python",
-            Self::Rust => "nixpacks-rust",
-            Self::Go => "nixpacks-go",
-            Self::Java => "nixpacks-java",
-            Self::Php => "nixpacks-php",
-            Self::Ruby => "nixpacks-ruby",
-            Self::Deno => "nixpacks-deno",
-            Self::Elixir => "nixpacks-elixir",
-            Self::CSharp => "nixpacks-csharp",
-            Self::FSharp => "nixpacks-fsharp",
-            Self::Dart => "nixpacks-dart",
-            Self::Swift => "nixpacks-swift",
-            Self::Zig => "nixpacks-zig",
-            Self::Scala => "nixpacks-scala",
-            Self::Haskell => "nixpacks-haskell",
-            Self::Clojure => "nixpacks-clojure",
-            Self::Crystal => "nixpacks-crystal",
-            Self::Cobol => "nixpacks-cobol",
-            Self::Gleam => "nixpacks-gleam",
-            Self::Lunatic => "nixpacks-lunatic",
-            Self::Scheme => "nixpacks-scheme",
-            Self::Static => "nixpacks-static",
+fn provider_description(provider: NixpacksProvider) -> &'static str {
+    match provider {
+        NixpacksProvider::Auto => "Auto-detects your language and framework from the repository",
+        NixpacksProvider::Node => {
+            "Node.js apps — Nuxt, Vue, SvelteKit, Astro, Remix, Express, and more"
         }
-    }
-
-    pub fn icon_url(&self) -> &'static str {
-        match self {
-            Self::Auto => "/presets/nixpacks.svg",
-            Self::Node => "/presets/nodejs.svg",
-            Self::Python => "/presets/python.svg",
-            Self::Rust => "/presets/rust.svg",
-            Self::Go => "/presets/go.svg",
-            Self::Java => "/presets/java.svg",
-            Self::Php => "/presets/php.svg",
-            Self::Ruby => "/presets/ruby.svg",
-            Self::Deno => "/presets/deno.svg",
-            Self::Elixir => "/presets/elixir.svg",
-            Self::CSharp => "/presets/dotnet.svg",
-            Self::FSharp => "/presets/fsharp.svg",
-            Self::Dart => "/presets/dart.svg",
-            Self::Swift => "/presets/swift.svg",
-            Self::Zig => "/presets/zig.svg",
-            Self::Scala => "/presets/scala.svg",
-            Self::Haskell => "/presets/haskell.svg",
-            Self::Clojure => "/presets/clojure.svg",
-            Self::Crystal => "/presets/crystal.svg",
-            Self::Cobol => "/presets/cobol.svg",
-            Self::Gleam => "/presets/gleam.svg",
-            Self::Lunatic => "/presets/lunatic.svg",
-            Self::Scheme => "/presets/scheme.svg",
-            Self::Static => "/presets/static.svg",
+        NixpacksProvider::Python => {
+            "Python web applications (Django, Flask, FastAPI, etc.)"
         }
-    }
-
-    /// Get all available provider variants
-    pub fn all() -> Vec<Self> {
-        vec![
-            Self::Auto,
-            Self::Node,
-            Self::Python,
-            Self::Rust,
-            Self::Go,
-            Self::Java,
-            Self::Php,
-            Self::Ruby,
-            Self::Deno,
-            Self::Elixir,
-            Self::CSharp,
-            Self::FSharp,
-            Self::Dart,
-            Self::Swift,
-            Self::Zig,
-            Self::Scala,
-            Self::Haskell,
-            Self::Clojure,
-            Self::Crystal,
-            Self::Cobol,
-            Self::Gleam,
-            Self::Lunatic,
-            Self::Scheme,
-            Self::Static,
-        ]
+        NixpacksProvider::Rust => "Rust web applications and services",
+        NixpacksProvider::Go => "Go web applications and services",
+        NixpacksProvider::Java => {
+            "Java web applications (Spring Boot, Micronaut, Quarkus, etc.)"
+        }
+        NixpacksProvider::Php => "PHP applications — Laravel, Symfony, and more",
+        NixpacksProvider::Ruby => "Ruby applications — Ruby on Rails and more",
+        NixpacksProvider::Deno => "Deno applications and services",
+        NixpacksProvider::Elixir => "Elixir applications — Phoenix and more",
+        NixpacksProvider::CSharp => "C# / .NET applications and services",
+        NixpacksProvider::FSharp => "F# / .NET applications and services",
+        NixpacksProvider::Dart => "Dart applications and services",
+        NixpacksProvider::Swift => "Swift applications and services",
+        NixpacksProvider::Zig => "Zig applications and services",
+        NixpacksProvider::Scala => "Scala applications and services",
+        NixpacksProvider::Haskell => "Haskell applications and services",
+        NixpacksProvider::Clojure => "Clojure applications and services",
+        NixpacksProvider::Crystal => "Crystal applications and services",
+        NixpacksProvider::Cobol => "COBOL applications and services",
+        NixpacksProvider::Gleam => "Gleam applications and services",
+        NixpacksProvider::Lunatic => "Lunatic applications and services",
+        NixpacksProvider::Scheme => "Scheme applications and services",
+        NixpacksProvider::Static => "Pre-built static files, no build step",
     }
 }
 
 pub struct NixpacksPreset {
-    provider: NixpacksProvider,
+    config: NixpacksConfig,
 }
 
 impl NixpacksPreset {
     pub fn new(provider: NixpacksProvider) -> Self {
-        Self { provider }
+        let providers = if provider == NixpacksProvider::Auto {
+            Vec::new()
+        } else {
+            vec![provider]
+        };
+        Self {
+            config: NixpacksConfig {
+                providers,
+                ..Default::default()
+            },
+        }
     }
 
     pub fn auto() -> Self {
-        Self {
-            provider: NixpacksProvider::Auto,
+        Self::new(NixpacksProvider::Auto)
+    }
+
+    pub fn from_config(config: NixpacksConfig) -> Self {
+        Self { config }
+    }
+
+    pub(super) fn validate_config(
+        config: &NixpacksConfig,
+    ) -> Result<(), crate::PresetResolutionError> {
+        if let Some(value) = config.nixpacks_config.as_deref() {
+            BuildPlan::from_toml(value).map_err(|_| {
+                crate::PresetResolutionError::InvalidConfig {
+                    slug: "nixpacks".to_string(),
+                    reason: "failed to parse Nixpacks TOML; verify its syntax and supported fields"
+                        .to_string(),
+                }
+            })?;
         }
+        Ok(())
+    }
+
+    fn display_provider(&self) -> NixpacksProvider {
+        match self.config.providers.as_slice() {
+            [provider] => *provider,
+            _ => NixpacksProvider::Auto,
+        }
+    }
+
+    fn generate_plan_options(&self) -> Result<GeneratePlanOptions, String> {
+        let mut plan = match self.config.nixpacks_config.as_deref() {
+            Some(config) => BuildPlan::from_toml(config).map_err(|_| {
+                "Failed to parse custom Nixpacks config; verify its syntax and supported fields"
+                    .to_string()
+            })?,
+            None => BuildPlan::default(),
+        };
+
+        if !self.config.providers.is_empty() {
+            plan.providers = Some(
+                self.config
+                    .providers
+                    .iter()
+                    .map(|provider| provider.nixpacks_name().to_string())
+                    .collect(),
+            );
+        }
+
+        Ok(GeneratePlanOptions {
+            plan: Some(plan),
+            ..Default::default()
+        })
+    }
+
+    fn generate_build_plan(
+        &self,
+        app: &App,
+        environment: &Environment,
+    ) -> Result<BuildPlan, String> {
+        let providers: &[&dyn nixpacks::providers::Provider] = &[
+            &nixpacks::providers::node::NodeProvider {},
+            &nixpacks::providers::python::PythonProvider {},
+            &nixpacks::providers::rust::RustProvider {},
+            &nixpacks::providers::go::GolangProvider {},
+            &nixpacks::providers::java::JavaProvider {},
+            &nixpacks::providers::php::PhpProvider {},
+            &nixpacks::providers::ruby::RubyProvider {},
+            &nixpacks::providers::deno::DenoProvider {},
+            &nixpacks::providers::elixir::ElixirProvider {},
+            &nixpacks::providers::csharp::CSharpProvider {},
+            &nixpacks::providers::fsharp::FSharpProvider {},
+            &nixpacks::providers::dart::DartProvider {},
+            &nixpacks::providers::swift::SwiftProvider {},
+            &nixpacks::providers::zig::ZigProvider {},
+            &nixpacks::providers::scala::ScalaProvider {},
+            &nixpacks::providers::haskell::HaskellStackProvider {},
+            &nixpacks::providers::clojure::ClojureProvider {},
+            &nixpacks::providers::crystal::CrystalProvider {},
+            &nixpacks::providers::cobol::CobolProvider {},
+            &nixpacks::providers::gleam::GleamProvider {},
+            &nixpacks::providers::lunatic::LunaticProvider {},
+            &nixpacks::providers::scheme::HauntProvider {},
+            &nixpacks::providers::staticfile::StaticfileProvider {},
+        ];
+
+        let options = self.generate_plan_options()?;
+        let mut generator = NixpacksBuildPlanGenerator::new(providers, options);
+        generator
+            .generate_plan(app, environment)
+            .map(|(plan, _)| plan)
+            .map_err(|error| format!("Failed to generate build plan: {}", error))
     }
 
     /// Detect which providers are available for a given path
@@ -451,42 +497,9 @@ impl NixpacksPreset {
         let environment = Environment::from_envs(env_vars)
             .map_err(|e| format!("Failed to create environment: {}", e))?;
 
-        // Get all providers
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
-        ];
-
-        // Generate build plan
-        let mut generator =
-            NixpacksBuildPlanGenerator::new(providers, GeneratePlanOptions {
-                ..Default::default()
-            });
-
-        let (plan, _app) = generator
-            .generate_plan(&app, &environment)
-            .map_err(|e| format!("Failed to generate build plan: {}", e))?;
+        // Generate the build plan with the persisted provider selection and
+        // optional user-supplied Nixpacks plan.
+        let plan = self.generate_build_plan(&app, &environment)?;
 
         // Validate plan
         let phase_count = plan.phases.clone().map_or(0, |phases| phases.len());
@@ -531,8 +544,11 @@ impl NixpacksPreset {
             }
         }
 
-        debug!("Generated Dockerfile:\n{}", dockerfile);
-        debug!("Build args: {:?}", build_args);
+        debug!(
+            dockerfile_bytes = dockerfile.len(),
+            build_arg_count = build_args.len(),
+            "Generated Nixpacks Dockerfile"
+        );
         info!(
             "Successfully generated Dockerfile using nixpacks with {} build args",
             build_args.len()
@@ -549,11 +565,57 @@ impl Preset for NixpacksPreset {
     }
 
     fn label(&self) -> String {
-        format!("Nixpacks ({})", self.provider.name())
+        if self.config.providers.len() > 1 {
+            let providers = self
+                .config
+                .providers
+                .iter()
+                .map(|provider| provider_name(*provider))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            format!("Nixpacks ({})", providers)
+        } else {
+            format!("Nixpacks ({})", provider_name(self.display_provider()))
+        }
     }
 
     fn icon_url(&self) -> String {
-        self.provider.icon_url().to_string()
+        provider_icon_url(self.display_provider()).to_string()
+    }
+
+    fn description(&self) -> String {
+        provider_description(self.display_provider()).to_string()
+    }
+
+    fn stored_preset(&self) -> Option<temps_entities::preset::Preset> {
+        Some(temps_entities::preset::Preset::Nixpacks)
+    }
+
+    fn resolve_storage(
+        &self,
+        config: Option<temps_entities::preset::PresetConfig>,
+    ) -> Result<crate::StoredPreset, crate::PresetResolutionError> {
+        let mut config = match config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => config,
+            Some(other) => {
+                return Err(crate::PresetResolutionError::ConfigMismatch {
+                    config_preset: other.preset_type(),
+                    slug: self.slug(),
+                });
+            }
+            None => NixpacksConfig::default(),
+        };
+
+        Self::validate_config(&config)?;
+
+        if !self.config.providers.is_empty() {
+            config.providers = self.config.providers.clone();
+        }
+
+        Ok(crate::StoredPreset {
+            preset: temps_entities::preset::Preset::Nixpacks,
+            config: Some(temps_entities::preset::PresetConfig::Nixpacks(config)),
+        })
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
@@ -611,7 +673,10 @@ COPY . .
     }
 
     fn slug(&self) -> String {
-        self.provider.slug().to_string()
+        match self.config.providers.as_slice() {
+            [provider] => provider.variant_slug().to_string(),
+            _ => "nixpacks".to_string(),
+        }
     }
 }
 
@@ -759,6 +824,46 @@ if __name__ == '__main__':
         assert_eq!(preset.slug(), "nixpacks");
         assert_eq!(preset.label(), "Nixpacks (Auto-detect)");
         assert!(matches!(preset.project_type(), ProjectType::Server));
+    }
+
+    #[test]
+    fn test_nixpacks_provider_selection_reaches_plan_options() {
+        let preset = NixpacksPreset::from_config(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Node],
+        });
+        let options = preset.generate_plan_options().unwrap();
+
+        assert_eq!(
+            options.plan.and_then(|plan| plan.providers),
+            Some(vec!["node".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_nixpacks_multiple_providers_preserve_order_and_auto_marker() {
+        let preset = NixpacksPreset::from_config(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        });
+        let options = preset.generate_plan_options().unwrap();
+
+        assert_eq!(
+            options.plan.and_then(|plan| plan.providers),
+            Some(vec!["...".to_string(), "python".to_string()])
+        );
+        assert_eq!(preset.slug(), "nixpacks");
+    }
+
+    #[test]
+    fn test_nixpacks_invalid_custom_config_is_contextual() {
+        let preset = NixpacksPreset::from_config(NixpacksConfig {
+            nixpacks_config: Some("invalid = [".to_string()),
+            providers: Vec::new(),
+        });
+
+        let error = preset.generate_plan_options().unwrap_err();
+        assert!(error.contains("Failed to parse custom Nixpacks config"));
     }
 
     fn create_rust_project() -> TempDir {
@@ -1142,6 +1247,23 @@ environment:
     }
 
     #[test]
+    fn test_explicit_csharp_provider_uses_native_nixpacks_name() {
+        let temp_dir = create_csharp_project();
+        let app = App::new(temp_dir.path().to_string_lossy().as_ref()).unwrap();
+        let environment = Environment::from_envs(vec![]).unwrap();
+        let preset = NixpacksPreset::from_config(NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::CSharp],
+        });
+
+        let plan = preset
+            .generate_build_plan(&app, &environment)
+            .expect("explicit C# provider should resolve in Nixpacks");
+
+        assert!(!plan.phases.unwrap_or_default().is_empty());
+    }
+
+    #[test]
     fn test_nixpacks_detects_dart() {
         let temp_dir = create_dart_project();
         assert!(
@@ -1183,6 +1305,56 @@ environment:
                 || dockerfile.content.contains("setup")
                 || dockerfile.content.contains("install"),
             "Content should contain nixpacks build plan information"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stored_python_provider_controls_ambiguous_project_build() {
+        let temp_dir = create_python_project();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{
+  "name": "ambiguous-app",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "express": "^4.18.0" }
+}"#,
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("index.js"), "console.log('node')").unwrap();
+
+        let stored_config =
+            temps_entities::preset::PresetConfig::Nixpacks(NixpacksConfig {
+                nixpacks_config: None,
+                providers: vec![NixpacksProvider::Python],
+            });
+        let preset = crate::get_preset_for_storage(
+            temps_entities::preset::Preset::Nixpacks,
+            Some(&stored_config),
+        )
+        .expect("stored Nixpacks config should be valid")
+        .expect("stored Nixpacks preset should resolve");
+        let dockerfile = preset
+            .dockerfile(DockerfileConfig {
+                use_buildkit: true,
+                root_local_path: temp_dir.path(),
+                local_path: temp_dir.path(),
+                install_command: None,
+                build_command: None,
+                output_dir: None,
+                build_vars: None,
+                project_slug: "ambiguous-project",
+            })
+            .await;
+
+        assert!(
+            !dockerfile.content.contains("Nixpacks failed"),
+            "{}",
+            dockerfile.content
+        );
+        assert!(
+            dockerfile.content.to_lowercase().contains("python"),
+            "expected Python build plan, got:\n{}",
+            dockerfile.content
         );
     }
 

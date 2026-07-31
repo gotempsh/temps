@@ -1021,11 +1021,112 @@ impl AppSettings {
             .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
         raw.trim_end_matches('/').to_string()
     }
+
+    /// Hostname the Temps console is served on, derived from `external_url`.
+    ///
+    /// Returns `None` when `external_url` is unset or unparsable (installs
+    /// reached by raw IP), in which case there is no console hostname to
+    /// protect.
+    pub fn console_hostname(&self) -> Option<String> {
+        let raw = self.external_url.as_ref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        // Tolerate a bare host ("console.example.com") as well as a full URL.
+        let candidate = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("https://{raw}")
+        };
+        url::Url::parse(&candidate)
+            .ok()?
+            .host_str()
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    }
+
+    /// True when `host` is owned by the platform itself and must never be
+    /// claimed by a project domain.
+    ///
+    /// Reserved hosts are the console hostname (`external_url`) and the
+    /// preview domain apex — routing either of them at a project makes the
+    /// console or every generated preview URL unreachable, and recovering
+    /// requires shell/IP access to the box (issue #478).
+    pub fn is_reserved_hostname(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        let preview = self
+            .preview_domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        !preview.is_empty() && preview == host
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #478: a project domain must never be allowed to claim the
+    // console hostname — doing so locks the operator out of the console and
+    // recovery requires the raw public IP.
+    #[test]
+    fn console_hostname_parses_url_and_bare_host() {
+        let with_external_url = |raw: Option<&str>| AppSettings {
+            external_url: raw.map(str::to_string),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            with_external_url(Some("https://Console.Example.com:8443/"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(
+            with_external_url(Some("console.example.com"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(with_external_url(Some("   ")).console_hostname(), None);
+        assert_eq!(with_external_url(None).console_hostname(), None);
+    }
+
+    #[test]
+    fn reserved_hostname_covers_console_and_preview_apex() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+
+        assert!(s.is_reserved_hostname("console.example.com"));
+        // Case and trailing-dot variants are the same host.
+        assert!(s.is_reserved_hostname("CONSOLE.example.com."));
+        assert!(s.is_reserved_hostname("apps.example.com"));
+
+        // Ordinary project domains, including subdomains of the preview
+        // domain, stay assignable.
+        assert!(!s.is_reserved_hostname("shop.example.com"));
+        assert!(!s.is_reserved_hostname("my-app.apps.example.com"));
+        assert!(!s.is_reserved_hostname(""));
+    }
+
+    #[test]
+    fn reserved_hostname_is_inert_without_external_url() {
+        let s = AppSettings {
+            external_url: None,
+            preview_domain: String::new(),
+            ..Default::default()
+        };
+        assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
     // to avoid the DNS-timeout-cascade failure mode (22-27 s TCP delays when

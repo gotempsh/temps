@@ -25,6 +25,12 @@ pub enum ObservabilityError {
     #[error("Time range invalid: from={from} is after to={to}; the merge query needs from <= to")]
     InvalidTimeRange { from: String, to: String },
 
+    /// The requested window is wider than the shared cap. Carries the message
+    /// from [`temps_core::time_window`] verbatim, because that message names
+    /// both the limit and how to still reach older data.
+    #[error("{0}")]
+    InvalidTimeWindow(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 

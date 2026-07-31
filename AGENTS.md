@@ -5,44 +5,26 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
-## Always update `CHANGELOG.md`
+## Do not hand-edit `CHANGELOG.md`
 
-Every user-visible change in this repo lands with a `CHANGELOG.md`
-entry under `## [Unreleased]`, in the same commit as the code change.
-"User-visible" means anything an operator could notice: behaviour
-change, new flag, new endpoint, removed flag, UI change, performance
-characteristic, error-message format, dependency bump that changes
-the operator surface. Internal refactors with no observable impact
-don't need an entry, but when in doubt, write one.
+`CHANGELOG.md` is generated from Conventional Commits by
+[git-cliff](https://git-cliff.org) at release time. PRs must not edit it
+directly, because concurrent `[Unreleased]` edits caused constant merge
+conflicts.
 
-The file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/):
-- Sections: `### Added`, `### Changed`, `### Removed`, `### Fixed`,
-  `### Tests` (last is project-specific).
-- Each bullet starts with a **bolded short headline**, then a colon,
-  then a self-contained explanation. Include *why* — not just *what*.
-- Reference migration filenames, endpoint paths, env vars, and crate
-  names by their exact identifiers so the entry is greppable later.
-- Test-only changes go under `### Tests`.
+The `Changelog` workflow validates every non-merge commit in a PR and
+posts a preview of the generated entry. A non-conventional commit is
+dropped from the changelog, so use a precise `type(scope): description`
+subject and make the user or operator impact clear there.
 
-If you're touching code without writing a CHANGELOG entry, you're
-either doing the wrong thing or you forgot. Stop and add the entry
-before staging the commit.
+Preview the generated entry locally with:
 
-**This is CI-enforced on every PR to `main`.** The `changelog-check`
-workflow fails the PR unless the diff touches `CHANGELOG.md` (with a
-valid `## [Unreleased]` category) **or** the PR carries the
-`skip-changelog` label. So for every PR you open, do one of:
+```bash
+scripts/changelog.sh --unreleased
+```
 
-- **Add a `CHANGELOG.md` entry** (the default — see above). This is
-  also required for changes to the `@temps-sdk/cli` npm package, even
-  though it versions separately; tag those bullets with `(\`@temps-sdk/cli\`, #PR)`.
-- **Apply the `skip-changelog` label** (`gh pr edit <n> --add-label
-  skip-changelog`) only when the change is genuinely changelog-exempt:
-  docs/typos, CI/build config, dependency bumps with no operator
-  impact, pure refactors, or test-only changes.
-
-Don't open a PR and leave the changelog check red — resolve it the
-same way you'd resolve a failing test.
+The release process regenerates `CHANGELOG.md`; the commit history is
+the source of truth.
 
 ## Use the generated OpenAPI SDK in `web/`
 
@@ -159,3 +141,17 @@ If you arrive at a working tree that's already dirty (because a
 previous session left files modified), confirm with the user whether
 to include those files before staging them. Sweeping unrelated work
 into a focused PR makes review slower and history harder to bisect.
+
+## Never commit secrets, including local dev-instance artifacts
+
+Never commit `.env` files, credentials, or secrets. This explicitly
+includes local dev-instance artifacts generated while running a local
+server for manual testing/verification — encryption keys, auth
+secrets, generated tokens, `temps_data`-style data directories. These
+are easy to sweep in by accident with a broad `git add` right after
+spinning up a local test instance to verify a change, which is exactly
+when review attention is focused elsewhere. Before staging, run `git
+status` and scrutinize every path outside the files you intentionally
+edited. If a secret does get committed, treat it as compromised: at
+minimum remove it from tracking going forward, and flag to the user
+whether history needs rewriting — don't force-push without asking.

@@ -1052,7 +1052,10 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
-        debug!("Project found: {:?}", project);
+        debug!(
+            "Project found id={} slug={} preset={}",
+            project.id, project.slug, project.preset
+        );
 
         debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
@@ -1103,6 +1106,52 @@ impl DeploymentService {
             })?;
 
         tracing::debug!("GitPushEvent successfully sent to queue");
+        Ok(())
+    }
+
+    /// Trigger a real deployment of a pre-built Docker image, with no build
+    /// step. This is the DockerImage-source counterpart to `trigger_pipeline`
+    /// (which is Git-only and requires `repo_owner`/`repo_name`) — used to
+    /// deploy projects that have no git repository at all, e.g. imports from
+    /// Portainer, Kubernetes, or Kamal.
+    ///
+    /// Reuses the `DeployImageRequested` job already driven by the template
+    /// one-click-deploy flow (see `job_processor::process_deploy_image_requested_job`),
+    /// which creates the deployment row itself (with `external_image_ref` in
+    /// its metadata) and plans a pull+run pipeline for the project's
+    /// non-preview environment(s).
+    pub async fn trigger_image_deployment(
+        &self,
+        project_id: i32,
+        image_ref: String,
+        health_check_path: Option<String>,
+    ) -> Result<(), DeploymentError> {
+        if image_ref.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Image reference is missing".to_string(),
+            ));
+        }
+
+        info!(
+            "Triggering image deployment for project_id: {} (image: {})",
+            project_id, image_ref
+        );
+
+        self.queue_service
+            .send(temps_core::Job::DeployImageRequested(
+                temps_core::DeployImageRequestedJob {
+                    project_id,
+                    image_ref,
+                    health_check_path,
+                },
+            ))
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to send DeployImageRequested to queue: {}", e);
+                DeploymentError::QueueError(e.to_string())
+            })?;
+
+        tracing::debug!("DeployImageRequested successfully sent to queue");
         Ok(())
     }
 
@@ -1178,8 +1227,10 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         // --- Git projects: rebuild from source when the image isn't reusable ---
         //
@@ -1787,6 +1838,24 @@ impl DeploymentService {
 
             for container in containers {
                 let container_id = container.container_id.clone();
+
+                // Mark the row deleted *before* stopping the container in Docker
+                // (see the identical race explained in
+                // WorkflowExecutionService::teardown_previous_deployment):
+                // ContainerHealthMonitor polls on its own schedule and would
+                // otherwise observe this container mid-exit with no signal that
+                // the exit is an intentional pre-rollback cleanup, firing a
+                // false ContainerCrash alarm.
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("removed".to_string()));
+                if let Err(e) = active_container.update(self.db.as_ref()).await {
+                    warn!(
+                        "Failed to mark container {} deleted before pre-rollback stop: {}",
+                        container_id, e
+                    );
+                }
+
                 if let Err(e) = self.deployer.stop_container(&container_id).await {
                     warn!(
                         "Failed to stop container {} during pre-rollback cleanup: {}",
@@ -1799,12 +1868,6 @@ impl DeploymentService {
                         container_id, e
                     );
                 }
-
-                // Mark container as deleted
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("removed".to_string()));
-                let _ = active_container.update(self.db.as_ref()).await;
 
                 info!(
                     "Pre-rollback: stopped and removed container {}",
@@ -1877,8 +1940,10 @@ impl DeploymentService {
             source_deployment_id, target_env.name, project_id, image_name
         );
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         let now = chrono::Utc::now();
 
@@ -2879,12 +2944,33 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Get all jobs for a deployment
+    /// Get all jobs for a deployment owned by the requested project.
+    ///
+    /// The project constraint is part of this service method rather than only
+    /// an HTTP guard because deployment IDs are globally enumerable and this
+    /// result includes sensitive workflow metadata.
     pub async fn get_deployment_jobs(
         &self,
+        project_id: i32,
         deployment_id: i32,
     ) -> Result<Vec<temps_entities::deployment_jobs::Model>, DeploymentError> {
         use temps_entities::deployment_jobs;
+
+        let deployment_exists = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .is_some();
+
+        if !deployment_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "deployment {} for project {} not found",
+                deployment_id, project_id
+            )));
+        }
 
         let jobs = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
@@ -5626,6 +5712,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_deployment_jobs_enforces_project_ownership(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let job = temps_entities::deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("sensitive-build".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Sensitive Build".to_string()),
+            log_id: Set("sensitive-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": "must-not-cross-projects"}
+            }))),
+            ..Default::default()
+        };
+        job.insert(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let own_jobs = service
+            .get_deployment_jobs(deployment.project_id, deployment.id)
+            .await?;
+        assert_eq!(own_jobs.len(), 1);
+
+        let foreign_result = service
+            .get_deployment_jobs(deployment.project_id + 999, deployment.id)
+            .await;
+        assert!(matches!(foreign_result, Err(DeploymentError::NotFound(_))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_deployment_container_logs_returns_captured_rows(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -5741,5 +5873,161 @@ mod tests {
             DeploymentService::resolve_resource_usage(Some(&empty_env), Some(&cfg(None, None)));
         assert_eq!(still_none.cpu_limit, None);
         assert_eq!(still_none.memory_limit, None);
+    }
+
+    /// `stop_environment_containers` (pre-rollback cleanup) has the same
+    /// deleted-before-stopped ordering requirement as
+    /// `WorkflowExecutionService::teardown_previous_deployment`. Uses
+    /// `block_in_place` to run a real DB check from inside the mock's
+    /// `stop_container` expectation, which requires the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stop_environment_containers_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, environment, old_deployment) = setup_test_data(&db).await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(old_deployment.id),
+            container_id: Set("old-env-container-1".to_string()),
+            container_name: Set("old-env-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Deployment state must be one of the active states
+        // `stop_environment_containers` scans for; a nonexistent id is enough
+        // for the "exclude current deployment" filter.
+        let exclude_deployment_id = old_deployment.id + 1_000_000;
+
+        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                test_db_url.to_string(),
+                None,
+                None,
+            )
+            .expect("Failed to create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+
+        let mut queue_service = MockQueueService::new();
+        queue_service.expect_send().returning(|_| Ok(()));
+        queue_service
+            .expect_subscribe()
+            .returning(|| Box::new(MockJobReceiver::new()));
+        let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
+
+        let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker));
+
+        let db_for_check = db.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_stop_container()
+            .returning(move |container_id| {
+                let db_for_check = db_for_check.clone();
+                let container_id = container_id.to_string();
+                let refreshed = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::ContainerId.eq(container_id))
+                            .one(db_for_check.as_ref())
+                            .await
+                    })
+                })
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+                assert!(
+                    refreshed.deleted_at.is_some(),
+                    "container must be marked deleted before stop_container() is called \
+                     during pre-rollback cleanup — otherwise ContainerHealthMonitor's \
+                     concurrent poll can observe it mid-exit with no signal the exit is \
+                     intentional, and fires a false ContainerCrash alarm"
+                );
+                Ok(())
+            });
+        deployer.expect_remove_container().returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let service = DeploymentService {
+            db: db.clone(),
+            log_service,
+            config_service,
+            queue_service,
+            docker_log_service,
+            deployer,
+            encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
+            env_resolver: std::sync::OnceLock::new(),
+        };
+
+        service
+            .stop_environment_containers(environment.id, exclude_deployment_id)
+            .await;
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("removed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_rejects_empty_image_ref(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let deployment_service = create_deployment_service_for_test(db);
+
+        let result = deployment_service
+            .trigger_image_deployment(1, String::new(), None)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_sends_deploy_image_requested_job(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let mut receiver = deployment_service.queue_service.subscribe();
+
+        deployment_service
+            .trigger_image_deployment(
+                42,
+                "ghcr.io/org/app:latest".to_string(),
+                Some("/healthz".to_string()),
+            )
+            .await?;
+
+        // The auto-responder spawned in create_deployment_service_for_test also
+        // listens on this queue (to keep RouteTableUpdated flowing) — drain past
+        // whatever else it produces until our own job shows up.
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+
+        assert_eq!(job.project_id, 42);
+        assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
+        assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        Ok(())
     }
 }

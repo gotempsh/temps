@@ -161,7 +161,8 @@ impl From<ObservabilityError> for Problem {
                 .with_detail(error.to_string()),
             ObservabilityError::InvalidKindsFilter { .. }
             | ObservabilityError::InvalidCursor { .. }
-            | ObservabilityError::InvalidTimeRange { .. } => {
+            | ObservabilityError::InvalidTimeRange { .. }
+            | ObservabilityError::InvalidTimeWindow(_) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Request")
                     .with_detail(error.to_string())

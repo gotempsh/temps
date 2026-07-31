@@ -165,6 +165,9 @@ impl TempsPlugin for KvPlugin {
         let redis_service = context.require_service::<RedisService>();
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
+        // Optional team-based access checker (present only when a plugin
+        // registers one); confines data-plane access to reachable projects.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         // Create app state for handlers
         let app_state = Arc::new(KvAppState {
@@ -172,6 +175,7 @@ impl TempsPlugin for KvPlugin {
             redis_service,
             external_service_manager,
             audit_service,
+            project_access_checker,
         });
 
         // Configure routes with the app state

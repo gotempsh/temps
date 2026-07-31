@@ -10,6 +10,7 @@ import {
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
+import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 
 export interface ActivationSignals {
   /** Git provider connected and active */
@@ -82,6 +83,26 @@ export function useActivationSignals(): ActivationSignals {
     ...listUsersOptions({ query: { include_deleted: false } }),
     retry: false,
   })
+
+  // TEMP: pretend nothing is set up yet, for building the first-run
+  // experience. See lib/devSimulate.ts. Placed after all hooks so hook order
+  // stays stable.
+  if (SIMULATE_EMPTY_INSTALL) {
+    return {
+      gitConnected: false,
+      wildcardDomainReady: false,
+      hasProject: false,
+      externalUrlSet: false,
+      notificationsConfigured: false,
+      hasDatabase: false,
+      backupsConfigured: false,
+      dnsProviderConnected: false,
+      teamInvited: false,
+      isLoaded: true,
+      completedCount: 0,
+      totalCount: TOTAL,
+    }
+  }
 
   const isLoaded =
     !settingsLoading &&

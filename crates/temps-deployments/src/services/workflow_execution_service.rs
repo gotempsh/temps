@@ -18,9 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
-    CronConfigService, DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, PullExternalImageJob, ResourceUsage,
-    VerifyLocalImageJob,
+    ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
+    DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
+    MetricAlertConfigService, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -72,6 +72,7 @@ pub struct WorkflowExecutionService {
     static_deployer: Arc<dyn StaticDeployer>,
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
+    alert_service: Arc<dyn MetricAlertConfigService>,
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
@@ -97,6 +98,7 @@ impl WorkflowExecutionService {
         static_deployer: Arc<dyn StaticDeployer>,
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
+        alert_service: Arc<dyn MetricAlertConfigService>,
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
@@ -111,6 +113,7 @@ impl WorkflowExecutionService {
             static_deployer,
             log_service,
             cron_service,
+            alert_service,
             agent_sync_service,
             config_service,
             screenshot_service,
@@ -185,7 +188,10 @@ impl WorkflowExecutionService {
                 temps_core::telemetry::TelemetryEventKind::DeployAttempted,
             )
             .with("source_type", project.source_type.to_string())
-            .with("preset", project.preset.to_string())
+            .with(
+                "preset",
+                temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+            )
             .with("is_preview", environment.is_preview),
         );
 
@@ -312,7 +318,10 @@ impl WorkflowExecutionService {
                         temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
                     )
                     .with("source_type", project.source_type.to_string())
-                    .with("preset", project.preset.to_string())
+                    .with(
+                        "preset",
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    )
                     .with("is_preview", environment.is_preview),
                 );
                 // Once-per-instance: "this instance shipped its first deploy".
@@ -322,7 +331,10 @@ impl WorkflowExecutionService {
                         temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
                     )
                     .with("source_type", project.source_type.to_string())
-                    .with("preset", project.preset.to_string()),
+                    .with(
+                        "preset",
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    ),
                 );
 
                 // NOW teardown previous deployment for zero-downtime deployment
@@ -627,10 +639,9 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass preset (always available since it's required)
-                // Convert preset enum to string for builder
-                let preset_str = format!("{:?}", project.preset).to_lowercase();
-                builder = builder.preset(preset_str);
+                builder = builder
+                    .preset(project.preset)
+                    .preset_config(project.preset_config.clone());
 
                 // Unseal build args from job_config. The planner derives build
                 // args from env vars and stores them encrypted (build_args
@@ -1000,6 +1011,43 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
                     .build(self.db.clone(), cron_service)?;
+
+                Ok(Arc::new(job))
+            }
+
+            "ConfigureMetricAlertsJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download_repo")
+                    .to_string();
+
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let deploy_container_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "mark_deployment_complete".to_string());
+
+                let alert_service = self.alert_service.clone();
+
+                let job = ConfigureMetricAlertsJobBuilder::new()
+                    .job_id(db_job.job_id.clone())
+                    .download_job_id(download_job_id)
+                    .deploy_container_job_id(deploy_container_job_id)
+                    .project_id(project.id)
+                    .environment_id(environment.id)
+                    .log_id(db_job.log_id.clone())
+                    .log_service(self.log_service.clone())
+                    .build(self.db.clone(), alert_service)?;
 
                 Ok(Arc::new(job))
             }
@@ -1631,6 +1679,12 @@ impl WorkflowExecutionService {
                     "environment_vars",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                let build_args = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "build_args",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
                 let directory = config
                     .get("directory")
@@ -1682,6 +1736,7 @@ impl WorkflowExecutionService {
                     .compose_override(compose_override)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
+                    .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
                     .build()?;
@@ -1772,7 +1827,13 @@ impl WorkflowExecutionService {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(p)) => (Some(p.source_type.to_string()), Some(p.preset.to_string())),
+                Ok(Some(p)) => (
+                    Some(p.source_type.to_string()),
+                    Some(temps_presets::runtime_slug(
+                        p.preset,
+                        p.preset_config.as_ref(),
+                    )),
+                ),
                 _ => (None, None),
             };
 
@@ -2094,6 +2155,22 @@ impl WorkflowExecutionService {
             for container in containers {
                 let container_id = container.container_id.clone();
 
+                // Mark the row deleted *before* stopping the container in Docker.
+                // ContainerHealthMonitor (temps-monitoring) polls
+                // `deployment_containers` filtered on `DeletedAt.is_null()` on its
+                // own independent schedule. If that poll lands between
+                // `stop_container()` below (which puts Docker's container state
+                // into `Exited`) and this row being marked deleted, it has no way
+                // to tell the exit was an intentional teardown and fires a false
+                // ContainerCrash alarm. Writing `deleted_at` first closes that
+                // window: once this update commits, the health monitor's next
+                // query no longer returns this row at all.
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("deleted".to_string()));
+                active_container.update(self.db.as_ref()).await?;
+
                 // Stop and remove the container
                 match self.container_deployer.stop_container(&container_id).await {
                     Ok(_) => {
@@ -2116,13 +2193,6 @@ impl WorkflowExecutionService {
                         warn!("Failed to remove container {}: {}", container_id, e);
                     }
                 }
-
-                // Mark container as deleted
-                use sea_orm::{ActiveModelTrait, Set};
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("deleted".to_string()));
-                active_container.update(self.db.as_ref()).await?;
 
                 if first_stopped_container_id.is_none() {
                     first_stopped_container_id = Some(container_id);
@@ -2713,6 +2783,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2755,6 +2827,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2862,6 +2936,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2951,5 +3027,197 @@ mod tests {
         fn is_enabled(&self) -> bool {
             true
         }
+    }
+
+    /// Deployer used only by
+    /// `test_teardown_previous_deployment_marks_deleted_before_stopping_container`.
+    /// Asserts that by the time Docker is asked to stop a container, its
+    /// `deployment_containers` row is already marked deleted in the database —
+    /// the invariant that closes the race with `ContainerHealthMonitor`'s
+    /// independent poll loop (see the comment in `teardown_previous_deployment`).
+    struct AssertDeletedBeforeStopDeployer {
+        db: Arc<DbConnection>,
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for AssertDeletedBeforeStopDeployer {
+        async fn deploy_container(
+            &self,
+            _request: temps_deployer::DeployRequest,
+        ) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn start_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stop_container(
+            &self,
+            container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            let container = temps_entities::deployment_containers::Entity::find()
+                .filter(temps_entities::deployment_containers::Column::ContainerId.eq(container_id))
+                .one(self.db.as_ref())
+                .await
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+            assert!(
+                container.deleted_at.is_some(),
+                "container {container_id} must be marked deleted before stop_container() \
+                 is called — otherwise ContainerHealthMonitor's concurrent poll can \
+                 observe an Exited container with no signal that the exit is an \
+                 intentional teardown, and fires a false ContainerCrash alarm"
+            );
+            Ok(())
+        }
+
+        async fn pause_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn resume_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn remove_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            Ok(())
+        }
+
+        async fn get_container_info(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_stats(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn list_containers(
+            &self,
+        ) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<String, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stream_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = String> + Unpin + Send>,
+            temps_deployer::DeployerError,
+        > {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        // A previous deployment in the same environment, still active, whose
+        // container should be torn down now that `current_deployment` is live.
+        let previous_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("previous-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(previous_deployment.id),
+            container_id: Set("old-container-1".to_string()),
+            container_name: Set("old-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let git_provider = Arc::new(MockGitProvider);
+        let image_builder = Arc::new(MockImageBuilder { should_fail: false });
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer { db: db.clone() });
+        let static_deployer = Arc::new(MockStaticDeployer);
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let cron_service =
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
+
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            git_provider,
+            image_builder,
+            container_deployer,
+            static_deployer,
+            log_service,
+            cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker,
+        );
+
+        let stopped_container_id = service
+            .teardown_previous_deployment(project.id, environment.id, current_deployment.id)
+            .await?;
+
+        assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        Ok(())
     }
 }

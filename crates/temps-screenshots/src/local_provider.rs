@@ -175,7 +175,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         "local-headless-chrome"
     }
 
-    async fn is_available(&self) -> bool {
+    async fn check_availability(&self) -> ScreenshotResult<()> {
         // Try to launch browser to check if Chrome is available
         // Use a 10-second timeout to prevent hanging on VPS/servers without Chrome
         let check_result = tokio::time::timeout(
@@ -189,7 +189,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
 
                 match options {
                     Ok(opts) => match Browser::new(opts) {
-                        Ok(_) => Ok(true),
+                        Ok(_) => Ok(()),
                         Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
                     },
                     Err(e) => Err(format!("Failed to build launch options: {}", e)),
@@ -198,42 +198,31 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         )
         .await;
 
-        match check_result {
-            Ok(Ok(Ok(true))) => {
+        let reason = match check_result {
+            Ok(Ok(Ok(()))) => {
                 debug!("Chrome browser is available");
-                true
+                return Ok(());
             }
-            Ok(Ok(Ok(false))) => {
-                // This shouldn't happen with our current logic, but handle it gracefully
-                debug!("Chrome browser check returned false");
-                false
-            }
-            Ok(Ok(Err(e))) => {
-                error!(
-                    "Chrome browser is NOT available: {}. \
-                    Screenshot features will be disabled. \
-                    To fix: install chromium (apt-get install chromium) or set up a remote screenshot provider.",
-                    e
-                );
-                false
-            }
-            Ok(Err(e)) => {
-                error!(
-                    "Chrome availability check task failed: {}. Screenshot features will be disabled.",
-                    e
-                );
-                false
-            }
+            Ok(Ok(Err(e))) => e,
+            Ok(Err(e)) => format!("Chrome availability check task failed: {}", e),
             Err(_) => {
-                error!(
-                    "Chrome availability check timed out after 10 seconds. \
-                    This usually means Chrome is not installed or has missing dependencies. \
-                    Screenshot features will be disabled. \
-                    To fix: install chromium (apt-get install chromium) or set up a remote screenshot provider."
-                );
-                false
+                "Chrome availability check timed out after 10 seconds; Chrome is most likely \
+                 installed but missing shared libraries (check `ldd <chrome-binary> | grep \
+                 'not found'`)"
+                    .to_string()
             }
-        }
+        };
+
+        let message = format!(
+            "{}. To fix: install Chrome's runtime dependencies (on Debian/Ubuntu: \
+             `apt-get install -y chromium` or `apt-get install -y libnss3 libnspr4 libatk1.0-0 \
+             libatk-bridge2.0-0 libcups2 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 \
+             libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libasound2t64`), or switch \
+             to a remote screenshot provider in Settings.",
+            reason
+        );
+        error!("Chrome browser is NOT available: {}", message);
+        Err(ScreenshotError::ChromeError(message))
     }
 }
 

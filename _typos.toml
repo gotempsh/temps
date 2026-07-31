@@ -1,3 +1,9 @@
+[files]
+# Translated READMEs (README.es.md, README.de.md, ...) are not English —
+# the checker "corrects" valid foreign words (oder→order, Cliente→Client).
+# The English README.md itself is still checked.
+extend-exclude = ["README.*.md"]
+
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,
 # matching the upstream Go/BuildKit API naming convention.

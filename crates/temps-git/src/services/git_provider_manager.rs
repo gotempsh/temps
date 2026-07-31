@@ -1557,6 +1557,7 @@ impl GitProviderManager {
     /// Get connections for a user with pagination and sorting
     pub async fn get_user_connections_paginated(
         &self,
+        caller_user_id: i32,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1565,7 +1566,8 @@ impl GitProviderManager {
         use sea_orm::QueryOrder;
 
         let mut query = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true));
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(caller_user_id)));
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {
@@ -3417,22 +3419,30 @@ impl GitProviderManager {
         detected_presets
             .into_iter()
             .map(|preset| {
-                // Parse preset slug to get metadata from entity enum
-                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
-
-                let exposed_port = preset_enum
+                let runtime_preset = temps_presets::get_preset_by_slug(&preset.slug);
+                let preset_enum = runtime_preset
                     .as_ref()
-                    .and_then(|p| p.exposed_port())
-                    .or(preset.exposed_port);
+                    .and_then(|preset| preset.stored_preset());
 
-                let icon_url = preset_enum
-                    .as_ref()
-                    .and_then(|p| p.icon_url())
-                    .map(|s| s.to_string());
+                // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
+                let exposed_port = preset
+                    .exposed_port
+                    .or_else(|| preset_enum.as_ref().and_then(|p| p.exposed_port()));
 
-                let project_type = preset_enum
+                let icon_url = runtime_preset
                     .as_ref()
-                    .map(|p| p.project_type().to_string())
+                    .map(|preset| preset.icon_url())
+                    .or_else(|| {
+                        preset_enum
+                            .as_ref()
+                            .and_then(|p| p.icon_url())
+                            .map(|s| s.to_string())
+                    });
+
+                let project_type = runtime_preset
+                    .as_ref()
+                    .map(|preset| preset.project_type().to_string())
+                    .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                     .unwrap_or_else(|| "unknown".to_string());
 
                 ProjectPresetDomain {

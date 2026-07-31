@@ -113,11 +113,14 @@ command -v curl >/dev/null ||
 
 # Channel selection. Mirrors `temps upgrade --channel`:
 #   stable (default) — track non-prerelease tags only
-#   beta             — track the newest tag, prerelease or not
+#   beta             — track the newest tag, prerelease or not, EXCLUDING
+#                       nightly builds (a `-nightly.` tag never satisfies beta)
+#   nightly          — track only automated nightly builds (`-nightly.` tags),
+#                       cut once a day from `main` when it has new commits
 #
 # CLI-only by design: there is no env-var fallback. A user must pass
-# `--channel beta` explicitly to opt into prereleases. `bash install.sh`
-# always lands on stable — same contract as `temps upgrade`.
+# `--channel beta` or `--channel nightly` explicitly to opt into prereleases.
+# `bash install.sh` always lands on stable — same contract as `temps upgrade`.
 channel="stable"
 positional=()
 while [[ $# -gt 0 ]]; do
@@ -140,9 +143,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$channel" in
-    stable|beta) ;;
+    stable|beta|nightly) ;;
     *)
-        error "Unknown channel '$channel'. Supported: stable, beta"
+        error "Unknown channel '$channel'. Supported: stable, beta, nightly"
         ;;
 esac
 
@@ -181,7 +184,12 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     #   404 means there are zero stable releases yet; fall through to a
     #   helpful error.
     # - beta: /releases/latest skips betas, so we walk the first page of
-    #   /releases (newest-first) and take the very first `tag_name`.
+    #   /releases (newest-first) and take the first `tag_name` that is NOT a
+    #   nightly build (mirrors `temps upgrade`'s `UpgradeChannel::Beta`,
+    #   which excludes `-nightly.` tags so a deliberate beta opt-in never
+    #   silently resolves to an automated nightly).
+    # - nightly: same page, but take the first `tag_name` that IS a nightly
+    #   build (contains `-nightly.`), minted by the "Nightly Release" workflow.
     #
     # Why "first tag_name" (no draft check):
     #   We don't ship draft releases publicly — anything visible on the
@@ -197,11 +205,19 @@ if [[ ${#positional[@]} -eq 0 ]]; then
                     grep '"tag_name":' |
                     head -n 1 |
                     sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+    elif [[ "$channel" = "nightly" ]]; then
+        # GitHub orders releases newest-first; take the first tag_name that
+        # contains the `-nightly.` marker.
+        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
+                    grep -oE '"tag_name": *"[^"]*-nightly\.[^"]*"' |
+                    head -n 1 |
+                    sed -E 's/.*"([^"]+)"$/\1/' 2>/dev/null)
     else
-        # GitHub orders releases newest-first, so the first `tag_name`
-        # in the page is the newest release of any kind.
+        # beta: GitHub orders releases newest-first; take the first
+        # tag_name that is NOT a nightly build.
         temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
                     grep '"tag_name":' |
+                    grep -v -- '-nightly\.' |
                     head -n 1 |
                     sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
     fi

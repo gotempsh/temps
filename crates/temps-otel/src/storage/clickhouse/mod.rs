@@ -115,6 +115,18 @@ pub struct ClickHouseOtelClient {
     pub(crate) client: ::clickhouse::Client,
 }
 
+/// Wall-clock ceiling for any single ClickHouse query, in seconds.
+/// A Traces list query that takes two minutes is already a failure from the
+/// user's point of view; this makes it fail as one.
+const CH_MAX_EXECUTION_TIME_SECS: &str = "120";
+
+/// Memory ceiling for any single ClickHouse query, in bytes (8 GiB).
+const CH_MAX_MEMORY_USAGE_BYTES: &str = "8589934592";
+
+/// Start spilling `GROUP BY` state to disk at half the memory ceiling, so
+/// aggregations degrade to slow rather than failing outright.
+const CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY: &str = "4294967296";
+
 impl ClickHouseOtelClient {
     /// Build a client from configuration.
     ///
@@ -125,7 +137,27 @@ impl ClickHouseOtelClient {
             .with_url(config.url)
             .with_database(config.database)
             .with_user(config.user)
-            .with_password(config.password);
+            .with_password(config.password)
+            // Per-query blast radius. Without these, one authenticated read of
+            // a very large project (an unbounded `count_traces`, a wide window,
+            // a pathological offset) can hold many GB and many minutes on a
+            // ClickHouse instance every tenant on the node shares — the query
+            // fails either way, the question is whether it takes the server's
+            // other queries down with it. These bound it to a clean
+            // per-query MEMORY_LIMIT_EXCEEDED / TIMEOUT_EXCEEDED instead.
+            //
+            // Deliberately generous: a normal Traces page reads a window, not a
+            // table, so real usage is orders of magnitude under both. They are
+            // constants rather than settings because there is no operator
+            // demand for tuning them yet; if that appears, they belong on a
+            // settings row (CLAUDE.md forbids env-var config), not an env var.
+            .with_setting("max_execution_time", CH_MAX_EXECUTION_TIME_SECS)
+            .with_setting("max_memory_usage", CH_MAX_MEMORY_USAGE_BYTES)
+            // Spill GROUP BY state to disk rather than dying at the ceiling.
+            .with_setting(
+                "max_bytes_before_external_group_by",
+                CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY,
+            );
         Self { client }
     }
 
@@ -1059,17 +1091,15 @@ impl OtelStorage for ClickHouseOtelStorage {
         // QueryBuilder is not object-safe). Instead we use a small state
         // machine: we render SQL with `?` placeholders in the same order as
         // the values, then call .bind() in the same order.
-        let mut sql = String::from(
-            "SELECT project_id, deployment_id, service_name, service_version, \
-             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
-             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
-             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
-             duration_ms, status_code, status_message, attributes, events \
-             FROM spans FINAL WHERE project_id = ?",
-        );
+        //
+        // The predicate is accumulated into `where_sql` rather than straight
+        // into the final statement because it is used TWICE — see the
+        // two-stage assembly at the end of this method.
+        let mut where_sql = String::from("project_id = ?");
 
         // We build bind values as a Vec<ChBindValue> — a local enum that lets
         // us defer the actual .bind() calls until we have the full query string.
+        #[derive(Clone)]
         enum Bv {
             I32(i32),
             I64(i64),
@@ -1078,32 +1108,43 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         let mut binds: Vec<Bv> = vec![Bv::I32(query.project_id)];
 
+        // The time predicates are ALSO tracked separately so the outer stage of
+        // the two-stage query can repeat them. Repeating them is what preserves
+        // monthly partition pruning on the outer read; the `IN` set alone would
+        // leave the outer query unbounded in time.
+        let mut time_sql = String::new();
+        let mut time_binds: Vec<Bv> = Vec::new();
+
         if let Some(ref tid) = query.trace_id {
-            sql.push_str(" AND trace_id = ?");
+            where_sql.push_str(" AND trace_id = ?");
             binds.push(Bv::Str(tid.clone()));
         }
         if let Some(ref svc) = query.service_name {
-            sql.push_str(" AND service_name = ?");
+            where_sql.push_str(" AND service_name = ?");
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(status) = query.status {
-            sql.push_str(" AND status_code = ?");
+            where_sql.push_str(" AND status_code = ?");
             binds.push(Bv::Str(span_status_to_str(status).to_owned()));
         }
         if let Some(min_dur) = query.min_duration_ms {
-            sql.push_str(" AND duration_ms >= ?");
+            where_sql.push_str(" AND duration_ms >= ?");
             binds.push(Bv::F64(min_dur));
         }
         if let Some(start) = query.start_time {
-            sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(start.timestamp_millis()));
+            time_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(start.timestamp_millis()));
         }
         if let Some(end) = query.end_time {
-            sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(end.timestamp_millis()));
+            time_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(end.timestamp_millis()));
         }
         if let Some(did) = query.deployment_id {
-            sql.push_str(" AND deployment_id = ?");
+            where_sql.push_str(" AND deployment_id = ?");
             binds.push(Bv::I32(did));
         }
         // environment_id: CH has no JOIN to deployments; filter delegated when
@@ -1113,39 +1154,126 @@ impl OtelStorage for ClickHouseOtelStorage {
         // a separate Postgres lookup, so we skip that filter here.
         if let Some(ref attrs) = query.attributes {
             for (key, value) in attrs {
-                sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
+                where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
                 binds.push(Bv::Str(key.clone()));
                 binds.push(Bv::Str(value.clone()));
             }
         }
         if let Some(ref pattern) = query.name_pattern {
-            sql.push_str(" AND name ILIKE ?");
+            where_sql.push_str(" AND name ILIKE ?");
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
         }
         if query.root_only {
             // Root spans use the '' sentinel for parent_span_id in the CH
             // schema (0001_spans.sql) — the NULL analog of TimescaleDB's
             // `parent_span_id IS NULL`.
-            sql.push_str(" AND parent_span_id = ''");
+            where_sql.push_str(" AND parent_span_id = ''");
         }
 
         // ORDER BY — enum-derived, injection-safe.
         let order_dir = query.sort_order.as_sql();
-        match query.sort_by {
-            crate::types::TraceSortField::Duration => {
-                sql.push_str(&format!(" ORDER BY duration_ms {order_dir}"));
-            }
-            crate::types::TraceSortField::StartTime => {
-                sql.push_str(&format!(" ORDER BY start_time {order_dir}"));
-            }
-        }
-        sql.push_str(" LIMIT ? OFFSET ?");
-        binds.push(Bv::I64(limit as i64));
-        binds.push(Bv::I64(offset as i64));
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => format!("duration_ms {order_dir}"),
+            crate::types::TraceSortField::StartTime => format!("start_time {order_dir}"),
+        };
+
+        // The full row projection, shared by both assemblies below.
+        const SPAN_COLUMNS: &str = "project_id, deployment_id, service_name, service_version, \
+             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
+             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
+             duration_ms, status_code, status_message, attributes, events";
+
+        // NO FINAL in either form below. 0001_spans.sql reserves FINAL for reads
+        // "where dedup correctness is required (trace summaries list)"; this is a
+        // LIMIT-ed span list feeding the Observe console and the Traces page. A
+        // retried OTLP batch showing one span twice until the next merge is
+        // acceptable there; a merge-on-read pass over every part is not.
+        let (sql, all_binds) = if query.trace_id.is_some() {
+            // ── Single stage ─────────────────────────────────────────────────
+            // A trace_id-anchored query already matches a prefix of the sort key
+            // (project_id, trace_id, span_id), so ClickHouse reads one contiguous
+            // block and satisfies the LIMIT almost immediately. Splitting it in
+            // two would read that same prefix twice for nothing — measured on the
+            // 159.8M-span set: 8.0ms single-stage vs 14.6ms two-stage.
+            let sql =
+                format!("SELECT {SPAN_COLUMNS} FROM spans WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+            let mut all_binds = binds;
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            (sql, all_binds)
+        } else {
+            // ── Two stages ───────────────────────────────────────────────────
+            //
+            // Stage 1 (inner) resolves WHICH spans belong on the page, selecting
+            // only the identity columns. Stage 2 (outer) reads the wide row —
+            // including the `attributes` / `events` JSON blobs, which dominate
+            // the row size — for the ≤100 spans that survived, looking them up
+            // by (project_id, trace_id, span_id), the table's primary key.
+            //
+            // The single-stage form this replaces asked ClickHouse to
+            // materialise every column, blobs included, for every row matching
+            // the filter before sorting and discarding all but 100 of them.
+            // Without a trace_id, ordering by start_time has no sort-key prefix
+            // to lean on (trace_id is a random hash), so "every matching row"
+            // meant the project's entire month.
+            //
+            // Splitting the query also lets stage 1 be served by the
+            // `proj_recent` projection (0007_spans_recent_projection.sql), which
+            // stores exactly these narrow columns ordered by
+            // (project_id, start_time). The projection cannot serve the
+            // single-stage query at all, because that one selects blob columns
+            // the projection does not contain.
+            //
+            // Measured on 159.8M spans (150M in one project), root spans, 24h
+            // window, LIMIT 100: 5050ms single-stage with FINAL → 132ms here,
+            // with a byte-identical result set. The dedup added below costs a
+            // further ~8% (112ms → 122ms on a 10M re-measure).
+            // `LIMIT 1 BY (trace_id, span_id)` in BOTH stages is what keeps the
+            // page honest without FINAL. spans is a ReplacingMergeTree, so a
+            // retried OTLP batch leaves two physical rows for one span identity
+            // until the next merge:
+            //
+            //   * inner — without it, a duplicated pair consumes two of the
+            //     `limit` slots and the page comes back short on distinct spans.
+            //   * outer — without it, the IN-set matches every physical row for
+            //     each pair, so the statement can return MORE rows than the
+            //     caller asked for. The single-stage shape cannot drift this way
+            //     because its LIMIT applies to rows directly.
+            //
+            // This restores the row-count guarantee FINAL used to provide, at
+            // the cost of a dedup over ≤`limit` rows rather than a merge over
+            // every part. Retried rows are byte-identical apart from `_version`,
+            // so which copy survives is not observable (FINAL would keep the
+            // highest `_version`).
+            let inner_sql = format!(
+                "SELECT trace_id, span_id FROM spans WHERE {where_sql} \
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ? OFFSET ?"
+            );
+            let sql = format!(
+                "SELECT {SPAN_COLUMNS} \
+                 FROM spans \
+                 WHERE project_id = ?{time_sql} AND (trace_id, span_id) IN ({inner_sql}) \
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ?"
+            );
+
+            // Bind order must match the rendered placeholder order: the outer
+            // project_id and time bounds come first (they precede the subquery
+            // in the statement), then the subquery's own binds and its
+            // LIMIT/OFFSET, and finally the outer LIMIT.
+            let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() + time_binds.len() + 4);
+            all_binds.push(Bv::I32(query.project_id));
+            all_binds.extend(time_binds);
+            all_binds.extend(binds);
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            all_binds.push(Bv::I64(limit as i64));
+            (sql, all_binds)
+        };
 
         // Apply binds sequentially to the query builder.
         let mut q = self.ch.query(&sql);
-        for b in binds {
+        for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
                 Bv::I64(v) => q.bind(v),
@@ -1241,9 +1369,55 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// Aggregate spans into per-trace summaries using query-time GROUP BY.
     ///
     /// Chosen approach from benchmark (ADR-016 Phase 0): query-time GROUP BY
-    /// on `spans FINAL` beats the AggregatingMergeTree MV approach at our
-    /// benchmark scale (23ms vs 31ms best, 400k traces).  Re-evaluate if the
-    /// table grows past 10M distinct traces.
+    /// beats the AggregatingMergeTree MV approach at our benchmark scale
+    /// (23ms vs 31ms best, 400k traces).  Re-evaluate if the table grows past
+    /// 10M distinct traces.
+    ///
+    /// Runs in two stages, for the same reason `query_spans` does
+    /// (0007_spans_recent_projection.sql):
+    ///
+    ///   * Stage 1 picks the page's `trace_id`s. In the unfiltered case it
+    ///     touches only `project_id`, `start_time` and `trace_id` — exactly the
+    ///     columns `proj_recent` stores ordered by `(project_id, start_time)` —
+    ///     so ClickHouse serves it from the projection and reads granules
+    ///     proportional to the requested window. The single-stage form could
+    ///     not use the projection at all (it selects `name`, `duration_ms`,
+    ///     `status_code`, … which the projection does not contain), so a 1h
+    ///     query read the project's entire month.
+    ///   * Stage 2 aggregates the wide columns for just those ≤`limit` traces.
+    ///     `trace_id` is the second component of the table's sort key, so
+    ///     `project_id = ? AND trace_id IN (…)` is a primary-key lookup.
+    ///
+    /// Stage 2 repeats stage 1's full WHERE clause, not just the time bounds:
+    /// the single-stage query filtered spans before grouping, so `span_count`
+    /// and `error_count` have always counted only matching spans. Dropping the
+    /// filter here would silently change those two numbers.
+    ///
+    /// NO `FINAL` — but stage 2 still deduplicates explicitly, because dropping
+    /// FINAL outright would have been wrong.
+    ///
+    /// `spans` is a ReplacingMergeTree, so one `(project_id, trace_id, span_id)`
+    /// can have several physical rows until the next merge, and FINAL cost
+    /// 932ms vs 122ms on a 10M-span measure (0007 header) while also disabling
+    /// projection use. It is tempting to argue the aggregates are
+    /// duplicate-insensitive and leave it at that — that argument only holds
+    /// for OTLP exporter retries, which re-send byte-identical rows.
+    ///
+    /// It does NOT hold in general: `temps-cli`'s `ch_backfill_domains` is a
+    /// second writer into this table, copying Postgres `otel_spans` rows in
+    /// with `_version` set to the span's own `start_time` (deliberately lower
+    /// than a live row's ingest-time `_version`). A backfilled copy and a live
+    /// copy of the same span can therefore differ in `status_code`,
+    /// `attributes`, `duration_ms` and more. FINAL resolved that by keeping the
+    /// highest `_version`; nothing else would.
+    ///
+    /// So stage 2 reads through an `ORDER BY _version DESC LIMIT 1 BY
+    /// (trace_id, span_id)` subquery, which keeps exactly the row FINAL would
+    /// have kept. This is affordable precisely because stage 2 is already
+    /// narrowed to the page's <= `limit` traces (a few hundred rows), whereas
+    /// FINAL would have merged across every part of the scanned range.
+    /// With one row per span guaranteed, `count()` / `countIf()` are exact
+    /// again and `argMax` can no longer tie between divergent copies.
     ///
     /// `deployment_environment` is a denormalized LowCardinality column at
     /// ingest time; there is no CH→Postgres JOIN for environment names. The
@@ -1255,6 +1429,9 @@ impl OtelStorage for ClickHouseOtelStorage {
         let offset = query.offset.unwrap_or(0);
 
         // ── Build WHERE clause and ordered bind list ────────────────────────
+        // `Clone` because the WHERE clause is rendered twice (stage 2 and the
+        // stage 1 subquery), so its binds must be supplied twice as well.
+        #[derive(Clone)]
         enum Bv {
             I32(i32),
             I64(i64),
@@ -1312,6 +1489,11 @@ impl OtelStorage for ClickHouseOtelStorage {
         // ── HAVING clause for status filter ────────────────────────────────
         // Mirrors TimescaleDB: ERROR = has at least one ERROR span;
         // Ok = has zero ERROR spans. `HAVING` can reference aggregate exprs.
+        //
+        // `countIf` is safe here without FINAL even though it counts duplicate
+        // physical rows: the test is `> 0` / `= 0`, and duplication can never
+        // turn a 0 into a positive count or vice versa. Only the counts we
+        // *return* need `uniqExact` (see the SELECT below).
         let having_sql = match query.status {
             Some(SpanStatusCode::Error) => " HAVING countIf(status_code = 'ERROR') > 0",
             Some(SpanStatusCode::Ok) => " HAVING countIf(status_code = 'ERROR') = 0",
@@ -1319,21 +1501,44 @@ impl OtelStorage for ClickHouseOtelStorage {
         };
 
         // ── ORDER BY — enum-derived, injection-safe ─────────────────────────
+        // Written as aggregate expressions rather than SELECT aliases so the
+        // identical clause can be used by stage 1, which selects `trace_id`
+        // only and therefore has no `max_duration_ms` alias to refer to.
         let order_dir = query.sort_order.as_sql();
         let order_sql = match query.sort_by {
             crate::types::TraceSortField::Duration => {
-                format!("ORDER BY max_duration_ms {order_dir}, min(start_time) DESC, trace_id")
+                format!("ORDER BY max(duration_ms) {order_dir}, min(start_time) DESC, trace_id")
             }
             crate::types::TraceSortField::StartTime => {
                 format!("ORDER BY min(start_time) {order_dir}, trace_id")
             }
         };
 
-        // ── Full query ──────────────────────────────────────────────────────
+        // ── Stage 1: the page's trace_ids ───────────────────────────────────
+        // Projection-eligible when no column outside proj_recent is filtered
+        // or sorted on — which is the default Traces-list query.
+        let stage1_sql = format!(
+            "SELECT trace_id FROM spans \
+             WHERE {where_sql} \
+             GROUP BY trace_id{having_sql} \
+             {order_sql} \
+             LIMIT ? OFFSET ?"
+        );
+
+        // ── Stage 2: full aggregation, scoped to those traces ───────────────
         // argMax(name, …) picks the root-span name: root spans have
         // parent_span_id = '' (our empty-string sentinel), so we boost their
         // priority with a large addend so argMax always selects them when
         // present; otherwise falls back to the longest span (max duration).
+        //
+        // The inner SELECT is the FINAL replacement (see the doc comment):
+        // `ORDER BY _version DESC LIMIT 1 BY (trace_id, span_id)` keeps exactly
+        // the row FINAL would have kept, over the few hundred rows belonging to
+        // this page's traces. Because that guarantees one row per span,
+        // `count()` and `countIf()` are exact and do not need `uniqExact`.
+        //
+        // No HAVING: stage 1 already applied it, and stage 2 groups the same
+        // spans over the same filter, so it would be a no-op.
         let sql = format!(
             r#"SELECT
                 trace_id,
@@ -1353,15 +1558,27 @@ impl OtelStorage for ClickHouseOtelStorage {
                 max(duration_ms) AS max_duration_ms,
                 count() AS span_count,
                 countIf(status_code = 'ERROR') AS error_count
-            FROM spans FINAL
-            WHERE {where_sql}
+            FROM (
+                SELECT trace_id, span_id, parent_span_id, name, service_name,
+                       kind, deployment_environment, start_time, duration_ms,
+                       status_code
+                FROM spans
+                WHERE {where_sql} AND trace_id IN ({stage1_sql})
+                ORDER BY _version DESC
+                LIMIT 1 BY (trace_id, span_id)
+            )
             GROUP BY trace_id
-            {having_sql}
-            {order_sql}
-            LIMIT ? OFFSET ?"#
+            {order_sql}"#
         );
-        binds.push(Bv::I64(limit as i64));
-        binds.push(Bv::I64(offset as i64));
+
+        // Bind order follows the rendered placeholder order: stage 2's WHERE
+        // comes first, then the stage 1 subquery's WHERE, then its LIMIT/OFFSET.
+        let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() * 2 + 2);
+        all_binds.extend(binds.iter().cloned());
+        all_binds.extend(binds);
+        all_binds.push(Bv::I64(limit as i64));
+        all_binds.push(Bv::I64(offset as i64));
+        let binds = all_binds;
 
         let mut q = self.ch.query(&sql);
         for b in binds {
@@ -1420,6 +1637,42 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// Mirrors `query_trace_summaries` filters exactly — including `status`
     /// (via a HAVING on countIf) and `min_duration_ms` — so the pagination
     /// count matches the actual result set returned by that method.
+    ///
+    /// Two shapes, because the cheap one only works without a status filter:
+    ///
+    ///   * No status filter → `uniqExact(trace_id)`, a single pass that never
+    ///     materialises per-trace groups. It reads only `project_id`,
+    ///     `start_time` and `trace_id` in the common case, so `proj_recent`
+    ///     serves it and the scan is proportional to the window rather than to
+    ///     the whole month (see `query_trace_summaries`).
+    ///   * Status filter → the per-trace GROUP BY + HAVING is unavoidable, so
+    ///     keep the subquery form.
+    ///
+    /// NO `FINAL` in either shape:
+    ///
+    ///   * `uniqExact(trace_id)` counts DISTINCT trace IDs, so duplicate
+    ///     physical rows cannot inflate it no matter how they differ.
+    ///   * The status `HAVING` is a `> 0` / `= 0` test, which byte-identical
+    ///     duplicates (the OTLP-retry case) cannot flip either.
+    ///
+    /// KNOWN RESIDUAL, deliberately not fixed here. `query_trace_summaries`
+    /// explains how a `ch_backfill_domains` copy of a span can disagree with
+    /// the live copy about `status_code`. Where that happens, this `HAVING` —
+    /// and the identical one in the page's stage 1 — can call a trace errored
+    /// on the strength of a superseded row, while the page's stage 2 (which
+    /// does deduplicate) reports `error_count = 0` for it.
+    ///
+    /// Resolving it here would mean grouping by `(trace_id, span_id)` to pick
+    /// `argMax(status_code, _version)` first: one group per SPAN instead of per
+    /// trace, across the whole window, on the exact query this module was
+    /// rewritten to make cheap. That is the wrong trade. The divergence needs
+    /// the same span to have been ingested into BOTH Postgres and ClickHouse
+    /// with different content — spans are never dual-written (`self.inner`
+    /// handles logs/insights/quota, not spans), and a re-run of the backfill
+    /// re-inserts byte-identical rows because its `_version` is derived from
+    /// `start_time`. It is narrow, transient, and a merge resolves it. The
+    /// `status = OK` direction cannot misreport at all: `= 0` means no copy is
+    /// ERROR, so the winning copy is not either.
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
         enum Bv {
             I32(i32),
@@ -1484,18 +1737,24 @@ impl OtelStorage for ClickHouseOtelStorage {
             _ => "",
         };
 
-        // Use a subquery so we can apply HAVING on per-trace aggregates and
-        // then count the filtered set. `uniqExact` on the outer query is not
-        // needed because the inner GROUP BY already yields one row per trace.
-        let sql = format!(
-            "SELECT count() AS cnt FROM (\
-                SELECT trace_id \
-                FROM spans FINAL \
-                WHERE {where_sql} \
-                GROUP BY trace_id\
-                {having_sql}\
-            )"
-        );
+        // With a status filter, resolve one status_code per span (the highest
+        // `_version`, i.e. what FINAL would have kept) before applying HAVING
+        // on per-trace aggregates, then count the filtered set. `count()` on
+        // the outer query is enough because the middle GROUP BY already yields
+        // one row per trace. Without a status filter, skip all of it.
+        let sql = if having_sql.is_empty() {
+            format!("SELECT uniqExact(trace_id) AS cnt FROM spans WHERE {where_sql}")
+        } else {
+            format!(
+                "SELECT count() AS cnt FROM (\
+                    SELECT trace_id \
+                    FROM spans \
+                    WHERE {where_sql} \
+                    GROUP BY trace_id\
+                    {having_sql}\
+                )"
+            )
+        };
 
         let mut q = self.ch.query(&sql);
         for b in binds {
