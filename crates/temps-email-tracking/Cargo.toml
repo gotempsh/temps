@@ -60,7 +60,7 @@ reqwest = { workspace = true }
 # unrelated) because `rsa` 0.9's Pkcs1v15Sign requires digest 0.10's
 # AssociatedOid trait.
 rsa = "0.9"
-sha1 = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.11", features = ["oid"] }
 sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
 x509-parser = "0.18"
 

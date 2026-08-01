@@ -709,7 +709,7 @@ dependencies = [
  "fastrand",
  "hex",
  "http 1.4.2",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "time",
  "tokio",
  "tracing",
@@ -1241,7 +1241,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
  "tokio-tungstenite",
@@ -9655,9 +9655,9 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -10156,7 +10156,7 @@ dependencies = [
  "rsa",
  "rust_decimal",
  "serde",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "smallvec",
  "sqlx-core 0.8.6",
@@ -11615,7 +11615,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha1 0.10.6",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "sha2 0.11.0",
  "temps-auth",
@@ -13746,7 +13746,7 @@ dependencies = [
  "base32",
  "constant_time_eq 0.3.1",
  "hmac 0.12.1",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
 ]
 
@@ -13954,7 +13954,7 @@ dependencies = [
  "rand 0.9.4",
  "rustls",
  "rustls-pki-types",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "thiserror 2.0.18",
 ]
 
