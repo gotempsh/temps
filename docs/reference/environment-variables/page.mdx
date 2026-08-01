@@ -76,6 +76,14 @@ export TEMPS_DOCKER_EXTRA_NETWORKS=supabase_default,redis_default
 If any configured network is missing or cannot be attached, the deploy fails
 instead of starting an app that cannot resolve its dependency hostnames.
 
+<Note>
+  This setting applies host-wide: **every** app container on the node joins
+  these networks, across all projects and environments. Anything reachable on
+  them is reachable by every deployed app, so only use it on single-tenant
+  installs, and make sure the services it exposes have their own
+  authentication. It is not a per-project setting.
+</Note>
+
 ---
 
 ## Database Configuration {{ anchor: true, id: 'database' }}

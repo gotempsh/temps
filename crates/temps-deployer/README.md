@@ -124,6 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             protocol: Protocol::Tcp,
         }],
         network_name: Some("my-network".to_string()),
+        // Must be a subset of TEMPS_DOCKER_EXTRA_NETWORKS; a request can
+        // narrow the operator's configured networks but never widen them.
         extra_networks: vec![],
         resource_limits: ResourceLimits {
             cpu_limit: Some(2.0),

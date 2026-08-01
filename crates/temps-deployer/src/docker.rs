@@ -652,21 +652,23 @@ impl DockerRuntime {
 
     /// Attach required dependency networks before container start so Docker's
     /// embedded DNS can resolve service names during app boot.
+    ///
+    /// Request-supplied networks may only *narrow* the operator's configured
+    /// set, never widen it: a caller asking for a network the operator did not
+    /// configure is rejected. The agent's deploy endpoint deserializes
+    /// `DeployRequest` straight from the request body, so without this the
+    /// field would let any token holder bridge a container onto an arbitrary
+    /// host network (another project's database network, the control plane's).
     async fn attach_required_networks(
         &self,
         container_id: &str,
         request_networks: &[String],
     ) -> Result<(), DeployerError> {
-        let mut requested = self.extra_networks.clone();
-        requested.extend(request_networks.iter().cloned());
-        let networks = normalize_extra_networks(
-            requested,
+        let requested = normalize_extra_networks(
+            request_networks.to_vec(),
             &self.network_name,
             self.overlay_network.as_deref(),
         );
-        if networks.is_empty() {
-            return Ok(());
-        }
 
         let existing_networks = self
             .docker
@@ -674,19 +676,90 @@ impl DockerRuntime {
             .await
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
 
+        // Resolve every identifier (name *or* ID) to a canonical ID so the
+        // allowlist and the primary/overlay guards can't be sidestepped by
+        // naming the same network a different way.
+        let canonical = |identifier: &str| -> Option<String> {
+            existing_networks
+                .iter()
+                .find(|candidate| {
+                    network_matches_identifier(
+                        candidate.name.as_deref(),
+                        candidate.id.as_deref(),
+                        identifier,
+                    )
+                })
+                .map(|candidate| {
+                    candidate
+                        .id
+                        .clone()
+                        .or_else(|| candidate.name.clone())
+                        .unwrap_or_else(|| identifier.to_string())
+                })
+        };
+
+        // Networks the operator opted into, by canonical ID. Configured
+        // networks that don't exist are still an error below; they just don't
+        // participate in the allowlist here.
+        let allowed: HashSet<String> = self
+            .extra_networks
+            .iter()
+            .filter_map(|network| canonical(network))
+            .collect();
+
+        for network in &requested {
+            let is_allowed = canonical(network)
+                .map(|id| allowed.contains(&id))
+                .unwrap_or(false);
+            if !is_allowed {
+                return Err(DeployerError::NetworkError(format!(
+                    "network '{}' is not in TEMPS_DOCKER_EXTRA_NETWORKS; \
+                     per-request networks may only narrow the operator's configured set",
+                    network
+                )));
+            }
+        }
+
+        let mut networks = self.extra_networks.clone();
+        networks.extend(requested);
+        let networks = normalize_extra_networks(
+            networks,
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+        if networks.is_empty() {
+            return Ok(());
+        }
+
+        // Guard against reaching the primary/overlay network under an alias
+        // (its ID, or its ID when configured by name). `normalize_extra_networks`
+        // can only compare the raw strings it was given.
+        let reserved: HashSet<String> = std::iter::once(self.network_name.as_str())
+            .chain(self.overlay_network.as_deref())
+            .filter_map(canonical)
+            .collect();
+
+        let mut attached: HashSet<String> = HashSet::new();
         for network in networks {
-            let exists = existing_networks.iter().any(|candidate| {
-                network_matches_identifier(
-                    candidate.name.as_deref(),
-                    candidate.id.as_deref(),
-                    &network,
-                )
-            });
-            if !exists {
+            let Some(network_id) = canonical(&network) else {
                 return Err(DeployerError::NetworkError(format!(
                     "required network '{}' does not exist",
                     network
                 )));
+            };
+
+            if reserved.contains(&network_id) {
+                tracing::debug!(
+                    container = %container_id,
+                    network,
+                    "skipping required network that aliases the primary or overlay network"
+                );
+                continue;
+            }
+
+            // Two identifiers can resolve to the same network; attach once.
+            if !attached.insert(network_id) {
+                continue;
             }
 
             let req = bollard::models::NetworkConnectRequest {
@@ -707,9 +780,18 @@ impl DockerRuntime {
                     );
                 }
                 Err(e) => {
+                    // The raw bollard error can carry host topology detail, so
+                    // it goes to the log; the caller gets the network name it
+                    // already supplied plus an actionable summary.
+                    tracing::error!(
+                        container = %container_id,
+                        network,
+                        error = %e,
+                        "failed to attach required network"
+                    );
                     return Err(DeployerError::NetworkError(format!(
-                        "connect_network({}): {}",
-                        network, e
+                        "could not attach required network '{}' — see server logs",
+                        network
                     )));
                 }
             }
@@ -729,6 +811,14 @@ impl DockerRuntime {
                 error = %cleanup_error,
                 "failed to remove container after deploy error"
             );
+            // Self-hosted operators have no support channel: a stale container
+            // squatting the name will break every retry, so say so in the
+            // error they actually see instead of only in the server log.
+            return DeployerError::DeploymentFailed(format!(
+                "{} (cleanup also failed: container {} could not be removed and \
+                 may need `docker rm -f {}` before retrying)",
+                error, container_id, container_id
+            ));
         }
         error
     }
@@ -2450,10 +2540,11 @@ fn default_secrets_root() -> PathBuf {
 ///
 /// Rejects keys that would escape the directory (path separators, `.`, `..`)
 /// to defend against a maliciously-crafted secret name.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn write_secrets_to_host_dir(
     dir: &Path,
     secrets: &HashMap<String, String>,
-    _owner: Option<(u32, u32)>,
+    owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
     use std::fs;
     use std::io::Write;
@@ -2573,7 +2664,7 @@ fn write_secrets_to_host_dir(
     // `no-new-privileges`, and the bind mount is read-only — the trust
     // boundary is still the container itself.
     #[cfg(unix)]
-    if let Some((uid, gid)) = _owner {
+    if let Some((uid, gid)) = owner {
         use std::os::unix::fs::{chown, PermissionsExt};
 
         let chown_result: std::io::Result<()> = (|| {
@@ -3342,6 +3433,11 @@ mod docker_tests {
                     }
                 };
 
+                // Operator configures the network by NAME; the request names
+                // the same network by ID. Both must resolve to the same
+                // canonical network so the allowlist accepts it.
+                let runtime = runtime.with_extra_networks(vec![extra_network_name.clone()]);
+
                 let deploy_result = runtime
                     .deploy_container(alpine_deploy_request(
                         container_name.clone(),
@@ -3392,11 +3488,9 @@ mod docker_tests {
             Ok(runtime) => {
                 let container_name = unique_test_name("temps-missing-network-container");
                 let missing_network = unique_test_name("temps-missing-network");
+                let runtime = runtime.with_extra_networks(vec![missing_network.clone()]);
                 let deploy_result = runtime
-                    .deploy_container(alpine_deploy_request(
-                        container_name.clone(),
-                        vec![missing_network.clone()],
-                    ))
+                    .deploy_container(alpine_deploy_request(container_name.clone(), Vec::new()))
                     .await;
 
                 match deploy_result {
@@ -3426,6 +3520,73 @@ mod docker_tests {
                         );
                     }
                 }
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    /// A request may narrow the operator's configured networks, never widen
+    /// them. The agent deploy endpoint deserializes `DeployRequest` from the
+    /// request body, so an unbounded field here would let any token holder
+    /// bridge a container onto an arbitrary host network.
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_rejects_request_network_outside_operator_allowlist() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let off_limits_network = unique_test_name("temps-off-limits-network");
+                let container_name = unique_test_name("temps-off-limits-container");
+
+                let create_options = bollard::models::NetworkCreateRequest {
+                    name: off_limits_network.clone(),
+                    driver: Some("bridge".to_string()),
+                    ..Default::default()
+                };
+                if let Err(e) = runtime.docker.create_network(create_options).await {
+                    println!("Docker network create failed (may be expected): {}", e);
+                    return;
+                }
+
+                // The network EXISTS — it is simply not one the operator
+                // opted into, which is exactly the cross-tenant bridge case.
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(
+                        container_name.clone(),
+                        vec![off_limits_network.clone()],
+                    ))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                        let _ = runtime.docker.remove_network(&off_limits_network).await;
+                        panic!(
+                            "deploy must reject a request network outside the operator allowlist"
+                        );
+                    }
+                    Err(DeployerError::NetworkError(message))
+                        if message.contains("not in TEMPS_DOCKER_EXTRA_NETWORKS") =>
+                    {
+                        let leftover = runtime
+                            .find_container_by_name(&container_name)
+                            .await
+                            .expect("container lookup after rejected deploy");
+                        assert!(
+                            leftover.is_none(),
+                            "rejected deploy should remove the created container"
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before allowlist assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
+
+                let _ = runtime.docker.remove_network(&off_limits_network).await;
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
