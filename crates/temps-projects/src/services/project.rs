@@ -2381,10 +2381,30 @@ impl ProjectService {
     }
 
     pub async fn get_project_statistics(&self) -> Result<ProjectStatistics, ProjectError> {
+        self.get_project_statistics_excluding(&[]).await
+    }
+
+    /// [`Self::get_project_statistics`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// The count has to honour the same exclusion as the list, or the
+    /// dashboard tells a scoped user how many projects exist on the
+    /// instance while showing them only their own — a smaller leak than
+    /// the names, but the same leak.
+    pub async fn get_project_statistics_excluding(
+        &self,
+        hidden: &[i32],
+    ) -> Result<ProjectStatistics, ProjectError> {
         use sea_orm::PaginatorTrait;
 
-        // Get total count of projects
-        let total_count = projects::Entity::find()
+        let query = projects::Entity::find();
+        let query = if hidden.is_empty() {
+            query
+        } else {
+            query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+        };
+
+        let total_count = query
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?

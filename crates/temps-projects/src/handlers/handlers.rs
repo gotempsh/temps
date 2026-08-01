@@ -1164,9 +1164,12 @@ pub async fn get_project_statistics(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
 
+    // Same exclusion as the list — see `resolve_hidden_projects`.
+    let hidden = resolve_hidden_projects(&state, &auth).await?;
+
     let statistics = state
         .project_service
-        .get_project_statistics()
+        .get_project_statistics_excluding(&hidden)
         .await
         .map_err(Problem::from)?;
 
