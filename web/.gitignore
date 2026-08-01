@@ -1,1 +1,9 @@
 *.txt
+
+# Playwright: browser binaries, run artifacts and the saved login state.
+# e2e/.auth/user.json holds a real session cookie -- never commit it.
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/e2e/.auth/
