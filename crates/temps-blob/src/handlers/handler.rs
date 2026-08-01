@@ -658,7 +658,7 @@ pub async fn blob_enable(
 
         // Create the service through ExternalServiceManager
         // This creates the database record AND initializes/starts the container
-        state
+        let created = state
             .external_service_manager
             .create_service(create_request)
             .await
@@ -667,7 +667,37 @@ pub async fn blob_enable(
                 temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Failed to Enable Blob Service")
                     .with_detail(format!("Could not create S3/Blob service: {}", e))
-            })?
+            })?;
+
+        // `create_service` builds its own service instance to start the
+        // container; the plugin's `rustfs_service` — the one every blob
+        // upload, list and head goes through — is still unconfigured. Without
+        // this the branch above returns "enabled successfully" and then every
+        // blob request fails until the server is restarted and the plugin
+        // initializes itself on boot. Load the config it just persisted.
+        let service_config = state
+            .external_service_manager
+            .get_service_config(created.id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get config for newly created Blob service: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not read back Blob service config: {}", e))
+            })?;
+
+        state
+            .rustfs_service
+            .init(service_config)
+            .await
+            .map_err(|e| {
+                error!("Failed to initialize RustfsService after create: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not initialize RustFS service: {}", e))
+            })?;
+
+        created
     };
 
     // Get status from the service

@@ -1,4 +1,5 @@
 use crate::externalsvc::{
+    legacy_managed_instance_names, managed_instance_name,
     mariadb::{MariaDbService, MariaDbSizeProfile},
     mongodb::MongodbService,
     postgres::PostgresService,
@@ -859,14 +860,17 @@ impl ExternalServiceManager {
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
-            // Temps KV uses Redis backend - create a RedisService with "kv-" prefix
+            // Temps KV uses Redis backend. The instance name must come from
+            // `managed_instance_name` so this agrees with the kv plugin —
+            // see the module docs on `externalsvc::naming` and issue #495.
             ServiceType::Kv => Box::new(RedisService::new(
-                format!("kv-{}", name),
+                managed_instance_name(&name, service_type),
                 self.docker.clone(),
             )),
-            // Temps Blob uses RustfsService (high-performance S3-compatible storage)
+            // Temps Blob uses RustfsService (high-performance S3-compatible
+            // storage). Same naming contract as `Kv` above.
             ServiceType::Blob => Box::new(RustfsService::new(
-                format!("blob-{}", name),
+                managed_instance_name(&name, service_type),
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
@@ -2176,6 +2180,40 @@ impl ExternalServiceManager {
                         reason: e.to_string(),
                     }
                 })?;
+            }
+        }
+
+        // Sweep containers stranded by the pre-#495 naming split.
+        //
+        // Installs that enabled Blob before the fix have a second container
+        // under the old prefixed name (`rustfs-blob-temps-blob`). It has no
+        // `external_services` row of its own, and the row that could still
+        // reach it is the one the transaction above just deleted — so this is
+        // the last moment anything can find it. Local containers only: the
+        // blob and kv plugins run on the control plane, never on a worker.
+        //
+        // Best-effort. A missing legacy container is the normal case on any
+        // install created after the fix, and a Docker hiccup here must not
+        // turn an otherwise successful delete into a 500.
+        if service.node_id.is_none() {
+            for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
+                match self
+                    .create_service_instance(legacy_name.clone(), service_type_enum)
+                    .remove()
+                    .await
+                {
+                    Ok(()) => info!(
+                        service_id,
+                        legacy_name,
+                        "Removed duplicate container left behind by the earlier managed-service naming split"
+                    ),
+                    Err(e) => debug!(
+                        service_id,
+                        legacy_name,
+                        error = %e,
+                        "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                    ),
+                }
             }
         }
 
@@ -8778,8 +8816,10 @@ echo "[restore] Pre-seed complete"
             }
             // Temps KV uses Redis backend
             ServiceType::Kv => {
-                let redis =
-                    RedisService::new(format!("kv-{}", request.name), Arc::clone(&self.docker));
+                let redis = RedisService::new(
+                    managed_instance_name(&request.name, request.service_type),
+                    Arc::clone(&self.docker),
+                );
                 redis
                     .import_from_container(
                         request.container_id.clone(),
@@ -8792,7 +8832,7 @@ echo "[restore] Pre-seed complete"
             // Temps Blob uses RustfsService (high-performance S3-compatible storage)
             ServiceType::Blob => {
                 let rustfs = RustfsService::new(
-                    format!("blob-{}", request.name),
+                    managed_instance_name(&request.name, request.service_type),
                     Arc::clone(&self.docker),
                     Arc::clone(&self.encryption_service),
                 );
@@ -9634,13 +9674,6 @@ async fn sample_container_stats_once(
     stream.next().await?.ok()
 }
 
-/// Compute the docker-CLI-equivalent CPU percent from two consecutive
-/// stats samples. Returns `None` when either sample is missing the
-/// counters we need, the deltas are zero/negative (container just
-/// started / stopped), or the result isn't finite.
-///
-/// Formula (matches `docker stats`):
-/// ```
 /// Remove a single key from an `external_services.health_metadata` JSONB
 /// blob. Returns `None` when the result would be an empty object (so the
 /// column goes back to NULL instead of `{}`).
@@ -9677,6 +9710,13 @@ fn merge_health_metadata_key<T: serde::Serialize>(
     serde_json::Value::Object(map)
 }
 
+/// Compute the docker-CLI-equivalent CPU percent from two consecutive
+/// stats samples. Returns `None` when either sample is missing the
+/// counters we need, the deltas are zero/negative (container just
+/// started / stopped), or the result isn't finite.
+///
+/// Formula (matches `docker stats`):
+/// ```text
 /// cpu_delta    = current.total_usage     - previous.total_usage
 /// system_delta = current.system_cpu_usage - previous.system_cpu_usage
 /// percent      = (cpu_delta / system_delta) * online_cpus * 100
@@ -11042,6 +11082,78 @@ mod tests {
         assert!(!parameters.contains_key("password"));
         assert_eq!(parameters["api_token"], serde_json::json!("replacement"));
         assert_eq!(parameters["username"], serde_json::json!("temps"));
+    }
+
+    /// Regression for #495.
+    ///
+    /// The blob plugin creates and serves `rustfs-temps-blob`. When
+    /// `create_service_instance` prefixed the name, the manager built
+    /// `rustfs-blob-temps-blob` instead — so enabling Blob and restarting left
+    /// two containers, and `delete_service` removed the empty one while the
+    /// container holding every uploaded blob stayed up with its
+    /// `external_services` row gone, unreachable from the platform.
+    #[test]
+    fn blob_service_instance_targets_the_container_the_plugin_created() {
+        let manager = mock_service_manager(vec![]);
+        let instance = manager.create_service_instance("temps-blob".to_string(), ServiceType::Blob);
+
+        assert_eq!(
+            instance.get_name(),
+            "temps-blob",
+            "delete_service targets container `rustfs-{}`, but the blob plugin created \
+             `rustfs-temps-blob`",
+            instance.get_name()
+        );
+    }
+
+    /// Guard rail, not a live bug: `temps-kv` persists `ServiceType::Redis`,
+    /// so the `Kv` branch is off the hot path today. Correcting that type is
+    /// the obvious cleanup, and before #495 was fixed it would have
+    /// reproduced the same orphan for KV.
+    #[test]
+    fn kv_service_instance_targets_the_container_the_plugin_created() {
+        let manager = mock_service_manager(vec![]);
+        let instance = manager.create_service_instance("temps-kv".to_string(), ServiceType::Kv);
+
+        assert_eq!(
+            instance.get_name(),
+            "temps-kv",
+            "delete_service targets container `redis-{}`, but the kv plugin created \
+             `redis-temps-kv`",
+            instance.get_name()
+        );
+    }
+
+    /// The sweep at the end of `delete_service` reaches pre-fix containers by
+    /// building an instance from each legacy name. That only works if the
+    /// instance comes out named exactly what the old code produced — if this
+    /// round-trip drifts, upgraded installs keep their orphan forever and the
+    /// delete still reports success.
+    #[test]
+    fn legacy_instance_names_round_trip_to_the_pre_fix_containers() {
+        let manager = mock_service_manager(vec![]);
+
+        for (service_name, service_type, expected) in [
+            ("temps-blob", ServiceType::Blob, "blob-temps-blob"),
+            ("temps-kv", ServiceType::Kv, "kv-temps-kv"),
+        ] {
+            let legacy = legacy_managed_instance_names(service_name, service_type);
+            assert_eq!(legacy, vec![expected.to_string()]);
+
+            let instance = manager.create_service_instance(legacy[0].clone(), service_type);
+            assert_eq!(
+                instance.get_name(),
+                expected,
+                "the sweep must address the old container, not re-derive the canonical one"
+            );
+            assert_ne!(
+                instance.get_name(),
+                manager
+                    .create_service_instance(service_name.to_string(), service_type)
+                    .get_name(),
+                "sweeping the canonical container would delete the live service's data"
+            );
+        }
     }
 
     fn mock_service_manager(

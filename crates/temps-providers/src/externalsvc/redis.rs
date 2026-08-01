@@ -249,7 +249,12 @@ impl RedisService {
         Ok(conn)
     }
 
-    fn get_container_name(&self) -> String {
+    /// The Docker container this instance owns.
+    ///
+    /// Public for the same reason as `RustfsService::get_container_name`:
+    /// callers reasoning about the container should ask rather than re-derive
+    /// `redis-{name}` themselves. See `externalsvc::naming`.
+    pub fn get_container_name(&self) -> String {
         format!("redis-{}", self.name)
     }
 
