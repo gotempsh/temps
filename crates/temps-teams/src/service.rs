@@ -7,7 +7,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
-use temps_entities::{custom_roles, project_team_access, team_members, teams, users, TeamRole};
+use temps_entities::{project_team_access, team_members, teams, users, TeamRole};
 use utoipa::ToSchema;
 
 use crate::checker::TeamProjectAccessChecker;
@@ -59,15 +59,10 @@ pub struct CreateProjectAccessRequest {
     pub role: TeamRole,
 }
 
-/// `role` and `custom_role_id` are mutually exclusive — exactly one must
-/// be set. Setting `role` clears any existing `custom_role_id`; setting
-/// `custom_role_id` leaves the fixed `role` column as-is (it becomes
-/// irrelevant once `custom_role_id` is non-null, per the precedence rule
-/// in [`CustomRoleService::effective_permissions`](crate::CustomRoleService::effective_permissions)).
+/// The new fixed role for an existing membership.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateMemberRoleRequest {
-    pub role: Option<TeamRole>,
-    pub custom_role_id: Option<i32>,
+    pub role: TeamRole,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +104,7 @@ pub trait TeamService: Send + Sync {
 
     async fn remove_member(&self, team_id: i32, user_id: i32) -> Result<(), TeamError>;
 
-    /// Assigns a fixed `role` or a `custom_role_id` to an existing
-    /// membership.
+    /// Changes the fixed role on an existing membership.
     async fn set_member_role(
         &self,
         team_id: i32,
@@ -437,20 +431,6 @@ impl TeamService for DefaultTeamService {
         user_id: i32,
         req: UpdateMemberRoleRequest,
     ) -> Result<TeamMember, TeamError> {
-        match (&req.role, &req.custom_role_id) {
-            (Some(_), Some(_)) => {
-                return Err(TeamError::Validation {
-                    message: "role and custom_role_id are mutually exclusive".into(),
-                })
-            }
-            (None, None) => {
-                return Err(TeamError::Validation {
-                    message: "must specify exactly one of role or custom_role_id".into(),
-                })
-            }
-            _ => {}
-        }
-
         let existing = team_members::Entity::find()
             .filter(team_members::Column::TeamId.eq(team_id))
             .filter(team_members::Column::UserId.eq(user_id))
@@ -459,25 +439,12 @@ impl TeamService for DefaultTeamService {
             .ok_or(TeamError::MemberNotFound { team_id, user_id })?;
 
         let mut active: team_members::ActiveModel = existing.into();
-        if let Some(role) = req.role {
-            active.role = Set(role.to_string());
-            active.custom_role_id = Set(None);
-        } else if let Some(custom_role_id) = req.custom_role_id {
-            // Existence check up front — 404 rather than letting the FK
-            // constraint fail as an opaque 500 for an unknown role id.
-            custom_roles::Entity::find_by_id(custom_role_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(TeamError::CustomRoleNotFound {
-                    role_id: custom_role_id,
-                })?;
-            active.custom_role_id = Set(Some(custom_role_id));
-        }
+        active.role = Set(req.role.to_string());
         active.updated_at = Set(Utc::now());
         let member = active.update(self.db.as_ref()).await?;
 
         // The checker's permissions cache is keyed on exactly what this
-        // call just changed — `role` and `custom_role_id` — so a stale
+        // call just changed — the member's `role` — so a stale
         // entry would keep serving the member's OLD resolved permissions
         // (e.g. still `admin` after a demotion to `viewer`) until the TTL.
         // Unlike the binary access cache, which only depends on membership
@@ -604,13 +571,9 @@ pub struct TeamMemberResponse {
     pub id: i32,
     pub team_id: i32,
     pub user_id: i32,
-    /// Used when `custom_role_id` is `None` — and in that case also the
-    /// source of this member's project-scoped permissions (intersected
-    /// with `project_team_access.role`).
+    /// The source of this member's project-scoped permissions, intersected
+    /// with `project_team_access.role`.
     pub role: TeamRole,
-    /// When `Some`, this member's effective project-scoped permissions
-    /// come from this custom role's permission set instead of `role`.
-    pub custom_role_id: Option<i32>,
     pub added_by: i32,
     /// The member's display name, joined from `users`. `None` if the
     /// referenced user no longer exists.
@@ -637,7 +600,6 @@ impl TeamMemberResponse {
             team_id: member.team_id,
             user_id: member.user_id,
             role,
-            custom_role_id: member.custom_role_id,
             added_by: member.added_by,
             user_name,
             user_email,
@@ -808,42 +770,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_member_role_rejects_both_role_and_custom_role_id() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let svc = DefaultTeamService::new(Arc::new(db));
-        let err = svc
-            .set_member_role(
-                1,
-                5,
-                UpdateMemberRoleRequest {
-                    role: Some(TeamRole::Viewer),
-                    custom_role_id: Some(9),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, TeamError::Validation { .. }));
-    }
-
-    #[tokio::test]
-    async fn set_member_role_rejects_neither_role_nor_custom_role_id() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let svc = DefaultTeamService::new(Arc::new(db));
-        let err = svc
-            .set_member_role(
-                1,
-                5,
-                UpdateMemberRoleRequest {
-                    role: None,
-                    custom_role_id: None,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, TeamError::Validation { .. }));
-    }
-
-    #[tokio::test]
     async fn set_member_role_returns_not_found_for_missing_member() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<team_members::Model>::new()])
@@ -854,8 +780,7 @@ mod tests {
                 1,
                 5,
                 UpdateMemberRoleRequest {
-                    role: Some(TeamRole::Viewer),
-                    custom_role_id: None,
+                    role: TeamRole::Viewer,
                 },
             )
             .await
@@ -866,43 +791,6 @@ mod tests {
                 team_id: 1,
                 user_id: 5
             }
-        ));
-    }
-
-    /// An unknown custom_role_id returns 404 up front rather than letting
-    /// the FK constraint fail as an opaque 500.
-    #[tokio::test]
-    async fn set_member_role_returns_not_found_for_missing_custom_role() {
-        let now = Utc::now();
-        let member = team_members::Model {
-            id: 1,
-            team_id: 1,
-            user_id: 5,
-            role: "viewer".into(),
-            custom_role_id: None,
-            added_by: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![member]])
-            .append_query_results(vec![Vec::<custom_roles::Model>::new()])
-            .into_connection();
-        let svc = DefaultTeamService::new(Arc::new(db));
-        let err = svc
-            .set_member_role(
-                1,
-                5,
-                UpdateMemberRoleRequest {
-                    role: None,
-                    custom_role_id: Some(999),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            TeamError::CustomRoleNotFound { role_id: 999 }
         ));
     }
 }

@@ -3103,16 +3103,6 @@ export type CreateConversationRequest = {
     context_type: string;
 };
 
-export type CreateCustomRoleRequest = {
-    description?: string | null;
-    name: string;
-    /**
-     * `Permission::to_string()` values, e.g. `"deployments:write"`.
-     */
-    permissions: Array<string>;
-    slug: string;
-};
-
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
@@ -3985,24 +3975,6 @@ export type CustomDomainResponse = {
     status: string;
     status_code?: number | null;
     updated_at: number;
-};
-
-export type CustomRoleListResponse = {
-    page: number;
-    page_size: number;
-    roles: Array<CustomRoleResponse>;
-    total: number;
-};
-
-export type CustomRoleResponse = {
-    created_at: string;
-    created_by: number;
-    description?: string | null;
-    id: number;
-    name: string;
-    permissions: Array<string>;
-    slug: string;
-    updated_at: string;
 };
 
 export type CustomerMovementResponse = {
@@ -16026,16 +15998,10 @@ export type TeamListResponse = {
 export type TeamMemberResponse = {
     added_by: number;
     created_at: string;
-    /**
-     * When `Some`, this member's effective project-scoped permissions
-     * come from this custom role's permission set instead of `role`.
-     */
-    custom_role_id?: number | null;
     id: number;
     /**
-     * Used when `custom_role_id` is `None` — and in that case also the
-     * source of this member's project-scoped permissions (intersected
-     * with `project_team_access.role`).
+     * The source of this member's project-scoped permissions, intersected
+     * with `project_team_access.role`.
      */
     role: TeamRole;
     team_id: number;
@@ -16859,15 +16825,6 @@ export type UpdateCustomDomainRequest = {
     status_code?: number | null;
 };
 
-export type UpdateCustomRoleRequest = {
-    description?: string | null;
-    name?: string | null;
-    /**
-     * When `Some`, replaces the role's entire permission set.
-     */
-    permissions?: Array<string> | null;
-};
-
 export type UpdateDashboardRequest = {
     layout?: null | DashboardLayout;
     name?: string | null;
@@ -17180,15 +17137,10 @@ export type UpdateMcpRequest = {
 };
 
 /**
- * `role` and `custom_role_id` are mutually exclusive — exactly one must
- * be set. Setting `role` clears any existing `custom_role_id`; setting
- * `custom_role_id` leaves the fixed `role` column as-is (it becomes
- * irrelevant once `custom_role_id` is non-null, per the precedence rule
- * in [`CustomRoleService::effective_permissions`](crate::CustomRoleService::effective_permissions)).
+ * The new fixed role for an existing membership.
  */
 export type UpdateMemberRoleRequest = {
-    custom_role_id?: number | null;
-    role?: null | TeamRole;
+    role: TeamRole;
 };
 
 export type UpdateMetricAlertRequest = {
@@ -23685,154 +23637,6 @@ export type BlobHeadResponses = {
      */
     200: unknown;
 };
-
-export type ListCustomRolesData = {
-    body?: never;
-    path?: never;
-    query?: {
-        page?: number;
-        page_size?: number;
-    };
-    url: '/custom-roles';
-};
-
-export type ListCustomRolesErrors = {
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-};
-
-export type ListCustomRolesResponses = {
-    /**
-     * Paginated custom roles
-     */
-    200: CustomRoleListResponse;
-};
-
-export type ListCustomRolesResponse = ListCustomRolesResponses[keyof ListCustomRolesResponses];
-
-export type CreateCustomRoleData = {
-    body: CreateCustomRoleRequest;
-    path?: never;
-    query?: never;
-    url: '/custom-roles';
-};
-
-export type CreateCustomRoleErrors = {
-    /**
-     * Validation error
-     */
-    400: unknown;
-    /**
-     * A requested permission exceeds the actor's own permissions
-     */
-    403: unknown;
-    /**
-     * Slug already taken
-     */
-    409: unknown;
-};
-
-export type CreateCustomRoleResponses = {
-    /**
-     * Custom role created
-     */
-    201: CustomRoleResponse;
-};
-
-export type CreateCustomRoleResponse = CreateCustomRoleResponses[keyof CreateCustomRoleResponses];
-
-export type DeleteCustomRoleData = {
-    body?: never;
-    path: {
-        role_id: number;
-    };
-    query?: never;
-    url: '/custom-roles/{role_id}';
-};
-
-export type DeleteCustomRoleErrors = {
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Not found
-     */
-    404: unknown;
-};
-
-export type DeleteCustomRoleResponses = {
-    /**
-     * Custom role deleted
-     */
-    204: void;
-};
-
-export type DeleteCustomRoleResponse = DeleteCustomRoleResponses[keyof DeleteCustomRoleResponses];
-
-export type GetCustomRoleData = {
-    body?: never;
-    path: {
-        role_id: number;
-    };
-    query?: never;
-    url: '/custom-roles/{role_id}';
-};
-
-export type GetCustomRoleErrors = {
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Not found
-     */
-    404: unknown;
-};
-
-export type GetCustomRoleResponses = {
-    /**
-     * Custom role
-     */
-    200: CustomRoleResponse;
-};
-
-export type GetCustomRoleResponse = GetCustomRoleResponses[keyof GetCustomRoleResponses];
-
-export type UpdateCustomRoleData = {
-    body: UpdateCustomRoleRequest;
-    path: {
-        role_id: number;
-    };
-    query?: never;
-    url: '/custom-roles/{role_id}';
-};
-
-export type UpdateCustomRoleErrors = {
-    /**
-     * Validation error
-     */
-    400: unknown;
-    /**
-     * A requested permission exceeds the actor's own permissions
-     */
-    403: unknown;
-    /**
-     * Not found
-     */
-    404: unknown;
-};
-
-export type UpdateCustomRoleResponses = {
-    /**
-     * Updated custom role
-     */
-    200: CustomRoleResponse;
-};
-
-export type UpdateCustomRoleResponse = UpdateCustomRoleResponses[keyof UpdateCustomRoleResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
@@ -46586,15 +46390,11 @@ export type UpdateTeamMemberRoleData = {
 
 export type UpdateTeamMemberRoleErrors = {
     /**
-     * Must specify exactly one of role/custom_role_id
-     */
-    400: unknown;
-    /**
-     * Assigned custom role grants a permission exceeding the actor's own
+     * Insufficient permissions
      */
     403: unknown;
     /**
-     * Member or custom role not found
+     * Member not found
      */
     404: unknown;
 };

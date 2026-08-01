@@ -13,7 +13,6 @@ import {
   getProjectsOptions,
   getTeamOptions,
   getTeamQueryKey,
-  listCustomRolesOptions,
   listTeamMembersOptions,
   listTeamMembersQueryKey,
   listTeamProjectsOptions,
@@ -237,11 +236,7 @@ function AddMemberDialog({
   )
 }
 
-/**
- * Inline role editor for one membership. Offers the four fixed roles plus
- * any custom roles defined on the instance; the two are mutually exclusive
- * server-side, so this sends exactly one of them.
- */
+/** Inline role editor for one membership. */
 function MemberRoleCell({
   teamId,
   member,
@@ -250,9 +245,6 @@ function MemberRoleCell({
   member: TeamMemberResponse
 }) {
   const queryClient = useQueryClient()
-  const { data: customRoles } = useQuery(
-    listCustomRolesOptions({ query: { page: 1, page_size: 100 } })
-  )
 
   const updateMutation = useMutation({
     ...updateTeamMemberRoleMutation(),
@@ -267,43 +259,17 @@ function MemberRoleCell({
     },
   })
 
-  const value = member.custom_role_id
-    ? `custom:${member.custom_role_id}`
-    : member.role
-
-  const handleChange = (next: string) => {
-    const body = next.startsWith('custom:')
-      ? { role: null, custom_role_id: Number(next.slice('custom:'.length)) }
-      : { role: next as TeamRole, custom_role_id: null }
-    updateMutation.mutate({
-      path: { team_id: teamId, user_id: member.user_id },
-      body,
-    })
-  }
-
   return (
-    <Select
-      value={value}
-      onValueChange={handleChange}
+    <RoleSelect
+      value={member.role}
       disabled={updateMutation.isPending}
-    >
-      <SelectTrigger className="w-[180px]">
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {TEAM_ROLES.map((role) => (
-          <SelectItem key={role} value={role}>
-            <span className="capitalize">{role}</span>
-          </SelectItem>
-        ))}
-        {(customRoles?.roles ?? []).map((role) => (
-          <SelectItem key={role.id} value={`custom:${role.id}`}>
-            {role.name}
-            <span className="ml-2 text-xs text-muted-foreground">custom</span>
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+      onChange={(role) =>
+        updateMutation.mutate({
+          path: { team_id: teamId, user_id: member.user_id },
+          body: { role },
+        })
+      }
+    />
   )
 }
 

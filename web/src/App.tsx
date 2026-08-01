@@ -110,11 +110,6 @@ const Users = lazy(() =>
 const UserDetail = lazy(() =>
   import('./pages/UserDetail').then((m) => ({ default: m.UserDetail }))
 )
-const CustomRolesPage = lazy(() =>
-  import('./pages/settings/CustomRolesPage').then((m) => ({
-    default: m.CustomRolesPage,
-  }))
-)
 const Teams = lazy(() =>
   import('./pages/Teams').then((m) => ({ default: m.Teams }))
 )
@@ -528,7 +523,6 @@ const FullAppRoutes = () => {
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
-                  <Route path="custom-roles" element={<CustomRolesPage />} />
                   <Route path="auth" element={<AuthSettingsPage />} />
                   <Route path="auth/new" element={<CreateOidcProviderPage />} />
                   <Route

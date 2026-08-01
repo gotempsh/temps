@@ -2,10 +2,9 @@
 //! (`owner`/`admin`/`deployer`/`viewer`).
 //!
 //! This is the single place those labels acquire permission semantics.
-//! [`CustomRoleService::effective_permissions`](crate::CustomRoleService::effective_permissions)
-//! is the equivalent for admin-defined roles; keeping both resolvers in
-//! one crate means there is exactly one answer to "what does this role
-//! let you do inside a project".
+//! A plugin can supply a different answer for an individual membership via
+//! [`temps_core::MembershipPermissionResolver`], but the result is still
+//! capped by the team's grant role resolved through this same mapping.
 //!
 //! Lives here rather than as a method on [`TeamRole`] because
 //! `temps-entities` is a pure Sea-ORM data crate with no dependency on

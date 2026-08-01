@@ -5,9 +5,6 @@
 //! - **Teams** — named groups of users (`/teams`).
 //! - **Project access** — which teams may reach which projects, and with
 //!   what role (`/projects/{project_id}/access`).
-//! - **Custom roles** — admin-defined named permission sets that can
-//!   replace one of the four fixed roles on a membership
-//!   (`/custom-roles`).
 //!
 //! # How enforcement works
 //!
@@ -34,9 +31,15 @@
 //!
 //! Instance admins are never restricted by team membership — that bypass
 //! lives in the guard macro, not here.
+//!
+//! # Richer roles than the fixed four
+//!
+//! A plugin can override what a single membership resolves to by
+//! registering a [`temps_core::MembershipPermissionResolver`]. Its answer
+//! is intersected with the team's grant on the project, so it can only
+//! narrow a member below their team's access, never widen them past it.
 
 pub mod checker;
-pub mod custom_role_service;
 pub mod error;
 pub mod handlers;
 pub mod plugin;
@@ -44,10 +47,6 @@ pub mod role_permissions;
 pub mod service;
 
 pub use checker::TeamProjectAccessChecker;
-pub use custom_role_service::{
-    CreateCustomRoleRequest, CustomRoleListResponse, CustomRoleResponse, CustomRoleService,
-    DefaultCustomRoleService, UpdateCustomRoleRequest,
-};
 pub use error::TeamError;
 pub use handlers::{TeamsApiDoc, TeamsAppState};
 pub use plugin::TeamsPlugin;

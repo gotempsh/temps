@@ -1,14 +1,11 @@
 import type { Command } from 'commander'
 import {
   addTeamMember,
-  createCustomRole,
   createTeam,
-  deleteCustomRole,
   deleteTeam,
   getProjects,
   getTeam,
   grantProjectAccess,
-  listCustomRoles,
   listProjectAccess,
   listTeamMembers,
   listTeamProjects,
@@ -16,12 +13,10 @@ import {
   listUsers,
   removeTeamMember,
   revokeProjectAccess,
-  updateCustomRole,
   updateTeam,
   updateTeamMemberRole
 } from '../../api/sdk.gen.js'
 import type {
-  CustomRoleResponse,
   ProjectAccessResponse,
   TeamMemberResponse,
   TeamResponse,
@@ -119,10 +114,9 @@ export function registerTeamsCommands(program: Command): void {
 
   members
     .command('set-role <team>')
-    .description('Change a member\'s role, or assign them a custom role')
+    .description('Change a member\'s role in the team')
     .option('-u, --user <user>', 'User id or email')
-    .option('-r, --role <role>', `Fixed team role (${TEAM_ROLES.join('|')})`)
-    .option('-c, --custom-role <role>', 'Custom role id or slug (mutually exclusive with --role)')
+    .option('-r, --role <role>', `Team role (${TEAM_ROLES.join('|')})`)
     .option('--json', 'Output in JSON format')
     .action(setMemberRoleAction)
 
@@ -163,45 +157,6 @@ export function registerTeamsCommands(program: Command): void {
     .option('-y, --yes', 'Skip confirmation')
     .action(revokeAccessAction)
 
-  // --- custom roles ---
-
-  const roles = program
-    .command('custom-roles')
-    .description('Manage admin-defined permission sets')
-
-  roles
-    .command('list')
-    .alias('ls')
-    .description('List custom roles')
-    .option('--json', 'Output in JSON format')
-    .action(listCustomRolesAction)
-
-  roles
-    .command('create')
-    .alias('add')
-    .description('Create a custom role')
-    .option('-n, --name <name>', 'Role name')
-    .option('-s, --slug <slug>', 'URL-safe slug ([a-z0-9-]+)')
-    .option('-d, --description <description>', 'Role description')
-    .option('--permissions <permissions>', 'Comma-separated permissions, e.g. deployments:read,logs:read')
-    .option('--json', 'Output in JSON format')
-    .action(createCustomRoleAction)
-
-  roles
-    .command('update <role>')
-    .description('Update a custom role (--permissions replaces the whole set)')
-    .option('-n, --name <name>', 'New name')
-    .option('-d, --description <description>', 'New description')
-    .option('--permissions <permissions>', 'Comma-separated permissions replacing the current set')
-    .option('--json', 'Output in JSON format')
-    .action(updateCustomRoleAction)
-
-  roles
-    .command('delete <role>')
-    .alias('rm')
-    .description('Delete a custom role (members fall back to their fixed role)')
-    .option('-y, --yes', 'Skip confirmation')
-    .action(deleteCustomRoleAction)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,28 +221,6 @@ async function resolveProjectId(flagValue?: string): Promise<number> {
   const match = projects.find((p) => p.slug === slug || p.name === slug)
   if (!match) {
     throw new Error(`No project matches '${slug}'`)
-  }
-  return match.id
-}
-
-async function fetchCustomRoles(): Promise<CustomRoleResponse[]> {
-  const { data, error } = await listCustomRoles({ client, query: { page_size: 100 } })
-  if (error) {
-    throw new Error(getErrorMessage(error))
-  }
-  return data?.roles ?? []
-}
-
-async function resolveCustomRoleId(roleRef: string): Promise<number> {
-  if (/^\d+$/.test(roleRef)) {
-    return Number(roleRef)
-  }
-  const roles = await fetchCustomRoles()
-  const match = roles.find((r) => r.slug === roleRef || r.name === roleRef)
-  if (!match) {
-    throw new Error(
-      `No custom role matches '${roleRef}'. Known slugs: ${roles.map((r) => r.slug).join(', ') || '(none)'}`
-    )
   }
   return match.id
 }
@@ -429,10 +362,7 @@ async function showTeamAction(teamRef: string, options: JsonOption): Promise<voi
       [
         { header: 'User', accessor: (m) => m.user_name ?? `#${m.user_id}` },
         { header: 'Email', accessor: (m) => m.user_email ?? '—' },
-        {
-          header: 'Role',
-          accessor: (m) => (m.custom_role_id ? `custom #${m.custom_role_id}` : m.role)
-        }
+        { header: 'Role', key: 'role' }
       ] as TableColumn<TeamMemberResponse>[],
       { style: 'minimal' }
     )
@@ -556,10 +486,7 @@ async function listMembersAction(teamRef: string, options: JsonOption): Promise<
       { header: 'User ID', key: 'user_id', width: 9 },
       { header: 'Name', accessor: (m) => m.user_name ?? '—' },
       { header: 'Email', accessor: (m) => m.user_email ?? '—' },
-      {
-        header: 'Role',
-        accessor: (m) => (m.custom_role_id ? `custom #${m.custom_role_id}` : m.role)
-      }
+      { header: 'Role', key: 'role' }
     ] as TableColumn<TeamMemberResponse>[],
     { style: 'minimal' }
   )
@@ -601,35 +528,20 @@ async function addMemberAction(
 
 async function setMemberRoleAction(
   teamRef: string,
-  options: { user?: string; role?: string; customRole?: string } & JsonOption
+  options: { user?: string; role?: string } & JsonOption
 ): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  if (options.role && options.customRole) {
-    warning('--role and --custom-role are mutually exclusive')
-    return
-  }
-
   const userRef = options.user || (await promptText({ message: 'User id or email', required: true }))
-
-  let role: TeamRole | null = null
-  let customRoleId: number | null = null
-
-  if (options.customRole) {
-    customRoleId = await resolveCustomRoleId(options.customRole)
-  } else if (options.role) {
-    role = parseRole(options.role)
-  } else {
-    role = await promptRole('New role in this team')
-  }
+  const role = options.role ? parseRole(options.role) : await promptRole('New role in this team')
 
   const member = await withSpinner('Updating member role...', async () => {
     const [teamId, userId] = await Promise.all([resolveTeamId(teamRef), resolveUserId(userRef)])
     const { data, error } = await updateTeamMemberRole({
       client,
       path: { team_id: teamId, user_id: userId },
-      body: { role, custom_role_id: customRoleId }
+      body: { role }
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -644,9 +556,7 @@ async function setMemberRoleAction(
 
   newline()
   success(
-    `${member.user_email ?? `User #${member.user_id}`} is now ${
-      member.custom_role_id ? `custom role #${member.custom_role_id}` : member.role
-    } in '${teamRef}'`
+    `${member.user_email ?? `User #${member.user_id}`} is now ${member.role} in '${teamRef}'`
   )
   newline()
 }
@@ -807,162 +717,5 @@ async function revokeAccessAction(
   newline()
   success(`Revoked '${teamRef}' access to project ${projectId}`)
   warning('Removing the last grant makes this project unrestricted again')
-  newline()
-}
-
-// ---------------------------------------------------------------------------
-// Custom roles
-// ---------------------------------------------------------------------------
-
-async function listCustomRolesAction(options: JsonOption): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const roles = await withSpinner('Fetching custom roles...', fetchCustomRoles)
-
-  if (options.json) {
-    json(roles)
-    return
-  }
-
-  newline()
-  header(`${icons.info} Custom roles (${roles.length})`)
-  if (roles.length === 0) {
-    info('No custom roles')
-    info('Run: temps custom-roles create --name "Release Manager" --permissions deployments:create,deployments:read')
-    newline()
-    return
-  }
-
-  printTable(
-    roles,
-    [
-      { header: 'ID', key: 'id', width: 6 },
-      { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
-      { header: 'Slug', key: 'slug' },
-      { header: 'Permissions', accessor: (r) => String(r.permissions.length) }
-    ] as TableColumn<CustomRoleResponse>[],
-    { style: 'minimal' }
-  )
-  newline()
-}
-
-async function createCustomRoleAction(options: {
-  name?: string
-  slug?: string
-  description?: string
-  permissions?: string
-} & JsonOption): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const name = options.name || (await promptText({ message: 'Role name', required: true }))
-  const slug = options.slug || (await promptText({ message: 'Slug', default: slugify(name) }))
-  const permissionsInput =
-    options.permissions ||
-    (await promptText({
-      message: 'Permissions (comma-separated, e.g. deployments:read,logs:read)',
-      required: true
-    }))
-
-  const permissions = permissionsInput
-    .split(',')
-    .map((p) => p.trim())
-    .filter(Boolean)
-
-  const role = await withSpinner('Creating custom role...', async () => {
-    const { data, error } = await createCustomRole({
-      client,
-      body: { name, slug, description: options.description ?? null, permissions }
-    })
-    if (error) {
-      throw new Error(getErrorMessage(error))
-    }
-    return data!
-  })
-
-  if (options.json) {
-    json(role)
-    return
-  }
-
-  newline()
-  success(`Created custom role '${role.name}' (id ${role.id}) with ${role.permissions.length} permission(s)`)
-  info(`Assign it: temps teams members set-role <team> --user <email> --custom-role ${role.slug}`)
-  newline()
-}
-
-async function updateCustomRoleAction(
-  roleRef: string,
-  options: { name?: string; description?: string; permissions?: string } & JsonOption
-): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  if (!options.name && options.description === undefined && !options.permissions) {
-    warning('Nothing to update — pass --name, --description and/or --permissions')
-    return
-  }
-
-  const permissions = options.permissions
-    ? options.permissions.split(',').map((p) => p.trim()).filter(Boolean)
-    : null
-
-  const role = await withSpinner('Updating custom role...', async () => {
-    const roleId = await resolveCustomRoleId(roleRef)
-    const { data, error } = await updateCustomRole({
-      client,
-      path: { role_id: roleId },
-      body: {
-        name: options.name ?? null,
-        description: options.description ?? null,
-        permissions
-      }
-    })
-    if (error) {
-      throw new Error(getErrorMessage(error))
-    }
-    return data!
-  })
-
-  if (options.json) {
-    json(role)
-    return
-  }
-
-  newline()
-  success(`Updated custom role '${role.name}' (${role.permissions.length} permission(s))`)
-  newline()
-}
-
-async function deleteCustomRoleAction(
-  roleRef: string,
-  options: { yes?: boolean }
-): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const roleId = await resolveCustomRoleId(roleRef)
-
-  if (!options.yes) {
-    const confirmed = await promptConfirm({
-      message: `Delete custom role '${roleRef}'? Members holding it fall back to their fixed team role.`,
-      default: false
-    })
-    if (!confirmed) {
-      info('Cancelled')
-      return
-    }
-  }
-
-  await withSpinner('Deleting custom role...', async () => {
-    const { error } = await deleteCustomRole({ client, path: { role_id: roleId } })
-    if (error) {
-      throw new Error(getErrorMessage(error))
-    }
-  })
-
-  newline()
-  success(`Deleted custom role '${roleRef}'`)
   newline()
 }

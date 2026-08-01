@@ -184,7 +184,6 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
       { title: 'Teams', url: '/teams', icon: UsersRound },
-      { title: 'Custom Roles', url: '/settings/custom-roles', icon: ShieldCheck },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],

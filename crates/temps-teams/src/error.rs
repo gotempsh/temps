@@ -29,15 +29,6 @@ pub enum TeamError {
     #[error("Invalid role: {0}")]
     InvalidRole(#[from] TeamRoleParseError),
 
-    #[error("Custom role {role_id} not found")]
-    CustomRoleNotFound { role_id: i32 },
-
-    #[error("Custom role slug '{slug}' is already taken")]
-    CustomRoleSlugConflict { slug: String },
-
-    #[error("Invalid permission: '{permission}'")]
-    InvalidPermission { permission: String },
-
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -47,21 +38,19 @@ impl From<TeamError> for Problem {
         match error {
             TeamError::NotFound { .. }
             | TeamError::MemberNotFound { .. }
-            | TeamError::ProjectAccessNotFound { .. }
-            | TeamError::CustomRoleNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+            | TeamError::ProjectAccessNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
 
-            TeamError::Validation { .. }
-            | TeamError::InvalidRole(_)
-            | TeamError::InvalidPermission { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Validation Error")
-                .with_detail(error.to_string()),
+            TeamError::Validation { .. } | TeamError::InvalidRole(_) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Validation Error")
+                    .with_detail(error.to_string())
+            }
 
             TeamError::SlugConflict { .. }
             | TeamError::DuplicateMember { .. }
-            | TeamError::DuplicateProjectAccess { .. }
-            | TeamError::CustomRoleSlugConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+            | TeamError::DuplicateProjectAccess { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Resource Conflict")
                 .with_detail(error.to_string()),
 

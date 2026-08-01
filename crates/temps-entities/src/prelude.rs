@@ -9,8 +9,6 @@ pub use super::backups::Entity as Backups;
 pub use super::cron_executions::Entity as CronExecutions;
 pub use super::crons::Entity as Crons;
 pub use super::cross_project_trace_refs::Entity as CrossProjectTraceRefs;
-pub use super::custom_role_permissions::Entity as CustomRolePermissions;
-pub use super::custom_roles::Entity as CustomRoles;
 pub use super::custom_routes::Entity as CustomRoutes;
 pub use super::deployment_config::{DeploymentConfig, DeploymentConfigSnapshot};
 pub use super::deployment_containers::Entity as DeploymentContainers;

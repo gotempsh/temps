@@ -35,20 +35,23 @@
 //!
 //! [`user_can_access_project`](ProjectAccessChecker::user_can_access_project)
 //! is a binary check — it never looks at the specific `role`
-//! (`owner|admin|deployer|viewer`) or `custom_role_id` value, so a project
-//! role meant to be more restrictive than another has no effect once the
-//! binary answer is yes. `effective_project_permissions` closes that gap:
+//! (`owner|admin|deployer|viewer`), so a project role meant to be more
+//! restrictive than another has no effect once the binary answer is yes. `effective_project_permissions` closes that gap:
 //! it resolves the exact permission set a user holds *within* a project,
 //! so `project_permission_guard!` can deny specific actions the coarser
 //! check would allow.
 //!
 //! Resolution: for each team the user belongs to that has a grant on the
-//! project, resolve that membership's permission set — `custom_role_id`
-//! wins, else the intersection of `team_members.role` and
+//! project, take the intersection of `team_members.role` and
 //! `project_team_access.role`'s fixed permission sets
-//! ([`fixed_role_permissions`]) — and union across teams. Intersecting the
-//! two fixed-role columns is deliberately *narrowing*: it cannot leak
-//! privilege regardless of which column an admin actually populated.
+//! ([`fixed_role_permissions`]), then union across teams. Intersecting the
+//! two role columns is deliberately *narrowing*: it cannot leak privilege
+//! regardless of which column an admin actually populated.
+//!
+//! A registered [`MembershipPermissionResolver`] may replace the
+//! *membership* half of that intersection for memberships it recognises —
+//! but the grant half still applies, so a plugin can only narrow a member
+//! below their team's access, never widen them past it.
 //!
 //! # Caching
 //!
@@ -62,20 +65,20 @@
 //! - [`invalidate_user`](TeamProjectAccessChecker::invalidate_user) —
 //!   `add_member` / `remove_member` / `set_member_role`
 //! - [`invalidate_all`](TeamProjectAccessChecker::invalidate_all) —
-//!   `delete_team`, and custom-role update/delete, where the set of
-//!   affected `(user, project)` pairs is unbounded.
+//!   `delete_team`, and any plugin-side change to what a
+//!   [`MembershipPermissionResolver`] answers, where the set of affected
+//!   `(user, project)` pairs is unbounded.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_auth::permissions::Permission;
-use temps_core::ProjectAccessChecker;
+use temps_core::{MembershipPermissionResolver, ProjectAccessChecker};
 use temps_entities::{project_team_access, team_members};
 
-use crate::custom_role_service::CustomRoleService;
 use crate::role_permissions::fixed_role_permissions;
 
 /// Team membership and project grants change through deliberate admin
@@ -106,13 +109,14 @@ pub(crate) enum CheckerError {
     },
 
     #[error(
-        "Failed to resolve custom-role permissions for user {user_id} on project {project_id}: \
-         {source}"
+        "A registered MembershipPermissionResolver failed for team member {team_member_id} \
+         (user {user_id}, project {project_id}): {source}"
     )]
-    CustomRoleResolution {
+    MembershipResolution {
+        team_member_id: i32,
         user_id: i32,
         project_id: i32,
-        source: crate::error::TeamError,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -132,14 +136,15 @@ pub struct TeamProjectAccessChecker {
     /// `(user_id, project_id) → effective permission strings`, `None` when
     /// unrestricted.
     permissions_cache: Cache<(i32, i32), Option<Vec<String>>>,
-    custom_role_service: Arc<dyn CustomRoleService>,
+    /// Populated once during route configuration, by which point every
+    /// plugin's services are registered. `None` inside the `OnceLock` on a
+    /// stock binary, where resolution is purely from the fixed roles;
+    /// unset entirely before configuration, which reads the same way.
+    membership_resolver: OnceLock<Option<Arc<dyn MembershipPermissionResolver>>>,
 }
 
 impl TeamProjectAccessChecker {
-    pub fn new(
-        db: Arc<DatabaseConnection>,
-        custom_role_service: Arc<dyn CustomRoleService>,
-    ) -> Self {
+    pub fn new(db: Arc<DatabaseConnection>) -> Self {
         let cache = Cache::builder()
             .max_capacity(CACHE_MAX_CAPACITY)
             .time_to_live(CACHE_TTL)
@@ -152,8 +157,21 @@ impl TeamProjectAccessChecker {
             db,
             cache,
             permissions_cache,
-            custom_role_service,
+            membership_resolver: OnceLock::new(),
         }
+    }
+
+    /// Attaches the optional [`MembershipPermissionResolver`].
+    ///
+    /// Called during route configuration rather than service registration:
+    /// a resolver is registered by another plugin, and plugin registration
+    /// order is not guaranteed, but *all* services are registered before
+    /// *any* plugin configures routes. Resolving it earlier would silently
+    /// miss a resolver whose plugin happens to load later.
+    ///
+    /// Idempotent — a second call is ignored.
+    pub fn set_membership_resolver(&self, resolver: Option<Arc<dyn MembershipPermissionResolver>>) {
+        let _ = self.membership_resolver.set(resolver);
     }
 
     /// Explicit cache invalidation for all `(*, project_id)` entries, so
@@ -306,6 +324,41 @@ impl TeamProjectAccessChecker {
         Ok(gated.difference(&allowed).copied().collect())
     }
 
+    /// Asks a registered [`MembershipPermissionResolver`], if any, what
+    /// this membership's own role should resolve to. `Ok(None)` means
+    /// "use the fixed role" — which is also the answer on a binary with
+    /// no resolver registered.
+    async fn resolve_member_side(
+        &self,
+        membership: &team_members::Model,
+    ) -> Result<Option<Vec<Permission>>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(resolver) = self.membership_resolver.get().and_then(|r| r.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(strings) = resolver.membership_permissions(membership.id).await? else {
+            return Ok(None);
+        };
+        // Unrecognised strings are dropped, not errored: narrowing is the
+        // safe direction if a resolver is ahead of this binary's
+        // `Permission` enum.
+        Ok(Some(
+            strings
+                .into_iter()
+                .filter_map(|p| {
+                    let parsed = Permission::from_str(&p);
+                    if parsed.is_none() {
+                        tracing::warn!(
+                            team_member_id = membership.id,
+                            permission = %p,
+                            "teams: resolver returned an unrecognized permission — dropping it"
+                        );
+                    }
+                    parsed
+                })
+                .collect(),
+        ))
+    }
+
     /// Resolves the permission strings `user_id` holds within `project_id`
     /// — runs only on a permissions-cache miss.
     async fn check_permissions_uncached(
@@ -328,9 +381,9 @@ impl TeamProjectAccessChecker {
         let granted_team_ids: Vec<i32> = grants.iter().map(|g| g.team_id).collect();
 
         // Step 2: the user's membership rows on those granted teams.
-        // Unlike the binary check we need the full rows (role,
-        // custom_role_id), and there can be more than one — a user may
-        // belong to several teams granted access to the same project.
+        // Unlike the binary check we need the full rows (for the role),
+        // and there can be more than one — a user may belong to several
+        // teams granted access to the same project.
         let memberships = team_members::Entity::find()
             .filter(team_members::Column::UserId.eq(user_id))
             .filter(team_members::Column::TeamId.is_in(granted_team_ids))
@@ -358,61 +411,63 @@ impl TeamProjectAccessChecker {
                 continue;
             };
 
-            let resolved: Vec<Permission> = if membership.custom_role_id.is_some() {
-                match self
-                    .custom_role_service
-                    .effective_permissions(membership)
-                    .await
-                    .map_err(|source| CheckerError::CustomRoleResolution {
+            // What the member's own role contributes. A registered
+            // resolver may replace this half; the grant half below still
+            // applies either way.
+            let member_side: Vec<Permission> = match self.resolve_member_side(membership).await {
+                Ok(Some(perms)) => perms,
+                Ok(None) => fixed_role_permissions_or_empty(&membership.role),
+                Err(source) => {
+                    return Err(CheckerError::MembershipResolution {
+                        team_member_id: membership.id,
                         user_id,
                         project_id,
                         source,
-                    })? {
-                    Some(perms) => perms,
-                    // custom_role_id was Some but resolution found nothing
-                    // — fall back to the fixed-role intersection rather
-                    // than silently granting zero permissions.
-                    None => intersect_fixed_roles(&membership.role, &grant.role),
+                    })
                 }
-            } else {
-                intersect_fixed_roles(&membership.role, &grant.role)
             };
 
-            effective.extend(resolved.into_iter().map(|p| p.to_string()));
+            // The team's grant on this project is a hard ceiling: whatever
+            // the member's side says, they cannot exceed what their team
+            // was actually granted here.
+            let grant_side: std::collections::HashSet<Permission> =
+                fixed_role_permissions_or_empty(&grant.role)
+                    .into_iter()
+                    .collect();
+
+            effective.extend(
+                member_side
+                    .into_iter()
+                    .filter(|p| grant_side.contains(p))
+                    .map(|p| p.to_string()),
+            );
         }
 
         Ok(Some(effective.into_iter().collect()))
     }
 }
 
-/// `fixed_role_permissions(member_role) ∩ fixed_role_permissions(grant_role)`
-/// — whichever of the two columns is more restrictive wins. Malformed role
-/// strings (which should not occur: both columns are always written via
-/// `TeamRole::as_str()`) contribute no permissions rather than erroring the
-/// whole resolution; other valid memberships in the union are unaffected.
-fn intersect_fixed_roles(member_role: &str, grant_role: &str) -> Vec<Permission> {
+/// Fixed-role permission set for a stored role string.
+///
+/// A malformed value (which should not occur — both role columns are only
+/// ever written via `TeamRole::as_str()`) contributes nothing rather than
+/// erroring the whole resolution, so one bad row can't deny a user the
+/// access their other memberships legitimately grant.
+fn fixed_role_permissions_or_empty(role: &str) -> Vec<Permission> {
     use std::str::FromStr;
     use temps_entities::TeamRole;
 
-    let (Ok(member_role), Ok(grant_role)) = (
-        TeamRole::from_str(member_role),
-        TeamRole::from_str(grant_role),
-    ) else {
-        tracing::warn!(
-            member_role,
-            grant_role,
-            "teams: unparsable role string during permission resolution — contributing no \
-             permissions for this membership"
-        );
-        return Vec::new();
-    };
-
-    let member_set: std::collections::HashSet<Permission> =
-        fixed_role_permissions(member_role).into_iter().collect();
-    fixed_role_permissions(grant_role)
-        .into_iter()
-        .filter(|p| member_set.contains(p))
-        .collect()
+    match TeamRole::from_str(role) {
+        Ok(role) => fixed_role_permissions(role),
+        Err(_) => {
+            tracing::warn!(
+                role,
+                "teams: unparsable role string during permission resolution — contributing \
+                 no permissions"
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[async_trait]
@@ -502,71 +557,66 @@ mod tests {
             team_id,
             user_id,
             role: "viewer".to_string(),
-            custom_role_id: None,
             added_by: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
 
-    /// A `CustomRoleService` whose `effective_permissions` returns a
-    /// fixed, configurable set. `None` models "no custom role resolved";
-    /// `Some(perms)` lets a test observe whether the custom-role branch
-    /// was actually taken.
-    struct StubCustomRoleService(Option<Vec<Permission>>);
+    /// A resolver that answers with a fixed set for every membership,
+    /// standing in for a plugin that has an opinion about this member.
+    struct StubResolver(Vec<Permission>);
 
     #[async_trait]
-    impl CustomRoleService for StubCustomRoleService {
-        async fn create_custom_role(
+    impl MembershipPermissionResolver for StubResolver {
+        async fn membership_permissions(
             &self,
-            _actor_user_id: i32,
-            _req: crate::custom_role_service::CreateCustomRoleRequest,
-        ) -> Result<(temps_entities::custom_roles::Model, Vec<String>), crate::error::TeamError>
-        {
-            unreachable!("not exercised by checker tests")
-        }
-        async fn list_custom_roles(
-            &self,
-            _page: Option<u64>,
-            _page_size: Option<u64>,
-        ) -> Result<
-            (Vec<(temps_entities::custom_roles::Model, Vec<String>)>, u64),
-            crate::error::TeamError,
-        > {
-            unreachable!("not exercised by checker tests")
-        }
-        async fn get_custom_role(
-            &self,
-            _role_id: i32,
-        ) -> Result<(temps_entities::custom_roles::Model, Vec<String>), crate::error::TeamError>
-        {
-            unreachable!("not exercised by checker tests")
-        }
-        async fn update_custom_role(
-            &self,
-            _role_id: i32,
-            _req: crate::custom_role_service::UpdateCustomRoleRequest,
-        ) -> Result<(temps_entities::custom_roles::Model, Vec<String>), crate::error::TeamError>
-        {
-            unreachable!("not exercised by checker tests")
-        }
-        async fn delete_custom_role(&self, _role_id: i32) -> Result<(), crate::error::TeamError> {
-            unreachable!("not exercised by checker tests")
-        }
-        async fn effective_permissions(
-            &self,
-            member: &team_members::Model,
-        ) -> Result<Option<Vec<Permission>>, crate::error::TeamError> {
-            assert!(
-                member.custom_role_id.is_some(),
-                "effective_permissions should only be called when custom_role_id is set"
-            );
-            Ok(self.0.clone())
+            _team_member_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(self.0.iter().map(|p| p.to_string()).collect()))
         }
     }
 
+    /// A resolver that always declines, so resolution falls through to the
+    /// fixed role — the same path a binary with no resolver takes.
+    struct DecliningResolver;
+
+    #[async_trait]
+    impl MembershipPermissionResolver for DecliningResolver {
+        async fn membership_permissions(
+            &self,
+            _team_member_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+    }
+
+    /// A resolver whose backing store is down.
+    struct FailingResolver;
+
+    #[async_trait]
+    impl MembershipPermissionResolver for FailingResolver {
+        async fn membership_permissions(
+            &self,
+            _team_member_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Err("resolver backend unavailable".into())
+        }
+    }
+
+    /// The stock shape: no plugin registered.
     fn new_checker(db: DatabaseConnection) -> TeamProjectAccessChecker {
-        TeamProjectAccessChecker::new(Arc::new(db), Arc::new(StubCustomRoleService(None)))
+        TeamProjectAccessChecker::new(Arc::new(db))
+    }
+
+    /// A checker with a resolver attached, as `configure_routes` would.
+    fn checker_with_resolver(
+        db: DatabaseConnection,
+        resolver: Arc<dyn MembershipPermissionResolver>,
+    ) -> TeamProjectAccessChecker {
+        let checker = TeamProjectAccessChecker::new(Arc::new(db));
+        checker.set_membership_resolver(Some(resolver));
+        checker
     }
 
     /// Project with zero access-grant rows → allow regardless of team
@@ -951,27 +1001,50 @@ mod tests {
         assert!(checker.effective_project_permissions(1, 42).await.is_err());
     }
 
-    /// `custom_role_id` set → the custom role's permission set is used,
-    /// not the fixed `member.role ∩ grant.role` mapping.
+    /// A registered resolver replaces the *membership* half of the
+    /// intersection: a member whose resolver answer is narrower than their
+    /// fixed role gets the narrower set.
     #[tokio::test]
-    async fn effective_permissions_uses_custom_role_when_assigned() {
-        let mut member = member_with_role(10, 1, "viewer");
-        member.custom_role_id = Some(5);
-        // A permission the "viewer" fixed set does NOT contain, so success
-        // can only mean the custom-role branch actually ran.
-        let custom_only_perm = Permission::WebhooksWrite;
+    async fn resolver_replaces_the_membership_half() {
+        // Team is granted `admin`, member's fixed role is `admin`, but the
+        // resolver says they only hold one permission here.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_with_role(42, 10, "admin")]])
+            .append_query_results(vec![vec![member_with_role(10, 1, "admin")]])
+            .into_connection();
+        let checker = checker_with_resolver(
+            db,
+            Arc::new(StubResolver(vec![Permission::DeploymentsRead])),
+        );
+
+        let perms = checker
+            .effective_project_permissions(1, 42)
+            .await
+            .unwrap()
+            .expect("must resolve to Some(perms)");
+        assert_eq!(perms, vec![Permission::DeploymentsRead.to_string()]);
+    }
+
+    /// The grant role is a hard ceiling on whatever a resolver answers.
+    /// A plugin must not be able to hand a member permissions the team was
+    /// never granted on this project.
+    #[tokio::test]
+    async fn resolver_cannot_exceed_the_team_grant() {
+        let over_reach = Permission::DeploymentsCreate;
         assert!(
-            !fixed_role_permissions(TeamRole::Viewer).contains(&custom_only_perm),
-            "test fixture invariant: WebhooksWrite must not be in the viewer set"
+            !fixed_role_permissions(TeamRole::Viewer).contains(&over_reach),
+            "fixture invariant: DeploymentsCreate must not be in the viewer set"
         );
 
+        // Team holds only `viewer` on this project, but the resolver tries
+        // to grant a deploy permission.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_with_role(42, 10, "viewer")]])
-            .append_query_results(vec![vec![member]])
+            .append_query_results(vec![vec![member_with_role(10, 1, "admin")]])
             .into_connection();
-        let checker = TeamProjectAccessChecker::new(
-            Arc::new(db),
-            Arc::new(StubCustomRoleService(Some(vec![custom_only_perm]))),
+        let checker = checker_with_resolver(
+            db,
+            Arc::new(StubResolver(vec![over_reach, Permission::DeploymentsRead])),
         );
 
         let perms = checker
@@ -979,45 +1052,54 @@ mod tests {
             .await
             .unwrap()
             .expect("must resolve to Some(perms)");
-        assert_eq!(
-            perms,
-            vec![custom_only_perm.to_string()],
-            "the custom role's set must be used verbatim, not intersected with the fixed mapping"
+        assert!(
+            !perms.contains(&over_reach.to_string()),
+            "the team's viewer grant must cap what the resolver can hand out"
+        );
+        assert!(
+            perms.contains(&Permission::DeploymentsRead.to_string()),
+            "permissions inside the grant ceiling still come through"
         );
     }
 
-    /// `custom_role_id` set but the role resolved to nothing (e.g. it was
-    /// concurrently emptied) → fall back to the fixed-role intersection
-    /// rather than silently granting zero permissions.
+    /// A resolver that declines falls through to the fixed role — same
+    /// result as a binary with no resolver registered.
     #[tokio::test]
-    async fn effective_permissions_falls_back_when_custom_role_resolves_none() {
-        let mut member = member_with_role(10, 1, "viewer");
-        member.custom_role_id = Some(5);
-
+    async fn declining_resolver_falls_through_to_fixed_role() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![grant_with_role(42, 10, "viewer")]])
-            .append_query_results(vec![vec![member]])
+            .append_query_results(vec![vec![grant_with_role(42, 10, "deployer")]])
+            .append_query_results(vec![vec![member_with_role(10, 1, "deployer")]])
             .into_connection();
-        let checker =
-            TeamProjectAccessChecker::new(Arc::new(db), Arc::new(StubCustomRoleService(None)));
+        let checker = checker_with_resolver(db, Arc::new(DecliningResolver));
 
         let perms = checker
             .effective_project_permissions(1, 42)
             .await
             .unwrap()
             .expect("must resolve to Some(perms)");
-        let viewer_set: std::collections::HashSet<String> =
-            fixed_role_permissions(TeamRole::Viewer)
-                .into_iter()
-                .map(|p| p.to_string())
-                .collect();
-        let resolved_set: std::collections::HashSet<String> = perms.into_iter().collect();
-        assert_eq!(resolved_set, viewer_set);
+        assert!(perms.contains(&Permission::DeploymentsCreate.to_string()));
     }
 
-    /// Editing a custom role's permissions must be visible on the next
-    /// resolution without waiting for the TTL — `invalidate_all` must
-    /// clear the permissions cache, not just the binary-access cache.
+    /// Fail-closed: a resolver error propagates rather than silently
+    /// falling back to the fixed role, which could widen a member the
+    /// plugin meant to narrow.
+    #[tokio::test]
+    async fn failing_resolver_propagates_err() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_with_role(42, 10, "admin")]])
+            .append_query_results(vec![vec![member_with_role(10, 1, "admin")]])
+            .into_connection();
+        let checker = checker_with_resolver(db, Arc::new(FailingResolver));
+
+        assert!(
+            checker.effective_project_permissions(1, 42).await.is_err(),
+            "a resolver failure must not fall back to the fixed role"
+        );
+    }
+
+    /// A plugin-side change to what a resolver answers must be visible on
+    /// the next resolution without waiting for the TTL — `invalidate_all`
+    /// must clear the permissions cache, not just the binary-access cache.
     #[tokio::test]
     async fn invalidate_all_clears_permissions_cache_too() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)

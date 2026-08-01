@@ -120,3 +120,39 @@ pub trait ProjectAccessChecker: Send + Sync {
         Ok(None)
     }
 }
+
+/// Optional extension point for overriding what a single team membership
+/// resolves to, in place of the fixed role stored on the membership row.
+///
+/// Core knows four fixed roles (`owner`/`admin`/`deployer`/`viewer`) and
+/// resolves a member's permissions inside a project from those. A plugin
+/// (e.g. one implementing admin-defined named permission sets) registers
+/// an implementation via `context.register_service(resolver)` to answer
+/// differently for memberships it knows about. Retrieved with
+/// `context.get_service::<dyn MembershipPermissionResolver>()` — never
+/// `require_service` — so a binary with nothing registered resolves purely
+/// from the fixed roles, identical in spirit to [`crate::DeploymentGate`].
+///
+/// # The answer is a ceiling, not a grant
+///
+/// Whatever this returns is **intersected** with the permission set the
+/// team's own grant on the project allows. It can therefore only ever
+/// narrow a member below their team's access, never widen them past it.
+/// That invariant belongs to core, not to the implementation: a team
+/// granted `viewer` on a project must not end up with a member who can
+/// deploy to it, no matter what a plugin says.
+#[async_trait]
+pub trait MembershipPermissionResolver: Send + Sync {
+    /// Returns `Ok(Some(perms))` — permission strings (matching
+    /// `Permission::to_string()`, e.g. `"deployments:create"`) to use for
+    /// this membership instead of its fixed role — or `Ok(None)` to fall
+    /// through to the fixed role.
+    ///
+    /// `Err(_)` is an infrastructure failure and is propagated: the caller
+    /// fails the check rather than silently falling back, since falling
+    /// back could widen a member the plugin meant to narrow.
+    async fn membership_permissions(
+        &self,
+        team_member_id: i32,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>>;
+}

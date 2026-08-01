@@ -7,11 +7,9 @@
 //! enforced by `project_access_guard!`/`project_permission_guard!` in the
 //! project-scoped handlers across the rest of the platform.
 
-mod custom_roles;
 mod project_access;
 mod teams;
 
-pub use custom_roles::*;
 pub use project_access::*;
 pub use teams::*;
 
@@ -22,10 +20,6 @@ use temps_core::AuditLogger;
 use utoipa::OpenApi;
 
 use crate::checker::TeamProjectAccessChecker;
-use crate::custom_role_service::{
-    CreateCustomRoleRequest, CustomRoleListResponse, CustomRoleResponse, CustomRoleService,
-    UpdateCustomRoleRequest,
-};
 use crate::service::{
     CreateProjectAccessRequest, CreateTeamMemberRequest, CreateTeamRequest, ProjectAccessResponse,
     TeamMemberResponse, TeamService, UpdateMemberRoleRequest, UpdateTeamRequest,
@@ -35,30 +29,23 @@ use crate::service::{
 #[derive(Clone)]
 pub struct TeamsAppState {
     pub team_service: Arc<dyn TeamService>,
-    pub custom_role_service: Arc<dyn CustomRoleService>,
     /// Records authorization-state changes (team delete, membership,
-    /// project-access grant/revoke, custom-role edits) to the audit log.
+    /// project-access grant/revoke) to the audit log.
     pub audit: Arc<dyn AuditLogger>,
-    /// Held as the concrete type (not the `Arc<dyn ProjectAccessChecker>`
-    /// trait object the rest of the platform sees) so the custom-role
-    /// update/delete handlers can call `invalidate_all()` after a
-    /// permission-set change — that changes what's cached for every member
-    /// holding the role without any membership row changing, so the
-    /// service's narrower `invalidate_user`/`invalidate_project` calls
-    /// don't cover it.
+    /// Held as the concrete type, not the `Arc<dyn ProjectAccessChecker>`
+    /// trait object the rest of the platform sees, so the access handlers
+    /// can guard themselves with the very checker this crate registers.
     pub checker: Arc<TeamProjectAccessChecker>,
 }
 
 impl TeamsAppState {
     pub fn new(
         team_service: Arc<dyn TeamService>,
-        custom_role_service: Arc<dyn CustomRoleService>,
         audit: Arc<dyn AuditLogger>,
         checker: Arc<TeamProjectAccessChecker>,
     ) -> Self {
         Self {
             team_service,
-            custom_role_service,
             audit,
             checker,
         }
@@ -69,7 +56,6 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
     Router::new()
         .merge(teams::router())
         .merge(project_access::router())
-        .merge(custom_roles::router())
         .with_state(state)
 }
 
@@ -89,11 +75,6 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         project_access::list_project_access,
         project_access::grant_project_access,
         project_access::revoke_project_access,
-        custom_roles::list_custom_roles,
-        custom_roles::create_custom_role,
-        custom_roles::get_custom_role,
-        custom_roles::update_custom_role,
-        custom_roles::delete_custom_role,
     ),
     components(schemas(
         teams::TeamResponse,
@@ -105,12 +86,8 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         CreateTeamMemberRequest,
         CreateProjectAccessRequest,
         UpdateMemberRoleRequest,
-        CustomRoleResponse,
-        CustomRoleListResponse,
-        CreateCustomRoleRequest,
-        UpdateCustomRoleRequest,
         temps_entities::TeamRole,
     )),
-    tags((name = "Teams", description = "Teams, project-scoped access, and custom roles"))
+    tags((name = "Teams", description = "Teams and project-scoped access"))
 )]
 pub struct TeamsApiDoc;

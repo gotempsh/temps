@@ -61,7 +61,7 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
-pub use project_access::ProjectAccessChecker;
+pub use project_access::{MembershipPermissionResolver, ProjectAccessChecker};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,

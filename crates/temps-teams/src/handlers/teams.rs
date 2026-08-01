@@ -166,8 +166,7 @@ struct TeamMemberRoleUpdatedAudit {
     context: AuditContext,
     team_id: i32,
     target_user_id: i32,
-    role: Option<String>,
-    custom_role_id: Option<i32>,
+    role: String,
 }
 
 impl AuditOperation for TeamMemberRoleUpdatedAudit {
@@ -504,9 +503,8 @@ pub async fn add_team_member(
     request_body = UpdateMemberRoleRequest,
     responses(
         (status = 200, description = "Updated membership", body = TeamMemberResponse),
-        (status = 400, description = "Must specify exactly one of role/custom_role_id"),
-        (status = 403, description = "Assigned custom role grants a permission exceeding the actor's own"),
-        (status = 404, description = "Member or custom role not found"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Member not found"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -519,32 +517,8 @@ pub async fn update_team_member_role(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
-    // Assigning an EXISTING custom role to a member is itself a privilege
-    // delegation: the role's permission set was ceiling-checked against
-    // ITS creator at create/update time, not against whoever is assigning
-    // it here. Without this check, any actor holding only UsersWrite could
-    // grant a team member a role carrying permissions (e.g. SystemAdmin)
-    // the assigning actor never held themselves — the same
-    // escalation-by-proxy shape as the API-key ceiling bug, one hop removed.
-    //
-    // Known accepted limitation: this read and the write in
-    // `set_member_role` below aren't in the same transaction, so a
-    // legitimate admin concurrently PATCHing this role's permission set
-    // between the two could let this assignment bind against a permission
-    // set the ceiling check never saw. That requires precise timing plus a
-    // second, independent higher-privileged actor acting at that exact
-    // moment — not a self-contained escalation path for the caller.
-    if let Some(custom_role_id) = req.custom_role_id {
-        let (_, permissions) = state
-            .custom_role_service
-            .get_custom_role(custom_role_id)
-            .await?;
-        super::custom_roles::enforce_permission_ceiling(&auth, &permissions)?;
-    }
-
-    // Capture audit fields before req is moved into the service call.
-    let audit_role = req.role.map(|r| r.to_string());
-    let audit_custom_role_id = req.custom_role_id;
+    // Capture the audit field before req is moved into the service call.
+    let audit_role = req.role.to_string();
 
     let member = state
         .team_service
@@ -560,7 +534,6 @@ pub async fn update_team_member_role(
         team_id,
         target_user_id: user_id,
         role: audit_role,
-        custom_role_id: audit_custom_role_id,
     };
     if let Err(e) = state.audit.create_audit_log(&audit).await {
         tracing::error!(error = %e, "teams: failed to write team member role update audit log");

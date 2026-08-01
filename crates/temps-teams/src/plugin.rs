@@ -26,7 +26,6 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::checker::TeamProjectAccessChecker;
-use crate::custom_role_service::DefaultCustomRoleService;
 use crate::handlers::{router, TeamsApiDoc, TeamsAppState};
 use crate::service::{DefaultTeamService, TeamService};
 
@@ -56,16 +55,10 @@ impl TempsPlugin for TeamsPlugin {
         Box::pin(async move {
             let db = context.require_service::<DatabaseConnection>();
 
-            // Built before the checker: the checker's permission
-            // resolution needs it to resolve `custom_role_id` grants.
-            let custom_role_service = Arc::new(DefaultCustomRoleService::new(db.clone()));
-
             // Owns the caches and the DB handle for the authorization
-            // queries.
-            let checker = Arc::new(TeamProjectAccessChecker::new(
-                db.clone(),
-                custom_role_service.clone(),
-            ));
+            // queries. Its optional membership resolver is attached later,
+            // in `configure_routes` — see there for why.
+            let checker = Arc::new(TeamProjectAccessChecker::new(db.clone()));
 
             // The team service holds an Arc to the concrete checker so it
             // can invalidate the caches after writes.
@@ -75,12 +68,7 @@ impl TempsPlugin for TeamsPlugin {
 
             let audit = context.require_service::<dyn temps_core::AuditLogger>();
 
-            let app_state = Arc::new(TeamsAppState::new(
-                team_service,
-                custom_role_service,
-                audit,
-                checker.clone(),
-            ));
+            let app_state = Arc::new(TeamsAppState::new(team_service, audit, checker.clone()));
             context.register_service(app_state);
 
             // Registering this activates `project_access_guard!` and
@@ -96,6 +84,17 @@ impl TempsPlugin for TeamsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let app_state = context.require_service::<TeamsAppState>();
+
+        // Attach the optional membership resolver here rather than in
+        // `register_services`: it's registered by a different plugin, and
+        // plugin registration order isn't guaranteed. Every plugin's
+        // services are registered before any plugin configures routes, so
+        // this is the first point at which a resolver is guaranteed
+        // visible however the plugins happen to be ordered.
+        app_state.checker.set_membership_resolver(
+            context.get_service::<dyn temps_core::MembershipPermissionResolver>(),
+        );
+
         Some(PluginRoutes::new(router(app_state)))
     }
 
