@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{AuditLogger, DeploymentCanceller, ProjectEnvVarsProvider};
+use temps_core::{
+    AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
+};
 use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
@@ -14,6 +16,7 @@ pub struct AppState {
     pub secret_service: Arc<SecretService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub deployment_service: Arc<dyn DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     /// Optional on-demand waker for starting/stopping containers during wake/sleep.
     /// Only available when the proxy's OnDemandManager is registered.
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -34,6 +37,7 @@ pub fn create_environment_app_state(
     secret_service: Arc<SecretService>,
     audit_service: Arc<dyn AuditLogger>,
     deployment_service: Arc<dyn DeploymentCanceller>,
+    deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -45,6 +49,7 @@ pub fn create_environment_app_state(
         secret_service,
         audit_service,
         deployment_service,
+        deployment_container_cleaner,
         on_demand_waker,
         integration_env_provider,
         telemetry,

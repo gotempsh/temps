@@ -1677,10 +1677,17 @@ pub async fn delete_environment(
     // Get environment details before deletion for audit log
     let environment = state
         .environment_service
-        .get_environment(project_id, env_id)
+        .get_environment_for_deletion(project_id, env_id)
         .await?;
 
     let project = state.environment_service.get_project(project_id).await?;
+
+    // Persist the deletion fence before cancelling workflows or touching
+    // Docker. Deployment workers already reject soft-deleted environments.
+    state
+        .environment_service
+        .delete_environment(project_id, env_id)
+        .await?;
 
     // Cancel all active deployments for this environment
     match state
@@ -1696,20 +1703,38 @@ pub async fn delete_environment(
                 );
             }
         }
-        Err(e) => {
+        Err(error) => {
             error!(
-                "Failed to cancel deployments for environment {}: {:?}",
-                env_id, e
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to cancel environment deployments"
             );
-            // Continue with deletion even if cancellation fails
+            return Err(
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Deployment Cancellation Failed")
+                    .with_detail(format!(
+                        "Failed to cancel active deployments for environment {env_id}: {error}"
+                    )),
+            );
         }
     }
 
-    // Delete the environment
     state
-        .environment_service
-        .delete_environment(project_id, env_id)
-        .await?;
+        .deployment_container_cleaner
+        .cleanup_environment_containers(project_id, env_id)
+        .await
+        .map_err(|error| {
+            error!(
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to clean up environment containers"
+            );
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Environment Container Cleanup Failed")
+                .with_detail(error.to_string())
+        })?;
 
     // Create audit event
     let audit_context = temps_core::AuditContext {

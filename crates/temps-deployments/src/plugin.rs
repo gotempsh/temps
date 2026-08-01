@@ -97,6 +97,10 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
             context.register_service(deployment_canceller);
 
+            let deployment_container_cleaner =
+                deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
+            context.register_service(deployment_container_cleaner);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile

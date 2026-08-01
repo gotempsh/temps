@@ -87,6 +87,18 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     )
 }
 
+fn remove_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
+    match error {
+        temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
+        temps_deployer::DeployerError::DeploymentFailed(_)
+        | temps_deployer::DeployerError::ImageNotFound(_)
+        | temps_deployer::DeployerError::NetworkError(_)
+        | temps_deployer::DeployerError::ResourceAllocationFailed(_)
+        | temps_deployer::DeployerError::SecretMountFailed { .. }
+        | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -318,6 +330,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container removed", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
         (status = 500, description = "Remove failed")
     ),
     security(("bearer_auth" = []))
@@ -337,13 +350,40 @@ pub async fn remove_container(
             AgentResponse::ok("removed".to_string()).into_response()
         }
         Err(e) => {
-            tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            let status = remove_error_status(&e);
+            if status == StatusCode::NOT_FOUND {
+                tracing::info!(container_id = %container_id, reason = %e, "Container already absent");
+            } else {
+                tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            }
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 format!("Remove failed for container {}: {}", container_id, e),
             )
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    #[test]
+    fn missing_container_maps_to_http_not_found_for_idempotent_remote_cleanup() {
+        let error = temps_deployer::DeployerError::ContainerNotFound(
+            "container no longer exists".to_string(),
+        );
+        assert_eq!(remove_error_status(&error), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn operational_remove_failure_maps_to_http_internal_server_error() {
+        let error = temps_deployer::DeployerError::NetworkError("dockerd unavailable".to_string());
+        assert_eq!(
+            remove_error_status(&error),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 

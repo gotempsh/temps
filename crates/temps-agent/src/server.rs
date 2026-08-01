@@ -326,7 +326,9 @@ fn spawn_heartbeat_loop(
                         }
                         consecutive_failures = 0;
                         succeeded = true;
-                        inventory_sent = true;
+                        if body.get("containers").is_some() {
+                            inventory_sent = true;
+                        }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
                     }

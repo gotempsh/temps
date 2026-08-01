@@ -2269,7 +2269,8 @@ impl ContainerDeployer for DockerRuntime {
             // Docker prefixes inspect names with a leading '/'.
             .map(|n| n.trim_start_matches('/').to_string());
 
-        self.docker
+        let removal_result = self
+            .docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -2278,20 +2279,34 @@ impl ContainerDeployer for DockerRuntime {
                 }),
             )
             .await
-            .map_err(|e| DeployerError::Other(format!("Failed to remove container: {}", e)))?;
+            .map_err(|error| match error {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    message,
+                } => DeployerError::ContainerNotFound(message),
+                other => DeployerError::Other(format!("Failed to remove container: {other}")),
+            });
 
-        if let Some(name) = container_name {
-            let dir = self.secrets_host_dir(&name);
-            if dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&dir) {
-                    warn!(
-                        "Failed to clean up secrets host dir {}: {}",
-                        dir.display(),
-                        e
-                    );
+        let should_cleanup_secrets = matches!(
+            &removal_result,
+            Ok(()) | Err(DeployerError::ContainerNotFound(_))
+        );
+        if should_cleanup_secrets {
+            if let Some(name) = container_name {
+                let dir = self.secrets_host_dir(&name);
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        warn!(
+                            "Failed to clean up secrets host dir {}: {}",
+                            dir.display(),
+                            e
+                        );
+                    }
                 }
             }
         }
+
+        removal_result?;
 
         Ok(())
     }

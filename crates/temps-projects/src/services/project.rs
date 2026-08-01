@@ -901,6 +901,27 @@ impl ProjectService {
         Ok(updated)
     }
 
+    /// Persist deletion intent before cancelling workflows or touching Docker.
+    /// Deployment workers reject projects with this fence, closing the window
+    /// where a new container could appear after the cleanup snapshot.
+    pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        if project.is_deleted {
+            return Ok(());
+        }
+
+        let mut active: projects::ActiveModel = project.into();
+        active.is_deleted = Set(true);
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.updated_at = Set(chrono::Utc::now());
+        active.update(self.db.as_ref()).await?;
+        info!(project_id, "Marked project for deletion");
+        Ok(())
+    }
+
     pub async fn delete_project(
         &self,
         project_id: i32,
@@ -3070,6 +3091,37 @@ mod tests {
             environment_service,
             encryption_service,
         )
+    }
+
+    #[tokio::test]
+    async fn begin_project_deletion_persists_idempotent_deployment_fence() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deleting Project".to_string()),
+            slug: Set("deleting-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        service.begin_project_deletion(project.id).await.unwrap();
+        service.begin_project_deletion(project.id).await.unwrap();
+
+        let fenced = temps_entities::projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project remains until container cleanup completes");
+        assert!(fenced.is_deleted);
+        assert!(fenced.deleted_at.is_some());
     }
 
     #[tokio::test]

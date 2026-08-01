@@ -286,6 +286,15 @@ impl RemoteNodeDeployer {
                 ))
             })?;
 
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DeployerError::ContainerNotFound(format!(
+                "container at {} was not found on node {}",
+                url, self.node_name
+            )));
+        }
+
         let body: AgentResponse<String> = response.json().await.map_err(|e| {
             DeployerError::NetworkError(format!(
                 "Invalid response from node {} at {}: {}",
@@ -592,6 +601,41 @@ mod tests {
         .unwrap();
         assert_eq!(deployer.node_name(), "worker-3");
         assert_eq!(deployer.agent_url(), "https://worker-3.internal:3100");
+    }
+
+    #[tokio::test]
+    async fn remove_container_maps_agent_not_found_to_typed_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"container missing"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+        let result = deployer.remove_container("already-gone").await;
+        assert!(matches!(result, Err(DeployerError::ContainerNotFound(_))));
+        server.await.expect("mock agent task");
     }
 
     /// Live **REAL DEPLOYMENT** over mTLS: drives the production
