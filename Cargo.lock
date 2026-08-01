@@ -1930,7 +1930,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93f85c3824e4191621dec0551e3cef3d511f329da9a8990bf3e450a85651d97e"
 dependencies = [
  "backtrace",
- "rand 0.8.6",
+ "rand 0.8.7",
  "tokio",
  "trackable",
 ]
@@ -5163,7 +5163,7 @@ dependencies = [
  "p256",
  "p384",
  "pem",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rsa",
  "serde",
  "serde_json",
@@ -6254,7 +6254,7 @@ dependencies = [
  "node-semver",
  "path-slash",
  "portpicker",
- "rand 0.8.6",
+ "rand 0.8.7",
  "regex",
  "sanitize-filename",
  "semver",
@@ -6398,7 +6398,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.8.7",
  "smallvec",
  "zeroize",
 ]
@@ -6490,7 +6490,7 @@ dependencies = [
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
- "rand 0.8.6",
+ "rand 0.8.7",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6645,7 +6645,7 @@ dependencies = [
  "oauth2",
  "p256",
  "p384",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rsa",
  "serde",
  "serde-value",
@@ -7197,7 +7197,7 @@ dependencies = [
  "pingora-http",
  "pingora-lru",
  "pingora-timeout",
- "rand 0.8.6",
+ "rand 0.8.7",
  "regex",
  "rmp",
  "rmp-serde",
@@ -7242,7 +7242,7 @@ dependencies = [
  "pingora-runtime",
  "pingora-timeout",
  "prometheus",
- "rand 0.8.6",
+ "rand 0.8.7",
  "regex",
  "serde",
  "serde_yaml",
@@ -7318,7 +7318,7 @@ dependencies = [
  "pingora-http",
  "pingora-ketama",
  "pingora-runtime",
- "rand 0.8.6",
+ "rand 0.8.7",
  "tokio",
 ]
 
@@ -7331,7 +7331,7 @@ dependencies = [
  "arrayvec",
  "hashbrown 0.17.1",
  "parking_lot",
- "rand 0.8.6",
+ "rand 0.8.7",
 ]
 
 [[package]]
@@ -7380,7 +7380,7 @@ dependencies = [
  "pingora-core",
  "pingora-error",
  "pingora-http",
- "rand 0.8.6",
+ "rand 0.8.7",
  "regex",
  "tokio",
 ]
@@ -7392,7 +7392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41815a13691a3e7d9ad0e34767d4140284132e31b95a4481f5e73ab6f407f834"
 dependencies = [
  "once_cell",
- "rand 0.8.6",
+ "rand 0.8.7",
  "thread_local",
  "tokio",
 ]
@@ -7510,7 +7510,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
 dependencies = [
- "rand 0.8.6",
+ "rand 0.8.7",
 ]
 
 [[package]]
@@ -8017,9 +8017,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.8.6"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -8761,7 +8761,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rkyv",
  "serde",
  "serde_json",
@@ -10088,7 +10088,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rsa",
  "rust_decimal",
  "serde",
@@ -10158,7 +10158,7 @@ dependencies = [
  "memchr",
  "num-bigint",
  "once_cell",
- "rand 0.8.6",
+ "rand 0.8.7",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -10526,7 +10526,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "parking_lot",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
@@ -10570,7 +10570,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "pulldown-cmark",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "serde",
  "serde_json",
@@ -10708,7 +10708,7 @@ dependencies = [
  "axum",
  "axum-macros",
  "chrono",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -10889,7 +10889,7 @@ dependencies = [
  "log",
  "openidconnect",
  "qrcode",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
@@ -10996,7 +10996,7 @@ dependencies = [
  "futures-util",
  "http 1.4.2",
  "once_cell",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "sea-orm",
@@ -11056,7 +11056,7 @@ dependencies = [
  "ipnet",
  "libc",
  "mime_guess",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "rustls",
  "sea-orm",
@@ -11149,7 +11149,7 @@ dependencies = [
  "dirs",
  "hex",
  "log",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "serde",
  "serde_derive",
@@ -11188,7 +11188,7 @@ dependencies = [
  "ipnet",
  "log",
  "once_cell",
- "rand 0.8.6",
+ "rand 0.10.1",
  "rcgen",
  "serde",
  "serde_json",
@@ -11286,7 +11286,7 @@ dependencies = [
  "ipnet",
  "mockall",
  "octocrab",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
@@ -11636,7 +11636,7 @@ dependencies = [
  "hex",
  "http 1.4.2",
  "log",
- "rand 0.8.6",
+ "rand 0.10.1",
  "regex",
  "relay-event-schema",
  "relay-protocol",
@@ -11745,7 +11745,7 @@ dependencies = [
  "log",
  "maxminddb",
  "moka",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "serde",
  "temps-auth",
@@ -11781,7 +11781,7 @@ dependencies = [
  "log",
  "mockito",
  "octocrab",
- "rand 0.8.6",
+ "rand 0.10.1",
  "regex",
  "reqwest 0.12.28",
  "rustls",
@@ -11835,7 +11835,7 @@ dependencies = [
  "include_dir",
  "jsonwebtoken",
  "mime_guess",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "rsa",
  "sea-orm",
@@ -12116,7 +12116,7 @@ dependencies = [
  "futures-util",
  "http 1.4.2",
  "once_cell",
- "rand 0.8.6",
+ "rand 0.10.1",
  "redis",
  "schemars 0.8.22",
  "sea-orm",
@@ -12542,7 +12542,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mongodb",
- "rand 0.8.6",
+ "rand 0.10.1",
  "redis",
  "regex",
  "reqwest 0.12.28",
@@ -12617,7 +12617,7 @@ dependencies = [
  "pingora-load-balancing",
  "pingora-openssl",
  "pingora-proxy",
- "rand 0.8.6",
+ "rand 0.10.1",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -12792,7 +12792,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 1.4.2",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -12851,7 +12851,7 @@ dependencies = [
  "futures",
  "hex",
  "http 1.4.2",
- "rand 0.8.6",
+ "rand 0.10.1",
  "sea-orm",
  "serde",
  "serde_json",
