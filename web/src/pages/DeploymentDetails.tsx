@@ -29,7 +29,7 @@ import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { formatMicrocores } from '@/lib/cpu-format'
-import { resolvePrimaryUrl } from '@/lib/deployment-url'
+import { normalizeUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -106,8 +106,12 @@ function buildUrlEntries(
     seen.add(primaryUrl)
   }
   deployment.environment.domains?.forEach((domain) => {
-    const url = domain.startsWith('http') ? domain : `https://${domain}`
-    if (seen.has(url)) return
+    // Same scheme validation as the primary URL. These entries are rendered as
+    // links too, and custom domains reach this array as raw user-supplied
+    // strings, so the weaker `startsWith('http')` test used to let
+    // `httpfoo://` and `//evil.com` through to an href.
+    const url = normalizeUrl(domain)
+    if (!url || seen.has(url)) return
     seen.add(url)
     entries.push({ url, display: domain, kind: 'preview' })
   })

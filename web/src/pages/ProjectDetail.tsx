@@ -35,7 +35,7 @@ import { AlertRuleForm } from '@/pages/AlertRuleForm'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { resolvePrimaryUrl } from '@/lib/deployment-url'
+import { resolveStableUrl } from '@/lib/deployment-url'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
@@ -305,7 +305,7 @@ export function ProjectDetail() {
                 : undefined)
             }
             lastDeploymentUrl={
-              lastDeployment ? resolvePrimaryUrl(lastDeployment) : null
+              lastDeployment ? resolveStableUrl(lastDeployment) : null
             }
             isLoadingLastDeployment={isLoadingLastDeployment}
           />
