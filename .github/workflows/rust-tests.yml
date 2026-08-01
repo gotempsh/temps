@@ -183,6 +183,11 @@ jobs:
       - name: Install dependencies
         run: cd web && bun install
 
+      # react/react-dom drifting apart is invisible to tsc and rsbuild but
+      # blanks the console at runtime with React error #527 (issue #504).
+      - name: Check react/react-dom versions match
+        run: cd web && bun run check:react-versions
+
       - name: Type check
         run: cd web && bunx tsc --noEmit
 
