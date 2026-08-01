@@ -13,9 +13,17 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import {
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { CodeBlock } from '@/components/ui/code-block'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -54,7 +62,7 @@ import {
 } from 'lucide-react'
 
 const proseClasses =
-  'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-black/30 prose-pre:text-muted-foreground prose-pre:text-xs prose-pre:border-0 prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
+  'prose prose-sm dark:prose-invert max-w-none prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
 
 interface AutopilotRunDetailProps {
   project: ProjectResponse
@@ -114,11 +122,85 @@ function logLevelColor(level: string): string {
   }
 }
 
-/** Render markdown content using prose styles */
+type CodeBlockLanguage = NonNullable<
+  ComponentProps<typeof CodeBlock>['language']
+>
+
+/** Map common markdown fence hints onto the languages the shared CodeBlock
+ *  highlights. Unknown/absent hints fall back to 'text' (no highlighting). */
+const fenceLanguageMap: Record<string, CodeBlockLanguage> = {
+  bash: 'bash',
+  sh: 'shell',
+  shell: 'shell',
+  zsh: 'shell',
+  console: 'shell',
+  yaml: 'yaml',
+  yml: 'yaml',
+  json: 'json',
+  jsonc: 'json',
+  javascript: 'javascript',
+  js: 'javascript',
+  jsx: 'javascript',
+  typescript: 'typescript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  python: 'python',
+  py: 'python',
+  go: 'go',
+  golang: 'go',
+  text: 'text',
+  txt: 'text',
+  plaintext: 'text',
+}
+
+function fenceLanguage(className: string | undefined): CodeBlockLanguage {
+  const match = /language-([\w-]+)/.exec(className ?? '')
+  return (match && fenceLanguageMap[match[1].toLowerCase()]) || 'text'
+}
+
+/** Flatten a react-markdown code element's children to the raw code string. */
+function extractText(node: ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(extractText).join('')
+  if (isValidElement(node)) {
+    return extractText((node.props as { children?: ReactNode }).children)
+  }
+  return ''
+}
+
+/** Fenced code blocks render through the shared CodeBlock (same component as
+ *  the AI Gateway page): syntax colors, line numbers, copy button, and a wrap
+ *  toggle. Long lines scroll horizontally instead of stretching the layout. */
+function MarkdownPre({ children }: { children?: ReactNode }) {
+  if (isValidElement(children)) {
+    const codeProps = children.props as {
+      className?: string
+      children?: ReactNode
+    }
+    return (
+      <CodeBlock
+        code={extractText(codeProps.children).replace(/\n$/, '')}
+        language={fenceLanguage(codeProps.className)}
+        className="not-prose my-3 text-left"
+        defaultShowLineNumbers
+      />
+    )
+  }
+  return <pre>{children}</pre>
+}
+
+/** Render markdown content using prose styles. Fenced code blocks are routed
+ *  to the shared CodeBlock via the `pre` component override; inline code keeps
+ *  the prose styling (react-markdown only wraps fences in `<pre>`). */
 function Markdown({ children }: { children: string }) {
   return (
     <div className={proseClasses}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{ pre: MarkdownPre }}
+      >
+        {children}
+      </ReactMarkdown>
     </div>
   )
 }

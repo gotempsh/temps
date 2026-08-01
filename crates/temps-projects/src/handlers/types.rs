@@ -154,7 +154,8 @@ pub struct CreateProjectRequest {
     ///
     /// Different presets accept different configuration options:
     /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
-    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Nixpacks preset**: Accepts ordered `providers` (for example `["...", "python"]`)
+    ///   and optional inline `nixpacksConfig` TOML
     /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
     ///
     /// Example for Dockerfile preset:

@@ -39,7 +39,7 @@ pub async fn register_with_origin(config: &mut EdgeConfig) -> Result<(), EdgeErr
     };
 
     // Generate X25519 key pair for ECIES certificate encryption
-    let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let secret = temps_core::ecies::generate_x25519_static_secret();
     let public = x25519_dalek::PublicKey::from(&secret);
     let private_key_b64 = BASE64.encode(secret.as_bytes());
     let public_key_b64 = BASE64.encode(public.as_bytes());

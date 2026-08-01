@@ -456,6 +456,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
         static_deployer,
         log_service,
         cron_config_service,
+        Arc::new(temps_deployments::jobs::NoOpMetricAlertConfigService)
+            as Arc<dyn temps_deployments::jobs::MetricAlertConfigService>,
         Arc::new(temps_deployments::jobs::NoOpAgentSyncService)
             as Arc<dyn temps_deployments::jobs::AgentSyncService>,
         config_service.clone(),

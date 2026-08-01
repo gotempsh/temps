@@ -122,29 +122,88 @@ impl ObservabilityService {
     /// Strategy:
     ///   1. Validate the filter struct.
     ///   2. For each enabled kind in `filters.kinds`, run an independent
-    ///      Sea-ORM query (LIMIT = page size) returning rows already mapped
-    ///      to the `ObservabilityEvent` wire type — no follow-up fetches.
+    ///      query (LIMIT = page size) returning rows already mapped to the
+    ///      `ObservabilityEvent` wire type — no follow-up fetches.
     ///   3. k-way merge the streams by ts DESC and trim to `filters.limit`.
+    ///
+    /// Step 2 runs the enabled fetchers CONCURRENTLY. They are independent —
+    /// different stores entirely (proxy logs and spans go to ClickHouse when
+    /// it is configured; errors and revenue to Postgres) — so awaiting them
+    /// one after another made the endpoint cost the SUM of four round trips
+    /// instead of the slowest one. With spans being by far the slowest kind
+    /// at volume, that serialisation was a large share of the observed
+    /// multi-second latency on busy projects.
+    ///
+    /// `try_join!` short-circuits on the first error, matching the previous
+    /// `?`-per-fetcher behaviour: one failing store still fails the request
+    /// rather than silently returning a partial feed.
     pub async fn query(
         &self,
         filters: EventFilters,
     ) -> Result<Vec<ObservabilityEvent>, ObservabilityError> {
         filters.validate()?;
 
-        let mut streams: Vec<Vec<ObservabilityEvent>> = Vec::new();
+        // Bound the window BEFORE any fetcher runs, so every kind inherits it.
+        // `from` is an optional query parameter, and the span and request
+        // stores take the range verbatim — `query_spans` and `list_page` would
+        // otherwise scan their whole table for a caller that simply omitted a
+        // date. The web UI always sends a range; the API must not depend on
+        // that. Rules and measurements live in temps_core::time_window.
+        //
+        // The SCOPED cap applies unconditionally: `EventFilters::project_id`
+        // is a required `i32`, not `Option` — every call into this feed is
+        // already narrowed to one project's rows, so it gets the same 30-day
+        // ceiling `list_page`/the AI-breakdown endpoints grant a project-scoped
+        // caller (see `ProxyLogService::resolve_window`), matching the 30-day
+        // preset the Observe picker (`ObserveFilterBar.tsx`) already ships.
+        let window = temps_core::time_window::resolve_with_max(
+            filters.from,
+            filters.to,
+            chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
+            chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS_SCOPED),
+        )
+        .map_err(|e| ObservabilityError::InvalidTimeWindow(e.to_string()))?;
+        let filters = EventFilters {
+            from: Some(window.start),
+            to: window.end,
+            ..filters
+        };
 
-        if filters.kinds.contains(&EventKind::Request) {
-            streams.push(self.fetch_requests(&filters).await?);
-        }
-        if filters.kinds.contains(&EventKind::Error) {
-            streams.push(self.fetch_errors(&filters).await?);
-        }
-        if filters.kinds.contains(&EventKind::Revenue) {
-            streams.push(self.fetch_revenue(&filters).await?);
-        }
-        if filters.kinds.contains(&EventKind::Span) {
-            streams.push(self.fetch_spans(&filters).await?);
-        }
+        // A disabled kind resolves to an empty stream without touching its
+        // store, so the join arms stay uniform in type.
+        let requests = async {
+            if filters.kinds.contains(&EventKind::Request) {
+                self.fetch_requests(&filters).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let errors = async {
+            if filters.kinds.contains(&EventKind::Error) {
+                self.fetch_errors(&filters).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let revenue = async {
+            if filters.kinds.contains(&EventKind::Revenue) {
+                self.fetch_revenue(&filters).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let spans = async {
+            if filters.kinds.contains(&EventKind::Span) {
+                self.fetch_spans(&filters).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+
+        let (requests, errors, revenue, spans) =
+            tokio::try_join!(requests, errors, revenue, spans)?;
+
+        let streams: Vec<Vec<ObservabilityEvent>> = vec![requests, errors, revenue, spans];
 
         Ok(merge_desc_by_ts(streams, filters.limit as usize))
     }

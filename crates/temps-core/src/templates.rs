@@ -69,6 +69,11 @@ pub struct ProjectTemplate {
     /// URL to template image/icon
     #[serde(default)]
     pub image_url: Option<String>,
+    /// URL to a full screenshot/banner preview of the deployed template (e.g.
+    /// `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
+    /// template card; optional — templates without one show no banner.
+    #[serde(default)]
+    pub screenshot_url: Option<String>,
     /// Git repository reference (supports any git provider). Always present as
     /// the source-of-truth / build fallback, even for image-based templates.
     pub git: GitRef,
@@ -660,6 +665,7 @@ templates:
                 name: "Test Template".to_string(),
                 description: Some("A test template".to_string()),
                 image_url: None,
+                screenshot_url: None,
                 git: GitRef {
                     url: "https://github.com/test/test-repo.git".to_string(),
                     path: None,

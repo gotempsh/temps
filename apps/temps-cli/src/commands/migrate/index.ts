@@ -1,25 +1,26 @@
 /**
- * CLI command registration for the migration system.
+ * Vercel migration — the one client-side migration path left in this CLI.
  *
- * Commands:
- *   temps migrate --from <platform>       Full interactive migration wizard
- *   temps migrate discover --from <platform>  Discover projects on source platform
- *   temps migrate plan --from <platform>  Generate and display a migration plan
+ * `temps migrate` (registered in `../imports/index.ts`) is the single
+ * user-facing migration command. Every other source (Coolify, Dokploy,
+ * CapRover, Portainer, Kamal, Kubernetes, Docker) goes through the real
+ * backend importer pipeline (`temps-import`) via that command. Vercel has
+ * no backend importer yet, so `temps migrate` delegates to
+ * `runVercelMigrationWizard` below for that one source instead of
+ * reimplementing a second client-side adapter system for platforms that
+ * already have a proper backend implementation.
  */
 
-import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient } from '../../lib/api-client.js'
 import {
   header,
   newline,
   icons,
-  colors,
   success,
   error as errorOutput,
   warning,
   info,
-  keyValue,
   box,
 } from '../../ui/output.js'
 import {
@@ -31,69 +32,36 @@ import {
   promptSearch,
 } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { printTable, type TableColumn } from '../../ui/table.js'
 
-import type { PlatformId, PlatformCredentials, DiscoveredProject, MigrationPlan } from './types.js'
+import type { PlatformId, PlatformCredentials, MigrationPlan } from './types.js'
 import { PLATFORMS } from './types.js'
 import type { PlatformAdapter } from './adapters/base.js'
 import { VercelAdapter } from './adapters/vercel.js'
-import { CoolifyAdapter } from './adapters/coolify.js'
-import { DokployAdapter } from './adapters/dokploy.js'
 import { displayMigrationPlan, displayMigrationResult } from './plan-display.js'
 import { runPreChecks, runPostChecks } from './verification.js'
 import { executeMigration } from './orchestrator.js'
 
 // ---------------------------------------------------------------------------
-// Adapter registry
+// Adapter registry (Vercel-only — see the file header)
 // ---------------------------------------------------------------------------
 
 function getAdapter(platformId: PlatformId): PlatformAdapter {
   switch (platformId) {
     case 'vercel':
       return new VercelAdapter()
-    case 'coolify':
-      return new CoolifyAdapter()
-    case 'dokploy':
-      return new DokployAdapter()
     default:
       throw new Error(`Unknown platform: ${platformId}`)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Command registration
-// ---------------------------------------------------------------------------
-
-export function registerMigrateCommands(program: Command): void {
-  const migrate = program
-    .command('migrate')
-    .description('Migrate projects from other platforms (Vercel, Coolify, Dokploy)')
-
-  // Full wizard
-  migrate
-    .command('run')
-    .description('Run the full interactive migration wizard')
-    .option('--from <platform>', 'Source platform (vercel, coolify, dokploy)')
-    .action(runMigrationWizard)
-
-  // Discover projects
-  migrate
-    .command('discover')
-    .description('Discover projects on a source platform')
-    .option('--from <platform>', 'Source platform (vercel, coolify, dokploy)')
-    .option('--json', 'Output in JSON format')
-    .action(discoverProjectsAction)
-
-  // Generate plan
-  migrate
-    .command('plan')
-    .description('Generate a migration plan for a project')
-    .option('--from <platform>', 'Source platform (vercel, coolify, dokploy)')
-    .option('--project <id>', 'Source project ID')
-    .action(generatePlanAction)
-
-  // Default action: run the wizard
-  migrate.action(runMigrationWizard)
+/**
+ * Entry point called by `temps migrate` (in `../imports/index.ts`) when the
+ * user picks Vercel as the source. Runs the full interactive wizard:
+ * credentials → discover → pick project → plan → review/modify → confirm →
+ * execute → pre/post verification.
+ */
+export async function runVercelMigrationWizard(): Promise<void> {
+  await runMigrationWizard({ from: 'vercel' })
 }
 
 // ---------------------------------------------------------------------------
@@ -132,22 +100,6 @@ async function collectCredentials(platformId: PlatformId): Promise<PlatformCrede
         required: true,
       })
     }
-  }
-
-  if (platformInfo.requiresBaseUrl) {
-    baseUrl = await promptText({
-      message: `${platformInfo.name} server URL`,
-      default: platformId === 'coolify' ? 'http://localhost:8000' : 'http://localhost:3000',
-      required: true,
-      validate: (value) => {
-        try {
-          new URL(value)
-          return true
-        } catch {
-          return 'Please enter a valid URL'
-        }
-      },
-    })
   }
 
   return { token, teamId, baseUrl }
@@ -331,98 +283,6 @@ async function runMigrationWizard(options: { from?: string }): Promise<void> {
   }
 
   newline()
-}
-
-async function discoverProjectsAction(options: { from?: string; json?: boolean }): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const platformId = await selectPlatform(options.from)
-  const adapter = getAdapter(platformId)
-  const creds = await collectCredentials(platformId)
-
-  const validation = await withSpinner(
-    `Validating credentials...`,
-    () => adapter.validateCredentials(creds)
-  )
-
-  if (!validation.valid) {
-    errorOutput(validation.message)
-    return
-  }
-
-  const projects = await withSpinner(
-    `Discovering projects...`,
-    () => adapter.discoverProjects(creds),
-    { successText: (p) => `Found ${p.length} project(s)` }
-  )
-
-  if (options.json) {
-    console.log(JSON.stringify(projects, null, 2))
-    return
-  }
-
-  newline()
-  header(`${icons.package} Projects on ${PLATFORMS[platformId].name} (${projects.length})`)
-
-  const columns: TableColumn<DiscoveredProject>[] = [
-    { header: 'Name', accessor: (p) => p.name, color: (v) => colors.bold(v) },
-    { header: 'Framework', accessor: (p) => p.framework ?? '-', color: (v) => colors.muted(v) },
-    { header: 'Git', accessor: (p) => p.gitUrl ?? '-', color: (v) => colors.muted(v) },
-    { header: 'Updated', accessor: (p) => p.updatedAt ? new Date(p.updatedAt).toLocaleDateString() : '-' },
-  ]
-
-  printTable(projects, columns, { style: 'minimal' })
-  newline()
-}
-
-async function generatePlanAction(options: { from?: string; project?: string }): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const platformId = await selectPlatform(options.from)
-  const adapter = getAdapter(platformId)
-  const creds = await collectCredentials(platformId)
-
-  const validation = await withSpinner(
-    `Validating credentials...`,
-    () => adapter.validateCredentials(creds)
-  )
-
-  if (!validation.valid) {
-    errorOutput(validation.message)
-    return
-  }
-
-  let projectId = options.project
-  if (!projectId) {
-    const projects = await withSpinner(
-      `Discovering projects...`,
-      () => adapter.discoverProjects(creds),
-      { successText: (p) => `Found ${p.length} project(s)` }
-    )
-
-    if (projects.length === 0) {
-      warning('No projects found')
-      return
-    }
-
-    projectId = await promptSearch<string>({
-      message: 'Select project',
-      choices: projects.map((p) => ({
-        name: p.name,
-        value: p.id,
-        description: p.framework ?? undefined,
-      })),
-    })
-  }
-
-  const snapshot = await withSpinner('Taking project snapshot...', () =>
-    adapter.snapshotProject(creds, projectId!)
-  )
-
-  const plan = adapter.generatePlan(snapshot)
-  displayMigrationPlan(plan)
 }
 
 // ---------------------------------------------------------------------------

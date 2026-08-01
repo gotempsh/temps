@@ -2285,6 +2285,122 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
     )
 }
 
+/// Selects the upstream read/write/idle timeout for a proxied request.
+/// `default_timeout` is the caller's already-computed websocket-aware value
+/// (3600s for websocket upgrades, 60s otherwise); this only widens it
+/// further, to [`CONSOLE_IO_TIMEOUT_SECS`], for non-websocket traffic bound
+/// for the console address — long-running admin operations (e.g.
+/// triggering an import) routinely exceed the 60s hot-path bound tuned for
+/// customer-app traffic. See the call site in `LoadBalancer::upstream_peer`
+/// for the full rationale.
+///
+/// [`CONSOLE_IO_TIMEOUT_SECS`] must cover the real worst case of the
+/// slowest known console operation (import execute), not just look
+/// generous: `POST /imports/execute` runs service creation, then every
+/// created service's data transfer concurrently (each individually bounded
+/// by `temps_import::resource_executor::TRANSFER_TIMEOUT` = 1800s), then
+/// deploy-and-verify (`temps_import::deployment_verifier`'s
+/// `TRIGGER_GRACE`(15s) + `DEPLOY_TIMEOUT`(600s) + `HTTP_TIMEOUT`(90s) =
+/// 705s) — all inside the one HTTP request the handler awaits directly. A
+/// timeout shorter than `1800 + 705` would reintroduce, at a longer time
+/// constant, the exact "import succeeds server-side, browser sees a dead
+/// connection" bug this timeout extension exists to fix.
+const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
+
+fn upstream_io_timeout(
+    peer_addr: &str,
+    console_addr: &str,
+    is_websocket: bool,
+    default_timeout: std::time::Duration,
+) -> std::time::Duration {
+    let is_console = !console_addr.is_empty() && peer_addr == console_addr;
+    if is_console && !is_websocket {
+        std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)
+    } else {
+        default_timeout
+    }
+}
+
+#[cfg(test)]
+mod upstream_io_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression test: POST /api/imports/execute (and any other
+    /// long-running console/control-plane call) used to be RST'd at the
+    /// 60s hot-path default before the handler finished — the import would
+    /// complete successfully server-side while the browser saw a 503 with
+    /// no way to tell the user it actually worked.
+    #[test]
+    fn console_traffic_gets_the_extended_timeout() {
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, false, Duration::from_secs(60));
+        assert_eq!(timeout, Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS));
+    }
+
+    /// The console timeout must actually cover the real worst case of the
+    /// slowest console operation (import execute), not just be "generous".
+    ///
+    /// This crate can't depend on `temps-import` (wrong direction --
+    /// `temps-proxy` sits below it), so the four constants below are
+    /// necessarily hardcoded copies, not references to the real ones. The
+    /// authoritative check lives in
+    /// `temps_import::services::resource_executor::tests::worst_case_execute_duration_fits_under_the_documented_console_timeout`,
+    /// which owns all four real constants and fails at the source if they
+    /// drift. If you change any of the four numbers below, update that test
+    /// (and this one) too.
+    #[test]
+    fn console_timeout_covers_the_worst_case_import_execute_duration() {
+        const TRIGGER_GRACE_SECS: u64 = 15;
+        const DEPLOY_TIMEOUT_SECS: u64 = 600;
+        const HTTP_TIMEOUT_SECS: u64 = 90;
+        const TRANSFER_TIMEOUT_SECS: u64 = 30 * 60;
+
+        let worst_case_execute_duration =
+            TRANSFER_TIMEOUT_SECS + TRIGGER_GRACE_SECS + DEPLOY_TIMEOUT_SECS + HTTP_TIMEOUT_SECS;
+
+        assert!(
+            CONSOLE_IO_TIMEOUT_SECS > worst_case_execute_duration,
+            "console timeout ({CONSOLE_IO_TIMEOUT_SECS}s) must exceed the worst-case import \
+             execute duration ({worst_case_execute_duration}s) — service data transfers run \
+             concurrently (see populate_services), so the worst case no longer scales with the \
+             number of services, but it must still fit inside one timeout window"
+        );
+    }
+
+    #[test]
+    fn customer_app_traffic_keeps_the_hot_path_default() {
+        let timeout = upstream_io_timeout(
+            "10.0.0.9:9000",
+            "10.0.0.5:8081",
+            false,
+            Duration::from_secs(60),
+        );
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn websocket_upgrade_to_the_console_keeps_the_websocket_timeout() {
+        // Console traffic never upgrades to websocket today, but the
+        // extended console bound must never override the caller's own
+        // websocket-specific timeout if that combination ever occurs. Uses
+        // a value distinct from CONSOLE_IO_TIMEOUT_SECS so the assertion
+        // can't pass by coincidence.
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, true, Duration::from_secs(7200));
+        assert_eq!(timeout, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn empty_console_address_never_matches() {
+        // The trait's default console_address() is "" for resolvers that
+        // don't override it (test mocks) — must never accidentally match a
+        // peer address and grant an unintended extended timeout.
+        let timeout = upstream_io_timeout("10.0.0.9:9000", "", false, Duration::from_secs(60));
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -4255,9 +4371,27 @@ impl ProxyHttp for LoadBalancer {
 
         let mut peer = selection.peer;
 
+        // The 60s hot-path default (set above) is tuned for customer-app
+        // traffic — a slow customer endpoint shouldn't hang a proxy worker
+        // forever. It's the wrong bound for the console/control-plane API,
+        // which the browser reaches through this same proxy: long-running
+        // admin operations (e.g. POST /api/imports/execute, which
+        // synchronously builds, deploys, and health-checks the imported
+        // app) routinely take well over 60s for a real app. Without this,
+        // the request is RST'd out from under a handler that goes on to
+        // finish successfully server-side — the import completes, but the
+        // browser sees a 503 and the user has no way to know it worked.
+        let io_timeout = upstream_io_timeout(
+            &peer.address().to_string(),
+            self.upstream_resolver.console_address(),
+            is_websocket,
+            io_timeout,
+        );
+
         // Configure upstream connection options. `io_timeout` is bumped to
         // 1h for websocket upgrades (see top of this method) so idle terminals
-        // and SSE streams don't get RST every 60s.
+        // and SSE streams don't get RST every 60s, and to 10 minutes for
+        // console/control-plane traffic (see above).
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
         peer.options.read_timeout = Some(io_timeout);
         peer.options.write_timeout = Some(io_timeout);

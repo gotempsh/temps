@@ -123,7 +123,7 @@ impl WireGuardManager {
     ///
     /// Uses x25519-dalek for Curve25519 key generation — no `wg genkey` needed.
     pub async fn generate_keypair(&self) -> Result<WireGuardKeypair, WireGuardError> {
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let secret = temps_core::ecies::generate_x25519_static_secret();
         let public = x25519_dalek::PublicKey::from(&secret);
 
         let private_key = BASE64.encode(secret.as_bytes());

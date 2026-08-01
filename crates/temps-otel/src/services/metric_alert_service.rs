@@ -545,6 +545,7 @@ mod tests {
         Model {
             id,
             project_id: 7,
+            environment_id: None,
             name: "High latency".to_string(),
             metric_name: "http.server.duration".to_string(),
             aggregation: "p95".to_string(),

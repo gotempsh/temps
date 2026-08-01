@@ -42,6 +42,9 @@ pub struct TemplateResponse {
     pub description: Option<String>,
     /// URL to template image/icon
     pub image_url: Option<String>,
+    /// URL to a wide screenshot/banner preview of the deployed template.
+    /// Absent for templates that don't have one captured yet.
+    pub screenshot_url: Option<String>,
     /// Git repository reference
     pub git: GitRefResponse,
     /// Framework/preset to use
@@ -101,6 +104,7 @@ impl From<ProjectTemplate> for TemplateResponse {
             name: template.name,
             description: template.description,
             image_url: template.image_url,
+            screenshot_url: template.screenshot_url,
             git: GitRefResponse {
                 url: template.git.url,
                 path: template.git.path,
@@ -380,6 +384,7 @@ mod tests {
             name: "Test Template".to_string(),
             description: Some("A test template".to_string()),
             image_url: Some("/templates/test.png".to_string()),
+            screenshot_url: Some("/templates/test-screenshot.png".to_string()),
             git: GitRef {
                 url: "https://github.com/test/test-repo.git".to_string(),
                 path: None,
@@ -415,6 +420,10 @@ mod tests {
         assert_eq!(response.slug, "test-template");
         assert_eq!(response.name, "Test Template");
         assert_eq!(response.description, Some("A test template".to_string()));
+        assert_eq!(
+            response.screenshot_url,
+            Some("/templates/test-screenshot.png".to_string())
+        );
         assert_eq!(response.git.url, "https://github.com/test/test-repo.git");
         assert_eq!(response.git.r#ref, "main");
         assert_eq!(response.preset, "nextjs");

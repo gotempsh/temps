@@ -375,6 +375,7 @@ fn sandbox_response_matches_sdk_envelope() {
             disk_size_mb: None,
             preview_url_template: String::new(),
             preview_password_hint: None,
+            agent_run_id: None,
         },
         routes: Vec::new(),
     };
@@ -449,6 +450,7 @@ fn sandbox_status_uses_sdk_enum_values() {
                 disk_size_mb: None,
                 preview_url_template: String::new(),
                 preview_password_hint: None,
+                agent_run_id: None,
             },
             routes: Vec::new(),
         };

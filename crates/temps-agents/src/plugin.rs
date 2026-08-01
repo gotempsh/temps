@@ -545,11 +545,28 @@ impl TempsPlugin for AgentsPlugin {
             context.register_service(sandbox_provider.clone());
 
             let sandbox_registry = Arc::new(SandboxRegistry::new(sandbox_provider));
+            // Registered so the temps-sandbox plugin can inject its managed
+            // run-sandbox service (agent runs then get first-class
+            // `sandboxes` rows in the standalone sandbox API).
+            context.register_service(sandbox_registry.clone());
 
             let config_service = Arc::new(AgentConfigService::new(
                 db.clone(),
                 encryption_service.clone(),
             ));
+            match config_service.encrypt_legacy_inline_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy inline agent MCP and custom-tool configurations"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy inline agent credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(config_service.clone());
 
             let secret_service =
@@ -573,7 +590,21 @@ impl TempsPlugin for AgentsPlugin {
             let definition_service =
                 Arc::new(crate::services::definition_service::DefinitionService::new(
                     context.require_service::<sea_orm::DatabaseConnection>(),
+                    encryption_service.clone(),
                 ));
+            match definition_service.encrypt_legacy_mcp_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy MCP environment and header credentials"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy MCP credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(definition_service.clone());
             let executor = Arc::new(AgentExecutor::new(
                 db.clone(),

@@ -1578,6 +1578,7 @@ mod tests {
             prompt_text: None,
             workspace_volume: None,
             run_config: None,
+            triggered_by_user_id: None,
         }
     }
 

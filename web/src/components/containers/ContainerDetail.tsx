@@ -45,7 +45,14 @@ export function ContainerDetail({
   }
 
   if (tab === 'configuration') {
-    return <ContainerConfiguration container={container} />
+    return (
+      <ContainerConfiguration
+        container={container}
+        projectId={parseInt(projectId || '0')}
+        environmentId={parseInt(environmentId || '0')}
+        containerId={containerId}
+      />
+    )
   }
 
   return (

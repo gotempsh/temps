@@ -70,6 +70,10 @@ impl SandboxExpirationSweeper {
         let expired = sandboxes::Entity::find()
             .filter(sandboxes::Column::Status.eq("running"))
             .filter(sandboxes::Column::ExpiresAt.lt(now))
+            // Agent-run sandboxes are lifecycle-owned by the run itself
+            // (analysis → fix → PR can legitimately outlive any timeout
+            // while the user reviews between phases) — never sweep them.
+            .filter(sandboxes::Column::AgentRunId.is_null())
             .all(self.db.as_ref())
             .await?;
 
@@ -146,7 +150,8 @@ mod tests {
         sandboxes::Model {
             id,
             public_id: format!("sbx_test{:06x}", id),
-            user_id: 1,
+            user_id: Some(1),
+            agent_run_id: None,
             name: format!("sbx-{}", id),
             status: status.to_string(),
             image: None,

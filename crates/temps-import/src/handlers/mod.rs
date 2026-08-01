@@ -1,9 +1,10 @@
 //! HTTP handlers for import operations
 
+pub mod audit;
 pub mod types;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -12,6 +13,8 @@ use axum::{
 use std::sync::Arc;
 use temps_auth::{permission_check, RequireAuth};
 use temps_core::problemdetails::Problem;
+use temps_core::{AuditContext, RequestMetadata};
+use tracing::error;
 use utoipa::OpenApi;
 
 use types::{
@@ -132,9 +135,14 @@ async fn create_plan(
 async fn execute_import(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<types::AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<types::ExecuteImportRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsCreate);
+
+    let session_id = request.session_id.clone();
+    let project_name = request.project_name.clone();
+    let dry_run = request.dry_run.unwrap_or(false);
 
     let result = state
         .import_orchestrator
@@ -145,9 +153,31 @@ async fn execute_import(
             request.preset,
             request.directory,
             request.main_branch,
-            request.dry_run.unwrap_or(false),
+            dry_run,
         )
         .await?;
+
+    // This creates real projects/services/deployments/domains from
+    // user-supplied platform credentials — an audit trail is required
+    // regardless of whether the import itself succeeded.
+    let audit_event = audit::ImportExecutedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        session_id,
+        project_name,
+        project_id: result.project_id,
+        environment_id: result.environment_id,
+        dry_run,
+        succeeded: matches!(result.status, types::ImportExecutionStatus::Completed),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log for import execution: {}", e);
+        // Continue — the import itself already ran; audit logging failure
+        // must not undo or fail a real operation that already happened.
+    }
 
     Ok((StatusCode::ACCEPTED, Json(result)))
 }
@@ -175,7 +205,10 @@ async fn get_import_status(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsRead);
 
-    let status = state.import_orchestrator.get_status(&session_id).await?;
+    let status = state
+        .import_orchestrator
+        .get_status(auth.user_id(), &session_id)
+        .await?;
     Ok(Json(status))
 }
 

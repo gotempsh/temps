@@ -50,6 +50,12 @@ members = [
     "crates/temps-import-types",
     "crates/temps-import",
     "crates/temps-import-docker",
+    "crates/temps-import-kubernetes",
+    "crates/temps-import-coolify",
+    "crates/temps-import-dokploy",
+    "crates/temps-import-caprover",
+    "crates/temps-import-portainer",
+    "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
     "crates/temps-webhooks",
     "crates/temps-email",
@@ -89,7 +95,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.54"
+version = "0.1.0-beta.55"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Temps Contributors"]
@@ -194,7 +200,7 @@ argon2 = "0.5"
 aes-gcm = "0.10.3"
 hkdf = "0.13"
 totp-rs = "5.7.0"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
 base64 = "0.22"
 hex = "0.4.3"
@@ -295,7 +301,7 @@ regex = "1.11"
 flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
-zip = "2.2"
+zip = "8.6"
 zstd = "0.13"
 
 # ============================================================================

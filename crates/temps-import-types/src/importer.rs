@@ -51,6 +51,14 @@ pub enum ImportSource {
     Render,
     /// Fly.io deployments (containers, machines)
     Fly,
+    /// Kubernetes clusters (Deployments, StatefulSets, CronJobs via kubeconfig)
+    Kubernetes,
+    /// CapRover platform (apps, one-click databases)
+    Caprover,
+    /// Portainer (Docker environments, compose stacks, standalone containers)
+    Portainer,
+    /// Kamal (imported from its config/deploy.yml — there is no control plane)
+    Kamal,
     /// Custom/other source
     Custom,
 }
@@ -67,6 +75,10 @@ impl ImportSource {
             ImportSource::Railway => "railway",
             ImportSource::Render => "render",
             ImportSource::Fly => "fly",
+            ImportSource::Kubernetes => "kubernetes",
+            ImportSource::Caprover => "caprover",
+            ImportSource::Portainer => "portainer",
+            ImportSource::Kamal => "kamal",
             ImportSource::Custom => "custom",
         }
     }
@@ -96,6 +108,10 @@ impl std::str::FromStr for ImportSource {
             "railway" => Ok(ImportSource::Railway),
             "render" => Ok(ImportSource::Render),
             "fly" => Ok(ImportSource::Fly),
+            "kubernetes" => Ok(ImportSource::Kubernetes),
+            "caprover" => Ok(ImportSource::Caprover),
+            "portainer" => Ok(ImportSource::Portainer),
+            "kamal" => Ok(ImportSource::Kamal),
             "custom" => Ok(ImportSource::Custom),
             _ => Err(crate::ImportError::SourceNotAccessible(format!(
                 "Unknown import source: {}",
@@ -498,4 +514,6 @@ pub struct ImporterCapabilities {
     pub supports_domains: bool,
     /// Supports full project-level snapshots (describe_project)
     pub supports_project_snapshot: bool,
+    /// Supports cluster cost + overprovisioning analysis (CostAnalysis in plan)
+    pub supports_cost_analysis: bool,
 }

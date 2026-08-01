@@ -148,8 +148,11 @@ async fn merge_returns_rows_in_descending_ts_across_kinds() {
         .query(EventFilters {
             project_id,
             kinds: EventKind::ALL.iter().copied().collect(),
-            from: None,
-            to: None,
+            // Fixture rows sit at a fixed 2026-05-01 timestamp, not "now" — an
+            // omitted range now defaults to the last hour (see
+            // `temps_core::time_window`), which would silently exclude them.
+            from: Some(t_revenue - Duration::minutes(1)),
+            to: Some(t_request + Duration::minutes(1)),
             deployment_id: None,
             environment_id: None,
             search: None,
@@ -540,7 +543,9 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
         .query(EventFilters {
             project_id,
             kinds: [EventKind::Span].iter().copied().collect(),
-            from: None,
+            // `t` sits exactly at the default 1h lookback boundary — pin an
+            // explicit `from` so this doesn't flake on execution timing.
+            from: Some(t - Duration::minutes(5)),
             to: None,
             deployment_id: None,
             environment_id: None,
@@ -573,7 +578,7 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
         .query(EventFilters {
             project_id,
             kinds: [EventKind::Span].iter().copied().collect(),
-            from: None,
+            from: Some(t - Duration::minutes(5)),
             to: None,
             deployment_id: None,
             environment_id: None,
@@ -696,8 +701,11 @@ async fn merge_interleaves_spans_with_other_kinds() {
         .query(EventFilters {
             project_id,
             kinds: EventKind::ALL.iter().copied().collect(),
-            from: None,
-            to: None,
+            // Fixture rows sit at a fixed 2026-05-01 timestamp, not "now" — an
+            // omitted range now defaults to the last hour (see
+            // `temps_core::time_window`), which would silently exclude them.
+            from: Some(t_revenue - Duration::minutes(1)),
+            to: Some(t_request + Duration::minutes(1)),
             deployment_id: None,
             environment_id: None,
             search: None,
