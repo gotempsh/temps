@@ -200,7 +200,7 @@ argon2 = "0.5"
 aes-gcm = "0.10.3"
 hkdf = "0.13"
 totp-rs = "5.7.0"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
 base64 = "0.22"
 hex = "0.4.3"
