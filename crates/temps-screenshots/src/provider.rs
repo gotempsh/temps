@@ -14,6 +14,17 @@ pub trait ScreenshotProvider: Send + Sync {
     /// Get the name of this provider (for logging/debugging)
     fn provider_name(&self) -> &'static str;
 
-    /// Check if the provider is available/configured
-    async fn is_available(&self) -> bool;
+    /// Check if the provider is available/configured, returning *why* it is not.
+    ///
+    /// Implementations must surface an actionable reason (missing binary, missing
+    /// shared libraries, unreachable remote service) rather than a bare boolean —
+    /// self-hosted operators have no support channel and the reason is what ends
+    /// up in the deployment job's error message.
+    async fn check_availability(&self) -> ScreenshotResult<()>;
+
+    /// Convenience wrapper over [`check_availability`](Self::check_availability)
+    /// for call sites that only need a yes/no answer.
+    async fn is_available(&self) -> bool {
+        self.check_availability().await.is_ok()
+    }
 }

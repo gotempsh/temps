@@ -119,6 +119,12 @@ pub struct EnvironmentInfo {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct GetEnvironmentVariablesQuery {
     pub environment_id: Option<i32>,
+    /// Exact manual env-var row to reveal. Required by the dashboard so
+    /// duplicate keys on disjoint environments cannot cross-reveal.
+    pub var_id: Option<i32>,
+    /// Required by integration-value reveals to bind the plaintext response to
+    /// the exact service displayed by the client.
+    pub service_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -253,6 +259,7 @@ pub struct EnvVarIntegrationInfo {
     pub service_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_slug: Option<String>,
+    pub service_updated_at: String,
 }
 
 /// One entry in the computed env-var view that merges manual and integration

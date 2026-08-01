@@ -1052,7 +1052,10 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
-        debug!("Project found: {:?}", project);
+        debug!(
+            "Project found id={} slug={} preset={}",
+            project.id, project.slug, project.preset
+        );
 
         debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
@@ -1103,6 +1106,52 @@ impl DeploymentService {
             })?;
 
         tracing::debug!("GitPushEvent successfully sent to queue");
+        Ok(())
+    }
+
+    /// Trigger a real deployment of a pre-built Docker image, with no build
+    /// step. This is the DockerImage-source counterpart to `trigger_pipeline`
+    /// (which is Git-only and requires `repo_owner`/`repo_name`) — used to
+    /// deploy projects that have no git repository at all, e.g. imports from
+    /// Portainer, Kubernetes, or Kamal.
+    ///
+    /// Reuses the `DeployImageRequested` job already driven by the template
+    /// one-click-deploy flow (see `job_processor::process_deploy_image_requested_job`),
+    /// which creates the deployment row itself (with `external_image_ref` in
+    /// its metadata) and plans a pull+run pipeline for the project's
+    /// non-preview environment(s).
+    pub async fn trigger_image_deployment(
+        &self,
+        project_id: i32,
+        image_ref: String,
+        health_check_path: Option<String>,
+    ) -> Result<(), DeploymentError> {
+        if image_ref.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Image reference is missing".to_string(),
+            ));
+        }
+
+        info!(
+            "Triggering image deployment for project_id: {} (image: {})",
+            project_id, image_ref
+        );
+
+        self.queue_service
+            .send(temps_core::Job::DeployImageRequested(
+                temps_core::DeployImageRequestedJob {
+                    project_id,
+                    image_ref,
+                    health_check_path,
+                },
+            ))
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to send DeployImageRequested to queue: {}", e);
+                DeploymentError::QueueError(e.to_string())
+            })?;
+
+        tracing::debug!("DeployImageRequested successfully sent to queue");
         Ok(())
     }
 
@@ -1178,8 +1227,10 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         // --- Git projects: rebuild from source when the image isn't reusable ---
         //
@@ -1889,8 +1940,10 @@ impl DeploymentService {
             source_deployment_id, target_env.name, project_id, image_name
         );
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         let now = chrono::Utc::now();
 
@@ -2891,12 +2944,33 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Get all jobs for a deployment
+    /// Get all jobs for a deployment owned by the requested project.
+    ///
+    /// The project constraint is part of this service method rather than only
+    /// an HTTP guard because deployment IDs are globally enumerable and this
+    /// result includes sensitive workflow metadata.
     pub async fn get_deployment_jobs(
         &self,
+        project_id: i32,
         deployment_id: i32,
     ) -> Result<Vec<temps_entities::deployment_jobs::Model>, DeploymentError> {
         use temps_entities::deployment_jobs;
+
+        let deployment_exists = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .is_some();
+
+        if !deployment_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "deployment {} for project {} not found",
+                deployment_id, project_id
+            )));
+        }
 
         let jobs = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
@@ -5638,6 +5712,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_deployment_jobs_enforces_project_ownership(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let job = temps_entities::deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("sensitive-build".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Sensitive Build".to_string()),
+            log_id: Set("sensitive-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": "must-not-cross-projects"}
+            }))),
+            ..Default::default()
+        };
+        job.insert(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let own_jobs = service
+            .get_deployment_jobs(deployment.project_id, deployment.id)
+            .await?;
+        assert_eq!(own_jobs.len(), 1);
+
+        let foreign_result = service
+            .get_deployment_jobs(deployment.project_id + 999, deployment.id)
+            .await;
+        assert!(matches!(foreign_result, Err(DeploymentError::NotFound(_))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_deployment_container_logs_returns_captured_rows(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -5859,6 +5979,55 @@ mod tests {
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("removed"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_rejects_empty_image_ref(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let deployment_service = create_deployment_service_for_test(db);
+
+        let result = deployment_service
+            .trigger_image_deployment(1, String::new(), None)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_sends_deploy_image_requested_job(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let mut receiver = deployment_service.queue_service.subscribe();
+
+        deployment_service
+            .trigger_image_deployment(
+                42,
+                "ghcr.io/org/app:latest".to_string(),
+                Some("/healthz".to_string()),
+            )
+            .await?;
+
+        // The auto-responder spawned in create_deployment_service_for_test also
+        // listens on this queue (to keep RouteTableUpdated flowing) — drain past
+        // whatever else it produces until our own job shows up.
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+
+        assert_eq!(job.project_id, 42);
+        assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
+        assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
         Ok(())
     }
 }

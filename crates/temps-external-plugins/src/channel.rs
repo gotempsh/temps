@@ -534,7 +534,7 @@ fn project_to_info(p: &temps_entities::projects::Model) -> ProjectInfo {
         repo_name: p.repo_name.clone(),
         repo_owner: p.repo_owner.clone(),
         main_branch: p.main_branch.clone(),
-        preset: format!("{:?}", p.preset),
+        preset: temps_presets::runtime_slug(p.preset, p.preset_config.as_ref()),
         source_type: format!("{:?}", p.source_type),
         created_at: format_dt(&p.created_at),
         updated_at: format_dt(&p.updated_at),

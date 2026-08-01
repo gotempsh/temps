@@ -477,7 +477,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
 // First, let's memoize the LogViewer component
 const MemoizedLogViewer = memo(LogViewer)
 
-// Config Modal Component
+// Stage details modal
 interface ConfigModalProps {
   isOpen: boolean
   onClose: () => void
@@ -494,7 +494,6 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
       job_id: stage.job_id,
       status: stage.status,
       execution_order: stage.execution_order,
-      job_config: stage.job_config,
       dependencies: stage.dependencies,
       outputs: stage.outputs,
       started_at: stage.started_at,
@@ -508,9 +507,9 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col gap-4 p-6">
         <DialogHeader>
-          <DialogTitle>Stage Configuration</DialogTitle>
+          <DialogTitle>Stage Details</DialogTitle>
           <DialogDescription>
-            Configuration details for{' '}
+            Execution details for{' '}
             <span className="font-mono">{stage.name}</span>
           </DialogDescription>
         </DialogHeader>
@@ -790,7 +789,7 @@ export function DeploymentStages({
                     e.stopPropagation()
                     setConfigModalStage(stage)
                   }}
-                  title="View stage configuration"
+                  title="View stage details"
                 >
                   <Settings className="h-4 w-4" />
                 </Button>
@@ -821,7 +820,7 @@ export function DeploymentStages({
         ))}
       </div>
 
-      {/* Config Modal */}
+      {/* Stage details modal */}
       {configModalStage && (
         <ConfigModal
           isOpen={!!configModalStage}

@@ -51,12 +51,13 @@ pub struct ApiKeyState {
 /// requester actually holds the permissions being granted. Unparsable
 /// custom permission strings and unrecognized role names are left to that
 /// existing validation, which returns 400.
-fn enforce_permission_ceiling(
+fn enforce_permission_ceiling_for_role(
     auth: &crate::context::AuthContext,
-    request: &CreateApiKeyRequest,
+    role_type: &str,
+    permissions: Option<&[String]>,
 ) -> Result<(), Problem> {
-    if request.role_type == "custom" {
-        let Some(ref permissions) = request.permissions else {
+    if role_type == "custom" {
+        let Some(permissions) = permissions else {
             return Ok(());
         };
         for perm_str in permissions {
@@ -72,7 +73,7 @@ fn enforce_permission_ceiling(
     // Predefined role type: the minted key inherits that role's ENTIRE
     // permission set, so every permission the role carries must also be
     // held by the requester — not just some of them.
-    if let Some(role) = crate::permissions::Role::from_str(&request.role_type) {
+    if let Some(role) = crate::permissions::Role::from_str(role_type) {
         for perm in role.permissions() {
             if !auth.has_permission(perm) {
                 return Err(permission_ceiling_exceeded(&perm.to_string()));
@@ -80,6 +81,13 @@ fn enforce_permission_ceiling(
         }
     }
     Ok(())
+}
+
+fn enforce_permission_ceiling(
+    auth: &crate::context::AuthContext,
+    request: &CreateApiKeyRequest,
+) -> Result<(), Problem> {
+    enforce_permission_ceiling_for_role(auth, &request.role_type, request.permissions.as_deref())
 }
 
 fn permission_ceiling_exceeded(perm_str: &str) -> Problem {
@@ -398,6 +406,13 @@ pub async fn rotate_api_key(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
 
+    let target = state
+        .api_key_service
+        .get_api_key(auth.user_id(), api_key_id)
+        .await
+        .map_err(|e| e.to_problem())?;
+    enforce_permission_ceiling_for_role(&auth, &target.role_type, target.permissions.as_deref())?;
+
     let rotated = state
         .api_key_service
         .rotate_api_key(auth.user_id(), api_key_id)
@@ -510,6 +525,10 @@ mod tests {
         AuthContext::new_session(test_user(42), role)
     }
 
+    fn api_key_auth(role: Role) -> AuthContext {
+        AuthContext::new_api_key(test_user(42), Some(role), None, "caller".to_string(), 7)
+    }
+
     fn custom_request(permissions: Vec<&str>) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
             name: "test-key".to_string(),
@@ -567,6 +586,32 @@ mod tests {
         let req = predefined_request("admin");
         let err = enforce_permission_ceiling(&auth, &req).unwrap_err();
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn lower_privileged_api_key_cannot_rotate_admin_key() {
+        let auth = api_key_auth(Role::User);
+        let err = enforce_permission_ceiling_for_role(&auth, "admin", None)
+            .expect_err("user API key must not acquire an admin key secret");
+
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+    }
+
+    #[test]
+    fn api_key_can_rotate_key_within_its_permission_ceiling() {
+        let auth = api_key_auth(Role::User);
+
+        assert!(enforce_permission_ceiling_for_role(&auth, "user", None).is_ok());
+        assert!(enforce_permission_ceiling_for_role(
+            &auth,
+            "custom",
+            Some(&["projects:read".to_string()])
+        )
+        .is_ok());
     }
 
     /// A user requesting a predefined role that is a subset of (or equal

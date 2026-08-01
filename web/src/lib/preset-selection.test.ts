@@ -1,9 +1,40 @@
 import { describe, expect, test } from 'bun:test'
 import {
   normalizePresetPath,
+  presetConfigForSelection,
   presetSelectionKey,
   splitPresetSelection,
 } from './preset-selection'
+
+describe('presetConfigForSelection', () => {
+  test('selecting base Nixpacks resets providers but preserves inline TOML', () => {
+    expect(
+      presetConfigForSelection('nixpacks', {
+        preset: 'nixpacks',
+        providers: ['node'],
+        nixpacksConfig: '[start]\ncmd = "npm start"',
+      })
+    ).toEqual({
+      preset: 'nixpacks',
+      providers: [],
+      nixpacksConfig: '[start]\ncmd = "npm start"',
+    })
+  })
+
+  test('does not carry another preset config into Nixpacks', () => {
+    expect(
+      presetConfigForSelection('nixpacks', {
+        preset: 'dockerfile',
+        dockerfilePath: 'Dockerfile.api',
+      })
+    ).toEqual({ providers: [] })
+  })
+
+  test('leaves provider-specific selections unchanged', () => {
+    const config = { preset: 'nixpacks', providers: ['python'] }
+    expect(presetConfigForSelection('nixpacks-python', config)).toBe(config)
+  })
+})
 
 /**
  * These helpers exist because the composite `slug::path` key was being handled

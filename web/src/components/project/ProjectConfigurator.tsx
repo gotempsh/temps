@@ -602,12 +602,10 @@ export function ProjectConfigurator({
             preset_config:
               finalData.preset === 'dockerfile' && finalData.dockerfilePath
                 ? {
-                    preset: 'dockerfile',
                     dockerfilePath: finalData.dockerfilePath,
                   }
                 : finalData.preset === 'docker-compose'
                   ? {
-                      preset: 'docker-compose',
                       composePath:
                         finalData.composePath || 'docker-compose.yml',
                     }

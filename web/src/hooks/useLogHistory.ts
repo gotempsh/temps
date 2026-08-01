@@ -120,6 +120,14 @@ async function searchLogs(params: LogSearchParams): Promise<SearchLogsResponse> 
     security: [{ scheme: 'bearer', type: 'http' }],
   })
 
+  // When the server returns a non-2xx status and throwOnError is false the
+  // hey-api client resolves with { data: undefined }.  Throw explicitly so
+  // React Query sets `error` and the UI shows the failure state instead of
+  // crashing in getNextPageParam when it receives an undefined page.
+  if (response.data == null) {
+    throw new Error('Log search returned no data — the server may have returned an error')
+  }
+
   return response.data as SearchLogsResponse
 }
 
@@ -190,7 +198,7 @@ export function useLogHistoryInfinite(
     initialPageParam: undefined as string | undefined,
     // lastPage is the most recently fetched (oldest) page; its next_cursor
     // points at the next-older page. Undefined stops the "load older" walk.
-    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    getNextPageParam: (lastPage) => lastPage?.next_cursor ?? undefined,
     enabled: enabled && (!!params.projectId || params.externalServiceId != null),
     staleTime: 1000 * 30,
   })

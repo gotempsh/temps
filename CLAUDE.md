@@ -6,6 +6,7 @@ Guidance for Claude Code when working with the Temps codebase.
 ## Critical Rules
 
 ### NEVER
+- Commit `.env` files, credentials, or secrets -- this includes local dev-instance artifacts (encryption keys, auth secrets, generated tokens, `temps_data`-style data directories) created while running a local server for manual testing/verification. Before staging changes, run `git status` and scrutinize every path outside the files you intentionally edited -- a broad `git add` after spinning up a local test instance is the most common way this happens. If a secret is committed, treat it as compromised: remove it from tracking going forward at minimum, and flag to the user whether history needs rewriting (don't force-push without asking)
 - Access database directly from HTTP handlers -- ALWAYS use services
 - Return untyped JSON (`serde_json::Value`) -- ALWAYS use typed structs
 - Use `.context()` from anyhow -- ALWAYS use `.map_err()` with typed errors

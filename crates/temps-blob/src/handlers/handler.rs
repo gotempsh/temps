@@ -33,9 +33,10 @@ use crate::services::{ListOptions, PutOptions};
 /// Priority:
 /// 1. Deployment tokens: Use project_id from token (request value ignored for security)
 /// 2. API keys/sessions: Use project_id from request (required)
-fn extract_project_id(
+async fn extract_project_id(
     auth: &temps_auth::AuthContext,
     request_project_id: Option<i32>,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<i32, Problem> {
     // For deployment tokens, always use the token's project_id (security: prevent access to other projects)
     if let Some(token_project_id) = auth.project_id() {
@@ -43,11 +44,32 @@ fn extract_project_id(
     }
 
     // For API keys and sessions, require project_id in the request
-    request_project_id.ok_or_else(|| {
+    let project_id = request_project_id.ok_or_else(|| {
         temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Project ID Required")
             .with_detail("The 'project_id' field is required for API key or session authentication")
-    })
+    })?;
+
+    // Confine session/API-key callers to projects they may access; see the KV
+    // handler for the full rationale. No-op in plain OSS, enforced when a
+    // team-access plugin registers a checker.
+    authorize_project_access(auth, project_id, project_access_checker).await?;
+
+    Ok(project_id)
+}
+
+/// Run the team-based project access guard for session/API-key callers.
+///
+/// Shared by the request-body handlers (via [`extract_project_id`]) and the
+/// path-based `blob_head`/`blob_download` handlers, which resolve `project_id`
+/// from the URL path rather than the body.
+async fn authorize_project_access(
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<(), Problem> {
+    temps_auth::project_access_guard!(auth, project_id, project_access_checker);
+    Ok(())
 }
 
 /// OpenAPI documentation for Blob API
@@ -126,7 +148,8 @@ async fn blob_put(
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
     // Get project ID from query or auth context
-    let project_id = extract_project_id(&auth, query.project_id)?;
+    let project_id =
+        extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
 
     // Use pathname from query or default
     let pathname = query.pathname.as_deref().unwrap_or("upload");
@@ -161,7 +184,8 @@ async fn blob_delete(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<DeleteBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let deleted = state
         .blob_service
@@ -193,7 +217,8 @@ async fn blob_list(
     State(state): State<Arc<BlobAppState>>,
     Query(query): Query<ListBlobsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, query.project_id)?;
+    let project_id =
+        extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
 
     let options = ListOptions {
         limit: query.limit,
@@ -226,7 +251,8 @@ async fn blob_copy(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<CopyBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     // Extract pathname from URL (handles both full URLs and relative paths)
     let from_pathname = extract_pathname_from_url(&request.from_url);
@@ -314,7 +340,9 @@ async fn blob_head(
         }
         token_project_id
     } else {
-        // API key/session: use path parameter
+        // API key/session: use path parameter, then verify the caller may
+        // reach that project (no-op in OSS; enforced with a team-access plugin).
+        authorize_project_access(&auth, params.project_id, &state.project_access_checker).await?;
         params.project_id
     };
 
@@ -368,7 +396,9 @@ async fn blob_download(
         }
         token_project_id
     } else {
-        // API key/session: use path parameter
+        // API key/session: use path parameter, then verify the caller may
+        // reach that project (no-op in OSS; enforced with a team-access plugin).
+        authorize_project_access(&auth, params.project_id, &state.project_access_checker).await?;
         params.project_id
     };
 
@@ -941,5 +971,106 @@ mod tests {
         let result = sanitize_download_filename("/");
         // The fallback is "download"
         assert_eq!(result, "download");
+    }
+}
+
+#[cfg(test)]
+mod idor_tests {
+    //! Regression tests for the cross-tenant IDOR on the blob data plane
+    //! (security review finding #3). Before the fix, `extract_project_id` (and
+    //! the path-based `blob_head`/`blob_download`) trusted the client-supplied
+    //! `project_id` verbatim for session/API-key auth. They now run the
+    //! team-based `project_access_guard!` via `authorize_project_access`.
+
+    use super::{authorize_project_access, extract_project_id};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use temps_auth::{AuthContext, Role};
+    use temps_core::ProjectAccessChecker;
+
+    struct MockChecker {
+        allow: bool,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for MockChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allow)
+        }
+    }
+
+    fn checker(allow: bool) -> Option<Arc<dyn ProjectAccessChecker>> {
+        Some(Arc::new(MockChecker { allow }))
+    }
+
+    fn session_auth() -> AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Test User".to_string(),
+            email: "user42@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        AuthContext::new_session(user, Role::User)
+    }
+
+    // Request-body handlers (blob_put/delete/list/copy) go through
+    // extract_project_id.
+    #[tokio::test]
+    async fn body_handler_denied_project_is_rejected() {
+        let auth = session_auth();
+        let err = extract_project_id(&auth, Some(999), &checker(false))
+            .await
+            .expect_err("cross-tenant project id must be rejected");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn body_handler_allowed_project_is_accepted() {
+        let auth = session_auth();
+        let pid = extract_project_id(&auth, Some(7), &checker(true))
+            .await
+            .expect("accessible project id must be accepted");
+        assert_eq!(pid, 7);
+    }
+
+    // Path handlers (blob_head/blob_download) go through
+    // authorize_project_access directly.
+    #[tokio::test]
+    async fn path_handler_denied_project_is_rejected() {
+        let auth = session_auth();
+        let err = authorize_project_access(&auth, 999, &checker(false))
+            .await
+            .expect_err("cross-tenant project id must be rejected on path handlers");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oss_without_checker_is_a_noop() {
+        let auth = session_auth();
+        let pid = extract_project_id(&auth, Some(7), &None)
+            .await
+            .expect("OSS with no checker must remain a no-op");
+        assert_eq!(pid, 7);
+        authorize_project_access(&auth, 7, &None)
+            .await
+            .expect("OSS with no checker must remain a no-op on path handlers");
     }
 }
