@@ -1316,7 +1316,25 @@ impl SetupCommand {
                         ip
                     }
                 };
-                let sslip_domain = format!("{}.sslip.io", ip);
+                // Dashed IP, not dotted. Wildcard-DNS services locate the target
+                // IP by scanning the hostname for four numeric components joined
+                // by a *single* separator style, taking the leftmost match — and
+                // that match is not anchored to the base domain. With a dotted
+                // base, any generated label ending in a number donates it to the
+                // front of the IP and the name resolves somewhere else entirely:
+                //
+                //   observability-starter-1.127.0.0.1.sslip.io -> 1.127.0.0
+                //   pr-42.127.0.0.1.sslip.io                   -> 42.127.0.0
+                //
+                // Deployment slugs are `{project}-{n}` and preview environments
+                // are `pr-{number}`, so on a dotted base that is every generated
+                // hostname. The dashed spelling makes the separator styles
+                // disagree (`1.127-0-0` mixes a dot and dashes, so it is
+                // rejected) and the real `127-0-0-1` wins.
+                //
+                // `deploy.sh` sets the same dashed form for the quick-start
+                // flow; this covers `temps setup` run without `--wildcard-domain`.
+                let sslip_domain = format!("{}.sslip.io", ip.replace('.', "-"));
                 print_success(&format!(
                     "Using sslip.io domain: {}",
                     format!("*.{}", sslip_domain).bright_cyan()

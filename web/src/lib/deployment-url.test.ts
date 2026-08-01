@@ -102,4 +102,54 @@ describe('resolvePrimaryUrl', () => {
       )
     ).toBe('https://app.example.com')
   })
+
+  // The result is rendered as a followable link and environment domains are
+  // partly user-supplied (custom domains), so a non-http(s) scheme must never
+  // reach the href. A `startsWith('http')` check passed several of these.
+  const hostileDomains: string[] = [
+    'javascript:alert(1)',
+    'httpfoo://evil.com',
+    '//evil.com',
+    'data:text/html,<script>alert(1)</script>',
+    'file:///etc/passwd',
+  ]
+  for (const hostile of hostileDomains) {
+    test(`rejects non-http(s) candidate ${hostile}`, () => {
+      expect(
+        resolvePrimaryUrl(
+          deployment({
+            is_current: true,
+            url: '',
+            environment: { domains: [hostile] },
+          })
+        )
+      ).toBeNull()
+    })
+  }
+
+  test('a hostile environment domain falls through to the deployment URL', () => {
+    // One bad stored domain must not suppress an otherwise valid link.
+    expect(
+      resolvePrimaryUrl(
+        deployment({
+          is_current: true,
+          url: 'https://good.example.com',
+          environment: { domains: ['javascript:alert(1)'] },
+        })
+      )
+    ).toBe('https://good.example.com')
+  })
+
+  test('http scheme is preserved, not upgraded', () => {
+    // Local / self-hosted installs are frequently HTTP-only; rewriting to
+    // https would produce a dead link.
+    expect(
+      resolvePrimaryUrl(
+        deployment({
+          is_current: true,
+          environment: { domains: ['http://app.127-0-0-1.sslip.io'] },
+        })
+      )
+    ).toBe('http://app.127-0-0-1.sslip.io')
+  })
 })
