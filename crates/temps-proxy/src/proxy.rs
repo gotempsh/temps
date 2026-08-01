@@ -413,6 +413,11 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The upstream confirmed a long-lived stream (SSE `text/event-stream`, or
+    /// a `101` WebSocket upgrade). Such a session's total duration is a
+    /// connection lifetime, not a latency, so `logging` keeps it out of the
+    /// duration histograms — see [`crate::metrics::ProxyMetrics::record`].
+    pub streaming_session: bool,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -2453,6 +2458,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
         }
     }
 
@@ -4094,6 +4100,10 @@ impl ProxyHttp for LoadBalancer {
         if is_sse {
             ctx.is_sse = true;
             ctx.skip_tracking = true; // Skip visitor/session tracking for SSE streams
+                                      // The upstream *confirmed* a stream (as opposed to `ctx.is_sse` set
+                                      // from the request's Accept header, which is only client intent and
+                                      // may still be answered by an ordinary short response).
+            ctx.streaming_session = true;
             debug!("SSE response detected from upstream");
         }
 
@@ -4606,12 +4616,20 @@ impl ProxyHttp for LoadBalancer {
             &ctx.routing_status,
         );
 
+        // A `101` means the WebSocket tunnel was actually established, so this
+        // hook is firing at tunnel *close* — anything up to the 1h idle timeout
+        // set in `upstream_peer`. Together with an upstream-confirmed SSE
+        // stream these are the two cases where `start_time.elapsed()` is a
+        // connection lifetime rather than a request latency.
+        let is_streaming = status_code == 101 || ctx.streaming_session;
+
         // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(
             status_code,
             ctx.start_time.elapsed().as_millis() as u64,
             ctx.upstream_response_time_ms,
             destination,
+            is_streaming,
         );
 
         // The response body has now fully streamed through response_body_filter
@@ -4920,6 +4938,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
         }
     }
 
@@ -5463,6 +5482,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
         }
     }
 

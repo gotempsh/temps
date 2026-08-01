@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn test_build_points_maps_samples_to_node_points() {
         let metrics = ProxyMetrics::default();
-        metrics.record(200, 12, None, RequestDestination::Project);
-        metrics.record(502, 340, None, RequestDestination::Console);
+        metrics.record(200, 12, None, RequestDestination::Project, false);
+        metrics.record(502, 340, None, RequestDestination::Console, false);
         let delta = metrics.snapshot().delta_since(&MetricsSnapshot::default());
 
         let points = build_points(&delta.samples());
@@ -241,10 +241,10 @@ mod tests {
             ProxyMetricsSampler::new(Arc::clone(&metrics), Arc::clone(&store), config_service);
 
         // ── Cycle 1: mixed traffic ────────────────────────────────────────
-        metrics.record(200, 100, Some(80), RequestDestination::Project);
-        metrics.record(200, 40, Some(30), RequestDestination::Project);
-        metrics.record(404, 5, None, RequestDestination::Console);
-        metrics.record(502, 60, Some(55), RequestDestination::Project);
+        metrics.record(200, 100, Some(80), RequestDestination::Project, false);
+        metrics.record(200, 40, Some(30), RequestDestination::Project, false);
+        metrics.record(404, 5, None, RequestDestination::Console, false);
+        metrics.record(502, 60, Some(55), RequestDestination::Project, false);
 
         let mut last_snapshot = MetricsSnapshot::default();
         sampler.sample_once(&mut last_snapshot).await;
@@ -273,7 +273,7 @@ mod tests {
         assert!((latest["proxy.self_duration_avg_ms"] - (35.0 / 3.0)).abs() < 1e-9);
 
         // ── Cycle 2: only new traffic must be reported ────────────────────
-        metrics.record(200, 10, Some(8), RequestDestination::Project);
+        metrics.record(200, 10, Some(8), RequestDestination::Project, false);
         sampler.sample_once(&mut last_snapshot).await;
 
         let latest = store
