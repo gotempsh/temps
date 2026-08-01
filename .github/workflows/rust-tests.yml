@@ -183,6 +183,11 @@ jobs:
       - name: Install dependencies
         run: cd web && bun install
 
+      # react/react-dom drifting apart is invisible to tsc and rsbuild but
+      # blanks the console at runtime with React error #527 (issue #504).
+      - name: Check react/react-dom versions match
+        run: cd web && bun run check:react-versions
+
       - name: Type check
         run: cd web && bunx tsc --noEmit
 
@@ -520,6 +525,11 @@ jobs:
             # --test-threads=1, a plain INSERT in temps-deployments' test
             # setup deadlocked against a concurrently-running test in the
             # same shared DB within a couple of runs.
+            #
+            # temps-agent belongs here rather than in a unit group: it had no
+            # group at all (its tests only ever got compiled, never run), and
+            # the platform-detection tests it now carries assert against a
+            # real `docker info`.
             archive: default
             filter: >-
               package(temps-deployments) or package(temps-backup) or
@@ -530,7 +540,8 @@ jobs:
               package(temps-query-postgres) or package(temps-embeddings) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-logs) or
-              package(temps-domains) or package(temps-projects)
+              package(temps-domains) or package(temps-projects) or
+              package(temps-agent)
             test_threads: "1"
           - group: migrations
             # temps-migrations' up()/down() tests guard on

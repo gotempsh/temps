@@ -665,6 +665,11 @@ impl EnvironmentService {
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
         }
+        // Absent leaves the environment inheriting the project's setting; an
+        // explicit value (including `false`) pins it for this environment.
+        if let Some(cross_architecture_builds) = settings.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
         if let Some(on_demand) = settings.on_demand {
             deployment_config.on_demand = on_demand;
         }
@@ -1220,6 +1225,7 @@ mod tests {
                     target_nodes: None,
                     target_labels: None,
                     anti_affinity: None,
+                    cross_architecture_builds: None,
                     protected: None,
                     attack_mode: None,
                     on_demand: None,

@@ -157,6 +157,23 @@ pub struct DeploymentTokenRotatedAudit {
     pub token_name: String,
 }
 
+// ── Node audits ─────────────────────────────────────────────────────────────
+
+/// A node reported a container platform different from the one on record.
+///
+/// Worth auditing rather than only logging: the field decides where images are
+/// placed, it is supplied by the node itself, and a change means either an
+/// operator repointed a daemon or something is impersonating the node. `from`
+/// is `None` the first time a node reports one.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeArchitectureChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    pub from: Option<String>,
+    pub to: String,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -208,3 +225,4 @@ impl_audit_operation!(ExternalImageRegisteredAudit, "EXTERNAL_IMAGE_REGISTERED")
 impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
+impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");

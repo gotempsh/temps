@@ -21,10 +21,16 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
+
+pub use platform::{
+    canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,
+    normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
+};
 
 #[derive(Error, Debug)]
 pub enum BuilderError {
@@ -558,7 +564,37 @@ pub trait ImageBuilder: Send + Sync {
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
+    ///
+    /// May be a *fallback* — the architecture this binary was compiled for —
+    /// when the daemon's platform hasn't been discovered. Callers that must
+    /// not act on a guess should use [`Self::discovered_platform`] instead.
     fn get_native_platform(&self) -> String;
+
+    /// The platform this runtime **confirmed** with its Docker daemon, or
+    /// `None` when discovery hasn't succeeded.
+    ///
+    /// The distinction matters wherever a wrong answer is worse than no
+    /// answer: with a cross-architecture `DOCKER_HOST`, `get_native_platform`
+    /// reports this process's architecture until discovery lands, and treating
+    /// that as authoritative would pick the wrong image for the control plane.
+    ///
+    /// Defaults to `None` so an implementation that can't tell the difference
+    /// is treated as "unknown" rather than as a confirmation.
+    fn discovered_platform(&self) -> Option<String> {
+        None
+    }
+
+    /// Confirm the daemon's platform, querying it if that hasn't happened yet.
+    ///
+    /// [`Self::discovered_platform`] only reports what is already known, which
+    /// leaves callers on paths that never build — image uploads, external
+    /// images — permanently unable to tell a matching image from a mismatched
+    /// one. This lets them ask, at the cost of one `docker info`.
+    ///
+    /// Still `None` when the daemon can't be reached: unknown, never a guess.
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.discovered_platform()
+    }
 
     /// Validate that an image's architecture matches the target platform
     /// Returns Ok(()) if compatible, or Err(BuilderError::PlatformMismatch) if not

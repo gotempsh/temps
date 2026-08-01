@@ -45,6 +45,15 @@ pub struct AgentState {
     /// per-peer routes inside each new container's netns. Empty until
     /// the first successful network/peers poll.
     pub overlay_peers: crate::network_sync::SharedPeers,
+    /// Container platform of the Docker daemon this agent drives, in OCI form
+    /// (`linux/amd64`, `linux/arm64`), once discovered from `docker info`
+    /// (see [`crate::server::detect_agent_platform`]).
+    ///
+    /// Shared with the heartbeat loop, which keeps retrying discovery while it
+    /// is `None` — the daemon is often not up yet when the agent starts. The
+    /// health report exposes it so the control plane can resolve a node whose
+    /// stored architecture is still unknown before transferring an image.
+    pub platform: crate::server::SharedPlatform,
 }
 
 /// Response wrapper for consistent agent API responses.
@@ -1109,5 +1118,8 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         disk_used_bytes: disk_used,
         disk_total_bytes: disk_total,
         running_containers,
+        // Empty means "not discovered yet" — the control plane treats a blank
+        // platform as unknown rather than as a claim about this node.
+        platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
     }
 }

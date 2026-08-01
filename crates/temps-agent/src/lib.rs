@@ -67,6 +67,12 @@ pub struct NodeHealthReport {
     pub disk_total_bytes: u64,
     /// Number of running containers
     pub running_containers: u64,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). The control plane reads this as a fallback when the
+    /// `nodes` row has no architecture yet (agent upgraded but not yet
+    /// heartbeated), so it can validate an image before transferring it.
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Configuration for the agent server.

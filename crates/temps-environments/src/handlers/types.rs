@@ -391,6 +391,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// environment on the same node. Defaults to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anti_affinity: Option<bool>,
+    /// Build one image per architecture the eligible nodes run (overrides the
+    /// project-level setting). Off by default: cross-architecture builds are
+    /// emulated on the control plane and substantially slower, so they are
+    /// opted into per environment rather than triggered by cluster topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_architecture_builds: Option<bool>,
     /// When true, git pushes do NOT auto-deploy to this environment.
     /// Deployments must be promoted from another environment.
     #[serde(skip_serializing_if = "Option::is_none")]

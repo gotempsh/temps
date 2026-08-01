@@ -2477,6 +2477,12 @@ impl ProjectService {
         if let Some(security) = config.security {
             deployment_config.security = Some(security);
         }
+        // Absent leaves it unset (disabled, and inheritable); an explicit value
+        // — including `false` — pins it for every environment that doesn't
+        // override it.
+        if let Some(cross_architecture_builds) = config.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
 
         // Validate the deployment config
         deployment_config

@@ -966,6 +966,12 @@ pub async fn update_project_deployment_config(
     if config.security.is_some() {
         updated_fields.insert("security".to_string(), "updated".to_string());
     }
+    if config.cross_architecture_builds.is_some() {
+        updated_fields.insert(
+            "cross_architecture_builds".to_string(),
+            "updated".to_string(),
+        );
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,

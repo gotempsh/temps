@@ -197,7 +197,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 db.clone(),
                 queue_service.clone(),
                 git_provider,
-                image_builder,
+                image_builder.clone(),
                 deployer,
                 static_deployer,
                 log_service.clone(),
@@ -219,9 +219,16 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Source map service wired into workflow execution service");
             }
 
-            // Wire NodeScheduler for multi-node deployments
+            // Wire NodeScheduler for multi-node deployments. It needs the
+            // control plane's own container platform so the `Local` slot takes
+            // part in architecture filtering like any worker: on a cluster
+            // where the CP is amd64 and an arm64-only image is deployed, Local
+            // must drop out of the pool instead of taking the replica.
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
-            let node_scheduler = Arc::new(crate::services::NodeScheduler::new(node_service));
+            let node_scheduler = Arc::new(
+                crate::services::NodeScheduler::new(node_service)
+                    .with_platform_source(image_builder.clone()),
+            );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments

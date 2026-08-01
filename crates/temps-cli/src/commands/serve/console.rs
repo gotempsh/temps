@@ -2512,6 +2512,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         notification_service: service_context
             .get_service::<dyn temps_core::notifications::NotificationService>(),
+        audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);

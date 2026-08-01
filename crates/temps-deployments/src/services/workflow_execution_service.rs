@@ -669,6 +669,91 @@ impl WorkflowExecutionService {
                     }
                 }
 
+                // Cross-build for any worker architecture this deployment could
+                // be scheduled onto. Empty on a homogeneous cluster, which is
+                // the single native build every deployment does today.
+                //
+                // This runs at build time even though placement happens later,
+                // because the build job precedes scheduling in the workflow;
+                // the node selectors below are the same ones the scheduler will
+                // apply, so we never build for an architecture this deployment
+                // cannot land on.
+                //
+                // Off unless the operator asked for it. Cross-builds are
+                // emulated and slow, and deriving them from cluster topology
+                // would let one node joining change build behaviour for every
+                // deployment — including breaking builds outright on a control
+                // plane without the matching QEMU binfmt handlers. Environment
+                // setting wins, inheriting the project's when unset.
+                let cross_builds_enabled = environment
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.cross_architecture_builds)
+                    .or_else(|| {
+                        project
+                            .deployment_config
+                            .as_ref()
+                            .and_then(|c| c.cross_architecture_builds)
+                    })
+                    .unwrap_or(false);
+
+                if !cross_builds_enabled {
+                    debug!(
+                        deployment_id = db_job.deployment_id,
+                        "Cross-architecture builds disabled; building for the control plane's \
+                         platform only"
+                    );
+                }
+
+                if let (true, Some(scheduler)) = (cross_builds_enabled, self.node_scheduler.get()) {
+                    let target_nodes = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|c| c.target_nodes.clone())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|c| c.target_nodes.clone())
+                        });
+                    let target_labels = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|c| c.target_labels.clone())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|c| c.target_labels.clone())
+                        });
+
+                    match scheduler
+                        .required_build_platforms(target_labels.as_ref(), target_nodes.as_deref())
+                        .await
+                    {
+                        Ok(platforms) if !platforms.is_empty() => {
+                            info!(
+                                deployment_id = db_job.deployment_id,
+                                platforms = ?platforms,
+                                "Cluster spans multiple architectures — building one image per platform"
+                            );
+                            builder = builder.target_platforms(platforms);
+                        }
+                        Ok(_) => {}
+                        // Not being able to enumerate nodes must not block a
+                        // build: fall back to the native-only build and let the
+                        // deploy path's architecture check catch a mismatch.
+                        Err(e) => {
+                            warn!(
+                                deployment_id = db_job.deployment_id,
+                                "Could not determine cluster architectures ({}); \
+                                 building for the control plane's platform only",
+                                e
+                            );
+                        }
+                    }
+                }
+
                 let job = builder.build(self.image_builder.clone())?;
 
                 Ok(Arc::new(job))
