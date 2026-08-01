@@ -732,9 +732,9 @@ impl LoadBalancer {
         identifier_type: &str,
     ) -> String {
         // Generate a random challenge (32 hex characters)
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
         let challenge = hex::encode(bytes);
 
         // Difficulty: 20 leading zero bits (~1 million attempts)

@@ -11,7 +11,7 @@ use argon2::{Argon2, PasswordHasher};
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
+use rand::RngExt;
 use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
@@ -237,10 +237,10 @@ pub struct SetupCommand {
 fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -265,7 +265,8 @@ fn setup_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
         Ok(key.trim().to_string())
     } else {
         // Generate new encryption key
-        let key = EncryptionService::generate_raw_key();
+        let key = EncryptionService::generate_raw_key()
+            .map_err(|e| anyhow::anyhow!("Failed to generate encryption key: {}", e))?;
         fs::write(&encryption_key_path, &key)
             .map_err(|e| anyhow::anyhow!("Failed to write encryption key: {}", e))?;
         debug!(
@@ -521,7 +522,7 @@ async fn create_git_provider(
 
         // Generate webhook secret
         let mut webhook_secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut webhook_secret_bytes);
+        rand::rng().fill(&mut webhook_secret_bytes);
         let webhook_secret = hex::encode(webhook_secret_bytes);
 
         // Create provider

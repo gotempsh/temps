@@ -487,7 +487,7 @@ mod tests {
         use crate::services::gitlab_webhook::generate_signing_token;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-        let tok = generate_signing_token();
+        let tok = generate_signing_token().unwrap();
         assert!(tok.starts_with("whsec_"));
         let decoded = STANDARD
             .decode(tok.strip_prefix("whsec_").unwrap())

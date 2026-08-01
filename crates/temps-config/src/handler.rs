@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
@@ -1405,8 +1405,8 @@ async fn generate_join_token(
 
     // Generate a random 32-byte token as hex
     let plaintext_token = {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
         hex::encode(bytes)
     };
     let token_hash = sha256_hash(&plaintext_token);

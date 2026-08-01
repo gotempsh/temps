@@ -1793,7 +1793,8 @@ impl ProjectService {
         let webhook_url = format!("{}/api/webhook/git/gitlab/events", external_url);
 
         // Generate a random 32-byte signing token.
-        let signing_token = generate_signing_token();
+        let signing_token = generate_signing_token()
+            .map_err(|error| format!("Failed to generate GitLab webhook token: {error}"))?;
 
         let hook_id = client
             .install_webhook(owner, repo, &webhook_url, &signing_token)
@@ -1984,7 +1985,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh secret-in-path delivery token.
-        let delivery_token = generate_bitbucket_webhook_token();
+        let delivery_token = generate_bitbucket_webhook_token()
+            .map_err(|error| format!("Failed to generate Bitbucket webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/bitbucket/events/{}",
@@ -2178,7 +2180,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh HMAC secret (used as the Gitea webhook secret).
-        let signing_token = generate_gitea_signing_token();
+        let signing_token = generate_gitea_signing_token()
+            .map_err(|error| format!("Failed to generate Gitea webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/gitea/events",
@@ -2275,7 +2278,8 @@ impl ProjectService {
             return Ok(None);
         }
 
-        let token = generate_generic_webhook_token();
+        let token = generate_generic_webhook_token()
+            .map_err(|error| format!("Failed to generate Generic webhook token: {error}"))?;
 
         let encrypted_token = self
             .encryption_service

@@ -35,7 +35,7 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
@@ -699,7 +699,7 @@ fn effective_status(stored: &str, expires_at: temps_core::UtcDateTime) -> String
 /// Generate a 32-byte hex-encoded device_code. ~10^77 entropy.
 fn generate_device_code() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -708,9 +708,9 @@ fn generate_device_code() -> String {
 /// which is fine given expiry and rate-limit protection.
 fn generate_user_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let pick = |rng: &mut rand::rngs::ThreadRng| -> char {
-        let idx = rng.gen_range(0..ALPHABET.len());
+        let idx = rng.random_range(0..ALPHABET.len());
         ALPHABET[idx] as char
     };
     let mut out = String::with_capacity(9);

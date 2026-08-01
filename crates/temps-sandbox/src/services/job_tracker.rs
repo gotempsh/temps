@@ -250,9 +250,9 @@ impl JobTracker {
     /// Generate a new job ID. Same format as sandbox public IDs but
     /// with `job_` prefix.
     pub fn new_job_id() -> String {
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         format!("job_{}", hex::encode(bytes))
     }
 }

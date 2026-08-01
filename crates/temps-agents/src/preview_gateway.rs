@@ -70,9 +70,9 @@ pub fn ensure_shared_secret(data_dir: &std::path::Path) -> Result<String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Generate a fresh 32-byte random secret.
-            use rand::RngCore;
+            use rand::Rng;
             let mut bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut bytes);
+            rand::rng().fill_bytes(&mut bytes);
             let hex = hex::encode(bytes);
 
             // Make sure the parent dir exists.
@@ -566,9 +566,9 @@ pub async fn ensure_shared_secret_db(
 }
 
 fn generate_secret() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
