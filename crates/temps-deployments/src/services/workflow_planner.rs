@@ -8,7 +8,23 @@ use std::sync::Arc;
 use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
-use tracing::{debug, info};
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+#[derive(Debug, Error)]
+pub enum WorkflowPlanningError {
+    #[error(
+        "Failed to seal workflow field '{field}' for deployment {deployment_id} \
+         (project {project_id}): {source}"
+    )]
+    SealSensitiveField {
+        deployment_id: i32,
+        project_id: i32,
+        field: &'static str,
+        #[source]
+        source: crate::services::sensitive_envelope::SensitiveEnvelopeError,
+    },
+}
 
 /// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
 ///
@@ -33,6 +49,26 @@ pub struct JobDefinition {
 
 use super::deployment_token_service::DeploymentTokenService;
 
+const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
+
+/// Derive an opaque, stable namespace for BuildKit cache mounts.
+///
+/// Cache mounts are writable and live on a shared builder. A public namespace
+/// would allow an unrelated project to mount or poison another project's
+/// cache. The HMAC-derived value is stable for warm builds of the same ref but
+/// cannot be derived by tenants that do not hold the Temps master key.
+fn buildkit_cache_mount_namespace(
+    encryption_service: &EncryptionService,
+    project_id: i32,
+    environment_id: i32,
+    cache_ref: &str,
+) -> String {
+    let domain = format!(
+        "temps-buildkit-cache-v1:project={project_id}:environment={environment_id}:ref={cache_ref}"
+    );
+    hex::encode(encryption_service.derive_subkey(&domain))
+}
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -56,6 +92,50 @@ pub struct WorkflowPlanner {
 }
 
 impl WorkflowPlanner {
+    fn seal_sensitive_field(
+        &self,
+        job_config: &mut serde_json::Map<String, serde_json::Value>,
+        deployment: &deployments::Model,
+        field: &'static str,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<(), WorkflowPlanningError> {
+        crate::services::sensitive_envelope::write_sealed(
+            job_config,
+            self.encryption_service.as_ref(),
+            field,
+            values,
+        )
+        .map_err(|source| WorkflowPlanningError::SealSensitiveField {
+            deployment_id: deployment.id,
+            project_id: deployment.project_id,
+            field,
+            source,
+        })
+    }
+
+    fn buildkit_cache_namespace_for(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+    ) -> String {
+        // Tags take precedence during checkout, followed by branches and
+        // direct commit deployments. Branch deployments retain a stable cache
+        // namespace across commits, while detached commits remain isolated.
+        let cache_ref = deployment
+            .tag_ref
+            .as_deref()
+            .or(deployment.branch_ref.as_deref())
+            .or(deployment.commit_sha.as_deref())
+            .unwrap_or(&project.main_branch);
+        buildkit_cache_mount_namespace(
+            self.encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            cache_ref,
+        )
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         log_service: Arc<LogService>,
@@ -965,6 +1045,20 @@ impl WorkflowPlanner {
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
+        // This is a platform-owned build argument, not a tenant runtime
+        // variable. Drop any user-controlled value before planning so it
+        // cannot override the HMAC namespace or leak into deployed containers.
+        if env_vars
+            .remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+            .is_some()
+        {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Ignoring tenant-provided reserved BuildKit cache namespace"
+            );
+        }
+
         // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
@@ -997,8 +1091,16 @@ impl WorkflowPlanner {
 
         // Docker Compose preset uses its own deployment path
         if project.preset == temps_entities::preset::Preset::DockerCompose {
+            let buildkit_cache_namespace =
+                self.buildkit_cache_namespace_for(project, environment, deployment);
             return self
-                .plan_compose_deployment(project, environment, deployment, env_vars)
+                .plan_compose_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    buildkit_cache_namespace,
+                )
                 .await;
         }
 
@@ -1062,6 +1164,13 @@ impl WorkflowPlanner {
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
+
+        // BuildKit's predefined BUILDKIT_CACHE_MOUNT_NS argument is applied to
+        // every RUN --mount=type=cache ID. Scope it by project, environment,
+        // and checked-out ref so unrelated tenants and preview branches cannot
+        // read or poison each other's writable compiler/package caches.
+        let buildkit_cache_namespace =
+            self.buildkit_cache_namespace_for(project, environment, deployment);
 
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
@@ -1138,12 +1247,15 @@ impl WorkflowPlanner {
 
         // Check if this preset supports static deployment using temps-presets
         // Get the preset instance and check if it has a static output directory
-        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let runtime_slug =
+            temps_presets::runtime_slug(project.preset, project.preset_config.as_ref());
+        let preset_instance =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())?;
         let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
 
         debug!(
             "Preset {} static output directory: {:?}",
-            project.preset, static_output_dir
+            runtime_slug, static_output_dir
         );
 
         // Job 2: Build container image (skip for static deployments)
@@ -1161,11 +1273,18 @@ impl WorkflowPlanner {
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
 
-            // Convert environment variables to build args
-            let mut build_args_map = serde_json::Map::new();
-            for (key, value) in &env_vars {
-                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
+            // Build args contain every resolved environment value, including
+            // secrets. Keep the static-deployment path aligned with container
+            // deployments: store only an encrypted envelope plus a plaintext
+            // key index for diagnostics.
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace.clone(),
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1182,6 +1301,14 @@ impl WorkflowPlanner {
                 }
             }
 
+            let mut build_job_config = serde_json::json!({
+                "dockerfile_path": dockerfile_path,
+                "build_context": build_context,
+            });
+            if let Some(obj) = build_job_config.as_object_mut() {
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+            }
+
             // Job 2: Build image (for static deployments, this builds the static files inside container)
             jobs.push(JobDefinition {
                 job_id: "build_image".to_string(),
@@ -1189,11 +1316,7 @@ impl WorkflowPlanner {
                 name: "Build Container Image".to_string(),
                 description: Some("Build Docker image and compile static files".to_string()),
                 dependencies: build_dependencies.clone(),
-                job_config: Some(serde_json::json!({
-                    "dockerfile_path": dockerfile_path,
-                    "build_args": build_args_map,
-                    "build_context": build_context
-                })),
+                job_config: Some(build_job_config),
                 required_for_completion: true,
             });
 
@@ -1261,10 +1384,14 @@ impl WorkflowPlanner {
             // whole map under `build_args_encrypted` instead so an operator
             // dumping `deployment_jobs.job_config` for debugging never sees
             // an env-var value they shouldn't.
-            let build_args_map: std::collections::HashMap<String, String> = env_vars
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1286,13 +1413,7 @@ impl WorkflowPlanner {
                 "build_context": build_context,
             });
             if let Some(obj) = build_job_config.as_object_mut() {
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "build_args",
-                    &build_args_map,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal build_args: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
             }
 
             jobs.push(JobDefinition {
@@ -1343,28 +1464,24 @@ impl WorkflowPlanner {
                 // Seal env vars, remote env vars, and secret-file contents.
                 // None of these end up in `job_config` in plaintext anymore;
                 // the executor pulls them back through `read_sealed`.
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "environment_variables",
                     &deploy_env_vars,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+                )?;
 
                 if let Some(ref remote_vars) = remote_deploy_env_vars {
                     info!(
                         "Sealing remote_environment_variables in job config ({} keys)",
                         remote_vars.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
+                    self.seal_sensitive_field(
                         obj,
-                        self.encryption_service.as_ref(),
+                        deployment,
                         "remote_environment_variables",
                         remote_vars,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                    })?;
+                    )?;
                 } else {
                     info!("No remote_environment_variables to store (single-node mode or no active nodes)");
                 }
@@ -1374,13 +1491,7 @@ impl WorkflowPlanner {
                         "Sealing {} secret file(s) in deploy job config",
                         secrets.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
-                        obj,
-                        self.encryption_service.as_ref(),
-                        "secrets",
-                        &secrets,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                    self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
                 }
             }
 
@@ -1492,6 +1603,28 @@ impl WorkflowPlanner {
             });
             debug!(
                 "Added configure_crons job to workflow (runs after deployment is marked complete)"
+            );
+
+            // Job: Reconcile metric alert rules from .temps.yaml alerts: section.
+            // Runs in parallel with configure_crons, after deployment is complete.
+            // NOT required for deployment completion.
+            jobs.push(JobDefinition {
+                job_id: "configure_metric_alerts".to_string(),
+                job_type: "ConfigureMetricAlertsJob".to_string(),
+                name: "Configure Metric Alerts".to_string(),
+                description: Some(
+                    "Reconcile metric alert rules from .temps.yaml with the database".to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "download_job_id": "download_repo"
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
             );
 
             // Job: Sync agent definitions from .temps/agents/*.yaml
@@ -1677,6 +1810,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
@@ -1739,13 +1873,12 @@ impl WorkflowPlanner {
             "directory": project.directory,
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_vars",
-                &env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal compose environment_vars: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            let build_args = std::collections::HashMap::from([(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            )]);
+            self.seal_sensitive_field(obj, deployment, "build_args", &build_args)?;
         }
 
         jobs.push(JobDefinition {
@@ -1939,28 +2072,19 @@ impl WorkflowPlanner {
             "use_external_image": true,
         });
         if let Some(obj) = job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_variables",
-                &deploy_env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
 
             if let Some(ref remote_vars) = remote_deploy_env_vars {
                 info!(
                     "Sealing remote_environment_variables in docker image job config ({} keys)",
                     remote_vars.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "remote_environment_variables",
                     remote_vars,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                })?;
+                )?;
             } else {
                 info!("No remote_environment_variables for docker image deployment");
             }
@@ -1970,13 +2094,7 @@ impl WorkflowPlanner {
                     "Sealing {} secret file(s) in docker image deploy job config",
                     secrets.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "secrets",
-                    &secrets,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             }
         }
 
@@ -2208,6 +2326,40 @@ mod tests {
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+    #[test]
+    fn buildkit_cache_namespace_is_stable_and_opaque() {
+        let encryption_service = create_test_encryption_service();
+
+        let first =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+        let second =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains("main"));
+        assert!(!first.contains("42"));
+    }
+
+    #[test]
+    fn buildkit_cache_namespace_isolates_tenants_and_refs() {
+        let encryption_service = create_test_encryption_service();
+        let namespace = |project_id, environment_id, cache_ref| {
+            buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project_id,
+                environment_id,
+                cache_ref,
+            )
+        };
+
+        let baseline = namespace(42, 7, "refs/heads/main");
+        assert_ne!(baseline, namespace(43, 7, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 8, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 7, "refs/heads/feature"));
+    }
 
     #[test]
     fn image_ref_release_extracts_tag_digest_and_handles_registry_port() {
@@ -2555,6 +2707,7 @@ mod tests {
     async fn test_job_configuration() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
@@ -2565,10 +2718,10 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
-            create_test_encryption_service(),
+            encryption_service.clone(),
         );
 
-        let (_project, _environment, deployment) =
+        let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
@@ -2595,10 +2748,38 @@ mod tests {
                 config_obj.get("build_args_keys").is_some(),
                 "build_image config must include build_args_keys index",
             );
+            let build_arg_keys = config_obj
+                .get("build_args_keys")
+                .and_then(|value| value.as_array())
+                .expect("build_args_keys must be an array");
+            assert!(
+                build_arg_keys
+                    .iter()
+                    .any(|key| { key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG) }),
+                "BuildKit cache namespace must be forwarded as a build arg",
+            );
             // Plaintext `build_args` must NOT appear — that would leak env-var values.
             assert!(
                 config_obj.get("build_args").is_none(),
                 "plaintext build_args must not be present (envelope leak)",
+            );
+            let opened = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let expected_namespace = buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project.id,
+                environment.id,
+                &project.main_branch,
+            );
+            assert_eq!(
+                opened
+                    .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                    .map(String::as_str),
+                Some(expected_namespace.as_str()),
+                "planner must overwrite the reserved build arg with its HMAC namespace",
             );
         }
 
@@ -2613,6 +2794,202 @@ mod tests {
             assert!(config_obj.get("port").is_some());
             assert!(config_obj.get("replicas").is_some());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_build_args_are_sealed() -> Result<(), Box<dyn std::error::Error>> {
+        const STATIC_SECRET: &str = "static-build-secret-must-not-leak";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping static build-args sealing test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "STATIC_DATABASE_PASSWORD".to_string(),
+            STATIC_SECRET.to_string(),
+        );
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(SucceedingSecretsResolver { secrets });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::Static).await?;
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .expect("static deployment must include build_image");
+        let config = build_job
+            .job_config
+            .as_ref()
+            .expect("build_image must include job_config");
+
+        assert!(
+            config.get("build_args").is_none(),
+            "static build args must never be persisted in plaintext",
+        );
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_arg_keys = config
+            .get("build_args_keys")
+            .and_then(serde_json::Value::as_array)
+            .expect("static build args must include a plaintext key index");
+        assert!(
+            build_arg_keys
+                .iter()
+                .any(|key| key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)),
+            "static builds must receive the BuildKit cache namespace",
+        );
+        assert!(
+            !config.to_string().contains(STATIC_SECRET),
+            "sealed static job_config must not contain secret values",
+        );
+
+        let opened = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        assert_eq!(
+            opened.get("STATIC_DATABASE_PASSWORD").map(String::as_str),
+            Some(STATIC_SECRET),
+            "executor must recover static build args from the sealed envelope",
+        );
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            &project.main_branch,
+        );
+        assert_eq!(
+            opened
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        const TENANT_VALUE: &str = "tenant-controlled-cache-namespace";
+        const CACHE_REF: &str = "feature/compose-cache";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping Compose cache namespace test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+        let mut deployment_active: deployments::ActiveModel = deployment.into();
+        deployment_active.branch_ref = Set(Some(CACHE_REF.to_string()));
+        let deployment = deployment_active.update(db.as_ref()).await?;
+
+        let tenant_var = env_vars::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            key: Set(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string()),
+            value: Set(TENANT_VALUE.to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(tenant_var.id),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let compose_job = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("Compose deployment must include deploy_compose");
+        let config = compose_job
+            .job_config
+            .as_ref()
+            .expect("Compose job must have configuration");
+
+        assert!(config.get("build_args").is_none());
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            CACHE_REF,
+        );
+        assert_eq!(
+            build_args
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+        assert!(!config.to_string().contains(TENANT_VALUE));
+
+        let runtime_env = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "environment_vars",
+        )?;
+        assert!(
+            !runtime_env.contains_key(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG),
+            "reserved BuildKit namespace must never enter Compose service runtime environments",
+        );
+        assert!(!runtime_env
+            .values()
+            .any(|value| value == &expected_namespace));
 
         Ok(())
     }

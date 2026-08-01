@@ -933,14 +933,6 @@ function TypingDots() {
   )
 }
 
-function AssistantAvatar() {
-  return (
-    <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
-      <Sparkles className="h-4 w-4 text-primary" />
-    </div>
-  )
-}
-
 /** Open links (including `remark-gfm` autolinked bare URLs) in a new tab, styled
  *  as links. `rel="noopener noreferrer"` so the opened page can't access us. */
 const markdownComponents: Components = {
@@ -1453,8 +1445,7 @@ export function DebugChatPanel({
           ))}
 
         {showBootRow && (
-          <div className="flex items-start gap-2.5">
-            <AssistantAvatar />
+          <div className="flex items-start">
             <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5 text-sm text-muted-foreground">
               <TypingDots />
               Reading logs and analyzing the failure…
@@ -1476,8 +1467,7 @@ export function DebugChatPanel({
               )}
             </div>
           ) : (
-            <div key={i} className="flex items-start gap-2.5">
-              <AssistantAvatar />
+            <div key={i} className="flex items-start">
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
                   <AssistantBody

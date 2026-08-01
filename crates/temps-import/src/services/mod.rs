@@ -1,8 +1,12 @@
 //! Import orchestration services
 
+pub mod deployment_verifier;
 mod orchestrator;
+pub mod resource_executor;
 
+pub use deployment_verifier::DeploymentVerifier;
 pub use orchestrator::ImportOrchestrator;
+pub use resource_executor::ResourceExecutor;
 
 use axum::http::StatusCode;
 use temps_core::problemdetails::{self, Problem};
@@ -78,9 +82,7 @@ impl From<ImportServiceError> for Problem {
                     .with_title("Database Error")
                     .with_detail(e.to_string())
             }
-            ImportServiceError::Import(e) => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Import Error")
-                .with_detail(e.to_string()),
+            ImportServiceError::Import(e) => import_error_to_problem(e),
             ImportServiceError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -91,6 +93,51 @@ impl From<ImportServiceError> for Problem {
                     .with_title("Invalid Importer Base URL")
                     .with_detail(format!("base_url '{url}' rejected: {reason}"))
             }
+        }
+    }
+}
+
+/// Map each `ImportError` variant to its own HTTP status — collapsing them
+/// all into one status (e.g. always 400) would hide the difference between
+/// "your credentials are wrong" (401), "the source platform is rate
+/// limiting you" (429), and "temps couldn't reach it" (502), all of which
+/// need different handling on the client.
+fn import_error_to_problem(error: temps_import_types::ImportError) -> Problem {
+    use temps_import_types::ImportError;
+    match error {
+        ImportError::AuthenticationError(_) | ImportError::InvalidCredentials(_) => {
+            problemdetails::new(StatusCode::UNAUTHORIZED)
+                .with_title("Source Authentication Failed")
+                .with_detail(error.to_string())
+        }
+        ImportError::RateLimitExceeded(_) => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Source Rate Limit Exceeded")
+            .with_detail(error.to_string()),
+        ImportError::ContainerNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Workload Not Found")
+            .with_detail(error.to_string()),
+        ImportError::SourceNotAccessible(_)
+        | ImportError::DiscoveryFailed(_)
+        | ImportError::InspectionFailed(_)
+        | ImportError::NetworkError(_) => problemdetails::new(StatusCode::BAD_GATEWAY)
+            .with_title("Source Platform Unreachable")
+            .with_detail(error.to_string()),
+        ImportError::InvalidConfiguration(_)
+        | ImportError::ValidationFailed(_)
+        | ImportError::PlanGenerationFailed(_)
+        | ImportError::UnsupportedFeature(_) => problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Import Request")
+            .with_detail(error.to_string()),
+        ImportError::ExecutionFailed(_)
+        | ImportError::StepFailed { .. }
+        | ImportError::VolumeError(_)
+        | ImportError::ServiceMigrationError(_)
+        | ImportError::DomainMigrationError(_)
+        | ImportError::Internal(_)
+        | ImportError::SerializationError(_) => {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Import Execution Failed")
+                .with_detail(error.to_string())
         }
     }
 }

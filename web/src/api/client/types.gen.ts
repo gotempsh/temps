@@ -294,6 +294,8 @@ export type AgentConfigResponse = {
     max_turns: number;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline values are write-only and appear as
+     * `***`. Omit this field on update to preserve their stored values.
      */
     mcp_servers_config?: unknown;
     name: string;
@@ -311,7 +313,9 @@ export type AgentConfigResponse = {
     source: string;
     timeout_seconds: number;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+     * are write-only and appear as `***`. Omit this field on update to
+     * preserve their stored values.
      */
     tools_config?: unknown;
     trigger_config: unknown;
@@ -2048,6 +2052,11 @@ export type CliLoginRequest = {
 };
 
 /**
+ * Cloud provider detected from node metadata
+ */
+export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
+
+/**
  * Configuration for a Cloudflare Email Sending notification provider.
  *
  * Notifications are delivered through Cloudflare's transactional Email Sending
@@ -2061,8 +2070,7 @@ export type CloudflareConfig = {
     account_id: string;
     /**
      * Cloudflare API token with the Email Sending permission. Encrypted at
-     * rest; like the other notification providers, it is returned decrypted to
-     * authorized callers so the edit form can prefill (not masked).
+     * rest and masked in normal API responses.
      */
     api_token: string;
     /**
@@ -2078,6 +2086,24 @@ export type CloudflareConfig = {
      * Recipients that should receive the notification.
      */
     to_addresses: Array<string>;
+};
+
+/**
+ * Total cluster capacity (sum of node allocatable resources)
+ */
+export type ClusterCapacity = {
+    /**
+     * Total allocatable CPU in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Total allocatable memory in MB
+     */
+    memory_mb: number;
+    /**
+     * Number of nodes
+     */
+    node_count: number;
 };
 
 /**
@@ -2292,6 +2318,20 @@ export type CommitListResponse = {
  */
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
+/**
+ * A port that should be exposed publicly through the proxy for a compose service.
+ */
+export type ComposePublicPort = {
+    /**
+     * Container port to expose (e.g. 8123)
+     */
+    port: number;
+    /**
+     * Compose service name (e.g. "web", "clickhouse")
+     */
+    service: string;
+};
+
 export type ConnectionListQuery = {
     direction?: string | null;
     page?: number | null;
@@ -2464,6 +2504,10 @@ export type ContainerDetailResponse = {
      */
     started_at?: string | null;
     status: string;
+};
+
+export type ContainerEnvironmentVariableValueResponse = {
+    value: string;
 };
 
 export type ContainerInfoResponse = {
@@ -2899,6 +2943,54 @@ export type CopyBlobRequest = {
      * Destination pathname
      */
     toPathname: string;
+};
+
+/**
+ * Full cluster cost + rightsizing analysis attached to an import plan.
+ */
+export type CostAnalysis = {
+    actual_usage?: null | ResourceFootprint;
+    /**
+     * Total cluster capacity (sum of node allocatable resources)
+     */
+    capacity: ClusterCapacity;
+    /**
+     * Managed control-plane fee included in `current_monthly_usd` (EKS/GKE
+     * charge ~$73/mo per cluster). `None` when not applicable/unknown.
+     */
+    control_plane_monthly_usd?: number | null;
+    /**
+     * Estimated total infrastructure cost per month in USD (compute nodes +
+     * control-plane fee). `None` when no node could be priced.
+     */
+    current_monthly_usd?: number | null;
+    /**
+     * Per-node inventory with price estimates where the instance type is known
+     */
+    nodes: Array<NodeCostInfo>;
+    /**
+     * Honesty notes: what could not be measured, which numbers are
+     * estimates, and any assumptions made. Always shown to the user.
+     */
+    notes: Array<string>;
+    /**
+     * Requests-vs-capacity-vs-usage assessment
+     */
+    overprovisioning: OverprovisioningAssessment;
+    provider?: null | CloudProvider;
+    /**
+     * The temps/Hetzner target sizing and savings estimate
+     */
+    recommendation: TargetRecommendation;
+    /**
+     * Sum of pod resource *requests* across running pods — what the
+     * scheduler has reserved, i.e. what the cluster is sized for.
+     */
+    requested: ResourceFootprint;
+    /**
+     * How the usage numbers were obtained (drives UI wording)
+     */
+    usage_source: UsageSource;
 };
 
 export type CreateAlertRuleRequest = {
@@ -4330,6 +4422,7 @@ export type DeploymentConfiguration = {
      * Environment variables
      */
     env_vars: Array<EnvironmentVariable>;
+    git?: null | GitSourcePlan;
     health_check?: null | HealthCheckConfiguration;
     /**
      * Image to deploy
@@ -4420,6 +4513,10 @@ export type DeploymentJobResponse = {
     execution_order?: number | null;
     finished_at?: number | null;
     id: number;
+    /**
+     * Internal workflow configuration is intentionally redacted. It can
+     * contain legacy plaintext secrets or encrypted secret envelopes.
+     */
     job_config?: unknown;
     job_id: string;
     job_type: string;
@@ -5198,6 +5295,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5234,7 +5349,16 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    variant?: null | DockerfileVariant;
 };
+
+/**
+ * Catalog variant persisted under the canonical Dockerfile preset.
+ *
+ * Existing rows predate this discriminator and therefore deserialize as
+ * [`DockerfileVariant::File`].
+ */
+export type DockerfileVariant = 'file' | 'custom';
 
 /**
  * What to do with a domain during migration
@@ -5286,6 +5410,15 @@ export type DomainPlan = {
      * Redirect target (if this is a redirect domain)
      */
     redirect_to?: string | null;
+    /**
+     * The temps-side address that replaces this domain when it is skipped.
+     *
+     * Source-generated domains (sslip.io / traefik.me / platform subdomains)
+     * embed the source server's IP and would keep pointing at the old
+     * machine — this tells the user where the app will be reachable on
+     * temps instead.
+     */
+    replacement?: string | null;
     /**
      * Redirect status code
      */
@@ -5654,6 +5787,16 @@ export type EnableKvResponse = {
 };
 
 /**
+ * Response for the enable pg_stat_statements endpoint.
+ */
+export type EnablePgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the action.
+     */
+    message: string;
+};
+
+/**
  * One DNS record on the wire. Mirrors `service_endpoints::Model` but
  * keeps the API stable across entity evolution. `target_ip` is a string
  * (v4 or v6 literal, or CNAME target hostname) parsed by the resolver.
@@ -5792,6 +5935,7 @@ export type EnvVarIntegrationInfo = {
     service_name: string;
     service_slug?: string | null;
     service_type: string;
+    service_updated_at: string;
 };
 
 /**
@@ -6736,6 +6880,11 @@ export type ExternalServiceDetails = {
         [key: string]: string;
     } | null;
     parameter_schema?: unknown;
+    /**
+     * Parameter names whose values are masked in `current_parameters` and
+     * may be fetched only through the audited reveal endpoint.
+     */
+    sensitive_parameters: Array<string>;
     service: ExternalServiceInfo;
 };
 
@@ -7440,6 +7589,16 @@ export type GetDeploymentsParams = {
 
 export type GetEnvironmentVariablesQuery = {
     environment_id?: number | null;
+    /**
+     * Required by integration-value reveals to bind the plaintext response to
+     * the exact service displayed by the client.
+     */
+    service_id?: number | null;
+    /**
+     * Exact manual env-var row to reveal. Required by the dashboard so
+     * duplicate keys on disjoint environments cannot cross-reveal.
+     */
+    var_id?: number | null;
 };
 
 export type GetFunnelMetricsQuery = {
@@ -7556,6 +7715,34 @@ export type GitRefResponse = {
      * Git repository URL
      */
     url: string;
+};
+
+/**
+ * Git repository the source platform deploys from
+ */
+export type GitSourcePlan = {
+    /**
+     * Branch the source platform deploys
+     */
+    branch: string;
+    /**
+     * Full clone URL, e.g. `https://github.com/owner/repo.git`
+     */
+    clone_url?: string | null;
+    /**
+     * True when the repository is public (no credentials on the source
+     * platform) — the project can then build without a git provider
+     * connection.
+     */
+    is_public: boolean;
+    /**
+     * Repository owner (organization or user)
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
 };
 
 /**
@@ -8003,6 +8190,7 @@ export type ImportPlan = {
      * Additional deployments (workers, cron jobs, etc.)
      */
     additional_deployments?: Array<DeploymentConfiguration>;
+    cost_analysis?: null | CostAnalysis;
     /**
      * Primary deployment configuration
      */
@@ -8092,7 +8280,7 @@ export type ImportSelector = {
 /**
  * Import source identifier
  */
-export type ImportSource = 'docker' | 'coolify' | 'dokploy' | 'vercel' | 'netlify' | 'railway' | 'render' | 'fly' | 'custom';
+export type ImportSource = 'docker' | 'coolify' | 'dokploy' | 'vercel' | 'netlify' | 'railway' | 'render' | 'fly' | 'kubernetes' | 'caprover' | 'portainer' | 'kamal' | 'custom';
 
 /**
  * Source capabilities
@@ -8103,6 +8291,10 @@ export type ImportSourceCapabilities = {
      */
     requires_credentials: boolean;
     supports_build: boolean;
+    /**
+     * Supports cluster cost + overprovisioning analysis in the plan
+     */
+    supports_cost_analysis: boolean;
     /**
      * Supports custom domain migration
      */
@@ -9770,12 +9962,28 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 
 /**
  * Configuration for Nixpacks preset
- * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
- * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ * Nixpacks provider and inline build-plan configuration.
  */
 export type NixpacksPresetConfig = {
-    [key: string]: unknown;
+    /**
+     * Optional inline nixpacks.toml contents.
+     */
+    nixpacksConfig?: string | null;
+    /**
+     * Ordered Nixpacks providers. Empty means repository config or auto-detect;
+     * include `...` to combine auto-detection with explicit providers.
+     */
+    providers?: Array<NixpacksProvider>;
 };
+
+/**
+ * A Nixpacks build provider.
+ *
+ * `Auto` serializes as the native Nixpacks `...` marker, which includes the
+ * provider detected from the project alongside any explicitly listed
+ * providers.
+ */
+export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
@@ -9796,6 +10004,37 @@ export type NodeContainerResponse = {
     project_id: number;
     project_name: string;
     status: string;
+};
+
+/**
+ * One cluster node with capacity and (when priceable) a cost estimate
+ */
+export type NodeCostInfo = {
+    /**
+     * CPU capacity in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Instance type from `node.kubernetes.io/instance-type` (e.g. "m5.xlarge")
+     */
+    instance_type?: string | null;
+    /**
+     * Memory capacity in MB
+     */
+    memory_mb: number;
+    /**
+     * Estimated on-demand monthly price in USD. `None` when the instance
+     * type is unknown or not in the price table.
+     */
+    monthly_usd?: number | null;
+    /**
+     * Node name
+     */
+    name: string;
+    /**
+     * Region from `topology.kubernetes.io/region`
+     */
+    region?: string | null;
 };
 
 export type NodeInfoResponse = {
@@ -10286,6 +10525,51 @@ export type OutlierParams = {
      */
     tolerance?: number;
 };
+
+/**
+ * Requests-vs-capacity-vs-usage assessment
+ */
+export type OverprovisioningAssessment = {
+    /**
+     * Ratio of requested CPU to measured CPU usage (e.g. 40.0 = requests
+     * reserve 40× what the workloads actually use). `None` without metrics.
+     */
+    cpu_request_inflation_ratio?: number | null;
+    /**
+     * Requested CPU as % of cluster capacity
+     */
+    cpu_requested_pct?: number | null;
+    /**
+     * Measured CPU usage as % of cluster capacity (`None` without metrics)
+     */
+    cpu_utilization_pct?: number | null;
+    /**
+     * Human-readable explanation of the verdict, e.g. "Cluster capacity is
+     * 8 vCPU but measured usage is 0.3 vCPU (3.7%) — severely overprovisioned"
+     */
+    explanation: string;
+    /**
+     * Ratio of requested memory to measured memory usage
+     */
+    memory_request_inflation_ratio?: number | null;
+    /**
+     * Requested memory as % of cluster capacity
+     */
+    memory_requested_pct?: number | null;
+    /**
+     * Measured memory usage as % of cluster capacity (`None` without metrics)
+     */
+    memory_utilization_pct?: number | null;
+    /**
+     * Overall verdict
+     */
+    verdict: OverprovisioningVerdict;
+};
+
+/**
+ * Overall overprovisioning verdict
+ */
+export type OverprovisioningVerdict = 'severe' | 'moderate' | 'reasonable' | 'unknown';
 
 /**
  * Time bucket data point for page activity graph
@@ -11273,7 +11557,7 @@ export type PostgresWalHealth = {
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
-export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+export type PresetConfigSchema = DockerfilePresetConfig | DockerComposePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
 
 /**
  * Detected preset information
@@ -12756,6 +13040,20 @@ export type ResourceCounts = {
 };
 
 /**
+ * A CPU + memory footprint (requests or measured usage)
+ */
+export type ResourceFootprint = {
+    /**
+     * CPU in millicores
+     */
+    cpu_millis: number;
+    /**
+     * Memory in MB
+     */
+    memory_mb: number;
+};
+
+/**
  * Resource attributes extracted from OTel resource descriptors.
  */
 export type ResourceInfo = {
@@ -13266,6 +13564,11 @@ export type SandboxEventsResponse = {
  * the SDK's zod validator rejects missing required fields.
  */
 export type SandboxInner = {
+    /**
+     * Agent run this sandbox executes (autofixer / workflow agent).
+     * `None` for sandboxes created via this API.
+     */
+    agent_run_id?: number | null;
     /**
      * Isolation backend: "docker" | "firecracker". `None` on legacy rows
      * created before the backend was recorded.
@@ -13866,6 +14169,18 @@ export type SendMessageRequest = {
      * side; oversized values are ignored rather than rejected.
      */
     page_context?: string | null;
+};
+
+export type SensitiveConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveMcpConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveValueResponse = {
+    value: string;
 };
 
 export type SentryChunkUploadResponse = {
@@ -14694,6 +15009,66 @@ export type SlackConfig = {
 };
 
 /**
+ * Response envelope for the slow-queries list endpoint.
+ */
+export type SlowQueriesResponse = {
+    /**
+     * Current page number (1-based).
+     */
+    page: number;
+    /**
+     * Number of rows per page used for this request.
+     */
+    page_size: number;
+    /**
+     * Ordered list of query stats, slowest first by mean_exec_time_ms.
+     */
+    queries: Array<SlowQueryRow>;
+    /**
+     * Total number of qualifying rows across all pages.
+     */
+    total_count: number;
+};
+
+/**
+ * A single entry from `pg_stat_statements`, representing one normalized
+ * query fingerprint and its aggregate execution stats.
+ */
+export type SlowQueryRow = {
+    /**
+     * Shared block cache hit ratio (0.0–1.0).
+     * `None` when total block accesses are zero (e.g. function-only queries).
+     */
+    cache_hit_ratio?: number | null;
+    /**
+     * Number of times this query was executed.
+     */
+    calls: number;
+    /**
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
+     */
+    database: string;
+    /**
+     * Average wall-clock time per execution, in milliseconds.
+     */
+    mean_exec_time_ms: number;
+    /**
+     * Normalized query text (parameter literals replaced with `$N`).
+     */
+    query: string;
+    /**
+     * Total number of rows returned or affected.
+     */
+    rows: number;
+    /**
+     * Total wall-clock time spent executing this query, in milliseconds.
+     */
+    total_exec_time_ms: number;
+};
+
+/**
  * Smart filter presets for common funnel patterns
  */
 export type SmartFilter = {
@@ -15054,10 +15429,20 @@ export type SpanKind = 'UNSPECIFIED' | 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODU
  * A single trace span ready for storage.
  */
 export type SpanRecord = {
+    /**
+     * Raw key/value pairs exactly as reported by the instrumenting library.
+     * Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+     * may be seconds, milliseconds, microseconds, or nanoseconds depending on
+     * the exporter's own convention, and the unit is not labeled here.
+     */
     attributes: {
         [key: string]: string;
     };
     deployment_id?: number | null;
+    /**
+     * Span duration in milliseconds. The only field on this struct guaranteed
+     * to be in milliseconds.
+     */
     duration_ms: number;
     end_time: string;
     events: Array<SpanEvent>;
@@ -15532,6 +15917,52 @@ export type TailLogsRequest = {
 };
 
 /**
+ * The temps/Hetzner target sizing and savings estimate
+ */
+export type TargetRecommendation = {
+    /**
+     * Whether the workloads fit a single recommended server. When `false`,
+     * the rationale explains the multi-node option (temps worker nodes).
+     */
+    fits_single_node: boolean;
+    /**
+     * Memory (GB) of the recommended server
+     */
+    memory_gb: number;
+    /**
+     * Estimated monthly price of the recommended server in EUR
+     */
+    monthly_eur: number;
+    /**
+     * Estimated monthly savings in USD (current cost minus target cost,
+     * treating EUR≈USD for the rough comparison — disclaimed in `notes`).
+     * `None` when the current cost is unknown.
+     */
+    monthly_savings_usd?: number | null;
+    /**
+     * Human-readable recommendation summary
+     */
+    rationale: string;
+    /**
+     * Recommended Hetzner server type (e.g. "cpx32")
+     */
+    server_type: string;
+    /**
+     * What the sizing was based on, e.g. "2× measured usage + temps
+     * platform overhead" or "resource requests (no metrics available)"
+     */
+    sizing_basis: string;
+    /**
+     * vCPUs of the recommended server
+     */
+    vcpus: number;
+    /**
+     * `monthly_savings_usd × 12`
+     */
+    yearly_savings_usd?: number | null;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
@@ -15580,6 +16011,11 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
+    /**
+     * URL to a wide screenshot/banner preview of the deployed template.
+     * Absent for templates that don't have one captured yet.
+     */
+    screenshot_url?: string | null;
     /**
      * Required external services
      */
@@ -15875,7 +16311,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -17029,6 +17471,8 @@ export type UpsertAgentRequest = {
     max_turns?: number | null;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline objects are write-only: normal reads
+     * mask them, and updates must omit this field to preserve existing values.
      */
     mcp_servers_config?: unknown;
     name?: string | null;
@@ -17041,7 +17485,8 @@ export type UpsertAgentRequest = {
     slug?: string | null;
     timeout_seconds?: number | null;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Custom-tool webhook URLs and headers are
+     * write-only; omit this field on update to preserve them.
      */
     tools_config?: unknown;
     /**
@@ -17199,6 +17644,11 @@ export type UsageQueryParams = {
      */
     user_id?: number | null;
 };
+
+/**
+ * How the "actual usage" numbers were obtained
+ */
+export type UsageSource = 'metrics-api' | 'requests-only' | 'unavailable';
 
 export type UsageSummary = {
     avg_latency_ms: number;
@@ -26625,6 +27075,50 @@ export type ExternalServiceMetricsStatusResponses = {
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
 
+export type RevealServiceParameterData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Sensitive parameter name
+         */
+        param_name: string;
+    };
+    query?: never;
+    url: '/external-services/{id}/parameters/{param_name}';
+};
+
+export type RevealServiceParameterErrors = {
+    /**
+     * Parameter is not sensitive
+     */
+    400: unknown;
+    /**
+     * Caller cannot access a project linked to this service
+     */
+    403: unknown;
+    /**
+     * Service or parameter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceParameterResponses = {
+    /**
+     * Sensitive parameter value
+     */
+    200: SensitiveValueResponse;
+};
+
+export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
+
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
     path: {
@@ -26860,7 +27354,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27273,6 +27767,118 @@ export type GetPostgresWalHealthResponses = {
 };
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
+
+export type ExternalServiceEnablePgStatStatementsData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned standalone Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/enable';
+};
+
+export type ExternalServiceEnablePgStatStatementsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not standalone Postgres (cluster or wrong type)
+     */
+    422: unknown;
+    /**
+     * Restart failed
+     */
+    500: unknown;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponses = {
+    /**
+     * Container restarted; pg_stat_statements now active
+     */
+    200: EnablePgStatStatementsResponse;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
+export type GetSlowQueriesData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: {
+        /**
+         * Page number (1-based). Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Number of rows per page (1–100). Defaults to 20.
+         */
+        page_size?: number | null;
+        /**
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: `asc` or `desc`. Defaults to `desc`.
+         */
+        sort_order?: string | null;
+    };
+    url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
+};
+
+export type GetSlowQueriesErrors = {
+    /**
+     * Invalid pagination or sort parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:read)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not a Postgres service
+     */
+    422: unknown;
+    /**
+     * pg_stat_statements extension not available (container restart required)
+     */
+    503: unknown;
+};
+
+export type GetSlowQueriesResponses = {
+    /**
+     * Paginated slow queries from pg_stat_statements
+     */
+    200: SlowQueriesResponse;
+};
+
+export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
 export type ListRootContainersData = {
     body?: never;
@@ -31517,6 +32123,10 @@ export type UpdateNotificationProviderData = {
 
 export type UpdateNotificationProviderErrors = {
     /**
+     * Invalid masked provider configuration
+     */
+    400: unknown;
+    /**
      * Provider not found
      */
     404: unknown;
@@ -31534,6 +32144,50 @@ export type UpdateNotificationProviderResponses = {
 };
 
 export type UpdateNotificationProviderResponse = UpdateNotificationProviderResponses[keyof UpdateNotificationProviderResponses];
+
+export type RevealNotificationProviderConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+        /**
+         * Sensitive field, such as password or headers.Authorization
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/notification-providers/{id}/config/{field}';
+};
+
+export type RevealNotificationProviderConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * Provider or field not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealNotificationProviderConfigResponses = {
+    /**
+     * Sensitive provider configuration value
+     */
+    200: SensitiveConfigValueResponse;
+};
+
+export type RevealNotificationProviderConfigResponse = RevealNotificationProviderConfigResponses[keyof RevealNotificationProviderConfigResponses];
 
 export type TestNotificationProviderData = {
     body?: never;
@@ -32763,6 +33417,10 @@ export type QueryTraceSummariesData = {
          * Sort direction: 'asc' or 'desc' (default)
          */
         sort_order?: string;
+        /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -37248,18 +37906,34 @@ export type GetResolvedEnvironmentVariableValueData = {
     };
     query?: {
         /**
-         * Optional environment ID (manual vars only)
+         * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact manual environment-variable row ID
+         */
+        var_id?: number;
+        /**
+         * Integration service ID shown by the resolved list
+         */
+        service_id?: number;
     };
     url: '/projects/{project_id}/env-vars/resolved/{key}/value';
 };
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
      * Project, key, or integration not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -37292,15 +37966,27 @@ export type GetEnvironmentVariableValueData = {
          * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact environment-variable row ID
+         */
+        var_id?: number;
     };
     url: '/projects/{project_id}/env-vars/{key}/value';
 };
 
 export type GetEnvironmentVariableValueErrors = {
     /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
      * Project or variable not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -38120,6 +38806,54 @@ export type GetContainerDetailResponses = {
 };
 
 export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
+export type GetContainerEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+        /**
+         * Environment variable name
+         */
+        variable_name: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}';
+};
+
+export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
+     * Container or environment variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerEnvironmentVariableResponses = {
+    /**
+     * Environment variable value
+     */
+    200: ContainerEnvironmentVariableValueResponse;
+};
+
+export type GetContainerEnvironmentVariableResponse = GetContainerEnvironmentVariableResponses[keyof GetContainerEnvironmentVariableResponses];
 
 export type GetContainerLogsByIdData = {
     body?: never;
@@ -40505,6 +41239,55 @@ export type UpdateMcpResponses = {
 
 export type UpdateMcpResponse = UpdateMcpResponses[keyof UpdateMcpResponses];
 
+export type RevealMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealMcpConfigResponse = RevealMcpConfigResponses[keyof RevealMcpConfigResponses];
+
 export type ListMonitorsData = {
     body?: never;
     path: {
@@ -42550,11 +43333,23 @@ export type GetProxyLogsData = {
          */
         visitor_id?: number | null;
         /**
-         * Start date for filtering (ISO 8601 format)
+         * Start date for filtering (ISO 8601 format).
+         *
+         * **Defaults to 1 hour before `end_date` (or before now) when omitted.**
+         * The listing is always time-bounded: an unbounded query would have to
+         * consider the entire retention window — 100M+ rows on a busy deployment —
+         * to return a single page. Pass an explicit `start_date` to widen the
+         * window, up to the configured retention horizon.
+         *
+         * The maximum span between `start_date` and `end_date` is 7 days when
+         * `project_id` is omitted, or 30 days when a single `project_id` is set —
+         * a project-scoped query is bounded by that project's own row count
+         * rather than the whole deployment's. A wider request is rejected with a
+         * 400 naming the applicable cap.
          */
         start_date?: string | null;
         /**
-         * End date for filtering (ISO 8601 format)
+         * End date for filtering (ISO 8601 format). Defaults to now.
          */
         end_date?: string | null;
         /**
@@ -43717,6 +44512,10 @@ export type GetRepositoryPresetLiveErrors = {
      */
     400: unknown;
     /**
+     * The git provider rejected the stored credential - the connection must be re-authorized
+     */
+    401: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -44696,6 +45495,51 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type RevealGlobalMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/settings/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealGlobalMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealGlobalMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
 export type RefreshRouteTableData = {
     body?: never;
@@ -45810,6 +46654,10 @@ export type DestroySandboxErrors = {
      * Not found
      */
     404: unknown;
+    /**
+     * Sandbox belongs to an active agent run — stop the run instead
+     */
+    409: unknown;
 };
 
 export type DestroySandboxResponses = {
@@ -46421,6 +47269,10 @@ export type StopSandboxErrors = {
      * Not found
      */
     404: unknown;
+    /**
+     * Sandbox belongs to an active agent run — stop the run instead
+     */
+    409: unknown;
 };
 
 export type StopSandboxResponses = {
@@ -47076,6 +47928,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -47104,6 +47960,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */

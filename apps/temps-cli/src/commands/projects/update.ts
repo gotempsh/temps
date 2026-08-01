@@ -11,7 +11,8 @@ import {
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, warning, error, keyValue } from '../../ui/output.js'
+import { fetchGitConnections, findRepositoryByName } from '../../lib/git-connection.js'
 
 export async function updateProjectAction(
   options: { project?: string; name?: string; json?: boolean; yes?: boolean }
@@ -203,6 +204,7 @@ export async function updateGitAction(
     branch?: string
     directory?: string
     preset?: string
+    connection?: string
     json?: boolean
     yes?: boolean
   }
@@ -307,8 +309,39 @@ export async function updateGitAction(
     preset = preset ?? project.preset ?? 'auto'
   }
 
+  // Resolve the git provider connection — same shape as `projects create`.
+  // Without this, repo_owner/repo_name alone give the project text fields
+  // pointing at a repo it has no actual clone access to; `deploy` then
+  // reports "no git provider connected" even though `projects git`
+  // reported success. --connection <id> makes this settable
+  // non-interactively; omitting it keeps the project's existing
+  // connection untouched (explicit opt-in, never silently cleared).
+  let connectionId: number | undefined
+  if (options.connection) {
+    const connId = parseInt(options.connection, 10)
+    if (isNaN(connId)) {
+      error(`Invalid connection ID: ${options.connection}`)
+      return
+    }
+    const connections = await fetchGitConnections()
+    const connection = connections.find((c) => c.id === connId)
+    if (!connection) {
+      error(`Git connection with ID ${options.connection} not found.`)
+      return
+    }
+    if (repoOwner && repoName) {
+      const repo = await findRepositoryByName(connection.id, repoOwner, repoName)
+      if (!repo) {
+        error(`Repository "${repoOwner}/${repoName}" not found in connection "${connection.account_name}".`)
+        return
+      }
+    }
+    info(`Using git connection: ${connection.account_name}`)
+    connectionId = connection.id
+  }
+
   const updated = await withSpinner('Updating git settings...', async () => {
-    const { data, error } = await updateGitSettings({
+    const { data, error: apiError } = await updateGitSettings({
       client,
       path: { project_id: project.id },
       body: {
@@ -317,10 +350,11 @@ export async function updateGitAction(
         main_branch: mainBranch!,
         directory: directory || '',
         preset: preset || null,
+        ...(connectionId !== undefined ? { git_provider_connection_id: connectionId } : {}),
       },
     })
-    if (error) {
-      throw new Error(getErrorMessage(error))
+    if (apiError) {
+      throw new Error(getErrorMessage(apiError))
     }
     return data
   })

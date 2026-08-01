@@ -12,6 +12,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  workflow-contracts:
+    name: Release Workflow Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Verify nightly release wiring
+        run: .github/scripts/test-nightly-release-workflows.sh
+
   compose-security:
     name: Compose Security
     runs-on: ubuntu-latest
@@ -20,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # The toolchain stage (apk deps, bun, wasm-pack/wasm-bindgen-cli compiled
       # from source) only changes when the Dockerfile does, so cache it as
@@ -29,7 +39,7 @@ jobs:
       # would, but with a cargo target dir that persists across runs — the
       # one thing an in-Docker build can never have.
       - name: Build toolchain image (GHA layer cache)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: toolchain
@@ -75,7 +85,7 @@ jobs:
       # Assemble the production runtime stage around the prebuilt binary —
       # the builder stage is skipped entirely, so this takes ~1 minute.
       - name: Build temps image from prebuilt binary
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -349,6 +359,29 @@ jobs:
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
               package(temps-otel)) and kind(=lib)
+          - group: unit-integration
+            # The kind(=test) counterpart to the two groups above: crates
+            # whose tests/*.rs files need neither Docker nor a database, and
+            # which therefore no CI job has ever run (the groups above are
+            # all kind(=lib)).
+            #
+            # This list is deliberately short. Every candidate was run
+            # locally first, and two were dropped because they FAIL today —
+            # they are not in scope here and each needs its own fix:
+            #   temps-dns-resolver  both end_to_end tests time out
+            #                       ("first sync converged: Elapsed(())")
+            #   temps-agents        sandbox_credential_smoke_test builds a
+            #                       Docker image; `cargo build --release
+            #                       --bin temps-pty-agent` exits 101
+            # Also excluded, needing infrastructure CI does not have:
+            # temps-network (it_kernel/it_allocator — covered by
+            # network-kernel-tests.yml), temps-agents::firecracker_e2e (KVM),
+            # temps-auth::oidc_discovery_live and temps-git::gitea_e2e (live
+            # network / a Gitea server).
+            filter: >-
+              (package(temps-ai-gateway) or package(temps-git-credential) or
+              package(temps-memory) or package(temps-pty-agent))
+              and kind(=test)
 
     steps:
       - name: Free up disk space
@@ -511,6 +544,49 @@ jobs:
             archive: default
             filter: package(temps-migrations)
             test_threads: "1"
+          # ---------------------------------------------------------------
+          # temps-otel integration tests. Previously NO CI job ran these: the
+          # unit-tests groups are pinned to kind(=lib), which excludes
+          # tests/*.rs entirely. An audit of the whole workspace found 37 of
+          # 47 integration-test binaries, across 18 crates, in that state.
+          # These two groups close the temps-otel share of it.
+          #
+          # Split by what each binary needs, not by size:
+          #
+          #   otel        — TestDatabase-backed. These MUST keep the shared
+          #                 TimescaleDB (i.e. must NOT be added to the
+          #                 TEMPS_TEST_DATABASE_URL exclusion below). Without
+          #                 it, TestDatabase falls back to a process-local
+          #                 OnceCell container, and because nextest runs every
+          #                 test in its own process that means cold-booting a
+          #                 fresh container PER TEST — the exact pathology the
+          #                 unit-tests job documents. Measured: 41 tests take
+          #                 195s against the shared DB and roughly 90 MINUTES
+          #                 without it. --test-threads=1 for the same
+          #                 shared-DB deadlock reason as docker-deployments.
+          #
+          #   otel-clickhouse — provisions its own ClickHouse per test via
+          #                 testcontainers and uses a MockDatabase for the
+          #                 inner store, so the shared DB is irrelevant here
+          #                 and the container cost is unavoidable (~60s/test,
+          #                 23 tests). Isolated containers mean no shared
+          #                 state, so --test-threads=2 is safe.
+          - group: otel
+            archive: default
+            filter: >-
+              package(temps-otel) and kind(=test) and
+              (binary(timescaledb_storage_test) or binary(e2e_http_test) or
+               binary(dynamic_alert_integration_test) or
+               binary(decode_to_store_test))
+            test_threads: "1"
+          - group: otel-clickhouse
+            archive: default
+            filter: >-
+              package(temps-otel) and kind(=test) and
+              (binary(clickhouse_storage_test) or
+               binary(clickhouse_query_spans_test) or
+               binary(clickhouse_trace_summaries_test))
+            test_threads: "2"
 
     steps:
       - name: Free up disk space

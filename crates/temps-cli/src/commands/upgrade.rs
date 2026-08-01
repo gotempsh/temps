@@ -28,23 +28,39 @@ pub enum UpgradeTier {
 /// available GitHub releases through this channel before selecting the
 /// newest, so a host on `Stable` never auto-upgrades onto a beta tag.
 /// Pre-release tags carry a `-` (`v1.2.0-beta.4`, `v1.2.0-rc.1`); stable
-/// tags don't (`v1.2.0`).
+/// tags don't (`v1.2.0`). Nightly tags are a distinct kind of prerelease,
+/// identified by a `-nightly.` segment (`v1.2.0-nightly.20260727.abc1234`),
+/// minted automatically by CI — see `is_nightly_tag`.
 ///
 /// Channel selection is **CLI-only** — there is no env-var fallback. The
 /// default is `Stable` and the user must explicitly pass `--channel beta`
-/// to opt into prereleases. This is by design: an env var on a long-lived
-/// shell or CI runner could silently switch a host onto beta without an
-/// audit trail, which we want to prevent. Pinning a specific `--version`
-/// ignores the channel entirely.
+/// or `--channel nightly` to opt into prereleases. This is by design: an
+/// env var on a long-lived shell or CI runner could silently switch a host
+/// onto beta/nightly without an audit trail, which we want to prevent.
+/// Pinning a specific `--version` ignores the channel entirely.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum UpgradeChannel {
     /// Track stable releases only (default). Tag must NOT contain `-`.
     Stable,
-    /// Track beta releases. Includes any prerelease tag (anything with `-`).
+    /// Track beta releases: any prerelease tag EXCEPT nightly builds.
     /// `Beta` selects the newest of stable + beta, so a beta host receives
     /// stable releases too — they're considered an upgrade from the latest
-    /// beta on the same line.
+    /// beta on the same line. Nightly builds are excluded so an operator who
+    /// opts into a deliberate `-beta.N` cut never silently lands on an
+    /// automated nightly instead.
     Beta,
+    /// Track nightly builds only: tags containing `-nightly.`, cut
+    /// automatically once a day from `main` when it has new commits. The
+    /// least stable channel — intended for testing unreleased work, not
+    /// production hosts.
+    Nightly,
+}
+
+/// Is this tag a nightly build (minted by the `Nightly Release` CI workflow)?
+/// Nightly tags look like `v0.1.0-nightly.20260727.abc1234` — the
+/// `-nightly.` marker distinguishes them from a deliberate `-beta.N` cut.
+fn is_nightly_tag(tag: &str) -> bool {
+    tag.contains("-nightly.")
 }
 
 impl UpgradeChannel {
@@ -52,31 +68,37 @@ impl UpgradeChannel {
         match self {
             Self::Stable => "stable",
             Self::Beta => "beta",
+            Self::Nightly => "nightly",
         }
     }
 
     /// Does this release belong to this channel?
     /// - Stable: only non-prerelease tags. `v1.2.0` matches; `v1.2.0-beta.4` does not.
-    /// - Beta: any non-draft tag. Both stable AND beta releases qualify, so
-    ///   a beta host always sees the freshest available version regardless of
-    ///   whether it was promoted to stable or not.
+    /// - Beta: any non-draft prerelease-or-stable tag EXCEPT nightly builds.
+    /// - Nightly: only tags with a `-nightly.` marker.
     fn includes(self, release: &GitHubRelease) -> bool {
         if release.draft {
             return false;
         }
+        let nightly = is_nightly_tag(&release.tag_name);
         match self {
             Self::Stable => !release.prerelease,
-            Self::Beta => true,
+            Self::Beta => !nightly,
+            Self::Nightly => nightly,
         }
     }
 
     /// Infer the channel an *installed* binary is on from its version tag.
-    /// A prerelease tag (`v1.2.0-beta.4` — anything with a `-` after the
-    /// core version) means the host opted into beta at install/upgrade
-    /// time; a plain tag (`v1.2.0`) means stable. Used by the startup
-    /// update notifier, which has no `--channel` flag to consult.
+    /// A `-nightly.` tag means the host opted into nightly; any other
+    /// prerelease tag (`v1.2.0-beta.4` — anything with a `-` after the core
+    /// version) means the host opted into beta at install/upgrade time; a
+    /// plain tag (`v1.2.0`) means stable. Used by the startup update
+    /// notifier, which has no `--channel` flag to consult.
     pub fn for_installed_version(tag: &str) -> Self {
-        if tag.trim().trim_start_matches('v').contains('-') {
+        let core = tag.trim().trim_start_matches('v');
+        if is_nightly_tag(tag) {
+            Self::Nightly
+        } else if core.contains('-') {
             Self::Beta
         } else {
             Self::Stable
@@ -88,7 +110,9 @@ impl UpgradeChannel {
 #[derive(Args)]
 pub struct UpgradeCommand {
     /// Release channel to track. Default: `stable`. Pass `--channel beta`
-    /// to opt into prereleases. Pinning a `--version` ignores the channel.
+    /// to opt into prereleases, or `--channel nightly` to track automated
+    /// nightly builds cut from `main`. Pinning a `--version` ignores the
+    /// channel.
     #[arg(long, value_enum)]
     pub channel: Option<UpgradeChannel>,
 
@@ -880,6 +904,11 @@ pub async fn fetch_latest_release_in_channel(
             "No stable releases found. Try `--channel beta` to include prereleases."
         ),
         UpgradeChannel::Beta => anyhow::anyhow!("No releases found."),
+        UpgradeChannel::Nightly => anyhow::anyhow!(
+            "No nightly releases found. The nightly build only cuts a new tag when \
+             `main` has commits since the last one — check the 'Nightly Release' \
+             workflow run history, or try `--channel beta`."
+        ),
     })
 }
 
@@ -1584,6 +1613,14 @@ mod tests {
     }
 
     #[test]
+    fn test_installed_channel_nightly_for_nightly_tag() {
+        assert_eq!(
+            UpgradeChannel::for_installed_version("v1.2.0-nightly.20260727.abc1234"),
+            UpgradeChannel::Nightly
+        );
+    }
+
+    #[test]
     fn test_is_newer_version_core_ordering() {
         assert!(is_newer_version("v0.2.0", "v0.1.9"));
         assert!(is_newer_version("v1.0.0", "v0.9.9"));
@@ -1688,6 +1725,29 @@ mod tests {
         assert!(UpgradeChannel::Beta.includes(&stable));
         assert!(UpgradeChannel::Beta.includes(&beta));
         assert!(!UpgradeChannel::Beta.includes(&draft));
+    }
+
+    #[test]
+    fn channel_beta_excludes_nightly_builds() {
+        // Beta must never silently resolve to an automated nightly — an
+        // operator who deliberately opts into beta expects a `-beta.N` cut,
+        // not whatever CI cut overnight. Nightly is a separate, opt-in
+        // channel.
+        let nightly = release("v1.3.0-nightly.20260727.abc1234", true, false);
+        assert!(!UpgradeChannel::Beta.includes(&nightly));
+    }
+
+    #[test]
+    fn channel_nightly_includes_only_nightly_tags() {
+        let stable = release("v1.2.0", false, false);
+        let beta = release("v1.3.0-beta.1", true, false);
+        let nightly = release("v1.3.0-nightly.20260727.abc1234", true, false);
+        let draft_nightly = release("v1.4.0-nightly.20260728.def5678", true, true);
+
+        assert!(!UpgradeChannel::Nightly.includes(&stable));
+        assert!(!UpgradeChannel::Nightly.includes(&beta));
+        assert!(UpgradeChannel::Nightly.includes(&nightly));
+        assert!(!UpgradeChannel::Nightly.includes(&draft_nightly));
     }
 
     #[test]

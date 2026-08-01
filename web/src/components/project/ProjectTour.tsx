@@ -5,6 +5,7 @@ import {
   type CSSProperties,
   useCallback,
   useEffect,
+  useRef,
   useState,
   useSyncExternalStore,
 } from 'react'
@@ -139,8 +140,23 @@ export function ProjectTour() {
   }, [start])
 
   // Navigate to each step's page as the tour advances, so the user sees it.
+  //
+  // Keyed on the step itself, not on every run of the effect: `navigate` gets a
+  // new identity whenever the location changes, so re-running turned any step
+  // whose route redirects into an infinite loop. Metrics is one — `…/metrics`
+  // immediately redirects to `…/metrics/explore`, which changed the location,
+  // which re-ran this effect, which pushed `…/metrics` again (hundreds of
+  // history entries, a flickering URL bar and a destroyed Back button).
+  const navigatedFor = useRef<string | null>(null)
   useEffect(() => {
-    if (active && slug) navigate(`/projects/${slug}/${STEPS[idx].route}`)
+    if (!active || !slug) {
+      navigatedFor.current = null
+      return
+    }
+    const target = `/projects/${slug}/${STEPS[idx].route}`
+    if (navigatedFor.current === target) return
+    navigatedFor.current = target
+    navigate(target)
   }, [active, idx, slug, navigate])
 
   // Measure the anchor sidebar item to place the card + ring (deferred a frame,

@@ -797,3 +797,70 @@ async fn test_e2e_pipeline_stats() {
         "metrics_received should be > 0 after ingesting"
     );
 }
+
+/// `include_total` is the opt-out that lets a caller skip the trace-summaries
+/// count query entirely. Its contract has two halves and both matter:
+///
+///   * default (absent) → `total` is computed and present
+///   * `include_total=false` → `total` is **omitted**, not zeroed
+///
+/// The second half is the one worth a test. `total` is `Option<u64>` with
+/// `skip_serializing_if`, and the whole point is that a client reading
+/// `total ?? 0` must not silently render "0 traces" over a full page. Because
+/// `None` is only ever produced by the branch that skips `count_traces`, an
+/// omitted key is also proof that the second query was not issued.
+#[tokio::test]
+async fn test_e2e_trace_summaries_include_total_contract() {
+    let Some((_test_db, router, project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // Default: the count is computed, so `total` is present and numeric.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/otel/trace-summaries?project_id={project_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(body["data"].is_array(), "data should be an array");
+    assert!(
+        body.get("total").and_then(|t| t.as_u64()).is_some(),
+        "total must be present by default, got: {body}"
+    );
+
+    // Opted out: `total` must be ABSENT from the payload — not 0, not null.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/otel/trace-summaries?project_id={project_id}&include_total=false"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(
+        body["data"].is_array(),
+        "data must still be returned when the count is skipped, got: {body}"
+    );
+    assert!(
+        body.get("total").is_none(),
+        "include_total=false must omit `total` entirely (a 0 would be read as \
+         'no traces' by a client doing `total ?? 0`), got: {body}"
+    );
+}

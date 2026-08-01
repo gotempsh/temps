@@ -1513,6 +1513,24 @@ impl CachedPeerTable {
         debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
             projects_cache.len(), environments_cache.len(), deployments_cache.len());
 
+        // The console hostname is owned by the control plane, never by a
+        // project. A route pointing it at a deployment locks the operator out
+        // of the console entirely (issue #478) — the create/update API now
+        // refuses such domains, but installs that already stored one would
+        // otherwise stay bricked until the row is deleted over the public IP.
+        // Dropping it here makes the next reload self-heal.
+        if let Some(console_host) = app_settings.console_hostname() {
+            let removed = routes.remove(&console_host).is_some()
+                | http_routes_map.remove(&console_host).is_some()
+                | tls_routes_map.remove(&console_host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for reserved console hostname '{}' — the Temps console keeps it (issue #478)",
+                    console_host
+                );
+            }
+        }
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();

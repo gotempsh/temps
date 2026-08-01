@@ -62,7 +62,9 @@ export const weeklyDigestSchema = z.object({
  * Schema for notification provider configuration
  * Supports Slack, Email, and Webhook providers with comprehensive settings
  */
-export const providerSchema = z
+const MASKED_VALUE = '***'
+
+const buildProviderSchema = (allowMaskedValues: boolean) => z
   .object({
     name: z.string().min(1, 'Name is required'),
     provider_type: z.enum(['email', 'slack', 'webhook', 'cloudflare']),
@@ -105,6 +107,9 @@ export const providerSchema = z
         if (!url || url === '') {
           return false
         }
+        if (allowMaskedValues && url === MASKED_VALUE) {
+          return true
+        }
         // Check if it's a valid URL
         try {
           new URL(url)
@@ -142,6 +147,9 @@ export const providerSchema = z
         const { url } = data.config
         if (!url || url === '') {
           return false
+        }
+        if (allowMaskedValues && url === MASKED_VALUE) {
+          return true
         }
         // Check if it's a valid URL
         try {
@@ -188,6 +196,9 @@ export const providerSchema = z
       path: ['config'],
     }
   )
+
+export const providerSchema = buildProviderSchema(false)
+export const providerUpdateSchema = buildProviderSchema(true)
 
 export type ProjectAlertsFormData = z.infer<typeof projectAlertsSchema>
 export type DomainAlertsFormData = z.infer<typeof domainAlertsSchema>

@@ -425,7 +425,15 @@ impl AgentExecutor {
                 Some(global_sandbox.custom_image.clone())
             }
         } else {
-            Some(format!("temps-sandbox-{}:latest", global_sandbox.runtime))
+            // MUST match what the sandbox-status endpoint validates. This used
+            // to hardcode `temps-sandbox-<runtime>:latest`, an unqualified name
+            // Docker resolves against Docker Hub — where it does not exist — so
+            // status reported "image ready" for the real GHCR image while every
+            // run died on `404 pull access denied`. The log line below already
+            // used this helper, so it also printed an image the run never used.
+            Some(crate::sandbox::docker::image_name_for_runtime(
+                &global_sandbox.runtime,
+            ))
         };
 
         // Inject auth credentials into sandbox based on auth_type and provider.
@@ -562,8 +570,18 @@ impl AgentExecutor {
             tracing::warn!("Run {}: failed to persist workspace_volume: {}", run_id, e);
         }
 
+        // Attribute the sandbox to the user who triggered the run (if any)
+        // so it shows under their sandboxes in the standalone sandbox API.
+        let owner_user_id = self
+            .run_service
+            .get_run(run_id)
+            .await
+            .ok()
+            .and_then(|r| r.triggered_by_user_id);
+
         let sandbox_config = SandboxCreateConfig {
             run_id,
+            owner_user_id,
             container_name_override: None,
             host_work_dir: host_work_dir.clone(),
             workspace_volume: Some(workspace_volume),
@@ -4058,6 +4076,7 @@ mod tests {
             prompt_text: None,
             workspace_volume: None,
             run_config: None,
+            triggered_by_user_id: None,
         }
     }
 
@@ -4225,6 +4244,7 @@ mod tests {
     ) -> Arc<crate::services::definition_service::DefinitionService> {
         Arc::new(crate::services::definition_service::DefinitionService::new(
             db,
+            make_encryption_service(),
         ))
     }
 

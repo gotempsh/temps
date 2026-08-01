@@ -53,7 +53,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 testcontainers = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-axum-test = "16.3"
+axum-test = "18.7"
 webpki-roots = "1.0"
 bollard = { workspace = true }
 futures-util = { workspace = true }

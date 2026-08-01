@@ -158,6 +158,76 @@ mod route_table_tests {
         Ok(())
     }
 
+    /// Issue #478: a project custom domain that matches the console hostname
+    /// (`external_url`) must never win the route, otherwise the operator is
+    /// locked out of the console and can only recover over the public IP.
+    /// Installs that stored such a row before the API-level guard existed
+    /// self-heal on the next route reload.
+    #[tokio::test]
+    async fn test_route_table_skips_console_hostname() -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelBehavior, EntityTrait};
+        use temps_core::AppSettings;
+        use temps_entities::settings;
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        // Configure the console to live on console.example.com
+        let app_settings = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await?;
+
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
+        test_db
+            .create_deployment_container(deployment.id, 9010, None)
+            .await?;
+
+        // A pre-existing row claiming the console hostname, plus a normal one
+        for domain in ["console.example.com", "app.example.com"] {
+            project_custom_domains::ActiveModel {
+                domain: Set(domain.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                status: Set("active".to_string()),
+                redirect_to: Set(None),
+                status_code: Set(None),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.get_route("console.example.com").is_none(),
+            "console hostname must not be routed to a project (issue #478)"
+        );
+        assert!(
+            route_table.get_route("app.example.com").is_some(),
+            "ordinary custom domains must still route"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_route_table_with_redirect() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;

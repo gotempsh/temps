@@ -22,7 +22,15 @@ pub struct Model {
 
     /// Owner of the sandbox. All sandbox operations require the
     /// authenticated user to match this column (or have admin override).
-    pub user_id: i32,
+    /// `None` for agent-run sandboxes with no attributable user (e.g. a
+    /// workflow run triggered by a git webhook).
+    pub user_id: Option<i32>,
+
+    /// When set, this sandbox executes the linked `agent_runs` row
+    /// (autofixer / workflow agent). Its lifecycle is owned by the agent
+    /// run — the expiration sweeper skips these rows. NULL for standalone
+    /// API sandboxes.
+    pub agent_run_id: Option<i32>,
 
     /// Container name used by the sandbox provider.
     pub name: String,

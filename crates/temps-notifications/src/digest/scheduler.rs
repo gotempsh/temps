@@ -221,10 +221,10 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
 
     /// Helper to create a DigestScheduler with real DB-backed services.
-    async fn create_test_scheduler() -> (DigestScheduler, TestDatabase) {
+    async fn create_test_scheduler() -> Result<(DigestScheduler, TestDatabase), String> {
         let test_db = TestDatabase::with_migrations()
             .await
-            .expect("Failed to create test database");
+            .map_err(|error| format!("Failed to create test database: {error}"))?;
 
         let encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let encryption_service = Arc::new(
@@ -245,7 +245,22 @@ mod tests {
         ));
 
         let scheduler = DigestScheduler::new(digest_service, preferences_service);
-        (scheduler, test_db)
+        Ok((scheduler, test_db))
+    }
+
+    macro_rules! create_test_scheduler_or_skip {
+        () => {
+            match create_test_scheduler().await {
+                Ok(setup) => setup,
+                Err(error) => {
+                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                        eprintln!("Skipping Docker-dependent digest scheduler test: {error}");
+                        return;
+                    }
+                    panic!("Failed to set up digest scheduler test database: {error}");
+                }
+            }
+        };
     }
 
     #[test]
@@ -282,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_new_does_not_start_task() {
-        let (scheduler, _db) = create_test_scheduler().await;
+        let (scheduler, _db) = create_test_scheduler_or_skip!();
 
         // new() should NOT have a running task
         assert!(scheduler.task_handle.is_none());
@@ -290,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_start_creates_task() {
-        let (mut scheduler, _db) = create_test_scheduler().await;
+        let (mut scheduler, _db) = create_test_scheduler_or_skip!();
 
         scheduler.start();
         assert!(scheduler.task_handle.is_some());
@@ -301,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown_clears_task() {
-        let (mut scheduler, _db) = create_test_scheduler().await;
+        let (mut scheduler, _db) = create_test_scheduler_or_skip!();
 
         scheduler.start();
         assert!(scheduler.task_handle.is_some());
@@ -312,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_double_start_is_noop() {
-        let (mut scheduler, _db) = create_test_scheduler().await;
+        let (mut scheduler, _db) = create_test_scheduler_or_skip!();
 
         scheduler.start();
         let handle_ptr = scheduler
@@ -336,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown_without_start_is_safe() {
-        let (mut scheduler, _db) = create_test_scheduler().await;
+        let (mut scheduler, _db) = create_test_scheduler_or_skip!();
 
         // shutdown on an unstarted scheduler should not panic
         scheduler.shutdown();
@@ -345,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_drop_aborts_task() {
-        let (mut scheduler, _db) = create_test_scheduler().await;
+        let (mut scheduler, _db) = create_test_scheduler_or_skip!();
 
         scheduler.start();
         let handle = scheduler.task_handle.as_ref().unwrap().abort_handle();

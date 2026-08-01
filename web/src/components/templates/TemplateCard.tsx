@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { TemplateResponse } from '@/api/client/types.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -9,6 +10,42 @@ interface TemplateCardProps {
   template: TemplateResponse
   onClick?: (template: TemplateResponse) => void
   selected?: boolean
+  /**
+   * Drop the screenshot banner. Set for the full-width list view, where a
+   * 16:9 banner would be several hundred pixels tall per row.
+   */
+  compact?: boolean
+}
+
+interface TemplateScreenshotProps {
+  src: string
+  alt: string
+}
+
+/**
+ * Wide screenshot banner shown above the card header. Screenshots are captured
+ * from real running instances (tall, full-page), so the banner crops to the top
+ * of the image to keep the hero/first section visible.
+ *
+ * Renders nothing at all if the image fails to load — most templates have no
+ * screenshot yet, and a broken-image icon would look worse than no banner.
+ */
+function TemplateScreenshot({ src, alt }: TemplateScreenshotProps) {
+  const [failed, setFailed] = useState(false)
+
+  if (failed) return null
+
+  return (
+    <div className="aspect-video w-full overflow-hidden border-b bg-muted">
+      <img
+        src={src}
+        alt={`${alt} preview`}
+        loading="lazy"
+        className="h-full w-full object-cover object-top"
+        onError={() => setFailed(true)}
+      />
+    </div>
+  )
 }
 
 /** Map service names to display-friendly labels */
@@ -33,15 +70,23 @@ function getServiceLabel(service: string): string {
   return labels[service.toLowerCase()] || service
 }
 
-export function TemplateCard({ template, onClick, selected }: TemplateCardProps) {
+export function TemplateCard({
+  template,
+  onClick,
+  selected,
+  compact,
+}: TemplateCardProps) {
   return (
     <Card
       className={cn(
-        'cursor-pointer transition-all hover:border-primary/50 hover:shadow-md',
+        'cursor-pointer overflow-hidden transition-all hover:border-primary/50 hover:shadow-md',
         selected && 'border-primary ring-2 ring-primary/20'
       )}
       onClick={() => onClick?.(template)}
     >
+      {!compact && template.screenshot_url && (
+        <TemplateScreenshot src={template.screenshot_url} alt={template.name} />
+      )}
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-3">

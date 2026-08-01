@@ -162,6 +162,8 @@ mod m20260722_000001_create_source_files;
 mod m20260722_000002_add_source_context_enabled_to_projects;
 mod m20260723_000001_add_error_source_root_to_projects;
 mod m20260724_000001_add_run_config_to_agent_runs;
+mod m20260725_000001_sandboxes_agent_run_link;
+mod m20260728_000001_add_environment_id_to_metric_alert_rules;
 
 pub struct Migrator;
 
@@ -329,6 +331,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260722_000002_add_source_context_enabled_to_projects::Migration),
             Box::new(m20260723_000001_add_error_source_root_to_projects::Migration),
             Box::new(m20260724_000001_add_run_config_to_agent_runs::Migration),
+            Box::new(m20260725_000001_sandboxes_agent_run_link::Migration),
+            Box::new(
+                m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
+            ),
         ]
     }
 }

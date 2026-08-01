@@ -3309,6 +3309,37 @@ mod ai_tool_allowlist_tests {
              resolvable via the read-only AI tool allowlist"
         );
     }
+
+    /// `describe_api` only ever surfaces an operation's `summary`/`description`
+    /// to the model — never response-body field docs — so a span's
+    /// `duration_ms` vs. unlabeled `attributes` units can only be explained via
+    /// the operation description itself. This proves the unit-guidance text
+    /// added to the trace/GenAI-trace handler doc comments actually survives
+    /// into the real compiled `OtelApiDoc` and would reach the model through
+    /// `describe_api`, rather than just existing as a comment nobody reads.
+    #[test]
+    fn trace_tool_descriptions_warn_about_unlabeled_attribute_units() {
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let index = ReadOnlyApiIndex::from_openapi(&openapi, &[]);
+
+        for operation_id in [
+            "get_trace",
+            "query_traces",
+            "query_genai_traces",
+            "get_genai_trace",
+        ] {
+            let op = index
+                .get(operation_id)
+                .unwrap_or_else(|| panic!("{operation_id} missing from OtelApiDoc"));
+            let description = op.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("duration_ms") && description.contains("milliseconds"),
+                "{operation_id}'s OpenAPI description must warn the model that only \
+                 `duration_ms` is guaranteed to be milliseconds and other numeric \
+                 fields carry unlabeled/different units — got: {description:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

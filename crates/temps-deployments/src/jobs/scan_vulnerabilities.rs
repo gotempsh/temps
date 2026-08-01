@@ -198,7 +198,7 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
                 Some(self.environment_id),
                 Some(self.deployment_id),
                 Some(self.branch.clone()),
-                Some(self.commit_hash.clone()),
+                (!self.commit_hash.is_empty()).then(|| self.commit_hash.clone()),
             )
             .await
         {

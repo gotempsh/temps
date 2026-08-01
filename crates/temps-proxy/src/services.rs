@@ -205,6 +205,10 @@ impl UpstreamResolver for UpstreamResolverImpl {
     async fn get_lb_strategy(&self, _host: &str) -> Option<String> {
         Some("round_robin".to_string())
     }
+
+    fn console_address(&self) -> &str {
+        &self.server_config.console_address
+    }
 }
 
 /// Implementation of ProjectContextResolver trait

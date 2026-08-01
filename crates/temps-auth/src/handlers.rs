@@ -6,6 +6,7 @@ use crate::audit::{
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
+use crate::permissions::Permission;
 use crate::user_service::UserServiceError;
 use crate::{permission_guard, RequireAuth};
 use axum::extract::Path;
@@ -1107,9 +1108,10 @@ async fn list_users(
 /// Reason a role-assignment request was denied by [`authorize_role_assignment`].
 #[derive(Debug, PartialEq, Eq)]
 enum RoleChangeDenied {
-    /// Caller is not an admin. `UsersWrite` alone (held by non-admin roles such
-    /// as `PlatformAdmin`) must not be sufficient to grant roles.
-    NotAdmin,
+    /// The presented credential lacks the `users:manage` permission. `UsersWrite`
+    /// alone (held by non-admin roles such as `PlatformAdmin`) is not sufficient
+    /// to grant roles.
+    MissingPermission,
     /// The path `user_id` and the body `user_id` disagree, leaving the target
     /// ambiguous. Historically the self-modification guard checked the path id
     /// while the mutation acted on the body id, so a mismatched pair bypassed it.
@@ -1118,26 +1120,29 @@ enum RoleChangeDenied {
     SelfModification,
 }
 
-/// Reason an admin-only mutation of another user was denied.
+/// Reason a `users:manage`-gated mutation of another user was denied.
 #[derive(Debug, PartialEq, Eq)]
 enum AdminTargetDenied {
-    /// The presented credential is not currently acting as an admin.
-    NotAdmin,
+    /// The presented credential lacks the `users:manage` permission.
+    MissingPermission,
     /// The credential owner attempted to mutate their own account or roles.
     SelfModification,
 }
 
-/// Authorize an admin-only mutation against another user.
+/// Authorize a `users:manage`-gated mutation against another user.
 ///
-/// This deliberately checks the presented credential's effective role. Looking
-/// up the owning user's database roles would let an admin-owned, restricted API
-/// key escape its `PlatformAdmin` or custom permission ceiling.
+/// The check is permission-based, not role-based: the capability can be carried
+/// either by a role that includes `users:manage` (only `Admin`) or by an API key
+/// explicitly granted it. It reads the presented credential's *effective*
+/// permissions, so an admin-owned key restricted below `users:manage` (e.g. a
+/// `PlatformAdmin`-scoped or custom `UsersWrite` key) is correctly rejected
+/// without consulting the owner's database roles.
 fn authorize_admin_target(
     auth: &AuthContext,
     target_user_id: i32,
 ) -> Result<(), AdminTargetDenied> {
-    if !auth.is_admin() {
-        return Err(AdminTargetDenied::NotAdmin);
+    if !auth.has_permission(&Permission::UsersManage) {
+        return Err(AdminTargetDenied::MissingPermission);
     }
     if target_user_id == auth.user_id() {
         return Err(AdminTargetDenied::SelfModification);
@@ -1150,15 +1155,15 @@ fn authorize_admin_target(
 /// This is the security precondition for the `assign_role` endpoint, factored
 /// out so every bypass path can be unit-tested without a full HTTP harness. It
 /// mirrors the guards on the sibling `remove_role`/`delete_user` handlers
-/// (admin-only, no self-modification) and additionally requires the path and
-/// body target ids to agree so there is exactly one, unambiguous target.
+/// (`users:manage` required, no self-modification) and additionally requires the
+/// path and body target ids to agree so there is exactly one, unambiguous target.
 fn authorize_role_assignment(
     auth: &AuthContext,
     path_user_id: i32,
     body_user_id: i32,
 ) -> Result<i32, RoleChangeDenied> {
-    if !auth.is_admin() {
-        return Err(RoleChangeDenied::NotAdmin);
+    if !auth.has_permission(&Permission::UsersManage) {
+        return Err(RoleChangeDenied::MissingPermission);
     }
     if path_user_id != body_user_id {
         return Err(RoleChangeDenied::TargetMismatch);
@@ -1198,17 +1203,15 @@ async fn assign_role(
     Path(user_id): Path<i32>,
     Json(assign_req): Json<AssignRoleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Assigning role {} to user {}",
         assign_req.role_type, assign_req.user_id
     );
 
-    // Authorize and resolve the single target: role mutation requires the admin
-    // role (UsersWrite alone is not enough, matching remove_role/delete_user),
-    // the path and body target ids must agree, and callers may not change their
-    // own roles.
+    // Authorize and resolve the single target: role mutation requires the
+    // `users:manage` permission (UsersWrite alone is not enough, matching
+    // remove_role/delete_user), the path and body target ids must agree, and
+    // callers may not change their own roles.
     let target_user_id =
         authorize_role_assignment(&auth, user_id, assign_req.user_id).map_err(|denied| {
             error!(
@@ -1220,7 +1223,7 @@ async fn assign_role(
                 RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
                     .detail("Path user_id and body user_id must match".to_string())
                     .build(),
-                RoleChangeDenied::NotAdmin | RoleChangeDenied::SelfModification => {
+                RoleChangeDenied::MissingPermission | RoleChangeDenied::SelfModification => {
                     temps_core::error_builder::forbidden().build()
                 }
             }
@@ -1292,7 +1295,12 @@ async fn create_user(
     Extension(metadata): Extension<RequestMetadata>,
     Json(create_req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Creating a user (and assigning its roles) is gated on `users:manage`, not
+    // the broader `UsersWrite`: the latter is also held by `PlatformAdmin`, which
+    // must not be able to mint a brand-new `admin` account. There is no existing
+    // target here, so this is a plain permission gate rather than
+    // authorize_admin_target.
+    permission_guard!(auth, UsersManage);
 
     info!(
         "Creating new user with username: {} and email: {}",
@@ -1373,14 +1381,13 @@ async fn delete_user(
     Extension(metadata): Extension<RequestMetadata>,
     Path(user_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Request to delete user {} by user {}",
         user_id,
         auth.user_id()
     );
 
+    // `users:manage` gate (+ no self-deletion) lives in authorize_admin_target.
     if let Err(denied) = authorize_admin_target(&auth, user_id) {
         error!(
             "Denied user deletion by user {} for target {}: {:?}",
@@ -1441,14 +1448,13 @@ async fn remove_role(
     Extension(metadata): Extension<RequestMetadata>,
     Path((user_id, role_type)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
     info!(
         "Request to remove role {} from user {} by user {}",
         role_type,
         user_id,
         auth.user_id()
     );
+    // `users:manage` gate (+ no self-modification) lives in authorize_admin_target.
     if let Err(denied) = authorize_admin_target(&auth, user_id) {
         error!(
             "Denied role removal by user {} for target {}: {:?}",
@@ -1595,10 +1601,19 @@ async fn update_user(
     Path(user_id): Path<i32>,
     Json(update_req): Json<UpdateUserRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Check authentication
-    permission_guard!(auth, UsersWrite);
-
-    permission_guard!(auth, UsersWrite);
+    // Editing another user's account is gated on `users:manage` (+ no
+    // self-modification via authorize_admin_target); callers use PATCH /users/me
+    // to change their own details. UsersWrite alone (held by PlatformAdmin) is
+    // not sufficient.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied user update by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
 
     info!("Admin {} updating user {}", auth.user_id(), user_id);
 
@@ -1663,8 +1678,18 @@ async fn restore_user(
     Extension(metadata): Extension<RequestMetadata>,
     Path(user_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-    permission_guard!(auth, UsersWrite);
+    // Restoring a soft-deleted user is gated on `users:manage`, matching
+    // delete_user/remove_role. UsersWrite alone (held by PlatformAdmin) is not
+    // sufficient.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied user restore by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
 
     info!("Request to restore user {}", user_id);
 
@@ -1937,8 +1962,9 @@ async fn disable_mfa(
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_role, authorize_admin_target, authorize_role_assignment, delete_user, remove_role,
-        AdminTargetDenied, AssignRoleRequest, RoleChangeDenied,
+        assign_role, authorize_admin_target, authorize_role_assignment, create_user, delete_user,
+        remove_role, restore_user, update_user, AdminTargetDenied, AssignRoleRequest,
+        CreateUserRequest, RoleChangeDenied, UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
@@ -1958,12 +1984,15 @@ mod tests {
     use temps_core::{AuditLogger, RequestMetadata};
     use temps_entities::{roles, user_roles, users};
 
-    // Regression tests for the `assign_role` privilege-escalation hole
-    // (security review finding #2). Two defects combined: (a) the handler only
-    // checked `UsersWrite`, never `is_admin()`, so a non-admin `PlatformAdmin`
-    // could grant the `admin` role; and (b) the self-modification guard checked
-    // the path id while the mutation used the body id, so a mismatched pair
-    // bypassed it. `authorize_role_assignment` is the extracted precondition.
+    // Regression tests for the user-management privilege-escalation hole. The
+    // handlers checked only `UsersWrite`, which `PlatformAdmin` (and admin-owned
+    // restricted API keys) also hold, so a non-admin could grant the `admin`
+    // role or mint an `admin` account; and `assign_role`'s self-modification
+    // guard checked the path id while the mutation used the body id, so a
+    // mismatched pair bypassed it. The fix gates these operations on the
+    // dedicated `users:manage` permission (held only by `Role::Admin`, or
+    // grantable directly to an API key). `authorize_role_assignment` /
+    // `authorize_admin_target` are the extracted, permission-based preconditions.
 
     fn test_user(id: i32) -> users::Model {
         let now = Utc::now();
@@ -2104,11 +2133,11 @@ mod tests {
         assert!(!auth.is_admin());
         assert_eq!(
             authorize_role_assignment(&auth, 2, 2),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
             authorize_admin_target(&auth, 2),
-            Err(AdminTargetDenied::NotAdmin)
+            Err(AdminTargetDenied::MissingPermission)
         );
     }
 
@@ -2119,11 +2148,11 @@ mod tests {
         assert!(!auth.is_admin());
         assert_eq!(
             authorize_role_assignment(&auth, 2, 2),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
             authorize_admin_target(&auth, 2),
-            Err(AdminTargetDenied::NotAdmin)
+            Err(AdminTargetDenied::MissingPermission)
         );
     }
 
@@ -2133,6 +2162,28 @@ mod tests {
         assert!(auth.is_admin());
         assert_eq!(authorize_role_assignment(&auth, 2, 2), Ok(2));
         assert_eq!(authorize_admin_target(&auth, 2), Ok(()));
+    }
+
+    #[test]
+    fn api_key_granted_users_manage_permission_is_authorized() {
+        // The point of gating on a permission rather than a role: a key that is
+        // NOT an admin role but was explicitly granted `users:manage` may manage
+        // users, while a key holding only the broader `UsersWrite` may not.
+        let manage_key = api_key_auth(None, Some(vec![Permission::UsersManage]));
+        assert!(!manage_key.is_admin());
+        assert!(manage_key.has_permission(&Permission::UsersManage));
+        assert_eq!(authorize_role_assignment(&manage_key, 2, 2), Ok(2));
+        assert_eq!(authorize_admin_target(&manage_key, 2), Ok(()));
+
+        let write_only_key = api_key_auth(None, Some(vec![Permission::UsersWrite]));
+        assert_eq!(
+            authorize_role_assignment(&write_only_key, 2, 2),
+            Err(RoleChangeDenied::MissingPermission)
+        );
+        assert_eq!(
+            authorize_admin_target(&write_only_key, 2),
+            Err(AdminTargetDenied::MissingPermission)
+        );
     }
 
     #[test]
@@ -2167,7 +2218,7 @@ mod tests {
         let auth = session_auth(Role::PlatformAdmin);
         assert_eq!(
             authorize_role_assignment(&auth, 2, 1),
-            Err(RoleChangeDenied::NotAdmin)
+            Err(RoleChangeDenied::MissingPermission)
         );
     }
 
@@ -2268,6 +2319,80 @@ mod tests {
 
             match result {
                 Ok(_) => panic!("restricted API key unexpectedly removed a role"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = create_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Json(CreateUserRequest {
+                    username: "provisioned-user".to_string(),
+                    email: Some("provisioned@example.com".to_string()),
+                    password: Some("a-valid-passphrase".to_string()),
+                    // Requesting the admin role is the case the gate must stop a
+                    // restricted credential from performing.
+                    roles: vec!["admin".to_string()],
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly created a user"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = update_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Path(2),
+                Json(UpdateUserRequest {
+                    email: Some("changed@example.com".to_string()),
+                    name: None,
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly updated a user"),
+                Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_user_handler_rejects_admin_owned_restricted_api_keys() {
+        for auth in [
+            api_key_auth(Some(Role::PlatformAdmin), None),
+            api_key_auth(None, Some(vec![Permission::UsersWrite])),
+        ] {
+            let result = restore_user(
+                State(admin_owner_state()),
+                RequireAuth(auth),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+
+            match result {
+                Ok(_) => panic!("restricted API key unexpectedly restored a user"),
                 Err(problem) => assert_problem_status(problem, StatusCode::FORBIDDEN),
             }
         }

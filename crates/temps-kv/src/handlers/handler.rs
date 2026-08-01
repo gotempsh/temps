@@ -108,7 +108,8 @@ pub async fn kv_get(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<GetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let value = state.kv_service.get(project_id, &request.key).await?;
 
@@ -133,7 +134,8 @@ pub async fn kv_set(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<SetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     info!(
         "KV SET request: key={}, project_id={}",
@@ -183,7 +185,8 @@ pub async fn kv_del(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<DelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let deleted = state.kv_service.del(project_id, request.keys).await?;
 
@@ -208,7 +211,8 @@ pub async fn kv_incr(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<IncrRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let value = match request.amount {
         Some(amount) if amount != 1 => {
@@ -241,7 +245,8 @@ pub async fn kv_expire(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<ExpireRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let success = state
         .kv_service
@@ -269,7 +274,8 @@ pub async fn kv_ttl(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<TtlRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let ttl = state.kv_service.ttl(project_id, &request.key).await?;
 
@@ -294,7 +300,8 @@ pub async fn kv_keys(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<KeysRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth, request.project_id)?;
+    let project_id =
+        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
 
     let keys = state.kv_service.keys(project_id, &request.pattern).await?;
 
@@ -306,9 +313,10 @@ pub async fn kv_keys(
 /// Priority:
 /// 1. Deployment tokens: Use project_id from token (request body ignored for security)
 /// 2. API keys/sessions: Use project_id from request body (required)
-fn extract_project_id(
+async fn extract_project_id(
     auth: &temps_auth::AuthContext,
     request_project_id: Option<i32>,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<i32, Problem> {
     // For deployment tokens, always use the token's project_id (security: prevent access to other projects)
     if let Some(token_project_id) = auth.project_id() {
@@ -316,13 +324,21 @@ fn extract_project_id(
     }
 
     // For API keys and sessions, require project_id in the request body
-    request_project_id.ok_or_else(|| {
+    let project_id = request_project_id.ok_or_else(|| {
         temps_core::problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
             .with_title("Project ID Required")
             .with_detail(
                 "The 'project_id' field is required in the request body for API key or session authentication",
             )
-    })
+    })?;
+
+    // Confine session/API-key callers to projects they may access. Without this
+    // the client-supplied project_id was trusted verbatim, allowing cross-tenant
+    // reads/writes of another project's KV entries. No-op in plain OSS (no
+    // checker registered); enforced when a team-access plugin is present.
+    temps_auth::project_access_guard!(auth, project_id, project_access_checker);
+
+    Ok(project_id)
 }
 
 // =============================================================================
@@ -778,4 +794,93 @@ pub async fn kv_disable(
         success: true,
         message: "KV service disabled successfully".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod idor_tests {
+    //! Regression tests for the cross-tenant IDOR on the KV data plane
+    //! (security review finding #3). Before the fix, `extract_project_id`
+    //! trusted the client-supplied `project_id` verbatim for session/API-key
+    //! auth, so any authenticated principal could read/write another project's
+    //! KV entries by passing an arbitrary id. It now runs the team-based
+    //! `project_access_guard!`.
+
+    use super::extract_project_id;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use temps_auth::{AuthContext, Role};
+    use temps_core::ProjectAccessChecker;
+
+    struct MockChecker {
+        allow: bool,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for MockChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allow)
+        }
+    }
+
+    fn checker(allow: bool) -> Option<Arc<dyn ProjectAccessChecker>> {
+        Some(Arc::new(MockChecker { allow }))
+    }
+
+    fn session_auth() -> AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Test User".to_string(),
+            email: "user42@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        AuthContext::new_session(user, Role::User)
+    }
+
+    #[tokio::test]
+    async fn session_supplying_inaccessible_project_is_rejected() {
+        // The exploit input: a non-admin session naming a project it cannot
+        // reach. Old code returned Ok(999); now denied 403.
+        let auth = session_auth();
+        let err = extract_project_id(&auth, Some(999), &checker(false))
+            .await
+            .expect_err("cross-tenant project id must be rejected");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_supplying_accessible_project_is_accepted() {
+        let auth = session_auth();
+        let pid = extract_project_id(&auth, Some(7), &checker(true))
+            .await
+            .expect("accessible project id must be accepted");
+        assert_eq!(pid, 7);
+    }
+
+    #[tokio::test]
+    async fn oss_without_checker_is_a_noop() {
+        // Plain OSS (no team-access plugin) is unaffected: no checker → allow.
+        let auth = session_auth();
+        let pid = extract_project_id(&auth, Some(7), &None)
+            .await
+            .expect("OSS with no checker must remain a no-op");
+        assert_eq!(pid, 7);
+    }
 }
