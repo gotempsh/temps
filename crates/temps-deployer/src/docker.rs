@@ -210,6 +210,14 @@ fn normalize_extra_networks(
         .collect()
 }
 
+fn network_matches_identifier(
+    candidate_name: Option<&str>,
+    candidate_id: Option<&str>,
+    identifier: &str,
+) -> bool {
+    candidate_name == Some(identifier) || candidate_id == Some(identifier)
+}
+
 /// Build a short human-readable explanation of why a container is in its
 /// current state. Returns None for containers that are still running, have
 /// never been started, or exited cleanly with status 0 and no Docker error.
@@ -667,9 +675,13 @@ impl DockerRuntime {
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
 
         for network in networks {
-            let exists = existing_networks
-                .iter()
-                .any(|candidate| candidate.name.as_deref() == Some(network.as_str()));
+            let exists = existing_networks.iter().any(|candidate| {
+                network_matches_identifier(
+                    candidate.name.as_deref(),
+                    candidate.id.as_deref(),
+                    &network,
+                )
+            });
             if !exists {
                 return Err(DeployerError::NetworkError(format!(
                     "required network '{}' does not exist",
@@ -704,6 +716,21 @@ impl DockerRuntime {
         }
 
         Ok(())
+    }
+
+    async fn cleanup_created_container_after_error(
+        &self,
+        container_id: &str,
+        error: DeployerError,
+    ) -> DeployerError {
+        if let Err(cleanup_error) = self.remove_container(container_id).await {
+            tracing::warn!(
+                container = %container_id,
+                error = %cleanup_error,
+                "failed to remove container after deploy error"
+            );
+        }
+        error
     }
 
     /// Install per-peer routes inside the container's netns. Must be
@@ -1908,18 +1935,34 @@ impl ContainerDeployer for DockerRuntime {
         // their primary network interface (`temps-app-network`); the overlay
         // attachment is purely additive and silently no-ops when the overlay
         // network isn't present yet on this node.
-        self.maybe_attach_overlay(&container.id).await?;
+        if let Err(e) = self.maybe_attach_overlay(&container.id).await {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
 
-        self.attach_required_networks(&container.id, &request.extra_networks)
-            .await?;
+        if let Err(e) = self
+            .attach_required_networks(&container.id, &request.extra_networks)
+            .await
+        {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
 
         // Start container
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
             .map_err(|e| {
                 DeployerError::DeploymentFailed(format!("Failed to start container: {}", e))
-            })?;
+            })
+        {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
 
         // Install overlay peer routes inside the container's netns.
         // Must run *after* start_container — `docker inspect` only
@@ -1936,7 +1979,7 @@ impl ContainerDeployer for DockerRuntime {
 
         // When host_port was 0 (Docker picks), inspect the container to get the actual port
         let host_port = if requested_host_port == 0 && container_port > 0 {
-            let inspect = self
+            let inspect = match self
                 .docker
                 .inspect_container(&container.id, None::<InspectContainerOptions>)
                 .await
@@ -1945,10 +1988,17 @@ impl ContainerDeployer for DockerRuntime {
                         "Failed to inspect container {} for port mapping: {}",
                         container.id, e
                     ))
-                })?;
+                }) {
+                Ok(inspect) => inspect,
+                Err(e) => {
+                    return Err(self
+                        .cleanup_created_container_after_error(&container.id, e)
+                        .await);
+                }
+            };
 
             let port_key = format!("{}/tcp", container_port);
-            inspect
+            match inspect
                 .network_settings
                 .and_then(|ns| ns.ports)
                 .and_then(|ports| ports.get(&port_key).cloned())
@@ -1961,7 +2011,14 @@ impl ContainerDeployer for DockerRuntime {
                         "Container {} has no host port binding for {}",
                         container.id, port_key
                     ))
-                })?
+                }) {
+                Ok(host_port) => host_port,
+                Err(e) => {
+                    return Err(self
+                        .cleanup_created_container_after_error(&container.id, e)
+                        .await);
+                }
+            }
         } else {
             requested_host_port
         };
@@ -2396,7 +2453,7 @@ fn default_secrets_root() -> PathBuf {
 fn write_secrets_to_host_dir(
     dir: &Path,
     secrets: &HashMap<String, String>,
-    owner: Option<(u32, u32)>,
+    _owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
     use std::fs;
     use std::io::Write;
@@ -2516,7 +2573,7 @@ fn write_secrets_to_host_dir(
     // `no-new-privileges`, and the bind mount is read-only — the trust
     // boundary is still the container itself.
     #[cfg(unix)]
-    if let Some((uid, gid)) = owner {
+    if let Some((uid, gid)) = _owner {
         use std::os::unix::fs::{chown, PermissionsExt};
 
         let chown_result: std::io::Result<()> = (|| {
@@ -2887,6 +2944,36 @@ mod docker_tests {
         );
     }
 
+    fn unique_test_name(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        format!("{}-{}", prefix, now)
+    }
+
+    fn alpine_deploy_request(container_name: String, extra_networks: Vec<String>) -> DeployRequest {
+        DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            extra_networks,
+            resource_limits: ResourceLimits {
+                cpu_limit: Some(0.5),
+                memory_limit_mb: Some(64),
+                disk_limit_mb: Some(256),
+            },
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from("/tmp/temps-extra-network-test.log"),
+            command: Some(vec!["sleep".to_string(), "30".to_string()]),
+            log_config: Some(ContainerLogConfig::app_default()),
+            labels: HashMap::new(),
+        }
+    }
+
     #[test]
     fn test_write_secrets_to_host_dir_creates_files_with_correct_perms() {
         let tmp = TempDir::new().unwrap();
@@ -3179,6 +3266,25 @@ mod docker_tests {
         );
     }
 
+    #[test]
+    fn test_required_network_identifier_matches_name_or_id() {
+        assert!(network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "supabase_default"
+        ));
+        assert!(network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "abc123"
+        ));
+        assert!(!network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "missing"
+        ));
+    }
+
     #[tokio::test]
     async fn test_with_extra_networks_sets_normalized_field() {
         match create_test_docker_runtime().await {
@@ -3192,6 +3298,134 @@ mod docker_tests {
                         "temps-overlay".to_string(),
                     ]);
                 assert_eq!(runtime.extra_networks, vec!["supabase_default"]);
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_attaches_required_network_by_id() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let extra_network_name = unique_test_name("temps-extra-network");
+                let container_name = unique_test_name("temps-extra-network-container");
+
+                let create_options = bollard::models::NetworkCreateRequest {
+                    name: extra_network_name.clone(),
+                    driver: Some("bridge".to_string()),
+                    ..Default::default()
+                };
+
+                if let Err(e) = runtime.docker.create_network(create_options).await {
+                    println!("Docker network create failed (may be expected): {}", e);
+                    return;
+                }
+
+                let network_id = match runtime
+                    .docker
+                    .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+                    .await
+                    .ok()
+                    .and_then(|networks| {
+                        networks
+                            .into_iter()
+                            .find(|network| network.name.as_deref() == Some(&extra_network_name))
+                            .and_then(|network| network.id)
+                    }) {
+                    Some(id) => id,
+                    None => {
+                        let _ = runtime.docker.remove_network(&extra_network_name).await;
+                        panic!("created network {} was not listed", extra_network_name);
+                    }
+                };
+
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(
+                        container_name.clone(),
+                        vec![network_id.clone()],
+                    ))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let inspect = runtime
+                            .docker
+                            .inspect_container(
+                                &deploy_info.container_id,
+                                None::<InspectContainerOptions>,
+                            )
+                            .await
+                            .expect("inspect deployed container");
+
+                        let attached = inspect
+                            .network_settings
+                            .and_then(|settings| settings.networks)
+                            .map(|networks| networks.contains_key(&extra_network_name))
+                            .unwrap_or(false);
+                        assert!(attached, "container should be attached to required network");
+
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before required-network assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
+
+                let _ = runtime.docker.remove_network(&extra_network_name).await;
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_missing_required_network_removes_created_container() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let container_name = unique_test_name("temps-missing-network-container");
+                let missing_network = unique_test_name("temps-missing-network");
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(
+                        container_name.clone(),
+                        vec![missing_network.clone()],
+                    ))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                        panic!("deploy should fail when required network is missing");
+                    }
+                    Err(DeployerError::NetworkError(message))
+                        if message.contains(&format!(
+                            "required network '{}' does not exist",
+                            missing_network
+                        )) =>
+                    {
+                        let leftover = runtime
+                            .find_container_by_name(&container_name)
+                            .await
+                            .expect("container lookup after failed deploy");
+                        assert!(
+                            leftover.is_none(),
+                            "failed required-network deploy should remove the created container"
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before required-network assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
