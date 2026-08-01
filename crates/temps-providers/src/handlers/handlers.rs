@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::types::AppState;
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Json, Router,
@@ -25,17 +25,19 @@ use utoipa::OpenApi;
 use super::audit::{
     ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
     ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
-    ExternalServiceDeletedAudit, ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit,
-    ServiceHealthChecked,
+    ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
+    ExternalServiceParameterRevealedAudit, ExternalServiceStatusChangedAudit,
+    ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
     ClusterMemberHealthResponse, CreateExternalServiceRequest, EnvironmentVariableInfo,
     ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
-    ServiceHealthStatusEntryResponse, ServiceMemberInfo, ServiceParameter, ServiceTypeInfo,
-    ServiceTypeRoute, UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    RetryClusterRequest, SensitiveValueResponse, ServiceHealthResponse,
+    ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -300,6 +302,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/projects/{project_id}/environment/{var_name}",
             get(get_service_environment_variable),
+        )
+        .route(
+            "/external-services/{id}/parameters/{param_name}",
+            get(reveal_service_parameter),
         )
         .route(
             "/external-services/{id}/projects/{project_id}/environment",
@@ -612,21 +618,9 @@ async fn update_service(
         .await
     {
         Ok(service) => {
-            // Convert parameters to strings for audit log
-            let params_as_strings: HashMap<String, String> = request
-                .parameters
-                .iter()
-                .map(|(k, v)| {
-                    let v_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        serde_json::Value::Null => String::new(),
-                        _ => v.to_string(),
-                    };
-                    (k.clone(), v_str)
-                })
-                .collect();
+            let mut updated_parameter_names =
+                request.parameters.keys().cloned().collect::<Vec<_>>();
+            updated_parameter_names.sort();
 
             // Create audit log with metadata
             let audit = ExternalServiceUpdatedAudit {
@@ -638,7 +632,7 @@ async fn update_service(
                 service_id: service.id,
                 name: service.name.clone(),
                 service_type: service.service_type.to_string(),
-                updated_parameters: params_as_strings,
+                updated_parameter_names,
             };
 
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -660,6 +654,121 @@ async fn update_service(
             }
         }
     }
+}
+
+/// Reveal one sensitive service parameter. Service detail responses never
+/// contain plaintext values; every successful reveal is recorded separately.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/parameters/{param_name}",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Sensitive parameter value", body = SensitiveValueResponse),
+        (status = 400, description = "Parameter is not sensitive"),
+        (status = 403, description = "Caller cannot access a project linked to this service"),
+        (status = 404, description = "Service or parameter not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+        ("param_name" = String, Path, description = "Sensitive parameter name")
+    )
+)]
+async fn reveal_service_parameter(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((id, param_name)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    require_service_parameter_project_access(&auth, &app_state, id).await?;
+
+    let value = app_state
+        .external_service_manager
+        .get_sensitive_parameter_value(id, &param_name)
+        .await
+        .map_err(|error| match error {
+            crate::services::ExternalServiceError::ServiceNotFound { .. }
+            | crate::services::ExternalServiceError::ParameterNotFound { .. } => {
+                not_found().detail(error.to_string()).build()
+            }
+            crate::services::ExternalServiceError::ParameterNotSensitive { .. } => {
+                bad_request().detail(error.to_string()).build()
+            }
+            _ => internal_server_error().detail(error.to_string()).build(),
+        })?;
+
+    let audit = ExternalServiceParameterRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: id,
+        parameter_name: param_name,
+    };
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
+        error!(service_id = id, error = %error, "Failed to audit service parameter reveal");
+    }
+    require_reveal_audit(
+        audit_result,
+        "The parameter could not be revealed because its audit record failed",
+    )?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(SensitiveValueResponse { value }),
+    ))
+}
+
+async fn require_service_parameter_project_access(
+    auth: &temps_auth::AuthContext,
+    app_state: &AppState,
+    service_id: i32,
+) -> Result<(), Problem> {
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::Role::PlatformAdmin)
+        || app_state.project_access_checker.is_none()
+    {
+        return Ok(());
+    }
+
+    let linked_projects = app_state
+        .external_service_manager
+        .list_service_projects(service_id)
+        .await
+        .map_err(|error| {
+            error!(service_id, error = %error, "Failed to resolve linked projects for credential reveal");
+            internal_server_error()
+                .detail("Failed to verify service project access")
+                .build()
+        })?;
+    let project_ids = linked_projects
+        .into_iter()
+        .map(|link| link.project.id)
+        .collect::<Vec<_>>();
+    if let Some(checker) = app_state.project_access_checker.as_ref() {
+        super::metrics_handlers::require_access_to_any_linked_project(
+            auth.user_id(),
+            &project_ids,
+            checker.as_ref(),
+        )
+        .await
+    } else {
+        Ok(())
+    }
+}
+
+fn require_reveal_audit(
+    result: std::result::Result<(), temps_core::anyhow::Error>,
+    detail: &'static str,
+) -> Result<(), Problem> {
+    result.map_err(|_| internal_server_error().detail(detail).build())
 }
 
 /// Canonical HTTP mapping for the upgrade/guard-related `ExternalServiceError`
@@ -721,10 +830,7 @@ async fn upgrade_service(
                 service_id: service.id,
                 name: service.name.clone(),
                 service_type: service.service_type.to_string(),
-                updated_parameters: HashMap::from([(
-                    "docker_image".to_string(),
-                    request.docker_image,
-                )]),
+                updated_parameter_names: vec!["docker_image".to_string()],
             };
 
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -1874,8 +1980,8 @@ async fn list_project_services(
     tag = "External Services",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableInfo),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or variable not found"),
-        (status = 403, description = "Access denied for encrypted variable"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1888,8 +1994,10 @@ async fn get_service_environment_variable(
     State(app_state): State<Arc<AppState>>,
     Path((id, project_id, var_name)): Path<(i32, i32, String)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
@@ -1899,7 +2007,36 @@ async fn get_service_environment_variable(
         .get_service_environment_variable(id, project_id, &var_name)
         .await
     {
-        Ok(var_info) => Ok((StatusCode::OK, Json(var_info))),
+        Ok(var_info) => {
+            let audit = ExternalServiceEnvironmentVariableRevealedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: id,
+                project_id,
+                variable_name: var_name,
+            };
+            let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+            if let Err(error) = &audit_result {
+                error!(
+                    service_id = id,
+                    project_id,
+                    error = %error,
+                    "Failed to audit service environment-variable reveal"
+                );
+            }
+            require_reveal_audit(
+                audit_result,
+                "The environment variable could not be revealed because its audit record failed",
+            )?;
+            Ok((
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(var_info),
+            ))
+        }
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" | "Variable not found" => {
                 Err(not_found().detail(e.to_string()).build())
@@ -1942,9 +2079,9 @@ async fn get_service_environment_variables(
     let options = EnvironmentVariableOptions {
         include_docker: false,
         include_runtime: false,
-        // Only an admin may read plaintext connection strings / passwords.
-        // Non-admin owners get masked values to prevent credential exfiltration.
-        mask_sensitive: !auth.is_admin(),
+        // Bulk reads are always masked. Plaintext is available only through
+        // the audited single-variable reveal endpoint.
+        mask_sensitive: true,
         names_only: false,
     };
 
@@ -1993,7 +2130,14 @@ async fn get_project_service_environment_variables(
         .get_project_service_environment_variables(project_id)
         .await
     {
-        Ok(variables) => Ok((StatusCode::OK, Json(variables))),
+        Ok(mut variables) => {
+            for service_variables in variables.values_mut() {
+                crate::services::ExternalServiceManager::mask_environment_variable_values(
+                    service_variables,
+                );
+            }
+            Ok((StatusCode::OK, Json(variables)))
+        }
         Err(e) => match e.to_string().as_str() {
             "Project not found" => Err(not_found().detail(e.to_string()).build()),
             _ => Err(internal_server_error()
@@ -2284,39 +2428,6 @@ async fn update_service_resources(
         .await
     {
         Ok(response) => {
-            let applied_limits = &response.limits;
-            // Audit: capture the new caps as flat strings so the existing
-            // ExternalServiceUpdatedAudit shape works.
-            let mut params = HashMap::new();
-            params.insert(
-                "memory_mb".to_string(),
-                applied_limits
-                    .memory_mb
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "memory_swap_mb".to_string(),
-                applied_limits
-                    .memory_swap_mb
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "nano_cpus".to_string(),
-                applied_limits
-                    .nano_cpus
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-            params.insert(
-                "cpu_shares".to_string(),
-                applied_limits
-                    .cpu_shares
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "unlimited".to_string()),
-            );
-
             // Look up the service for context fields the audit log needs.
             // If this fails, log but don't fail the response — the limits
             // are already saved.
@@ -2330,7 +2441,12 @@ async fn update_service_resources(
                     service_id: service.id,
                     name: service.name.clone(),
                     service_type: service.service_type.clone(),
-                    updated_parameters: params,
+                    updated_parameter_names: vec![
+                        "cpu_shares".to_string(),
+                        "memory_mb".to_string(),
+                        "memory_swap_mb".to_string(),
+                        "nano_cpus".to_string(),
+                    ],
                 };
                 if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
                     error!("Failed to create audit log for resource update: {}", e);
@@ -2360,6 +2476,7 @@ async fn update_service_resources(
         get_service_type_parameters,
         list_services,
         get_service,
+        reveal_service_parameter,
         create_service,
         list_available_containers,
         import_external_service,
@@ -2431,6 +2548,7 @@ async fn update_service_resources(
         LinkServiceRequest,
         ProjectServiceInfo,
         EnvironmentVariableInfo,
+        SensitiveValueResponse,
         ServiceHealthResponse,
         HealthCheckEntryResponse,
         ServiceHealthStatusBatchResponse,
@@ -2486,8 +2604,88 @@ pub struct ExternalServiceApiDoc;
 
 #[cfg(test)]
 mod tests {
+    use super::super::metrics_handlers::require_access_to_any_linked_project;
     use super::*;
     use axum::response::IntoResponse;
+    use sea_orm::MockDatabase;
+    use std::sync::Mutex;
+    use temps_entities::external_services;
+
+    #[derive(Clone, Default)]
+    struct RecordingAuditLogger {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            self.operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    struct TestProjectAccessChecker {
+        allowed_project_ids: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for TestProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("project access database unavailable".into());
+            }
+            Ok(self.allowed_project_ids.contains(&project_id))
+        }
+    }
+
+    fn test_auth_context() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Credential Auditor".to_string(),
+            email: "auditor@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "credential-reveal-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
 
     // Guards the shared error->status mapping used by update_service /
     // upgrade_service / start_service. The exact bug this class of test exists
@@ -2528,5 +2726,165 @@ mod tests {
             name: "n".to_string()
         })
         .is_none());
+    }
+
+    #[test]
+    fn credential_reveal_fails_closed_when_audit_write_fails() {
+        assert!(require_reveal_audit(Ok(()), "audit failed").is_ok());
+        let problem = require_reveal_audit(
+            Err(temps_core::anyhow::anyhow!("database unavailable")),
+            "audit failed",
+        )
+        .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_rejects_cross_project_user() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![99],
+            fail: false,
+        };
+
+        let problem = require_access_to_any_linked_project(42, &[10, 11], &checker)
+            .await
+            .expect_err("user without access to a linked project must be denied");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_allows_access_to_any_linked_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![11],
+            fail: false,
+        };
+
+        require_access_to_any_linked_project(42, &[10, 11], &checker)
+            .await
+            .expect("access to one linked project should authorize reveal");
+    }
+
+    #[tokio::test]
+    async fn service_parameter_reveal_fails_closed_on_access_check_error() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: Vec::new(),
+            fail: true,
+        };
+
+        let problem = require_access_to_any_linked_project(42, &[10], &checker)
+            .await
+            .expect_err("access-check infrastructure failure must deny reveal");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_reveal_returns_no_store_response_and_writes_audit() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "service-handler-reveal-test",
+        ));
+        let encrypted_config = encryption_service
+            .encrypt_string(
+                &serde_json::json!({
+                    "password": "handler-secret",
+                    "max_connections": 100
+                })
+                .to_string(),
+            )
+            .expect("test service config encryption should succeed");
+        let model = external_services::Model {
+            id: 17,
+            name: "postgres-test".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("postgres-test".to_string()),
+            config: Some(encrypted_config),
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // 1: assert_service_owned_by_caller's existence check
+                .append_query_results([vec![model.clone()]])
+                // 2: assert_service_owned_by_caller's linked-projects lookup
+                // (empty — irrelevant here since project_access_checker is
+                // None, which fails open regardless of the project list)
+                .append_query_results([Vec::<temps_entities::project_services::Model>::new()])
+                // 3: get_sensitive_parameter_value's own fetch
+                .append_query_results([vec![model]])
+                .into_connection(),
+        );
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let audit_logger = RecordingAuditLogger::default();
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            audit_service: Arc::new(audit_logger.clone()),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: None,
+        });
+
+        let response = reveal_service_parameter(
+            RequireAuth(test_auth_context()),
+            State(state),
+            Extension(test_request_metadata()),
+            Path((17, "password".to_string())),
+        )
+        .await
+        .expect("authorized reveal should succeed")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reveal response body should be readable");
+        let revealed: SensitiveValueResponse =
+            serde_json::from_slice(&body).expect("reveal response should be JSON");
+        assert_eq!(revealed.value, "handler-secret");
+        assert_eq!(
+            audit_logger
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .as_slice(),
+            ["EXTERNAL_SERVICE_PARAMETER_REVEALED"]
+        );
     }
 }

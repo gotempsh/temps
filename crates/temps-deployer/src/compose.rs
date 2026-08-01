@@ -70,6 +70,9 @@ pub struct ComposeDeployRequest {
     pub compose_path: Option<String>,
     /// Environment variables to inject (merged with .env)
     pub environment_vars: HashMap<String, String>,
+    /// Platform-owned arguments passed only to `docker compose build`.
+    /// These are deliberately separate from service runtime environments.
+    pub build_args: HashMap<String, String>,
     /// Temps labels to apply to all containers
     pub labels: HashMap<String, String>,
     /// Source repo directory (needed for compose files with build: directives)
@@ -179,6 +182,7 @@ impl ComposeExecutor {
                 &project_name,
                 compose_file,
                 &request.environment_vars,
+                &request.build_args,
             )
             .await?;
         }
@@ -1915,17 +1919,15 @@ impl ComposeExecutor {
         project_name: &str,
         compose_file: &str,
         env_vars: &HashMap<String, String>,
+        build_args: &HashMap<String, String>,
     ) -> Result<(), ComposeError> {
-        let mut cmd = tokio::process::Command::new("docker");
-        cmd.args(["compose", "-p", project_name])
-            .args(["-f", compose_file])
-            .args(["build", "--pull"])
-            .current_dir(project_dir)
-            .env("PWD", project_dir.to_string_lossy().to_string());
-
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
+        let mut cmd = Self::compose_build_command(
+            project_dir,
+            project_name,
+            compose_file,
+            env_vars,
+            build_args,
+        );
 
         debug!(project = %project_name, "Running docker compose build");
 
@@ -1941,6 +1943,39 @@ impl ComposeExecutor {
 
         info!(project = %project_name, "docker compose build completed");
         Ok(())
+    }
+
+    fn compose_build_command(
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+        env_vars: &HashMap<String, String>,
+        build_args: &HashMap<String, String>,
+    ) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("docker");
+        cmd.args(["compose", "-p", project_name])
+            .args(["-f", compose_file])
+            .args(["build", "--pull"])
+            .current_dir(project_dir)
+            .env("PWD", project_dir.to_string_lossy().to_string());
+
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+
+        // Sort for deterministic command construction and test output. Build
+        // arguments are appended explicitly, so they override any tenant
+        // Compose `args:` value. Mirroring them into the build process
+        // environment after tenant vars also prevents `${VAR}` substitution
+        // from selecting a tenant-controlled value.
+        let mut sorted_build_args: Vec<_> = build_args.iter().collect();
+        sorted_build_args.sort_by_key(|(key, _)| *key);
+        for (key, value) in sorted_build_args {
+            cmd.args(["--build-arg", &format!("{key}={value}")]);
+            cmd.env(key, value);
+        }
+
+        cmd
     }
 
     async fn compose_up(
@@ -2564,6 +2599,54 @@ mod tests {
         let entry: ComposePsEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.service, "redis");
         assert!(entry.publishers.is_empty());
+    }
+
+    #[test]
+    fn compose_build_forces_platform_build_args_over_tenant_values() {
+        let project_dir = Path::new("/tmp/temps-compose-command-test");
+        let env_vars = HashMap::from([
+            (
+                "BUILDKIT_CACHE_MOUNT_NS".to_string(),
+                "tenant-controlled".to_string(),
+            ),
+            ("RUNTIME_ONLY".to_string(), "runtime-value".to_string()),
+        ]);
+        let build_args = HashMap::from([(
+            "BUILDKIT_CACHE_MOUNT_NS".to_string(),
+            "platform-derived".to_string(),
+        )]);
+
+        let command = ComposeExecutor::compose_build_command(
+            project_dir,
+            "temps-42-7",
+            "docker-compose.yml",
+            &env_vars,
+            &build_args,
+        );
+        let command = command.as_std();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == [
+                    "--build-arg".to_string(),
+                    "BUILDKIT_CACHE_MOUNT_NS=platform-derived".to_string(),
+                ]
+            }),
+            "platform namespace must be an explicit Compose build argument: {args:?}",
+        );
+        assert!(!args.iter().any(|arg| arg.contains("tenant-controlled")));
+        assert!(!args.iter().any(|arg| arg.contains("RUNTIME_ONLY")));
+
+        let namespace_env = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("BUILDKIT_CACHE_MOUNT_NS"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(namespace_env.as_deref(), Some("platform-derived"));
     }
 
     #[test]

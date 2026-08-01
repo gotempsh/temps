@@ -4,7 +4,9 @@ Comprehensive command-line reference for the Temps deployment platform CLI.
 
 ## What This Skill Covers
 
-Complete documentation for all **440+ CLI commands across 69 command groups** (matches `@temps-sdk/cli` v0.1.26) including:
+Complete documentation for all **440+ CLI commands across 69 command groups**
+(catalog generated from `@temps-sdk/cli` v0.1.26; pinned runtime v0.1.28)
+including:
 
 - ✅ Authentication (login, logout, whoami)
 - ✅ Projects (create, update, delete, settings)
@@ -37,82 +39,97 @@ Complete documentation for all **440+ CLI commands across 69 command groups** (m
 
 ## Installation
 
-```bash
-# Run directly without installing (recommended)
-npx @temps-sdk/cli --version
-bunx @temps-sdk/cli --version
+Use the installed `temps` binary for every example. Do not execute the CLI
+through an on-demand package runner. Install or upgrade only with explicit user
+approval, and pin the reviewed version:
 
-# Or install globally
-npm install -g @temps-sdk/cli
-bun add -g @temps-sdk/cli
+```bash
+# Verify the reviewed registry artifact
+expected_temps_cli_integrity='sha512-ZYqScqes66gQ+fVKuUtDmV9PTxjF7M8XpCbhDCm4e5m3Hul9F5oVx6HM6MXI3YjaCL4pwXfxlNnBA0cNc538Wg=='
+actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.28 dist.integrity)"
+test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
+  echo "Refusing to install: @temps-sdk/cli@0.1.28 integrity mismatch" >&2
+  exit 1
+}
+
+# Disable dependency lifecycle scripts during installation
+npm install --global --ignore-scripts @temps-sdk/cli@0.1.28
+
+command -v temps
+temps --version
 ```
+
+Before a state-changing command, insert `--target-context <name>` immediately
+after `temps`. Never place real credentials in agent-generated commands or
+repeat credential-reveal output in chat; use interactive prompts or
+environment variables injected by the user's secret manager.
 
 ## Quick Start
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli login
+temps login
 
 # Create a project
-bunx @temps-sdk/cli projects create my-app
+temps projects create my-app
 
 # Deploy from Git
-bunx @temps-sdk/cli deploy my-app -b main -e production
+temps deploy my-app -b main -e production
 
 # Set environment variables
-bunx @temps-sdk/cli environments vars set DATABASE_URL "postgresql://..." -p my-app -e production
+temps environments vars set DATABASE_URL "postgresql://..." -p my-app -e production
 
 # View deployment logs
-bunx @temps-sdk/cli deployments logs -p my-app -f
+temps deployments logs -p my-app -f
 ```
 
 ## Common Commands
 
 ```bash
 # Projects
-bunx @temps-sdk/cli projects list
-bunx @temps-sdk/cli projects create
-bunx @temps-sdk/cli projects show -p my-app
+temps projects list
+temps projects create
+temps projects show -p my-app
 
 # Deployments
-bunx @temps-sdk/cli deploy my-app -b main -e production
-bunx @temps-sdk/cli deployments list -p my-app
-bunx @temps-sdk/cli deployments rollback -p my-app
+temps deploy my-app -b main -e production
+temps deployments list -p my-app
+temps deployments rollback -p my-app
 
 # Services
-bunx @temps-sdk/cli services create -t postgres -n mydb
-bunx @temps-sdk/cli services list
-bunx @temps-sdk/cli services link --id 1 --project-id 5
+temps services create -t postgres -n mydb
+temps services list
+temps services link --id 1 --project-id 5
 
 # Domains
-bunx @temps-sdk/cli domains add -p my-app -d example.com
-bunx @temps-sdk/cli domains verify -p my-app -d example.com
+temps domains add -p my-app -d example.com
+temps domains verify -p my-app -d example.com
 
 # Logs
-bunx @temps-sdk/cli deployments logs -p my-app -f
-bunx @temps-sdk/cli runtime-logs -p my-app -e staging -f
+temps deployments logs -p my-app -f
+temps runtime-logs -p my-app -e staging -f
 
 # Monitoring
-bunx @temps-sdk/cli monitors create --project-id 5 -n "API Health" -t http
-bunx @temps-sdk/cli incidents list --project-id 5
+temps monitors create --project-id 5 -n "API Health" -t http
+temps incidents list --project-id 5
 ```
 
 ## Configuration
 
-**Config file**: `~/.temps/config.json`
-**Credentials**: Stored securely in `~/.temps/` with restricted file permissions (mode 0600)
+Credentials are managed automatically by the CLI. Never direct an agent to
+discover, read, or edit the underlying files.
 
 ```bash
 # Interactive AWS-style wizard
-bunx @temps-sdk/cli configure
+temps configure
 
-# Non-interactive (e.g. CI)
-bunx @temps-sdk/cli configure --api-url https://temps.example.com --api-token <TOKEN> --output-format json --no-interactive
+# Non-interactive (TEMPS_TOKEN is injected separately by CI)
+temps configure --api-url "$TEMPS_API_URL" --output-format json --no-interactive
 
 # View configuration / inspect or change individual values
-bunx @temps-sdk/cli configure show
-bunx @temps-sdk/cli configure get output-format
-bunx @temps-sdk/cli configure set output-format json
+temps configure show
+temps configure get output-format
+temps configure set output-format json
 ```
 
 ## Environment Variables
@@ -145,10 +162,10 @@ All commands support `--json` for scripting:
 
 ```bash
 # Get project ID
-bunx @temps-sdk/cli projects show -p my-app --json | jq '.id'
+temps projects show -p my-app --json | jq '.id'
 
 # List running services
-bunx @temps-sdk/cli services list --json | jq '.[] | select(.status == "running")'
+temps services list --json | jq '.[] | select(.status == "running")'
 ```
 
 ## CI/CD Automation
@@ -156,12 +173,13 @@ bunx @temps-sdk/cli services list --json | jq '.[] | select(.status == "running"
 Use `-y/--yes` to skip prompts:
 
 ```bash
-export TEMPS_TOKEN=$TEMPS_TOKEN
+# TEMPS_TOKEN is injected by the CI secret store and must never be echoed.
 export TEMPS_API_URL=https://temps.example.com
+test -n "${TEMPS_TOKEN:-}" || { echo "TEMPS_TOKEN is not configured" >&2; exit 1; }
 
-bunx @temps-sdk/cli deploy my-app -b main -e production -y
-bunx @temps-sdk/cli environments vars set VERSION "1.2.3" -p my-app -e production
-bunx @temps-sdk/cli scans trigger --project-id 5 --environment-id 1
+temps --target-context production deploy my-app -b main -e production -y
+temps --target-context production environments vars set VERSION "1.2.3" -p my-app -e production
+temps --target-context production scans trigger --project-id 5 --environment-id 1
 ```
 
 ## When to Use This Skill
@@ -190,4 +208,6 @@ See [SKILL.md](SKILL.md) for the complete command reference with examples (6000+
 ---
 
 **Package**: [@temps-sdk/cli](https://www.npmjs.com/package/@temps-sdk/cli)
-**Version**: 0.1.26
+**Generated reference**: 0.1.26
+
+**Required runtime**: 0.1.28

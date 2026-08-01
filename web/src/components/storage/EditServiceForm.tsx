@@ -94,6 +94,7 @@ export function EditServiceForm({
               : '',
           required: schema.required?.includes(key) || false,
           encrypted:
+            currentParameters?.[key] === '***' ||
             key.toLowerCase().includes('password') ||
             key.toLowerCase().includes('secret'),
           validation_pattern: prop.pattern || undefined,
@@ -108,7 +109,7 @@ export function EditServiceForm({
     }
 
     return undefined
-  }, [parametersResponse])
+  }, [parametersResponse, currentParameters])
 
   // Dynamically create the form schema based on parameters
   const formSchema = useMemo(() => {
@@ -190,12 +191,16 @@ export function EditServiceForm({
   const [useCustomImage, setUseCustomImage] = useState(false)
 
   // Determine if the docker_image field value matches a supported image
-  const dockerImageValue = form.watch('parameters.docker_image') as string | undefined
+  const dockerImageValue = form.watch('parameters.docker_image') as
+    string | undefined
   const isKnownImage = supportedImages.some((s) => s.image === dockerImageValue)
 
   // On mount, if the current docker_image isn't in the list, show custom input
   useEffect(() => {
-    if (dockerImageValue && !supportedImages.some((s) => s.image === dockerImageValue)) {
+    if (
+      dockerImageValue &&
+      !supportedImages.some((s) => s.image === dockerImageValue)
+    ) {
       setUseCustomImage(true)
     }
   }, [dockerImageValue, supportedImages])
@@ -278,7 +283,10 @@ export function EditServiceForm({
             }
 
             // Render docker_image as a select with custom fallback
-            if (paramObj.name === 'docker_image' && supportedImages.length > 0) {
+            if (
+              paramObj.name === 'docker_image' &&
+              supportedImages.length > 0
+            ) {
               return (
                 <FormField
                   key={paramObj.name}

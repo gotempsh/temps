@@ -127,7 +127,7 @@ pub enum Preset {
 }
 
 impl Preset {
-    /// Get the preset name as a string
+    /// Get the canonical persisted preset name.
     pub fn as_str(&self) -> &'static str {
         match self {
             Preset::NextJs => "nextjs",
@@ -813,10 +813,32 @@ pub struct LaravelConfig {
     pub build_command: Option<String>,
 }
 
+/// Catalog variant persisted under the canonical Dockerfile preset.
+///
+/// Existing rows predate this discriminator and therefore deserialize as
+/// [`DockerfileVariant::File`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerfileVariant {
+    #[default]
+    File,
+    Custom,
+}
+
+impl DockerfileVariant {
+    fn is_file(&self) -> bool {
+        *self == Self::File
+    }
+}
+
 /// Dockerfile preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DockerfileConfig {
+    /// Catalog variant. Omitted for the standard user-provided Dockerfile flow.
+    #[serde(default, skip_serializing_if = "DockerfileVariant::is_file")]
+    pub variant: DockerfileVariant,
+
     /// Path to Dockerfile (default: "Dockerfile")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile_path: Option<String>,
@@ -860,6 +882,102 @@ pub struct ComposePublicPort {
     pub port: u16,
 }
 
+/// A Nixpacks build provider.
+///
+/// `Auto` serializes as the native Nixpacks `...` marker, which includes the
+/// provider detected from the project alongside any explicitly listed
+/// providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NixpacksProvider {
+    #[serde(rename = "...", alias = "auto")]
+    Auto,
+    Node,
+    Python,
+    Rust,
+    Go,
+    Java,
+    Php,
+    Ruby,
+    Deno,
+    Elixir,
+    CSharp,
+    FSharp,
+    Dart,
+    Swift,
+    Zig,
+    Scala,
+    Haskell,
+    Clojure,
+    Crystal,
+    Cobol,
+    Gleam,
+    Lunatic,
+    Scheme,
+    Static,
+}
+
+impl NixpacksProvider {
+    /// Provider identifier expected by Nixpacks build plans.
+    pub fn nixpacks_name(self) -> &'static str {
+        match self {
+            Self::Auto => "...",
+            Self::Node => "node",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Deno => "deno",
+            Self::Elixir => "elixir",
+            Self::CSharp => "c#",
+            Self::FSharp => "f#",
+            Self::Dart => "dart",
+            Self::Swift => "swift",
+            Self::Zig => "zig",
+            Self::Scala => "scala",
+            Self::Haskell => "haskell",
+            Self::Clojure => "clojure",
+            Self::Crystal => "crystal",
+            Self::Cobol => "cobol",
+            Self::Gleam => "gleam",
+            Self::Lunatic => "lunatic",
+            Self::Scheme => "scheme",
+            Self::Static => "staticfile",
+        }
+    }
+
+    pub fn variant_slug(self) -> &'static str {
+        match self {
+            Self::Auto => "nixpacks",
+            Self::Node => "nixpacks-node",
+            Self::Python => "nixpacks-python",
+            Self::Rust => "nixpacks-rust",
+            Self::Go => "nixpacks-go",
+            Self::Java => "nixpacks-java",
+            Self::Php => "nixpacks-php",
+            Self::Ruby => "nixpacks-ruby",
+            Self::Deno => "nixpacks-deno",
+            Self::Elixir => "nixpacks-elixir",
+            Self::CSharp => "nixpacks-csharp",
+            Self::FSharp => "nixpacks-fsharp",
+            Self::Dart => "nixpacks-dart",
+            Self::Swift => "nixpacks-swift",
+            Self::Zig => "nixpacks-zig",
+            Self::Scala => "nixpacks-scala",
+            Self::Haskell => "nixpacks-haskell",
+            Self::Clojure => "nixpacks-clojure",
+            Self::Crystal => "nixpacks-crystal",
+            Self::Cobol => "nixpacks-cobol",
+            Self::Gleam => "nixpacks-gleam",
+            Self::Lunatic => "nixpacks-lunatic",
+            Self::Scheme => "nixpacks-scheme",
+            Self::Static => "nixpacks-static",
+        }
+    }
+}
+
 /// Nixpacks preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -867,6 +985,14 @@ pub struct NixpacksConfig {
     /// Custom nixpacks.toml configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nixpacks_config: Option<String>,
+
+    /// Ordered providers used to create the Nixpacks plan.
+    ///
+    /// An empty list delegates provider selection to the repository config or
+    /// Nixpacks auto-detection. Include `...` to combine auto-detection with
+    /// explicitly selected providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<NixpacksProvider>,
 }
 
 /// Static site preset configuration
@@ -1064,7 +1190,100 @@ mod tests {
         assert_eq!(Preset::from_str("NextJs").unwrap(), Preset::NextJs);
         assert_eq!(Preset::from_str("nodejs").unwrap(), Preset::NodeJs);
         assert_eq!(Preset::from_str("node").unwrap(), Preset::NodeJs);
+        // Catalog variants are not database enum values.
+        assert!(Preset::from_str("nixpacks-node").is_err());
+        assert!(Preset::from_str("nixpacks-python").is_err());
         assert!(Preset::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_nixpacks_provider_serialization_and_validation() {
+        assert_eq!(
+            serde_json::to_string(&NixpacksProvider::Auto).unwrap(),
+            "\"...\""
+        );
+        assert_eq!(
+            serde_json::from_str::<NixpacksProvider>("\"auto\"").unwrap(),
+            NixpacksProvider::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<NixpacksProvider>("\"node\"").unwrap(),
+            NixpacksProvider::Node
+        );
+        assert_eq!(
+            serde_json::to_string(&NixpacksProvider::CSharp).unwrap(),
+            "\"csharp\""
+        );
+        assert_eq!(NixpacksProvider::CSharp.nixpacks_name(), "c#");
+        assert_eq!(
+            serde_json::to_string(&NixpacksProvider::Static).unwrap(),
+            "\"static\""
+        );
+        assert_eq!(NixpacksProvider::Static.nixpacks_name(), "staticfile");
+        assert!(serde_json::from_str::<NixpacksProvider>("\"not-real\"").is_err());
+    }
+
+    #[test]
+    fn test_dockerfile_variant_is_backward_compatible_and_typed() {
+        let legacy: DockerfileConfig =
+            serde_json::from_value(serde_json::json!({ "dockerfilePath": "Dockerfile" })).unwrap();
+        assert_eq!(legacy.variant, DockerfileVariant::File);
+
+        let custom = DockerfileConfig {
+            variant: DockerfileVariant::Custom,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(custom).unwrap();
+        assert_eq!(json["variant"], "custom");
+    }
+
+    #[test]
+    fn test_nixpacks_config_supports_ordered_multiple_providers() {
+        let config = NixpacksConfig {
+            nixpacks_config: None,
+            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["providers"], serde_json::json!(["...", "python"]));
+        assert_eq!(
+            serde_json::from_value::<NixpacksConfig>(json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn test_legacy_nixpacks_config_defaults_to_auto_detection() {
+        let config: NixpacksConfig = serde_json::from_value(serde_json::json!({
+            "nixpacksConfig": "[start]\ncmd = \"npm start\""
+        }))
+        .unwrap();
+        assert!(config.providers.is_empty());
+        assert_eq!(
+            config.nixpacks_config.as_deref(),
+            Some("[start]\ncmd = \"npm start\"")
+        );
+    }
+
+    #[test]
+    fn test_parse_for_preset_nixpacks_with_providers() {
+        let value = serde_json::json!({
+            "providers": ["node", "python"],
+            "nixpacksConfig": "[start]\ncmd = \"npm start\""
+        });
+        let config = PresetConfig::parse_for_preset(&Preset::Nixpacks, &value).unwrap();
+        match config {
+            PresetConfig::Nixpacks(cfg) => {
+                assert_eq!(
+                    cfg.providers,
+                    vec![NixpacksProvider::Node, NixpacksProvider::Python]
+                );
+                assert_eq!(
+                    cfg.nixpacks_config.as_deref(),
+                    Some("[start]\ncmd = \"npm start\"")
+                );
+            }
+            other => panic!("expected Nixpacks config, got {other:?}"),
+        }
     }
 
     #[test]

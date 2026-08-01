@@ -1,0 +1,45 @@
+{
+  "skill_name": "temps-best-practices",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have an Express app that currently calls app.listen(3000). It is deployed on Temps with a custom Dockerfile, and OpenTelemetry Node auto-instrumentation is enabled. Prepare it for production on Temps. Show the concrete configuration/code changes and a verification checklist.",
+      "expected_output": "A production-ready plan/code sketch that covers the complete Temps runtime and telemetry contract without exposing credentials.",
+      "files": [],
+      "expectations": [
+        "Creates or merges .temps.yaml in the effective app root with only health.path for the dedicated readiness route.",
+        "Explains that the exact incoming health path must be ignored by OpenTelemetry server instrumentation while a normal route remains traced.",
+        "Requires the app to read PORT, bind to HOST or 0.0.0.0, and align the custom Docker image EXPOSE value.",
+        "Handles SIGTERM by stopping new work, draining, flushing or shutting down telemetry, and exiting within Temps' 10-second window.",
+        "Addresses readiness semantics, bounded telemetry attributes, sensitive-data filtering, and concrete runtime verification."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Our monorepo has a Next.js app under apps/web, and Temps Root Directory is apps/web. apps/web/.temps.yaml already contains build and cron keys. We use @vercel/otel and want to add session replay. What exactly should we change, and what privacy/security checks should block release?",
+      "expected_output": "A merge-safe Next.js plan that places health configuration correctly, distinguishes incoming health suppression from outbound fetch filtering, and gives enforceable replay/privacy release criteria.",
+      "files": [],
+      "expectations": [
+        "Preserves existing build and cron keys and places health.path in apps/web/.temps.yaml, not blindly at repository root.",
+        "States that @vercel/otel outbound fetch ignore configuration does not prove incoming health requests are excluded from server spans.",
+        "Requires a dedicated readiness route and keeps its path synchronized with .temps.yaml and the incoming-request filter.",
+        "Keeps deployment or API tokens and OTEL_EXPORTER_OTLP_HEADERS out of NEXT_PUBLIC variables and browser bundles.",
+        "Requires replay to be default-off until consent, masks sensitive inputs/content, excludes sensitive paths, and verifies the recorder's actual state with synthetic sensitive data.",
+        "Requires CRON_SECRET bearer validation for cron routes and preserves unrelated cron configuration."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I want to export OTLP traces directly from our React browser app using the Temps deployment token, and use browser analytics purchase events as the source of truth for billing. Give me the recommended implementation.",
+      "expected_output": "A secure correction that rejects both unsafe premises and replaces them with server-authoritative designs.",
+      "files": [],
+      "expectations": [
+        "Explicitly refuses to embed dt_, tk_, TEMPS_API_TOKEN, or OTEL authorization headers in browser code or public-prefixed environment variables.",
+        "Routes browser telemetry through an authenticated backend or controlled collector with validation, rate limiting, and server-side Temps credentials.",
+        "Treats public browser analytics as untrusted attribution data rather than proof of a purchase or billing authority.",
+        "Records authoritative purchase state in authenticated server code and optionally emits analytics only after the transaction succeeds.",
+        "Includes practical verification that production client bundles contain no machine credentials and that spoofed analytics events cannot affect billing."
+      ]
+    }
+  ]
+}

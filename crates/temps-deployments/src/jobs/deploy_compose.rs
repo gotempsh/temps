@@ -41,6 +41,9 @@ pub struct DeployComposeJob {
     /// Inline compose content (used when no git repo, e.g. manual project)
     compose_content: Option<String>,
     environment_vars: HashMap<String, String>,
+    /// Platform-owned build arguments. These are passed only to
+    /// `docker compose build`, never to service runtime environments.
+    build_args: HashMap<String, String>,
     /// User-provided docker-compose override YAML
     compose_override: Option<String>,
     /// Job ID of the download_repo job (to read repo_dir from context)
@@ -60,6 +63,7 @@ pub struct DeployComposeJobBuilder {
     compose_content: Option<String>,
     compose_override: Option<String>,
     environment_vars: HashMap<String, String>,
+    build_args: HashMap<String, String>,
     download_job_id: Option<String>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -84,6 +88,7 @@ impl DeployComposeJobBuilder {
             compose_content: None,
             compose_override: None,
             environment_vars: HashMap::new(),
+            build_args: HashMap::new(),
             download_job_id: None,
             log_id: None,
             log_service: None,
@@ -134,6 +139,10 @@ impl DeployComposeJobBuilder {
         self.environment_vars = vars;
         self
     }
+    pub fn build_args(mut self, args: HashMap<String, String>) -> Self {
+        self.build_args = args;
+        self
+    }
     pub fn log_id(mut self, id: Option<String>) -> Self {
         self.log_id = id;
         self
@@ -165,6 +174,7 @@ impl DeployComposeJobBuilder {
             compose_content: self.compose_content,
             compose_override: self.compose_override,
             environment_vars: self.environment_vars,
+            build_args: self.build_args,
             download_job_id: self
                 .download_job_id
                 .unwrap_or_else(|| "download_repo".to_string()),
@@ -376,6 +386,7 @@ impl WorkflowTask for DeployComposeJob {
             work_dir: PathBuf::from("/tmp"),
             compose_path: self.compose_path.clone(),
             environment_vars: self.environment_vars.clone(),
+            build_args: self.build_args.clone(),
             labels,
             repo_dir: repo_path,
             compose_override: self.compose_override.clone(),

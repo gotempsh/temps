@@ -999,6 +999,33 @@ impl MetricAlertEvaluator {
         )
     }
 
+    /// Resolve `rule.environment_id` to that environment's name, for scoping
+    /// the metric query. Config-as-code rules (`.temps.yaml` `alerts:`) are
+    /// tagged with an environment id at creation time
+    /// (`DatabaseMetricAlertConfigService`), but `MetricQuery::environment`
+    /// filters by the denormalized environment *name*, not id — without this
+    /// resolution every query-construction site below would silently ignore
+    /// `environment_id` and evaluate blended data across all of the project's
+    /// environments (the same class of bug as the un-scoped Explore page).
+    /// Project-scoped rules (`environment_id = None`) return `Ok(None)` and
+    /// evaluate across the whole project, unchanged from before this column
+    /// existed. A DB error here propagates rather than falling back to
+    /// unscoped, so a transient lookup failure fails closed (preserves state)
+    /// instead of silently blending environments.
+    async fn environment_name(
+        &self,
+        environment_id: Option<i32>,
+    ) -> Result<Option<String>, crate::error::OtelError> {
+        let Some(id) = environment_id else {
+            return Ok(None);
+        };
+        use sea_orm::EntityTrait;
+        let env = temps_entities::environments::Entity::find_by_id(id)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(env.map(|e| e.name))
+    }
+
     /// Repopulate `firing_series` from the DB on startup so a restart doesn't
     /// orphan open per-series alarms (ADR-026 Phase 3 §Open questions Q3).
     /// Mirrors `temps_monitoring::AlertEvaluator::load_firing_alarms_from_db`.
@@ -1126,9 +1153,11 @@ impl MetricAlertEvaluator {
         let window = chrono::Duration::seconds(rule.window_secs.max(1) as i64);
         let aggregation = MetricAggregation::parse(&rule.aggregation);
         let (label_filters, _) = rule_query_scope(&rule);
+        let environment = self.environment_name(rule.environment_id).await?;
         let query = MetricQuery {
             project_id: rule.project_id,
             metric_name: Some(rule.metric_name.clone()),
+            environment,
             start_time: Some(now - window),
             end_time: Some(now),
             bucket_interval: Some(format!("{}s", rule.window_secs.max(1))),
@@ -1285,10 +1314,12 @@ impl MetricAlertEvaluator {
         let aggregation = MetricAggregation::parse(&rule.aggregation);
         let (label_filters, _) = rule_query_scope(&rule);
         let config = DetectionConfig::from_value(&rule.detection_config)?;
+        let environment = self.environment_name(rule.environment_id).await?;
 
         let query = MetricQuery {
             project_id: rule.project_id,
             metric_name: Some(rule.metric_name.clone()),
+            environment,
             start_time: Some(now - window),
             end_time: Some(now),
             bucket_interval: Some(format!("{}s", rule.window_secs.max(1))),
@@ -1759,9 +1790,11 @@ impl MetricAlertEvaluator {
         let aggregation = MetricAggregation::parse(&rule.aggregation);
         let (mut label_filters, _) = rule_query_scope(rule);
         label_filters.extend(extra_filters.iter().cloned());
+        let environment = self.environment_name(rule.environment_id).await?;
         let query = MetricQuery {
             project_id: rule.project_id,
             metric_name: Some(rule.metric_name.clone()),
+            environment,
             start_time: Some(now - chrono::Duration::days(lookback_days as i64)),
             end_time: Some(now),
             bucket_interval: Some(format!("{}s", rule.window_secs.max(1))),
@@ -2041,9 +2074,11 @@ impl MetricAlertEvaluator {
         let now = Utc::now();
         let (mut label_filters, _) = rule_query_scope(rule);
         label_filters.extend(extra_filters.iter().cloned());
+        let environment = self.environment_name(rule.environment_id).await.ok()?;
         let query = MetricQuery {
             project_id: rule.project_id,
             metric_name: Some(rule.metric_name.clone()),
+            environment,
             start_time: Some(now - chrono::Duration::seconds(window as i64 * 60)),
             end_time: Some(now),
             bucket_interval: Some(format!("{}s", window)),
@@ -2788,6 +2823,7 @@ mod tests {
         AlertRule {
             id: 1,
             project_id: 1,
+            environment_id: None,
             name: "test-rule".to_string(),
             metric_name: "test.metric".to_string(),
             aggregation: "avg".to_string(),

@@ -44,6 +44,14 @@ pub enum EnvVarError {
     #[error("Secret env var '{key}' requires a non-empty value on create")]
     SecretValueRequired { key: String },
 
+    #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
+    SecretValueCannotBeRevealed { var_id: i32, key: String },
+
+    #[error(
+        "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
+    )]
+    AmbiguousValue { project_id: i32, key: String },
+
     #[error("Environment variable '{key}' already exists in one of the selected environments")]
     AlreadyExists { key: String },
 
@@ -460,19 +468,51 @@ impl EnvVarService {
         &self,
         project_id: i32,
         key: &str,
-        _environment_id: Option<i32>,
+        environment_id: Option<i32>,
+        var_id: Option<i32>,
     ) -> Result<String, EnvVarError> {
-        let var = env_vars::Entity::find()
+        let mut query = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
-            .filter(env_vars::Column::Key.eq(key))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                EnvVarError::NotFound(format!(
-                    "Environment variable '{}' not found in project {}",
-                    key, project_id
-                ))
-            })?;
+            .filter(env_vars::Column::Key.eq(key));
+        if let Some(var_id) = var_id {
+            query = query.filter(env_vars::Column::Id.eq(var_id));
+        }
+        let mut vars = query.all(self.db.as_ref()).await?;
+
+        if let Some(environment_id) = environment_id {
+            let var_ids = vars.iter().map(|var| var.id).collect::<Vec<_>>();
+            let links = env_var_environments::Entity::find()
+                .filter(env_var_environments::Column::EnvVarId.is_in(var_ids))
+                .filter(env_var_environments::Column::EnvironmentId.eq(environment_id))
+                .all(self.db.as_ref())
+                .await?;
+            let linked_ids = links
+                .into_iter()
+                .map(|link| link.env_var_id)
+                .collect::<std::collections::HashSet<_>>();
+            vars.retain(|var| linked_ids.contains(&var.id));
+        }
+
+        if vars.len() > 1 {
+            return Err(EnvVarError::AmbiguousValue {
+                project_id,
+                key: key.to_string(),
+            });
+        }
+
+        let var = vars.into_iter().next().ok_or_else(|| {
+            EnvVarError::NotFound(format!(
+                "Environment variable '{}' not found in project {}",
+                key, project_id
+            ))
+        })?;
+
+        if var.is_secret {
+            return Err(EnvVarError::SecretValueCannotBeRevealed {
+                var_id: var.id,
+                key: var.key,
+            });
+        }
 
         self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)
     }
@@ -756,10 +796,127 @@ mod tests {
 
         let service = EnvVarService::new(db, svc);
         let value = service
-            .get_environment_variable_value(10, "API_KEY", None)
+            .get_environment_variable_value(10, "API_KEY", None, None)
             .await
             .unwrap();
 
         assert_eq!(value, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_value_selects_matching_environment() {
+        let encryption_service = make_encryption_service();
+        let first = encryption_service.encrypt_string("first-value").unwrap();
+        let second = encryption_service.encrypt_string("second-value").unwrap();
+        let first_model = make_env_var_model(3, 10, "SHARED_KEY", &first, true);
+        let second_model = make_env_var_model(4, 10, "SHARED_KEY", &second, true);
+        let matching_link = env_var_environments::Model {
+            id: 9,
+            env_var_id: 4,
+            environment_id: 22,
+            created_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![first_model, second_model]])
+                .append_query_results([vec![matching_link]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let value = service
+            .get_environment_variable_value(10, "SHARED_KEY", Some(22), None)
+            .await
+            .expect("environment-scoped reveal should select the linked row");
+
+        assert_eq!(value, "second-value");
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_value_rejects_ambiguous_key_without_environment() {
+        let encryption_service = make_encryption_service();
+        let first = encryption_service.encrypt_string("first-value").unwrap();
+        let second = encryption_service.encrypt_string("second-value").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![
+                    make_env_var_model(3, 10, "SHARED_KEY", &first, true),
+                    make_env_var_model(4, 10, "SHARED_KEY", &second, true),
+                ]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .get_environment_variable_value(10, "SHARED_KEY", None, None)
+            .await
+            .expect_err("unscoped duplicate-key reveal must fail closed");
+
+        assert!(matches!(
+            error,
+            EnvVarError::AmbiguousValue {
+                project_id: 10,
+                ref key,
+            } if key == "SHARED_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_value_uses_authoritative_row_id() {
+        let encryption_service = make_encryption_service();
+        let selected = encryption_service
+            .encrypt_string("selected-row-value")
+            .unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env_var_model(
+                    4,
+                    10,
+                    "SHARED_KEY",
+                    &selected,
+                    true,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let value = service
+            .get_environment_variable_value(10, "SHARED_KEY", None, Some(4))
+            .await
+            .expect("row-scoped reveal should return the requested env-var row");
+
+        assert_eq!(value, "selected-row-value");
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_value_rejects_write_only_secret() {
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("never-reveal").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_env_var_model_full(
+                    4,
+                    10,
+                    "WRITE_ONLY_TOKEN",
+                    &encrypted,
+                    true,
+                    true,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .get_environment_variable_value(10, "WRITE_ONLY_TOKEN", None, None)
+            .await
+            .expect_err("write-only secret must not be revealable");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueCannotBeRevealed {
+                var_id: 4,
+                ref key,
+            } if key == "WRITE_ONLY_TOKEN"
+        ));
     }
 }

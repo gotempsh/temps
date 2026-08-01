@@ -12,6 +12,7 @@ temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
+temps-presets = { path = "../temps-presets" }
 sea-orm = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }

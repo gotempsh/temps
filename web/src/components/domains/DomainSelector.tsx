@@ -14,7 +14,9 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
+import { reservedHostnameReason } from '@/lib/reservedHostnames'
 import { useDebounce } from '@/hooks/useDebounce'
+import { useSettings } from '@/hooks/useSettings'
 import { useQuery } from '@tanstack/react-query'
 import { Check, ChevronsUpDown, Globe } from 'lucide-react'
 import { useState } from 'react'
@@ -60,6 +62,7 @@ export function DomainSelector({
   })
 
   const domains = data?.domains ?? []
+  const { data: platformSettings } = useSettings()
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -98,27 +101,49 @@ export function DomainSelector({
             </CommandEmpty>
             {domains.length > 0 && (
               <CommandGroup>
-                {domains.map((domain) => (
-                  <CommandItem
-                    key={domain.id}
-                    value={domain.domain}
-                    onSelect={() => {
-                      onValueChange(domain.domain)
-                      setOpen(false)
-                      setSearch('')
-                    }}
-                  >
-                    <Check
-                      className={cn(
-                        'mr-2 h-4 w-4 shrink-0',
-                        value === domain.domain ? 'opacity-100' : 'opacity-0'
+                {domains.map((domain) => {
+                  // Reserved hostnames (console, preview apex) belong to the
+                  // platform — selecting one takes the console offline, so it
+                  // is shown but not selectable (issue #478).
+                  const reserved = !!reservedHostnameReason(
+                    domain.domain,
+                    platformSettings
+                  )
+                  return (
+                    <CommandItem
+                      key={domain.id}
+                      value={domain.domain}
+                      disabled={reserved}
+                      title={
+                        reserved
+                          ? 'Reserved by Temps — this is the console or preview domain'
+                          : undefined
+                      }
+                      onSelect={() => {
+                        if (reserved) return
+                        onValueChange(domain.domain)
+                        setOpen(false)
+                        setSearch('')
+                      }}
+                    >
+                      <Check
+                        className={cn(
+                          'mr-2 h-4 w-4 shrink-0',
+                          value === domain.domain ? 'opacity-100' : 'opacity-0'
+                        )}
+                      />
+                      <Globe className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate flex-1">{domain.domain}</span>
+                      {reserved ? (
+                        <span className="ml-2 shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                          Reserved
+                        </span>
+                      ) : (
+                        <DomainStatusBadge status={domain.status} />
                       )}
-                    />
-                    <Globe className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate flex-1">{domain.domain}</span>
-                    <DomainStatusBadge status={domain.status} />
-                  </CommandItem>
-                ))}
+                    </CommandItem>
+                  )
+                })}
               </CommandGroup>
             )}
             {data && data.total > domains.length && (

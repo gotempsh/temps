@@ -61,3 +61,28 @@ export function splitPresetSelection(value: string): {
   const stripped = path.startsWith('./') ? path.slice(2) : path
   return { preset, directory: `./${stripped}` }
 }
+
+/**
+ * Keep inline Nixpacks settings when the base catalog entry is selected, while
+ * making that selection explicitly reset provider forcing to auto-detection.
+ */
+export function presetConfigForSelection(
+  preset: string,
+  currentConfig: unknown
+): unknown {
+  if (preset !== 'nixpacks') return currentConfig
+
+  if (
+    currentConfig &&
+    typeof currentConfig === 'object' &&
+    !Array.isArray(currentConfig) &&
+    (currentConfig as Record<string, unknown>).preset === 'nixpacks'
+  ) {
+    return {
+      ...(currentConfig as Record<string, unknown>),
+      providers: [],
+    }
+  }
+
+  return { providers: [] }
+}

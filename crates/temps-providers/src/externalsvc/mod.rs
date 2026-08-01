@@ -779,6 +779,24 @@ pub trait ExternalService: Send + Sync {
         Ok(())
     }
 
+    /// Force this service's container to be recreated so a CMD-level config
+    /// change (e.g. `shared_preload_libraries`) takes effect.
+    ///
+    /// Unlike a plain `start()` on a fresh, unhydrated instance, callers here
+    /// pass `service_config` explicitly so the engine can populate its
+    /// in-memory config before recreating — a freshly-constructed instance
+    /// (as returned by `ExternalServiceManager::create_service_instance_for_parameter_value`)
+    /// has no config until `init()`/this method hydrates it, and the normal
+    /// reconcile-on-start drift check needs that config to build the new
+    /// container once a recreate is warranted.
+    ///
+    /// Default is a no-op; only engines with CMD-baked config that can drift
+    /// post-creation (currently Postgres, for `shared_preload_libraries`)
+    /// override this.
+    async fn force_recreate(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 

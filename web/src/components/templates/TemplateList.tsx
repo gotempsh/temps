@@ -174,6 +174,7 @@ export function TemplateList({
               template={template}
               onClick={onTemplateSelect}
               selected={selectedTemplate?.slug === template.slug}
+              compact={viewMode === 'list'}
             />
           ))}
         </div>

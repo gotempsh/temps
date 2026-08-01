@@ -22,7 +22,7 @@
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_entities::deployments;
+use temps_entities::{deployments, projects};
 use temps_import_types::StepResult;
 use tracing::{info, warn};
 
@@ -46,6 +46,23 @@ fn is_terminal(state: &str) -> bool {
 
 fn is_success(state: &str) -> bool {
     state == "completed"
+}
+
+/// Decide how to (re)trigger a real deployment when nothing started on its
+/// own: git-backed projects use the normal git-push pipeline (returns
+/// `None`, meaning "not an image deploy"); projects with no git repo but a
+/// known image (docker-source imports: Portainer, Kubernetes, Kamal) deploy
+/// that image directly instead, since `trigger_pipeline` always fails for
+/// them (it requires non-empty `repo_owner`/`repo_name`).
+fn resolve_image_deploy_target(
+    repo_owner: &str,
+    repo_name: &str,
+    placeholder_image_name: Option<String>,
+) -> Option<String> {
+    if !repo_owner.is_empty() && !repo_name.is_empty() {
+        return None;
+    }
+    placeholder_image_name
 }
 
 /// Result of the deploy-and-verify phase
@@ -114,11 +131,30 @@ impl DeploymentVerifier {
             .await;
 
         if initial.is_none() {
-            if let Err(e) = self
-                .deployment_service
-                .trigger_pipeline(project_id, environment_id, branch.clone(), None, None)
-                .await
-            {
+            // Git-backed imports (Coolify/Dokploy/CapRover) go through the
+            // normal git-push pipeline. Image-based imports (Portainer,
+            // Kubernetes, Kamal) have no repository at all — trigger_pipeline
+            // would always fail for them (it requires repo_owner/repo_name) —
+            // so deploy the pre-built image directly instead, using the
+            // importer's own placeholder deployment row to find the image.
+            let image_ref = self
+                .placeholder_image_ref(project_id, placeholder_deployment_id)
+                .await;
+
+            let trigger_result = match image_ref {
+                Some(image_ref) => {
+                    self.deployment_service
+                        .trigger_image_deployment(project_id, image_ref, None)
+                        .await
+                }
+                None => {
+                    self.deployment_service
+                        .trigger_pipeline(project_id, environment_id, branch.clone(), None, None)
+                        .await
+                }
+            };
+
+            if let Err(e) = trigger_result {
                 let message = format!(
                     "Could not start a deployment: {} — the project and its services were created, but nothing is running yet. Deploy it from the project page once the cause is resolved (most often: no repository linked, or the image is not reachable).",
                     e
@@ -262,6 +298,38 @@ impl DeploymentVerifier {
         }
     }
 
+    /// Resolve the image reference to deploy directly, for projects with no
+    /// git repository. Returns `None` when the project has a git repo linked
+    /// (the normal git-push pipeline should run instead) or when the
+    /// importer's placeholder deployment carries no image.
+    async fn placeholder_image_ref(
+        &self,
+        project_id: i32,
+        placeholder_deployment_id: Option<i32>,
+    ) -> Option<String> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()?;
+
+        let deployment_image_name = match placeholder_deployment_id {
+            Some(deployment_id) => deployments::Entity::find_by_id(deployment_id)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|d| d.image_name),
+            None => None,
+        };
+
+        resolve_image_deploy_target(
+            &project.repo_owner,
+            &project.repo_name,
+            deployment_image_name,
+        )
+    }
+
     async fn latest_deployment_id(&self, project_id: i32, environment_id: i32) -> Option<i32> {
         deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
@@ -363,5 +431,46 @@ mod tests {
         ] {
             assert!(!is_success(state), "{state} must not count as success");
         }
+    }
+
+    #[test]
+    fn git_backed_projects_never_use_image_deploy() {
+        // Even when the placeholder happens to carry an image_name (unusual
+        // but not impossible), a project with a real repo must go through
+        // the normal git-push pipeline, not a direct image deploy.
+        assert_eq!(
+            resolve_image_deploy_target("acme", "web", Some("nginx:latest".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn repo_less_projects_with_no_image_still_use_the_git_pipeline() {
+        // Nothing to deploy directly — fall through to trigger_pipeline,
+        // which will report its own (accurate) error for this case.
+        assert_eq!(resolve_image_deploy_target("", "", None), None);
+    }
+
+    #[test]
+    fn repo_less_projects_with_an_image_deploy_it_directly() {
+        assert_eq!(
+            resolve_image_deploy_target("", "", Some("ghcr.io/org/app:v1".to_string())),
+            Some("ghcr.io/org/app:v1".to_string())
+        );
+    }
+
+    #[test]
+    fn partial_repo_info_is_treated_as_repo_less() {
+        // repo_owner and repo_name must both be present — a half-populated
+        // project (e.g. owner set but name empty) cannot go through the git
+        // pipeline either.
+        assert_eq!(
+            resolve_image_deploy_target("acme", "", Some("nginx:latest".to_string())),
+            Some("nginx:latest".to_string())
+        );
+        assert_eq!(
+            resolve_image_deploy_target("", "web", Some("nginx:latest".to_string())),
+            Some("nginx:latest".to_string())
+        );
     }
 }

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use super::audit::{
-    ContainerActionAudit, DeploymentCancelledAudit, DeploymentPausedAudit, DeploymentPromotedAudit,
-    DeploymentResumedAudit, DeploymentRollbackAudit, DeploymentTeardownAudit,
-    EnvironmentTeardownAudit,
+    ContainerActionAudit, ContainerEnvironmentVariableRevealedAudit, DeploymentCancelledAudit,
+    DeploymentPausedAudit, DeploymentPromotedAudit, DeploymentResumedAudit,
+    DeploymentRollbackAudit, DeploymentTeardownAudit, EnvironmentTeardownAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -12,7 +12,7 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json,
@@ -30,12 +30,12 @@ use utoipa::OpenApi;
 
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
-    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
-    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
-    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
-    PromoteDeploymentRequest, ResourceLimitsResponse,
+    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerInfoResponse,
+    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
+    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
+    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -77,6 +77,12 @@ fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
     }
 }
 
+fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
+    Ok(())
+}
+
 fn public_service_url(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
@@ -109,6 +115,7 @@ fn public_service_url(
         get_container_logs_by_id,
         get_container_logs,
         get_container_detail,
+        get_container_environment_variable,
         stop_container,
         start_container,
         restart_container,
@@ -128,6 +135,7 @@ fn public_service_url(
         ContainerListResponse,
         ContainerInfoResponse,
         ContainerDetailResponse,
+        ContainerEnvironmentVariableValueResponse,
         EnvVarResponse,
         ResourceLimitsResponse,
         ContainerMetricsResponse,
@@ -243,6 +251,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
             get(get_container_detail),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}",
+            get(get_container_environment_variable),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
@@ -1354,7 +1366,7 @@ pub async fn get_deployment_jobs(
 
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let total = jobs.len();
@@ -1396,7 +1408,7 @@ pub async fn get_deployment_job_logs(
     // Get the job to verify it exists and get its log_id
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let job = jobs
@@ -1554,7 +1566,7 @@ pub async fn tail_deployment_job_logs(
     // Get the job to verify it exists and get its log_id
     let jobs = state
         .deployment_service
-        .get_deployment_jobs(deployment_id)
+        .get_deployment_jobs(project_id, deployment_id)
         .await?;
 
     let job = jobs
@@ -1635,7 +1647,8 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_container_detail(
     State(state): State<Arc<AppState>>,
@@ -1650,26 +1663,15 @@ pub async fn get_container_detail(
         .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
-    // Parse environment variables and mask sensitive ones
-    let mut env_vars = vec![];
+    // Container configuration is a bulk response, so every value is masked.
+    // Plaintext is available only from the audited per-variable endpoint.
+    let mut env_vars = Vec::new();
     if let Ok(vars) = state
         .deployment_service
         .get_container_env_variables(project_id, environment_id, container_id.clone())
         .await
     {
-        let sensitive_keys = [
-            "password", "secret", "token", "key", "auth", "api_key", "npm_rc",
-        ];
-        for (key, value) in vars {
-            let is_masked = sensitive_keys
-                .iter()
-                .any(|&s| key.to_lowercase().contains(s));
-            env_vars.push(crate::handlers::types::EnvVarResponse {
-                key,
-                value: if is_masked { "***".to_string() } else { value },
-                is_masked,
-            });
-        }
+        env_vars = mask_container_environment_variables(vars);
     }
 
     let restart_count = state
@@ -1796,6 +1798,117 @@ pub async fn get_container_detail(
     };
 
     Ok(Json(response).into_response())
+}
+
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ("variable_name" = String, Path, description = "Environment variable name")
+    ),
+    responses(
+        (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 404, description = "Container or environment variable not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_container_environment_variable(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id, variable_name)): Path<(
+        i32,
+        i32,
+        String,
+        String,
+    )>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    require_container_environment_reveal(&auth)?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let variables = state
+        .deployment_service
+        .get_container_env_variables(project_id, environment_id, container_id.clone())
+        .await?;
+    let value = variables
+        .into_iter()
+        .find_map(|(key, value)| (key == variable_name).then_some(value))
+        .ok_or_else(|| {
+            temps_core::error_builder::not_found()
+                .title("Container environment variable not found")
+                .detail(format!(
+                    "Environment variable '{}' was not found in container '{}'",
+                    variable_name, container_id
+                ))
+                .build()
+        })?;
+
+    let audit = ContainerEnvironmentVariableRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        environment_id,
+        container_id,
+        variable_name,
+    };
+    audit_container_environment_variable_reveal(state.audit_service.as_ref(), &audit).await?;
+
+    Ok(container_environment_variable_value_response(value))
+}
+
+async fn audit_container_environment_variable_reveal(
+    audit_service: &dyn temps_core::AuditLogger,
+    audit: &ContainerEnvironmentVariableRevealedAudit,
+) -> Result<(), Problem> {
+    audit_service
+        .create_audit_log(audit)
+        .await
+        .map_err(|audit_error| {
+            error!(
+                project_id = audit.project_id,
+                environment_id = audit.environment_id,
+                container_id = %audit.container_id,
+                variable_name = %audit.variable_name,
+                error = %audit_error,
+                "Failed to audit container environment-variable reveal"
+            );
+            temps_core::error_builder::internal_server_error()
+                .title("Container environment variable could not be revealed")
+                .detail("The audit record for this reveal could not be written")
+                .build()
+        })
+}
+
+fn container_environment_variable_value_response(
+    value: String,
+) -> (
+    [(header::HeaderName, &'static str); 1],
+    Json<ContainerEnvironmentVariableValueResponse>,
+) {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ContainerEnvironmentVariableValueResponse { value }),
+    )
+}
+
+fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec<EnvVarResponse> {
+    variables
+        .into_iter()
+        .map(|(key, _value)| EnvVarResponse {
+            key,
+            value: "***".to_string(),
+            is_masked: true,
+        })
+        .collect()
 }
 
 /// Stop a specific container
@@ -2320,6 +2433,19 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    async fn database_test_prerequisites_available() -> bool {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() {
+            return true;
+        }
+
+        tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     #[derive(Clone)]
     struct MockAuditLogger;
 
@@ -2331,6 +2457,98 @@ mod tests {
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
+    }
+
+    struct FailingAuditLogger;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for FailingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            Err(anyhow::anyhow!("audit database unavailable"))
+        }
+    }
+
+    #[test]
+    fn container_detail_masks_every_environment_variable_value() {
+        let masked = mask_container_environment_variables(vec![
+            ("PORT".to_string(), "3000".to_string()),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                "Authorization=Bearer hidden-token".to_string(),
+            ),
+        ]);
+
+        assert_eq!(masked.len(), 2);
+        assert!(masked.iter().all(|variable| variable.is_masked));
+        assert!(masked.iter().all(|variable| variable.value == "***"));
+    }
+
+    #[test]
+    fn container_environment_reveal_audit_excludes_plaintext() {
+        let audit = ContainerEnvironmentVariableRevealedAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "container-reveal-test".to_string(),
+            },
+            project_id: 7,
+            environment_id: 8,
+            container_id: "container-9".to_string(),
+            variable_name: "DATABASE_URL".to_string(),
+        };
+
+        assert_eq!(
+            temps_core::AuditOperation::operation_type(&audit),
+            "CONTAINER_ENVIRONMENT_VARIABLE_REVEALED"
+        );
+        let serialized = temps_core::AuditOperation::serialize(&audit)
+            .expect("container reveal audit should serialize");
+        let payload: serde_json::Value =
+            serde_json::from_str(&serialized).expect("audit payload should be JSON");
+        assert_eq!(payload["project_id"], 7);
+        assert_eq!(payload["environment_id"], 8);
+        assert_eq!(payload["container_id"], "container-9");
+        assert_eq!(payload["variable_name"], "DATABASE_URL");
+        assert!(payload.get("value").is_none());
+    }
+
+    #[tokio::test]
+    async fn container_environment_reveal_fails_closed_when_audit_fails() {
+        let audit = ContainerEnvironmentVariableRevealedAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: None,
+                user_agent: "container-reveal-test".to_string(),
+            },
+            project_id: 7,
+            environment_id: 8,
+            container_id: "container-9".to_string(),
+            variable_name: "DATABASE_URL".to_string(),
+        };
+
+        let problem = audit_container_environment_variable_reveal(&FailingAuditLogger, &audit)
+            .await
+            .expect_err("credential reveal must fail if audit persistence fails");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn container_environment_reveal_response_disables_storage() {
+        let response =
+            container_environment_variable_value_response("secret".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
     }
 
     struct MockImageBuilder;
@@ -2532,8 +2750,7 @@ mod tests {
         }
     }
 
-    /// Helper to create a mock AuthContext for testing
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context_for_role(role: temps_auth::Role) -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -2554,7 +2771,30 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    /// Helper to create a mock AuthContext for testing
+    fn create_test_auth_context() -> temps_auth::AuthContext {
+        create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    #[test]
+    fn reader_cannot_reveal_plaintext_container_environment_values() {
+        let problem = require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Reader,
+        ))
+        .expect_err("reader must not reveal plaintext container environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_reveal_plaintext_container_environment_values() {
+        require_container_environment_reveal(&create_test_auth_context_for_role(
+            temps_auth::Role::Admin,
+        ))
+        .expect("admin should be allowed to reveal plaintext container environment values");
     }
 
     /// Helper to create a mock RequestMetadata for testing
@@ -3619,6 +3859,8 @@ mod tests {
                 as Arc<dyn temps_deployer::static_deployer::StaticDeployer>,
             log_service.clone(),
             Arc::new(MockCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             Arc::new(ConfigService::new(
                 Arc::new(
@@ -4021,9 +4263,13 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::{deployment_jobs, deployments, environments, projects};
 
+        if !database_test_prerequisites_available().await {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return;
+        }
         let test_db = TestDatabase::with_migrations()
             .await
-            .expect("Failed to create test database");
+            .expect("Failed to create deployment ownership test database");
         let db = test_db.connection_arc();
 
         let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
@@ -4073,7 +4319,10 @@ mod tests {
         .await
         .expect("Failed to create test deployment");
 
-        // Create deployment jobs
+        // Create deployment jobs. The first row deliberately uses the legacy
+        // plaintext format to prove an authorized same-project read cannot
+        // receive secrets from historical/queued workflow configuration.
+        const SAME_PROJECT_SECRET: &str = "same-project-legacy-build-secret";
         let _job1 = deployment_jobs::ActiveModel {
             deployment_id: Set(deployment.id),
             job_id: Set("build-job".to_string()),
@@ -4081,6 +4330,10 @@ mod tests {
             name: Set("Build Job".to_string()),
             log_id: Set("build-log".to_string()),
             status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": SAME_PROJECT_SECRET},
+                "build_args_encrypted": "legacy-ciphertext-must-not-leave-api"
+            }))),
             ..Default::default()
         }
         .insert(&*db)
@@ -4099,6 +4352,73 @@ mod tests {
         .insert(&*db)
         .await
         .expect("Failed to create job 2");
+        std::fs::write(
+            temp_dir.join("build-log.log"),
+            "authorized same-project build log",
+        )
+        .expect("Failed to seed same-project build log");
+
+        // Seed another tenant's deployment with deliberately sensitive legacy
+        // job_config. Supplying the authorized project's ID with this foreign
+        // deployment ID must return 404 without exposing any job metadata.
+        let foreign_project = projects::ActiveModel {
+            name: Set("Foreign Project".to_string()),
+            slug: Set(format!("foreign-project-{}", uuid::Uuid::new_v4())),
+            repo_name: Set("foreign-repo".to_string()),
+            repo_owner: Set("foreign-owner".to_string()),
+            directory: Set("/tmp/foreign-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign project");
+
+        let foreign_subdomain = format!("foreign-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let foreign_environment = environments::ActiveModel {
+            project_id: Set(foreign_project.id),
+            name: Set("Foreign Environment".to_string()),
+            slug: Set("foreign-env".to_string()),
+            subdomain: Set(foreign_subdomain.clone()),
+            host: Set(format!("{}.localhost", foreign_subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign environment");
+
+        let foreign_deployment = deployments::ActiveModel {
+            project_id: Set(foreign_project.id),
+            environment_id: Set(foreign_environment.id),
+            slug: Set(format!("foreign-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign deployment");
+
+        const FOREIGN_SECRET: &str = "cross-project-build-secret";
+        let _foreign_job = deployment_jobs::ActiveModel {
+            deployment_id: Set(foreign_deployment.id),
+            job_id: Set("foreign-build-job".to_string()),
+            job_type: Set("build".to_string()),
+            name: Set("Foreign Build Job".to_string()),
+            log_id: Set("foreign-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": FOREIGN_SECRET}
+            }))),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create foreign job");
 
         let auth_middleware = middleware::from_fn(
             |mut req: Request, next: axum::middleware::Next| async move {
@@ -4140,6 +4460,91 @@ mod tests {
         let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
         assert!(body["jobs"].is_array());
         assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+        let body_json = body.to_string();
+        assert!(!body_json.contains(SAME_PROJECT_SECRET));
+        assert!(!body_json.contains("legacy-ciphertext-must-not-leave-api"));
+        assert!(
+            body["jobs"]
+                .as_array()
+                .expect("jobs must be an array")
+                .iter()
+                .all(|job| job["job_config"].is_null()),
+            "external job responses must redact executor-internal configuration",
+        );
+
+        let foreign_jobs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs",
+                addr, project.id, foreign_deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to request foreign deployment jobs");
+        assert_eq!(foreign_jobs_response.status(), StatusCode::NOT_FOUND);
+        let foreign_jobs_body = foreign_jobs_response
+            .text()
+            .await
+            .expect("Failed to read foreign jobs error");
+        assert!(!foreign_jobs_body.contains(FOREIGN_SECRET));
+        assert!(!foreign_jobs_body.contains("foreign-build-job"));
+
+        let foreign_logs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs/{}/logs",
+                addr, project.id, foreign_deployment.id, "foreign-build-job"
+            ))
+            .send()
+            .await
+            .expect("Failed to request foreign deployment job logs");
+        assert_eq!(foreign_logs_response.status(), StatusCode::NOT_FOUND);
+        let foreign_logs_body = foreign_logs_response
+            .text()
+            .await
+            .expect("Failed to read foreign logs error");
+        assert!(!foreign_logs_body.contains(FOREIGN_SECRET));
+        assert!(!foreign_logs_body.contains("foreign-build-job"));
+
+        let own_logs_response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs/{}/logs",
+                addr, project.id, deployment.id, "build-job"
+            ))
+            .send()
+            .await
+            .expect("Failed to request same-project deployment job logs");
+        assert_eq!(own_logs_response.status(), StatusCode::OK);
+        assert_eq!(
+            own_logs_response
+                .text()
+                .await
+                .expect("Failed to read same-project logs"),
+            "authorized same-project build log"
+        );
+
+        let own_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, deployment.id, "build-job"
+        );
+        let (mut own_socket, own_upgrade) = connect_async(own_ws_url)
+            .await
+            .expect("same-project log tail must upgrade");
+        assert_eq!(own_upgrade.status(), StatusCode::SWITCHING_PROTOCOLS);
+        own_socket
+            .close(None)
+            .await
+            .expect("same-project log tail socket must close cleanly");
+
+        let foreign_ws_url = format!(
+            "ws://{}/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, foreign_deployment.id, "foreign-build-job"
+        );
+        let foreign_upgrade = connect_async(foreign_ws_url).await;
+        match foreign_upgrade {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+            other => panic!("foreign log tail must be rejected before upgrade: {other:?}"),
+        }
 
         println!("✅ GET /projects/{{project_id}}/deployments/{{deployment_id}}/jobs test passed");
         std::fs::remove_dir_all(&temp_dir).ok();
