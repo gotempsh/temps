@@ -49,6 +49,10 @@ pub struct EnvironmentSettingsUpdatedFields {
     /// `None` = unchanged, `Some(None)` = cleared (inherit project),
     /// `Some(Some(b))` = overridden.
     pub attack_mode: Option<Option<bool>>,
+    /// Per-environment HTTP→HTTPS redirect override change (tri-state):
+    /// `None` = unchanged, `Some(None)` = cleared (inherit the proxy default),
+    /// `Some(Some(b))` = overridden.
+    pub force_https: Option<Option<bool>>,
 }
 
 // Add these new audit structs after the other audit structs

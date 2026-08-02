@@ -140,6 +140,17 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(resourcesCmd)
 
+  // Force HTTPS subcommand
+  environments
+    .command('force-https <environment>')
+    .description('View or set the HTTP to HTTPS redirect override for an environment')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--enable', 'Always redirect plain HTTP to HTTPS, even without a local certificate')
+    .option('--disable', 'Never redirect: keep serving this environment over plain HTTP')
+    .option('--inherit', 'Clear the override and follow the proxy default')
+    .option('--json', 'Output in JSON format')
+    .action(forceHttpsCmd)
+
   // Scale subcommand
   environments
     .command('scale')
@@ -1123,6 +1134,126 @@ function displayResources(env: EnvironmentResponse | null | undefined): void {
   info(`${colors.bold('Requests')} = guaranteed minimum resources`)
   newline()
   info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
+}
+
+// ============ Force HTTPS Command ============
+
+interface ForceHttpsOptions {
+  project?: string
+  enable?: boolean
+  disable?: boolean
+  inherit?: boolean
+  json?: boolean
+}
+
+/**
+ * Render the tri-state override. `null`/`undefined` is deliberately NOT shown
+ * as "disabled": it means the proxy falls back to its default, which redirects
+ * any host that has an active TLS certificate.
+ */
+function describeForceHttps(value: boolean | null | undefined): string {
+  if (value === true) return colors.success('always redirect')
+  if (value === false) return colors.warning('never redirect')
+  return colors.muted('inherit (redirect only when the host has a certificate)')
+}
+
+async function forceHttpsCmd(environment: string, options: ForceHttpsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const chosen = [
+    options.enable ? '--enable' : null,
+    options.disable ? '--disable' : null,
+    options.inherit ? '--inherit' : null,
+  ].filter((flag): flag is string => flag !== null)
+
+  if (chosen.length > 1) {
+    errorOutput(`Pass only one of --enable, --disable, or --inherit (got ${chosen.join(' ')})`)
+    return
+  }
+
+  const resolved = await requireProjectSlug(options.project)
+
+  if (resolved.source !== 'flag') {
+    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
+  }
+
+  const projectId = await getProjectId(resolved.slug)
+
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  if (chosen.length === 0) {
+    // Read-only view
+    if (options.json) {
+      json({ environment: targetEnv.slug, force_https: targetEnv.force_https ?? null })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} HTTPS redirect for ${resolved.slug}/${targetEnv.slug}`)
+    newline()
+    keyValue('Force HTTPS', describeForceHttps(targetEnv.force_https))
+    newline()
+    info('Set it with --enable, --disable, or --inherit')
+    info(
+      `Requests under ${colors.muted('/.well-known/acme-challenge/')} are never redirected, ` +
+        'so Let\'s Encrypt HTTP-01 validation keeps working in every mode'
+    )
+    newline()
+    return
+  }
+
+  // `--inherit` sends an explicit JSON null to clear the override; the API
+  // distinguishes that from an absent field ("leave unchanged").
+  const nextValue: boolean | null = options.enable ? true : options.disable ? false : null
+
+  const updatedEnv = await withSpinner('Updating HTTPS redirect...', async () => {
+    const { data, error } = await updateEnvironmentSettings({
+      client,
+      path: { project_id: projectId, env_id: targetEnv.id },
+      body: { force_https: nextValue },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (options.json) {
+    json({ environment: updatedEnv?.slug, force_https: updatedEnv?.force_https ?? null })
+    return
+  }
+
+  newline()
+  success(`HTTPS redirect updated for ${resolved.slug}/${targetEnv.slug}`)
+  newline()
+  keyValue('Force HTTPS', describeForceHttps(updatedEnv?.force_https))
+  newline()
+
+  if (nextValue === true) {
+    info('Plain HTTP requests now get a 301 to the HTTPS URL, even if no certificate is registered here')
+    info('Use this when TLS is terminated upstream (CDN or external load balancer)')
+  } else if (nextValue === false) {
+    warning('Plain HTTP requests are served as-is — clients can reach this environment without TLS')
+  } else {
+    info('Following the proxy default: redirect only when the host has an active certificate')
+  }
+  newline()
 }
 
 // ============ Scale Command ============

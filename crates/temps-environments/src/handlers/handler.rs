@@ -176,6 +176,7 @@ pub async fn get_environments(
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
@@ -246,6 +247,7 @@ pub async fn get_environment(
         protected: env.protected,
         sleeping: env.sleeping,
         attack_mode: env.attack_mode,
+        force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
@@ -1147,6 +1149,7 @@ pub async fn update_environment_settings(
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
         attack_mode: settings.attack_mode,
+        force_https: settings.force_https,
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {
@@ -1222,6 +1225,7 @@ pub async fn update_environment_settings(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1326,6 +1330,7 @@ pub async fn update_environment_subdomain(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1481,6 +1486,7 @@ pub async fn wake_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1622,6 +1628,7 @@ pub async fn sleep_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1828,6 +1835,7 @@ pub async fn create_environment(
             protected: environment.protected,
             sleeping: environment.sleeping,
             attack_mode: environment.attack_mode,
+            force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !environment.sleeping {
                 environment

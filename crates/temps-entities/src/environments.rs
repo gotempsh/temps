@@ -43,6 +43,15 @@ pub struct Model {
     /// this environment, taking precedence over the project default.
     /// (A nullable boolean column maps to `Option<bool>` automatically.)
     pub attack_mode: Option<bool>,
+    /// Per-environment override for the proxy's HTTP→HTTPS redirect.
+    /// `None` (NULL) means inherit the proxy default, which redirects only when
+    /// the requested host has an active TLS certificate. `Some(true)` always
+    /// redirects plain HTTP for this environment (useful when TLS is terminated
+    /// by an upstream CDN, so no local cert exists to trigger the default);
+    /// `Some(false)` never redirects it (HTTP-only clients).
+    /// Requests under `/.well-known/acme-challenge/` are exempt in every case so
+    /// Let's Encrypt HTTP-01 issuance and renewal can always complete.
+    pub force_https: Option<bool>,
     /// Last proxied request timestamp for on-demand environments.
     /// Persisted periodically by the idle sweep, not on every request.
     pub last_activity_at: Option<DBDateTime>,

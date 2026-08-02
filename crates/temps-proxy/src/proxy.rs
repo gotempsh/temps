@@ -341,6 +341,58 @@ pub const LB_SEED: u64 = 42;
 pub const MAX_WEBHOOK_BODY_SIZE: usize = 16 * 1024;
 pub const LOG_STATIC_ASSETS: bool = false;
 
+/// Path prefix reserved for ACME HTTP-01 challenge validation (RFC 8555 §8.3).
+///
+/// Single source of truth: both the challenge responder and the HTTP→HTTPS
+/// redirect gate compare against this, so a request that could be a Let's
+/// Encrypt validation can never be redirected out from under the CA.
+pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
+
+/// Decide whether a request on the plain-HTTP listener should be answered with
+/// a 301 to the HTTPS URL.
+///
+/// The inputs, in the order they are consulted:
+///
+/// - `globally_disabled` — the `disable_https_redirect` operator kill switch
+///   (set by the service unit in local/testing mode). Master off; nothing
+///   overrides it, including a per-environment `force_https = true`, so a local
+///   rig never starts bouncing developers to a port with no certificate.
+/// - `is_tls` — already HTTPS, nothing to do.
+/// - `path` — anything under [`ACME_HTTP01_PREFIX`] is exempt unconditionally.
+///   A 301 here breaks issuance and, worse, silent renewal: the CA follows the
+///   redirect to an HTTPS endpoint whose certificate is precisely the one that
+///   has expired or does not exist yet. This exemption applies even when the
+///   host has a valid certificate, because renewal happens while the old
+///   certificate is still installed.
+/// - `env_force_https` — the per-environment override. `None` inherits
+///   `host_has_cert`; `Some(b)` wins outright.
+/// - `host_has_cert` — the default heuristic: redirect only hosts that actually
+///   completed TLS provisioning, so HTTP-only installs are never redirected.
+///
+/// Kept as a free function over plain values so the decision table is unit
+/// testable without a live session, and so the hot path stays allocation-free.
+/// `host_has_cert` is a closure rather than a `bool` to preserve the
+/// short-circuit the original `&&` chain had: the overwhelmingly common case is
+/// an HTTPS request, which must not pay for a cert-cache snapshot read, and an
+/// environment with an explicit override never needs the lookup at all.
+fn should_redirect_to_https(
+    globally_disabled: bool,
+    is_tls: bool,
+    path: &str,
+    env_force_https: Option<bool>,
+    host_has_cert: impl FnOnce() -> bool,
+) -> bool {
+    if globally_disabled || is_tls {
+        return false;
+    }
+
+    if path.starts_with(ACME_HTTP01_PREFIX) {
+        return false;
+    }
+
+    env_force_https.unwrap_or_else(host_has_cert)
+}
+
 /// Proxy context for tracking request state
 pub struct ProxyContext {
     pub response_modified: bool,
@@ -1167,13 +1219,11 @@ impl LoadBalancer {
     }
 
     async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
-        const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
-
-        if !path.starts_with(ACME_CHALLENGE_PREFIX) {
+        if !path.starts_with(ACME_HTTP01_PREFIX) {
             return Ok(None);
         }
 
-        let token = &path[ACME_CHALLENGE_PREFIX.len()..];
+        let token = &path[ACME_HTTP01_PREFIX.len()..];
         if token.is_empty() {
             debug!("Empty ACME challenge token in path: {}", path);
             return Ok(None);
@@ -2401,6 +2451,177 @@ mod upstream_io_timeout_tests {
     }
 }
 
+#[cfg(test)]
+mod https_redirect_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Convenience wrapper for the common "cert lookup returns X" case.
+    fn decide(
+        globally_disabled: bool,
+        is_tls: bool,
+        path: &str,
+        env_force_https: Option<bool>,
+        host_has_cert: bool,
+    ) -> bool {
+        should_redirect_to_https(globally_disabled, is_tls, path, env_force_https, || {
+            host_has_cert
+        })
+    }
+
+    #[test]
+    fn default_behaviour_follows_certificate_presence() {
+        // No per-environment override → the pre-existing heuristic is unchanged:
+        // hosts with a provisioned certificate are redirected, HTTP-only installs
+        // (sslip.io quick/local modes) are not.
+        assert!(decide(false, false, "/", None, true));
+        assert!(!decide(false, false, "/", None, false));
+    }
+
+    #[test]
+    fn force_https_true_redirects_without_a_local_certificate() {
+        // The motivating case: TLS terminated by an upstream CDN, so the control
+        // plane holds no certificate for the host and the default heuristic would
+        // happily keep serving a full 200 over plain HTTP alongside HTTPS.
+        assert!(decide(false, false, "/", Some(true), false));
+    }
+
+    #[test]
+    fn force_https_false_suppresses_redirect_even_with_a_certificate() {
+        // Escape hatch for environments that must stay reachable over plain HTTP
+        // (appliances, hardware clients with no modern TLS stack).
+        assert!(!decide(false, false, "/", Some(false), true));
+    }
+
+    #[test]
+    fn https_requests_are_never_redirected() {
+        for force in [None, Some(true), Some(false)] {
+            assert!(
+                !decide(false, true, "/", force, true),
+                "already-TLS request must never redirect (force_https={force:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn global_kill_switch_outranks_the_environment_override() {
+        // `disable_https_redirect` is set by the service unit in local/testing
+        // mode. A per-environment force_https must not resurrect the redirect
+        // there, or a developer's local rig bounces to a port serving no cert.
+        assert!(!decide(true, false, "/", Some(true), true));
+        assert!(!decide(true, false, "/", None, true));
+    }
+
+    #[test]
+    fn acme_challenge_is_exempt_under_every_override() {
+        let path = "/.well-known/acme-challenge/some-token";
+        for force in [None, Some(true), Some(false)] {
+            for has_cert in [true, false] {
+                assert!(
+                    !decide(false, false, path, force, has_cert),
+                    "ACME challenge must never redirect \
+                     (force_https={force:?}, has_cert={has_cert})"
+                );
+            }
+        }
+    }
+
+    /// Regression guard for silent renewal failure. A host that already has a
+    /// certificate is exactly the host that will renew, and renewal happens
+    /// while the old certificate is still installed. If the challenge request
+    /// were redirected, the CA would follow it to an HTTPS endpoint presenting
+    /// the certificate that is about to expire — issuance fails, nothing logs an
+    /// error at the proxy, and the site breaks weeks later when the old cert
+    /// finally lapses.
+    #[test]
+    fn acme_challenge_is_exempt_during_renewal_of_an_existing_certificate() {
+        assert!(!decide(
+            false,
+            false,
+            "/.well-known/acme-challenge/renewal-token",
+            None,
+            true,
+        ));
+    }
+
+    /// The exemption is anchored to the full challenge prefix, not a loose
+    /// `.well-known` match — other well-known resources should still be pushed
+    /// to HTTPS like any normal path.
+    #[test]
+    fn other_well_known_paths_still_redirect() {
+        assert!(decide(
+            false,
+            false,
+            "/.well-known/security.txt",
+            None,
+            true
+        ));
+        assert!(decide(
+            false,
+            false,
+            "/.well-known/acme-challenge-not-really",
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn certificate_lookup_is_skipped_when_it_cannot_change_the_answer() {
+        // The cert-cache read is a lock-free snapshot, but it runs on every
+        // plain-HTTP request, so the cases that cannot possibly need it must not
+        // pay for it.
+        let calls = Cell::new(0);
+        let counting_lookup = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        // Already HTTPS — the overwhelmingly common case.
+        assert!(!should_redirect_to_https(
+            false,
+            true,
+            "/",
+            None,
+            counting_lookup
+        ));
+        // Global kill switch.
+        assert!(!should_redirect_to_https(
+            true,
+            false,
+            "/",
+            None,
+            counting_lookup
+        ));
+        // ACME challenge.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/.well-known/acme-challenge/t",
+            None,
+            counting_lookup
+        ));
+        // Explicit environment override — answer is known without the lookup.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/",
+            Some(true),
+            counting_lookup
+        ));
+        assert_eq!(calls.get(), 0, "cert cache must not have been consulted");
+
+        // Only the inherit-the-default path consults it.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/",
+            None,
+            counting_lookup
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -3624,21 +3845,45 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // HTTP to HTTPS redirect for non-TLS connections.
-        // This MUST come after ACME challenge handling to allow Let's Encrypt HTTP-01 validation.
+        // This MUST come after ACME challenge handling to allow Let's Encrypt
+        // HTTP-01 validation. `should_redirect_to_https` additionally exempts the
+        // whole `/.well-known/acme-challenge/` prefix, so a validation request
+        // that did NOT match a stored token (renewal in flight, token written to
+        // a sibling domain row, wildcard parent) still falls through to normal
+        // routing instead of being 301'd to a certificate that has expired or
+        // does not exist yet.
         //
-        // Redirect is per-domain: we only redirect when the requesting host
-        // actually has an active TLS certificate in the database (exact match or
-        // wildcard parent). This means HTTP-only installs (sslip.io quick/local
-        // modes, no cert provisioned) never get redirected, while hosts that
-        // have gone through SSL provisioning get automatic HTTPS enforcement.
+        // By default the redirect is per-domain: we only redirect when the
+        // requesting host actually has an active TLS certificate in the database
+        // (exact match or wildcard parent). This means HTTP-only installs
+        // (sslip.io quick/local modes, no cert provisioned) never get redirected,
+        // while hosts that have gone through SSL provisioning get automatic HTTPS
+        // enforcement.
+        //
+        // The environment resolved above can override that default in either
+        // direction (`force_https`): `Some(true)` for sites whose TLS is
+        // terminated by an upstream CDN — no local cert exists, so the default
+        // heuristic would leave plain HTTP serving a full 200 alongside HTTPS —
+        // and `Some(false)` for environments that must stay reachable over HTTP.
+        // Reading it off `ctx.environment` costs nothing extra: the environment
+        // was already resolved and cloned into the context earlier in this
+        // filter, so there is no additional lookup on the hot path.
         //
         // `disable_https_redirect` is a global escape hatch (set by the service
-        // unit in local/testing mode) that bypasses the check entirely.
+        // unit in local/testing mode) that bypasses the check entirely and
+        // outranks the per-environment override.
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
-        let needs_redirect = !self.disable_https_redirect
-            && !self.is_tls_connection(session)
-            && self.cert_host_cache.has_cert_for_host(&ctx.host);
+        let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        let needs_redirect = should_redirect_to_https(
+            self.disable_https_redirect,
+            self.is_tls_connection(session),
+            &ctx.path,
+            env_force_https,
+            // Lock-free ArcSwap snapshot read, and only reached when the
+            // environment has no explicit override.
+            || self.cert_host_cache.has_cert_for_host(&ctx.host),
+        );
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
             let redirect_url = if let Some(query) = &ctx.query_string {

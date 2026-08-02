@@ -165,6 +165,12 @@ pub struct EnvironmentResponse {
     /// explicitly enable/disable the challenge for this environment. Always
     /// serialized (NOT skipped) so the UI can distinguish `null` from `false`.
     pub attack_mode: Option<bool>,
+    /// Per-environment HTTP→HTTPS redirect override.
+    /// `null` means inherit the proxy default (redirect only when the host has
+    /// an active TLS certificate); `true` always redirects plain HTTP for this
+    /// environment, `false` never does. Always serialized (NOT skipped) so the
+    /// UI can distinguish `null` from `false`.
+    pub force_https: Option<bool>,
     /// Last proxied request timestamp (epoch millis) for on-demand environments.
     /// NULL when on-demand is disabled or no traffic has been received yet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +216,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            force_https: env.force_https,
             last_activity_at,
             estimated_sleep_at,
         }
@@ -412,6 +419,19 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// - `true`/`false` → override the project setting for this environment
     #[serde(default, deserialize_with = "deserialize_optional_optional_bool")]
     pub attack_mode: Option<Option<bool>>,
+    /// Per-environment HTTP→HTTPS redirect override (tri-state):
+    /// - absent → leave the current override unchanged
+    /// - JSON `null` → clear the override (inherit the proxy default, which
+    ///   redirects only when the host has an active TLS certificate)
+    /// - `true` → always redirect plain HTTP to HTTPS for this environment,
+    ///   even when no local certificate exists (TLS terminated upstream)
+    /// - `false` → never redirect this environment, even when a certificate does
+    ///   exist
+    ///
+    /// Requests under `/.well-known/acme-challenge/` are never redirected
+    /// regardless of this setting, so ACME HTTP-01 validation always completes.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_bool")]
+    pub force_https: Option<Option<bool>>,
     /// Enable on-demand mode (scale-to-zero). Containers are stopped after
     /// idle_timeout_seconds of no traffic and started on the next request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,5 +589,47 @@ mod tests {
         let disabled: UpdateEnvironmentSettingsRequest =
             serde_json::from_str(r#"{"attack_mode":false}"#).unwrap();
         assert_eq!(disabled.attack_mode, Some(Some(false)));
+    }
+
+    /// `force_https` is the same tri-state shape as `attack_mode`. The `null`
+    /// case matters most here: clearing the override must restore the proxy's
+    /// certificate-driven default rather than pinning the environment to
+    /// "never redirect", which is what a plain `Option<bool>` would have done.
+    #[test]
+    fn force_https_distinguishes_absent_null_and_value() {
+        // Field absent → None (leave unchanged)
+        let absent: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"branch":"main"}"#).unwrap();
+        assert_eq!(absent.force_https, None);
+
+        // Field present as JSON null → Some(None) (clear → inherit proxy default)
+        let cleared: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":null}"#).unwrap();
+        assert_eq!(cleared.force_https, Some(None));
+
+        // Field present as true → Some(Some(true)) (always redirect)
+        let enabled: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
+        assert_eq!(enabled.force_https, Some(Some(true)));
+
+        // Field present as false → Some(Some(false)) (never redirect)
+        let disabled: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":false}"#).unwrap();
+        assert_eq!(disabled.force_https, Some(Some(false)));
+    }
+
+    /// `force_https` and `attack_mode` are independent overrides — updating one
+    /// must not implicitly clear the other.
+    #[test]
+    fn force_https_and_attack_mode_are_independent() {
+        let only_force: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
+        assert_eq!(only_force.force_https, Some(Some(true)));
+        assert_eq!(only_force.attack_mode, None);
+
+        let only_attack: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"attack_mode":true}"#).unwrap();
+        assert_eq!(only_attack.attack_mode, Some(Some(true)));
+        assert_eq!(only_attack.force_https, None);
     }
 }

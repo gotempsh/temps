@@ -719,6 +719,10 @@ impl EnvironmentService {
         if let Some(attack_mode) = settings.attack_mode {
             active_model.attack_mode = Set(attack_mode);
         }
+        // force_https follows the same tri-state contract as attack_mode.
+        if let Some(force_https) = settings.force_https {
+            active_model.force_https = Set(force_https);
+        }
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
@@ -1127,6 +1131,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
         let mut fenced = environment.clone();
@@ -1242,6 +1247,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -1288,6 +1294,7 @@ mod tests {
                     cross_architecture_builds: None,
                     protected: None,
                     attack_mode: None,
+                    force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
@@ -1328,6 +1335,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }
