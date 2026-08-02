@@ -21,8 +21,8 @@ impl AuditOperation for EmailProviderCreatedAudit {
         "EMAIL_PROVIDER_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -54,8 +54,8 @@ impl AuditOperation for EmailProviderUpdatedAudit {
         "EMAIL_PROVIDER_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -83,8 +83,8 @@ impl AuditOperation for EmailProviderDeletedAudit {
         "EMAIL_PROVIDER_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -116,8 +116,8 @@ impl AuditOperation for EmailProviderTestedAudit {
         "EMAIL_PROVIDER_TESTED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -148,8 +148,8 @@ impl AuditOperation for EmailProviderTrackingSetupAudit {
         "EMAIL_PROVIDER_TRACKING_SETUP".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -182,8 +182,8 @@ impl AuditOperation for EmailDomainCreatedAudit {
         "EMAIL_DOMAIN_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -212,8 +212,8 @@ impl AuditOperation for EmailDomainVerifiedAudit {
         "EMAIL_DOMAIN_VERIFIED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -241,8 +241,8 @@ impl AuditOperation for EmailDomainDeletedAudit {
         "EMAIL_DOMAIN_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -276,8 +276,8 @@ impl AuditOperation for EmailSentAudit {
         "EMAIL_SENT".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

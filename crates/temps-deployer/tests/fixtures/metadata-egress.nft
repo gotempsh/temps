@@ -1,0 +1,14 @@
+# `add` makes the following delete valid on both first install and refresh.
+# nft applies the complete batch atomically at COMMIT.
+add table inet temps_metadata
+delete table inet temps_metadata
+add table inet temps_metadata
+add chain inet temps_metadata forward { type filter hook forward priority -200; policy accept; }
+
+# IPv4 link-local covers AWS/GCP/Azure/Hetzner/DO/Tencent metadata endpoints.
+add rule inet temps_metadata forward ip daddr 169.254.0.0/16 counter reject with icmp type port-unreachable
+# Alibaba Cloud metadata.
+add rule inet temps_metadata forward ip daddr 100.100.100.200 counter reject with icmp type port-unreachable
+# AWS and Google IPv6 metadata endpoints.
+add rule inet temps_metadata forward ip6 daddr fd00:ec2::254 counter reject with icmpv6 type port-unreachable
+add rule inet temps_metadata forward ip6 daddr fd20:ce::254 counter reject with icmpv6 type port-unreachable

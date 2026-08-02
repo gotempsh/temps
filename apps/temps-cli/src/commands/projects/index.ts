@@ -30,7 +30,7 @@ export function registerProjectsCommands(program: Command): void {
     .description('Create a new project (git-based or manual deployment)')
     .option('-n, --name <name>', 'Project name')
     .option('-d, --description <description>', 'Project description')
-    .option('--repo <repository>', 'Repository in owner/name format')
+    .option('--repo <repository>', 'Repository in owner/name format (nested groups supported: group/subgroup/name)')
     .option('--branch <branch>', 'Git branch')
     .option('--directory <directory>', 'Root directory (relative to repo)')
     .option('--preset <preset>', 'Build preset (e.g., nextjs, nodejs, static, docker)')

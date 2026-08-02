@@ -21,6 +21,7 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod metadata_egress;
 pub mod platform;
 pub mod plugin;
 pub mod readiness;

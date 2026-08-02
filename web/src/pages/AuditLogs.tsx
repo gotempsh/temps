@@ -64,6 +64,7 @@ const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'MFA_ENABLED', label: 'MFA Enabled' },
       { value: 'MFA_DISABLED', label: 'MFA Disabled' },
       { value: 'MFA_VERIFIED', label: 'MFA Verified' },
+      { value: 'MFA_VERIFICATION_FAILED', label: 'MFA Verification Failed' },
     ],
   },
   {

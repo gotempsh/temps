@@ -31,28 +31,41 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// Request body for validating an email address
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ValidateEmailRequest {
     /// Email address to validate
     #[schema(example = "someone@gmail.com")]
     pub email: String,
-    /// Optional SOCKS5 proxy configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<ProxyRequest>,
 }
 
-/// Proxy configuration for email validation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ProxyRequest {
-    /// Proxy host
-    #[schema(example = "proxy.example.com")]
-    pub host: String,
-    /// Proxy port
-    #[schema(example = 1080)]
-    pub port: u16,
-    /// Optional proxy username
-    pub username: Option<String>,
-    /// Optional proxy password
-    pub password: Option<String>,
+#[cfg(test)]
+mod tests {
+    use super::ValidateEmailRequest;
+    use serde_json::json;
+
+    #[test]
+    fn validate_email_request_accepts_email_only() {
+        let request: ValidateEmailRequest = serde_json::from_value(json!({
+            "email": "someone@example.com"
+        }))
+        .expect("email-only validation request should deserialize");
+
+        assert_eq!(request.email, "someone@example.com");
+    }
+
+    #[test]
+    fn validate_email_request_rejects_request_controlled_proxy() {
+        let result = serde_json::from_value::<ValidateEmailRequest>(json!({
+            "email": "someone@example.com",
+            "proxy": {
+                "host": "127.0.0.1",
+                "port": 5432
+            }
+        }));
+
+        let error = result.expect_err("request-controlled SMTP proxy must be rejected");
+        assert!(error.to_string().contains("unknown field `proxy`"));
+    }
 }
 
 /// Email reachability status
@@ -247,17 +260,8 @@ pub async fn validate_email(
             .build());
     }
 
-    // Convert proxy config if provided
-    let proxy = request.proxy.map(|p| crate::services::ProxyConfig {
-        host: p.host,
-        port: p.port,
-        username: p.username,
-        password: p.password,
-    });
-
     let service_request = ServiceValidateEmailRequest {
         email: request.email.clone(),
-        proxy,
     };
 
     let result = state

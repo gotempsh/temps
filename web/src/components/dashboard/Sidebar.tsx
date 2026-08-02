@@ -874,7 +874,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
   )
   return (
     <>
-      <SwapHeader title="Settings" onBack={onBack} />
+      <SwapHeader title="Settings" onBack={onBack} backLabel="Back to menu" />
       {settingsGroups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
         const siblings = allSettingsUrls.filter((u) => !ownUrls.has(u))
@@ -1068,7 +1068,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   if (!project) {
     return (
       <>
-        <SwapHeader title="Loading…" onBack={onBack} />
+        <SwapHeader title="Loading…" onBack={onBack} backLabel="Back to menu" />
       </>
     )
   }
@@ -1090,7 +1090,11 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     if (parent?.subItems?.length) {
       return (
         <>
-          <SwapHeader title={parent.title} onBack={() => setDrilledTo(null)} />
+          <SwapHeader
+            title={parent.title}
+            onBack={() => setDrilledTo(null)}
+            backLabel={`Back to ${project.name}`}
+          />
           <SidebarGroup className="pt-0">
             <SidebarMenu>
               {parent.subItems.map((sub) => {
@@ -1123,7 +1127,11 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
 
   return (
     <>
-      <SwapHeader title={project.name} onBack={onBack} />
+      <SwapHeader
+        title={project.name}
+        onBack={onBack}
+        backLabel="Back to menu"
+      />
       <SidebarGroup className="pt-0">
         <SidebarMenu>
           {items.map((item) => {
@@ -1251,10 +1259,43 @@ function CurrentProjectPin({
 
 // Shared back-arrow header used by Settings, Project, and drill-down
 // sub-views. `onBack` is a state callback — it never navigates.
-function SwapHeader({ title, onBack }: { title: string; onBack: () => void }) {
+//
+// `backLabel` names the destination, and is only surfaced when the sidebar is
+// collapsed: expanded, the row reads "← Analytics" (where you *are*, which the
+// surrounding items already imply), but collapsed there is nothing but an arrow,
+// so the tooltip has to say where it goes.
+function SwapHeader({
+  title,
+  onBack,
+  backLabel = 'Back',
+}: {
+  title: string
+  onBack: () => void
+  backLabel?: string
+}) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  if (compact) return null
+  // Collapsed, this used to render nothing at all — leaving a second-level nav
+  // (e.g. a project's Analytics sub-items) with no way back out except
+  // re-expanding the sidebar or using the breadcrumb.
+  if (compact) {
+    return (
+      <SidebarGroup className="pb-0">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip={backLabel}
+              aria-label={backLabel}
+              onClick={onBack}
+              className="justify-center text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft />
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
   return (
     <SidebarGroup className="pb-0">
       <button

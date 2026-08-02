@@ -7,6 +7,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Superseded PR pushes used to leave the previous run's jobs going to
+# completion — including an 80-minute cold musl build whose output nobody
+# would ever look at, while the new commit's jobs queued behind it. Cancel
+# them. Never on `main`: those runs are what populate the default-branch
+# cache scope that every PR reads from.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -22,9 +31,27 @@ jobs:
       - name: Verify nightly release wiring
         run: .github/scripts/test-nightly-release-workflows.sh
 
-  compose-security:
-    name: Compose Security
+  # ---------------------------------------------------------------------------
+  # One `temps` binary, two consumers.
+  #
+  # Compose Security needs a musl binary to assemble the production image
+  # around; the e2e job needs a runnable `temps` to drive real deployments.
+  # These used to be two separate compiles of the same workspace — a `fast`
+  # musl build here and a `--release` glibc build in `e2e-tests.yml`, each
+  # with its own web-UI + WASM build in front of it. Now this job compiles
+  # once and both consume the artifact.
+  #
+  # musl-static is the right target for both: it is exactly the binary that
+  # ships in the Docker image, and a static binary runs fine directly on the
+  # runner. E2E therefore now tests the artifact users actually get.
+  # ---------------------------------------------------------------------------
+  build-binary:
+    name: Build temps Binary (musl)
     runs-on: ubuntu-latest
+    # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
+    # which took 81 minutes the last time the cargo cache was evicted — a
+    # tighter bound would turn a slow run into a failed one.
+    timeout-minutes: 100
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -45,15 +72,46 @@ jobs:
           target: toolchain
           load: true
           tags: temps-toolchain:ci
-          cache-from: type=gha,scope=compose-security-toolchain
-          cache-to: type=gha,scope=compose-security-toolchain,mode=max
+          # Second entry is the pre-rename scope, kept so in-flight PRs don't
+          # all pay for a cold toolchain build until `main` repopulates the
+          # new one. Safe to drop after a `main` build has run.
+          cache-from: |
+            type=gha,scope=temps-toolchain
+            type=gha,scope=compose-security-toolchain
+          # Write from `main` only. Cache writes are scoped to the producing
+          # ref, so exporting from PRs stored a private copy of a
+          # byte-identical image in every open PR's scope — four concurrent
+          # PRs held four copies of the same layer set, ~718MB each, ~2.9GB
+          # of a 10GB pool, evicting the cargo caches this job depends on.
+          # Reads see `main`'s copy, which is what every ref can read anyway.
+          # A PR touching the Dockerfile's toolchain stage rebuilds it (~7min)
+          # and can't cache that for its own next push; toolchain changes are
+          # rare enough that this is the cheaper side of the trade.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=temps-toolchain,mode=max' || '' }}
 
-      - name: Cache cargo target dir (musl, fast profile)
-        uses: actions/cache@v6
+      # Keyed on Cargo.lock + Dockerfile, so any dependency bump misses. The
+      # `restore-keys` prefix is what makes that survivable: it falls back to
+      # the most recent musl target dir and rebuilds only what changed. That
+      # fallback only works if the entry still exists — see the note in
+      # `release.yml` about the 10GB pool being flooded by dead tag-scoped
+      # buildkit blobs, which is what made this miss outright and turned a
+      # ~5 minute incremental build into 81 minutes of cold compile.
+      #
+      # Restore always, save from `main` only. This is the largest single
+      # cache in the repo (a musl target dir plus cargo registry for 55
+      # crates), so a per-ref copy of it is what pushed the pool over its
+      # 10GB limit fastest — four open PRs each holding their own was several
+      # GB spent guaranteeing that nobody's copy survived. A PR that changes
+      # Cargo.lock now rebuilds the delta on top of main's copy on every
+      # push, instead of everyone cold-building because the pool thrashed.
+      - name: Restore cargo target dir (musl, fast profile)
+        id: musl-cache
+        uses: actions/cache/restore@v6
         with:
           path: ci-build-cache
-          key: compose-security-musl-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
           restore-keys: |
+            temps-musl-fast-
             compose-security-musl-
 
       # Mirrors the Dockerfile builder stage (WASM -> web UI -> cargo build)
@@ -81,6 +139,53 @@ jobs:
                 ci-prebuilt crates/temps-cli/dist
             '
           chmod +x ci-prebuilt/temps
+          file ci-prebuilt/temps
+
+      - name: Save cargo target dir (musl, fast profile)
+        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ci-build-cache
+          key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+
+      - name: Upload temps binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-binary-musl-fast
+          path: ci-prebuilt/temps
+          retention-days: 1
+          # Already a stripped binary; re-compressing costs more than it saves.
+          compression-level: 0
+
+  # Lives in its own file for readability; called from here so it can reuse
+  # the binary `build-binary` already compiled. Artifacts are per-run, and a
+  # called workflow is part of the same run, so the download just works.
+  e2e:
+    name: E2E
+    needs: build-binary
+    uses: ./.github/workflows/e2e-tests.yml
+    with:
+      binary-artifact: temps-binary-musl-fast
+
+  compose-security:
+    name: Compose Security
+    runs-on: ubuntu-latest
+    needs: build-binary
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: temps-binary-musl-fast
+          path: ci-prebuilt
+
+      - name: Restore executable bit
+        run: chmod +x ci-prebuilt/temps
 
       # Assemble the production runtime stage around the prebuilt binary —
       # the builder stage is skipped entirely, so this takes ~1 minute.
@@ -120,10 +225,18 @@ jobs:
           # Share the same cache slot as build-tests/clippy instead of each
           # getting its own — they compile largely the same dependency graph,
           # and per-job caches were bloating the repo's total cache footprint
-          # enough to evict other workflows' caches (e.g. e2e-tests.yml's
-          # release build) well before their 7-day idle expiry.
+          # enough to evict other workflows' caches well before their 7-day
+          # idle expiry.
+          #
+          # Deduping by key was only half of it: writes are also scoped to the
+          # producing ref, so `save-if: true` stored a separate ~886MB copy in
+          # every open PR's scope. A snapshot with three PRs in flight held
+          # 2.66GB of this one key. Save from `main` — the scope every ref can
+          # read — and let PRs restore from it. A PR that shifts the
+          # dependency graph rebuilds the delta on top of main's copy, which
+          # is what the prefix restore-keys are for.
           shared-key: test-build
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
@@ -172,8 +285,11 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
+      # Restore always, save only from `main` — see the cache-scoping note on
+      # the toolchain export above.
+      - name: Restore Bun dependencies
+        id: bun-cache
+        uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -182,6 +298,13 @@ jobs:
 
       - name: Install dependencies
         run: cd web && bun install
+
+      - name: Save Bun dependencies
+        if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       # react/react-dom drifting apart is invisible to tsc and rsbuild but
       # blanks the console at runtime with React error #527 (issue #504).
@@ -213,9 +336,10 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # See the check job above for why this shares build-tests' key.
+          # See the check job above for why this shares build-tests' key
+          # and why it only saves from `main`.
           shared-key: test-build
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
@@ -286,7 +410,10 @@ jobs:
           # so there's no cross-scope resolver mismatch to worry about (see
           # the removed per-group cache keys this replaces).
           shared-key: nextest-archive
-          save-if: true
+          # Save from `main` only — this key's archive runs ~1.3GB, and
+          # per-PR copies of it were a top-three consumer of the repo's 10GB
+          # cache pool. See the check job for the full reasoning.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

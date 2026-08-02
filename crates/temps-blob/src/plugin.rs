@@ -173,35 +173,33 @@ impl TempsPlugin for BlobPlugin {
                             BLOB_RUSTFS_SERVICE_NAME, service_model.id, service_model.status
                         );
 
+                        // Goes through the manager rather than calling
+                        // `init()` directly so the parameters the engine
+                        // infers — notably the port it adopts from the
+                        // running container — are written back to the row.
+                        // `health_probe` reads that stored port, so dropping
+                        // it here makes the health monitor probe a port the
+                        // service no longer uses.
                         match external_service_manager
-                            .get_service_config(service_model.id)
+                            .initialize_plugin_service(service_model.id, rustfs_service.as_ref())
                             .await
                         {
-                            Ok(service_config) => match rustfs_service.init(service_config).await {
-                                Ok(_) => {
-                                    info!(
-                                        "Blob RustFS service '{}' initialized successfully from database config",
-                                        BLOB_RUSTFS_SERVICE_NAME
-                                    );
-                                    if let Err(e) = rustfs_service.start().await {
-                                        warn!(
-                                            "Failed to start Blob RustFS container (may already be running): {}",
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
+                            Ok(()) => {
+                                info!(
+                                    "Blob RustFS service '{}' initialized successfully from database config",
+                                    BLOB_RUSTFS_SERVICE_NAME
+                                );
+                                if let Err(e) = rustfs_service.start().await {
                                     warn!(
-                                        "Failed to initialize Blob RustFS service from database config: {}. \
-                                         The service will need to be created via the API.",
+                                        "Failed to start Blob RustFS container (may already be running): {}",
                                         e
                                     );
                                 }
-                            },
+                            }
                             Err(e) => {
                                 warn!(
-                                    "Failed to get Blob service config from database: {}. \
-                                     The service may need to be recreated.",
+                                    "Failed to initialize Blob RustFS service from database config: {}. \
+                                     The service will need to be created via the API.",
                                     e
                                 );
                             }

@@ -459,26 +459,21 @@ pub async fn kv_enable(
             existing.status
         );
 
-        // Get the service config from the database and initialize the plugin's RedisService
-        // This is necessary because the plugin may have skipped initialization if the service was stopped
-        let service_config = state
-            .external_service_manager
-            .get_service_config(existing.id)
-            .await
-            .map_err(|e| {
-                error!("Failed to get KV service config: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable KV Service")
-                    .with_detail(format!("Could not get KV service config: {}", e))
-            })?;
-
+        // Initialize the plugin's RedisService from the stored config, and
+        // write the engine's inferred parameters back to the row. This is
+        // necessary because the plugin skips initialization when the service
+        // was stopped; going through the manager also keeps the stored port
+        // — which `health_probe` reads — matching the live container.
         info!(
-            "Retrieved KV service config (service_id: {}), initializing RedisService...",
+            "Initializing RedisService from stored config (service_id: {})...",
             existing.id
         );
 
-        // Initialize the plugin's RedisService with the config from database
-        if let Err(e) = state.redis_service.init(service_config).await {
+        if let Err(e) = state
+            .external_service_manager
+            .initialize_plugin_service(existing.id, state.redis_service.as_ref())
+            .await
+        {
             error!("Failed to initialize RedisService: {}", e);
             return Err(
                 temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -563,21 +558,10 @@ pub async fn kv_enable(
         // set goes through — is still unconfigured. Without this the branch
         // above returns "enabled successfully" and then every KV request
         // fails until the server is restarted and the plugin initializes
-        // itself on boot. Load the config it just persisted.
-        let service_config = state
-            .external_service_manager
-            .get_service_config(created.id)
-            .await
-            .map_err(|e| {
-                error!("Failed to get config for newly created KV service: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable KV Service")
-                    .with_detail(format!("Could not read back KV service config: {}", e))
-            })?;
-
+        // itself on boot.
         state
-            .redis_service
-            .init(service_config)
+            .external_service_manager
+            .initialize_plugin_service(created.id, state.redis_service.as_ref())
             .await
             .map_err(|e| {
                 error!("Failed to initialize RedisService after create: {}", e);

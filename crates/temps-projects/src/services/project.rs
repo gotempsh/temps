@@ -19,6 +19,46 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
 // Placeholder functions - these should be implemented properly or imported from other services
 
+/// Whether changing `repo_owner`/`repo_name` would leave `git_url` pointing at
+/// a different repository.
+///
+/// Returns `Some((old, new))` — both as `owner/name` — only when the stored URL
+/// demonstrably identifies the *current* repo and the requested change moves
+/// away from it. A URL that doesn't carry a recognisable `owner/name` tail
+/// (self-hosted layouts, ssh remotes with unusual paths) returns `None`: we
+/// can't prove a desync, so we don't block the operator.
+fn would_desync_git_url(
+    git_url: &Option<String>,
+    current: (&str, &str),
+    requested: (Option<&str>, Option<&str>),
+) -> Option<(String, String)> {
+    let (new_owner, new_name) = (
+        requested.0.unwrap_or(current.0),
+        requested.1.unwrap_or(current.1),
+    );
+    let old_pair = format!("{}/{}", current.0, current.1);
+    let new_pair = format!("{}/{}", new_owner, new_name);
+    if old_pair == new_pair {
+        return None;
+    }
+
+    let url = git_url.as_deref()?;
+    // Compare on the `owner/name` tail, ignoring a `.git` suffix and any
+    // trailing slash, so https/ssh and with/without `.git` all match.
+    let tail = url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit(['/', ':'])
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.len() < 2 {
+        return None;
+    }
+    let url_pair = format!("{}/{}", tail[1], tail[0]);
+
+    (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
+
 fn slugify(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -1241,6 +1281,33 @@ impl ProjectService {
                     "Project {} not found",
                     project_id
                 )))?;
+
+            // `repo_owner`/`repo_name` and `git_url` are read by different
+            // code paths — branch resolution uses the former, the clone uses
+            // the latter — and this endpoint only writes the former. Changing
+            // the repo identity here therefore used to leave a stale clone
+            // URL behind, and the next deploy resolved a commit from one repo
+            // and cloned another:
+            //
+            //   Starting repository download for owner/new-repo
+            //   Checking out ref: <commit that only exists in new-repo>
+            //   Cloning public repository from: .../old-repo.git
+            //
+            // The project could not be recovered through the API. Reject the
+            // change when it would actually desync — the git URL is owned by
+            // `POST /projects/{id}/git`, which validates it.
+            let desync = would_desync_git_url(
+                &project.git_url,
+                (&project.repo_owner, &project.repo_name),
+                (repo_owner.as_deref(), repo_name.as_deref()),
+            );
+            if let Some((old, new)) = desync {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Changing the repository to '{new}' would leave the clone URL pointing at \
+                     '{old}'. Update both together with POST /projects/{project_id}/git, which \
+                     sets git_url alongside the owner and name."
+                )));
+            }
 
             let existing_preset_config = project.preset_config.clone();
             let mut active_project: projects::ActiveModel = project.into();
@@ -2995,6 +3062,74 @@ impl ProjectService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    // ── git_url / repo identity consistency ─────────────────────────────
+
+    /// The failure this guards: the repo identity was changed through
+    /// `/settings`, the clone URL was left behind, and the next deploy
+    /// resolved a commit from the new repo while cloning the old one.
+    #[test]
+    fn test_repo_change_that_strands_git_url_is_detected() {
+        let url = Some("https://github.com/acme/old-repo.git".to_string());
+        let desync = would_desync_git_url(&url, ("acme", "old-repo"), (None, Some("new-repo")));
+
+        let (old, new) = desync.expect("changing the name strands the URL");
+        assert_eq!(old, "acme/old-repo");
+        assert_eq!(new, "acme/new-repo");
+    }
+
+    /// Changing the owner counts too.
+    #[test]
+    fn test_owner_change_is_detected() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (Some("other"), None)).is_some());
+    }
+
+    /// No repo change means nothing to desync, whatever the URL looks like.
+    #[test]
+    fn test_no_repo_change_is_allowed() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (None, None)).is_none());
+        assert!(
+            would_desync_git_url(&url, ("acme", "app"), (Some("acme"), Some("app"))).is_none(),
+            "restating the same values is not a change"
+        );
+    }
+
+    /// A URL that doesn't identify the current repo can't be proven stale, so
+    /// the operator isn't blocked — self-hosted layouts and unusual remotes
+    /// must keep working.
+    #[test]
+    fn test_unrelated_or_unparsable_url_does_not_block() {
+        // Points somewhere that isn't the current repo: not our call to make.
+        let other = Some("https://git.internal/mirrors/vendored.git".to_string());
+        assert!(would_desync_git_url(&other, ("acme", "app"), (None, Some("app2"))).is_none());
+
+        // No URL at all.
+        assert!(would_desync_git_url(&None, ("acme", "app"), (None, Some("app2"))).is_none());
+    }
+
+    /// ssh remotes and missing `.git` must match the same way https does,
+    /// or the guard would fire on projects it shouldn't.
+    #[test]
+    fn test_matching_is_scheme_and_suffix_insensitive() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://github.com/ACME/App.git",
+        ] {
+            assert!(
+                would_desync_git_url(
+                    &Some(url.to_string()),
+                    ("acme", "app"),
+                    (None, Some("app2"))
+                )
+                .is_some(),
+                "should recognise {url} as the current repo"
+            );
+        }
+    }
     use std::sync::Arc;
     use std::sync::Mutex;
     use temps_core::async_trait::async_trait;

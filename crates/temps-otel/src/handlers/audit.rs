@@ -35,8 +35,8 @@ impl AuditOperation for OtelDashboardCreatedAudit {
         "OTEL_DASHBOARD_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -58,8 +58,8 @@ impl AuditOperation for OtelDashboardUpdatedAudit {
         "OTEL_DASHBOARD_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -81,8 +81,8 @@ impl AuditOperation for OtelDashboardDeletedAudit {
         "OTEL_DASHBOARD_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -118,8 +118,8 @@ impl AuditOperation for CrossProjectTraceSiblingsReadAudit {
         "CROSS_PROJECT_TRACE_SIBLINGS_READ".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -152,8 +152,8 @@ impl AuditOperation for UnifiedTraceReadAudit {
         "UNIFIED_TRACE_READ".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -202,8 +202,8 @@ impl AuditOperation for OtelMetricAlertCreatedAudit {
         "OTEL_METRIC_ALERT_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -225,8 +225,8 @@ impl AuditOperation for OtelMetricAlertUpdatedAudit {
         "OTEL_METRIC_ALERT_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -248,8 +248,8 @@ impl AuditOperation for OtelMetricAlertDeletedAudit {
         "OTEL_METRIC_ALERT_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

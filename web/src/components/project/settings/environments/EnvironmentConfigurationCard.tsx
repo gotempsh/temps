@@ -80,6 +80,32 @@ function attackModeToPayload(value: AttackModeSelect): boolean | null {
   return null
 }
 
+/** Select value for the tri-state environment HTTP→HTTPS redirect override. */
+type ForceHttpsSelect = 'inherit' | 'always' | 'never'
+
+/**
+ * Map the environment's nullable `force_https` to the select value.
+ * `null`/`undefined` → "inherit", which is NOT the same as "never": the proxy
+ * default still redirects any host that has an active TLS certificate.
+ */
+function forceHttpsToSelect(
+  value: boolean | null | undefined
+): ForceHttpsSelect {
+  if (value === true) return 'always'
+  if (value === false) return 'never'
+  return 'inherit'
+}
+
+/**
+ * Map the select value back to the API payload. "inherit" sends `null` to clear
+ * the override; "always"/"never" send the explicit boolean.
+ */
+function forceHttpsToPayload(value: ForceHttpsSelect): boolean | null {
+  if (value === 'always') return true
+  if (value === 'never') return false
+  return null
+}
+
 export function EnvironmentConfigurationCard({
   project,
   environment,
@@ -109,6 +135,7 @@ export function EnvironmentConfigurationCard({
     // 'on' (true → force on) or 'off' (false → force off). Map the nullable
     // boolean from the API to the select value.
     attack_mode: attackModeToSelect(environment.attack_mode),
+    force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
     target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
@@ -163,6 +190,7 @@ export function EnvironmentConfigurationCard({
       replicas: environment.deployment_config?.replicas?.toString() ?? '1',
       exposed_port: environment.deployment_config?.exposedPort?.toString() ?? '',
       attack_mode: attackModeToSelect(environment.attack_mode),
+      force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
       target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
@@ -244,6 +272,9 @@ export function EnvironmentConfigurationCard({
         automatic_deploy: formData.automatic_deploy,
         // Tri-state: null clears the override (inherit project), true/false force it.
         attack_mode: attackModeToPayload(formData.attack_mode),
+        // Tri-state: null clears the override (inherit the proxy's
+        // certificate-driven default), true/false force it.
+        force_https: forceHttpsToPayload(formData.force_https),
         anti_affinity: formData.anti_affinity,
         target_nodes:
           formData.target_nodes.length > 0 ? formData.target_nodes : null,
@@ -821,6 +852,41 @@ export function EnvironmentConfigurationCard({
                       </SelectItem>
                       <SelectItem value="on">On</SelectItem>
                       <SelectItem value="off">Off</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
+                  <div className="flex-1 min-w-0">
+                    <Label className="text-sm font-medium">Force HTTPS</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Redirect plain HTTP requests to HTTPS with a 301. Inherit
+                      redirects only when this environment&apos;s host has a
+                      certificate issued here — choose Always when TLS is
+                      terminated upstream (CDN or external load balancer), since
+                      there is no local certificate to trigger the default.
+                      Let&apos;s Encrypt HTTP-01 challenges are never
+                      redirected.
+                    </p>
+                  </div>
+                  <Select
+                    value={formData.force_https}
+                    onValueChange={(value) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        force_https: value as ForceHttpsSelect,
+                      }))
+                    }
+                  >
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="inherit">
+                        Inherit (when certified)
+                      </SelectItem>
+                      <SelectItem value="always">Always</SelectItem>
+                      <SelectItem value="never">Never</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
