@@ -91,6 +91,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
+    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — a secret cannot later be made non-secret')
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -513,7 +514,7 @@ async function setEnvVar(
   projectFlag: string | undefined,
   key: string,
   value: string | undefined,
-  options: { environments?: string; preview?: boolean; update?: boolean }
+  options: { environments?: string; preview?: boolean; update?: boolean; secret?: boolean }
 ): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -608,11 +609,15 @@ async function setEnvVar(
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: options.preview !== false,
+          // Only sent when --secret is passed. Omitting it leaves the existing
+          // flag untouched; sending false against an already-secret variable is
+          // rejected by the API, since promotion is deliberately one-way.
+          ...(options.secret ? { is_secret: true } : {}),
         },
       })
       if (error) throw new Error(getErrorMessage(error))
     })
-    success(`Updated ${key}`)
+    success(`Updated ${key}${options.secret ? ' (secret)' : ''}`)
   } else {
     // Create new variable
     await withSpinner(`Setting ${key}...`, async () => {
@@ -624,11 +629,12 @@ async function setEnvVar(
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: options.preview !== false,
+          ...(options.secret ? { is_secret: true } : {}),
         },
       })
       if (error) throw new Error(getErrorMessage(error))
     })
-    success(`Set ${key}`)
+    success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
