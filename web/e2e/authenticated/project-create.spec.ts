@@ -18,19 +18,24 @@ import { expect, expectAppMounted, test, urlForProject } from '../fixtures'
 const PUBLIC_REPO_URL =
   process.env.E2E_REPO_URL ?? 'https://github.com/gotempsh/temps.git'
 
-/** Unique per run so repeat runs against a shared instance don't collide. */
-function projectName(): string {
-  const suffix =
-    process.env.GITHUB_RUN_ID ?? String(process.hrtime.bigint()).slice(-8)
-  return `e2e-ui-${suffix}`.toLowerCase().slice(0, 32)
+/**
+ * Unique per run AND per retry.
+ *
+ * The retry index matters: if an attempt creates the project and then fails
+ * later in the flow, a retry reusing the same name hits a duplicate-name error
+ * and fails permanently -- turning a transient problem into a hard red.
+ */
+function projectName(retry: number): string {
+  const run = process.env.GITHUB_RUN_ID ?? String(process.hrtime.bigint())
+  return `e2e-ui-${run.slice(-8)}-${retry}`.toLowerCase().slice(0, 32)
 }
 
 test.describe('project creation', () => {
   test('creates a project from a public git URL', async ({
     page,
     consoleErrors,
-  }) => {
-    const name = projectName()
+  }, testInfo) => {
+    const name = projectName(testInfo.retry)
 
     await page.goto('/projects/new')
     await expectAppMounted(page)
@@ -63,6 +68,18 @@ test.describe('project creation', () => {
     await expect(
       page.getByText('Root Directory', { exact: true })
     ).toBeVisible()
+
+    // Preset auto-detection resolves a beat AFTER the form paints, and until it
+    // does no preset is selected. Submitting in that window fails zod
+    // validation on `preset`, so the click is a silent no-op: no navigation,
+    // nothing visible, just `Form validation errors: {preset: ...}` on the
+    // console. Waiting on the name field alone is therefore not enough -- this
+    // is what made the spec flaky in CI, where the first (cold) detection is
+    // slow and only the warm retry passed.
+    await expect(
+      page.getByText(/We detected the following presets/i),
+      'preset auto-detection must finish before submitting, or the form silently refuses'
+    ).toBeVisible({ timeout: 90_000 })
 
     await nameField.fill(name)
     await page
