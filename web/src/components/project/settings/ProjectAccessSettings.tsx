@@ -211,7 +211,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
               description={
                 <p className="text-sm text-muted-foreground">
                   Create a team first, then come back to grant it access.{' '}
-                  <Link to="/teams" className="underline">
+                  <Link to="/settings/teams" className="underline">
                     Go to Teams
                   </Link>
                 </p>
@@ -244,7 +244,7 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
                     <TableRow key={grant.id}>
                       <TableCell className="font-medium">
                         <Link
-                          to={`/teams/${grant.team_id}`}
+                          to={`/settings/teams/${grant.team_id}`}
                           className="hover:underline"
                         >
                           {teamName(grant.team_id)}

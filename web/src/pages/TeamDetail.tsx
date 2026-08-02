@@ -18,7 +18,9 @@ import {
   listTeamProjectsOptions,
   listTeamProjectsQueryKey,
   listUsersOptions,
+  listTeamsQueryKey,
   removeTeamMemberMutation,
+  updateTeamMutation,
   updateTeamMemberRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamMemberResponse, TeamRole } from '@/api/client/types.gen'
@@ -50,6 +52,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -69,7 +72,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { FolderGit2, Plus, Trash2, Users } from 'lucide-react'
+import { ArrowLeft, FolderGit2, Pencil, Plus, Trash2, Users } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -236,6 +239,111 @@ function AddMemberDialog({
   )
 }
 
+interface EditTeamDialogProps {
+  teamId: number
+  name: string
+  description: string | null | undefined
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}
+
+/**
+ * Rename a team / change its description. The slug is deliberately absent:
+ * it's the stable handle the CLI and scripts address the team by, so it is
+ * fixed at creation rather than quietly editable here.
+ */
+function EditTeamDialog({
+  teamId,
+  name,
+  description,
+  open,
+  onOpenChange,
+}: EditTeamDialogProps) {
+  const queryClient = useQueryClient()
+  const [draftName, setDraftName] = useState(name)
+  const [draftDescription, setDraftDescription] = useState(description ?? '')
+
+  // The dialog stays mounted (no conditional mounting), so re-seed the
+  // fields whenever it opens or the underlying team changes.
+  useEffect(() => {
+    if (!open) return
+    setDraftName(name)
+    setDraftDescription(description ?? '')
+  }, [open, name, description])
+
+  const updateMutation = useMutation({
+    ...updateTeamMutation(),
+    onSuccess: (updated) => {
+      queryClient.invalidateQueries({
+        queryKey: getTeamQueryKey({ path: { team_id: teamId } }),
+      })
+      queryClient.invalidateQueries({ queryKey: listTeamsQueryKey() })
+      toast.success(`Team "${updated?.name ?? draftName}" updated`)
+      onOpenChange(false)
+    },
+    onError: (err: Error) => {
+      toast.error(err.message || 'Failed to update team')
+    },
+  })
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit team</DialogTitle>
+          <DialogDescription>
+            Changing the name doesn't affect who can reach what — membership
+            and project grants stay as they are.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <Label htmlFor="edit-team-name">Name</Label>
+            <Input
+              id="edit-team-name"
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="edit-team-description">Description</Label>
+            <Input
+              id="edit-team-description"
+              value={draftDescription}
+              onChange={(e) => setDraftDescription(e.target.value)}
+              placeholder="What this team is for"
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={updateMutation.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={() =>
+              updateMutation.mutate({
+                path: { team_id: teamId },
+                body: {
+                  name: draftName.trim(),
+                  description: draftDescription.trim() || null,
+                },
+              })
+            }
+            disabled={!draftName.trim() || updateMutation.isPending}
+          >
+            {updateMutation.isPending ? 'Saving…' : 'Save changes'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 /** Inline role editor for one membership. */
 function MemberRoleCell({
   teamId,
@@ -290,6 +398,7 @@ export function TeamDetail() {
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [addOpen, setAddOpen] = useState(false)
+  const [editOpen, setEditOpen] = useState(false)
   const [memberToRemove, setMemberToRemove] =
     useState<TeamMemberResponse | null>(null)
 
@@ -314,7 +423,7 @@ export function TeamDetail() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Teams', href: '/teams' },
+      { label: 'Teams', href: '/settings/teams' },
       { label: team?.name ?? 'Team' },
     ])
   }, [setBreadcrumbs, team?.name])
@@ -339,25 +448,50 @@ export function TeamDetail() {
     },
   })
 
-  const projectName = (id: number) =>
-    projects?.projects?.find((p) => p.id === id)?.name ?? `Project ${id}`
+  // Grants store project ids, but the project route is keyed by slug —
+  // linking by id 404s. Fall back to showing the id un-linked when the
+  // project isn't in the caller's own visible list.
+  const projectFor = (id: number) => projects?.projects?.find((p) => p.id === id)
+  const projectName = (id: number) => projectFor(id)?.name ?? `Project ${id}`
 
   const memberList = members ?? []
   const grantList = grants ?? []
 
   return (
     <div className="container mx-auto space-y-6 px-4 py-6 sm:px-6">
-      <div>
-        {teamLoading ? (
-          <Skeleton className="h-9 w-64" />
-        ) : (
-          <h1 className="text-2xl font-bold sm:text-3xl">
-            {team?.name ?? 'Team'}
-          </h1>
-        )}
-        <p className="mt-2 text-muted-foreground">
-          {team?.description || 'No description'}
-        </p>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => navigate('/settings/teams')}
+        >
+          <ArrowLeft className="mr-2 h-4 w-4" />
+          Back to teams
+        </Button>
+      </div>
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          {teamLoading ? (
+            <Skeleton className="h-9 w-64" />
+          ) : (
+            <h1 className="text-2xl font-bold sm:text-3xl">
+              {team?.name ?? 'Team'}
+            </h1>
+          )}
+          <p className="mt-2 text-muted-foreground">
+            {team?.description || 'No description'}
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setEditOpen(true)}
+          disabled={!team}
+        >
+          <Pencil className="mr-2 h-4 w-4" />
+          Edit team
+        </Button>
       </div>
 
       <Card>
@@ -467,8 +601,13 @@ export function TeamDetail() {
                   {grantList.map((grant) => (
                     <TableRow
                       key={grant.id}
-                      className="cursor-pointer"
-                      onClick={() => navigate(`/projects/${grant.project_id}`)}
+                      className={
+                        projectFor(grant.project_id) ? 'cursor-pointer' : undefined
+                      }
+                      onClick={() => {
+                        const slug = projectFor(grant.project_id)?.slug
+                        if (slug) navigate(`/projects/${slug}`)
+                      }}
                     >
                       <TableCell className="font-medium">
                         {projectName(grant.project_id)}
@@ -486,6 +625,14 @@ export function TeamDetail() {
           )}
         </CardContent>
       </Card>
+
+      <EditTeamDialog
+        teamId={teamId}
+        name={team?.name ?? ''}
+        description={team?.description}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+      />
 
       <AddMemberDialog
         teamId={teamId}

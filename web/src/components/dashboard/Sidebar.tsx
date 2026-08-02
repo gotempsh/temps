@@ -183,7 +183,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
-      { title: 'Teams', url: '/teams', icon: UsersRound },
+      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],

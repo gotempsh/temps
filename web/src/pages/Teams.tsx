@@ -311,7 +311,7 @@ export function Teams() {
                     <TableRow
                       key={team.id}
                       className="cursor-pointer"
-                      onClick={() => navigate(`/teams/${team.id}`)}
+                      onClick={() => navigate(`/settings/teams/${team.id}`)}
                     >
                       <TableCell className="font-medium">{team.name}</TableCell>
                       <TableCell>

@@ -484,11 +484,6 @@ const FullAppRoutes = () => {
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />
                 <Route path="/sandboxes/:sandboxId" element={<SandboxDetail />} />
-                {/* Teams live at the top level, not under /settings: they're
-                    a day-to-day surface (who can reach what), and the
-                    settings layout swaps the sidebar away from projects. */}
-                <Route path="/teams" element={<Teams />} />
-                <Route path="/teams/:teamId" element={<TeamDetail />} />
                 <Route path="/monitoring" element={<Monitoring />}>
                   <Route index element={<Navigate to="resources" replace />} />
                   <Route path="alarms" element={<Alarms />} />
@@ -523,6 +518,11 @@ const FullAppRoutes = () => {
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
+                  {/* Teams sit under /settings alongside Users and API Keys:
+                      the sidebar lists them together, and a top-level route
+                      would drop out of the settings layout on click. */}
+                  <Route path="teams" element={<Teams />} />
+                  <Route path="teams/:teamId" element={<TeamDetail />} />
                   <Route path="auth" element={<AuthSettingsPage />} />
                   <Route path="auth/new" element={<CreateOidcProviderPage />} />
                   <Route
