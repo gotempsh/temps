@@ -54,6 +54,7 @@ import {
   useAlertStatus,
   type AlertStatusLevel,
 } from '@/components/metrics/alert-status'
+import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -627,24 +628,32 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             Explore OpenTelemetry metrics for {project.name}.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            namesQuery.refetch()
-            if (metricName) metricsQuery.refetch()
-          }}
-          className="gap-1.5 self-start"
-        >
-          <RefreshCw
-            className={
-              metricsQuery.isFetching || namesQuery.isFetching
-                ? 'size-3.5 animate-spin'
-                : 'size-3.5'
-            }
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <SuggestAlertsButton
+            projectId={project.id}
+            projectSlug={project.slug}
+            projectName={project.name}
+            focusMetric={metricName || undefined}
           />
-          Refresh
-        </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              namesQuery.refetch()
+              if (metricName) metricsQuery.refetch()
+            }}
+            className="gap-1.5"
+          >
+            <RefreshCw
+              className={
+                metricsQuery.isFetching || namesQuery.isFetching
+                  ? 'size-3.5 animate-spin'
+                  : 'size-3.5'
+              }
+            />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* Filter bar — collapsed by default; the header summarizes the active

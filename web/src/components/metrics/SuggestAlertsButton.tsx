@@ -30,12 +30,27 @@ import { Skeleton } from '@/components/ui/skeleton'
 const START_PROMPT =
   'Look at what this project already alerts on and what metrics it actually reports, then propose the alert rules worth adding. Ground every threshold in real values you queried, and backtest anomaly detectors before proposing them.'
 
+/**
+ * Opened from the explorer with a metric on screen, the question is narrower —
+ * "should I alert on *this*" — so lead with that metric instead of restarting
+ * the whole survey, while still letting the assistant mention anything else
+ * obviously worth covering.
+ */
+const focusedStartPrompt = (metric: string) =>
+  `I'm looking at the metric \`${metric}\`. Query its real values, decide whether it's worth alerting on, and if so propose a rule with a threshold grounded in what you find (backtest it first). Check what this project already alerts on so you don't duplicate an existing rule. Afterwards, mention briefly if any other reported metric obviously deserves an alert too.`
+
 interface SuggestAlertsButtonProps {
   projectId: number
   projectSlug?: string
   projectName?: string
   /** Rendered inside an EmptyState — slightly more prominent there. */
   variant?: 'outline' | 'default'
+  /**
+   * The metric the user is currently viewing, when there is one. Narrows the
+   * opening question to that metric; omit for the general "what should I alert
+   * on?" survey.
+   */
+  focusMetric?: string
 }
 
 /**
@@ -62,6 +77,7 @@ export function SuggestAlertsButton({
   projectSlug,
   projectName,
   variant = 'outline',
+  focusMetric,
 }: SuggestAlertsButtonProps) {
   const { open } = useAiAssistant()
   const queryClient = useQueryClient()
@@ -90,13 +106,16 @@ export function SuggestAlertsButton({
   const openChat = () =>
     open({
       projectId,
+      // The conversation is keyed on the project, so returning here resumes the
+      // same chat rather than starting a parallel one per metric. `focusMetric`
+      // only steers the opening question of a NEW chat.
       context: {
         contextType: 'alert_suggest',
         contextId: projectId,
         title: 'Suggest alerts',
         description:
           'Ask AI which metrics are worth alerting on. Each suggested rule is proposed for you to review — nothing is created until you confirm it.',
-        startPrompt: START_PROMPT,
+        startPrompt: focusMetric ? focusedStartPrompt(focusMetric) : START_PROMPT,
         projectSlug,
         projectName,
       },

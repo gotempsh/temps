@@ -38,6 +38,29 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// One or more supplied parameters are not part of the operation.
+    ///
+    /// This has to be an error, not a shrug. An unrecognised parameter used to
+    /// be dropped on the floor, which quietly turned a *filtered* query into an
+    /// unfiltered one: `query_metrics --metric http.server.duration` (the flag
+    /// is `--metric_name`) returned a 200 containing the average across every
+    /// metric in the project, a plausible-looking number that answers a
+    /// different question. Nothing downstream can detect that, so the model
+    /// reasons confidently on nonsense — the worst possible failure mode for a
+    /// tool whose output becomes a threshold someone gets paged by.
+    #[error(
+        "Unknown parameter(s) for operation '{operation_id}': {unknown}. Valid parameters: \
+         {valid}. Nothing was queried — re-run with the correct name."
+    )]
+    UnknownParams {
+        /// The offending names, with a suggestion where one is obvious.
+        unknown: String,
+        /// Every parameter the operation does accept.
+        valid: String,
+        /// The operation being called.
+        operation_id: String,
+    },
+
     /// An object-valued body parameter does not match its schema's shape.
     ///
     /// Caught during validation rather than at execution, which matters most on

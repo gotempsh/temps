@@ -188,6 +188,37 @@ pub fn build_request_parts(
 ) -> Result<BuiltRequest, ApiToolError> {
     let params_obj = params.as_object();
 
+    // Pre-pass: reject parameters this operation does not have.
+    //
+    // Silently ignoring them is the dangerous option. A near-miss on a filter
+    // name (`--metric` for `--metric_name`) used to produce a 200 carrying the
+    // *unfiltered* result — an average across every metric in the project,
+    // which looks like a real number and is not. A wrong answer that cannot be
+    // distinguished from a right one is worse than no answer, so this fails
+    // loudly and says nothing was queried.
+    if let Some(obj) = params_obj {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !op.params.iter().any(|p| p.name == *key))
+            .collect();
+        if !unknown.is_empty() {
+            let valid: Vec<&str> = op.params.iter().map(|p| p.name.as_str()).collect();
+            let described: Vec<String> = unknown
+                .iter()
+                .map(|key| match nearest_param(key, &valid) {
+                    Some(hint) => format!("'{key}' (did you mean '{hint}'?)"),
+                    None => format!("'{key}'"),
+                })
+                .collect();
+            return Err(ApiToolError::UnknownParams {
+                unknown: described.join(", "),
+                valid: valid.join(", "),
+                operation_id: op.operation_id.clone(),
+            });
+        }
+    }
+
     // Pre-pass: report EVERY missing required parameter at once.
     //
     // The per-param loop below fails on the first one it meets, which reads fine
@@ -912,6 +943,57 @@ impl InternalApiCaller {
             None => true,
         }
     }
+}
+
+/// Best guess at which valid parameter an unknown name was meant to be.
+///
+/// The near-misses that actually happen are prefixes and small typos
+/// (an abbreviated `metric`, or a pair of transposed characters), so a
+/// containment check plus a bounded edit distance covers them. Returns `None`
+/// rather than a bad guess when nothing is close — a wrong suggestion sends the
+/// caller further astray than none at all.
+fn nearest_param<'a>(unknown: &str, valid: &[&'a str]) -> Option<&'a str> {
+    let needle = unknown.to_ascii_lowercase();
+
+    // A name that is a prefix/substring of exactly one valid parameter is almost
+    // certainly it (the `--metric` / `--metric_name` case).
+    let contained: Vec<&&str> = valid
+        .iter()
+        .filter(|v| {
+            let v = v.to_ascii_lowercase();
+            v.contains(&needle) || needle.contains(&v)
+        })
+        .collect();
+    if let [only] = contained.as_slice() {
+        return Some(**only);
+    }
+
+    // Otherwise the closest by edit distance, accepting at most a third of the
+    // name being wrong so unrelated parameters are never suggested.
+    let budget = (needle.chars().count() / 3).max(1);
+    valid
+        .iter()
+        .map(|v| (edit_distance(&needle, &v.to_ascii_lowercase()), *v))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, v)| v)
+}
+
+/// Levenshtein distance, two-row variant (names here are short).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur = vec![0; b_chars.len() + 1];
+
+    for (i, ac) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, bc) in b_chars.iter().enumerate() {
+            let cost = usize::from(ac != *bc);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b_chars.len()]
 }
 
 /// Check an object-valued parameter against its schema shape.
@@ -1666,6 +1748,96 @@ mod tests {
             panic!("expected BadObjectShape, got {err:?}");
         };
         assert!(problem.contains("string"), "{problem}");
+    }
+
+    /// The bug this exists to prevent, in full.
+    ///
+    /// A live model called `query_metrics --metric http.server.duration`. The
+    /// real flag is `--metric_name`, so the value was dropped, the query ran
+    /// UNFILTERED, and the endpoint returned 200 with the average across every
+    /// metric in the project (~62 million — a mean of latency-in-ms, error
+    /// rates and memory-in-bytes mixed together). The model then reasoned
+    /// confidently about thresholds from that number. Nothing downstream could
+    /// have caught it: the response was well-formed and the status was 200.
+    #[test]
+    fn near_miss_filter_name_is_rejected_instead_of_silently_unfiltering() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![
+                query_param("project_id", false),
+                query_param("metric_name", false),
+                query_param("start_time", false),
+            ],
+        );
+
+        let params = serde_json::json!({ "metric": "http.server.duration" });
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("an unfiltered query must never be passed off as a filtered one");
+
+        let ApiToolError::UnknownParams { unknown, valid, .. } = &err else {
+            panic!("expected UnknownParams, got {err:?}");
+        };
+        assert!(
+            unknown.contains("metric_name"),
+            "should suggest it: {unknown}"
+        );
+        assert!(
+            valid.contains("start_time"),
+            "should list the real flags: {valid}"
+        );
+        // Saying nothing ran is what stops the model treating the failure as an
+        // empty result set and concluding the metric has no data.
+        assert!(err.to_string().contains("Nothing was queried"), "{err}");
+    }
+
+    /// Optional filters must still be omittable — the whole point of the
+    /// unfiltered query is that it is legitimate when you meant it.
+    #[test]
+    fn omitting_optional_params_is_still_fine() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![
+                query_param("metric_name", false),
+                query_param("start_time", false),
+            ],
+        );
+        let params = serde_json::json!({ "metric_name": "http.server.duration" });
+        build_request_parts(&op, &params, &[], 20, 100).expect("partial filters are valid");
+    }
+
+    #[test]
+    fn unknown_param_with_no_close_match_is_reported_without_a_guess() {
+        let op = make_op(
+            "query_metrics",
+            "/otel/metrics",
+            vec![query_param("metric_name", false)],
+        );
+        let params = serde_json::json!({ "wibble": 1 });
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("unknown");
+        let ApiToolError::UnknownParams { unknown, .. } = &err else {
+            panic!("expected UnknownParams, got {err:?}");
+        };
+        assert!(
+            !unknown.contains("did you mean"),
+            "a bad guess is worse than none: {unknown}"
+        );
+    }
+
+    #[test]
+    fn nearest_param_matches_prefixes_and_typos_but_not_unrelated_names() {
+        let valid = ["metric_name", "environment_id", "start_time"];
+        assert_eq!(nearest_param("metric", &valid), Some("metric_name"));
+        // The transposition is built at runtime on purpose: a misspelled
+        // literal in this file gets "corrected" by the repo's spell-check hook,
+        // which would quietly reduce this to an exact-match assertion proving
+        // nothing.
+        let mut chars: Vec<char> = "metric_name".chars().collect();
+        chars.swap(8, 9);
+        let transposed: String = chars.into_iter().collect();
+        assert_eq!(nearest_param(&transposed, &valid), Some("metric_name"));
+        assert_eq!(nearest_param("zzzzzzzzzz", &valid), None);
     }
 
     #[test]
