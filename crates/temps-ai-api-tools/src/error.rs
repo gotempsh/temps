@@ -38,6 +38,29 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// An object-valued body parameter does not match its schema's shape.
+    ///
+    /// Caught during validation rather than at execution, which matters most on
+    /// the propose-then-confirm write path: without this check a structurally
+    /// impossible call is staged, a human approves it, and only then does the
+    /// API reject it — the one person who could not have known better pays for
+    /// the mistake. The message carries the accepted shape because the model
+    /// does not reliably consult `--help` first.
+    #[error(
+        "Parameter '{name}' has the wrong shape for operation '{operation_id}': {problem}. \
+         Expected {expected}."
+    )]
+    BadObjectShape {
+        /// Name of the offending parameter.
+        name: String,
+        /// What is wrong with the supplied value.
+        problem: String,
+        /// Human-readable description of the accepted JSON.
+        expected: String,
+        /// The operation being called.
+        operation_id: String,
+    },
+
     /// A parameter value is not one of the declared enum members.
     #[error(
         "Parameter '{name}' has value '{value}' which is not one of the allowed values: \

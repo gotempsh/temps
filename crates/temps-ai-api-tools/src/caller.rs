@@ -25,7 +25,8 @@
 use crate::{
     error::ApiToolError,
     index::{
-        ApiOperation, OperationSchema, OperationSummary, ParamLocation, ParamSpec, ReadOnlyApiIndex,
+        ApiOperation, ObjectShape, OperationSchema, OperationSummary, ParamLocation, ParamSpec,
+        ReadOnlyApiIndex,
     },
 };
 use axum::body::Body;
@@ -325,6 +326,19 @@ pub fn build_request_parts(
                 }
             }
         };
+
+        // Nested-object shape check. Only meaningful for body fields whose
+        // schema resolved to a known object shape; everything else is skipped.
+        if let Some(shape) = &param.object_shape {
+            if let Some(problem) = check_object_shape(&value, shape) {
+                return Err(ApiToolError::BadObjectShape {
+                    name: param.name.clone(),
+                    problem,
+                    expected: shape.describe(),
+                    operation_id: op.operation_id.clone(),
+                });
+            }
+        }
 
         // Enum membership check.
         if !param.enum_values.is_empty() {
@@ -900,6 +914,65 @@ impl InternalApiCaller {
     }
 }
 
+/// Check an object-valued parameter against its schema shape.
+///
+/// Returns `Some(problem)` describing what is wrong, or `None` when the value
+/// is acceptable. This is a *shape* check, not full JSON Schema validation: it
+/// verifies the discriminator and the required keys, which is what separates a
+/// call that can possibly succeed from one that cannot. Type-checking
+/// individual fields stays the API's job — being stricter here would risk
+/// rejecting valid calls the router would have accepted.
+fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
+    let Some(obj) = value.as_object() else {
+        return Some(format!("expected a JSON object, got {}", json_kind(value)));
+    };
+
+    let required = match &shape.discriminator {
+        Some(discriminator) => {
+            // Tagged union: the discriminator decides which keys are required,
+            // so it has to be present and recognised before anything else.
+            let Some(tag) = obj.get(discriminator) else {
+                return Some(format!("missing the '{discriminator}' discriminator"));
+            };
+            let Some(tag) = tag.as_str() else {
+                return Some(format!("'{discriminator}' must be a string"));
+            };
+            let Some(required) = shape.variants.get(tag) else {
+                let mut known: Vec<&str> = shape.variants.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                return Some(format!(
+                    "'{discriminator}' is '{tag}', which is not one of: {}",
+                    known.join(", ")
+                ));
+            };
+            required
+        }
+        None => &shape.required,
+    };
+
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|key| !obj.contains_key(key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!("missing key(s): {}", missing.join(", ")));
+    }
+    None
+}
+
+/// Name a JSON value's kind, for error messages.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Parse an uppercase HTTP method string into [`http::Method`].
 ///
 /// Only the literal string `"GET"` defaults to `GET`; all other well-known
@@ -1160,6 +1233,7 @@ mod tests {
             ty: "integer".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1171,6 +1245,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1182,6 +1257,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: vec![],
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1193,6 +1269,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1261,6 +1338,7 @@ mod tests {
             ty: "string".to_string(),
             enum_values: values.iter().map(|s| s.to_string()).collect(),
             description: None,
+            object_shape: None,
         }
     }
 
@@ -1441,6 +1519,153 @@ mod tests {
             vec!["metric_name", "aggregation", "severity"],
             "expected exactly the absent required fields, got: {names}"
         );
+    }
+
+    /// Build the real-world shape: `detection_config` is an internally-tagged
+    /// union, the exact field a live model kept getting wrong.
+    fn detector_shape() -> ObjectShape {
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            "static".to_string(),
+            vec![
+                "kind".to_string(),
+                "comparator".to_string(),
+                "threshold".to_string(),
+            ],
+        );
+        variants.insert(
+            "anomaly".to_string(),
+            vec!["kind".to_string(), "deviations".to_string()],
+        );
+        ObjectShape {
+            discriminator: Some("kind".to_string()),
+            variants,
+            required: Vec::new(),
+        }
+    }
+
+    fn op_with_detector() -> ApiOperation {
+        let mut param = body_param("detection_config", true);
+        param.object_shape = Some(detector_shape());
+        make_write_op(
+            "create_alert",
+            "POST",
+            "/otel/alerts",
+            "Alerts",
+            vec![param],
+        )
+    }
+
+    /// The exact failure seen against a live model: it proposed
+    /// `{"type": "threshold"}`, which has no `kind`. Before this check the call
+    /// validated fine, was staged for approval, and only failed with a 422
+    /// AFTER a human clicked Confirm.
+    #[test]
+    fn object_body_param_missing_discriminator_is_rejected_at_validation() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "type": "threshold", "threshold": 500 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a payload the API cannot accept must not validate");
+
+        let ApiToolError::BadObjectShape {
+            problem, expected, ..
+        } = &err
+        else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(
+            problem.contains("kind"),
+            "problem should name it: {problem}"
+        );
+        // The accepted shape must travel with the error — the model does not
+        // reliably run `--help`, so this is the one place it is guaranteed to
+        // see the discriminator's name and values.
+        assert!(expected.contains("static"), "expected: {expected}");
+        assert!(expected.contains("comparator"), "expected: {expected}");
+    }
+
+    #[test]
+    fn object_body_param_with_unknown_variant_lists_the_known_ones() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "threshold", "threshold": 500 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("unknown variant");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(
+            problem.contains("anomaly") && problem.contains("static"),
+            "{problem}"
+        );
+    }
+
+    /// The variant's own required keys are enforced too — a `static` detector
+    /// without a threshold is just as unusable as one without a `kind`.
+    #[test]
+    fn object_body_param_missing_variant_keys_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({ "detection_config": { "kind": "static" } });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("incomplete variant");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("comparator"), "{problem}");
+        assert!(problem.contains("threshold"), "{problem}");
+    }
+
+    #[test]
+    fn well_formed_object_body_param_passes_through_untouched() {
+        let op = op_with_detector();
+        let detector = serde_json::json!({
+            "kind": "static", "comparator": "gt", "threshold": 500
+        });
+        let params = serde_json::json!({ "detection_config": detector.clone() });
+
+        let built = build_request_parts(&op, &params, &[], 20, 100).expect("valid payload");
+        assert_eq!(
+            built.body.expect("body")["detection_config"],
+            detector,
+            "a valid object must reach the API byte-for-byte"
+        );
+    }
+
+    /// A plain (non-union) object is checked against its own required keys.
+    #[test]
+    fn plain_object_body_param_requires_its_keys() {
+        let mut param = body_param("window", true);
+        param.object_shape = Some(ObjectShape {
+            discriminator: None,
+            variants: std::collections::BTreeMap::new(),
+            required: vec!["from".to_string(), "to".to_string()],
+        });
+        let op = make_write_op("create_thing", "POST", "/things", "Things", vec![param]);
+
+        let params = serde_json::json!({ "window": { "from": "now-1h" } });
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("missing 'to'");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("to"), "{problem}");
+    }
+
+    /// A scalar where an object belongs must be named as such, not silently
+    /// forwarded for the API to reject.
+    #[test]
+    fn scalar_where_object_expected_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({ "detection_config": "static" });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("scalar");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("string"), "{problem}");
     }
 
     #[test]

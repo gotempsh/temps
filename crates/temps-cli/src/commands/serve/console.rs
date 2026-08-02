@@ -3303,6 +3303,90 @@ mod ai_tool_allowlist_tests {
     use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
     use utoipa::OpenApi;
 
+    /// A throwaway admin auth context for the prepare-path tests (no request is
+    /// executed, so it only has to satisfy the advisory permission filter).
+    fn admin_auth() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "tester".to_string(),
+            email: "tester@internal".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+    }
+
+    /// End-to-end against the REAL `OtelApiDoc`: a `create_alert` proposal with
+    /// a malformed `detection_config` must be rejected while the model can
+    /// still fix it, not after a human has approved it.
+    ///
+    /// This is the exact payload a live model produced three runs running
+    /// (`{"type": "threshold"}` instead of `{"kind": "static", …}`). Before the
+    /// shape check it validated cleanly, was staged as a pending action, and
+    /// failed with a 422 only once the user clicked Confirm — the one person in
+    /// the loop who had no way to know it was wrong.
+    #[tokio::test]
+    async fn malformed_detection_config_is_rejected_before_a_human_sees_it() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller, WritePrepareOutcome};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        // No request is executed on the prepare path, so an empty router is fine.
+        let caller = InternalApiCaller::new_write_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            vec!["create_alert".to_string()],
+        );
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let base = "alerts create_alert --name p95 --metric_name http.server.duration \
+                    --aggregation avg --window_secs 300 --for_duration_secs 300 \
+                    --severity critical --enabled true";
+
+        // 1. The model's actual mistake: no `kind` discriminator.
+        let outcome = caller.prepare_write_cli(
+            &format!("{base} --detection_config '{{\"type\": \"threshold\", \"threshold\": 500}}'"),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(msg.contains("kind"), "must name the discriminator: {msg}");
+        assert!(
+            msg.contains("static"),
+            "must show the accepted variants — the model does not run --help: {msg}"
+        );
+
+        // 2. The correct payload still validates and is staged.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \"gt\", \"threshold\": 500}}'"
+            ),
+            &scope,
+        );
+        assert!(
+            matches!(outcome, WritePrepareOutcome::Prepared(_)),
+            "a well-formed static detector must still be proposable"
+        );
+    }
+
     /// The AI read allowlist must never contain duplicate entries — a repeat
     /// is dead weight in the model's tool catalogue and a signal something
     /// was pasted twice while merging.

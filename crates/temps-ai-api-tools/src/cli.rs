@@ -315,6 +315,12 @@ fn render_operation_help(op: &ApiOperation) -> String {
             if !p.enum_values.is_empty() {
                 out.push_str(&format!(" — one of: {}", p.enum_values.join(", ")));
             }
+            // For an object-valued field, the accepted JSON is the single most
+            // useful thing we can say — a bare "<object>" tells the caller
+            // nothing, and guessing it wrong fails the whole call.
+            if let Some(shape) = &p.object_shape {
+                out.push_str(&format!(" — {}", shape.describe()));
+            }
             if let Some(d) = &p.description {
                 out.push_str(&format!(" — {d}"));
             }
