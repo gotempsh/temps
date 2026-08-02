@@ -938,6 +938,15 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
     let isCleaningUp = false
     let currentRetryCount = 0
+    // Guards against an infinite reconnect loop when the server accepts the
+    // WS upgrade but then immediately closes it (e.g. the container behind
+    // this id no longer exists in Docker, or its log stream has nothing left
+    // to follow). `onopen` firing doesn't mean the connection is actually
+    // useful -- only reset the retry counter once it's stayed open long
+    // enough to plausibly be delivering logs. Otherwise a fast open/close
+    // cycle keeps resetting the counter back to 0 before it ever reaches the
+    // retry cap, and the client reconnects forever.
+    let stableOpenTimeoutId: ReturnType<typeof setTimeout> | null = null
 
     const connectWS = () => {
       if (isCleaningUp) {
@@ -999,8 +1008,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           // open event fired, do nothing.
           if (ws !== wsRef.current || isCleaningUp) return
           setConnectionStatus('connected')
-          currentRetryCount = 0
-          setRetryCount(0)
           setErrorMessage('')
           isConnectingRef.current = false
 
@@ -1009,6 +1016,17 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             clearTimeout(retryTimeoutRef.current)
             retryTimeoutRef.current = null
           }
+
+          // Only clear the retry counter once the socket has proven it's a
+          // real, useful connection (stayed open past a short grace period).
+          // See the comment on `stableOpenTimeoutId` above.
+          if (stableOpenTimeoutId) clearTimeout(stableOpenTimeoutId)
+          stableOpenTimeoutId = setTimeout(() => {
+            stableOpenTimeoutId = null
+            if (ws !== wsRef.current || isCleaningUp) return
+            currentRetryCount = 0
+            setRetryCount(0)
+          }, 2000)
         }
 
         ws.onmessage = (event) => {
@@ -1046,6 +1064,14 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           // Late close from a replaced socket — ignore.
           if (ws !== wsRef.current) return
           isConnectingRef.current = false
+
+          // The connection closed before it proved itself useful — don't let
+          // the pending stable-open reset fire and wipe out the retry count
+          // we're about to increment.
+          if (stableOpenTimeoutId) {
+            clearTimeout(stableOpenTimeoutId)
+            stableOpenTimeoutId = null
+          }
 
           // Don't reconnect if cleaning up or normal closure
           if (isCleaningUp || event.code === 1000) {
@@ -1089,6 +1115,11 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     return () => {
       isCleaningUp = true
       isConnectingRef.current = false
+
+      if (stableOpenTimeoutId) {
+        clearTimeout(stableOpenTimeoutId)
+        stableOpenTimeoutId = null
+      }
 
       // Cancel any pending log flush so it can't fire after unmount.
       if (rafHandleRef.current != null) {

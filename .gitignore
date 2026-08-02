@@ -3,6 +3,11 @@
 *.local
 *.log*
 
+# Local dev-instance data dirs (encryption keys, auth secrets, tokens) --
+# created ad-hoc for manual testing, e.g. temps_data_pgstat_wt, temps_data_*
+temps_data
+temps_data_*
+
 # Dist
 node_modules
 dist/

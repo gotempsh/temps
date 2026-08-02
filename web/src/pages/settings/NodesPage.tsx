@@ -53,7 +53,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -227,6 +227,38 @@ function NodeCapacityMini({ capacity }: { capacity: unknown }) {
         <UsageBar percent={diskPercent} label={`Disk: ${formatPercent(diskPercent)}`} />
       )}
     </div>
+  )
+}
+
+// ── Architecture display ──
+
+/**
+ * A node reports its container platform (`linux/amd64`, `linux/arm64`) on every
+ * heartbeat. "Unknown" means an agent that predates multi-arch support, or one
+ * that hasn't heartbeated since upgrading — worth surfacing, since the
+ * scheduler cannot verify image compatibility for those nodes.
+ */
+function NodeArchitecture({ architecture }: { architecture?: string | null }) {
+  if (!architecture) {
+    return (
+      <span
+        className="text-xs text-muted-foreground"
+        title="This node has not reported its architecture yet"
+      >
+        Unknown
+      </span>
+    )
+  }
+  // Drop the redundant `linux/` prefix — every Temps node runs Linux.
+  const short = architecture.replace(/^linux\//, '')
+  return (
+    <Badge
+      variant="outline"
+      className="font-mono text-[10px]"
+      title={architecture}
+    >
+      {short}
+    </Badge>
   )
 }
 
@@ -505,6 +537,7 @@ function NodeTable({
           <TableRow>
             <TableHead>Name</TableHead>
             <TableHead>Status</TableHead>
+            <TableHead className="hidden sm:table-cell">Arch</TableHead>
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
@@ -536,6 +569,9 @@ function NodeTable({
               </TableCell>
               <TableCell>
                 <StatusBadge status={node.status} />
+              </TableCell>
+              <TableCell className="hidden sm:table-cell">
+                <NodeArchitecture architecture={node.architecture} />
               </TableCell>
               <TableCell className="hidden md:table-cell">
                 <NodeLabels labels={node.labels} />
@@ -943,6 +979,7 @@ function NodeDetail({
             <Server className="h-5 w-5 text-muted-foreground" />
             <h3 className="text-lg font-semibold truncate">{node.name}</h3>
             <StatusBadge status={node.status} />
+            <NodeArchitecture architecture={node.architecture} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last

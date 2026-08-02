@@ -337,6 +337,27 @@ pub struct DeploymentConfig {
     #[serde(default = "default_anti_affinity")]
     pub anti_affinity: bool,
 
+    /// Build one image per architecture the eligible nodes run.
+    ///
+    /// `None`/`false` (the default) builds exactly once, on the control
+    /// plane's native platform — byte-for-byte the behaviour of a
+    /// single-architecture cluster. When enabled and the nodes this
+    /// deployment could land on span more than one architecture, the build
+    /// job produces one image per architecture; the non-native ones go
+    /// through the daemon's `platform` option, which requires QEMU binfmt
+    /// handlers registered on the control plane.
+    ///
+    /// **Opt-in on purpose.** Cross-architecture builds are emulated and
+    /// substantially slower, and deriving them from cluster topology would
+    /// mean a single node joining silently changes build behaviour for every
+    /// deployment in the cluster. It also keeps the decision on operator
+    /// config rather than on a value each node reports about itself.
+    ///
+    /// `Option<bool>` so an environment inherits the project's setting
+    /// (`None`) or overrides it, matching `automatic_deploy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_architecture_builds: Option<bool>,
+
     /// Enable on-demand mode (scale-to-zero).
     /// When enabled, containers are stopped after `idle_timeout_seconds` of no traffic
     /// and automatically started when a new request arrives.
@@ -440,6 +461,7 @@ impl Default for DeploymentConfig {
             target_nodes: None,
             target_labels: None,
             anti_affinity: true,
+            cross_architecture_builds: None,
             on_demand: false,
             idle_timeout_seconds: 300,
             wake_timeout_seconds: 30,
@@ -514,6 +536,13 @@ impl DeploymentConfig {
                 .clone()
                 .or_else(|| self.target_labels.clone()),
             anti_affinity: other.anti_affinity,
+            // Env-wins, inheriting the project when unset — same semantics as
+            // `automatic_deploy`. Deliberately not `||`: an environment must be
+            // able to turn cross-builds *off* for a project that has them on,
+            // which an OR would make impossible.
+            cross_architecture_builds: other
+                .cross_architecture_builds
+                .or(self.cross_architecture_builds),
             on_demand: other.on_demand || self.on_demand,
             idle_timeout_seconds: if other.idle_timeout_seconds != 300 {
                 other.idle_timeout_seconds
@@ -634,6 +663,46 @@ impl DeploymentConfigSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-architecture builds are emulated and slow, so they must stay off
+    /// until someone asks for them — and an environment must be able to turn
+    /// them off again for a project that has them on.
+    #[test]
+    fn test_cross_architecture_builds_merge_semantics() {
+        let project_on = DeploymentConfig {
+            cross_architecture_builds: Some(true),
+            ..Default::default()
+        };
+        let env_unset = DeploymentConfig::default();
+        let env_off = DeploymentConfig {
+            cross_architecture_builds: Some(false),
+            ..Default::default()
+        };
+
+        // Off by default: nobody pays for an emulated build they didn't ask for.
+        assert_eq!(env_unset.cross_architecture_builds, None);
+
+        // An environment that says nothing inherits the project.
+        assert_eq!(
+            project_on.merge(&env_unset).cross_architecture_builds,
+            Some(true)
+        );
+
+        // ...and one that says `false` overrides it. An `||` merge (which is
+        // what the neighbouring booleans use) would make this impossible.
+        assert_eq!(
+            project_on.merge(&env_off).cross_architecture_builds,
+            Some(false)
+        );
+
+        // Neither set stays unset; the read site treats that as disabled.
+        assert_eq!(
+            DeploymentConfig::default()
+                .merge(&env_unset)
+                .cross_architecture_builds,
+            None
+        );
+    }
 
     #[test]
     fn test_default_config() {

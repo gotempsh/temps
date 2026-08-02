@@ -17,7 +17,7 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
@@ -29,6 +29,8 @@ import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import { SettingsLayout } from './components/settings/SettingsLayout'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
 import { AiAssistantProvider } from './components/ai/AiAssistantContext'
+import { AutofixOnboardingProvider } from './components/autofixer/AutofixOnboardingContext'
+import { AutofixOnboardingDialog } from './components/autofixer/AutofixOnboardingDialog'
 import { AiAssistantDock } from './components/ai/AiAssistantDock'
 import { AuthProvider } from './contexts/AuthContext'
 import { BreadcrumbProvider } from './contexts/BreadcrumbContext'
@@ -42,6 +44,9 @@ import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
 const Account = lazy(() =>
   import('./pages/Account').then((m) => ({ default: m.Account }))
+)
+const Setup = lazy(() =>
+  import('./pages/Setup').then((m) => ({ default: m.Setup }))
 )
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
@@ -77,6 +82,11 @@ const ServiceDataBrowser = lazy(() =>
 const ServiceLogs = lazy(() =>
   import('./pages/ServiceLogs').then((m) => ({
     default: m.ServiceLogs,
+  }))
+)
+const ServiceQueryPerformance = lazy(() =>
+  import('./pages/ServiceQueryPerformance').then((m) => ({
+    default: m.ServiceQueryPerformance,
   }))
 )
 const ServiceRestore = lazy(() =>
@@ -194,6 +204,11 @@ const EmailProviderDetail = lazy(() =>
     default: m.EmailProviderDetail,
   }))
 )
+const AddEmailProvider = lazy(() =>
+  import('./pages/AddEmailProvider').then((m) => ({
+    default: m.AddEmailProvider,
+  }))
+)
 const AuditLogs = lazy(() =>
   import('./pages/AuditLogs').then((m) => ({ default: m.AuditLogs }))
 )
@@ -293,6 +308,12 @@ const AiGateway = lazy(() =>
     default: m.AiGatewayPage,
   }))
 )
+
+const AiChat = lazy(() =>
+  import('./pages/AiChat').then((m) => ({
+    default: m.AiChat,
+  }))
+)
 const AgentSandboxLayout = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
     default: m.AgentSandboxLayout,
@@ -387,6 +408,7 @@ const FullAppRoutes = () => {
   return (
     <BreadcrumbProvider>
       <AiAssistantProvider>
+      <AutofixOnboardingProvider>
       <SidebarProvider>
         {/* Wrap sidebar with independent error boundary */}
         <ErrorBoundary
@@ -451,6 +473,7 @@ const FullAppRoutes = () => {
                 <Route path="/" element={<Navigate to="/projects" replace />} />
                 <Route path="/dashboard" element={<Navigate to="/projects" replace />} />
                 <Route path="/account" element={<Account />} />
+                <Route path="/setup" element={<Setup />} />
                 <Route path="/projects" element={<Projects />} />
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />
@@ -524,14 +547,17 @@ const FullAppRoutes = () => {
                 <Route path="/storage/:id/monitoring" element={<ServiceMonitoring />} />
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
                 <Route path="/storage/:id/logs" element={<ServiceLogs />} />
+          <Route path="/storage/:id/query-performance" element={<ServiceQueryPerformance />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />
                 <Route path="/storage/:id/members/add" element={<AddClusterMember />} />
                 <Route path="/email" element={<Email />} />
                 <Route path="/email/domains/:id" element={<EmailDomainDetail />} />
+                <Route path="/email/providers/new" element={<AddEmailProvider />} />
                 <Route path="/email/providers/:id" element={<EmailProviderDetail />} />
                 <Route path="/email/:id" element={<EmailDetail />} />
                 <Route path="/ai-gateway" element={<AiGateway />} />
+                <Route path="/chat" element={<AiChat />} />
                 <Route path="/agent-sandbox" element={<AgentSandboxLayout />}>
                   <Route index element={<AgentSandboxDashboard />} />
                   <Route path="providers" element={<AgentSandboxProvidersList />} />
@@ -590,7 +616,11 @@ const FullAppRoutes = () => {
             the user navigates the console. */}
         <AiAssistantDock />
         <CommandPalette />
+        {/* Shared AI-autofix setup dialog — mounted once so any surface can
+            open it via `useAutofixOnboarding()` instead of hiding autofix. */}
+        <AutofixOnboardingDialog />
       </SidebarProvider>
+      </AutofixOnboardingProvider>
       </AiAssistantProvider>
     </BreadcrumbProvider>
   )

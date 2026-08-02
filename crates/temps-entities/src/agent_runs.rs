@@ -66,6 +66,17 @@ pub struct Model {
     /// thing that removes these automatically. Nullable for historical
     /// rows and for runs that failed before volume creation.
     pub workspace_volume: Option<String>,
+    /// Per-run AI configuration chosen by the user when starting the run
+    /// (autofixer only): provider, model, max_turns, branch. Kept as JSON so
+    /// the retry dialog can prefill exactly what the run executed with.
+    /// Null for historical rows and generic agent runs.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub run_config: Option<Json>,
+    /// Authenticated user who started this run (e.g. clicked "Analyze" in
+    /// the autofixer UI). Used to attribute the run's sandbox row so it
+    /// appears in that user's sandbox list. NULL for webhook-triggered
+    /// runs and historical rows.
+    pub triggered_by_user_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

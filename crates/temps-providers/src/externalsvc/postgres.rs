@@ -303,8 +303,8 @@ fn default_username() -> String {
 }
 
 pub fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(16)
         .map(char::from)
@@ -633,6 +633,19 @@ impl PostgresService {
                 ),
                 "-c".to_string(),
                 "archive_timeout=60".to_string(),
+                // Enable pg_stat_statements at provision time so the extension
+                // can be created after startup. A restart (not just a reload)
+                // is required to change shared_preload_libraries, so this is
+                // set once at container-creation time. Existing services
+                // provisioned before this change need a container restart
+                // (via the restart endpoint) for the change to take effect.
+                // Merged with any library the image itself requires (e.g.
+                // `timescaledb`) — see `shared_preload_libraries_for_image`.
+                "-c".to_string(),
+                format!(
+                    "shared_preload_libraries={}",
+                    Self::shared_preload_libraries_for_image(&config.docker_image)
+                ),
             ]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
@@ -1219,6 +1232,63 @@ impl PostgresService {
         actual != desired
     }
 
+    /// Whether the container's `shared_preload_libraries` CMD flag disagrees
+    /// with what this image now requires (see
+    /// `shared_preload_libraries_for_image`).
+    ///
+    /// Without this check, `start()`'s drift-reconciliation only looked at
+    /// `archive_mode` — a plain restart of a container created before the
+    /// `pg_stat_statements` CMD flag existed (or with a stale library list)
+    /// would never pick up the correct flag, since the container was never
+    /// recreated, only started. `enable_pg_stat_statements` in
+    /// `pg_stat_statements.rs` relies on this drift check via its stop+start
+    /// call to actually recreate the container with the right CMD.
+    async fn container_cmd_shared_preload_libraries_differs(
+        &self,
+        container: &bollard::models::ContainerSummary,
+        desired: &str,
+    ) -> bool {
+        let id = match container.id.as_deref() {
+            Some(id) => id,
+            None => return false,
+        };
+        let info = match self
+            .docker
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        let cmd = info
+            .config
+            .as_ref()
+            .and_then(|c| c.cmd.as_ref())
+            .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let actual = cmd
+            .iter()
+            .find_map(|tok| tok.trim().strip_prefix("shared_preload_libraries="));
+
+        match actual {
+            Some(actual) => {
+                // Order-insensitive compare — "timescaledb,pg_stat_statements"
+                // and "pg_stat_statements,timescaledb" are equivalent.
+                let mut actual_libs: Vec<&str> = actual.split(',').map(str::trim).collect();
+                let mut desired_libs: Vec<&str> = desired.split(',').map(str::trim).collect();
+                actual_libs.sort_unstable();
+                desired_libs.sort_unstable();
+                actual_libs != desired_libs
+            }
+            // No flag at all predates pg_stat_statements support — drift.
+            None => true,
+        }
+    }
+
     async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
         let mut delay = Duration::from_millis(500);
         let mut total_wait = Duration::from_secs(0);
@@ -1453,6 +1523,25 @@ impl PostgresService {
     fn get_pgdata_path(docker_image: &str) -> Result<String> {
         let version = Self::extract_postgres_version(docker_image)?;
         Ok(format!("/var/lib/postgresql/{}/docker", version))
+    }
+
+    /// Build the `shared_preload_libraries` value for this image.
+    ///
+    /// `shared_preload_libraries` is a single comma-separated GUC — the last
+    /// `-c shared_preload_libraries=...` flag on the command line wins, it
+    /// does not merge with earlier ones. Images that require their own
+    /// preload library (e.g. `timescale/timescaledb-ha` requires
+    /// `timescaledb`) must have it listed alongside `pg_stat_statements`,
+    /// never overwritten by it — dropping `timescaledb` here silently
+    /// disables hypertables' background workers, continuous aggregates, and
+    /// compression policies with no error until a Timescale feature is used.
+    fn shared_preload_libraries_for_image(docker_image: &str) -> String {
+        let mut libs = Vec::new();
+        if docker_image.contains("timescaledb") {
+            libs.push("timescaledb");
+        }
+        libs.push("pg_stat_statements");
+        libs.join(",")
     }
 
     async fn restore_backup_file(
@@ -3093,15 +3182,39 @@ impl ExternalService for PostgresService {
         if let Some(container) = containers.first() {
             // Inspect the existing CMD. If it disagrees with what we'd emit
             // now, force a recreate by stopping + removing the old container
-            // and falling through to the create branch.
-            let drift = self
+            // and falling through to the create branch. Covers both
+            // archive_mode drift and shared_preload_libraries drift (e.g. a
+            // container created before pg_stat_statements support, or before
+            // an image-specific library like timescaledb was correctly
+            // merged in) — see `container_cmd_shared_preload_libraries_differs`.
+            //
+            // Desired libraries are derived from the *container's own*
+            // `Image` field, not `existing_config` — a freshly-constructed
+            // service instance (e.g. from `start_service()`'s non-imported
+            // path) has an unhydrated `self.config` (`None`), which would
+            // otherwise silently skip this drift check entirely.
+            let desired_preload_libraries = container
+                .image
+                .as_deref()
+                .map(Self::shared_preload_libraries_for_image);
+
+            let archive_drift = self
                 .container_cmd_archive_mode_differs(container, desired_enable_archiving)
                 .await;
+            let preload_drift = match &desired_preload_libraries {
+                Some(desired) => {
+                    self.container_cmd_shared_preload_libraries_differs(container, desired)
+                        .await
+                }
+                None => false,
+            };
+            let drift = archive_drift || preload_drift;
             if drift {
                 info!(
-                    "Container {} has archive_mode CMD drift (desired={}). \
+                    "Container {} has CMD drift (archive_mode drift={}, \
+                     shared_preload_libraries drift={}, desired archive_mode={}). \
                      Recreating to apply correct config.",
-                    container_name, desired_enable_archiving
+                    container_name, archive_drift, preload_drift, desired_enable_archiving
                 );
                 let _ = self
                     .docker
@@ -3176,6 +3289,26 @@ impl ExternalService for PostgresService {
             .await?;
 
         Ok(())
+    }
+
+    /// Hydrate `self.config` from `service_config` (mirroring `init()`, but
+    /// without unconditionally creating a container — a container may
+    /// already exist and only need recreating), then delegate to `start()`.
+    /// `start()`'s reconcile-on-start drift check derives desired
+    /// `shared_preload_libraries` from the *container's own* `Image` field
+    /// (see `container_cmd_shared_preload_libraries_differs`), so it will
+    /// detect drift and recreate correctly now that `self.config` is
+    /// populated for the create step.
+    async fn force_recreate(&self, service_config: ServiceConfig) -> Result<()> {
+        let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(anyhow::anyhow!("Invalid resource limits: {}", e));
+        }
+        let postgres_config = self.get_postgres_config(service_config)?;
+        *self.config.write().await = Some(postgres_config);
+        *self.resource_limits.write().await = resource_limits;
+
+        self.start().await
     }
 
     async fn stop(&self) -> Result<()> {
@@ -5844,5 +5977,44 @@ mod tests {
             "expected WAL-G requirement in error, got: {}",
             msg
         );
+    }
+
+    // -----------------------------------------------------------------
+    // shared_preload_libraries_for_image
+    // -----------------------------------------------------------------
+    //
+    // Regression coverage for the bug where this value was unconditionally
+    // overwritten to just "pg_stat_statements", silently dropping any
+    // image-required library (e.g. TimescaleDB requires "timescaledb" to be
+    // preloaded for hypertables' background workers, continuous aggregates,
+    // and compression policies to function at all).
+
+    #[test]
+    fn shared_preload_libraries_default_image_is_pg_stat_statements_only() {
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "gotempsh/postgres-walg:18-bookworm",
+        );
+        assert_eq!(libs, "pg_stat_statements");
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_merges_both() {
+        let libs =
+            PostgresService::shared_preload_libraries_for_image("timescale/timescaledb-ha:pg18");
+        assert_eq!(
+            libs, "timescaledb,pg_stat_statements",
+            "timescaledb must be preloaded alongside pg_stat_statements, never dropped"
+        );
+    }
+
+    #[test]
+    fn shared_preload_libraries_timescale_image_any_tag() {
+        // Detection is substring-based on the image name, not tag-specific —
+        // confirm a different tag still matches.
+        let libs = PostgresService::shared_preload_libraries_for_image(
+            "timescale/timescaledb-ha:pg16-ts2.15",
+        );
+        assert!(libs.contains("timescaledb"));
+        assert!(libs.contains("pg_stat_statements"));
     }
 }

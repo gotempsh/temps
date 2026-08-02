@@ -61,7 +61,7 @@ import {
   Routes,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 import { Card, CardContent } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ShieldAlert } from 'lucide-react'

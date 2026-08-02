@@ -24,7 +24,7 @@ import {
   Terminal,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 interface ErrorTrackingSetupProps {
   project: ProjectResponse

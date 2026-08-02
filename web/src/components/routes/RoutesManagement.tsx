@@ -46,7 +46,7 @@ import { useMutation } from '@tanstack/react-query'
 import { Globe, Lock, MoreHorizontal, Pencil, Plus, Router, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 

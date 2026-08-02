@@ -20,7 +20,7 @@ import { Cloud, Loader2, Lock } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 import { useForm } from 'react-hook-form'
 import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { z } from 'zod'
 
 const loginSchema = z.object({

@@ -8,6 +8,7 @@ import {
   listDsnsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ErrorTimeSeriesChart } from '@/components/error-tracking/ErrorTimeSeriesChart'
+import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -55,7 +56,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { CopyButton } from '../ui/copy-button'
@@ -209,14 +210,18 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   })
 
   // When the project has never received any errors, route to the onboarding
-  // wizard (mirrors analytics empty-state behavior).
+  // wizard (mirrors analytics empty-state behavior). Skip while the guided
+  // tour is showing off this page — it should render its own empty state
+  // rather than get bounced to /setup out from under the tour.
+  const isTourActive = useProjectTourActive()
   useEffect(() => {
-    if (isCheckingErrors) return
+    if (isCheckingErrors || isTourActive) return
     if (!hasErrorGroupsData?.has_error_groups) {
       navigate(`/projects/${project.slug}/errors/setup`, { replace: true })
     }
   }, [
     isCheckingErrors,
+    isTourActive,
     hasErrorGroupsData?.has_error_groups,
     navigate,
     project.slug,

@@ -19,6 +19,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { createCredentialRevealGuard } from '@/lib/credential-reveal-state'
+import { Eye, EyeOff, Loader2 } from 'lucide-react'
+import { InputHTMLAttributes, useEffect, useRef, useState } from 'react'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderFormData } from './schemas'
@@ -30,11 +33,105 @@ interface ProviderFormProps {
   isLoading?: boolean
   formId?: string
   hideSubmit?: boolean
+  revealScopeKey?: string | number
+  onRevealCredential?: (field: string) => Promise<string>
 }
+
+const MASKED_VALUE = '***'
 
 const showToastFormError = (error: any) => {
   toast.error(
     `The form has errors, please check the fields and try again: ${JSON.stringify(error)}`
+  )
+}
+
+interface RevealableInputProps extends Omit<
+  InputHTMLAttributes<HTMLInputElement>,
+  'onChange' | 'value'
+> {
+  fieldPath: string
+  value: string | undefined
+  onChange: (value: string) => void
+  onRevealCredential?: (field: string) => Promise<string>
+}
+
+function RevealableInput({
+  fieldPath,
+  value,
+  onChange,
+  onRevealCredential,
+  type = 'text',
+  ...inputProps
+}: RevealableInputProps) {
+  const [isRevealed, setIsRevealed] = useState(false)
+  const [isRevealing, setIsRevealing] = useState(false)
+  const revealGuard = useRef(createCredentialRevealGuard())
+
+  useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    return () => guard.invalidate()
+  }, [])
+
+  const canReveal =
+    !!onRevealCredential && (value === MASKED_VALUE || isRevealed)
+
+  const toggleReveal = async () => {
+    if (isRevealed) {
+      revealGuard.current.cancel(fieldPath)
+      onChange(MASKED_VALUE)
+      setIsRevealed(false)
+      return
+    }
+
+    if (!onRevealCredential) return
+
+    setIsRevealing(true)
+    const request = revealGuard.current.begin(fieldPath)
+    try {
+      const revealedValue = await onRevealCredential(fieldPath)
+      if (!revealGuard.current.isCurrent(fieldPath, request)) return
+      onChange(revealedValue)
+      setIsRevealed(true)
+    } catch {
+      if (revealGuard.current.isCurrent(fieldPath, request)) {
+        toast.error('Failed to reveal credential')
+      }
+    } finally {
+      if (revealGuard.current.finish(fieldPath, request)) {
+        setIsRevealing(false)
+      }
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        {...inputProps}
+        type={type === 'password' && isRevealed ? 'text' : type}
+        value={value ?? ''}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {canReveal && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          onClick={toggleReveal}
+          disabled={isRevealing || inputProps.disabled}
+          aria-label={isRevealed ? 'Hide value' : 'Reveal value'}
+          title={isRevealed ? 'Hide value' : 'Reveal value'}
+        >
+          {isRevealing ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : isRevealed ? (
+            <EyeOff className="h-4 w-4" />
+          ) : (
+            <Eye className="h-4 w-4" />
+          )}
+        </Button>
+      )}
+    </div>
   )
 }
 
@@ -45,6 +142,8 @@ export function ProviderForm({
   isLoading = false,
   formId,
   hideSubmit = false,
+  revealScopeKey,
+  onRevealCredential,
 }: ProviderFormProps) {
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
@@ -296,8 +395,12 @@ export function ProviderForm({
                 <FormItem>
                   <FormLabel>SMTP Password</FormLabel>
                   <FormControl>
-                    <Input
-                      {...field}
+                    <RevealableInput
+                      key={`${revealScopeKey}:password`}
+                      fieldPath="password"
+                      value={field.value}
+                      onChange={field.onChange}
+                      onRevealCredential={onRevealCredential}
                       type="password"
                       placeholder="••••••••"
                       disabled={!form.watch('config.use_credentials')}
@@ -381,8 +484,12 @@ export function ProviderForm({
                   <FormItem>
                     <FormLabel>Webhook URL</FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
+                      <RevealableInput
+                        key={`${revealScopeKey}:webhook_url`}
+                        fieldPath="webhook_url"
+                        value={field.value}
+                        onChange={field.onChange}
+                        onRevealCredential={onRevealCredential}
                         placeholder="https://hooks.slack.com/..."
                       />
                     </FormControl>
@@ -418,7 +525,8 @@ export function ProviderForm({
                 Webhook Configuration
               </h3>
               <p className="text-sm text-muted-foreground">
-                Send notifications as JSON payloads to any HTTP endpoint. Use custom headers for authentication.
+                Send notifications as JSON payloads to any HTTP endpoint. Use
+                custom headers for authentication.
               </p>
             </div>
 
@@ -429,8 +537,12 @@ export function ProviderForm({
                 <FormItem>
                   <FormLabel>Webhook URL</FormLabel>
                   <FormControl>
-                    <Input
-                      {...field}
+                    <RevealableInput
+                      key={`${revealScopeKey}:url`}
+                      fieldPath="url"
+                      value={field.value}
+                      onChange={field.onChange}
+                      onRevealCredential={onRevealCredential}
                       placeholder="https://api.example.com/webhook"
                     />
                   </FormControl>
@@ -501,7 +613,8 @@ export function ProviderForm({
                 Custom Headers
               </h4>
               <p className="text-sm text-muted-foreground">
-                Add custom headers for authentication (e.g., Authorization: Bearer token)
+                Add custom headers for authentication (e.g., Authorization:
+                Bearer token)
               </p>
 
               <FormField
@@ -515,7 +628,11 @@ export function ProviderForm({
                     field.onChange({ ...headers, '': '' })
                   }
 
-                  const updateHeader = (oldKey: string, newKey: string, value: string) => {
+                  const updateHeader = (
+                    oldKey: string,
+                    newKey: string,
+                    value: string
+                  ) => {
                     const newHeaders = { ...headers }
                     if (oldKey !== newKey) {
                       delete newHeaders[oldKey]
@@ -540,13 +657,24 @@ export function ProviderForm({
                             <Input
                               placeholder="Header name"
                               value={key}
-                              onChange={(e) => updateHeader(key, e.target.value, value as string)}
+                              onChange={(e) =>
+                                updateHeader(
+                                  key,
+                                  e.target.value,
+                                  value as string
+                                )
+                              }
                               className="flex-1"
                             />
-                            <Input
+                            <RevealableInput
+                              key={`${revealScopeKey}:${key}:${index}`}
+                              fieldPath={`headers.${key}`}
                               placeholder="Header value"
                               value={value as string}
-                              onChange={(e) => updateHeader(key, key, e.target.value)}
+                              onChange={(newValue) =>
+                                updateHeader(key, key, newValue)
+                              }
+                              onRevealCredential={onRevealCredential}
                               className="flex-1"
                             />
                             <Button
@@ -569,7 +697,8 @@ export function ProviderForm({
                         </Button>
                       </div>
                       <FormDescription>
-                        Common headers: Authorization, X-API-Key, X-Custom-Header
+                        Common headers: Authorization, X-API-Key,
+                        X-Custom-Header
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
@@ -579,9 +708,11 @@ export function ProviderForm({
             </div>
 
             <div className="rounded-lg border p-4 bg-muted/50">
-              <h4 className="text-sm font-medium mb-2">Webhook Payload Format</h4>
+              <h4 className="text-sm font-medium mb-2">
+                Webhook Payload Format
+              </h4>
               <pre className="text-xs text-muted-foreground overflow-x-auto">
-{`{
+                {`{
   "id": "notification-uuid",
   "title": "Alert Title",
   "message": "Alert message content",
@@ -636,8 +767,12 @@ export function ProviderForm({
                 <FormItem>
                   <FormLabel>API Token</FormLabel>
                   <FormControl>
-                    <Input
-                      {...field}
+                    <RevealableInput
+                      key={`${revealScopeKey}:api_token`}
+                      fieldPath="api_token"
+                      value={field.value}
+                      onChange={field.onChange}
+                      onRevealCredential={onRevealCredential}
                       type="password"
                       placeholder="••••••••"
                       autoComplete="off"

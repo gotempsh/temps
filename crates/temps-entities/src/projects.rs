@@ -58,6 +58,11 @@ pub struct Model {
     /// application source is always a deliberate choice.
     #[sea_orm(default_value = "false")]
     pub error_source_context_enabled: bool,
+    /// Where the auto-capture job reads source from, relative to the git
+    /// checkout. NULL = default to the deployment's Docker build context (the
+    /// directory the image was built from) — the correct root for Dockerfile
+    /// deploys and monorepos. Set it to narrow/override that default.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, preview environments auto-created for branches are

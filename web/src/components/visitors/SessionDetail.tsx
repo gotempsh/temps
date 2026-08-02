@@ -48,7 +48,7 @@ import {
   ChevronRight,
 } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { DateRange } from 'react-day-picker'

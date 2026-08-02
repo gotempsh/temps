@@ -1,4 +1,4 @@
-import { Outlet } from 'react-router-dom'
+import { Outlet } from 'react-router'
 
 // The settings nav lives in the main app sidebar (see Sidebar.tsx —
 // settings drill-down). This layout is a content-only wrapper.

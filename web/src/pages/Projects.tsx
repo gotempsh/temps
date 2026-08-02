@@ -4,7 +4,7 @@ import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
-import { GettingStartedCard } from '@/components/dashboard/GettingStartedCard'
+import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { MetricCard } from '@/components/dashboard/MetricCard'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { MetricCardSkeleton } from '@/components/skeletons/MetricCardSkeleton'
@@ -20,16 +20,21 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
+  ArrowRight,
   DollarSign,
   Eye,
   FolderGit2,
   Minus,
   TrendingDown,
   TrendingUp,
-  Upload,
   Users,
 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
+import { SourceLogo } from '@/components/imports/SourceLogo'
+import {
+  TOP_MIGRATION_SOURCES,
+  importHref,
+} from '@/components/imports/migration-sources'
 
 function formatTrendChange(trendPercentage: number | null | undefined): {
   change: string
@@ -83,7 +88,7 @@ export function Projects() {
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
-  const { data: projectsData, isLoading } = useQuery({
+  const { data: rawProjectsData, isLoading } = useQuery({
     ...getProjectsOptions({
       query: {
         page,
@@ -92,10 +97,17 @@ export function Projects() {
     }),
   })
 
-  const { data: gitProviders, isLoading: gitProvidersLoading } = useQuery({
+  const { data: rawGitProviders, isLoading: gitProvidersLoading } = useQuery({
     ...listGitProvidersOptions({}),
     retry: false,
   })
+
+  // TEMP: force an empty (brand-new install) dashboard while iterating on the
+  // first-run experience. See lib/devSimulate.ts.
+  const projectsData = SIMULATE_EMPTY_INSTALL
+    ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
+    : rawProjectsData
+  const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
@@ -219,14 +231,6 @@ export function Projects() {
 
   return (
     <div className="p-4 sm:p-8 space-y-6">
-      {/* The Getting Started checklist and the first-run "Deploy your first
-          project" empty state both cover connecting Git + the first deploy —
-          showing both at once is redundant and buries the deploy CTAs. On an
-          empty instance the empty state below owns that story; the checklist
-          returns once a project exists, to nudge the remaining setup (wildcard
-          domain, notifications). */}
-      {hasProjects && <GettingStartedCard />}
-
       {/* Metric cards (merged from former Dashboard page). Hidden on an empty
           instance — with no projects every figure is zero, so the cards are
           vanity data that pushes the recommended actions below the fold. The
@@ -302,26 +306,14 @@ export function Projects() {
       )}
 
       {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
-          <p className="text-sm text-muted-foreground">
-            Manage your projects and their settings
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button asChild variant="outline">
-            <Link
-              to="/projects/import-wizard"
-              className="flex items-center gap-2"
-            >
-              <Upload className="h-4 w-4" />
-              Import Project
-            </Link>
-          </Button>
-          <CreateActionButton to="/projects/new" label="New Project" />
-        </div>
-      </div>
+      <ProjectsHeader
+        actions={
+          <>
+            <PlatformStrip />
+            <CreateActionButton to="/projects/new" label="New Project" />
+          </>
+        }
+      />
 
       {/* Projects Grid */}
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
@@ -384,6 +376,62 @@ export function Projects() {
           </Button>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * Projects page header. The title block is fixed; `actions` is what the
+ * migration-entry-point variants swap out.
+ */
+function ProjectsHeader({ actions }: { actions: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
+        <p className="text-sm text-muted-foreground">
+          Manage your projects and their settings
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-2">{actions}</div>
+    </div>
+  )
+}
+
+/**
+ * Migration entry point. The platforms themselves are the affordance: brand
+ * marks sit inline in the header so someone arriving from Coolify or Dokploy
+ * recognises the path instead of reading for it, and each mark deep-links the
+ * import wizard with that source already selected — skipping its first step.
+ */
+function PlatformStrip() {
+  return (
+    <div className="flex items-center gap-1 rounded-md border p-1">
+      {/* The label is the first thing to go when the header wraps on mobile —
+          the brand marks still carry the meaning, and every one of them has an
+          accessible name. */}
+      <span className="hidden px-1.5 text-xs text-muted-foreground sm:inline">
+        Migrate from
+      </span>
+      {TOP_MIGRATION_SOURCES.map((p) => (
+        <Link
+          key={p.source}
+          to={importHref(p.source)}
+          title={`Import from ${p.label}`}
+          aria-label={`Import from ${p.label}`}
+          className="rounded p-1.5 transition-colors hover:bg-accent"
+        >
+          <SourceLogo source={p.source} className="h-4 w-4" />
+        </Link>
+      ))}
+      <Link
+        to="/projects/import-wizard"
+        className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent"
+        title="All platforms"
+        aria-label="All platforms"
+      >
+        <ArrowRight className="h-4 w-4" />
+      </Link>
     </div>
   )
 }

@@ -11,7 +11,12 @@
  */
 
 import { Button } from '@/components/ui/button'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  TOOLTIP_CONTENT_STYLE,
+  TOOLTIP_LABEL_STYLE,
+  formatChartTick,
+  formatChartTooltipLabel,
+} from '@/lib/chart-tooltip'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -59,7 +64,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { createContext, useContext, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { toast } from 'sonner'
 import {
@@ -660,10 +665,7 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
   })
 
   const chartData = (data ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
+    time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
@@ -700,10 +702,12 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
         />
         <XAxis
           dataKey="time"
+          type="number"
+          domain={['dataMin', 'dataMax']}
           tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
           tickLine={false}
           axisLine={false}
-          interval="preserveStartEnd"
+          tickFormatter={formatChartTick}
         />
         <YAxis
           tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -726,6 +730,7 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           labelStyle={TOOLTIP_LABEL_STYLE}
           itemStyle={{ color: CHART_LINE_COLOR }}
           cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
+          labelFormatter={(label) => formatChartTooltipLabel(Number(label))}
           formatter={(v) => [
             formatMetricValue(metricName, Number(v)),
             labelForMetric(metricName),
@@ -1341,6 +1346,8 @@ function MonitoringDashboard({
           aggregateByName={latestByName}
         />
       )}
+
+      {/* Slow queries moved to the dedicated Query Performance page */}
 
       {/* Alert rules */}
       <AlertRulesSection serviceId={serviceId} engine={engine} />

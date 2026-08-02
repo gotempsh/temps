@@ -1,11 +1,9 @@
 'use client'
 
 import {
-  createEmailProvider as createProvider2,
   listEmailProviders as listProviders2,
   testProvider,
   updateEmailProvider as updateProvider2,
-  type CreateEmailProviderRequest,
   type EmailProviderResponse,
   type TestEmailRequest as SdkTestEmailRequest,
   type TestEmailResponse as SdkTestEmailResponse,
@@ -13,6 +11,7 @@ import {
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
@@ -51,98 +50,27 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import {
-  EllipsisVertical,
-  Loader2,
-  Mail,
-  Plus,
-  Send,
-  Server,
-} from 'lucide-react'
+import { EllipsisVertical, Loader2, Mail, Send, Server } from 'lucide-react'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
+  awsRegions,
   deleteEmailProvider,
   problemMessage,
+  providerTypeLabel,
   readMaskedCreds,
+  scalewayRegions,
 } from './sharedUtils'
 
 // Types for email providers — alias over SDK response
 type EmailProvider = EmailProviderResponse
 type TestEmailResponse = SdkTestEmailResponse
 type TestEmailRequest = SdkTestEmailRequest
-
-// Form schema
-const createProviderSchema = z
-  .object({
-    name: z.string().min(1, 'Name is required'),
-    provider_type: z.enum(['ses', 'scaleway', 'smtp']),
-    region: z.string().min(1, 'Region is required'),
-    // SES credentials
-    sns_topic_arn: z.string().optional(),
-    access_key_id: z.string().optional(),
-    secret_access_key: z.string().optional(),
-    // Scaleway credentials
-    api_key: z.string().optional(),
-    project_id: z.string().optional(),
-    // SMTP credentials
-    smtp_host: z.string().optional(),
-    smtp_port: z.number().int().min(1).max(65535).optional(),
-    smtp_username: z.string().optional(),
-    smtp_password: z.string().optional(),
-    smtp_encryption: z.enum(['starttls', 'tls', 'none']).optional(),
-    smtp_accept_invalid_certs: z.boolean().optional(),
-  })
-  .superRefine((data, ctx) => {
-    if (data.provider_type === 'ses') {
-      if (!data.access_key_id || !data.secret_access_key) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message:
-            'Access key ID and secret access key are required for AWS SES',
-          path: ['access_key_id'],
-        })
-      }
-    } else if (data.provider_type === 'scaleway') {
-      if (!data.api_key || !data.project_id) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'API key and project ID are required for Scaleway',
-          path: ['api_key'],
-        })
-      }
-    } else if (data.provider_type === 'smtp') {
-      if (!data.smtp_host) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'SMTP host is required',
-          path: ['smtp_host'],
-        })
-      }
-      if (!data.smtp_port) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'SMTP port is required',
-          path: ['smtp_port'],
-        })
-      }
-      // password is required when username is set
-      if (data.smtp_username && !data.smtp_password) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'Password is required when a username is provided',
-          path: ['smtp_password'],
-        })
-      }
-    }
-  })
-
-type CreateProviderFormData = z.infer<typeof createProviderSchema>
 
 async function listEmailProviders(): Promise<EmailProvider[]> {
   const response = await listProviders2()
@@ -152,58 +80,6 @@ async function listEmailProviders(): Promise<EmailProvider[]> {
     )
   }
   return response.data ?? []
-}
-
-async function createEmailProvider(
-  data: CreateProviderFormData
-): Promise<EmailProvider> {
-  const body: CreateEmailProviderRequest = {
-    name: data.name,
-    provider_type: data.provider_type,
-    region: data.region,
-  }
-
-  if (
-    data.provider_type === 'ses' &&
-    data.access_key_id &&
-    data.secret_access_key
-  ) {
-    body.sns_topic_arn = data.sns_topic_arn || undefined
-    body.ses_credentials = {
-      access_key_id: data.access_key_id,
-      secret_access_key: data.secret_access_key,
-    }
-  } else if (
-    data.provider_type === 'scaleway' &&
-    data.api_key &&
-    data.project_id
-  ) {
-    body.scaleway_credentials = {
-      api_key: data.api_key,
-      project_id: data.project_id,
-    }
-  } else if (
-    data.provider_type === 'smtp' &&
-    data.smtp_host &&
-    data.smtp_port
-  ) {
-    body.smtp_credentials = {
-      host: data.smtp_host,
-      port: data.smtp_port,
-      username: data.smtp_username || undefined,
-      password: data.smtp_password || undefined,
-      encryption: data.smtp_encryption ?? 'starttls',
-      accept_invalid_certs: data.smtp_accept_invalid_certs ?? false,
-    }
-  }
-
-  const response = await createProvider2({ body })
-  if (response.error || !response.data) {
-    throw new Error(
-      problemMessage(response.error, 'Failed to create email provider')
-    )
-  }
-  return response.data
 }
 
 async function updateEmailProviderApi(
@@ -238,30 +114,6 @@ const testEmailSchema = z.object({
 
 type TestEmailFormData = z.infer<typeof testEmailSchema>
 
-// AWS regions for SES
-const awsRegions = [
-  { value: 'us-east-1', label: 'US East (N. Virginia)' },
-  { value: 'us-east-2', label: 'US East (Ohio)' },
-  { value: 'us-west-1', label: 'US West (N. California)' },
-  { value: 'us-west-2', label: 'US West (Oregon)' },
-  { value: 'eu-west-1', label: 'Europe (Ireland)' },
-  { value: 'eu-west-2', label: 'Europe (London)' },
-  { value: 'eu-west-3', label: 'Europe (Paris)' },
-  { value: 'eu-central-1', label: 'Europe (Frankfurt)' },
-  { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)' },
-  { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)' },
-  { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)' },
-  { value: 'ap-south-1', label: 'Asia Pacific (Mumbai)' },
-  { value: 'sa-east-1', label: 'South America (São Paulo)' },
-]
-
-// Scaleway regions
-const scalewayRegions = [
-  { value: 'fr-par', label: 'Paris, France' },
-  { value: 'nl-ams', label: 'Amsterdam, Netherlands' },
-  { value: 'pl-waw', label: 'Warsaw, Poland' },
-]
-
 function ProviderIcon({ type }: { type: 'ses' | 'scaleway' | 'smtp' }) {
   if (type === 'ses') {
     return <AWSIcon className="h-5 w-5 text-[#FF9900]" />
@@ -270,17 +122,6 @@ function ProviderIcon({ type }: { type: 'ses' | 'scaleway' | 'smtp' }) {
     return <ScalewayIcon className="h-5 w-5 text-[#4F0599]" />
   }
   return <Server className="h-5 w-5 text-slate-600 dark:text-slate-300" />
-}
-
-function providerTypeLabel(type: 'ses' | 'scaleway' | 'smtp'): string {
-  switch (type) {
-    case 'ses':
-      return 'AWS SES'
-    case 'scaleway':
-      return 'Scaleway'
-    case 'smtp':
-      return 'SMTP'
-  }
 }
 
 export function TestEmailDialog({
@@ -1077,7 +918,6 @@ export function EditProviderDialog({
 }
 
 export function EmailProvidersManagement() {
-  const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [isTestDialogOpen, setIsTestDialogOpen] = useState(false)
   const [testingProviderId, setTestingProviderId] = useState<number | null>(
     null
@@ -1093,21 +933,6 @@ export function EmailProvidersManagement() {
     queryFn: listEmailProviders,
   })
 
-  const createMutation = useMutation({
-    mutationFn: createEmailProvider,
-    onSuccess: () => {
-      toast.success('Email provider created successfully')
-      queryClient.invalidateQueries({ queryKey: ['email-providers'] })
-      setIsDialogOpen(false)
-      form.reset()
-    },
-    onError: (error: Error) => {
-      toast.error('Failed to create provider', {
-        description: error.message,
-      })
-    },
-  })
-
   const deleteMutation = useMutation({
     mutationFn: deleteEmailProvider,
     onSuccess: () => {
@@ -1120,38 +945,6 @@ export function EmailProvidersManagement() {
       })
     },
   })
-
-  const form = useForm<CreateProviderFormData>({
-    resolver: zodResolver(createProviderSchema),
-    defaultValues: {
-      name: '',
-      provider_type: 'ses',
-      region: 'us-east-1',
-      sns_topic_arn: '',
-      access_key_id: '',
-      secret_access_key: '',
-      api_key: '',
-      project_id: '',
-      smtp_host: '',
-      smtp_port: 587,
-      smtp_username: '',
-      smtp_password: '',
-      smtp_encryption: 'starttls',
-      smtp_accept_invalid_certs: false,
-    },
-  })
-
-  const providerType = form.watch('provider_type')
-  const regions =
-    providerType === 'ses'
-      ? awsRegions
-      : providerType === 'scaleway'
-        ? scalewayRegions
-        : []
-
-  const onSubmit = (data: CreateProviderFormData) => {
-    createMutation.mutate(data)
-  }
 
   const handleDelete = (id: number) => {
     deleteMutation.mutate(id)
@@ -1181,10 +974,11 @@ export function EmailProvidersManagement() {
         </div>
 
         {hasProviders && (
-          <Button onClick={() => setIsDialogOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Provider
-          </Button>
+          <CreateActionButton
+            to="/email/providers/new"
+            label="Add Provider"
+            disabled={isEditDialogOpen || isTestDialogOpen}
+          />
         )}
       </div>
 
@@ -1196,10 +990,11 @@ export function EmailProvidersManagement() {
           title="No email providers configured"
           description="Add your first email provider to start sending transactional emails from your applications."
           action={
-            <Button onClick={() => setIsDialogOpen(true)}>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Provider
-            </Button>
+            <CreateActionButton
+              to="/email/providers/new"
+              label="Add Provider"
+              disabled={isEditDialogOpen || isTestDialogOpen}
+            />
           }
         />
       ) : (
@@ -1215,420 +1010,6 @@ export function EmailProvidersManagement() {
           ))}
         </div>
       )}
-
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Add Email Provider</DialogTitle>
-            <DialogDescription>
-              Configure a cloud email provider to send transactional emails.
-            </DialogDescription>
-          </DialogHeader>
-
-          <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-              <FormField
-                control={form.control}
-                name="name"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Name</FormLabel>
-                    <FormControl>
-                      <Input placeholder="My Email Provider" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      A friendly name to identify this provider.
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              <FormField
-                control={form.control}
-                name="provider_type"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Provider Type</FormLabel>
-                    <Select
-                      onValueChange={(value) => {
-                        field.onChange(value)
-                        // Reset region to a sensible default for the new provider
-                        if (value === 'ses') {
-                          form.setValue('region', 'us-east-1')
-                        } else if (value === 'scaleway') {
-                          form.setValue('region', 'fr-par')
-                        } else if (value === 'smtp') {
-                          // SMTP doesn't use cloud regions; reuse the field as a free-form label
-                          form.setValue('region', 'custom')
-                        }
-                      }}
-                      value={field.value}
-                    >
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select a provider" />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="ses">
-                          <div className="flex items-center gap-2">
-                            <AWSIcon className="h-4 w-4 text-[#FF9900]" />
-                            AWS SES
-                          </div>
-                        </SelectItem>
-                        <SelectItem value="scaleway">
-                          <div className="flex items-center gap-2">
-                            <ScalewayIcon className="h-4 w-4 text-[#4F0599]" />
-                            Scaleway
-                          </div>
-                        </SelectItem>
-                        <SelectItem value="smtp">
-                          <div className="flex items-center gap-2">
-                            <Server className="h-4 w-4 text-slate-600 dark:text-slate-300" />
-                            SMTP (import existing domain)
-                          </div>
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <FormDescription>
-                      Choose <strong>SMTP</strong> when you already have SMTP
-                      credentials (for example, AWS SES SMTP, Sendgrid, Mailgun)
-                      and your sending domain is verified at the upstream
-                      provider — Temps will use those credentials directly
-                      without managing DNS.
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              {providerType !== 'smtp' && (
-                <FormField
-                  control={form.control}
-                  name="region"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Region</FormLabel>
-                      <Select
-                        onValueChange={field.onChange}
-                        value={field.value}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select a region" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {regions.map((region) => (
-                            <SelectItem key={region.value} value={region.value}>
-                              <div className="flex items-center justify-between gap-4 w-full">
-                                <span>{region.label}</span>
-                                <span className="font-mono text-xs text-muted-foreground">
-                                  {region.value}
-                                </span>
-                              </div>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              )}
-
-              {providerType === 'ses' && (
-                <>
-                  <FormField
-                    control={form.control}
-                    name="sns_topic_arn"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>SNS Topic ARN</FormLabel>
-                        <FormControl>
-                          <Input
-                            placeholder="arn:aws:sns:us-east-1:123456789012:temps-events"
-                            autoComplete="off"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Exact SNS topic authorized to send SES delivery,
-                          bounce, and complaint events for this provider.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="access_key_id"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Access Key ID</FormLabel>
-                        <FormControl>
-                          <Input
-                            placeholder="AKIAIOSFODNN7EXAMPLE"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Your AWS access key ID with SES permissions.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="secret_access_key"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Secret Access Key</FormLabel>
-                        <FormControl>
-                          <Input
-                            type="password"
-                            placeholder="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Your AWS secret access key.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                </>
-              )}
-
-              {providerType === 'scaleway' && (
-                <>
-                  <FormField
-                    control={form.control}
-                    name="api_key"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>API Key</FormLabel>
-                        <FormControl>
-                          <Input
-                            type="password"
-                            placeholder="scw-secret-key-12345"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Your Scaleway secret key with Transactional Email
-                          permissions.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="project_id"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Project ID</FormLabel>
-                        <FormControl>
-                          <Input
-                            placeholder="12345678-1234-1234-1234-123456789012"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Your Scaleway project ID.
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                </>
-              )}
-
-              {providerType === 'smtp' && (
-                <>
-                  <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-950/30 p-3 text-sm text-amber-900 dark:text-amber-100">
-                    Domains added under an SMTP provider are treated as already
-                    verified — Temps cannot manage DKIM/SPF/MX records via SMTP.
-                    Make sure DNS is configured at your upstream provider (e.g.
-                    the AWS SES console) before sending.
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-4">
-                    <FormField
-                      control={form.control}
-                      name="smtp_host"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>SMTP Host</FormLabel>
-                          <FormControl>
-                            <Input
-                              placeholder="email-smtp.eu-west-1.amazonaws.com"
-                              autoComplete="off"
-                              {...field}
-                            />
-                          </FormControl>
-                          <FormDescription>
-                            For AWS SES:{' '}
-                            <code className="font-mono text-xs">
-                              email-smtp.&lt;region&gt;.amazonaws.com
-                            </code>
-                            .
-                          </FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-
-                    <FormField
-                      control={form.control}
-                      name="smtp_port"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Port</FormLabel>
-                          <FormControl>
-                            <Input
-                              type="number"
-                              min={1}
-                              max={65535}
-                              placeholder="587"
-                              value={field.value ?? ''}
-                              onChange={(e) => {
-                                const v = e.target.value
-                                field.onChange(v === '' ? undefined : Number(v))
-                              }}
-                              onBlur={field.onBlur}
-                              name={field.name}
-                              ref={field.ref}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  </div>
-
-                  <FormField
-                    control={form.control}
-                    name="smtp_encryption"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Encryption</FormLabel>
-                        <Select
-                          onValueChange={(value) => {
-                            field.onChange(value)
-                            // Suggest the conventional port when switching modes,
-                            // unless the user has already customised it.
-                            const port = form.getValues('smtp_port')
-                            if (
-                              value === 'starttls' &&
-                              (port === 465 || port === 25)
-                            ) {
-                              form.setValue('smtp_port', 587)
-                            } else if (
-                              value === 'tls' &&
-                              (port === 587 || port === 25)
-                            ) {
-                              form.setValue('smtp_port', 465)
-                            } else if (
-                              value === 'none' &&
-                              (port === 587 || port === 465)
-                            ) {
-                              form.setValue('smtp_port', 25)
-                            }
-                          }}
-                          value={field.value ?? 'starttls'}
-                        >
-                          <FormControl>
-                            <SelectTrigger>
-                              <SelectValue placeholder="Select TLS mode" />
-                            </SelectTrigger>
-                          </FormControl>
-                          <SelectContent>
-                            <SelectItem value="starttls">
-                              STARTTLS (port 587, default)
-                            </SelectItem>
-                            <SelectItem value="tls">
-                              Implicit TLS / SMTPS (port 465)
-                            </SelectItem>
-                            <SelectItem value="none">
-                              No encryption (local testing only)
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="smtp_username"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Username (optional)</FormLabel>
-                        <FormControl>
-                          <Input
-                            placeholder="AKIAIOSFODNN7EXAMPLE"
-                            autoComplete="off"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          For AWS SES SMTP, this is the SMTP user generated in
-                          the SES console (it is <em>not</em> your IAM access
-                          key).
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="smtp_password"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Password / SMTP secret</FormLabel>
-                        <FormControl>
-                          <Input
-                            type="password"
-                            placeholder="••••••••••••"
-                            autoComplete="new-password"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                </>
-              )}
-
-              <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setIsDialogOpen(false)}
-                >
-                  Cancel
-                </Button>
-                <Button type="submit" disabled={createMutation.isPending}>
-                  {createMutation.isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Add Provider
-                </Button>
-              </DialogFooter>
-            </form>
-          </Form>
-        </DialogContent>
-      </Dialog>
 
       <TestEmailDialog
         open={isTestDialogOpen}

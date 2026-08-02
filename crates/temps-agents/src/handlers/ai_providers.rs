@@ -75,6 +75,19 @@ pub struct ProviderCatalogDto {
     /// picked. `None` means "use the CLI's own default" — the UI renders
     /// that as "Use provider default".
     pub default_model: Option<String>,
+    /// Default max turns for the autofixer analysis phase. `None` = built-in
+    /// default (10). Only enforced for CLIs with a turn flag (Claude Code).
+    pub max_turns_analysis: Option<i32>,
+    /// Default max turns for the autofixer fix phase. `None` = built-in
+    /// default (20).
+    pub max_turns_fix: Option<i32>,
+    /// Default max turns for autofixer feedback rounds. `None` = built-in
+    /// default (10).
+    pub max_turns_feedback: Option<i32>,
+    /// True when this provider's CLI supports enforcing a turn cap. False
+    /// for Codex/OpenCode, which run to completion — the UI labels their
+    /// max-turns inputs accordingly.
+    pub supports_max_turns: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -124,6 +137,20 @@ pub struct UpdateProviderRequest {
     /// value so the CLI falls back to its own default.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Default max turns for the autofixer analysis phase (1–200). `0`
+    /// clears the stored value (built-in default applies); omitted/`None`
+    /// leaves the current value unchanged — so a PATCH that only updates
+    /// `default_model` doesn't wipe the turn settings.
+    #[serde(default)]
+    pub max_turns_analysis: Option<i32>,
+    /// Default max turns for the autofixer fix phase (1–200). `0` clears;
+    /// omitted leaves unchanged.
+    #[serde(default)]
+    pub max_turns_fix: Option<i32>,
+    /// Default max turns for autofixer feedback rounds (1–200). `0` clears;
+    /// omitted leaves unchanged.
+    #[serde(default)]
+    pub max_turns_feedback: Option<i32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -131,6 +158,9 @@ pub struct UpdateProviderRequest {
 pub struct UpdateProviderResponse {
     pub provider_id: String,
     pub default_model: Option<String>,
+    pub max_turns_analysis: Option<i32>,
+    pub max_turns_fix: Option<i32>,
+    pub max_turns_feedback: Option<i32>,
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -214,6 +244,12 @@ pub async fn list_ai_providers(
                 credential_saved,
                 current_auth_type,
                 default_model: provider_cfg.default_model.clone(),
+                max_turns_analysis: provider_cfg.max_turns_analysis,
+                max_turns_fix: provider_cfg.max_turns_fix,
+                max_turns_feedback: provider_cfg.max_turns_feedback,
+                // Only Claude Code has a --max-turns flag today; Codex and
+                // OpenCode run to completion regardless of these settings.
+                supports_max_turns: entry.id == "claude_cli",
             }
         })
         .collect();
@@ -476,21 +512,55 @@ pub async fn update_ai_provider(
         })
     })?;
 
+    // Validate turn caps up front: 0 = clear, 1..=200 = set, else reject.
+    for (field, value) in [
+        ("max_turns_analysis", request.max_turns_analysis),
+        ("max_turns_fix", request.max_turns_fix),
+        ("max_turns_feedback", request.max_turns_feedback),
+    ] {
+        if let Some(v) = value {
+            if v != 0 && !(1..=200).contains(&v) {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "{} for provider '{}' must be between 1 and 200 (or 0 to clear), got {}",
+                        field, provider_id, v
+                    ),
+                }));
+            }
+        }
+    }
+
     // Normalize the incoming model: empty string → None (clear the field).
-    // Also validate against the catalog when the provider has a non-empty
-    // model list — for free-form providers (OpenCode) we accept anything
-    // the user types, since the catalog doesn't enumerate their models.
-    let new_model = match request.default_model.as_deref() {
+    // The catalog `models` list is a convenience, not an allowlist — CLIs
+    // (especially free-form ones like OpenCode) evolve faster than this
+    // table, so we accept unknown ids. But the stored value is read back at
+    // run time and, for OpenCode, interpolated into a `bash -lc` string, so
+    // we reject shell metacharacters and cap length here to close the stored
+    // command-injection vector. Real model ids use only [A-Za-z0-9._/-:].
+    let new_model = match request.default_model.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(m) => {
-            if !provider.models.is_empty() && !provider.models.contains(&m) {
-                // Allow unknown models too — the catalog `models` list is a
-                // convenience, not an allowlist. CLIs evolve faster than
-                // this table. We just trim + pass through.
-                Some(m.trim().to_string())
-            } else {
-                Some(m.trim().to_string())
+            if m.len() > 128 {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id is too long ({} chars, max 128) for provider '{}'",
+                        m.len(),
+                        provider_id
+                    ),
+                }));
             }
+            if !m
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':'))
+            {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id '{}' for provider '{}' contains invalid characters (allowed: letters, digits, . _ / - :)",
+                        m, provider_id
+                    ),
+                }));
+            }
+            Some(m.to_string())
         }
     };
 
@@ -540,6 +610,22 @@ pub async fn update_ai_provider(
             None => serde_json::Value::Null,
         },
     );
+    // Turn caps: omitted → leave the stored value alone; 0 → clear; n → set.
+    for (key, value) in [
+        ("max_turns_analysis", request.max_turns_analysis),
+        ("max_turns_fix", request.max_turns_fix),
+        ("max_turns_feedback", request.max_turns_feedback),
+    ] {
+        match value {
+            None => {}
+            Some(0) => {
+                merged.insert(key.to_string(), serde_json::Value::Null);
+            }
+            Some(v) => {
+                merged.insert(key.to_string(), serde_json::Value::from(v));
+            }
+        }
+    }
     // Fill in required fields if this is the first write for the provider.
     merged
         .entry("auth_type".to_string())
@@ -547,6 +633,12 @@ pub async fn update_ai_provider(
     merged
         .entry("extra".to_string())
         .or_insert(serde_json::Value::Null);
+    // Capture the effective stored values for the response before handing
+    // the object to the settings blob.
+    let stored_turns = |key: &str| merged.get(key).and_then(|v| v.as_i64()).map(|v| v as i32);
+    let effective_max_turns_analysis = stored_turns("max_turns_analysis");
+    let effective_max_turns_fix = stored_turns("max_turns_fix");
+    let effective_max_turns_feedback = stored_turns("max_turns_feedback");
     providers_value.insert(provider_id.clone(), serde_json::Value::Object(merged));
 
     let active = temps_entities::settings::ActiveModel {
@@ -562,6 +654,9 @@ pub async fn update_ai_provider(
     Ok(Json(UpdateProviderResponse {
         provider_id,
         default_model: new_model,
+        max_turns_analysis: effective_max_turns_analysis,
+        max_turns_fix: effective_max_turns_fix,
+        max_turns_feedback: effective_max_turns_feedback,
     }))
 }
 

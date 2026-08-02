@@ -6,7 +6,7 @@ import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useQuery } from '@tanstack/react-query'
 import { Camera, ExternalLink, GitBranch, Settings } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
 interface LastDeploymentProps {

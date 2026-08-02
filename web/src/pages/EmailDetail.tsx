@@ -26,7 +26,7 @@ import {
   Tag,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 
 function HeadersDisplay({ headers }: { headers: Record<string, string> | null | undefined }) {
   if (!headers || Object.keys(headers).length === 0) {

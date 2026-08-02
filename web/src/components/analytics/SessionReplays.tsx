@@ -33,7 +33,7 @@ import {
   User,
   Video,
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { TimeAgo } from '../utils/TimeAgo'
 
 function formatLocation(replay: SessionReplayWithVisitorDto): string | null {

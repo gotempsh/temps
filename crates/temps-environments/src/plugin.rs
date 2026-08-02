@@ -65,6 +65,8 @@ impl TempsPlugin for EnvironmentsPlugin {
         let env_var_service = context.require_service::<EnvVarService>();
         let secret_service = context.require_service::<SecretService>();
         let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
+        let deployment_container_cleaner =
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
             context.get_service::<dyn temps_core::ProjectEnvVarsProvider>();
@@ -79,6 +81,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             secret_service,
             audit_service,
             deployment_service,
+            deployment_container_cleaner,
             on_demand_waker,
             integration_env_provider,
             telemetry,

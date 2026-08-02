@@ -4,7 +4,25 @@ import { Check, ChevronDown, ChevronUp } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
-const Select = SelectPrimitive.Root
+// Radix renders a hidden native <select> when the Select sits inside a <form>.
+// That input echoes programmatic value changes (e.g. react-hook-form reset()
+// after settings load) back through a synthetic change event; when the new
+// value's <option> isn't committed yet, the native select coerces to "" and
+// Radix emits onValueChange(""), clobbering controlled form state and leaving
+// the trigger blank. Item values are documented non-empty, so "" can never be
+// a real selection — drop it. (Reproduced with @radix-ui/react-select 2.3.5.)
+const Select = ({
+  onValueChange,
+  ...props
+}: React.ComponentProps<typeof SelectPrimitive.Root>) => (
+  <SelectPrimitive.Root
+    {...props}
+    onValueChange={(value) => {
+      if (value === '') return
+      onValueChange?.(value)
+    }}
+  />
+)
 
 const SelectGroup = SelectPrimitive.Group
 

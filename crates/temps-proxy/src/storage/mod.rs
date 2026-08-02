@@ -84,6 +84,21 @@ pub trait ProxyLogStorage: Send + Sync {
         page_size: u64,
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError>;
 
+    /// Newest-first page of proxy logs WITHOUT the pagination total.
+    ///
+    /// The unified Observe feed fetches a merged page on every load/poll and
+    /// never renders a total; `list_with_filters`' COUNT (exact on the
+    /// TimescaleDB hypertable, `FINAL` merge-on-read on ClickHouse) would be
+    /// pure waste there — and unbounded when the caller sends no time range.
+    /// Mirrors `ProxyLogService::list_page`.
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError>;
+
     /// Fetch a single proxy log by its serial id.
     ///
     /// `timestamp` is the row's known event time (the list endpoint returns it

@@ -498,6 +498,22 @@ Temps can show the actual source code around each stack frame, not just
   Tracking Source Context*) — application source is only stored when you enable
   it.
 
+For **git-based deploys**, that's all you need: once the toggle is on, Temps
+captures the source automatically after each deploy, keyed by the commit SHA.
+By default it captures from the **Docker build context** — the exact directory
+the image was built from — which is the right root for Dockerfile deploys and
+monorepos (frame paths are relative to what was copied into the build). To
+narrow or override it:
+
+```yaml {{ title: '.temps.yaml' }}
+sourceContext:
+  root: services/api    # capture from here (relative to the repo); default: build context
+  include: [go, rs]     # override the default source-extension set
+```
+
+...or set the **Source Root** in the project's error-tracking settings. For
+**image deploys / external CI**, upload the source yourself (below).
+
 The release you upload under **must match the SDK's reported release**
 (`SENTRY_RELEASE`) — typically the deployed commit SHA or tag. For image-based
 deploys Temps injects `SENTRY_RELEASE` from the deployed image tag/digest, so

@@ -30,7 +30,7 @@ import {
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { CopyButton } from '@/components/ui/copy-button'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 interface KvServiceProps {
   project: ProjectResponse

@@ -14,7 +14,7 @@ use bollard::{
     Docker,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -108,6 +108,11 @@ pub struct DockerRuntime {
     /// that's the legitimate "overlay not yet bootstrapped on this node"
     /// state, not an error. Set via [`Self::with_overlay_network`].
     overlay_network: Option<String>,
+    /// Operator-level dependency networks that every app container must join
+    /// before start. Unlike the optional overlay network, these are required:
+    /// missing or failing attachments fail the deploy because the app is
+    /// expected to depend on DNS/services from these networks.
+    extra_networks: Vec<String>,
     /// Static resolvers to write into each new container's
     /// `/etc/resolv.conf`. Use [`Self::with_dns_servers`] for tests or
     /// fixed-IP setups; in the live agent we use
@@ -153,6 +158,14 @@ pub struct DockerRuntime {
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
+    /// Platform of the Docker *daemon* this runtime talks to, cached after the
+    /// first `docker info`. This is deliberately not the platform of the
+    /// binary: with `DOCKER_HOST` set (or a QEMU-emulated `docker:dind`), the
+    /// daemon can be a different architecture than the process, and what
+    /// decides whether an image will run is the daemon's. Populated by
+    /// [`Self::refresh_daemon_platform`]; until then `get_native_platform`
+    /// falls back to the compiled-in architecture.
+    daemon_platform: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Explicit per-build resource caps, set by the control plane from
@@ -187,6 +200,30 @@ fn signal_name_from_exit_code(code: i64) -> Option<&'static str> {
         15 => Some("SIGTERM"),
         _ => None,
     }
+}
+
+fn normalize_extra_networks(
+    networks: Vec<String>,
+    primary_network: &str,
+    overlay_network: Option<&str>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    networks
+        .into_iter()
+        .map(|network| network.trim().to_string())
+        .filter(|network| !network.is_empty())
+        .filter(|network| network != primary_network)
+        .filter(|network| Some(network.as_str()) != overlay_network)
+        .filter(|network| seen.insert(network.clone()))
+        .collect()
+}
+
+fn network_matches_identifier(
+    candidate_name: Option<&str>,
+    candidate_id: Option<&str>,
+    identifier: &str,
+) -> bool {
+    candidate_name == Some(identifier) || candidate_id == Some(identifier)
 }
 
 /// Build a short human-readable explanation of why a container is in its
@@ -432,13 +469,62 @@ impl DockerRuntime {
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
             overlay_network: None,
+            extra_networks: Vec::new(),
             dns_servers: Vec::new(),
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
             build_semaphore: None,
             build_resource_override: None,
+            daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Query the Docker daemon for its platform and cache it.
+    ///
+    /// Called during startup (control-plane deployer plugin, agent server) and
+    /// again before each build, so every later `get_native_platform()` — which
+    /// the `ImageBuilder` trait requires to be synchronous — answers with the
+    /// daemon's real architecture instead of the binary's.
+    ///
+    /// **Only a successful lookup is cached.** Caching a failure would freeze
+    /// the compiled-in fallback for the process lifetime: with a
+    /// cross-architecture `DOCKER_HOST`, one transient `docker info` error at
+    /// boot would make every later build and scheduling decision use the wrong
+    /// architecture even after the daemon recovered. Returning `None` instead
+    /// lets the next call retry.
+    ///
+    /// Failures are non-fatal — a daemon that isn't up yet must not stop the
+    /// process from booting.
+    pub async fn refresh_daemon_platform(&self) -> Option<String> {
+        if let Some(cached) = self.daemon_platform.get() {
+            return Some(cached.clone());
+        }
+
+        let platform = match self.docker.info().await {
+            Ok(info) => {
+                let os = info.os_type.unwrap_or_else(|| "linux".to_string());
+                match info.architecture {
+                    Some(arch) => crate::platform::normalize_platform(&os, &arch),
+                    None => {
+                        warn!("Docker daemon reported no architecture; will retry");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Could not read the Docker daemon platform ({}); will retry",
+                    e
+                );
+                return None;
+            }
+        };
+
+        // A concurrent caller may have won the race — its value came from the
+        // same daemon, so keep whichever landed first.
+        let _ = self.daemon_platform.set(platform);
+        self.daemon_platform.get().cloned()
     }
 
     /// Apply build concurrency + per-build resource caps. Called by the
@@ -555,6 +641,18 @@ impl DockerRuntime {
         self
     }
 
+    /// Configure required dependency networks for all containers created by
+    /// this runtime. Blank entries, duplicates, the primary network, and the
+    /// optional overlay network are ignored.
+    pub fn with_extra_networks(mut self, networks: Vec<String>) -> Self {
+        self.extra_networks = normalize_extra_networks(
+            networks,
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+        self
+    }
+
     /// Best-effort additional attachment to the overlay network. Logs and
     /// returns `Ok(())` when the overlay isn't configured or doesn't
     /// exist; only true bollard errors propagate.
@@ -606,6 +704,179 @@ impl DockerRuntime {
                 overlay, e
             ))),
         }
+    }
+
+    /// Attach required dependency networks before container start so Docker's
+    /// embedded DNS can resolve service names during app boot.
+    ///
+    /// Request-supplied networks may only *narrow* the operator's configured
+    /// set, never widen it: a caller asking for a network the operator did not
+    /// configure is rejected. The agent's deploy endpoint deserializes
+    /// `DeployRequest` straight from the request body, so without this the
+    /// field would let any token holder bridge a container onto an arbitrary
+    /// host network (another project's database network, the control plane's).
+    async fn attach_required_networks(
+        &self,
+        container_id: &str,
+        request_networks: &[String],
+    ) -> Result<(), DeployerError> {
+        let requested = normalize_extra_networks(
+            request_networks.to_vec(),
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+
+        let existing_networks = self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+            .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
+
+        // Resolve every identifier (name *or* ID) to a canonical ID so the
+        // allowlist and the primary/overlay guards can't be sidestepped by
+        // naming the same network a different way.
+        let canonical = |identifier: &str| -> Option<String> {
+            existing_networks
+                .iter()
+                .find(|candidate| {
+                    network_matches_identifier(
+                        candidate.name.as_deref(),
+                        candidate.id.as_deref(),
+                        identifier,
+                    )
+                })
+                .map(|candidate| {
+                    candidate
+                        .id
+                        .clone()
+                        .or_else(|| candidate.name.clone())
+                        .unwrap_or_else(|| identifier.to_string())
+                })
+        };
+
+        // Networks the operator opted into, by canonical ID. Configured
+        // networks that don't exist are still an error below; they just don't
+        // participate in the allowlist here.
+        let allowed: HashSet<String> = self
+            .extra_networks
+            .iter()
+            .filter_map(|network| canonical(network))
+            .collect();
+
+        for network in &requested {
+            let is_allowed = canonical(network)
+                .map(|id| allowed.contains(&id))
+                .unwrap_or(false);
+            if !is_allowed {
+                return Err(DeployerError::NetworkError(format!(
+                    "network '{}' is not in TEMPS_DOCKER_EXTRA_NETWORKS; \
+                     per-request networks may only narrow the operator's configured set",
+                    network
+                )));
+            }
+        }
+
+        let mut networks = self.extra_networks.clone();
+        networks.extend(requested);
+        let networks = normalize_extra_networks(
+            networks,
+            &self.network_name,
+            self.overlay_network.as_deref(),
+        );
+        if networks.is_empty() {
+            return Ok(());
+        }
+
+        // Guard against reaching the primary/overlay network under an alias
+        // (its ID, or its ID when configured by name). `normalize_extra_networks`
+        // can only compare the raw strings it was given.
+        let reserved: HashSet<String> = std::iter::once(self.network_name.as_str())
+            .chain(self.overlay_network.as_deref())
+            .filter_map(canonical)
+            .collect();
+
+        let mut attached: HashSet<String> = HashSet::new();
+        for network in networks {
+            let Some(network_id) = canonical(&network) else {
+                return Err(DeployerError::NetworkError(format!(
+                    "required network '{}' does not exist",
+                    network
+                )));
+            };
+
+            if reserved.contains(&network_id) {
+                tracing::debug!(
+                    container = %container_id,
+                    network,
+                    "skipping required network that aliases the primary or overlay network"
+                );
+                continue;
+            }
+
+            // Two identifiers can resolve to the same network; attach once.
+            if !attached.insert(network_id) {
+                continue;
+            }
+
+            let req = bollard::models::NetworkConnectRequest {
+                container: container_id.to_string(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(&network, req).await {
+                Ok(()) => {
+                    tracing::info!(container = %container_id, network, "attached to required network");
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        network,
+                        "container already connected to required network (403)"
+                    );
+                }
+                Err(e) => {
+                    // The raw bollard error can carry host topology detail, so
+                    // it goes to the log; the caller gets the network name it
+                    // already supplied plus an actionable summary.
+                    tracing::error!(
+                        container = %container_id,
+                        network,
+                        error = %e,
+                        "failed to attach required network"
+                    );
+                    return Err(DeployerError::NetworkError(format!(
+                        "could not attach required network '{}' — see server logs",
+                        network
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_created_container_after_error(
+        &self,
+        container_id: &str,
+        error: DeployerError,
+    ) -> DeployerError {
+        if let Err(cleanup_error) = self.remove_container(container_id).await {
+            tracing::warn!(
+                container = %container_id,
+                error = %cleanup_error,
+                "failed to remove container after deploy error"
+            );
+            // Self-hosted operators have no support channel: a stale container
+            // squatting the name will break every retry, so say so in the
+            // error they actually see instead of only in the server log.
+            return DeployerError::DeploymentFailed(format!(
+                "{} (cleanup also failed: container {} could not be removed and \
+                 may need `docker rm -f {}` before retrying)",
+                error, container_id, container_id
+            ));
+        }
+        error
     }
 
     /// Install per-peer routes inside the container's netns. Must be
@@ -808,22 +1079,18 @@ impl DockerRuntime {
         (memory_bytes, cpu_quota_us, CPU_PERIOD_US)
     }
 
-    /// Detect the native platform for Docker builds
-    /// Returns the platform string in the format "linux/arch"
-    fn detect_native_platform() -> String {
-        #[cfg(target_arch = "x86_64")]
-        {
-            "linux/amd64".to_string()
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            "linux/arm64".to_string()
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            // Fallback to amd64 for other architectures
-            "linux/amd64".to_string()
-        }
+    /// Detect the native platform for Docker builds.
+    ///
+    /// Prefers the daemon platform learned by [`Self::refresh_daemon_platform`]
+    /// and falls back to this binary's architecture until that succeeds. The
+    /// fallback is never cached, so a daemon that comes up late (or recovers)
+    /// is picked up by the next refresh — see the build paths, which refresh
+    /// before using this.
+    fn detect_native_platform(&self) -> String {
+        self.daemon_platform
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::platform::native_platform)
     }
 
     async fn concat_byte_stream<S>(s: S) -> Result<Vec<u8>, bollard::errors::Error>
@@ -904,6 +1171,12 @@ impl DockerRuntime {
 #[async_trait]
 impl ImageBuilder for DockerRuntime {
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+        // Cheap when already known (a `OnceLock` read); one `docker info` when
+        // discovery failed earlier. Doing it here means a daemon that wasn't up
+        // at boot — or a `DOCKER_HOST` pointing at another architecture — is
+        // reflected in the platform this build defaults to.
+        let _ = self.refresh_daemon_platform().await;
+
         // BuildKit is automatically detected and enabled if supported by Docker daemon
         // The standard Docker build API will use BuildKit when available (Docker 18.09+)
         info!(
@@ -996,7 +1269,8 @@ impl ImageBuilder for DockerRuntime {
             },
             platform: request
                 .platform
-                .unwrap_or_else(Self::detect_native_platform),
+                .clone()
+                .unwrap_or_else(|| self.detect_native_platform()),
             memory: Some(memory_i32),
             cpuquota: Some(cpu_quota_us),
             cpuperiod: Some(cpu_period_us),
@@ -1092,6 +1366,9 @@ impl ImageBuilder for DockerRuntime {
         &self,
         request_with_callback: crate::BuildRequestWithCallback,
     ) -> Result<BuildResult, BuilderError> {
+        // See `build_image`: refresh before defaulting to a platform.
+        let _ = self.refresh_daemon_platform().await;
+
         let request = request_with_callback.request;
         let log_callback = request_with_callback.log_callback;
 
@@ -1177,7 +1454,8 @@ impl ImageBuilder for DockerRuntime {
             },
             platform: request
                 .platform
-                .unwrap_or_else(Self::detect_native_platform),
+                .clone()
+                .unwrap_or_else(|| self.detect_native_platform()),
             memory: Some(memory_i32),
             cpuquota: Some(cpu_quota_us),
             cpuperiod: Some(cpu_period_us),
@@ -1555,14 +1833,28 @@ impl ImageBuilder for DockerRuntime {
     }
 
     async fn remove_image(&self, image_name: &str) -> Result<(), BuilderError> {
-        // Remove image - ignore any errors for now since it returns a stream
-        let _stream = self.docker.remove_image(
+        // The returned future used to be bound to `_stream` and dropped
+        // without ever being awaited, so nothing was sent to the daemon and
+        // every caller got a silent `Ok(())` while the image stayed put.
+        let deleted = self
+            .docker
+            .remove_image(
+                image_name,
+                Some(bollard::query_parameters::RemoveImageOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                BuilderError::Other(format!("Failed to remove image '{}': {}", image_name, e))
+            })?;
+
+        debug!(
+            "Removed image '{}' ({} layer(s) affected)",
             image_name,
-            Some(bollard::query_parameters::RemoveImageOptions {
-                force: true,
-                ..Default::default()
-            }),
-            None,
+            deleted.len()
         );
 
         Ok(())
@@ -1577,7 +1869,16 @@ impl ImageBuilder for DockerRuntime {
             .architecture
             .unwrap_or_else(|| "unknown".to_string());
         let os = inspect.os.unwrap_or_else(|| "linux".to_string());
-        let platform = format!("{}/{}", os, architecture);
+        // ARM images carry the variant in a separate field: an ARMv6 image is
+        // `architecture = "arm"`, `variant = "v6"`. Dropping the variant turns
+        // it into a bare `arm`, which normalizes to v7 — so a correctly built
+        // ARMv6 image would look like a mismatch and be rejected.
+        let platform = match inspect.variant.as_deref().map(str::trim) {
+            Some(variant) if !variant.is_empty() => {
+                crate::platform::normalize_platform(&os, &format!("{}/{}", architecture, variant))
+            }
+            _ => crate::platform::normalize_platform(&os, &architecture),
+        };
 
         let size_bytes = inspect.size.map(|s| s as u64).unwrap_or(0);
 
@@ -1609,7 +1910,15 @@ impl ImageBuilder for DockerRuntime {
     }
 
     fn get_native_platform(&self) -> String {
-        Self::detect_native_platform()
+        self.detect_native_platform()
+    }
+
+    fn discovered_platform(&self) -> Option<String> {
+        self.daemon_platform.get().cloned()
+    }
+
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.refresh_daemon_platform().await
     }
 }
 
@@ -1810,15 +2119,34 @@ impl ContainerDeployer for DockerRuntime {
         // their primary network interface (`temps-app-network`); the overlay
         // attachment is purely additive and silently no-ops when the overlay
         // network isn't present yet on this node.
-        self.maybe_attach_overlay(&container.id).await?;
+        if let Err(e) = self.maybe_attach_overlay(&container.id).await {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
+
+        if let Err(e) = self
+            .attach_required_networks(&container.id, &request.extra_networks)
+            .await
+        {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
 
         // Start container
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
             .map_err(|e| {
                 DeployerError::DeploymentFailed(format!("Failed to start container: {}", e))
-            })?;
+            })
+        {
+            return Err(self
+                .cleanup_created_container_after_error(&container.id, e)
+                .await);
+        }
 
         // Install overlay peer routes inside the container's netns.
         // Must run *after* start_container — `docker inspect` only
@@ -1835,7 +2163,7 @@ impl ContainerDeployer for DockerRuntime {
 
         // When host_port was 0 (Docker picks), inspect the container to get the actual port
         let host_port = if requested_host_port == 0 && container_port > 0 {
-            let inspect = self
+            let inspect = match self
                 .docker
                 .inspect_container(&container.id, None::<InspectContainerOptions>)
                 .await
@@ -1844,10 +2172,17 @@ impl ContainerDeployer for DockerRuntime {
                         "Failed to inspect container {} for port mapping: {}",
                         container.id, e
                     ))
-                })?;
+                }) {
+                Ok(inspect) => inspect,
+                Err(e) => {
+                    return Err(self
+                        .cleanup_created_container_after_error(&container.id, e)
+                        .await);
+                }
+            };
 
             let port_key = format!("{}/tcp", container_port);
-            inspect
+            match inspect
                 .network_settings
                 .and_then(|ns| ns.ports)
                 .and_then(|ports| ports.get(&port_key).cloned())
@@ -1860,7 +2195,14 @@ impl ContainerDeployer for DockerRuntime {
                         "Container {} has no host port binding for {}",
                         container.id, port_key
                     ))
-                })?
+                }) {
+                Ok(host_port) => host_port,
+                Err(e) => {
+                    return Err(self
+                        .cleanup_created_container_after_error(&container.id, e)
+                        .await);
+                }
+            }
         } else {
             requested_host_port
         };
@@ -1927,7 +2269,8 @@ impl ContainerDeployer for DockerRuntime {
             // Docker prefixes inspect names with a leading '/'.
             .map(|n| n.trim_start_matches('/').to_string());
 
-        self.docker
+        let removal_result = self
+            .docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -1936,20 +2279,34 @@ impl ContainerDeployer for DockerRuntime {
                 }),
             )
             .await
-            .map_err(|e| DeployerError::Other(format!("Failed to remove container: {}", e)))?;
+            .map_err(|error| match error {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    message,
+                } => DeployerError::ContainerNotFound(message),
+                other => DeployerError::Other(format!("Failed to remove container: {other}")),
+            });
 
-        if let Some(name) = container_name {
-            let dir = self.secrets_host_dir(&name);
-            if dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&dir) {
-                    warn!(
-                        "Failed to clean up secrets host dir {}: {}",
-                        dir.display(),
-                        e
-                    );
+        let should_cleanup_secrets = matches!(
+            &removal_result,
+            Ok(()) | Err(DeployerError::ContainerNotFound(_))
+        );
+        if should_cleanup_secrets {
+            if let Some(name) = container_name {
+                let dir = self.secrets_host_dir(&name);
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        warn!(
+                            "Failed to clean up secrets host dir {}: {}",
+                            dir.display(),
+                            e
+                        );
+                    }
                 }
             }
         }
+
+        removal_result?;
 
         Ok(())
     }
@@ -2292,6 +2649,7 @@ fn default_secrets_root() -> PathBuf {
 ///
 /// Rejects keys that would escape the directory (path separators, `.`, `..`)
 /// to defend against a maliciously-crafted secret name.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn write_secrets_to_host_dir(
     dir: &Path,
     secrets: &HashMap<String, String>,
@@ -2738,6 +3096,7 @@ mod docker_tests {
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: ResourceLimits {
                 cpu_limit: None,
                 memory_limit_mb: None,
@@ -2783,6 +3142,36 @@ mod docker_tests {
              default DNS servers when the primary resolver was unreachable \
              — temps-dns-resolver is still a SPOF: {lookup}"
         );
+    }
+
+    fn unique_test_name(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        format!("{}-{}", prefix, now)
+    }
+
+    fn alpine_deploy_request(container_name: String, extra_networks: Vec<String>) -> DeployRequest {
+        DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            extra_networks,
+            resource_limits: ResourceLimits {
+                cpu_limit: Some(0.5),
+                memory_limit_mb: Some(64),
+                disk_limit_mb: Some(256),
+            },
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from("/tmp/temps-extra-network-test.log"),
+            command: Some(vec!["sleep".to_string(), "30".to_string()]),
+            log_config: Some(ContainerLogConfig::app_default()),
+            labels: HashMap::new(),
+        }
     }
 
     #[test]
@@ -3029,6 +3418,10 @@ mod docker_tests {
                     runtime.overlay_network.is_none(),
                     "overlay_network must default to None for backwards compatibility"
                 );
+                assert!(
+                    runtime.extra_networks.is_empty(),
+                    "extra_networks must default to empty for backwards compatibility"
+                );
             }
             Err(e) => {
                 println!("🔧 Docker not available: {}", e);
@@ -3045,6 +3438,267 @@ mod docker_tests {
             }
             Err(e) => {
                 println!("🔧 Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_extra_networks_drops_empty_duplicates_primary_and_overlay() {
+        let normalized = normalize_extra_networks(
+            vec![
+                " ".to_string(),
+                "temps-app-network".to_string(),
+                "supabase_default".to_string(),
+                "supabase_default".to_string(),
+                "temps-overlay".to_string(),
+                "analytics_default".to_string(),
+            ],
+            "temps-app-network",
+            Some("temps-overlay"),
+        );
+
+        assert_eq!(
+            normalized,
+            vec![
+                "supabase_default".to_string(),
+                "analytics_default".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_required_network_identifier_matches_name_or_id() {
+        assert!(network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "supabase_default"
+        ));
+        assert!(network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "abc123"
+        ));
+        assert!(!network_matches_identifier(
+            Some("supabase_default"),
+            Some("abc123"),
+            "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_with_extra_networks_sets_normalized_field() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let runtime = runtime
+                    .with_overlay_network("temps-overlay")
+                    .with_extra_networks(vec![
+                        "test-network".to_string(),
+                        "supabase_default".to_string(),
+                        "supabase_default".to_string(),
+                        "temps-overlay".to_string(),
+                    ]);
+                assert_eq!(runtime.extra_networks, vec!["supabase_default"]);
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_attaches_required_network_by_id() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let extra_network_name = unique_test_name("temps-extra-network");
+                let container_name = unique_test_name("temps-extra-network-container");
+
+                let create_options = bollard::models::NetworkCreateRequest {
+                    name: extra_network_name.clone(),
+                    driver: Some("bridge".to_string()),
+                    ..Default::default()
+                };
+
+                if let Err(e) = runtime.docker.create_network(create_options).await {
+                    println!("Docker network create failed (may be expected): {}", e);
+                    return;
+                }
+
+                let network_id = match runtime
+                    .docker
+                    .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+                    .await
+                    .ok()
+                    .and_then(|networks| {
+                        networks
+                            .into_iter()
+                            .find(|network| network.name.as_deref() == Some(&extra_network_name))
+                            .and_then(|network| network.id)
+                    }) {
+                    Some(id) => id,
+                    None => {
+                        let _ = runtime.docker.remove_network(&extra_network_name).await;
+                        panic!("created network {} was not listed", extra_network_name);
+                    }
+                };
+
+                // Operator configures the network by NAME; the request names
+                // the same network by ID. Both must resolve to the same
+                // canonical network so the allowlist accepts it.
+                let runtime = runtime.with_extra_networks(vec![extra_network_name.clone()]);
+
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(
+                        container_name.clone(),
+                        vec![network_id.clone()],
+                    ))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let inspect = runtime
+                            .docker
+                            .inspect_container(
+                                &deploy_info.container_id,
+                                None::<InspectContainerOptions>,
+                            )
+                            .await
+                            .expect("inspect deployed container");
+
+                        let attached = inspect
+                            .network_settings
+                            .and_then(|settings| settings.networks)
+                            .map(|networks| networks.contains_key(&extra_network_name))
+                            .unwrap_or(false);
+                        assert!(attached, "container should be attached to required network");
+
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before required-network assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
+
+                let _ = runtime.docker.remove_network(&extra_network_name).await;
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_missing_required_network_removes_created_container() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let container_name = unique_test_name("temps-missing-network-container");
+                let missing_network = unique_test_name("temps-missing-network");
+                let runtime = runtime.with_extra_networks(vec![missing_network.clone()]);
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(container_name.clone(), Vec::new()))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                        panic!("deploy should fail when required network is missing");
+                    }
+                    Err(DeployerError::NetworkError(message))
+                        if message.contains(&format!(
+                            "required network '{}' does not exist",
+                            missing_network
+                        )) =>
+                    {
+                        let leftover = runtime
+                            .find_container_by_name(&container_name)
+                            .await
+                            .expect("container lookup after failed deploy");
+                        assert!(
+                            leftover.is_none(),
+                            "failed required-network deploy should remove the created container"
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before required-network assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
+            }
+        }
+    }
+
+    /// A request may narrow the operator's configured networks, never widen
+    /// them. The agent deploy endpoint deserializes `DeployRequest` from the
+    /// request body, so an unbounded field here would let any token holder
+    /// bridge a container onto an arbitrary host network.
+    #[tokio::test]
+    #[serial]
+    async fn test_deploy_rejects_request_network_outside_operator_allowlist() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let off_limits_network = unique_test_name("temps-off-limits-network");
+                let container_name = unique_test_name("temps-off-limits-container");
+
+                let create_options = bollard::models::NetworkCreateRequest {
+                    name: off_limits_network.clone(),
+                    driver: Some("bridge".to_string()),
+                    ..Default::default()
+                };
+                if let Err(e) = runtime.docker.create_network(create_options).await {
+                    println!("Docker network create failed (may be expected): {}", e);
+                    return;
+                }
+
+                // The network EXISTS — it is simply not one the operator
+                // opted into, which is exactly the cross-tenant bridge case.
+                let deploy_result = runtime
+                    .deploy_container(alpine_deploy_request(
+                        container_name.clone(),
+                        vec![off_limits_network.clone()],
+                    ))
+                    .await;
+
+                match deploy_result {
+                    Ok(deploy_info) => {
+                        let _ = runtime.remove_container(&deploy_info.container_id).await;
+                        let _ = runtime.docker.remove_network(&off_limits_network).await;
+                        panic!(
+                            "deploy must reject a request network outside the operator allowlist"
+                        );
+                    }
+                    Err(DeployerError::NetworkError(message))
+                        if message.contains("not in TEMPS_DOCKER_EXTRA_NETWORKS") =>
+                    {
+                        let leftover = runtime
+                            .find_container_by_name(&container_name)
+                            .await
+                            .expect("container lookup after rejected deploy");
+                        assert!(
+                            leftover.is_none(),
+                            "rejected deploy should remove the created container"
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "Docker deploy failed before allowlist assertion (may be expected): {}",
+                            e
+                        );
+                    }
+                }
+
+                let _ = runtime.docker.remove_network(&off_limits_network).await;
+            }
+            Err(e) => {
+                println!("Docker not available: {}", e);
             }
         }
     }
@@ -3091,7 +3745,9 @@ mod docker_tests {
 
     #[test]
     fn test_native_platform_detection() {
-        let platform = DockerRuntime::detect_native_platform();
+        // Before `refresh_daemon_platform` runs, detection falls back to the
+        // architecture this binary was compiled for.
+        let platform = test_runtime().detect_native_platform();
 
         // Verify platform format
         assert!(platform.starts_with("linux/"));
@@ -3114,6 +3770,114 @@ mod docker_tests {
             platform == "linux/amd64" || platform == "linux/arm64",
             "Platform should be either linux/amd64 or linux/arm64, got: {}",
             platform
+        );
+    }
+
+    /// A failed lookup must NOT be cached. It used to store the compiled-in
+    /// fallback in the `OnceLock`, so one transient `docker info` error at
+    /// boot froze the wrong architecture for the process lifetime — with a
+    /// cross-architecture `DOCKER_HOST`, every later build and scheduling
+    /// decision then used the binary's architecture even after the daemon
+    /// recovered, defeating the very checks this is here to feed.
+    #[tokio::test]
+    async fn test_failed_platform_lookup_is_not_cached() {
+        // Port 1 is reserved and refuses connections: a client that can never
+        // reach a daemon, which is what a boot-time failure looks like.
+        let unreachable =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("client construction makes no connection");
+        let runtime = DockerRuntime::new(Arc::new(unreachable), false, "test-network".to_string());
+
+        assert_eq!(runtime.refresh_daemon_platform().await, None);
+        // Still uncached, so a later call retries instead of returning a
+        // stale guess.
+        assert_eq!(runtime.refresh_daemon_platform().await, None);
+        // The synchronous accessor keeps answering with the binary's platform
+        // meanwhile — a fallback, not a recorded fact.
+        assert_eq!(
+            runtime.get_native_platform(),
+            crate::platform::native_platform()
+        );
+    }
+
+    /// `remove_image` used to build its request future and drop it, so it
+    /// removed nothing and still returned `Ok(())`. Tests that clean up after
+    /// themselves depended on a call that did nothing.
+    #[tokio::test]
+    async fn test_remove_image_actually_removes_and_reports_failures() {
+        let runtime = test_runtime();
+        if runtime.docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        // Removing something that isn't there must be an error, not a silent
+        // success — that silent success is exactly the bug.
+        let missing = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
+        assert!(
+            runtime.remove_image(&missing).await.is_err(),
+            "removing a non-existent image must fail"
+        );
+
+        // And a real image must be gone afterwards.
+        let Ok(info) = runtime.inspect_image("alpine:3.20").await else {
+            println!("alpine:3.20 not present locally, skipping the positive case");
+            return;
+        };
+        let tag = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
+        if runtime
+            .docker
+            .tag_image(
+                &info.id,
+                Some(bollard::query_parameters::TagImageOptions {
+                    repo: tag.split(':').next().map(|r| r.to_string()),
+                    tag: Some("latest".to_string()),
+                }),
+            )
+            .await
+            .is_err()
+        {
+            println!("Could not tag a test image, skipping the positive case");
+            return;
+        }
+
+        assert!(runtime.inspect_image(&tag).await.is_ok());
+        runtime
+            .remove_image(&tag)
+            .await
+            .expect("remove should work");
+        assert!(
+            runtime.inspect_image(&tag).await.is_err(),
+            "the tag must be gone after remove_image"
+        );
+    }
+
+    /// The daemon's platform — not the binary's — is what decides whether an
+    /// image will run, so `get_native_platform` must reflect `docker info`
+    /// once it has been refreshed.
+    #[tokio::test]
+    async fn test_refresh_daemon_platform_reads_docker_info() {
+        let runtime = test_runtime();
+        if runtime.docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let platform = runtime
+            .refresh_daemon_platform()
+            .await
+            .expect("a reachable daemon must report a platform");
+        assert!(
+            platform.starts_with("linux/"),
+            "expected a linux platform, got: {}",
+            platform
+        );
+        // Cached: the trait method now answers with the daemon's platform.
+        assert_eq!(runtime.get_native_platform(), platform);
+        // And it is stable across calls (OnceLock, no re-query).
+        assert_eq!(
+            runtime.refresh_daemon_platform().await.as_deref(),
+            Some(platform.as_str())
         );
     }
 
@@ -3208,6 +3972,7 @@ CMD ["cat", "/hello.txt"]
                     secrets: HashMap::new(),
                     port_mappings: vec![],
                     network_name: None,
+                    extra_networks: Vec::new(),
                     resource_limits: ResourceLimits {
                         cpu_limit: Some(0.5),
                         memory_limit_mb: Some(64),
@@ -3300,6 +4065,7 @@ CMD ["cat", "/hello.txt"]
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: limits,
             restart_policy: RestartPolicy::Never,
             log_path: PathBuf::from(format!("/tmp/{}.log", name)),

@@ -34,6 +34,16 @@ pub struct RemoteNodeDeployer {
     node_name: String,
     /// HTTP client with timeouts
     client: reqwest::Client,
+    /// Container platform of the remote node's Docker daemon
+    /// (`linux/amd64`, `linux/arm64`), as recorded on the `nodes` row.
+    ///
+    /// This is what makes `get_native_platform` truthful for a remote node.
+    /// Set via [`Self::with_platform`] by the caller that already loaded the
+    /// node row, so the common path costs no extra round-trip; when it is
+    /// `None` (node never reported, e.g. a pre-multi-arch agent), it can be
+    /// filled in from the agent's health endpoint with
+    /// [`Self::refresh_platform`].
+    platform: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 impl RemoteNodeDeployer {
@@ -57,6 +67,7 @@ impl RemoteNodeDeployer {
             token,
             node_name,
             client,
+            platform: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -105,7 +116,68 @@ impl RemoteNodeDeployer {
             token,
             node_name,
             client,
+            platform: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Record the node's container platform, as stored on its `nodes` row.
+    ///
+    /// A `None` or blank value leaves the platform unknown — the caller can
+    /// then fall back to [`Self::refresh_platform`], which asks the agent.
+    pub fn with_platform(self, platform: Option<String>) -> Self {
+        if let Some(platform) = platform {
+            let platform = platform.trim();
+            if !platform.is_empty() {
+                let _ = self
+                    .platform
+                    .set(crate::platform::canonicalize_platform(platform));
+            }
+        }
+        self
+    }
+
+    /// Ask the agent for its platform and cache it.
+    ///
+    /// Only needed when the `nodes` row has no architecture yet (agent older
+    /// than multi-arch support, or upgraded but not yet heartbeated). Returns
+    /// `None` when the agent is unreachable or reports nothing usable — the
+    /// caller must then decide whether to proceed, not silently assume amd64.
+    pub async fn refresh_platform(&self) -> Option<String> {
+        if let Some(cached) = self.platform.get() {
+            return Some(cached.clone());
+        }
+
+        #[derive(Deserialize)]
+        struct HealthPlatform {
+            #[serde(default)]
+            platform: String,
+        }
+
+        let health: HealthPlatform = match self.agent_get("/agent/health").await {
+            Ok(health) => health,
+            Err(e) => {
+                tracing::warn!(
+                    node = %self.node_name,
+                    "Could not read platform from agent health endpoint: {}",
+                    e
+                );
+                return None;
+            }
+        };
+
+        let reported = health.platform.trim();
+        if reported.is_empty() {
+            return None;
+        }
+
+        let platform = crate::platform::canonicalize_platform(reported);
+        let _ = self.platform.set(platform.clone());
+        Some(platform)
+    }
+
+    /// The node's platform if known, without contacting the agent.
+    pub fn platform(&self) -> Option<String> {
+        self.platform.get().cloned()
     }
 
     /// Helper to make authenticated GET requests to the agent.
@@ -213,6 +285,15 @@ impl RemoteNodeDeployer {
                     self.node_name, url, e
                 ))
             })?;
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DeployerError::ContainerNotFound(format!(
+                "container at {} was not found on node {}",
+                url, self.node_name
+            )));
+        }
 
         let body: AgentResponse<String> = response.json().await.map_err(|e| {
             DeployerError::NetworkError(format!(
@@ -481,8 +562,15 @@ impl ImageBuilder for RemoteNodeDeployer {
     }
 
     fn get_native_platform(&self) -> String {
-        // Unknown for remote — will need to query agent in Phase 2
-        "linux/amd64".to_string()
+        // Known from the node row (or a health-endpoint refresh). Falling back
+        // to the control plane's own platform when it isn't known keeps the
+        // historical behaviour for pre-multi-arch agents: assume compatible
+        // rather than block the deploy. Callers that need certainty check
+        // `platform()` for `None` and warn.
+        self.platform
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::platform::native_platform)
     }
 }
 
@@ -513,6 +601,41 @@ mod tests {
         .unwrap();
         assert_eq!(deployer.node_name(), "worker-3");
         assert_eq!(deployer.agent_url(), "https://worker-3.internal:3100");
+    }
+
+    #[tokio::test]
+    async fn remove_container_maps_agent_not_found_to_typed_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"container missing"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+        let result = deployer.remove_container("already-gone").await;
+        assert!(matches!(result, Err(DeployerError::ContainerNotFound(_))));
+        server.await.expect("mock agent task");
     }
 
     /// Live **REAL DEPLOYMENT** over mTLS: drives the production
@@ -582,6 +705,7 @@ mod tests {
                 protocol: crate::Protocol::Tcp,
             }],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: crate::ResourceLimits::default(),
             restart_policy: crate::RestartPolicy::Never,
             log_path: std::path::PathBuf::from("/tmp/mtls-deploy-probe.log"),
@@ -769,13 +893,159 @@ mod tests {
 
     #[test]
     fn test_get_native_platform() {
+        // No platform known yet: fall back to the control plane's own, which
+        // is what the historical hardcoded value effectively assumed.
         let deployer = RemoteNodeDeployer::new(
             "https://10.100.0.2:3100".to_string(),
             "token".to_string(),
             "worker-1".to_string(),
         )
         .unwrap();
-        assert_eq!(deployer.get_native_platform(), "linux/amd64");
+        assert_eq!(
+            deployer.get_native_platform(),
+            crate::platform::native_platform()
+        );
+        assert_eq!(deployer.platform(), None);
+    }
+
+    /// The whole point of the change: a node's platform must be reported
+    /// truthfully, not assumed to be the control plane's.
+    #[test]
+    fn test_with_platform_reports_the_nodes_architecture() {
+        let deployer = RemoteNodeDeployer::new(
+            "https://10.100.0.2:3100".to_string(),
+            "token".to_string(),
+            "worker-arm".to_string(),
+        )
+        .unwrap()
+        .with_platform(Some("linux/arm64".to_string()));
+
+        assert_eq!(deployer.get_native_platform(), "linux/arm64");
+        assert_eq!(deployer.platform().as_deref(), Some("linux/arm64"));
+    }
+
+    #[test]
+    fn test_with_platform_canonicalizes_and_ignores_blanks() {
+        let make = |platform: Option<&str>| {
+            RemoteNodeDeployer::new(
+                "https://10.100.0.2:3100".to_string(),
+                "token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_platform(platform.map(|p| p.to_string()))
+        };
+
+        // Docker's kernel spelling is normalized to the OCI one.
+        assert_eq!(
+            make(Some("linux/aarch64")).platform().as_deref(),
+            Some("linux/arm64")
+        );
+        // Blank/whitespace means "unknown", not a platform named "".
+        assert_eq!(make(Some("   ")).platform(), None);
+        assert_eq!(make(None).platform(), None);
+    }
+
+    /// Spawn a throwaway HTTP server that answers `GET /agent/health` like a
+    /// real agent would. Returns its base URL.
+    ///
+    /// Hand-rolled rather than pulled from a framework: this crate has no HTTP
+    /// server dependency and one canned response doesn't justify adding one.
+    async fn spawn_fake_agent(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.to_string();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Read (and discard) the request head; we only ever serve
+                    // one route.
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_refresh_platform_reads_agent_health() {
+        // A node that never reported its architecture at registration time —
+        // the pre-multi-arch agent case — can still be identified by asking it.
+        let url = spawn_fake_agent(
+            r#"{"success":true,"data":{"cpu_percent":1.0,"memory_used_bytes":1,"memory_total_bytes":2,"disk_used_bytes":1,"disk_total_bytes":2,"running_containers":0,"platform":"linux/aarch64"},"error":null}"#,
+        )
+        .await;
+
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".to_string(), "worker-arm".to_string()).unwrap();
+
+        assert_eq!(
+            deployer.refresh_platform().await.as_deref(),
+            Some("linux/arm64")
+        );
+        // Cached afterwards, so the deploy path pays at most one round-trip.
+        assert_eq!(deployer.platform().as_deref(), Some("linux/arm64"));
+        assert_eq!(deployer.get_native_platform(), "linux/arm64");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_platform_returns_none_when_agent_omits_it() {
+        // An agent too old to report a platform must leave us with `None` —
+        // "unknown" — never a guess that would silently pass a compatibility
+        // check.
+        let url = spawn_fake_agent(
+            r#"{"success":true,"data":{"cpu_percent":1.0,"memory_used_bytes":1,"memory_total_bytes":2,"disk_used_bytes":1,"disk_total_bytes":2,"running_containers":0,"platform":""},"error":null}"#,
+        )
+        .await;
+
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".to_string(), "legacy-worker".to_string()).unwrap();
+
+        assert_eq!(deployer.refresh_platform().await, None);
+        assert_eq!(deployer.platform(), None);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_platform_returns_none_when_agent_unreachable() {
+        let deployer = RemoteNodeDeployer::new(
+            "http://127.0.0.1:1".to_string(),
+            "token".to_string(),
+            "dead-worker".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(deployer.refresh_platform().await, None);
+    }
+
+    #[tokio::test]
+    async fn test_with_platform_wins_over_agent_query() {
+        // When the node row already carries the architecture we must not spend
+        // a round-trip; point the deployer at a server that would answer with
+        // a different value and verify it is never consulted.
+        let url = spawn_fake_agent(
+            r#"{"success":true,"data":{"cpu_percent":1.0,"memory_used_bytes":1,"memory_total_bytes":2,"disk_used_bytes":1,"disk_total_bytes":2,"running_containers":0,"platform":"linux/amd64"},"error":null}"#,
+        )
+        .await;
+
+        let deployer = RemoteNodeDeployer::new(url, "token".to_string(), "worker-arm".to_string())
+            .unwrap()
+            .with_platform(Some("linux/arm64".to_string()));
+
+        assert_eq!(
+            deployer.refresh_platform().await.as_deref(),
+            Some("linux/arm64")
+        );
     }
 
     #[tokio::test]
@@ -794,6 +1064,7 @@ mod tests {
             secrets: std::collections::HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: crate::ResourceLimits::default(),
             restart_policy: crate::RestartPolicy::default(),
             log_path: PathBuf::from("/tmp/deploy.log"),

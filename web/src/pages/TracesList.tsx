@@ -68,7 +68,7 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
@@ -765,6 +765,10 @@ export default function TracesList({ project }: TracesListProps) {
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
+        // Explicit: this list renders "Showing X–Y of Z" and a page count, so
+        // it genuinely needs the total. Stating it makes the `?? 0` below safe
+        // by construction rather than by relying on the server default.
+        include_total: true,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -782,13 +786,23 @@ export default function TracesList({ project }: TracesListProps) {
   // "set up OpenTelemetry" to a project with millions of historical traces just
   // because nothing landed in the last 24h. This probe answers the real
   // question the onboarding screen is for.
+  //
+  // `include_total: false` matters here. The probe only needs to know whether
+  // ANY trace exists, but `total` is a second aggregation over the project's
+  // whole retention — with no time filter to narrow it, that is the single most
+  // expensive query on this page (measured at ~10s on an 860M-span project).
+  // Asking for one row and checking whether we got it answers the same question
+  // without computing a count nobody reads.
   const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
     ...queryTraceSummariesOptions({
-      query: { project_id: project.id, limit: 1 },
+      query: { project_id: project.id, limit: 1, include_total: false },
     }),
     enabled: !!project.id,
   })
-  const hasEverReceivedTraces = (anyTraceData?.total ?? 0) > 0
+  // Deliberately NOT `total`: with include_total=false the server omits it, and
+  // `total ?? 0` would read "not computed" as "no traces" and show the setup
+  // onboarding to a project that has millions of them.
+  const hasEverReceivedTraces = (anyTraceData?.data?.length ?? 0) > 0
 
   const hasActiveFilters =
     !!search ||

@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
@@ -1405,8 +1405,8 @@ async fn generate_join_token(
 
     // Generate a random 32-byte token as hex
     let plaintext_token = {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
         hex::encode(bytes)
     };
     let token_hash = sha256_hash(&plaintext_token);
@@ -1777,6 +1777,9 @@ mod tests {
                         credentials_encrypted: Some("super-secret-blob".into()),
                         default_model: Some("sonnet".into()),
                         extra: serde_json::Value::Null,
+                        max_turns_analysis: None,
+                        max_turns_fix: None,
+                        max_turns_feedback: None,
                     },
                 )]
                 .into_iter()
@@ -1826,6 +1829,9 @@ mod tests {
                 credentials_encrypted: Some("super-secret-blob".into()),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             },
         );
         settings.agent_sandbox.api_key_encrypted = Some("legacy-secret".into());

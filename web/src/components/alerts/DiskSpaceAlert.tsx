@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button'
 import { useDiskStatus } from '@/hooks/useDiskStatus'
 import { HardDrive, X } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { useState } from 'react'
 import { cn } from '@/lib/utils'
 

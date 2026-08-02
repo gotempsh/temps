@@ -33,6 +33,7 @@ import { SessionReplays } from '@/components/analytics/SessionReplays'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
+import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
 import { Calendar } from '@/components/ui/calendar'
 import {
@@ -112,7 +113,7 @@ import {
   useNavigate,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 import { EventDetail } from '@/components/analytics/EventDetail'
 import {
   DimensionList,
@@ -1582,7 +1583,9 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     number | undefined
   >(undefined)
   const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const [showSetupOverride] = React.useState(false)
+  // While the guided tour is showing off this page, don't yank the user to
+  // /setup — the empty-state banner below already covers "no data yet".
+  const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
   const queryClient = useQueryClient()
   const { startDate, endDate } = getDateRangeFromFilter(dateFilter)

@@ -41,21 +41,30 @@ impl TempsPlugin for ObservabilityPlugin {
 
     fn register_services<'a>(
         &'a self,
-        context: &'a ServiceRegistrationContext,
+        _context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            let db = context.require_service::<DatabaseConnection>();
-            let service = Arc::new(ObservabilityService::new(db));
-
-            context.register_service(service);
-
-            debug!("Observability plugin services registered");
+            // ObservabilityService is constructed in `configure_routes` (which
+            // runs after EVERY plugin's registration phase) because it needs
+            // ProxyLogService and the OTel storage backend, and ProxyPlugin
+            // registers AFTER this plugin. Registering a half-wired service
+            // here would freeze the Postgres-only read path that broke the
+            // Observe page on ClickHouse-enabled servers.
+            debug!("Observability plugin: services resolved at route configuration");
             Ok(())
         })
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let service = context.require_service::<ObservabilityService>();
+        let db = context.require_service::<DatabaseConnection>();
+        // Backend-dispatching readers registered by ProxyPlugin / OtelPlugin.
+        // Both select ClickHouse vs TimescaleDB at startup from
+        // `TEMPS_CLICKHOUSE_*`; the Observe feed must read through them so it
+        // sees the same store the ingest paths write to.
+        let proxy_logs =
+            context.require_service::<temps_proxy::service::proxy_log_service::ProxyLogService>();
+        let otel = context.require_service::<dyn temps_otel::storage::OtelStorage>();
+        let service = Arc::new(ObservabilityService::new(db, proxy_logs, otel));
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let state = Arc::new(ObservabilityState {
             service,

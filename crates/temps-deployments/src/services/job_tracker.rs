@@ -93,7 +93,10 @@ impl JobTracker for DeploymentJobTracker {
                 active_job.started_at = Set(Some(now));
                 debug!("Job {} started at {}", job_execution_id, now);
             }
-            CoreJobStatus::Success | CoreJobStatus::Failure | CoreJobStatus::Cancelled => {
+            CoreJobStatus::Success
+            | CoreJobStatus::Failure
+            | CoreJobStatus::Cancelled
+            | CoreJobStatus::Skipped => {
                 let now = chrono::Utc::now();
                 active_job.finished_at = Set(Some(now));
                 debug!("Job {} finished at {}", job_execution_id, now);
@@ -569,6 +572,98 @@ mod tests {
             .all(db.as_ref())
             .await?;
         assert_eq!(pending_jobs.len(), 2); // crons and screenshot still pending
+
+        Ok(())
+    }
+
+    /// Regression test for #477: an optional job that never ran (failed
+    /// prerequisites) must leave a terminal row behind — not stay Pending — with the
+    /// reason and a finish time, so the UI stops showing it as in-progress.
+    #[tokio::test]
+    async fn test_prerequisite_failure_leaves_job_failed_not_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
+        let screenshot_job_id = create_test_job(
+            &db,
+            deployment_id,
+            "take_screenshot",
+            false,
+            EntityJobStatus::Pending,
+        )
+        .await?;
+
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+
+        // This is what WorkflowExecutor::persist_terminal_status does when
+        // validate_prerequisites fails.
+        let execution_id = tracker
+            .create_job_execution(
+                "deployment-workflow",
+                "take_screenshot",
+                CoreJobStatus::Failure,
+            )
+            .await?;
+        assert_eq!(execution_id, screenshot_job_id);
+
+        tracker
+            .update_job_status(
+                execution_id,
+                CoreJobStatus::Failure,
+                Some(
+                    "Screenshot provider 'local-headless-chrome' is not available: \
+                      Chrome browser error: libnss3.so: cannot open shared object file"
+                        .to_string(),
+                ),
+            )
+            .await?;
+
+        let job = DeploymentJobs::find_by_id(screenshot_job_id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("screenshot job should exist")?;
+
+        assert_eq!(job.status, EntityJobStatus::Failure);
+        assert!(
+            job.finished_at.is_some(),
+            "a job that reached a terminal state must have finished_at set"
+        );
+        assert!(job.error_message.unwrap_or_default().contains("libnss3.so"));
+
+        Ok(())
+    }
+
+    /// A skipped job must also be terminal, including `finished_at`.
+    #[tokio::test]
+    async fn test_skipped_job_records_finished_at() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
+        let job_id =
+            create_test_job(&db, deployment_id, "crons", false, EntityJobStatus::Pending).await?;
+
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+        tracker
+            .update_job_status(
+                job_id,
+                CoreJobStatus::Skipped,
+                Some("Not configured".to_string()),
+            )
+            .await?;
+
+        let job = DeploymentJobs::find_by_id(job_id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("job should exist")?;
+
+        assert_eq!(job.status, EntityJobStatus::Skipped);
+        assert!(
+            job.finished_at.is_some(),
+            "skipped jobs are terminal and must record finished_at"
+        );
 
         Ok(())
     }

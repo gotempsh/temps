@@ -55,7 +55,7 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
 
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -185,8 +185,36 @@ jobs:
           echo "Waiting for Temps to become healthy..."
           timeout 120 bash -c 'until curl -sf http://localhost:8081/ > /dev/null 2>&1; do sleep 2; done'
           echo "Platform is healthy"
+          # NOTE: this only proves the shell is served. A console whose JS dies
+          # on boot still answers 200 here -- that is exactly how #504 shipped.
+          # The console UI tests below are what actually verify it works.
           curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
           echo ""
+
+      # Drives the real console in a real browser against the instance started
+      # above. Runs before the API-level deploys so a broken UI is reported as a
+      # UI failure rather than being buried behind a 20-minute deploy matrix.
+      - name: Install Playwright browser
+        run: cd web && bunx playwright install --with-deps chromium
+
+      - name: Console UI end-to-end tests
+        env:
+          E2E_BASE_URL: http://localhost:8081
+          E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
+          E2E_PASSWORD: ${{ env.ADMIN_PASSWORD }}
+          E2E_REPO_URL: https://github.com/${{ github.repository }}.git
+        run: cd web && bun run e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Create API key via CLI
         id: auth

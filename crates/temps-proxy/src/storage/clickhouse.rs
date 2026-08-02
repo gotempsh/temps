@@ -801,6 +801,12 @@ impl ClickHouseProxyLogStore {
             clauses.push("is_bot = ?".into());
             binds.push(Bv::Bool(is_bot));
         }
+        if filters.exclude_bots == Some(true) {
+            // Tri-state exclusion: drop detected bots but KEEP rows with no
+            // detection metadata (is_bot IS NULL) — mirrors the TimescaleDB
+            // `is_bot = false OR is_bot IS NULL` predicate.
+            clauses.push("(is_bot = 0 OR is_bot IS NULL)".into());
+        }
         if let Some(ref bot_name) = filters.bot_name {
             clauses.push("bot_name ILIKE ?".into());
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(bot_name))));
@@ -963,13 +969,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         };
 
         // ── COUNT(*) total (same WHERE) ──────────────────────────────────────
-        // FINAL: proxy_logs is a ReplacingMergeTree, and an insert retry or a
-        // re-run of the TimescaleDB→ClickHouse backfill can leave duplicate rows
-        // that ClickHouse only collapses on a later merge — and two copies in
-        // different parts may never merge together without OPTIMIZE. Without
-        // FINAL this count() over-reports the pagination total. FINAL forces
-        // merge-on-read so the total matches the deduplicated result set.
-        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs FINAL {where_clause}");
+        // NO FINAL — deliberate, restoring the design stated in
+        // 0001_proxy_logs.sql: "the high-volume read paths (list + the 7
+        // aggregations) GROUP BY or LIMIT and tolerate the rare pre-merge
+        // duplicate, so they do NOT use FINAL (keeps the hot scans fast)".
+        //
+        // FINAL forces merge-on-read across every part in every partition. On
+        // an unfiltered listing that turns this count from a metadata-only
+        // lookup (1.2ms in the DDL benchmark) into a full-table merge scan —
+        // multiple seconds once the table reaches 100M+ rows, which is what
+        // made `GET /proxy-logs` unusable. proxy_logs is a ReplacingMergeTree
+        // only so a retried batch is idempotent; duplicates are rare, transient
+        // (collapsed at the next merge), and at worst inflate this total by a
+        // handful of rows out of millions. A pagination total is not worth a
+        // full merge scan for that.
+        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs {where_clause}");
         let (_, count_binds, _) = Self::build_list_where(start_date, end_date, &filters);
         let count_q = apply_binds(self.client.query(&count_sql), count_binds);
         let total = count_q
@@ -984,6 +998,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // ── Page fetch ───────────────────────────────────────────────────────
         // ORDER BY column is allowlist-derived; direction is a fixed enum. Both
         // are safe to interpolate (no user string reaches the SQL).
+        //
+        // NO FINAL here either (see the count note above). A LIMIT-ed page is
+        // exactly the shape the DDL calls out as duplicate-tolerant: the worst
+        // case is one retried request showing twice on a page until the next
+        // merge, versus merge-on-read over every part on every page load.
         let order_col = sort_column(filters.sort_by.as_deref());
         let order_dir = match filters.sort_order.as_deref() {
             Some("asc") => "ASC",
@@ -999,7 +1018,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
              LIMIT ? OFFSET ?"
@@ -1022,6 +1041,64 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             .map(ChProxyLogReadRow::into_model)
             .collect();
         Ok((models, total))
+    }
+
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        let (clauses, binds, impossible) = Self::build_list_where(start_date, end_date, &filters);
+
+        // Unknown ai_provider → guaranteed empty, no round-trip.
+        if impossible {
+            return Ok(vec![]);
+        }
+
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+
+        // Same page projection as `list_with_filters`, minus the count()
+        // aggregate — feed callers discard the total. ORDER BY column is
+        // allowlist-derived; direction is a fixed enum (injection-safe).
+        let order_col = sort_column(filters.sort_by.as_deref());
+        let order_dir = match filters.sort_order.as_deref() {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        let select_sql = format!(
+            "SELECT \
+                toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
+                host, status_code, response_time_ms, request_source, is_system_request, \
+                routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
+                container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
+                request_id, ip_geolocation_id, browser, browser_version, operating_system, \
+                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
+             FROM proxy_logs \
+             {where_clause} \
+             ORDER BY {order_col} {order_dir} \
+             LIMIT ?"
+        );
+
+        let mut binds = binds;
+        binds.push(Bv::I64(limit as i64));
+        let q = apply_binds(self.client.query(&select_sql), binds);
+        let rows = q.fetch_all::<ChProxyLogReadRow>().await.map_err(|e| {
+            ProxyLogServiceError::ClickHouse {
+                operation: "list_page".to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(ChProxyLogReadRow::into_model)
+            .collect())
     }
 
     async fn get_by_id(
@@ -1112,10 +1189,10 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             Self::append_stats_filters(f, &mut clauses, &mut binds);
         }
 
-        // FINAL: dedup ReplacingMergeTree before count() (see the list-count
-        // note above) so retried inserts / backfill re-runs don't inflate this.
+        // NO FINAL (see the list-count note above). This is one of the seven
+        // aggregations the DDL explicitly designates duplicate-tolerant.
         let sql = format!(
-            "SELECT count() AS cnt FROM proxy_logs FINAL WHERE {}",
+            "SELECT count() AS cnt FROM proxy_logs WHERE {}",
             clauses.join(" AND ")
         );
         let q = apply_binds(self.client.query(&sql), binds);
@@ -1181,7 +1258,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 countIf(status_code >= 400) AS error_count, \
                 sum(ifNull(request_size_bytes, 0)) AS total_request_bytes, \
                 sum(ifNull(response_size_bytes, 0)) AS total_response_bytes \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms \
              ORDER BY bucket_ms ASC \
@@ -1260,7 +1337,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS total_requests, \
                 countIf(status_code >= 500) AS total_errors, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {} \
              GROUP BY project_id",
             clauses.join(" AND ")
@@ -1373,7 +1450,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(client_ip) AS unique_ips, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bot_name \
              ORDER BY request_count DESC \
@@ -1451,7 +1528,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(bot_name) AS agent_count, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY path \
              ORDER BY request_count DESC \
@@ -1534,7 +1611,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 bot_name AS agent, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms, bot_name \
              ORDER BY bucket_ms ASC \
@@ -1651,7 +1728,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                     status_code >= 500 AND status_code < 600, '5xx', \
                     'other') AS status_class, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY status_class \
              ORDER BY request_count DESC"
@@ -2125,6 +2202,7 @@ mod tests {
             operating_system: None,
             device_type: None,
             is_bot: Some(true),
+            exclude_bots: None,
             bot_name: None,
             ai_provider: None,
             ai_agent: None,
@@ -2172,6 +2250,28 @@ mod tests {
         );
     }
 
+    /// exclude_bots=true is the NULL-keeping bot exclusion used by the
+    /// Observe feed's hide-bots toggle: detected bots drop, rows without
+    /// detection metadata (is_bot IS NULL) stay.
+    #[test]
+    fn build_list_where_exclude_bots_keeps_null_rows() {
+        let mut filters = empty_query();
+        filters.exclude_bots = Some(true);
+        let (clauses, binds, impossible) =
+            ClickHouseProxyLogStore::build_list_where(None, None, &filters);
+        assert!(!impossible);
+        assert!(clauses
+            .iter()
+            .any(|c| c == "(is_bot = 0 OR is_bot IS NULL)"));
+        assert!(binds.is_empty(), "predicate is constant — no binds");
+
+        // exclude_bots=false must be a no-op, not `is_bot = false`.
+        let mut noop = empty_query();
+        noop.exclude_bots = Some(false);
+        let (clauses, _, _) = ClickHouseProxyLogStore::build_list_where(None, None, &noop);
+        assert!(clauses.is_empty());
+    }
+
     /// Unknown ai_provider must mark the query impossible (Postgres Id.eq(-1)).
     #[test]
     fn build_list_where_unknown_provider_is_impossible() {
@@ -2194,46 +2294,7 @@ mod tests {
     }
 
     fn empty_query() -> ProxyLogsQuery {
-        ProxyLogsQuery {
-            project_id: None,
-            environment_id: None,
-            deployment_id: None,
-            session_id: None,
-            visitor_id: None,
-            start_date: None,
-            end_date: None,
-            method: None,
-            host: None,
-            path: None,
-            client_ip: None,
-            status_code: None,
-            response_time_min: None,
-            response_time_max: None,
-            routing_status: None,
-            request_source: None,
-            is_system_request: None,
-            user_agent: None,
-            browser: None,
-            operating_system: None,
-            device_type: None,
-            is_bot: None,
-            bot_name: None,
-            ai_provider: None,
-            ai_agent: None,
-            is_ai_agent: None,
-            request_size_min: None,
-            request_size_max: None,
-            response_size_min: None,
-            response_size_max: None,
-            cache_status: None,
-            container_id: None,
-            upstream_host: None,
-            has_error: None,
-            page: None,
-            page_size: None,
-            sort_by: None,
-            sort_order: None,
-        }
+        ProxyLogsQuery::default()
     }
 
     #[tokio::test]

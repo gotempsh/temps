@@ -25,6 +25,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { useSettings } from '@/hooks/useSettings'
+import { reservedHostnameReason } from '@/lib/reservedHostnames'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { X } from 'lucide-react'
@@ -212,6 +214,15 @@ export function DomainForm({
     control: form.control,
     name: 'redirectTo',
   })
+
+  // Reserved hostnames (console, preview apex) would take the control plane
+  // offline if routed at a project — block them before submit (issue #478).
+  const { data: platformSettings } = useSettings()
+  const watchedDomain = useWatch({ control: form.control, name: 'domain' })
+  const reservedDomainReason = useMemo(
+    () => reservedHostnameReason(watchedDomain ?? '', platformSettings),
+    [watchedDomain, platformSettings]
+  )
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
@@ -257,6 +268,12 @@ export function DomainForm({
                       .{selectedDomain.split('*.')?.[1]}
                     </span>
                   </div>
+                )}
+
+                {reservedDomainReason && (
+                  <p className="text-sm text-destructive">
+                    {reservedDomainReason}
+                  </p>
                 )}
               </div>
             </FormItem>
@@ -424,7 +441,11 @@ export function DomainForm({
           </Button>
           <Button
             type="submit"
-            disabled={createDomain.isPending || updateDomain.isPending}
+            disabled={
+              createDomain.isPending ||
+              updateDomain.isPending ||
+              !!reservedDomainReason
+            }
           >
             {createDomain.isPending || updateDomain.isPending
               ? initialData

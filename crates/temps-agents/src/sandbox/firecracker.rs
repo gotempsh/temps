@@ -1322,6 +1322,7 @@ mod tests {
     fn resolve_name_prefers_override() {
         let p = provider();
         let mut config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id: 7,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/tmp"),

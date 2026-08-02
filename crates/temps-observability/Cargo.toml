@@ -12,6 +12,8 @@ temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
+temps-otel = { path = "../temps-otel" }
+temps-proxy = { path = "../temps-proxy" }
 
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +30,12 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+temps-geo = { path = "../temps-geo" }
 temps-migrations = { path = "../temps-migrations" }
+# Real-ClickHouse regression test (clickhouse_observe_test.rs) — same pinned
+# client/testcontainers pattern as temps-otel's clickhouse_storage_test.rs.
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+testcontainers = { workspace = true, features = ["http_wait_plain"] }
 sea-orm-migration = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }

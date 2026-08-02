@@ -2,18 +2,20 @@ import {
   createProjectMutation,
   getBranchesByRepositoryIdOptions,
   getRepositoryByIdOptions,
+  listConnectionsOptions,
+  listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { Card, CardContent } from '@/components/ui/card'
-import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { GitBranchIcon } from 'lucide-react'
-import GithubIcon from '@/icons/Github'
+import { PageContainer } from '@/components/layout/PageContainer'
+import { NewProjectShell } from '@/components/project/NewProjectShell'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 export function ImportProject() {
@@ -53,6 +55,17 @@ export function ImportProject() {
   const selectedConnectionId =
     selectedRepository?.git_provider_connection_id ?? null
 
+  // Resolve the connection's provider type so the header shows the real
+  // provider mark (GitLab/Gitea/...) instead of assuming GitHub.
+  const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
+  const { data: gitProviders } = useQuery({ ...listGitProvidersOptions() })
+  const connectionProviderId = connectionsData?.connections?.find(
+    (c) => c.id === selectedConnectionId
+  )?.provider_id
+  const providerType = gitProviders?.find(
+    (p) => p.id === connectionProviderId
+  )?.provider_type
+
   usePageTitle(
     `Import ${selectedRepository?.full_name || 'Repository'}`
   )
@@ -80,47 +93,32 @@ export function ImportProject() {
   })
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      {/* Mini header with repository info */}
-      <div className="border-b bg-card">
-        <div className="w-full px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <GithubIcon className="h-5 w-5" />
-                <span className="font-medium">
-                  {selectedRepository?.full_name || 'Loading repository…'}
-                </span>
-              </div>
-              {selectedRepository && (
-                <>
-                  <Separator orientation="vertical" className="h-6" />
-                  <div className="flex items-center gap-2">
-                    <GitBranchIcon className="h-4 w-4 text-muted-foreground" />
-                    <span className="text-sm text-muted-foreground">
-                      {branchesData?.branches?.find((b: any) => b.is_default)
-                        ?.name ||
-                        selectedRepository.default_branch ||
-                        'main'}
-                    </span>
-                  </div>
-                </>
-              )}
-            </div>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <div
-                className={`w-2 h-2 rounded-full ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
-              ></div>
-              <span>Configure Project</span>
-              <div className="w-2 h-2 bg-muted rounded-full ml-4"></div>
-              <span>Deploy</span>
+    <PageContainer>
+      <NewProjectShell
+        activeSource="browse"
+        onSelectSource={(source) => navigate(`/projects/new?source=${source}`)}
+      >
+        {/* Repository context bar — same card language as the picker */}
+        <div className="mb-6 flex flex-col gap-3 rounded-lg border bg-card px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-4 min-w-0">
+            <div className="flex items-center gap-2 min-w-0">
+              <ProviderLogo providerType={providerType} className="h-5 w-5 shrink-0" />
+              <span className="font-medium truncate">
+                {selectedRepository?.full_name || 'Loading repository…'}
+              </span>
             </div>
           </div>
+          <div className="flex items-center gap-2 text-sm text-muted-foreground shrink-0">
+            <div
+              className={`w-2 h-2 rounded-full ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
+            ></div>
+            <span>Configure Project</span>
+            <div className="w-2 h-2 bg-muted rounded-full ml-4"></div>
+            <span>Deploy</span>
+          </div>
         </div>
-      </div>
 
-      {/* Main content */}
-      <div className="w-full px-4 sm:px-6 lg:px-8 py-8">
+        <div>
         {!Number.isFinite(repositoryId) ? (
           <Card>
             <CardContent className="pt-6">
@@ -211,6 +209,7 @@ export function ImportProject() {
             connectionId={selectedConnectionId!}
             branches={branchesData?.branches}
             mode="inline"
+            showRepositoryCard={false}
             onSubmit={async (data) => {
               try {
                 await createProjectMutationM.mutateAsync({
@@ -232,9 +231,9 @@ export function ImportProject() {
                     ),
                     preset_config:
                       data.preset === 'dockerfile' && data.dockerfilePath
-                        ? { preset: 'dockerfile', dockerfilePath: data.dockerfilePath }
+                        ? { dockerfilePath: data.dockerfilePath }
                         : data.preset === 'docker-compose'
-                          ? { preset: 'docker-compose', composePath: (data as any).composePath || 'docker-compose.yml' }
+                          ? { composePath: (data as any).composePath || 'docker-compose.yml' }
                           : undefined,
                     exposed_port: data.preset === 'docker-compose' ? undefined : data.port,
                   },
@@ -245,7 +244,8 @@ export function ImportProject() {
             }}
           />
         )}
-      </div>
-    </div>
+        </div>
+      </NewProjectShell>
+    </PageContainer>
   )
 }

@@ -24,6 +24,135 @@ use temps_entities::{
 use tracing::{error, info};
 use utoipa::ToSchema;
 
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderRevealError {
+    #[error("Notification provider {provider_id} was not found")]
+    ProviderNotFound { provider_id: i32 },
+    #[error(
+        "Field '{field}' is not a sensitive field for notification provider {provider_id} ({provider_type})"
+    )]
+    FieldNotRevealable {
+        provider_id: i32,
+        provider_type: String,
+        field: String,
+    },
+    #[error("Sensitive field '{field}' was not found in notification provider {provider_id}")]
+    FieldNotFound { provider_id: i32, field: String },
+    #[error("Failed to load notification provider {provider_id}: {source}")]
+    Database {
+        provider_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to decrypt notification provider {provider_id} configuration: {reason}")]
+    Decryption { provider_id: i32, reason: String },
+    #[error(
+        "Failed to serialize field '{field}' for notification provider {provider_id}: {reason}"
+    )]
+    Serialization {
+        provider_id: i32,
+        field: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderConfigMergeError {
+    #[error("Masked notification provider value at '{path}' has no existing value to preserve")]
+    UnmatchedMaskedValue { path: String },
+    #[error(
+        "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
+    )]
+    AmbiguousMaskedArray { path: String },
+}
+
+const MASKED_CONFIG_VALUE: &str = "***";
+
+fn normalize_config_key(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_was_lowercase_or_digit = false;
+    for character in name.chars() {
+        if matches!(character, '-' | ' ' | '.') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            previous_was_lowercase_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lowercase_or_digit {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+        previous_was_lowercase_or_digit =
+            character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    normalized
+}
+
+fn is_sensitive_config_key(name: &str) -> bool {
+    let normalized = normalize_config_key(name);
+    normalized == "url"
+        || normalized.ends_with("_url")
+        || normalized == "authorization"
+        || normalized.ends_with("_authorization")
+        || [
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "api_key",
+            "apikey",
+            "private_key",
+            "access_key",
+            "signing_key",
+            "key",
+            "auth",
+        ]
+        .iter()
+        .any(|marker| {
+            normalized == *marker
+                || normalized.starts_with(&format!("{marker}_"))
+                || normalized.ends_with(&format!("_{marker}"))
+        })
+}
+
+fn is_provider_config_field_revealable(_provider_type: &str, field: &str) -> bool {
+    if field
+        .strip_prefix("headers.")
+        .is_some_and(|name| !name.is_empty())
+    {
+        return true;
+    }
+
+    field.split('.').all(|segment| !segment.is_empty())
+        && field
+            .rsplit('.')
+            .next()
+            .is_some_and(is_sensitive_config_key)
+}
+
+fn provider_config_field<'a>(
+    config: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    match field
+        .strip_prefix("headers.")
+        .filter(|name| !name.is_empty())
+    {
+        Some(header_name) => config
+            .get("headers")
+            .and_then(|headers| headers.get(header_name)),
+        None => {
+            let mut value = config;
+            for segment in field.split('.') {
+                value = value.get(segment)?;
+            }
+            Some(value)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
@@ -1462,8 +1591,14 @@ impl NotificationService {
         Ok(providers)
     }
 
-    /// Decrypt the provider config for safe return to API
+    /// Decrypt and mask the provider config for API responses.
     pub fn decrypt_provider_config(&self, encrypted_config: &str) -> Result<serde_json::Value> {
+        let mut config_value = self.decrypt_provider_config_raw(encrypted_config)?;
+        Self::mask_provider_config(&mut config_value);
+        Ok(config_value)
+    }
+
+    fn decrypt_provider_config_raw(&self, encrypted_config: &str) -> Result<serde_json::Value> {
         let decrypted_config = self
             .encryption_service
             .decrypt_string(encrypted_config)
@@ -1473,6 +1608,157 @@ impl NotificationService {
             .map_err(|e| anyhow::anyhow!("Failed to parse decrypted config: {}", e))?;
 
         Ok(config_value)
+    }
+
+    fn mask_provider_config(config: &mut serde_json::Value) {
+        let Some(object) = config.as_object_mut() else {
+            *config = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+            return;
+        };
+
+        for (name, value) in object {
+            if name == "headers" {
+                if let Some(headers) = value.as_object_mut() {
+                    for header_value in headers.values_mut() {
+                        if !header_value.is_null() {
+                            *header_value =
+                                serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                        }
+                    }
+                } else if !value.is_null() {
+                    *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                }
+                continue;
+            }
+
+            if is_sensitive_config_key(name) && !value.is_null() {
+                *value = serde_json::Value::String(MASKED_CONFIG_VALUE.to_string());
+                continue;
+            }
+
+            match value {
+                serde_json::Value::Object(_) => Self::mask_provider_config(value),
+                serde_json::Value::Array(_) => Self::mask_nested_provider_config(value),
+                _ => {}
+            }
+        }
+    }
+
+    fn mask_nested_provider_config(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(_) => Self::mask_provider_config(value),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::mask_nested_provider_config(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains_masked_value(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(value) => value == MASKED_CONFIG_VALUE,
+            serde_json::Value::Object(object) => object.values().any(Self::contains_masked_value),
+            serde_json::Value::Array(items) => items.iter().any(Self::contains_masked_value),
+            _ => false,
+        }
+    }
+
+    fn merge_masked_values(
+        existing: &serde_json::Value,
+        replacement: &mut serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
+        match (existing, replacement) {
+            (serde_json::Value::Object(existing), serde_json::Value::Object(replacement)) => {
+                for (key, new_value) in replacement {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if let Some(old_value) = existing.get(key) {
+                        Self::merge_masked_values(old_value, new_value, &child_path)?;
+                    } else if Self::contains_masked_value(new_value) {
+                        return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                            path: child_path,
+                        });
+                    }
+                }
+            }
+            (_, serde_json::Value::Array(replacement)) => {
+                if replacement.iter().any(Self::contains_masked_value) {
+                    return Err(NotificationProviderConfigMergeError::AmbiguousMaskedArray {
+                        path: path.to_string(),
+                    });
+                }
+            }
+            (existing, replacement)
+                if replacement
+                    .as_str()
+                    .is_some_and(|value| value == MASKED_CONFIG_VALUE) =>
+            {
+                *replacement = existing.clone();
+            }
+            (_, replacement) => {
+                if Self::contains_masked_value(replacement) {
+                    return Err(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+                        path: path.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reveal a single sensitive configuration field after the HTTP layer has
+    /// applied authorization. The caller must audit every successful result.
+    pub async fn reveal_provider_config_value(
+        &self,
+        provider_id: i32,
+        field: &str,
+    ) -> std::result::Result<(String, String), NotificationProviderRevealError> {
+        let provider = notification_providers::Entity::find_by_id(provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| NotificationProviderRevealError::Database {
+                provider_id,
+                source,
+            })?
+            .ok_or(NotificationProviderRevealError::ProviderNotFound { provider_id })?;
+
+        if !is_provider_config_field_revealable(&provider.provider_type, field) {
+            return Err(NotificationProviderRevealError::FieldNotRevealable {
+                provider_id,
+                provider_type: provider.provider_type,
+                field: field.to_string(),
+            });
+        }
+
+        let config = self
+            .decrypt_provider_config_raw(&provider.config)
+            .map_err(|error| NotificationProviderRevealError::Decryption {
+                provider_id,
+                reason: error.to_string(),
+            })?;
+        let value = provider_config_field(&config, field).ok_or_else(|| {
+            NotificationProviderRevealError::FieldNotFound {
+                provider_id,
+                field: field.to_string(),
+            }
+        })?;
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => serde_json::to_string(other).map_err(|error| {
+                NotificationProviderRevealError::Serialization {
+                    provider_id,
+                    field: field.to_string(),
+                    reason: error.to_string(),
+                }
+            })?,
+        };
+        Ok((provider.provider_type, value))
     }
 
     async fn load_provider(
@@ -1561,13 +1847,16 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            let existing_config = provider.config.clone();
             let mut active_model: notification_providers::ActiveModel = provider.into();
 
             // Update fields if provided
             if let Some(new_name) = update.name {
                 active_model.name = Set(new_name);
             }
-            if let Some(new_config) = update.config {
+            if let Some(mut new_config) = update.config {
+                let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
+                Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
                 let encrypted_config = self
@@ -2010,6 +2299,23 @@ impl NotificationPreferencesService {
 mod tests {
     use super::*;
     use sea_orm::MockDatabase;
+    use temps_database::test_utils::TestDatabase;
+
+    macro_rules! test_database_or_skip {
+        () => {
+            match TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                        eprintln!("Skipping Docker-dependent notification test: {message}");
+                        return;
+                    }
+                    panic!("Failed to set up notification test database: {message}");
+                }
+            }
+        };
+    }
 
     fn create_test_notification() -> Notification {
         Notification {
@@ -2565,12 +2871,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_get_defaults() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2595,12 +2897,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2645,12 +2943,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_update_existing() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2690,12 +2984,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_delete() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -2771,12 +3061,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notification_preferences_service_multiple_updates() {
-        use temps_database::test_utils::TestDatabase;
-
         // Start database with migrations
-        let test_db = TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database");
+        let test_db = test_database_or_skip!();
 
         // Create service
         let service = NotificationPreferencesService::new(test_db.connection_arc());
@@ -3366,5 +3652,277 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[test]
+    fn provider_config_masking_covers_each_credential_shape() {
+        let mut config = serde_json::json!({
+            "password": "smtp-secret",
+            "smtp_password": "smtp-secret-alias",
+            "webhook_url": "https://hooks.example/secret",
+            "api_token": "cloudflare-secret",
+            "oauth": {
+                "client_secret": "oauth-secret",
+                "access_token": "oauth-token",
+                "clientSecret": "camel-secret",
+                "accessToken": "camel-token",
+                "issuer": "https://issuer.example.test"
+            },
+            "webhookUrl": "https://hooks.example/camel-secret",
+            "targets": [
+                [
+                    {"signing_key": "nested-array-secret", "name": "primary"}
+                ]
+            ],
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "secret"
+            },
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::mask_provider_config(&mut config);
+
+        assert_eq!(config["password"], "***");
+        assert_eq!(config["smtp_password"], "***");
+        assert_eq!(config["webhook_url"], "***");
+        assert_eq!(config["api_token"], "***");
+        assert_eq!(config["oauth"]["client_secret"], "***");
+        assert_eq!(config["oauth"]["access_token"], "***");
+        assert_eq!(config["oauth"]["clientSecret"], "***");
+        assert_eq!(config["oauth"]["accessToken"], "***");
+        assert_eq!(config["oauth"]["issuer"], "https://issuer.example.test");
+        assert_eq!(config["webhookUrl"], "***");
+        assert_eq!(config["targets"][0][0]["signing_key"], "***");
+        assert_eq!(config["targets"][0][0]["name"], "primary");
+        assert_eq!(config["headers"]["Authorization"], "***");
+        assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_preserves_masked_credentials() {
+        let existing = serde_json::json!({
+            "password": "smtp-secret",
+            "webhook_url": "https://hooks.slack.com/services/secret",
+            "url": "https://example.com/webhook/secret",
+            "headers": {"Authorization": "Bearer secret"},
+            "oauth": {"client_secret": {"primary": "nested-secret"}}
+        });
+        let mut replacement = serde_json::json!({
+            "password": "***",
+            "webhook_url": "***",
+            "url": "***",
+            "headers": {"Authorization": "***"},
+            "oauth": {"client_secret": "***"},
+            "smtp_host": "smtp.example.com"
+        });
+
+        NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect("matching masked paths should preserve existing credentials");
+
+        assert_eq!(replacement["password"], "smtp-secret");
+        assert_eq!(
+            replacement["webhook_url"],
+            "https://hooks.slack.com/services/secret"
+        );
+        assert_eq!(replacement["url"], "https://example.com/webhook/secret");
+        assert_eq!(replacement["headers"]["Authorization"], "Bearer secret");
+        assert_eq!(
+            replacement["oauth"]["client_secret"],
+            serde_json::json!({"primary": "nested-secret"})
+        );
+        assert_eq!(replacement["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn provider_config_update_rejects_renamed_masked_credential() {
+        let existing = serde_json::json!({
+            "headers": {"Authorization": "Bearer secret"}
+        });
+        let mut replacement = serde_json::json!({
+            "headers": {"X-Authorization": "***"}
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("a sentinel cannot be moved to a new path");
+
+        assert!(error.to_string().contains("headers.X-Authorization"));
+    }
+
+    #[test]
+    fn provider_config_update_rejects_masked_values_inside_arrays() {
+        let existing = serde_json::json!({
+            "targets": [
+                {"name": "primary", "access_token": "first-secret"},
+                {"name": "secondary", "access_token": "second-secret"}
+            ]
+        });
+        let mut replacement = serde_json::json!({
+            "targets": [
+                {"name": "secondary", "access_token": "***"},
+                {"name": "primary", "access_token": "***"}
+            ]
+        });
+
+        let error = NotificationService::merge_masked_values(&existing, &mut replacement, "")
+            .expect_err("array sentinels are structurally ambiguous after edits");
+
+        assert!(error.to_string().contains("inside array 'targets'"));
+    }
+
+    #[test]
+    fn webhook_headers_are_revealed_one_at_a_time() {
+        let config = serde_json::json!({
+            "url": "https://example.com/webhook",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Webhook-Secret": "second secret"
+            }
+        });
+
+        assert!(!is_provider_config_field_revealable("webhook", "headers"));
+        assert!(is_provider_config_field_revealable(
+            "webhook",
+            "headers.Authorization"
+        ));
+        assert!(is_provider_config_field_revealable(
+            "custom",
+            "oauth.client_secret"
+        ));
+        assert!(!is_provider_config_field_revealable(
+            "custom",
+            "oauth.issuer"
+        ));
+        assert_eq!(
+            provider_config_field(&config, "headers.Authorization"),
+            Some(&serde_json::json!("Bearer secret"))
+        );
+        assert_eq!(
+            provider_config_field(&config, "headers.X-Webhook-Secret"),
+            Some(&serde_json::json!("second secret"))
+        );
+    }
+
+    #[test]
+    fn malformed_provider_configs_are_fail_safe_masked() {
+        for malformed in [
+            serde_json::json!("Bearer plaintext"),
+            serde_json::json!({"headers": "Bearer plaintext"}),
+            serde_json::json!({"headers": ["Authorization", "Bearer plaintext"]}),
+        ] {
+            let mut masked = malformed;
+            NotificationService::mask_provider_config(&mut masked);
+            assert!(!masked.to_string().contains("plaintext"));
+        }
+    }
+
+    fn notification_provider_model(
+        encryption_service: &temps_core::EncryptionService,
+        config: serde_json::Value,
+    ) -> notification_providers::Model {
+        notification_providers::Model {
+            id: 17,
+            name: "Custom OAuth".to_string(),
+            provider_type: "custom".to_string(),
+            config: encryption_service
+                .encrypt_string(&config.to_string())
+                .unwrap(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_supports_nested_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({
+                "oauth": {
+                    "client_secret": "oauth-secret",
+                    "issuer": "https://issuer.example.test"
+                }
+            }),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let (_, value) = service
+            .reveal_provider_config_value(17, "oauth.client_secret")
+            .await
+            .unwrap();
+
+        assert_eq!(value, "oauth-secret");
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_rejects_non_sensitive_fields() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let provider = notification_provider_model(
+            encryption_service.as_ref(),
+            serde_json::json!({"oauth": {"issuer": "https://issuer.example.test"}}),
+        );
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![provider]])
+            .into_connection();
+        let service = NotificationService::new(Arc::new(db), encryption_service);
+
+        let error = service
+            .reveal_provider_config_value(17, "oauth.issuer")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::FieldNotRevealable {
+                provider_id: 17,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reveal_provider_config_value_reports_not_found_and_database_errors() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-reveal-test",
+        ));
+        let not_found_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<notification_providers::Model>::new()])
+            .into_connection();
+        let not_found_service =
+            NotificationService::new(Arc::new(not_found_db), encryption_service.clone());
+        let error = not_found_service
+            .reveal_provider_config_value(404, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::ProviderNotFound { provider_id: 404 }
+        ));
+
+        let database_error = sea_orm::DbErr::Custom("database unavailable".to_string());
+        let error_db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([database_error])
+            .into_connection();
+        let error_service = NotificationService::new(Arc::new(error_db), encryption_service);
+        let error = error_service
+            .reveal_provider_config_value(17, "api_token")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NotificationProviderRevealError::Database {
+                provider_id: 17,
+                ..
+            }
+        ));
     }
 }

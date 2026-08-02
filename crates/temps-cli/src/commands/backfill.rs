@@ -54,10 +54,11 @@ pub enum BackfillTarget {
 
 /// Which observability domain to copy from TimescaleDB into ClickHouse.
 ///
-/// `events` replicates via the live outbox too, but the other three
-/// (`proxy-logs`, `traces`, `metrics`) are backend-swap domains with no live
-/// replication — enabling ClickHouse routes *new* writes there but leaves the
-/// historical TimescaleDB rows behind. This backfill copies that history over.
+/// `events` replicates via the live outbox too, but the others
+/// (`proxy-logs`, `traces`, `metrics`, `trace-refs`) are backend-swap domains
+/// with no live replication — enabling ClickHouse routes *new* writes there
+/// but leaves the historical TimescaleDB rows behind. This backfill copies
+/// that history over.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackfillDomain {
     /// Analytics events (`events` → ClickHouse `events`).
@@ -68,7 +69,12 @@ pub enum BackfillDomain {
     Traces,
     /// Resource metrics (`service_metrics` → ClickHouse `service_metrics`).
     Metrics,
-    /// All four domains, in turn.
+    /// Cross-project trace refs (`cross_project_trace_refs` → ClickHouse
+    /// table of the same name). Optional: the live read path unions both
+    /// backends, so skipping this only means pre-cutover refs resolve from
+    /// Postgres until they age out.
+    TraceRefs,
+    /// All domains, in turn.
     All,
 }
 
@@ -76,8 +82,9 @@ pub enum BackfillDomain {
 pub struct ClickhouseBackfillArgs {
     /// Which domain(s) to copy. Defaults to `events` to preserve the prior
     /// behaviour of this command. Use `all` to copy every observability domain,
-    /// or pick `proxy-logs` / `traces` / `metrics` for a backend-swap domain
-    /// whose history did not migrate when you enabled ClickHouse.
+    /// or pick `proxy-logs` / `traces` / `metrics` / `trace-refs` for a
+    /// backend-swap domain whose history did not migrate when you enabled
+    /// ClickHouse.
     #[arg(long, value_enum, default_value_t = BackfillDomain::Events)]
     pub domain: BackfillDomain,
 
@@ -205,6 +212,7 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
             BackfillDomain::ProxyLogs,
             BackfillDomain::Traces,
             BackfillDomain::Metrics,
+            BackfillDomain::TraceRefs,
         ],
         single => vec![single],
     };
@@ -215,7 +223,10 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
     for domain in domains {
         match domain {
             BackfillDomain::Events => run_events_backfill(db.clone(), &args).await?,
-            BackfillDomain::ProxyLogs | BackfillDomain::Traces | BackfillDomain::Metrics => {
+            BackfillDomain::ProxyLogs
+            | BackfillDomain::Traces
+            | BackfillDomain::Metrics
+            | BackfillDomain::TraceRefs => {
                 crate::commands::ch_backfill_domains::run_domain_backfill(db.clone(), &args, domain)
                     .await?
             }

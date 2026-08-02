@@ -4,7 +4,6 @@ import {
   deleteEnvironmentVariableMutation,
   getEnvironmentsOptions,
   getEnvironmentVariablesOptions,
-  getEnvironmentVariableValueOptions,
   updateEnvironmentVariableMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
@@ -32,7 +31,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -48,13 +47,19 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
+  getEnvVarValue,
   getResolvedEnvVars,
   getResolvedEnvVarValue,
   indexResolvedByKey,
   type ResolvedEnvVar,
 } from '@/lib/resolved-env-vars'
+import {
+  createCredentialRevealGuard,
+  credentialValueForScope,
+  type ScopedCredentialValue,
+} from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -80,52 +85,82 @@ function EnvironmentVariableRow({
       ? (resolved.source.overrides_service ?? undefined)
       : undefined
   const [isVisible, setIsVisible] = useState(false)
-  const [isEditing, setIsEditing] = useState(false)
   const [editValue, setEditValue] = useState('')
   const [isEditMultiline, setIsEditMultiline] = useState(false)
+  const [revealedValue, setRevealedValue] = useState<
+    ScopedCredentialValue | undefined
+  >()
+  const [isRevealing, setIsRevealing] = useState(false)
+  const revealScope = `${project.id}:${variable.id}:${variable.updated_at}`
+  const revealGuard = useRef(createCredentialRevealGuard())
   // Secret env vars are write-only: the value is never fetched, the reveal
   // button is hidden, and the edit dialog defaults to "leave blank to keep
   // the existing value". This mirrors the file-based Secrets UX.
   const isSecret = variable.is_secret ?? false
 
-  const { data, refetch } = useQuery({
-    ...getEnvironmentVariableValueOptions({
-      path: {
-        project_id: project.id,
-        key: variable.key,
-      },
-    }),
-    enabled:
-      !isSecret && (isVisible || isEditing || showAllValues),
-  })
-
   useEffect(() => {
-    if (isSecret) return
-    if (data && typeof data === 'object' && 'value' in data) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setEditValue(data.value)
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setIsEditMultiline(data.value.includes('\n'))
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    // Drop plaintext whenever this row changes project, identity, or version.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRevealedValue(undefined)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setEditValue('')
+    return () => guard.invalidate()
+  }, [revealScope])
+
+  const revealValue = async (): Promise<string | undefined> => {
+    if (isSecret) return undefined
+    const request = revealGuard.current.begin('value')
+    setIsRevealing(true)
+    try {
+      const value = await getEnvVarValue(
+        project.id,
+        variable.key,
+        variable.id
+      )
+      if (!revealGuard.current.isCurrent('value', request)) return undefined
+      setRevealedValue({ value, scope: revealScope })
+      return value
+    } catch {
+      if (revealGuard.current.isCurrent('value', request)) {
+        toast.error(`Failed to reveal ${variable.key}`)
+      }
+      return undefined
+    } finally {
+      if (revealGuard.current.finish('value', request)) {
+        setIsRevealing(false)
+      }
     }
-  }, [data, isSecret])
+  }
 
   useEffect(() => {
     if (isSecret) return
+    revealGuard.current.cancel('value')
     setIsVisible(showAllValues)
     if (showAllValues) {
-      refetch()
+      void revealValue()
+    } else {
+      setRevealedValue(undefined)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAllValues, isSecret])
+  }, [showAllValues, isSecret, revealScope])
 
-  const dataValue = useMemo(() => data?.value ?? '', [data])
+  const dataValue =
+    credentialValueForScope(revealedValue, revealScope) ?? ''
 
   const toggleVisibility = async () => {
     if (isSecret) return
-    setIsVisible(!isVisible)
-    if (!isVisible) {
-      refetch()
+    if (isVisible) {
+      revealGuard.current.cancel('value')
+      setIsVisible(false)
+      setRevealedValue(undefined)
+      setEditValue('')
+      setIsEditMultiline(false)
+      return
     }
+    setIsVisible(true)
+    await revealValue()
   }
 
   const deleteMutation = useMutation({
@@ -145,8 +180,10 @@ function EnvironmentVariableRow({
       errorTitle: 'Failed to update environment variable',
     },
     onSuccess: () => {
-      setIsEditing(false)
-      refetch()
+      revealGuard.current.cancel('value')
+      setRevealedValue(undefined)
+      setEditValue('')
+      setIsEditMultiline(false)
       refetchEnvVariables()
       toast.success('Environment variable updated')
     },
@@ -177,9 +214,27 @@ function EnvironmentVariableRow({
     setEditIncludeInPreview(variable.include_in_preview ?? false)
   }, [variable.environments, variable.include_in_preview])
 
-  const openEditDialog = () => {
-    setIsEditing(true)
+  const openEditDialog = async () => {
     setIsEditModalOpen(true)
+    if (!isSecret) {
+      const value = dataValue || (await revealValue())
+      if (value !== undefined) {
+        setEditValue(value)
+        setIsEditMultiline(value.includes('\n'))
+      }
+    }
+  }
+
+  const handleEditDialogOpenChange = (open: boolean) => {
+    setIsEditModalOpen(open)
+    if (!open) {
+      setEditValue('')
+      setIsEditMultiline(false)
+      if (!isVisible && !showAllValues) {
+        revealGuard.current.cancel('value')
+        setRevealedValue(undefined)
+      }
+    }
   }
 
   const submitEdit = async () => {
@@ -201,7 +256,6 @@ function EnvironmentVariableRow({
       },
     })
     setIsEditModalOpen(false)
-    setIsEditing(false)
     setEditValue('')
   }
 
@@ -265,7 +319,13 @@ function EnvironmentVariableRow({
         <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
-              {isSecret ? '••••••••••••' : isVisible ? dataValue : '••••••••••••'}
+              {isSecret
+                ? '••••••••••••'
+                : isVisible
+                  ? isRevealing && !dataValue
+                    ? 'Revealing…'
+                    : dataValue || '••••••••••••'
+                  : '••••••••••••'}
             </span>
             {!isSecret && (
               <Button variant="ghost" size="sm" onClick={toggleVisibility}>
@@ -280,7 +340,7 @@ function EnvironmentVariableRow({
           <Button
             variant="outline"
             size="sm"
-            onClick={openEditDialog}
+            onClick={() => void openEditDialog()}
             disabled={deleteMutation.isPending || updateMutation.isPending}
           >
             Edit
@@ -335,7 +395,10 @@ function EnvironmentVariableRow({
         </div>
       </div>
 
-      <Dialog open={isEditModalOpen} onOpenChange={setIsEditModalOpen}>
+      <Dialog
+        open={isEditModalOpen}
+        onOpenChange={handleEditDialogOpenChange}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Environment Variable: {variable.key}</DialogTitle>
@@ -429,7 +492,7 @@ function EnvironmentVariableRow({
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => setIsEditModalOpen(false)}
+                onClick={() => handleEditDialogOpenChange(false)}
               >
                 Cancel
               </Button>
@@ -456,37 +519,84 @@ function IntegrationEnvVarRow({
   environmentId,
 }: IntegrationEnvVarRowProps) {
   const [isVisible, setIsVisible] = useState(false)
+  const [revealedValue, setRevealedValue] = useState<
+    ScopedCredentialValue | undefined
+  >()
+  const [isFetching, setIsFetching] = useState(false)
+  const revealGuard = useRef(createCredentialRevealGuard())
   const isIntegration = resolved.source.type === 'integration'
-
-  const shouldFetch = isIntegration && (isVisible || showAllValues)
-
-  const { data: revealedValue, refetch, isFetching } = useQuery({
-    queryKey: ['resolved-env-var-value', projectId, resolved.key, environmentId],
-    queryFn: () =>
-      getResolvedEnvVarValue(projectId, resolved.key, environmentId ?? undefined),
-    enabled: shouldFetch,
-    staleTime: 15_000,
-  })
+  const serviceId =
+    resolved.source.type === 'integration'
+      ? resolved.source.service.service_id
+      : 'manual'
+  const serviceUpdatedAt =
+    resolved.source.type === 'integration'
+      ? resolved.source.service.service_updated_at
+      : 'manual'
+  const revealScope = `${projectId}:${serviceId}:${serviceUpdatedAt}:${resolved.key}:${environmentId ?? 'all'}`
+  const currentValue = credentialValueForScope(revealedValue, revealScope)
 
   useEffect(() => {
+    const guard = createCredentialRevealGuard()
+    revealGuard.current = guard
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRevealedValue(undefined)
+    return () => guard.invalidate()
+  }, [revealScope])
+
+  const revealValue = async () => {
+    if (!isIntegration) return
+    const request = revealGuard.current.begin('value')
+    setIsFetching(true)
+    try {
+      const value = await getResolvedEnvVarValue(
+        projectId,
+        resolved.key,
+        environmentId ?? undefined,
+        serviceId === 'manual' ? undefined : serviceId
+      )
+      if (!revealGuard.current.isCurrent('value', request)) return
+      setRevealedValue({ value, scope: revealScope })
+    } catch {
+      if (revealGuard.current.isCurrent('value', request)) {
+        toast.error(`Failed to reveal ${resolved.key}`)
+      }
+    } finally {
+      if (revealGuard.current.finish('value', request)) {
+        setIsFetching(false)
+      }
+    }
+  }
+
+  useEffect(() => {
+    revealGuard.current.cancel('value')
     setIsVisible(showAllValues)
-  }, [showAllValues])
+    if (showAllValues) {
+      void revealValue()
+    } else {
+      setRevealedValue(undefined)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllValues, revealScope])
 
   if (resolved.source.type !== 'integration') return null
   const service = resolved.source.service
 
-  const toggleVisibility = () => {
-    setIsVisible((prev) => {
-      const next = !prev
-      if (next) refetch()
-      return next
-    })
+  const toggleVisibility = async () => {
+    if (isVisible) {
+      revealGuard.current.cancel('value')
+      setIsVisible(false)
+      setRevealedValue(undefined)
+      return
+    }
+    setIsVisible(true)
+    await revealValue()
   }
 
   const valueText = isVisible
-    ? isFetching && !revealedValue
+    ? isFetching && !currentValue
       ? 'Revealing…'
-      : (revealedValue ?? resolved.value_preview)
+      : (currentValue ?? resolved.value_preview)
     : '••••••••••••'
 
   return (
@@ -531,7 +641,7 @@ function IntegrationEnvVarRow({
         <Button
           variant="ghost"
           size="sm"
-          onClick={toggleVisibility}
+          onClick={() => void toggleVisibility()}
           aria-label={isVisible ? 'Hide value' : 'Reveal value'}
         >
           {isVisible ? (

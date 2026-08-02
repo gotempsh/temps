@@ -26,6 +26,9 @@ pub use job_tracker::*;
 pub mod database_cron_service;
 pub use database_cron_service::*;
 
+pub mod database_metric_alert_service;
+pub use database_metric_alert_service::*;
+
 pub mod external_deployment;
 pub use external_deployment::*;
 

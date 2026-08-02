@@ -1,9 +1,16 @@
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { Sparkles, X } from 'lucide-react'
-import { type CSSProperties, useCallback, useEffect, useState } from 'react'
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { createPortal } from 'react-dom'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 /**
  * A lightweight, dependency-free guided tour for new projects. It walks the user
@@ -16,6 +23,29 @@ import { useNavigate, useParams } from 'react-router-dom'
 
 const SEEN_KEY = 'temps.project-tour.v1'
 export const PROJECT_TOUR_EVENT = 'temps:project-tour'
+
+// Shared active-state so pages the tour visits (analytics, errors) can skip
+// their own "no data yet, redirect to setup" logic while the tour is
+// showing them off — otherwise the tour lands on a page that immediately
+// navigates itself away to a /setup route the tour never asked for.
+let tourActive = false
+const tourActiveListeners = new Set<() => void>()
+function setTourActive(value: boolean) {
+  tourActive = value
+  for (const listener of tourActiveListeners) listener()
+}
+export function isProjectTourActive() {
+  return tourActive
+}
+export function useProjectTourActive() {
+  return useSyncExternalStore(
+    (listener) => {
+      tourActiveListeners.add(listener)
+      return () => tourActiveListeners.delete(listener)
+    },
+    () => tourActive
+  )
+}
 
 interface TourStep {
   route: string
@@ -76,10 +106,12 @@ export function ProjectTour() {
   const start = useCallback(() => {
     setIdx(0)
     setActive(true)
+    setTourActive(true)
   }, [])
 
   const finish = useCallback(() => {
     setActive(false)
+    setTourActive(false)
     try {
       window.localStorage.setItem(SEEN_KEY, '1')
     } catch {
@@ -108,8 +140,23 @@ export function ProjectTour() {
   }, [start])
 
   // Navigate to each step's page as the tour advances, so the user sees it.
+  //
+  // Keyed on the step itself, not on every run of the effect: `navigate` gets a
+  // new identity whenever the location changes, so re-running turned any step
+  // whose route redirects into an infinite loop. Metrics is one — `…/metrics`
+  // immediately redirects to `…/metrics/explore`, which changed the location,
+  // which re-ran this effect, which pushed `…/metrics` again (hundreds of
+  // history entries, a flickering URL bar and a destroyed Back button).
+  const navigatedFor = useRef<string | null>(null)
   useEffect(() => {
-    if (active && slug) navigate(`/projects/${slug}/${STEPS[idx].route}`)
+    if (!active || !slug) {
+      navigatedFor.current = null
+      return
+    }
+    const target = `/projects/${slug}/${STEPS[idx].route}`
+    if (navigatedFor.current === target) return
+    navigatedFor.current = target
+    navigate(target)
   }, [active, idx, slug, navigate])
 
   // Measure the anchor sidebar item to place the card + ring (deferred a frame,

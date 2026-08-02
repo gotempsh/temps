@@ -192,6 +192,18 @@ impl ProxyLogStorage for TimescaleDbProxyLogStore {
             .await
     }
 
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        self.reader
+            .list_page(start_date, end_date, filters, limit)
+            .await
+    }
+
     async fn get_by_id(
         &self,
         id: i32,

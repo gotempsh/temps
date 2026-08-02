@@ -1,8 +1,9 @@
 //! TimescaleDB → ClickHouse backfill for the *backend-swap* observability
-//! domains: proxy/request logs, OTel traces, and resource metrics.
+//! domains: proxy/request logs, OTel traces, resource metrics, and
+//! cross-project trace refs.
 //!
 //! Unlike analytics `events` (which replicate live through the outbox + fan-out
-//! worker), these three domains pick their backend at construction: when
+//! worker), these domains pick their backend at construction: when
 //! `TEMPS_CLICKHOUSE_*` is set, new writes go to ClickHouse and the historical
 //! rows already in TimescaleDB are left behind. This module copies that history
 //! across so the UI shows a continuous record after a cutover.
@@ -51,8 +52,9 @@ pub async fn run_domain_backfill(
         BackfillDomain::ProxyLogs => "proxy / request logs",
         BackfillDomain::Traces => "OTel traces (spans)",
         BackfillDomain::Metrics => "resource metrics",
+        BackfillDomain::TraceRefs => "cross-project trace refs",
         BackfillDomain::Events | BackfillDomain::All => {
-            anyhow::bail!("run_domain_backfill is only for proxy-logs/traces/metrics")
+            anyhow::bail!("run_domain_backfill is only for proxy-logs/traces/metrics/trace-refs")
         }
     };
     println!("{}", format!("▸ Domain: {label}").bright_white().bold());
@@ -165,6 +167,9 @@ pub async fn run_domain_backfill(
         BackfillDomain::Metrics => {
             metrics::copy(db.as_ref(), &ch, since, until, batch_size, &pb).await?
         }
+        BackfillDomain::TraceRefs => {
+            trace_refs::copy(db.as_ref(), &ch, since, until, batch_size, &pb).await?
+        }
         _ => unreachable!(),
     };
 
@@ -218,6 +223,12 @@ fn domain_spec(domain: BackfillDomain) -> DomainSpec {
             ch_table: "service_metrics",
             ch_time_column: "time",
         },
+        BackfillDomain::TraceRefs => DomainSpec {
+            source_table: "cross_project_trace_refs",
+            time_column: "first_seen",
+            ch_table: "cross_project_trace_refs",
+            ch_time_column: "first_seen",
+        },
         BackfillDomain::Events | BackfillDomain::All => {
             unreachable!("domain_spec only covers backend-swap domains")
         }
@@ -237,7 +248,7 @@ async fn apply_schema(
                 .await
                 .map_err(|e| anyhow::anyhow!("proxy-log CH migrations failed: {e}"))?;
         }
-        BackfillDomain::Traces => {
+        BackfillDomain::Traces | BackfillDomain::TraceRefs => {
             temps_otel::storage::clickhouse::migrations::apply_migrations(ch, db_name)
                 .await
                 .map_err(|e| anyhow::anyhow!("otel CH migrations failed: {e}"))?;
@@ -888,6 +899,107 @@ mod metrics {
         }
 
         info!(copied, "service_metrics backfill complete");
+        Ok(copied)
+    }
+}
+
+// ── cross_project_trace_refs ─────────────────────────────────────────────────
+
+mod trace_refs {
+    use super::*;
+    use temps_otel::storage::clickhouse::{trace_ref_version, ChTraceRefRow};
+
+    #[derive(FromQueryResult)]
+    struct Row {
+        trace_id: String,
+        project_id: i32,
+        first_seen: DBDateTime,
+    }
+
+    // Keyset over (first_seen, trace_id, project_id) — a total order, since
+    // (trace_id, project_id) is the table's primary key.
+    const SELECT: &str = "SELECT trace_id, project_id, first_seen \
+        FROM cross_project_trace_refs \
+        WHERE first_seen >= $1 AND first_seen <= $2 \
+          AND (first_seen, trace_id, project_id) > ($3, $4, $5) \
+        ORDER BY first_seen ASC, trace_id ASC, project_id ASC \
+        LIMIT $6";
+
+    fn to_ch(r: &Row) -> ChTraceRefRow {
+        let ms = r.first_seen.timestamp_millis();
+        ChTraceRefRow {
+            trace_id: r.trace_id.clone(),
+            project_id: r.project_id,
+            first_seen: ms,
+            retention_days: temps_core::RetentionTable::Spans.default_days(),
+            // Inverted version: the Postgres row predates any live ClickHouse
+            // row for the same pair, so it wins the ReplacingMergeTree dedup
+            // and `first_seen` keeps meaning "earliest observation".
+            _version: trace_ref_version(ms),
+        }
+    }
+
+    pub async fn copy(
+        db: &DatabaseConnection,
+        ch: &::clickhouse::Client,
+        since: DBDateTime,
+        until: DBDateTime,
+        batch_size: u64,
+        pb: &ProgressBar,
+    ) -> anyhow::Result<u64> {
+        let mut last_ts = since - chrono::Duration::milliseconds(1);
+        let mut last_trace_id = String::new();
+        let mut last_project_id: i32 = i32::MIN;
+        let mut copied = 0u64;
+
+        loop {
+            let rows = Row::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                SELECT,
+                vec![
+                    since.into(),
+                    until.into(),
+                    last_ts.into(),
+                    last_trace_id.clone().into(),
+                    last_project_id.into(),
+                    (batch_size as i64).into(),
+                ],
+            ))
+            .all(db)
+            .await?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut inserter = ch
+                .insert::<ChTraceRefRow>("cross_project_trace_refs")
+                .await
+                .context("ClickHouse cross_project_trace_refs inserter setup")?;
+            for r in &rows {
+                inserter
+                    .write(&to_ch(r))
+                    .await
+                    .context("ClickHouse cross_project_trace_refs write")?;
+            }
+            inserter
+                .end()
+                .await
+                .context("ClickHouse cross_project_trace_refs end")?;
+
+            let last = rows.last().expect("non-empty");
+            last_ts = last.first_seen;
+            last_trace_id = last.trace_id.clone();
+            last_project_id = last.project_id;
+            copied += rows.len() as u64;
+            pb.set_position(copied);
+
+            if (rows.len() as u64) < batch_size {
+                break;
+            }
+        }
+
+        info!(copied, "cross_project_trace_refs backfill complete");
         Ok(copied)
     }
 }

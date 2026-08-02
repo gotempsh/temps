@@ -296,6 +296,7 @@ mod tests {
 
     fn test_config(run_id: i32, work_dir: PathBuf) -> SandboxCreateConfig {
         SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir,

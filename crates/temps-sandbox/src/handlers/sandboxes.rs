@@ -120,6 +120,9 @@ impl From<SandboxError> for Problem {
             SandboxError::InvalidState { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Invalid Sandbox State")
                 .with_detail(error.to_string()),
+            SandboxError::ManagedByAgentRun { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sandbox Managed By Agent Run")
+                .with_detail(error.to_string()),
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
                 .with_detail(error.to_string()),
@@ -511,6 +514,10 @@ pub struct SandboxInner {
     pub preview_url_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_password_hint: Option<String>,
+    /// Agent run this sandbox executes (autofixer / workflow agent).
+    /// `None` for sandboxes created via this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_run_id: Option<i32>,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -568,6 +575,7 @@ impl SandboxResponse {
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
+                agent_run_id: s.agent_run_id,
             },
             routes,
         }
@@ -1070,7 +1078,8 @@ pub async fn get_sandbox(
     path = "/v1/sandboxes/{id}/stop",
     responses(
         (status = 204, description = "Sandbox stopped and destroyed"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]
@@ -1093,7 +1102,8 @@ pub async fn stop_sandbox(
     path = "/v1/sandboxes/{id}/destroy",
     responses(
         (status = 204, description = "Sandbox destroyed (alias for `/stop` with an explicit verb)"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2478,6 +2488,7 @@ mod tests {
             ports: vec![],
             backend: None,
             disk_size_mb: None,
+            agent_run_id: None,
         };
         let r = SandboxResponse::from(summary);
         assert_eq!(r.sandbox.id, "sbx_abc");
@@ -2504,6 +2515,7 @@ mod tests {
             ports: vec![3000, 5173],
             backend: None,
             disk_size_mb: None,
+            agent_run_id: None,
         };
         let parts = PreviewUrlParts {
             protocol: "https".into(),

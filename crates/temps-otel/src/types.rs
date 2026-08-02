@@ -429,9 +429,15 @@ pub struct SpanRecord {
     pub start_time: DateTime<Utc>,
     #[schema(value_type = String, format = DateTime)]
     pub end_time: DateTime<Utc>,
+    /// Span duration in milliseconds. The only field on this struct guaranteed
+    /// to be in milliseconds.
     pub duration_ms: f64,
     pub status_code: SpanStatusCode,
     pub status_message: String,
+    /// Raw key/value pairs exactly as reported by the instrumenting library.
+    /// Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+    /// may be seconds, milliseconds, microseconds, or nanoseconds depending on
+    /// the exporter's own convention, and the unit is not labeled here.
     pub attributes: BTreeMap<String, String>,
     pub events: Vec<SpanEvent>,
 }
@@ -634,6 +640,13 @@ pub struct TraceQuery {
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// When `true`, only return ROOT spans (no parent) — one row per trace.
+    /// Roots are `parent_span_id IS NULL` on TimescaleDB and the `''`
+    /// sentinel on ClickHouse; each backend applies its own form. Used by
+    /// high-level activity feeds (unified Observe page) that would drown in
+    /// child spans otherwise.
+    #[serde(default)]
+    pub root_only: bool,
     /// Field to sort the trace-summaries list by. Defaults to start time.
     #[serde(default)]
     pub sort_by: TraceSortField,

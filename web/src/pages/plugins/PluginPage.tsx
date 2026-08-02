@@ -2,7 +2,7 @@ import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Loader2 } from 'lucide-react'
 import { useCallback, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
 
 /**
  * Renders an external plugin's UI inside an iframe.

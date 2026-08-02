@@ -45,7 +45,7 @@ import {
 } from 'lucide-react'
 import { getDnsProviderIcon } from '@/components/icons/DnsProviderIcons'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 // Helper function to get provider icon

@@ -4,7 +4,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Card } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, ArrowRight, Database } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 interface EmptyStateStorageProps {}
 

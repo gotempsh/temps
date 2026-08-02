@@ -33,6 +33,7 @@ These environment variables configure the Temps server itself:
 | `TEMPS_DATA_DIR`        | `--data-dir`        | `~/.temps`       | Data directory for keys and configuration            |
 | `TEMPS_LOG_LEVEL`       | `--log-level`       | `info`           | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `TEMPS_CONSOLE_ADDRESS` | `--console-address` | (optional)       | Console listener (public ingest + admin if no split) |
+| `TEMPS_DOCKER_EXTRA_NETWORKS` | (none)          | (empty)          | Comma-separated Docker networks app containers must join before startup |
 
 ### Admin Listener (optional)
 
@@ -60,6 +61,28 @@ export TEMPS_CONSOLE_ADMIN_ADDRESS=127.0.0.1:8081
 export TEMPS_ADMIN_ALLOWED_IPS=127.0.0.1/32,10.0.0.0/8
 export TEMPS_ADMIN_ALLOWED_HOSTS=admin.temps.example.com
 ```
+
+### External Docker Dependency Networks
+
+Self-hosted installations sometimes run shared dependencies, such as a
+database or cache, on a sibling Docker Compose network outside Temps' primary
+app network. Set `TEMPS_DOCKER_EXTRA_NETWORKS` to attach every deployed app
+container to those required networks before the container starts:
+
+```bash
+export TEMPS_DOCKER_EXTRA_NETWORKS=supabase_default,redis_default
+```
+
+If any configured network is missing or cannot be attached, the deploy fails
+instead of starting an app that cannot resolve its dependency hostnames.
+
+<Note>
+  This setting applies host-wide: **every** app container on the node joins
+  these networks, across all projects and environments. Anything reachable on
+  them is reachable by every deployed app, so only use it on single-tenant
+  installs, and make sure the services it exposes have their own
+  authentication. It is not a per-project setting.
+</Note>
 
 ---
 

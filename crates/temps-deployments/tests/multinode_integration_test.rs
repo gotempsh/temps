@@ -18,6 +18,7 @@ use temps_deployments::services::node_service::{HeartbeatRequest, NodeService};
 
 fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> nodes::Model {
     nodes::Model {
+        architecture: None,
         id,
         name: name.to_string(),
         token_hash: "hash".to_string(),
@@ -372,6 +373,7 @@ async fn test_heartbeat_reactivates_offline_node() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
             },
@@ -396,6 +398,7 @@ async fn test_heartbeat_preserves_draining_status() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
             },
@@ -446,4 +449,127 @@ async fn test_affected_deployments_identifies_needs_redeploy() {
         !dep20.needs_redeploy(),
         "Has replicas on other nodes → no redeploy"
     );
+}
+
+// ── Heterogeneous clusters (multi-architecture) ──────────────────────────
+
+/// A worker that reports `linux/arm64` must have it recorded, so the
+/// scheduler can tell later whether an image will run there. Before this,
+/// the architecture was never known and an amd64 image was shipped to arm64
+/// nodes, where the container died with `exec format error`.
+#[tokio::test]
+async fn test_heartbeat_records_reported_architecture() {
+    let node = make_node(1, "worker-arm", "active", 5);
+    let mut updated = node.clone();
+    updated.architecture = Some("linux/arm64".to_string());
+
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(vec![vec![node]])
+        .append_query_results(vec![vec![updated]])
+        .into_connection();
+
+    let service = NodeService::new(Arc::new(db));
+    let result = service
+        .heartbeat(
+            1,
+            HeartbeatRequest {
+                architecture: Some("linux/arm64".to_string()),
+                capacity: serde_json::json!({"cpu_percent": 10}),
+                labels: None,
+            },
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "heartbeat carrying an architecture must succeed"
+    );
+}
+
+/// An agent too old to report a platform must not erase one we already
+/// learned — otherwise a mixed fleet would flip a known node back to
+/// "unknown" on every beat from the older agent.
+#[tokio::test]
+async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
+    let mut node = make_node(1, "worker-arm", "active", 5);
+    node.architecture = Some("linux/arm64".to_string());
+    let unchanged = node.clone();
+
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(vec![vec![node]])
+        .append_query_results(vec![vec![unchanged]])
+        .into_connection();
+
+    let service = NodeService::new(Arc::new(db));
+    let result = service
+        .heartbeat(
+            1,
+            HeartbeatRequest {
+                architecture: None,
+                capacity: serde_json::json!({"cpu_percent": 10}),
+                labels: None,
+            },
+        )
+        .await;
+
+    assert!(result.is_ok());
+}
+
+/// End-to-end placement on a mixed fleet: an amd64-only image goes to the
+/// amd64 worker and the control plane, never to the arm64 one.
+#[tokio::test]
+async fn test_mixed_fleet_places_amd64_image_only_on_amd64_nodes() {
+    let mut arm = make_node(1, "worker-arm", "active", 5);
+    arm.architecture = Some("linux/arm64".to_string());
+    let mut amd = make_node(2, "worker-amd", "active", 5);
+    amd.architecture = Some("linux/amd64".to_string());
+
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(vec![vec![arm, amd]])
+        .into_connection();
+
+    let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+        .with_local_platform("linux/amd64");
+
+    let assignments = scheduler
+        .schedule_replicas_excluding(6, None, None, false, &[], &["linux/amd64".to_string()])
+        .await
+        .unwrap()
+        .assignments;
+
+    assert_eq!(assignments.len(), 6);
+    for assignment in &assignments {
+        match assignment {
+            NodeAssignment::Local => {}
+            NodeAssignment::Remote {
+                node_id, platform, ..
+            } => {
+                assert_eq!(*node_id, 2, "only the amd64 worker may host this image");
+                assert_eq!(platform.as_deref(), Some("linux/amd64"));
+            }
+        }
+    }
+}
+
+/// A cluster that spans two architectures must build both images, with the
+/// control plane's own platform first (it keeps the unsuffixed tag).
+#[tokio::test]
+async fn test_mixed_fleet_requires_a_build_per_architecture() {
+    let mut arm = make_node(1, "worker-arm", "active", 5);
+    arm.architecture = Some("linux/arm64".to_string());
+    let mut amd = make_node(2, "worker-amd", "active", 5);
+    amd.architecture = Some("linux/amd64".to_string());
+
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(vec![vec![arm, amd]])
+        .into_connection();
+
+    let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+        .with_local_platform("linux/amd64");
+
+    let platforms = scheduler
+        .required_build_platforms(None, None)
+        .await
+        .unwrap();
+    assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
 }

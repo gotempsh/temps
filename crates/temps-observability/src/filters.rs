@@ -150,7 +150,7 @@ mod tests {
     }
     fn req_at(t: &str, id: i64) -> ObservabilityEvent {
         ObservabilityEvent::Request(RequestRow {
-            id,
+            id: format!("req-{id}"),
             ts: ts(t),
             deployment_id: None,
             environment_id: None,

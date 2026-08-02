@@ -45,6 +45,15 @@ pub struct AgentState {
     /// per-peer routes inside each new container's netns. Empty until
     /// the first successful network/peers poll.
     pub overlay_peers: crate::network_sync::SharedPeers,
+    /// Container platform of the Docker daemon this agent drives, in OCI form
+    /// (`linux/amd64`, `linux/arm64`), once discovered from `docker info`
+    /// (see [`crate::server::detect_agent_platform`]).
+    ///
+    /// Shared with the heartbeat loop, which keeps retrying discovery while it
+    /// is `None` — the daemon is often not up yet when the agent starts. The
+    /// health report exposes it so the control plane can resolve a node whose
+    /// stored architecture is still unknown before transferring an image.
+    pub platform: crate::server::SharedPlatform,
 }
 
 /// Response wrapper for consistent agent API responses.
@@ -76,6 +85,18 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
             error: Some(message),
         }),
     )
+}
+
+fn remove_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
+    match error {
+        temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
+        temps_deployer::DeployerError::DeploymentFailed(_)
+        | temps_deployer::DeployerError::ImageNotFound(_)
+        | temps_deployer::DeployerError::NetworkError(_)
+        | temps_deployer::DeployerError::ResourceAllocationFailed(_)
+        | temps_deployer::DeployerError::SecretMountFailed { .. }
+        | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[derive(OpenApi)]
@@ -309,6 +330,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container removed", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
         (status = 500, description = "Remove failed")
     ),
     security(("bearer_auth" = []))
@@ -328,13 +350,40 @@ pub async fn remove_container(
             AgentResponse::ok("removed".to_string()).into_response()
         }
         Err(e) => {
-            tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            let status = remove_error_status(&e);
+            if status == StatusCode::NOT_FOUND {
+                tracing::info!(container_id = %container_id, reason = %e, "Container already absent");
+            } else {
+                tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            }
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 format!("Remove failed for container {}: {}", container_id, e),
             )
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    #[test]
+    fn missing_container_maps_to_http_not_found_for_idempotent_remote_cleanup() {
+        let error = temps_deployer::DeployerError::ContainerNotFound(
+            "container no longer exists".to_string(),
+        );
+        assert_eq!(remove_error_status(&error), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn operational_remove_failure_maps_to_http_internal_server_error() {
+        let error = temps_deployer::DeployerError::NetworkError("dockerd unavailable".to_string());
+        assert_eq!(
+            remove_error_status(&error),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 
@@ -1109,5 +1158,8 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         disk_used_bytes: disk_used,
         disk_total_bytes: disk_total,
         running_containers,
+        // Empty means "not discovered yet" — the control plane treats a blank
+        // platform as unknown rather than as a claim about this node.
+        platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
     }
 }
