@@ -73,6 +73,22 @@ const MANUAL_SOURCE_TYPES: {
   },
 ]
 
+/**
+ * Splits a repository path into owner and name.
+ *
+ * Splitting on the LAST slash rather than requiring exactly two segments is
+ * what makes nested GitLab groups work: `gala-games/chain/platform/my-repo`
+ * is owner `gala-games/chain/platform`, name `my-repo`. That matches how the
+ * API stores it (repo_owner / repo_name) and how the provider lists it.
+ * Requiring exactly two segments rejected every repo in a subgroup, even
+ * though the backend supported them.
+ */
+function parseRepoPath(repo: string): { owner: string; name: string } | null {
+  const lastSlash = repo.lastIndexOf('/')
+  if (lastSlash <= 0 || lastSlash === repo.length - 1) return null
+  return { owner: repo.slice(0, lastSlash), name: repo.slice(lastSlash + 1) }
+}
+
 export async function create(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -149,14 +165,14 @@ export async function create(options: CreateOptions): Promise<void> {
       info(`Using git connection: ${connection.account_name}`)
     } else if (options.repo && skipPrompts) {
       // Auto-find the connection that has this repo
-      const parts = options.repo.split('/')
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        error('Repository must be in owner/name format (e.g., myorg/myrepo)')
+      const parsed = parseRepoPath(options.repo)
+      if (!parsed) {
+        error('Repository must be in owner/name format (e.g., myorg/myrepo or mygroup/subgroup/myrepo)')
         return
       }
       const connections = await fetchGitConnections()
       for (const conn of connections) {
-        const repo = await findRepositoryByName(conn.id, parts[0], parts[1])
+        const repo = await findRepositoryByName(conn.id, parsed.owner, parsed.name)
         if (repo) {
           connection = conn
           info(`Auto-selected git connection: ${conn.account_name}`)
@@ -178,13 +194,13 @@ export async function create(options: CreateOptions): Promise<void> {
     // Step 2: Select Repository
     let repository
     if (options.repo) {
-      // Parse owner/name format
-      const parts = options.repo.split('/')
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        error('Repository must be in owner/name format (e.g., myorg/myrepo)')
+      // Parse owner/name, tolerating nested groups (mygroup/subgroup/myrepo)
+      const parsed = parseRepoPath(options.repo)
+      if (!parsed) {
+        error('Repository must be in owner/name format (e.g., myorg/myrepo or mygroup/subgroup/myrepo)')
         return
       }
-      repository = await findRepositoryByName(connection.id, parts[0], parts[1])
+      repository = await findRepositoryByName(connection.id, parsed.owner, parsed.name)
       if (!repository) {
         error(`Repository "${options.repo}" not found in connection "${connection.account_name}".`)
         return
