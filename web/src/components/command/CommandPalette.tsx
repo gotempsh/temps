@@ -15,6 +15,7 @@ import {
   CommandSeparator,
 } from '@/components/ui/command'
 import { usePluginsContext } from '@/contexts/PluginsContext'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useFrecency } from '@/hooks/useFrecency'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { useQuery } from '@tanstack/react-query'
@@ -61,7 +62,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 
 interface NavigationItem {
   title: string
@@ -87,7 +88,14 @@ const mainNavItems: NavigationItem[] = [
     title: 'Sandboxes',
     url: '/sandboxes',
     icon: Box,
-    keywords: ['sandbox', 'sandboxes', 'workspace', 'shell', 'terminal', 'environment'],
+    keywords: [
+      'sandbox',
+      'sandboxes',
+      'workspace',
+      'shell',
+      'terminal',
+      'environment',
+    ],
   },
   {
     title: 'Create New Project',
@@ -105,7 +113,14 @@ const mainNavItems: NavigationItem[] = [
     title: 'Monitoring',
     url: '/monitoring',
     icon: Activity,
-    keywords: ['metrics', 'performance', 'analytics', 'stats', 'alerts', 'health'],
+    keywords: [
+      'metrics',
+      'performance',
+      'analytics',
+      'stats',
+      'alerts',
+      'health',
+    ],
   },
 ]
 
@@ -121,7 +136,14 @@ const settingsNavItems: NavigationItem[] = [
     title: 'Notification Providers',
     url: '/settings/notifications',
     icon: Bell,
-    keywords: ['alerts', 'notifications', 'providers', 'slack', 'email', 'webhook'],
+    keywords: [
+      'alerts',
+      'notifications',
+      'providers',
+      'slack',
+      'email',
+      'webhook',
+    ],
   },
   {
     title: 'Add Notification Provider',
@@ -162,12 +184,24 @@ const settingsNavItems: NavigationItem[] = [
     icon: Key,
     keywords: ['tokens', 'auth', 'authentication', 'api'],
   },
+  {
+    title: 'Create API Key',
+    url: '/settings/keys/new',
+    icon: Key,
+    keywords: ['new', 'create', 'add', 'token', 'api', 'key'],
+  },
   // Infrastructure
   {
     title: 'Domains',
     url: '/domains',
     icon: Globe,
     keywords: ['dns', 'urls', 'websites', 'custom domain'],
+  },
+  {
+    title: 'Provision Domain',
+    url: '/domains/add',
+    icon: Globe,
+    keywords: ['new', 'create', 'add', 'domain', 'dns', 'custom domain'],
   },
   {
     title: 'Databases',
@@ -185,31 +219,73 @@ const settingsNavItems: NavigationItem[] = [
     title: 'AI Gateway',
     url: '/ai-gateway',
     icon: Sparkles,
-    keywords: ['ai', 'llm', 'openai', 'anthropic', 'gateway', 'models', 'providers', 'chat', 'gpt', 'claude'],
+    keywords: [
+      'ai',
+      'llm',
+      'openai',
+      'anthropic',
+      'gateway',
+      'models',
+      'providers',
+      'chat',
+      'gpt',
+      'claude',
+    ],
   },
   {
     title: 'AI Workflows',
     url: '/agent-sandbox',
     icon: Bot,
-    keywords: ['ai', 'workflows', 'agents', 'sandbox', 'automation', 'autopilot'],
+    keywords: [
+      'ai',
+      'workflows',
+      'agents',
+      'sandbox',
+      'automation',
+      'autopilot',
+    ],
   },
   {
     title: 'Skills',
     url: '/skills',
     icon: Wand2,
-    keywords: ['skills', 'ai', 'agents', 'claude', 'instructions', 'prompts', 'global'],
+    keywords: [
+      'skills',
+      'ai',
+      'agents',
+      'claude',
+      'instructions',
+      'prompts',
+      'global',
+    ],
   },
   {
     title: 'MCP Servers',
     url: '/mcp-servers',
     icon: Server,
-    keywords: ['mcp', 'model', 'context', 'protocol', 'tools', 'servers', 'agents', 'claude', 'global'],
+    keywords: [
+      'mcp',
+      'model',
+      'context',
+      'protocol',
+      'tools',
+      'servers',
+      'agents',
+      'claude',
+      'global',
+    ],
   },
   {
     title: 'Git Providers',
     url: '/git-providers',
     icon: GitBranch,
     keywords: ['github', 'gitlab', 'version control', 'repositories'],
+  },
+  {
+    title: 'Add Git Provider',
+    url: '/git-providers/add',
+    icon: GitBranch,
+    keywords: ['new', 'create', 'add', 'connect', 'github', 'gitlab', 'bitbucket', 'gitea'],
   },
   {
     title: 'DNS Providers',
@@ -299,7 +375,15 @@ const settingsNavItems: NavigationItem[] = [
     title: 'Metrics Monitoring',
     url: '/settings/metrics-monitoring',
     icon: BarChart3,
-    keywords: ['metrics', 'monitoring', 'thresholds', 'alerts', 'cpu', 'memory', 'resources'],
+    keywords: [
+      'metrics',
+      'monitoring',
+      'thresholds',
+      'alerts',
+      'cpu',
+      'memory',
+      'resources',
+    ],
   },
 ]
 
@@ -440,13 +524,28 @@ const projectNavItems: NavigationItem[] = [
     title: 'Traces',
     url: 'traces',
     icon: Workflow,
-    keywords: ['traces', 'opentelemetry', 'otel', 'spans', 'tracing', 'distributed'],
+    keywords: [
+      'traces',
+      'opentelemetry',
+      'otel',
+      'spans',
+      'tracing',
+      'distributed',
+    ],
   },
   {
     title: 'AI Crawlers',
     url: 'ai-crawlers',
     icon: Bot,
-    keywords: ['ai', 'crawlers', 'bots', 'gptbot', 'googlebot', 'scrapers', 'observe'],
+    keywords: [
+      'ai',
+      'crawlers',
+      'bots',
+      'gptbot',
+      'googlebot',
+      'scrapers',
+      'observe',
+    ],
   },
   {
     title: 'Project Settings',
@@ -512,19 +611,42 @@ const projectNavItems: NavigationItem[] = [
     title: 'Project MCP Servers',
     url: 'settings/mcp-servers',
     icon: Server,
-    keywords: ['mcp', 'model', 'context', 'protocol', 'tools', 'servers', 'project'],
+    keywords: [
+      'mcp',
+      'model',
+      'context',
+      'protocol',
+      'tools',
+      'servers',
+      'project',
+    ],
   },
   {
     title: 'Metrics',
     url: 'metrics',
     icon: BarChart3,
-    keywords: ['metrics', 'opentelemetry', 'otel', 'cpu', 'memory', 'resources', 'observe'],
+    keywords: [
+      'metrics',
+      'opentelemetry',
+      'otel',
+      'cpu',
+      'memory',
+      'resources',
+      'observe',
+    ],
   },
   {
     title: 'Observe',
     url: 'observe',
     icon: Activity,
-    keywords: ['observe', 'events', 'opentelemetry', 'otel', 'timeline', 'all events'],
+    keywords: [
+      'observe',
+      'events',
+      'opentelemetry',
+      'otel',
+      'timeline',
+      'all events',
+    ],
   },
   {
     title: 'Services',
@@ -548,7 +670,18 @@ const projectNavItems: NavigationItem[] = [
     title: 'AI Traces',
     url: 'ai-gateway',
     icon: Bot,
-    keywords: ['ai', 'traces', 'observability', 'llm', 'openai', 'anthropic', 'models', 'gateway', 'otel', 'gen_ai'],
+    keywords: [
+      'ai',
+      'traces',
+      'observability',
+      'llm',
+      'openai',
+      'anthropic',
+      'models',
+      'gateway',
+      'otel',
+      'gen_ai',
+    ],
   },
   {
     title: 'Agents',
@@ -693,12 +826,16 @@ export function CommandPalette() {
     [projectNavEntries]
   )
 
+  const canViewAuditLogs = useCanViewAuditLogs()
+
   // Create Fuse instances for fuzzy search
   const navFuse = useMemo(() => {
     const allNavItems = [
       ...mainNavItems.map((item) => ({ ...item, category: 'Navigation' })),
       ...settingsNavItems.map((item) => ({ ...item, category: 'Settings' })),
-      ...observeNavItems.map((item) => ({ ...item, category: 'Observe' })),
+      ...observeNavItems
+        .filter((item) => canViewAuditLogs || item.url !== '/audit-logs')
+        .map((item) => ({ ...item, category: 'Observe' })),
       ...accountNavItems.map((item) => ({ ...item, category: 'Account' })),
       ...pluginNavItems.map((item) => ({ ...item, category: 'Plugins' })),
     ]
@@ -728,7 +865,13 @@ export function CommandPalette() {
       shouldSort: true,
       minMatchCharLength: 1,
     })
-  }, [currentProjectSlug, currentProject, pluginNavItems, projectPluginNavItems])
+  }, [
+    currentProjectSlug,
+    currentProject,
+    pluginNavItems,
+    projectPluginNavItems,
+    canViewAuditLogs,
+  ])
 
   const projectsFuse = useMemo(() => {
     return new Fuse(projects, {
@@ -1012,7 +1155,11 @@ export function CommandPalette() {
       onOpenChange={setOpen}
       contentClassName="sm:max-w-2xl"
     >
-      <Command className="rounded-lg border shadow-md" loop shouldFilter={false}>
+      <Command
+        className="rounded-lg border shadow-md"
+        loop
+        shouldFilter={false}
+      >
         <CommandInput
           placeholder="Type a command or search..."
           value={search}

@@ -21,10 +21,16 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
+
+pub use platform::{
+    canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,
+    normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
+};
 
 #[derive(Error, Debug)]
 pub enum BuilderError {
@@ -146,6 +152,12 @@ pub struct DeployRequest {
     pub secrets: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
     pub network_name: Option<String>,
+    /// Additional Docker networks that this container must join before it
+    /// starts. Use this for host-local dependency networks, such as a
+    /// self-hosted database Compose network, where a successful deploy is not
+    /// useful unless service DNS is available at application boot.
+    #[serde(default)]
+    pub extra_networks: Vec<String>,
     pub resource_limits: ResourceLimits,
     pub restart_policy: RestartPolicy,
     #[schema(value_type = String)]
@@ -552,7 +564,37 @@ pub trait ImageBuilder: Send + Sync {
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
+    ///
+    /// May be a *fallback* — the architecture this binary was compiled for —
+    /// when the daemon's platform hasn't been discovered. Callers that must
+    /// not act on a guess should use [`Self::discovered_platform`] instead.
     fn get_native_platform(&self) -> String;
+
+    /// The platform this runtime **confirmed** with its Docker daemon, or
+    /// `None` when discovery hasn't succeeded.
+    ///
+    /// The distinction matters wherever a wrong answer is worse than no
+    /// answer: with a cross-architecture `DOCKER_HOST`, `get_native_platform`
+    /// reports this process's architecture until discovery lands, and treating
+    /// that as authoritative would pick the wrong image for the control plane.
+    ///
+    /// Defaults to `None` so an implementation that can't tell the difference
+    /// is treated as "unknown" rather than as a confirmation.
+    fn discovered_platform(&self) -> Option<String> {
+        None
+    }
+
+    /// Confirm the daemon's platform, querying it if that hasn't happened yet.
+    ///
+    /// [`Self::discovered_platform`] only reports what is already known, which
+    /// leaves callers on paths that never build — image uploads, external
+    /// images — permanently unable to tell a matching image from a mismatched
+    /// one. This lets them ask, at the cost of one `docker info`.
+    ///
+    /// Still `None` when the daemon can't be reached: unknown, never a guess.
+    async fn ensure_platform_discovered(&self) -> Option<String> {
+        self.discovered_platform()
+    }
 
     /// Validate that an image's architecture matches the target platform
     /// Returns Ok(()) if compatible, or Err(BuilderError::PlatformMismatch) if not
@@ -787,6 +829,7 @@ mod tests {
             secrets: HashMap::new(),
             port_mappings,
             network_name: Some("test-network".to_string()),
+            extra_networks: vec!["dependency-network".to_string()],
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path,
@@ -803,6 +846,7 @@ mod tests {
         assert_eq!(request.port_mappings[0].container_port, 3000);
         assert!(matches!(request.port_mappings[0].protocol, Protocol::Tcp));
         assert_eq!(request.network_name.as_ref().unwrap(), "test-network");
+        assert_eq!(request.extra_networks, vec!["dependency-network"]);
         assert_eq!(request.command.as_ref().unwrap().len(), 2);
         assert_eq!(request.command.as_ref().unwrap()[0], "node");
         assert_eq!(request.command.as_ref().unwrap()[1], "server.js");
@@ -1094,6 +1138,7 @@ CMD ["echo", "Hello from container"]
             secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
+            extra_networks: Vec::new(),
             resource_limits: ResourceLimits::default(),
             restart_policy: RestartPolicy::Always,
             log_path: temp_dir.path().join("deploy.log"),

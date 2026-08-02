@@ -21,7 +21,6 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
-use rand::Rng;
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
@@ -42,6 +41,9 @@ pub enum ConfigServiceError {
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    #[error("OS randomness failed while {operation}: {reason}")]
+    RandomnessFailed { operation: String, reason: String },
+
     #[error(
         "Failed to set TimescaleDB compression policy for {table} to {after_hours} hours: {source}"
     )]
@@ -61,6 +63,22 @@ pub enum ConfigServiceError {
         #[source]
         source: sea_orm::DbErr,
     },
+}
+
+fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
+    fill_random_bytes_with(&mut rand::rngs::SysRng, operation, bytes)
+}
+
+fn fill_random_bytes_with<R: rand::TryCryptoRng>(
+    rng: &mut R,
+    operation: &str,
+    bytes: &mut [u8],
+) -> Result<(), ConfigServiceError> {
+    rng.try_fill_bytes(bytes)
+        .map_err(|error| ConfigServiceError::RandomnessFailed {
+            operation: operation.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -248,6 +266,12 @@ pub struct ServerConfig {
     pub clickhouse_database: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
+
+    // Required Docker networks that every deployed app container should join
+    // before start, in addition to Temps' primary app network. This is useful
+    // for self-hosted installs where apps depend on services exposed by a
+    // sibling Docker Compose network.
+    pub docker_extra_networks: Vec<String>,
 }
 
 impl ServerConfig {
@@ -275,7 +299,7 @@ impl ServerConfig {
         let auth_secret = if auth_secret_path.exists() {
             fs::read_to_string(&auth_secret_path)?.trim().to_string()
         } else {
-            let secret = Self::generate_auth_secret();
+            let secret = Self::generate_auth_secret()?;
             fs::write(&auth_secret_path, &secret)?;
             Self::restrict_file_permissions(&auth_secret_path);
             secret
@@ -286,7 +310,7 @@ impl ServerConfig {
         let encryption_key = if encryption_key_path.exists() {
             fs::read_to_string(&encryption_key_path)?.trim().to_string()
         } else {
-            let key = Self::generate_encryption_key();
+            let key = Self::generate_encryption_key()?;
             fs::write(&encryption_key_path, &key)?;
             Self::restrict_file_permissions(&encryption_key_path);
             key
@@ -398,6 +422,8 @@ impl ServerConfig {
             clickhouse_password: std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
                 .ok()
                 .filter(|s| !s.is_empty()),
+
+            docker_extra_networks: parse_csv_env("TEMPS_DOCKER_EXTRA_NETWORKS"),
         })
     }
 
@@ -412,17 +438,17 @@ impl ServerConfig {
     }
 
     /// Generate a 32-byte auth secret (64 hex characters)
-    fn generate_auth_secret() -> String {
+    fn generate_auth_secret() -> Result<String, ConfigServiceError> {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill(&mut bytes);
-        hex::encode(bytes)
+        fill_secure_random_bytes("generating the server auth secret", &mut bytes)?;
+        Ok(hex::encode(bytes))
     }
 
     /// Generate a 32-byte encryption key (64 hex characters)
-    fn generate_encryption_key() -> String {
+    fn generate_encryption_key() -> Result<String, ConfigServiceError> {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill(&mut bytes);
-        hex::encode(bytes)
+        fill_secure_random_bytes("generating the server encryption key", &mut bytes)?;
+        Ok(hex::encode(bytes))
     }
 
     /// Set file permissions to owner-only (0o600) for sensitive files.
@@ -474,6 +500,20 @@ impl ServerConfig {
     pub fn get_postgres_max_lifetime_secs(&self) -> u64 {
         self.postgres_max_lifetime_secs.unwrap_or(1800)
     }
+}
+
+fn parse_csv_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // Default domain for local development (resolves to 127.0.0.1)
@@ -720,7 +760,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         } else {
             // Generate new key using OS CSPRNG
             let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill(&mut bytes);
+            fill_secure_random_bytes("creating the persisted encryption key", &mut bytes)?;
             let key = hex::encode(bytes);
 
             // Ensure data directory exists
@@ -752,7 +792,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         } else {
             // Generate new secret using OS CSPRNG (32 bytes as 64 hex characters)
             let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill(&mut bytes);
+            fill_secure_random_bytes("creating the persisted auth secret", &mut bytes)?;
             let secret = hex::encode(bytes);
 
             // Ensure data directory exists
@@ -1301,6 +1341,43 @@ mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    struct FailingCryptoRng;
+
+    impl rand::TryRng for FailingCryptoRng {
+        type Error = std::io::Error;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("config entropy unavailable"))
+        }
+    }
+
+    impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[test]
+    fn randomness_failure_preserves_config_operation_context() {
+        let error = fill_random_bytes_with(
+            &mut FailingCryptoRng,
+            "testing config entropy",
+            &mut [0u8; 32],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::RandomnessFailed { operation, reason }
+                if operation == "testing config entropy"
+                    && reason.contains("config entropy unavailable")
+        ));
+    }
 
     fn test_config() -> Arc<ServerConfig> {
         Arc::new(

@@ -318,7 +318,7 @@ describe('buildSummary', () => {
 
   test('adds manual actions for data services', () => {
     const summary = buildSummary(
-      'coolify',
+      'vercel',
       {
         envVars: [],
         services: [

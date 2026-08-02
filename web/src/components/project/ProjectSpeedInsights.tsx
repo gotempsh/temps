@@ -56,7 +56,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
 

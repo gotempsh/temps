@@ -84,6 +84,9 @@ pub enum AgentError {
     #[error("MCP definition '{slug}' not found in project {project_id}")]
     McpDefinitionNotFound { project_id: i32, slug: String },
 
+    #[error("MCP config field '{field}' was not found for server '{slug}'")]
+    McpConfigFieldNotFound { slug: String, field: String },
+
     #[error("A skill with slug '{slug}' already exists{}", scope_label(*project_id))]
     SkillDefinitionAlreadyExists {
         project_id: Option<i32>,

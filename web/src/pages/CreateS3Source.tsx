@@ -16,7 +16,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation } from '@tanstack/react-query'
 import { ArrowLeft, PlugZap, Plus, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 interface NewS3Source {

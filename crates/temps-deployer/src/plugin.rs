@@ -143,11 +143,13 @@ impl TempsPlugin for DeployerPlugin {
             };
 
             // Create DockerRuntime service
+            let server_config = config_service.get_server_config();
             let mut docker_runtime = DockerRuntime::new(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
-            );
+            )
+            .with_extra_networks(server_config.docker_extra_networks.clone());
             if let Some(limits) = build_limits {
                 let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
                     Some(crate::docker::BuildResourceLimits {
@@ -166,6 +168,26 @@ impl TempsPlugin for DeployerPlugin {
                     limits.cpu_limit_cores,
                     limits.memory_limit_mb
                 );
+            }
+
+            // Learn the daemon's architecture once, up front: every later
+            // `get_native_platform()` call is synchronous (the `ImageBuilder`
+            // trait requires it) and would otherwise answer with the binary's
+            // architecture, which is wrong whenever `DOCKER_HOST` points at a
+            // daemon on another machine. The scheduler and the pre-transfer
+            // platform check both depend on this value being the daemon's.
+            match docker_runtime.refresh_daemon_platform().await {
+                Some(platform) => tracing::info!(
+                    platform = %platform,
+                    "Control-plane container platform detected"
+                ),
+                // Not fatal, and deliberately not cached as the binary's
+                // architecture: each build retries the lookup, so a daemon
+                // that comes up late is picked up without a restart.
+                None => tracing::warn!(
+                    fallback = %crate::platform::native_platform(),
+                    "Could not detect the control-plane container platform;                      using this binary's architecture until the daemon answers"
+                ),
             }
 
             // ADR-024: optionally start the control-plane DNS resolver so
@@ -237,7 +259,6 @@ impl TempsPlugin for DeployerPlugin {
             context.register_service(image_builder);
 
             // Create and register StaticDeployer
-            let config_service = context.require_service::<temps_config::ConfigService>();
             let static_files_dir = config_service.get_server_config().data_dir.join("static");
             let filesystem_static_deployer =
                 Arc::new(FilesystemStaticDeployer::new(static_files_dir));

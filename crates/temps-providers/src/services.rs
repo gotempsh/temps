@@ -1,4 +1,5 @@
 use crate::externalsvc::{
+    legacy_managed_instance_names, managed_instance_name,
     mariadb::{MariaDbService, MariaDbSizeProfile},
     mongodb::MongodbService,
     postgres::PostgresService,
@@ -115,6 +116,12 @@ pub enum ExternalServiceError {
 
     #[error("Environment variable '{var_name}' not found for service {service_id}")]
     EnvironmentVariableNotFound { service_id: i32, var_name: String },
+
+    #[error("Parameter '{param_name}' not found for service {service_id}")]
+    ParameterNotFound { service_id: i32, param_name: String },
+
+    #[error("Parameter '{param_name}' for service {service_id} is not sensitive")]
+    ParameterNotSensitive { service_id: i32, param_name: String },
 
     #[error("Access denied for encrypted variable '{var_name}' in service {service_id}")]
     EncryptedVariableAccessDenied { service_id: i32, var_name: String },
@@ -233,6 +240,7 @@ pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
     pub parameter_schema: Option<serde_json::Value>,
     pub current_parameters: Option<HashMap<String, serde_json::Value>>,
+    pub sensitive_parameters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -852,14 +860,17 @@ impl ExternalServiceManager {
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
-            // Temps KV uses Redis backend - create a RedisService with "kv-" prefix
+            // Temps KV uses Redis backend. The instance name must come from
+            // `managed_instance_name` so this agrees with the kv plugin —
+            // see the module docs on `externalsvc::naming` and issue #495.
             ServiceType::Kv => Box::new(RedisService::new(
-                format!("kv-{}", name),
+                managed_instance_name(&name, service_type),
                 self.docker.clone(),
             )),
-            // Temps Blob uses RustfsService (high-performance S3-compatible storage)
+            // Temps Blob uses RustfsService (high-performance S3-compatible
+            // storage). Same naming contract as `Kv` above.
             ServiceType::Blob => Box::new(RustfsService::new(
-                format!("blob-{}", name),
+                managed_instance_name(&name, service_type),
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
@@ -1596,6 +1607,41 @@ impl ExternalServiceManager {
             })
     }
 
+    /// Force-recreate a service's container so a CMD-baked config change
+    /// (currently: `shared_preload_libraries`) takes effect immediately,
+    /// rather than waiting for the next unrelated restart to happen to also
+    /// pick it up via drift-reconciliation.
+    ///
+    /// Unlike `store_and_apply_ingest_key`, this doesn't persist anything new
+    /// into the service's config — the desired state is already derivable
+    /// from the container's own image — it just drives the engine's
+    /// `force_recreate` (see `ExternalService::force_recreate`) with a
+    /// properly hydrated config so the recreate step has what it needs.
+    pub async fn force_recreate_service_container(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let config = self.get_service_config(service_id).await?;
+        let instance = self.create_service_instance_for_parameter_value(
+            service.name.clone(),
+            service_type,
+            &config.parameters,
+        )?;
+        instance
+            .force_recreate(config)
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to recreate container: {}", e),
+            })
+    }
+
     pub async fn list_services(&self) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
         let services = external_services::Entity::find()
             .order_by_desc(external_services::Column::CreatedAt)
@@ -1653,11 +1699,46 @@ impl ExternalServiceManager {
             service_type,
             &parameters,
         )?;
+        let parameter_schema = service_instance.get_parameter_schema();
+        let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameter_schema: service_instance.get_parameter_schema(),
+            parameter_schema,
             current_parameters: Some(parameters),
+            sensitive_parameters,
+        })
+    }
+
+    /// Decrypt a single sensitive service parameter for an explicit reveal request.
+    ///
+    /// Normal detail responses are always masked. Keeping plaintext access in this
+    /// narrowly-scoped service method makes it possible for the HTTP layer to apply
+    /// authorization and write an audit event for every reveal.
+    pub async fn get_sensitive_parameter_value(
+        &self,
+        service_id: i32,
+        param_name: &str,
+    ) -> Result<String, ExternalServiceError> {
+        if !Self::is_sensitive_parameter(param_name) {
+            return Err(ExternalServiceError::ParameterNotSensitive {
+                service_id,
+                param_name: param_name.to_string(),
+            });
+        }
+
+        let parameters = self.get_service_parameters(service_id).await?;
+        let value =
+            parameters
+                .get(param_name)
+                .ok_or_else(|| ExternalServiceError::ParameterNotFound {
+                    service_id,
+                    param_name: param_name.to_string(),
+                })?;
+
+        Ok(match value {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
         })
     }
 
@@ -1794,6 +1875,13 @@ impl ExternalServiceManager {
 
         // Prepare update parameters (merge docker_image if provided)
         let mut update_params = request.parameters.clone();
+        // Detail responses use "***" for sensitive parameters. Treat that
+        // sentinel as "leave unchanged" so opening and saving an edit form
+        // cannot replace a real credential with the mask.
+        update_params.retain(|name, value| {
+            !(Self::is_sensitive_parameter(name)
+                && value.as_str().is_some_and(|value| value == "***"))
+        });
         if let Some(docker_image) = &request.docker_image {
             info!(
                 "Updating service {} with new Docker image: {}",
@@ -2092,6 +2180,40 @@ impl ExternalServiceManager {
                         reason: e.to_string(),
                     }
                 })?;
+            }
+        }
+
+        // Sweep containers stranded by the pre-#495 naming split.
+        //
+        // Installs that enabled Blob before the fix have a second container
+        // under the old prefixed name (`rustfs-blob-temps-blob`). It has no
+        // `external_services` row of its own, and the row that could still
+        // reach it is the one the transaction above just deleted — so this is
+        // the last moment anything can find it. Local containers only: the
+        // blob and kv plugins run on the control plane, never on a worker.
+        //
+        // Best-effort. A missing legacy container is the normal case on any
+        // install created after the fix, and a Docker hiccup here must not
+        // turn an otherwise successful delete into a 500.
+        if service.node_id.is_none() {
+            for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
+                match self
+                    .create_service_instance(legacy_name.clone(), service_type_enum)
+                    .remove()
+                    .await
+                {
+                    Ok(()) => info!(
+                        service_id,
+                        legacy_name,
+                        "Removed duplicate container left behind by the earlier managed-service naming split"
+                    ),
+                    Err(e) => debug!(
+                        service_id,
+                        legacy_name,
+                        error = %e,
+                        "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                    ),
+                }
             }
         }
 
@@ -8142,7 +8264,7 @@ echo "[restore] Pre-seed complete"
     ) -> Result<ExternalServiceDetails, ExternalServiceError> {
         // Get service info
         let service_info = self.get_service_info(service.id).await?;
-        let parameters = self.get_service_parameters(service.id).await?;
+        let mut parameters = self.get_service_parameters(service.id).await?;
         let service_type = ServiceType::from_str(&service_info.service_type.to_string())?;
 
         let service_instance = self.create_service_instance_for_parameters(
@@ -8150,11 +8272,14 @@ echo "[restore] Pre-seed complete"
             service_type,
             &parameters,
         )?;
+        let parameter_schema = service_instance.get_parameter_schema();
+        let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameter_schema: service_instance.get_parameter_schema(),
+            parameter_schema,
             current_parameters: Some(parameters),
+            sensitive_parameters,
         })
     }
 
@@ -8317,17 +8442,9 @@ echo "[restore] Pre-seed complete"
 
         // Handle mask_sensitive option
         let variables = if options.mask_sensitive {
-            all_vars
-                .into_iter()
-                .map(|(key, value)| {
-                    let masked_value = if Self::is_sensitive_variable(&key) {
-                        "***".to_string()
-                    } else {
-                        value
-                    };
-                    (key, masked_value)
-                })
-                .collect()
+            let mut masked = all_vars;
+            Self::mask_environment_variable_values(&mut masked);
+            masked
         } else {
             all_vars
         };
@@ -8407,43 +8524,69 @@ echo "[restore] Pre-seed complete"
                     })?
             };
 
-        // Mask sensitive values based on variable names
-        let masked_vars = env_vars
-            .into_iter()
-            .map(|(key, value)| {
-                let masked_value = if Self::is_sensitive_variable(&key) {
-                    "***".to_string()
-                } else {
-                    value
-                };
-                (key, masked_value)
-            })
-            .collect();
+        // Bulk previews never return plaintext. A value can contain embedded
+        // credentials even when its variable name looks operational.
+        let mut masked_vars = env_vars;
+        Self::mask_environment_variable_values(&mut masked_vars);
 
         Ok(masked_vars)
     }
 
-    /// Determine if a variable name indicates sensitive data
-    fn is_sensitive_variable(var_name: &str) -> bool {
-        let sensitive_patterns = [
+    pub(crate) fn mask_environment_variable_values(variables: &mut HashMap<String, String>) {
+        for value in variables.values_mut() {
+            *value = "***".to_string();
+        }
+    }
+
+    fn is_sensitive_parameter(param_name: &str) -> bool {
+        let normalized = param_name.to_ascii_lowercase().replace('-', "_");
+        let is_key = (normalized == "key" || normalized.ends_with("_key"))
+            && !normalized.starts_with("public_");
+        let is_url = normalized == "url"
+            || normalized.ends_with("_url")
+            || normalized == "uri"
+            || normalized.ends_with("_uri");
+        let is_connection_secret = normalized == "dsn"
+            || normalized.ends_with("_dsn")
+            || normalized == "connection_string"
+            || normalized.ends_with("_connection_string");
+        let has_secret_marker = [
             "password",
-            "pass",
+            "passwd",
+            "passphrase",
             "secret",
-            "key",
             "token",
             "credential",
-            "auth",
-            "api_key",
-            "private",
-            "cert",
-            "ssl",
-            "tls",
-        ];
+        ]
+        .iter()
+        .any(|marker| {
+            normalized == *marker
+                || normalized.starts_with(&format!("{marker}_"))
+                || normalized.ends_with(&format!("_{marker}"))
+        });
 
-        let var_lower = var_name.to_lowercase();
-        sensitive_patterns
-            .iter()
-            .any(|pattern| var_lower.contains(pattern))
+        is_key
+            || is_url
+            || is_connection_secret
+            || has_secret_marker
+            || normalized == "keyfile_content"
+            || normalized.starts_with("private_")
+    }
+
+    fn mask_sensitive_parameter_values(
+        parameters: &mut HashMap<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut sensitive_parameters = Vec::new();
+        for (name, value) in parameters {
+            if Self::is_sensitive_parameter(name) {
+                sensitive_parameters.push(name.clone());
+                if !value.is_null() {
+                    *value = serde_json::Value::String("***".to_string());
+                }
+            }
+        }
+        sensitive_parameters.sort();
+        sensitive_parameters
     }
 
     /// List available Docker containers that can be imported as services
@@ -8673,8 +8816,10 @@ echo "[restore] Pre-seed complete"
             }
             // Temps KV uses Redis backend
             ServiceType::Kv => {
-                let redis =
-                    RedisService::new(format!("kv-{}", request.name), Arc::clone(&self.docker));
+                let redis = RedisService::new(
+                    managed_instance_name(&request.name, request.service_type),
+                    Arc::clone(&self.docker),
+                );
                 redis
                     .import_from_container(
                         request.container_id.clone(),
@@ -8687,7 +8832,7 @@ echo "[restore] Pre-seed complete"
             // Temps Blob uses RustfsService (high-performance S3-compatible storage)
             ServiceType::Blob => {
                 let rustfs = RustfsService::new(
-                    format!("blob-{}", request.name),
+                    managed_instance_name(&request.name, request.service_type),
                     Arc::clone(&self.docker),
                     Arc::clone(&self.encryption_service),
                 );
@@ -9529,13 +9674,6 @@ async fn sample_container_stats_once(
     stream.next().await?.ok()
 }
 
-/// Compute the docker-CLI-equivalent CPU percent from two consecutive
-/// stats samples. Returns `None` when either sample is missing the
-/// counters we need, the deltas are zero/negative (container just
-/// started / stopped), or the result isn't finite.
-///
-/// Formula (matches `docker stats`):
-/// ```
 /// Remove a single key from an `external_services.health_metadata` JSONB
 /// blob. Returns `None` when the result would be an empty object (so the
 /// column goes back to NULL instead of `{}`).
@@ -9572,6 +9710,13 @@ fn merge_health_metadata_key<T: serde::Serialize>(
     serde_json::Value::Object(map)
 }
 
+/// Compute the docker-CLI-equivalent CPU percent from two consecutive
+/// stats samples. Returns `None` when either sample is missing the
+/// counters we need, the deltas are zero/negative (container just
+/// started / stopped), or the result isn't finite.
+///
+/// Formula (matches `docker stats`):
+/// ```text
 /// cpu_delta    = current.total_usage     - previous.total_usage
 /// system_delta = current.system_cpu_usage - previous.system_cpu_usage
 /// percent      = (cpu_delta / system_delta) * online_cpus * 100
@@ -10013,13 +10158,25 @@ mod tests {
             .port()
     }
     #[cfg(feature = "docker-tests")]
-    async fn setup_test_manager() -> (Arc<ExternalServiceManager>, TestDatabase) {
-        let test_db = TestDatabase::with_migrations().await.unwrap();
+    async fn setup_test_manager() -> Result<(Arc<ExternalServiceManager>, TestDatabase), String> {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|error| format!("Docker client is unavailable: {error}"))?;
+        docker
+            .ping()
+            .await
+            .map_err(|error| format!("Docker daemon is unavailable: {error}"))?;
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .map_err(|error| format!("test database is unavailable: {error}"))?;
         let db = test_db.db.clone();
 
         let encryption_key = "test_encryption_key_1234567890ab";
-        let encryption_service = Arc::new(EncryptionService::new(encryption_key).unwrap());
-        let docker = Arc::new(Docker::connect_with_local_defaults().ok().unwrap());
+        let encryption_service = Arc::new(
+            EncryptionService::new(encryption_key)
+                .map_err(|error| format!("test encryption setup failed: {error}"))?,
+        );
+        let docker = Arc::new(docker);
 
         let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
         let manager = Arc::new(ExternalServiceManager::new(
@@ -10028,7 +10185,23 @@ mod tests {
             docker.clone(),
             dns_registry,
         ));
-        (manager, test_db)
+        Ok((manager, test_db))
+    }
+
+    #[cfg(feature = "docker-tests")]
+    macro_rules! setup_test_manager_or_skip {
+        () => {
+            match setup_test_manager().await {
+                Ok(setup) => setup,
+                Err(error) => {
+                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                        eprintln!("Skipping Docker-dependent test: {error}");
+                        return;
+                    }
+                    panic!("Failed to set up provider Docker test: {error}");
+                }
+            }
+        };
     }
 
     /// The core safety guard: only PENDING/RUNNING/ROLLING_BACK upgrade rows
@@ -10043,7 +10216,7 @@ mod tests {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
         use temps_entities::{postgres_major_upgrades, users};
 
-        let (manager, test_db) = setup_test_manager().await;
+        let (manager, test_db) = setup_test_manager_or_skip!();
         let port = get_unused_port();
         let name = format!("guard-test-{}", chrono::Utc::now().timestamp_millis());
         let mut params = HashMap::new();
@@ -10173,7 +10346,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_postgres_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let service_name = format!("test-postgres-{}", chrono::Utc::now().timestamp_millis());
         let mut params = HashMap::new();
@@ -10233,7 +10406,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_redis_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         // Unique service name so the derived container name (redis-<name>) does
         // not collide with other tests' containers on the shared CI runner.
@@ -10267,7 +10440,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_s3_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
@@ -10302,7 +10475,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_stop_and_start_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         // Create a service first. Postgres requires database/username/password
         // at the parameter-validation layer (parameter_strategies), so they
@@ -10359,7 +10532,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_delete_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create a service first. Use an explicit unused port and a unique name
         // so the Redis container does not collide with the default port (6379)
@@ -10405,7 +10578,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_update_service_parameters() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create a service first. Use an explicit unused port and unique names
         // so the Postgres container (and its post-rename recreate) does not
@@ -10481,7 +10654,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_get_service_by_name() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create a service
         let mut params = HashMap::new();
@@ -10515,7 +10688,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_get_service_by_slug() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Use a name that slugifies to something different (uppercase + hyphens)
         // but still produces a Docker-compatible resource name. Whitespace in
@@ -10574,7 +10747,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_list_services() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create multiple services
         let mut services_created = vec![];
@@ -10622,7 +10795,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_service_environment_variables() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         // Create a postgres service
         let mut params = HashMap::new();
@@ -10683,7 +10856,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_service_parameter_encryption() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         // Create a service with sensitive parameters
         let mut params = HashMap::new();
@@ -10726,7 +10899,14 @@ mod tests {
         let service = manager.create_service(request).await.unwrap();
         let service_id = service.id;
 
-        // Get service details and verify parameters are properly handled
+        // The persisted config must remain encrypted at rest.
+        let stored_service = manager.get_service(service_id).await.unwrap();
+        let encrypted_config = stored_service
+            .config
+            .expect("service config should be stored");
+        assert!(!encrypted_config.contains("super_secret_password"));
+
+        // Normal service details must mask sensitive parameters.
         let details = manager.get_service_details(service_id).await;
         assert!(details.is_ok());
 
@@ -10734,11 +10914,22 @@ mod tests {
         assert!(service_details.current_parameters.is_some());
 
         let current_params = service_details.current_parameters.unwrap();
-        // Password should be decrypted for authorized access
         assert_eq!(
             current_params.get("password"),
-            Some(&JsonValue::String("super_secret_password".to_string()))
+            Some(&JsonValue::String("***".to_string()))
         );
+        assert_eq!(
+            current_params.get("max_connections"),
+            Some(&JsonValue::Number(100.into()))
+        );
+        assert_eq!(service_details.sensitive_parameters, vec!["password"]);
+
+        // Plaintext is available only through the explicit reveal path.
+        let revealed_password = manager
+            .get_sensitive_parameter_value(service_id, "password")
+            .await
+            .expect("explicit reveal should decrypt the password");
+        assert_eq!(revealed_password, "super_secret_password");
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
@@ -10747,7 +10938,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_invalid_service_type() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Try to get a service with invalid ID
         let result = manager.get_service_details(99999).await;
@@ -10761,7 +10952,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_validate_parameters_fails_with_missing_required() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create a postgres service without required parameters
         let params = HashMap::new(); // Empty parameters
@@ -10801,22 +10992,271 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_is_sensitive_variable() {
-        assert!(ExternalServiceManager::is_sensitive_variable("password"));
-        assert!(ExternalServiceManager::is_sensitive_variable("SECRET_KEY"));
-        assert!(ExternalServiceManager::is_sensitive_variable("api_token"));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "PRIVATE_CERT"
+    #[test]
+    fn test_bulk_environment_variable_masking_is_content_agnostic() {
+        let mut variables = HashMap::from([
+            ("PORT".to_string(), "5432".to_string()),
+            (
+                "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS".to_string(),
+                "Authorization=Bearer%20ingest-secret".to_string(),
+            ),
+        ]);
+
+        ExternalServiceManager::mask_environment_variable_values(&mut variables);
+
+        assert_eq!(variables["PORT"], "***");
+        assert_eq!(variables["RUSTFS_OBS_ENDPOINT_METRICS_HEADERS"], "***");
+        assert!(!serde_json::to_string(&variables)
+            .expect("masked environment variables should serialize")
+            .contains("ingest-secret"));
+    }
+
+    #[test]
+    fn test_service_parameter_policy_does_not_mask_operational_settings() {
+        assert!(ExternalServiceManager::is_sensitive_parameter("password"));
+        assert!(ExternalServiceManager::is_sensitive_parameter("api_token"));
+        assert!(ExternalServiceManager::is_sensitive_parameter(
+            "DATABASE_URL"
         ));
-        assert!(ExternalServiceManager::is_sensitive_variable(
-            "auth_credential"
+        assert!(ExternalServiceManager::is_sensitive_parameter(
+            "connection_string"
+        ));
+        assert!(ExternalServiceManager::is_sensitive_parameter(
+            "keyfile_content"
         ));
 
-        assert!(!ExternalServiceManager::is_sensitive_variable("database"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("username"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("port"));
-        assert!(!ExternalServiceManager::is_sensitive_variable("host"));
+        assert!(!ExternalServiceManager::is_sensitive_parameter(
+            "max_connections"
+        ));
+        assert!(!ExternalServiceManager::is_sensitive_parameter("ssl_mode"));
+        assert!(!ExternalServiceManager::is_sensitive_parameter("tls_mode"));
+        assert!(!ExternalServiceManager::is_sensitive_parameter(
+            "accept_invalid_certs"
+        ));
+    }
+
+    #[test]
+    fn test_mask_sensitive_parameter_values_returns_authoritative_names() {
+        let mut parameters = HashMap::from([
+            ("password".to_string(), serde_json::json!("database-secret")),
+            ("api_token".to_string(), serde_json::json!("token-secret")),
+            (
+                "keyfile_content".to_string(),
+                serde_json::json!("mongodb-replica-key"),
+            ),
+            ("username".to_string(), serde_json::json!("temps")),
+            ("port".to_string(), serde_json::json!(5432)),
+            ("max_connections".to_string(), serde_json::json!(100)),
+            ("ssl_mode".to_string(), serde_json::json!("prefer")),
+        ]);
+
+        let sensitive_parameters =
+            ExternalServiceManager::mask_sensitive_parameter_values(&mut parameters);
+
+        assert_eq!(
+            sensitive_parameters,
+            vec!["api_token", "keyfile_content", "password"]
+        );
+        assert_eq!(parameters["password"], serde_json::json!("***"));
+        assert_eq!(parameters["api_token"], serde_json::json!("***"));
+        assert_eq!(parameters["keyfile_content"], serde_json::json!("***"));
+        assert_eq!(parameters["username"], serde_json::json!("temps"));
+        assert_eq!(parameters["port"], serde_json::json!(5432));
+        assert_eq!(parameters["max_connections"], serde_json::json!(100));
+        assert_eq!(parameters["ssl_mode"], serde_json::json!("prefer"));
+    }
+
+    #[test]
+    fn test_masked_sensitive_updates_are_ignored() {
+        let mut parameters = HashMap::from([
+            ("password".to_string(), serde_json::json!("***")),
+            ("api_token".to_string(), serde_json::json!("replacement")),
+            ("username".to_string(), serde_json::json!("temps")),
+        ]);
+
+        parameters.retain(|name, value| {
+            !(ExternalServiceManager::is_sensitive_parameter(name)
+                && value.as_str().is_some_and(|value| value == "***"))
+        });
+
+        assert!(!parameters.contains_key("password"));
+        assert_eq!(parameters["api_token"], serde_json::json!("replacement"));
+        assert_eq!(parameters["username"], serde_json::json!("temps"));
+    }
+
+    /// Regression for #495.
+    ///
+    /// The blob plugin creates and serves `rustfs-temps-blob`. When
+    /// `create_service_instance` prefixed the name, the manager built
+    /// `rustfs-blob-temps-blob` instead — so enabling Blob and restarting left
+    /// two containers, and `delete_service` removed the empty one while the
+    /// container holding every uploaded blob stayed up with its
+    /// `external_services` row gone, unreachable from the platform.
+    #[test]
+    fn blob_service_instance_targets_the_container_the_plugin_created() {
+        let manager = mock_service_manager(vec![]);
+        let instance = manager.create_service_instance("temps-blob".to_string(), ServiceType::Blob);
+
+        assert_eq!(
+            instance.get_name(),
+            "temps-blob",
+            "delete_service targets container `rustfs-{}`, but the blob plugin created \
+             `rustfs-temps-blob`",
+            instance.get_name()
+        );
+    }
+
+    /// Guard rail, not a live bug: `temps-kv` persists `ServiceType::Redis`,
+    /// so the `Kv` branch is off the hot path today. Correcting that type is
+    /// the obvious cleanup, and before #495 was fixed it would have
+    /// reproduced the same orphan for KV.
+    #[test]
+    fn kv_service_instance_targets_the_container_the_plugin_created() {
+        let manager = mock_service_manager(vec![]);
+        let instance = manager.create_service_instance("temps-kv".to_string(), ServiceType::Kv);
+
+        assert_eq!(
+            instance.get_name(),
+            "temps-kv",
+            "delete_service targets container `redis-{}`, but the kv plugin created \
+             `redis-temps-kv`",
+            instance.get_name()
+        );
+    }
+
+    /// The sweep at the end of `delete_service` reaches pre-fix containers by
+    /// building an instance from each legacy name. That only works if the
+    /// instance comes out named exactly what the old code produced — if this
+    /// round-trip drifts, upgraded installs keep their orphan forever and the
+    /// delete still reports success.
+    #[test]
+    fn legacy_instance_names_round_trip_to_the_pre_fix_containers() {
+        let manager = mock_service_manager(vec![]);
+
+        for (service_name, service_type, expected) in [
+            ("temps-blob", ServiceType::Blob, "blob-temps-blob"),
+            ("temps-kv", ServiceType::Kv, "kv-temps-kv"),
+        ] {
+            let legacy = legacy_managed_instance_names(service_name, service_type);
+            assert_eq!(legacy, vec![expected.to_string()]);
+
+            let instance = manager.create_service_instance(legacy[0].clone(), service_type);
+            assert_eq!(
+                instance.get_name(),
+                expected,
+                "the sweep must address the old container, not re-derive the canonical one"
+            );
+            assert_ne!(
+                instance.get_name(),
+                manager
+                    .create_service_instance(service_name.to_string(), service_type)
+                    .get_name(),
+                "sweeping the canonical container would delete the live service's data"
+            );
+        }
+    }
+
+    fn mock_service_manager(
+        query_results: Vec<Vec<external_services::Model>>,
+    ) -> ExternalServiceManager {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(query_results)
+                .into_connection(),
+        );
+        ExternalServiceManager::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password(
+                "service-parameter-reveal-test",
+            )),
+            Arc::new(
+                Docker::connect_with_local_defaults()
+                    .expect("Docker client configuration should be available"),
+            ),
+            Arc::new(temps_dns::DnsRegistry::new(db)),
+        )
+    }
+
+    fn encrypted_service_model(id: i32, parameters: serde_json::Value) -> external_services::Model {
+        let encryption_service =
+            EncryptionService::new_from_password("service-parameter-reveal-test");
+        external_services::Model {
+            id,
+            name: "postgres-test".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("postgres-test".to_string()),
+            config: Some(
+                encryption_service
+                    .encrypt_string(&parameters.to_string())
+                    .unwrap(),
+            ),
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sensitive_parameter_reveal_returns_only_sensitive_values() {
+        let model = encrypted_service_model(
+            71,
+            serde_json::json!({
+                "password": "database-secret",
+                "max_connections": 100,
+                "ssl_mode": "prefer"
+            }),
+        );
+        let manager = mock_service_manager(vec![vec![model]]);
+
+        let password = manager
+            .get_sensitive_parameter_value(71, "password")
+            .await
+            .unwrap();
+
+        assert_eq!(password, "database-secret");
+    }
+
+    #[tokio::test]
+    async fn test_sensitive_parameter_reveal_rejects_operational_settings() {
+        let manager = mock_service_manager(Vec::new());
+
+        for parameter in ["max_connections", "ssl_mode", "tls_mode"] {
+            let error = manager
+                .get_sensitive_parameter_value(71, parameter)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ExternalServiceError::ParameterNotSensitive { service_id: 71, .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sensitive_parameter_reveal_reports_missing_service() {
+        let manager = mock_service_manager(vec![Vec::<external_services::Model>::new()]);
+
+        let error = manager
+            .get_sensitive_parameter_value(404, "password")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::ServiceNotFound { id: 404 }
+        ));
     }
 
     #[cfg(feature = "docker-tests")]
@@ -10825,7 +11265,7 @@ mod tests {
         // This test verifies that the docker_image parameter can be updated.
         // Uses same-major-version update (18 -> 18-alpine) to avoid data format
         // incompatibility issues that occur with cross-major-version upgrades.
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
 
         // Step 1: Create a PostgreSQL service with postgres:18
@@ -10926,7 +11366,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_create_service_with_invalid_params_rolls_back() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // Create a Redis service with invalid port (email address)
         let mut params = HashMap::new();
@@ -11001,7 +11441,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_masked_environment_variables() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         // Find a random unused port on the system
 
         let random_unused_port = get_unused_port();
@@ -11046,11 +11486,11 @@ mod tests {
         assert!(masked_vars.is_ok());
         let vars = masked_vars.unwrap();
 
-        // Password should be masked
+        // Bulk responses mask every value; credential-bearing content can
+        // appear under otherwise operational-looking keys.
         assert_eq!(vars.get("POSTGRES_PASSWORD"), Some(&"***".to_string()));
-        // Non-sensitive values should not be masked
-        assert_eq!(vars.get("POSTGRES_DB"), Some(&"testdb".to_string()));
-        assert_eq!(vars.get("POSTGRES_USER"), Some(&"user".to_string()));
+        assert_eq!(vars.get("POSTGRES_DB"), Some(&"***".to_string()));
+        assert_eq!(vars.get("POSTGRES_USER"), Some(&"***".to_string()));
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
@@ -11059,7 +11499,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_cannot_update_postgres_username() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
         params.insert(
@@ -11137,7 +11577,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_cannot_update_postgres_password() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
         params.insert(
@@ -11199,7 +11639,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_cannot_update_postgres_database() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
         params.insert(
@@ -11261,7 +11701,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_can_update_postgres_docker_image() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
         params.insert(
@@ -11331,7 +11771,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_cannot_update_redis_password() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
         params.insert(
@@ -11388,7 +11828,7 @@ mod tests {
         use temps_entities::preset::Preset;
         use temps_entities::{external_services, project_services, projects};
 
-        let (_manager, test_db) = setup_test_manager().await;
+        let (_manager, test_db) = setup_test_manager_or_skip!();
 
         // Create a test project
         let project = projects::ActiveModel {
@@ -11509,7 +11949,7 @@ mod tests {
             }
         };
 
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // TODO: Implement proper Docker container creation and import test
         // This test requires fixing the Bollard API usage for container creation
@@ -11539,7 +11979,7 @@ mod tests {
             }
         };
 
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // List available containers
         let result = manager.list_available_containers().await;
@@ -11759,7 +12199,7 @@ mod tests {
         // 4. Verify the imported service still works with the new version
 
         // Setup
-        let (_manager, _test_db) = setup_test_manager().await;
+        let (_manager, _test_db) = setup_test_manager_or_skip!();
 
         // Verify Docker is available
         let _docker = match Docker::connect_with_local_defaults() {
@@ -11995,7 +12435,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_initialize_cluster_not_found() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let result = manager
             .initialize_cluster(
@@ -12017,7 +12457,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_initialize_cluster_unsupported_type() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         // S3 does not support cluster topology
         let service_id = insert_test_service(
@@ -12049,7 +12489,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_initialize_cluster_invalid_role() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12082,7 +12522,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_retry_cluster_not_found() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let result = manager.retry_cluster(99999, &[]).await;
 
@@ -12096,7 +12536,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_retry_cluster_standalone_rejected() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12121,7 +12561,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_retry_cluster_wrong_status() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12146,7 +12586,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_retry_cluster_no_members() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12174,7 +12614,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_add_cluster_member_not_found() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let result = manager.add_cluster_member(99999, "replica", None).await;
 
@@ -12188,7 +12628,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_add_cluster_member_rejects_standalone() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12212,7 +12652,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_add_cluster_member_rejects_non_running_status() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12236,7 +12676,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_add_cluster_member_rejects_monitor_role() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12262,7 +12702,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_add_cluster_member_rejects_primary_role() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12317,7 +12757,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_rejects_standalone() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12341,7 +12781,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_not_found() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12366,7 +12806,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_rejects_monitor() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12426,7 +12866,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_rejects_primary() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12485,7 +12925,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_rejects_quorum_drop() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12537,7 +12977,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_remove_cluster_member_rejects_wrong_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_a = insert_test_service(
             manager.db.as_ref(),
@@ -12585,7 +13025,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_standalone() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12609,7 +13049,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_non_postgres() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12633,7 +13073,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_not_found() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12657,7 +13097,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_monitor() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12692,7 +13132,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_already_primary() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),
@@ -12727,7 +13167,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_wrong_service() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_a = insert_test_service(
             manager.db.as_ref(),
@@ -12770,7 +13210,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_promote_cluster_member_rejects_not_running() {
-        let (manager, _test_db) = setup_test_manager().await;
+        let (manager, _test_db) = setup_test_manager_or_skip!();
 
         let service_id = insert_test_service(
             manager.db.as_ref(),

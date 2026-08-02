@@ -1,5 +1,5 @@
 import { ProjectResponse } from '@/api/client/types.gen'
-import { Routes, Route, useParams } from 'react-router-dom'
+import { Routes, Route, useParams } from 'react-router'
 import { VisitorsList } from './VisitorsList'
 import { VisitorDetail } from './VisitorDetail'
 import { SessionDetail } from './SessionDetail'

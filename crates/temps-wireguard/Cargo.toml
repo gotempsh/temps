@@ -13,10 +13,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rand = { workspace = true }
 base64 = { workspace = true }
 temps-core = { path = "../temps-core" }
 
 # Embedded WireGuard (no external wireguard-tools dependency)
-defguard_wireguard_rs = "0.9"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+defguard_wireguard_rs = "0.11"
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }

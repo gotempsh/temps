@@ -10,6 +10,7 @@ pub mod managed_s3;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
 pub mod mongodb;
+pub mod naming;
 pub mod port_util;
 pub mod postgres;
 pub mod postgres_cluster;
@@ -40,6 +41,7 @@ pub use cluster_role::{ClusterRole, PgAutoFailoverState};
 pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
 pub use mariadb::{BinlogManifest, MariaDbService};
 pub use mongodb::MongodbService;
+pub use naming::{legacy_managed_instance_names, managed_instance_name};
 pub use postgres::PostgresService;
 pub use postgres_cluster::PostgresClusterService;
 pub use redis::RedisService;
@@ -776,6 +778,24 @@ pub trait ExternalService: Send + Sync {
     /// The key is read from `service_config` — callers must persist it first.
     /// Default is a no-op; only OTLP-push engines (RustFS) override this.
     async fn apply_ingest_key(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
+    /// Force this service's container to be recreated so a CMD-level config
+    /// change (e.g. `shared_preload_libraries`) takes effect.
+    ///
+    /// Unlike a plain `start()` on a fresh, unhydrated instance, callers here
+    /// pass `service_config` explicitly so the engine can populate its
+    /// in-memory config before recreating — a freshly-constructed instance
+    /// (as returned by `ExternalServiceManager::create_service_instance_for_parameter_value`)
+    /// has no config until `init()`/this method hydrates it, and the normal
+    /// reconcile-on-start drift check needs that config to build the new
+    /// container once a recreate is warranted.
+    ///
+    /// Default is a no-op; only engines with CMD-baked config that can drift
+    /// post-creation (currently Postgres, for `shared_preload_libraries`)
+    /// override this.
+    async fn force_recreate(&self, _service_config: ServiceConfig) -> Result<()> {
         Ok(())
     }
 

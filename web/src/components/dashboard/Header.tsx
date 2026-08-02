@@ -4,21 +4,12 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
-import { ThemeToggle } from '@/components/theme/ThemeToggle'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useQuery } from '@tanstack/react-query'
-import {
-  Check,
-  ChevronsUpDown,
-  FolderPlus,
-  GitBranch,
-  Globe,
-  Key,
-  Plus,
-} from 'lucide-react'
+import { Check, ChevronsUpDown, Plus } from 'lucide-react'
 import React, { useMemo, useState } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router'
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -28,7 +19,6 @@ import {
   BreadcrumbSeparator,
 } from '../ui/breadcrumb'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
-import { Button } from '../ui/button'
 import {
   Command,
   CommandEmpty,
@@ -38,14 +28,6 @@ import {
   CommandList,
   CommandSeparator,
 } from '../ui/command'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '../ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import { Separator } from '../ui/separator'
 import { SidebarTrigger } from '../ui/sidebar'
@@ -177,7 +159,6 @@ function ProjectSwitcher({
 
 export function Header() {
   const { breadcrumbs } = useBreadcrumbs()
-  const navigate = useNavigate()
   const location = useLocation()
   // Extension-provided header actions (e.g. EE's SRE Copilot), rendered
   // leftmost in the top-right control cluster.
@@ -189,22 +170,6 @@ export function Header() {
     !['new', 'import-wizard', 'import'].includes(projectSlugMatch[1])
       ? projectSlugMatch[1]
       : null
-
-  const handleCreateProject = () => {
-    navigate('/projects/new')
-  }
-
-  const handleProvisionDomain = () => {
-    navigate('/domains/add')
-  }
-
-  const handleCreateApiKey = () => {
-    navigate('/settings/keys/new')
-  }
-
-  const handleAddGitProvider = () => {
-    navigate('/git-providers/add')
-  }
 
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
@@ -254,37 +219,12 @@ export function Header() {
           {headerActions?.map((action) => (
             <React.Fragment key={action.id}>{action.element}</React.Fragment>
           ))}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="icon">
-                <Plus className="h-4 w-4" />
-                <span className="sr-only">Create new</span>
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[200px]">
-              <DropdownMenuLabel>Quick Actions</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleCreateProject}>
-                <FolderPlus className="mr-2 h-4 w-4" />
-                Create Project
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleProvisionDomain}>
-                <Globe className="mr-2 h-4 w-4" />
-                Provision Domain
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleCreateApiKey}>
-                <Key className="mr-2 h-4 w-4" />
-                Create API Key
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleAddGitProvider}>
-                <GitBranch className="mr-2 h-4 w-4" />
-                Add Git Provider
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {/* The "+" quick-actions menu and the theme toggle used to live here.
+              Every entry it held is now in the command palette (⌘K), and
+              appearance moved into the account menu — so the header keeps only
+              what you reach for mid-task: the assistant and alerts. */}
           <AiAssistantButton />
           <BackupAlertsButton />
-          <ThemeToggle />
         </div>
       </div>
     </header>

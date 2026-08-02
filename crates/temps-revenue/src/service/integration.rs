@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
-use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder,
@@ -127,7 +126,7 @@ impl RevenueIntegrationService {
             });
         }
 
-        let token = generate_path_token();
+        let token = generate_path_token()?;
         let encrypted = self
             .encryption
             .encrypt_string(&input.signing_secret)
@@ -321,7 +320,7 @@ impl RevenueIntegrationService {
     ) -> Result<IntegrationModel, RevenueError> {
         let row = self.get(project_id, integration_id).await?;
         let mut active: IntegrationActiveModel = row.into();
-        active.webhook_path_token = Set(generate_path_token());
+        active.webhook_path_token = Set(generate_path_token()?);
         let updated = active.update(self.db.as_ref()).await?;
         Ok(updated)
     }
@@ -341,10 +340,26 @@ impl RevenueIntegrationService {
     }
 }
 
-fn generate_path_token() -> String {
+fn generate_path_token() -> Result<String, RevenueError> {
     let mut bytes = [0u8; PATH_TOKEN_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    fill_random_bytes_with(
+        &mut rand::rngs::SysRng,
+        "generating a revenue webhook path token",
+        &mut bytes,
+    )?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn fill_random_bytes_with<R: rand::TryCryptoRng>(
+    rng: &mut R,
+    operation: &str,
+    bytes: &mut [u8],
+) -> Result<(), RevenueError> {
+    rng.try_fill_bytes(bytes)
+        .map_err(|error| RevenueError::RandomnessFailed {
+            operation: operation.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -352,6 +367,43 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::revenue_integrations;
+
+    struct FailingCryptoRng;
+
+    impl rand::TryRng for FailingCryptoRng {
+        type Error = std::io::Error;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(std::io::Error::other("revenue entropy unavailable"))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(std::io::Error::other("revenue entropy unavailable"))
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("revenue entropy unavailable"))
+        }
+    }
+
+    impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[test]
+    fn randomness_failure_preserves_revenue_operation_context() {
+        let error = fill_random_bytes_with(
+            &mut FailingCryptoRng,
+            "testing revenue entropy",
+            &mut [0u8; PATH_TOKEN_BYTES],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RevenueError::RandomnessFailed { operation, reason }
+                if operation == "testing revenue entropy"
+                    && reason.contains("revenue entropy unavailable")
+        ));
+    }
 
     fn make_encryption() -> Arc<EncryptionService> {
         Arc::new(
@@ -379,8 +431,8 @@ mod tests {
 
     #[test]
     fn path_token_has_expected_entropy() {
-        let t1 = generate_path_token();
-        let t2 = generate_path_token();
+        let t1 = generate_path_token().unwrap();
+        let t2 = generate_path_token().unwrap();
         assert_ne!(t1, t2);
         // base64url of 32 bytes, no padding = 43 chars
         assert_eq!(t1.len(), 43);

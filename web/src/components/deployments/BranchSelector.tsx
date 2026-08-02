@@ -35,7 +35,7 @@ import {
 } from 'lucide-react'
 import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 /** Detect git provider from a git URL */
 function detectProviderFromUrl(gitUrl: string): 'github' | 'gitlab' | null {

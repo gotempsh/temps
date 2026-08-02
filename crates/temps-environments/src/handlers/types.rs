@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{AuditLogger, DeploymentCanceller, ProjectEnvVarsProvider};
+use temps_core::{
+    AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
+};
 use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
@@ -14,6 +16,7 @@ pub struct AppState {
     pub secret_service: Arc<SecretService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub deployment_service: Arc<dyn DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     /// Optional on-demand waker for starting/stopping containers during wake/sleep.
     /// Only available when the proxy's OnDemandManager is registered.
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -34,6 +37,7 @@ pub fn create_environment_app_state(
     secret_service: Arc<SecretService>,
     audit_service: Arc<dyn AuditLogger>,
     deployment_service: Arc<dyn DeploymentCanceller>,
+    deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -45,6 +49,7 @@ pub fn create_environment_app_state(
         secret_service,
         audit_service,
         deployment_service,
+        deployment_container_cleaner,
         on_demand_waker,
         integration_env_provider,
         telemetry,
@@ -119,6 +124,12 @@ pub struct EnvironmentInfo {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct GetEnvironmentVariablesQuery {
     pub environment_id: Option<i32>,
+    /// Exact manual env-var row to reveal. Required by the dashboard so
+    /// duplicate keys on disjoint environments cannot cross-reveal.
+    pub var_id: Option<i32>,
+    /// Required by integration-value reveals to bind the plaintext response to
+    /// the exact service displayed by the client.
+    pub service_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -253,6 +264,7 @@ pub struct EnvVarIntegrationInfo {
     pub service_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_slug: Option<String>,
+    pub service_updated_at: String,
 }
 
 /// One entry in the computed env-var view that merges manual and integration
@@ -384,6 +396,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// environment on the same node. Defaults to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anti_affinity: Option<bool>,
+    /// Build one image per architecture the eligible nodes run (overrides the
+    /// project-level setting). Off by default: cross-architecture builds are
+    /// emulated on the control plane and substantially slower, so they are
+    /// opted into per environment rather than triggered by cluster topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_architecture_builds: Option<bool>,
     /// When true, git pushes do NOT auto-deploy to this environment.
     /// Deployments must be promoted from another environment.
     #[serde(skip_serializing_if = "Option::is_none")]

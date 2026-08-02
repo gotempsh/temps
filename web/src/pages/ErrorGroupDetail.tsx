@@ -45,7 +45,7 @@ import {
   RotateCcw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 
 export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const { projectSlug, errorGroupId } = useParams<{
@@ -296,16 +296,23 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      {/* Autofix section */}
-      {project.git_provider_connection_id && (
-        <div className="mb-6">
-          <AutofixButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            errorGroupId={parseInt(errorGroupId!)}
-          />
-        </div>
-      )}
+      {/* Autofix section — always rendered. When the repo/provider/sandbox
+          aren't set up yet the card onboards the user instead of vanishing. */}
+      <div className="mb-6">
+        <AutofixButton
+          projectId={project.id}
+          projectSlug={project.slug}
+          errorGroupId={parseInt(errorGroupId!)}
+          git={{
+            connected: !!project.git_provider_connection_id,
+            hasRepo: !!project.repo_owner && !!project.repo_name,
+            label:
+              project.repo_owner && project.repo_name
+                ? `${project.repo_owner}/${project.repo_name}`
+                : undefined,
+          }}
+        />
+      </div>
 
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>

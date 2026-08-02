@@ -1,4 +1,4 @@
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import ProxyLogsList from '@/components/logs/ProxyLogsList'
 

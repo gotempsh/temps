@@ -23,6 +23,7 @@ pub struct IntegrationServiceInfo {
     pub service_name: String,
     pub service_type: String,
     pub service_slug: Option<String>,
+    pub service_updated_at: String,
 }
 
 /// One linked integration and the env vars it produces for a given project.

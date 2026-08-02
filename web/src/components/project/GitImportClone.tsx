@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
@@ -11,7 +11,8 @@ import {
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
   SelectTrigger,
@@ -31,16 +32,16 @@ import type {
   TemplateResponse,
 } from '@/api/client/types.gen'
 import {
-  GitBranch,
   ChevronLeft,
   Link as LinkIcon,
   Loader2,
-  LayoutTemplate,
-  Container,
   FolderGit2,
+  Plus,
 } from 'lucide-react'
 import Github from '@/icons/Github'
 import Gitlab from '@/icons/Gitlab'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
+import { NewProjectShell } from '@/components/project/NewProjectShell'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 
@@ -193,10 +194,13 @@ export function GitImportClone({
 
   // Templates fetched at this level so we can resolve `?template=<slug>` from
   // the URL into a `TemplateResponse` (used to hydrate the configurator on
-  // page load / browser back-forward / shared link).
+  // page load / browser back-forward / shared link). Also fetched on the
+  // entry screen (selectedSource === null) to show a real template count.
   const { data: templatesData } = useQuery({
     ...listProjectTemplatesOptions(),
-    enabled: mode === 'navigation' && selectedSource === 'templates',
+    enabled:
+      mode === 'navigation' &&
+      (selectedSource === 'templates' || selectedSource === null),
   })
 
   const templateSlugFromUrl = mode === 'navigation' ? searchParams.get('template') : null
@@ -265,12 +269,14 @@ export function GitImportClone({
   const renderProviderIcon = (
     providerId: number | undefined | null,
     className = 'h-4 w-4'
-  ) => {
-    const type = providerId != null ? providerTypeForConnectionId(providerId) : undefined
-    if (type === 'github' || type === 'github_app') return <Github className={className} />
-    if (type === 'gitlab') return <Gitlab className={className} />
-    return <GitBranch className={className} />
-  }
+  ) => (
+    <ProviderLogo
+      providerType={
+        providerId != null ? providerTypeForConnectionId(providerId) : undefined
+      }
+      className={className}
+    />
+  )
 
   // Optional `?connection=<id>` param lets callers deep-link straight to a
   // specific connection's repository list — used by the first-run "connect a
@@ -278,6 +284,31 @@ export function GitImportClone({
   // PAT connection so they continue to repo selection without a detour.
   const connectionIdFromUrl =
     mode === 'navigation' ? searchParams.get('connection') : null
+
+  // Land directly on something deployable — the method chooser is not a
+  // destination. With a Git connection, that's the provider's repository
+  // list; without one, the template gallery (one-click deploys that need no
+  // connection). The Repositories pill keeps the connect path reachable.
+  useEffect(() => {
+    if (selectedSource !== null) return
+    if (!connections) return
+    const landing =
+      connections.connections.length > 0 ? 'browse' : 'templates'
+    if (mode === 'navigation') {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev)
+          params.set('source', landing)
+          return params
+        },
+        // replace, not push: Back should leave the page, not bounce through
+        // the redirect.
+        { replace: true }
+      )
+    } else {
+      setLocalSource(landing)
+    }
+  }, [connections, selectedSource, mode, setSearchParams])
 
   useEffect(() => {
     if (!connections || connections.connections.length === 0) return
@@ -512,27 +543,34 @@ export function GitImportClone({
     }
   }
 
-  // Show TemplateConfigurator when a template is selected
+  // Show TemplateConfigurator when a template is selected — inside the same
+  // shell (header + pills) as the picker, so configuring never swaps the
+  // page frame.
   if (selectedTemplate) {
     return (
-      <div className="space-y-6">
-        <div className="flex items-center gap-4">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => selectTemplate(null)}
-          >
-            <ChevronLeft className="h-4 w-4 mr-2" />
-            Back to Templates
-          </Button>
-        </div>
+      <NewProjectShell
+        activeSource="templates"
+        onSelectSource={setSelectedSource}
+      >
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => selectTemplate(null)}
+            >
+              <ChevronLeft className="h-4 w-4 mr-2" />
+              Back to Templates
+            </Button>
+          </div>
 
-        <TemplateConfigurator
-          template={selectedTemplate}
-          onCancel={() => selectTemplate(null)}
-          onSuccess={onProjectCreated}
-        />
-      </div>
+          <TemplateConfigurator
+            template={selectedTemplate}
+            onCancel={() => selectTemplate(null)}
+            onSuccess={onProjectCreated}
+          />
+        </div>
+      </NewProjectShell>
     )
   }
 
@@ -556,6 +594,10 @@ export function GitImportClone({
       }
     }
     return (
+      <NewProjectShell
+        activeSource={useGitUrl ? 'git-url' : 'browse'}
+        onSelectSource={setSelectedSource}
+      >
       <div className="space-y-6">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
@@ -613,12 +655,10 @@ export function GitImportClone({
                   preset_config:
                     data.preset === 'dockerfile' && data.dockerfilePath
                       ? {
-                          preset: 'dockerfile',
                           dockerfilePath: data.dockerfilePath,
                         }
                       : data.preset === 'docker-compose'
                         ? {
-                            preset: 'docker-compose',
                             composePath:
                               (data as any).composePath || 'docker-compose.yml',
                           }
@@ -634,6 +674,7 @@ export function GitImportClone({
           onCancel={goBackFromRepo}
         />
       </div>
+      </NewProjectShell>
     )
   }
 
@@ -642,292 +683,230 @@ export function GitImportClone({
   }
 
   // Source selection step
-  if (!selectedSource) {
-    const sources: Array<{
-      key: ProjectSource
-      icon: typeof FolderGit2
-      title: string
-      tagline: string
-      detail: string
-    }> = [
-      {
-        key: 'browse',
-        icon: FolderGit2,
-        title: 'Import Repository',
-        tagline: 'Browse your private and public repos',
-        detail:
-          'Select a repository from your connected Git accounts. Auto-detects framework, build settings, and sets up webhooks for automatic deploys on push.',
-      },
-      {
-        key: 'templates',
-        icon: LayoutTemplate,
-        title: 'Template',
-        tagline: 'Start from a pre-configured starter kit',
-        detail:
-          'Pick from curated templates like Next.js, SaaS starters, and documentation sites. Includes build settings, environment variables, and recommended services.',
-      },
-      {
-        key: 'git-url',
-        icon: LinkIcon,
-        title: 'Git URL',
-        tagline: 'Clone from a public repository URL',
-        detail:
-          'Paste a public GitHub or GitLab URL to import any open-source repository. No account connection required — great for trying out open-source projects.',
-      },
-      {
-        key: 'manual',
-        icon: Container,
-        title: 'Manual Deploy',
-        tagline: 'No Git repository needed',
-        detail:
-          'Deploy a pre-built Docker image from any registry (DockerHub, GHCR, etc.) or upload a static files bundle. Ideal for CI/CD pipelines or pre-built artifacts.',
-      },
-    ]
+  // Entry screen: persistent tab bar + sidebar. Only the content area below
+  // the tabs swaps based on `selectedSource` — switching tabs must never
+  // navigate away from this shell (that was the bug in the old two-screen
+  // "pick a source -> full-width takeover" flow).
 
-    return (
-      <Card className="flex-1">
-        <CardHeader className="flex items-center gap-2 pb-3">
-          <GitBranch className="h-5 w-5 text-foreground" />
-          <CardTitle className="text-xl font-bold">
-            Create New Project
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground mb-6">
-            Choose how you want to set up your project
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {sources.map((s) => {
-              const Icon = s.icon
-              return (
-                <button
-                  key={s.key}
-                  onClick={() => setSelectedSource(s.key)}
-                  className="group flex flex-col gap-3 p-5 rounded-lg border bg-card hover:border-primary hover:bg-accent/50 transition-colors text-left"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="rounded-md bg-primary/10 p-2.5 group-hover:bg-primary/20 transition-colors">
-                      <Icon className="h-5 w-5 text-primary" />
-                    </div>
-                    <div>
-                      <p className="font-semibold">{s.title}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {s.tagline}
-                      </p>
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground leading-relaxed pl-[52px]">
-                    {s.detail}
-                  </p>
-                  {s.key === 'browse' &&
-                    connections &&
-                    connections.connections.length > 0 && (
-                      <div className="flex items-center gap-2 pl-[52px] flex-wrap">
-                        {connections.connections.map((conn) => (
-                          <div
-                            key={conn.id}
-                            className="flex items-center gap-1.5 text-xs text-muted-foreground bg-muted/60 rounded-full px-2.5 py-1"
-                          >
-                            {renderProviderIcon(conn.provider_id, 'h-3 w-3')}
-                            <span>{conn.account_name}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  {s.key === 'browse' &&
-                    (!connections ||
-                      connections.connections.length === 0) && (
-                      <p className="text-xs text-amber-500 pl-[52px]">
-                        No Git connections yet — you can add one after
-                        selecting this option.
-                      </p>
-                    )}
-                </button>
-              )
-            })}
+  const connectionCount = connections?.connections?.length ?? 0
+
+  const sourceContentEl = (
+    <>
+
+        {!selectedSource && !connections && (
+          <div className="space-y-3">
+            <Skeleton className="h-10 w-full" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Skeleton key={i} className="h-32 w-full rounded-xl" />
+              ))}
+            </div>
           </div>
-        </CardContent>
-      </Card>
-    )
-  }
-
-  // Selected source content
-  return (
-    <Card className="flex-1">
-      <CardHeader className="flex items-center gap-2 pb-3">
-        <div className="flex items-center gap-2 w-full">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSelectedSource(null)}
-          >
-            <ChevronLeft className="h-4 w-4 mr-1" />
-            Back
-          </Button>
-          <CardTitle className="text-xl font-bold">
-            {selectedSource === 'templates' && 'Choose a Template'}
-            {selectedSource === 'browse' && 'Import Repository'}
-            {selectedSource === 'git-url' && 'Import from Git URL'}
-            {selectedSource === 'manual' && 'Manual Deployment'}
-          </CardTitle>
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {selectedSource === 'templates' && (
-          <TemplateList
-            onTemplateSelect={selectTemplate}
-            selectedTemplate={selectedTemplate}
-            showFeaturedFirst={true}
-          />
         )}
 
-        {selectedSource === 'browse' && (
-          <div className="space-y-3">
-            <Select
-              value={selectedConnection}
-              onValueChange={setSelectedConnection}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Select Connection">
-                  {selectedConnection &&
-                    connections &&
-                    (() => {
-                      const selectedConn = connections.connections.find(
-                        (c) => c.id.toString() === selectedConnection
-                      )
-                      return selectedConn ? (
-                        <div className="flex items-center gap-2">
-                          {renderProviderIcon(selectedConn.provider_id)}
-                          <span className="font-medium">
-                            {selectedConn.account_name}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            ({selectedConn.account_type})
-                          </span>
-                        </div>
-                      ) : (
-                        'Select Connection'
-                      )
-                    })()}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {connections?.connections?.map((connection) => (
-                  <SelectItem
-                    key={connection.id}
-                    value={connection.id.toString()}
-                  >
-                    <div className="flex items-center gap-2">
-                      {renderProviderIcon(connection.provider_id)}
-                      <span className="font-medium">
-                        {connection.account_name}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        ({connection.account_type})
-                      </span>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
 
-            {selectedConnection && (
-              <RepositoryList
-                connectionId={Number(selectedConnection)}
-                onRepositorySelect={handleRepositoryClick}
-                showSelection={false}
-                itemsPerPage={15}
-                showHeader={true}
-                compactMode={false}
+        {selectedSource === 'templates' && (
+          <Card>
+            <CardContent className="pt-6">
+              <TemplateList
+                onTemplateSelect={selectTemplate}
+                selectedTemplate={selectedTemplate}
+                showFeaturedFirst={true}
               />
-            )}
-          </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {selectedSource === 'browse' && connections && connectionCount === 0 && (
+          <Card>
+            <CardContent className="flex flex-col items-center text-center py-12 px-6">
+              <FolderGit2 className="size-8 text-muted-foreground mb-3" />
+              <p className="text-sm font-medium">No Git provider connected</p>
+              <p className="text-xs text-muted-foreground mt-1 mb-4 max-w-xs">
+                Connect GitHub or GitLab to browse your repositories, or paste
+                a public Git URL instead.
+              </p>
+              <div className="flex items-center gap-2">
+                {mode === 'navigation' && (
+                  <Button size="sm" onClick={() => navigate('/git-providers/add')}>
+                    <Plus className="h-4 w-4 mr-1.5" />
+                    Connect provider
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setSelectedSource('git-url')}
+                >
+                  <LinkIcon className="h-4 w-4 mr-1.5" />
+                  Use a Git URL
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {selectedSource === 'browse' && connectionCount > 0 && (
+          <Card>
+            <CardContent className="pt-6 space-y-3">
+              <Select
+                value={selectedConnection}
+                onValueChange={setSelectedConnection}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select Connection">
+                    {selectedConnection &&
+                      connections &&
+                      (() => {
+                        const selectedConn = connections.connections.find(
+                          (c) => c.id.toString() === selectedConnection
+                        )
+                        return selectedConn ? (
+                          <div className="flex items-center gap-2">
+                            {renderProviderIcon(selectedConn.provider_id)}
+                            <span className="font-medium">
+                              {selectedConn.account_name}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              ({selectedConn.account_type})
+                            </span>
+                          </div>
+                        ) : (
+                          'Select Connection'
+                        )
+                      })()}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {connections?.connections?.map((connection) => (
+                    <SelectItem
+                      key={connection.id}
+                      value={connection.id.toString()}
+                    >
+                      <div className="flex items-center gap-2">
+                        {renderProviderIcon(connection.provider_id)}
+                        <span className="font-medium">
+                          {connection.account_name}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          ({connection.account_type})
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              {selectedConnection && (
+                <RepositoryList
+                  connectionId={Number(selectedConnection)}
+                  onRepositorySelect={handleRepositoryClick}
+                  showSelection={false}
+                  itemsPerPage={15}
+                  showHeader={true}
+                  compactMode={false}
+                />
+              )}
+            </CardContent>
+          </Card>
         )}
 
         {selectedSource === 'git-url' && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="git-url">Public Repository URL</Label>
-              <Input
-                id="git-url"
-                type="url"
-                placeholder="https://github.com/owner/repository"
-                value={gitUrl}
-                onChange={(e) => setGitUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !isValidatingUrl) {
-                    handleGitUrlSubmit()
-                  }
-                }}
-                disabled={isValidatingUrl}
-              />
-              <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                <div className="flex items-center gap-1">
-                  <Github className="h-3 w-3" />
-                  <span>GitHub</span>
+          <Card>
+            <CardContent className="pt-6 space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="git-url">Public Repository URL</Label>
+                <Input
+                  id="git-url"
+                  type="url"
+                  placeholder="https://github.com/owner/repository"
+                  value={gitUrl}
+                  onChange={(e) => setGitUrl(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !isValidatingUrl) {
+                      handleGitUrlSubmit()
+                    }
+                  }}
+                  disabled={isValidatingUrl}
+                />
+                <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                  <div className="flex items-center gap-1">
+                    <Github className="h-3 w-3" />
+                    <span>GitHub</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <Gitlab className="h-3 w-3" />
+                    <span>GitLab</span>
+                  </div>
+                  <span className="text-muted-foreground/60">supported</span>
                 </div>
-                <div className="flex items-center gap-1">
-                  <Gitlab className="h-3 w-3" />
-                  <span>GitLab</span>
-                </div>
-                <span className="text-muted-foreground/60">supported</span>
               </div>
-            </div>
-            <Button
-              onClick={handleGitUrlSubmit}
-              className="w-full"
-              disabled={isValidatingUrl || !gitUrl.trim()}
-            >
-              {isValidatingUrl ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Validating repository...
-                </>
-              ) : (
-                <>
-                  <LinkIcon className="h-4 w-4 mr-2" />
-                  Continue with URL
-                </>
-              )}
-            </Button>
+              <Button
+                onClick={handleGitUrlSubmit}
+                className="w-full"
+                disabled={isValidatingUrl || !gitUrl.trim()}
+              >
+                {isValidatingUrl ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Validating repository...
+                  </>
+                ) : (
+                  <>
+                    <LinkIcon className="h-4 w-4 mr-2" />
+                    Continue with URL
+                  </>
+                )}
+              </Button>
 
-            {/* Show parsed URL preview */}
-            {gitUrl &&
-              !isValidatingUrl &&
-              (() => {
-                const parsed = parseGitUrl(gitUrl)
-                if (parsed) {
-                  return (
-                    <div className="p-3 bg-muted/50 rounded-md text-sm">
-                      <div className="flex items-center gap-2">
-                        {parsed.provider === 'github' ? (
-                          <Github className="h-4 w-4" />
-                        ) : (
-                          <Gitlab className="h-4 w-4" />
-                        )}
-                        <span className="font-medium">
-                          {parsed.owner}/{parsed.repo}
-                        </span>
-                        <Badge variant="secondary" className="text-xs">
-                          {parsed.provider}
-                        </Badge>
+              {/* Show parsed URL preview */}
+              {gitUrl &&
+                !isValidatingUrl &&
+                (() => {
+                  const parsed = parseGitUrl(gitUrl)
+                  if (parsed) {
+                    return (
+                      <div className="p-3 bg-muted/50 rounded-md text-sm">
+                        <div className="flex items-center gap-2">
+                          {parsed.provider === 'github' ? (
+                            <Github className="h-4 w-4" />
+                          ) : (
+                            <Gitlab className="h-4 w-4" />
+                          )}
+                          <span className="font-medium">
+                            {parsed.owner}/{parsed.repo}
+                          </span>
+                          <Badge variant="secondary" className="text-xs">
+                            {parsed.provider}
+                          </Badge>
+                        </div>
                       </div>
-                    </div>
-                  )
-                }
-                return null
-              })()}
-          </div>
+                    )
+                  }
+                  return null
+                })()}
+            </CardContent>
+          </Card>
         )}
 
         {selectedSource === 'manual' && (
-          <div className="space-y-4">
-            <ManualProjectConfigurator
-              onCancel={() => setSelectedSource(null)}
-            />
-          </div>
+          <Card>
+            <CardContent className="pt-6">
+              <ManualProjectConfigurator
+                onCancel={() => setSelectedSource(null)}
+              />
+            </CardContent>
+          </Card>
         )}
-      </CardContent>
-    </Card>
+    </>
+  )
+
+  return (
+    <NewProjectShell
+      activeSource={selectedSource}
+      onSelectSource={setSelectedSource}
+    >
+      {sourceContentEl}
+    </NewProjectShell>
   )
 }

@@ -50,8 +50,6 @@ import {
   Database,
   EllipsisVertical,
   ExternalLink,
-  GitBranch,
-  GitFork,
   Globe,
   Key,
   RefreshCw,
@@ -59,8 +57,9 @@ import {
   XCircle,
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
 
@@ -278,20 +277,9 @@ export default function GitProviderDetail() {
     )
   }
 
-  const getProviderIcon = () => {
-    switch (provider.provider_type) {
-      case 'github':
-        return <GithubIcon className="h-6 w-6" />
-      case 'gitea':
-        return <GitFork className="h-6 w-6" />
-      case 'generic':
-        return <Globe className="h-6 w-6" />
-      case 'gitlab':
-      case 'bitbucket':
-      default:
-        return <GitBranch className="h-6 w-6" />
-    }
-  }
+  const getProviderIcon = () => (
+    <ProviderLogo providerType={provider.provider_type} className="h-6 w-6" />
+  )
 
   const getProviderDisplayName = () => {
     switch (provider.provider_type) {

@@ -117,12 +117,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             env.insert("PORT".to_string(), "3000".to_string());
             env
         },
+        secrets: HashMap::new(),
         port_mappings: vec![PortMapping {
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
         }],
         network_name: Some("my-network".to_string()),
+        // Must be a subset of TEMPS_DOCKER_EXTRA_NETWORKS; a request can
+        // narrow the operator's configured networks but never widen them.
+        extra_networks: vec![],
         resource_limits: ResourceLimits {
             cpu_limit: Some(2.0),
             memory_limit_mb: Some(512),
@@ -130,6 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         restart_policy: RestartPolicy::Always,
         log_path: PathBuf::from("./deploy.log"),
+        command: None,
+        log_config: None,
+        labels: HashMap::new(),
     };
 
     let result = runtime.deploy_container(deploy_request).await?;

@@ -537,6 +537,32 @@ pub async fn delete_project(
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
 
+    state.project_service.begin_project_deletion(id).await?;
+
+    state
+        .deployment_canceller
+        .cancel_all_project_deployments(id)
+        .await
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to cancel project deployments");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deployment Cancellation Failed")
+                .with_detail(format!(
+                    "Failed to cancel active deployments for project {id}: {error}"
+                ))
+        })?;
+
+    state
+        .deployment_container_cleaner
+        .cleanup_project_containers(id)
+        .await
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to clean up project containers");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Container Cleanup Failed")
+                .with_detail(error.to_string())
+        })?;
+
     state
         .project_service
         .delete_project(id, &project.name)
@@ -617,6 +643,7 @@ pub async fn update_project_settings(
             settings.ai_write_actions_enabled,
             settings.cross_project_trace_sharing,
             settings.error_source_context_enabled,
+            settings.error_source_root.clone(),
         )
         .await
         .map_err(Problem::from)?;
@@ -750,6 +777,7 @@ pub async fn update_git_settings(
         .project_service
         .update_git_settings(
             project_id,
+            auth.user_id(),
             settings.git_provider_connection_id,
             settings.main_branch.clone(),
             settings.repo_owner.clone(),
@@ -964,6 +992,12 @@ pub async fn update_project_deployment_config(
     if config.security.is_some() {
         updated_fields.insert("security".to_string(), "updated".to_string());
     }
+    if config.cross_architecture_builds.is_some() {
+        updated_fields.insert(
+            "cross_architecture_builds".to_string(),
+            "updated".to_string(),
+        );
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,
@@ -1150,8 +1184,14 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
             let project_type = preset.project_type().to_string();
             let default_port = Some(preset.default_port());
 
-            // Generate relative icon URL
-            let icon_url = format!("/presets/{}.svg", slug);
+            // Use the preset's own icon, NOT one derived from the slug.
+            // Deriving it invented filenames that were never shipped —
+            // `docker-compose` resolved to `/presets/docker-compose.svg`
+            // (missing) instead of the `docker.svg` the preset declares, and
+            // every `nixpacks-<lang>` slug pointed at a nonexistent file
+            // rather than the language icon it maps to. Those 404s fell back
+            // to the generic gear in the UI.
+            let icon_url = preset.icon_url();
 
             super::types::PresetResponse {
                 slug,

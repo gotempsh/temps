@@ -38,7 +38,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState, type ComponentType, type SVGProps } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'

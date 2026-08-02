@@ -17,6 +17,8 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
@@ -154,7 +156,8 @@ pub struct CreateProjectRequest {
     ///
     /// Different presets accept different configuration options:
     /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
-    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Nixpacks preset**: Accepts ordered `providers` (for example `["...", "python"]`)
+    ///   and optional inline `nixpacksConfig` TOML
     /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
     ///
     /// Example for Dockerfile preset:
@@ -293,6 +296,9 @@ pub struct ProjectResponse {
     /// Opt-in to native error-tracking source context (false = off). When on,
     /// Temps stores uploaded source files and shows source code in stack traces.
     pub error_source_context_enabled: bool,
+    /// Where auto-capture reads source from (relative to the checkout). Null =
+    /// the deployment's Docker build context.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode
@@ -346,6 +352,7 @@ impl ProjectResponse {
             ai_debug_chat_enabled: project.ai_debug_chat_enabled,
             ai_write_actions_enabled: project.ai_write_actions_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
+            error_source_root: project.error_source_root,
             enable_preview_environments: project.enable_preview_environments,
             preview_envs_on_demand: project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: project.preview_envs_idle_timeout_seconds,
@@ -432,6 +439,10 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.container_exec_enabled)
                     .unwrap_or(false),
+                cross_architecture_builds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.cross_architecture_builds),
             },
         }
     }
@@ -549,6 +560,11 @@ pub struct UpdateDeploymentConfigRequest {
     pub session_recording_enabled: Option<bool>,
     pub replicas: Option<i32>,
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
+    /// Build one image per architecture the eligible nodes run. Off by
+    /// default; environments inherit this and may override it. Cross-builds
+    /// are emulated on the control plane and substantially slower, so they are
+    /// opted into rather than triggered by cluster topology.
+    pub cross_architecture_builds: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
@@ -571,6 +587,10 @@ pub struct UpdateProjectSettingsRequest {
     /// Opt in to native error-tracking source context (source-file upload +
     /// source code shown in stack traces).
     pub error_source_context_enabled: Option<bool>,
+    /// Set the auto-capture source root (relative to the checkout). Send an
+    /// empty string to clear it back to the build-context default. Omit to
+    /// leave unchanged.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: Option<bool>,
     /// When true, newly-created preview environments default to on-demand mode.

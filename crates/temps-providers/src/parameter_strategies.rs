@@ -1304,8 +1304,8 @@ fn is_empty_value(value: Option<&JsonValue>) -> bool {
 use crate::externalsvc::port_util::find_available_port;
 
 fn generate_secure_password() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     // Charset must be a subset of what `is_valid_pg_password` accepts.
     // `$` is intentionally excluded because the cluster startup script
     // uses shell expansion on env-injected passwords — see the matching
@@ -1314,27 +1314,27 @@ fn generate_secure_password() -> String {
     let charset: &[u8] =
         b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*_-+=";
     (0..32)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate an S3-style access key (20 uppercase alphanumeric characters)
 fn generate_access_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     (0..20)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate an S3-style secret key (40 alphanumeric characters with special chars)
 fn generate_secret_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     let charset: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
     (0..40)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 

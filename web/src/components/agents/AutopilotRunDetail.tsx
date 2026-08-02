@@ -1,12 +1,7 @@
 import { ProjectResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -18,9 +13,17 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import {
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { CodeBlock } from '@/components/ui/code-block'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -32,26 +35,34 @@ import {
   Terminal,
   Webhook,
 } from 'lucide-react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import {
   getErrorGroupOptions,
   getRunWithLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
+import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
 import {
   addContext,
   createPr,
   reAnalyze,
   retryRun,
-  startAnalysis,
   startFix,
 } from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
-import { ChevronDown, ChevronUp, GitBranch, MessageSquare, Send, Sparkles } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronUp,
+  GitBranch,
+  MessageSquare,
+  Send,
+  Sparkles,
+} from 'lucide-react'
 
-const proseClasses = 'prose prose-sm dark:prose-invert max-w-none prose-pre:bg-black/30 prose-pre:text-muted-foreground prose-pre:text-xs prose-pre:border-0 prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
+const proseClasses =
+  'prose prose-sm dark:prose-invert max-w-none prose-code:before:content-none prose-code:after:content-none prose-p:my-1.5 prose-headings:my-2 prose-ul:my-1.5 prose-ul:list-disc prose-ul:pl-5 prose-ol:my-1.5 prose-ol:list-decimal prose-ol:pl-5 prose-li:my-0.5 prose-li:marker:text-foreground/60 prose-hr:my-3 prose-hr:border-border prose-table:text-xs prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1'
 
 interface AutopilotRunDetailProps {
   project: ProjectResponse
@@ -75,7 +86,7 @@ const autofixerInteractivePhases = new Set(['analyzed', 'fix_ready'])
 
 function formatDuration(
   startedAt: string | null | undefined,
-  completedAt: string | null | undefined,
+  completedAt: string | null | undefined
 ): string {
   if (!startedAt) return '-'
   const start = new Date(startedAt).getTime()
@@ -111,11 +122,85 @@ function logLevelColor(level: string): string {
   }
 }
 
-/** Render markdown content using prose styles */
+type CodeBlockLanguage = NonNullable<
+  ComponentProps<typeof CodeBlock>['language']
+>
+
+/** Map common markdown fence hints onto the languages the shared CodeBlock
+ *  highlights. Unknown/absent hints fall back to 'text' (no highlighting). */
+const fenceLanguageMap: Record<string, CodeBlockLanguage> = {
+  bash: 'bash',
+  sh: 'shell',
+  shell: 'shell',
+  zsh: 'shell',
+  console: 'shell',
+  yaml: 'yaml',
+  yml: 'yaml',
+  json: 'json',
+  jsonc: 'json',
+  javascript: 'javascript',
+  js: 'javascript',
+  jsx: 'javascript',
+  typescript: 'typescript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  python: 'python',
+  py: 'python',
+  go: 'go',
+  golang: 'go',
+  text: 'text',
+  txt: 'text',
+  plaintext: 'text',
+}
+
+function fenceLanguage(className: string | undefined): CodeBlockLanguage {
+  const match = /language-([\w-]+)/.exec(className ?? '')
+  return (match && fenceLanguageMap[match[1].toLowerCase()]) || 'text'
+}
+
+/** Flatten a react-markdown code element's children to the raw code string. */
+function extractText(node: ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(extractText).join('')
+  if (isValidElement(node)) {
+    return extractText((node.props as { children?: ReactNode }).children)
+  }
+  return ''
+}
+
+/** Fenced code blocks render through the shared CodeBlock (same component as
+ *  the AI Gateway page): syntax colors, line numbers, copy button, and a wrap
+ *  toggle. Long lines scroll horizontally instead of stretching the layout. */
+function MarkdownPre({ children }: { children?: ReactNode }) {
+  if (isValidElement(children)) {
+    const codeProps = children.props as {
+      className?: string
+      children?: ReactNode
+    }
+    return (
+      <CodeBlock
+        code={extractText(codeProps.children).replace(/\n$/, '')}
+        language={fenceLanguage(codeProps.className)}
+        className="not-prose my-3 text-left"
+        defaultShowLineNumbers
+      />
+    )
+  }
+  return <pre>{children}</pre>
+}
+
+/** Render markdown content using prose styles. Fenced code blocks are routed
+ *  to the shared CodeBlock via the `pre` component override; inline code keeps
+ *  the prose styling (react-markdown only wraps fences in `<pre>`). */
 function Markdown({ children }: { children: string }) {
   return (
     <div className={proseClasses}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{ pre: MarkdownPre }}
+      >
+        {children}
+      </ReactMarkdown>
     </div>
   )
 }
@@ -167,7 +252,8 @@ function isOpenCodeFormat(output: string): boolean {
       trimmed.includes('"step_finish"') ||
       trimmed.includes('"message.part.updated"')
     const hasTextEventWithPart =
-      (trimmed.includes('"type":"text"') || trimmed.includes('"type": "text"')) &&
+      (trimmed.includes('"type":"text"') ||
+        trimmed.includes('"type": "text"')) &&
       trimmed.includes('"part"')
 
     if (hasStepEvent || hasTextEventWithPart) {
@@ -207,7 +293,10 @@ function parseOpenCodeOutput(output: string): ConversationEvent[] {
         } else {
           events.push({ type: 'assistant_text', content: part.text })
         }
-      } else if (parsed.type === 'message.part.updated' && part?.type === 'tool') {
+      } else if (
+        parsed.type === 'message.part.updated' &&
+        part?.type === 'tool'
+      ) {
         const toolName = part.name || 'unknown'
         // Capitalize first letter to match Claude/Codex rendering (bash → Bash)
         const displayName = toolName.charAt(0).toUpperCase() + toolName.slice(1)
@@ -224,21 +313,32 @@ function parseOpenCodeOutput(output: string): ConversationEvent[] {
         } else if (part.state === 'completed' || part.state === 'error') {
           // Tool finished — merge into existing in_progress event or create new
           const existing = part.id
-            ? events.find((e) => e.type === 'tool_call' && e.toolUseId === part.id)
-            : [...events].reverse().find(
-                (e) => e.type === 'tool_call' && e.tool === displayName && e.toolStatus === 'in_progress',
+            ? events.find(
+                (e) => e.type === 'tool_call' && e.toolUseId === part.id
               )
+            : [...events]
+                .reverse()
+                .find(
+                  (e) =>
+                    e.type === 'tool_call' &&
+                    e.tool === displayName &&
+                    e.toolStatus === 'in_progress'
+                )
 
-          const resultText = typeof part.result === 'string'
-            ? part.result
-            : part.output ?? ''
+          const resultText =
+            typeof part.result === 'string' ? part.result : (part.output ?? '')
 
           if (existing) {
             existing.toolResult = resultText
-            existing.toolStatus = part.state === 'error' ? 'failed' : 'completed'
+            existing.toolStatus =
+              part.state === 'error' ? 'failed' : 'completed'
             // Backfill input if the started event didn't have it
-            if (!existing.toolInput || Object.keys(existing.toolInput).length === 0) {
-              existing.toolInput = part.input ?? (part.args ? JSON.parse(part.args) : {})
+            if (
+              !existing.toolInput ||
+              Object.keys(existing.toolInput).length === 0
+            ) {
+              existing.toolInput =
+                part.input ?? (part.args ? JSON.parse(part.args) : {})
             }
           } else {
             events.push({
@@ -251,7 +351,10 @@ function parseOpenCodeOutput(output: string): ConversationEvent[] {
             })
           }
         }
-      } else if (parsed.type === 'step_finish' && part?.type === 'step-finish') {
+      } else if (
+        parsed.type === 'step_finish' &&
+        part?.type === 'step-finish'
+      ) {
         // Accumulate tokens and cost from each step
         if (part.tokens) {
           totalInputTokens += part.tokens.input || 0
@@ -267,7 +370,10 @@ function parseOpenCodeOutput(output: string): ConversationEvent[] {
   }
 
   // Add a synthetic result event with accumulated usage
-  if (events.length > 0 && (totalInputTokens > 0 || totalOutputTokens > 0 || totalCost > 0)) {
+  if (
+    events.length > 0 &&
+    (totalInputTokens > 0 || totalOutputTokens > 0 || totalCost > 0)
+  ) {
     events.push({
       type: 'result',
       tokensInput: totalInputTokens,
@@ -299,9 +405,16 @@ function parseCodexOutput(output: string): ConversationEvent[] {
       const parsed = JSON.parse(trimmed)
       const item = parsed.item
 
-      if (parsed.type === 'item.completed' && item?.type === 'agent_message' && item.text) {
+      if (
+        parsed.type === 'item.completed' &&
+        item?.type === 'agent_message' &&
+        item.text
+      ) {
         events.push({ type: 'assistant_text', content: item.text })
-      } else if (parsed.type === 'item.started' && item?.type === 'command_execution') {
+      } else if (
+        parsed.type === 'item.started' &&
+        item?.type === 'command_execution'
+      ) {
         // Command started — create a tool_call event that will be merged
         // with the completed event when it arrives
         events.push({
@@ -311,13 +424,23 @@ function parseCodexOutput(output: string): ConversationEvent[] {
           toolInput: { command: item.command },
           toolStatus: 'in_progress',
         })
-      } else if (parsed.type === 'item.completed' && item?.type === 'command_execution') {
+      } else if (
+        parsed.type === 'item.completed' &&
+        item?.type === 'command_execution'
+      ) {
         // Command completed — merge into existing tool_call or create new one
         const existing = item.id
-          ? events.find((e) => e.type === 'tool_call' && e.toolUseId === item.id)
-          : [...events].reverse().find(
-              (e) => e.type === 'tool_call' && !e.toolResult && e.toolInput?.command === item.command,
+          ? events.find(
+              (e) => e.type === 'tool_call' && e.toolUseId === item.id
             )
+          : [...events]
+              .reverse()
+              .find(
+                (e) =>
+                  e.type === 'tool_call' &&
+                  !e.toolResult &&
+                  e.toolInput?.command === item.command
+              )
 
         const resultText = item.aggregated_output || ''
         const exitCode = item.exit_code ?? null
@@ -329,7 +452,8 @@ function parseCodexOutput(output: string): ConversationEvent[] {
 
         if (existing) {
           existing.toolResult = fullResult
-          existing.toolStatus = item.status === 'failed' ? 'failed' : 'completed'
+          existing.toolStatus =
+            item.status === 'failed' ? 'failed' : 'completed'
         } else {
           events.push({
             type: 'tool_call',
@@ -340,7 +464,10 @@ function parseCodexOutput(output: string): ConversationEvent[] {
             toolStatus: item.status === 'failed' ? 'failed' : 'completed',
           })
         }
-      } else if (parsed.type === 'item.completed' && item?.type === 'function_call') {
+      } else if (
+        parsed.type === 'item.completed' &&
+        item?.type === 'function_call'
+      ) {
         // Codex function calls (MCP tools, etc.)
         events.push({
           type: 'tool_call',
@@ -400,16 +527,25 @@ function parseClaudeOutput(output: string): ConversationEvent[] {
         for (const block of parsed.message.content) {
           if (block.type === 'tool_result') {
             const content = Array.isArray(block.content)
-              ? block.content.map((c: { text?: string }) => c.text || '').join('')
+              ? block.content
+                  .map((c: { text?: string }) => c.text || '')
+                  .join('')
               : typeof block.content === 'string'
                 ? block.content
                 : JSON.stringify(block.content)
             const matchById = block.tool_use_id
               ? events.find(
-                  (e) => e.type === 'tool_call' && e.toolUseId === block.tool_use_id && !e.toolResult,
+                  (e) =>
+                    e.type === 'tool_call' &&
+                    e.toolUseId === block.tool_use_id &&
+                    !e.toolResult
                 )
               : null
-            const target = matchById || [...events].reverse().find((e) => e.type === 'tool_call' && !e.toolResult)
+            const target =
+              matchById ||
+              [...events]
+                .reverse()
+                .find((e) => e.type === 'tool_call' && !e.toolResult)
             if (target) {
               target.toolResult = content
             } else {
@@ -454,7 +590,6 @@ function parseStreamOutput(output: string): ConversationEvent[] {
   return parseClaudeOutput(output)
 }
 
-
 /** Claude-managed-agent style viewer: Transcript + Debug with inspector pane. */
 function ConversationViewer({
   output,
@@ -467,9 +602,9 @@ function ConversationViewer({
 }) {
   const events = parseStreamOutput(output)
   const [mode, setMode] = useState<'transcript' | 'debug'>('transcript')
-  const [filter, setFilter] = useState<'all' | 'user' | 'assistant' | 'tool' | 'system'>(
-    'all',
-  )
+  const [filter, setFilter] = useState<
+    'all' | 'user' | 'assistant' | 'tool' | 'system'
+  >('all')
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -590,7 +725,7 @@ function ConversationViewer({
             'px-2 py-0.5 rounded transition',
             mode === 'transcript'
               ? 'bg-foreground/10 text-foreground font-medium'
-              : 'text-muted-foreground hover:text-foreground',
+              : 'text-muted-foreground hover:text-foreground'
           )}
         >
           Transcript
@@ -601,7 +736,7 @@ function ConversationViewer({
             'px-2 py-0.5 rounded transition',
             mode === 'debug'
               ? 'bg-foreground/10 text-foreground font-medium'
-              : 'text-muted-foreground hover:text-foreground',
+              : 'text-muted-foreground hover:text-foreground'
           )}
         >
           Debug
@@ -614,13 +749,20 @@ function ConversationViewer({
         >
           <option value="all">All ({viewEvents.length})</option>
           <option value="assistant">
-            Assistant ({viewEvents.filter((v) => v.kind === 'assistant').length})
+            Assistant ({viewEvents.filter((v) => v.kind === 'assistant').length}
+            )
           </option>
           <option value="tool">
             Tool ({viewEvents.filter((v) => v.kind === 'tool').length})
           </option>
           <option value="system">
-            System ({viewEvents.filter((v) => v.kind === 'system' || v.kind === 'result').length})
+            System (
+            {
+              viewEvents.filter(
+                (v) => v.kind === 'system' || v.kind === 'result'
+              ).length
+            }
+            )
           </option>
         </select>
         <div className="flex-1" />
@@ -643,7 +785,10 @@ function ConversationViewer({
               {filtered.map((v, i) => {
                 if (v.kind === 'system') {
                   return (
-                    <details key={i} className="rounded-md border border-border bg-muted/20">
+                    <details
+                      key={i}
+                      className="rounded-md border border-border bg-muted/20"
+                    >
                       <summary className="px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer select-none">
                         System prompt
                       </summary>
@@ -659,7 +804,7 @@ function ConversationViewer({
                       <span
                         className={cn(
                           'shrink-0 h-6 px-2 text-[10px] font-medium rounded border uppercase tracking-wide flex items-center',
-                          kindStyle('assistant'),
+                          kindStyle('assistant')
                         )}
                       >
                         Assistant
@@ -683,14 +828,14 @@ function ConversationViewer({
                         'rounded-md border',
                         isFailed
                           ? 'border-red-500/20 bg-red-500/5'
-                          : 'border-blue-500/15 bg-blue-500/5',
+                          : 'border-blue-500/15 bg-blue-500/5'
                       )}
                     >
                       <div className="flex items-center gap-2 px-3 py-2">
                         <span
                           className={cn(
                             'text-xs font-mono font-medium',
-                            isFailed ? 'text-red-500' : 'text-blue-500',
+                            isFailed ? 'text-red-500' : 'text-blue-500'
                           )}
                         >
                           {e.tool}
@@ -702,13 +847,19 @@ function ConversationViewer({
                           <Loader2 className="h-3 w-3 animate-spin text-blue-500" />
                         )}
                         {isFailed && (
-                          <span className="text-[10px] font-medium text-red-500">FAILED</span>
+                          <span className="text-[10px] font-medium text-red-500">
+                            FAILED
+                          </span>
                         )}
                       </div>
                       {resultText.length > 2 && (
                         <details className="border-t border-border/40">
                           <summary className="px-3 py-1.5 text-[11px] text-muted-foreground cursor-pointer select-none hover:bg-muted/40">
-                            Output ({resultText.length > 1000 ? `${Math.round(resultText.length / 1000)}k` : resultText.length} chars)
+                            Output (
+                            {resultText.length > 1000
+                              ? `${Math.round(resultText.length / 1000)}k`
+                              : resultText.length}{' '}
+                            chars)
                           </summary>
                           <pre className="text-xs font-mono bg-muted/30 px-3 py-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
                             {resultText.slice(0, 2000)}
@@ -725,7 +876,7 @@ function ConversationViewer({
                       key={i}
                       className={cn(
                         'rounded-md border px-3 py-2 text-xs',
-                        kindStyle('result'),
+                        kindStyle('result')
                       )}
                     >
                       <span className="font-medium mr-2">Result</span>
@@ -752,13 +903,13 @@ function ConversationViewer({
                       onClick={() => setSelectedIdx(isSelected ? null : i)}
                       className={cn(
                         'w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/40 transition',
-                        isSelected && 'bg-muted/60',
+                        isSelected && 'bg-muted/60'
                       )}
                     >
                       <span
                         className={cn(
                           'shrink-0 h-5 px-1.5 text-[10px] font-medium rounded border uppercase tracking-wide flex items-center',
-                          kindStyle(v.kind),
+                          kindStyle(v.kind)
                         )}
                       >
                         {v.kind}
@@ -786,7 +937,7 @@ function ConversationViewer({
         <aside
           className={cn(
             'bg-muted/10',
-            mode !== 'debug' || !selected ? 'hidden' : 'block',
+            mode !== 'debug' || !selected ? 'hidden' : 'block'
           )}
         >
           {selected && (
@@ -796,12 +947,14 @@ function ConversationViewer({
                   <span
                     className={cn(
                       'shrink-0 h-5 px-1.5 text-[10px] font-medium rounded border uppercase tracking-wide flex items-center',
-                      kindStyle(selected.kind),
+                      kindStyle(selected.kind)
                     )}
                   >
                     {selected.kind}
                   </span>
-                  <span className="text-sm font-semibold">{selected.label}</span>
+                  <span className="text-sm font-semibold">
+                    {selected.label}
+                  </span>
                 </div>
                 <button
                   onClick={() => setSelectedIdx(null)}
@@ -811,7 +964,8 @@ function ConversationViewer({
                   ✕
                 </button>
               </div>
-              {selected.kind === 'system' && typeof selected.raw === 'string' ? (
+              {selected.kind === 'system' &&
+              typeof selected.raw === 'string' ? (
                 <>
                   <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wide">
                     prompt
@@ -863,8 +1017,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   const [isSendingContext, setIsSendingContext] = useState(false)
   const [isStartingFix, setIsStartingFix] = useState(false)
   const [isCreatingPr, setIsCreatingPr] = useState(false)
-  const [isStartingOver, setIsStartingOver] = useState(false)
   const [showFeedback, setShowFeedback] = useState(false)
+  // Retry/start-over config dialog: prefilled from the run's stored config
+  // so the user can change harness/model/turns/branch and add retry notes.
+  const [showRetryConfig, setShowRetryConfig] = useState(false)
 
   const runQueryOptions = getRunWithLogsOptions({
     path: { project_id: project.id, run_id: Number(runId) },
@@ -885,7 +1041,9 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
 
   const currentRun = data?.run
   const isAutofixerRun = currentRun?.trigger_source_type === 'error_group'
-  const errorGroupId = isAutofixerRun ? currentRun?.trigger_source_id ?? null : null
+  const errorGroupId = isAutofixerRun
+    ? (currentRun?.trigger_source_id ?? null)
+    : null
 
   const { data: errorGroup } = useQuery({
     ...getErrorGroupOptions({
@@ -968,9 +1126,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         <AlertTriangle className="h-4 w-4" />
         <AlertTitle>Error</AlertTitle>
         <AlertDescription>
-          {error instanceof Error
-            ? error.message
-            : 'Failed to load run'}
+          {error instanceof Error ? error.message : 'Failed to load run'}
         </AlertDescription>
       </Alert>
     )
@@ -994,7 +1150,8 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   const phase = run.phase || ''
   const isAutofixer = run.trigger_source_type === 'error_group'
   const isAutofixerActive = isAutofixer && autofixerActivePhases.has(phase)
-  const isAutofixerWaiting = isAutofixer && autofixerInteractivePhases.has(phase)
+  const isAutofixerWaiting =
+    isAutofixer && autofixerInteractivePhases.has(phase)
   const isActive = activeStatuses.has(run.status) || isAutofixerActive
   // Autofixer runs in interactive phases (analyzed / fix_ready) are NOT "done" —
   // a retry would throw away the user's analysis work. Only offer Retry when
@@ -1003,23 +1160,19 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     !isActive && !isAutofixerWaiting && run.source !== 'cli_ephemeral'
 
   const onRetry = async () => {
+    if (isAutofixer && run.trigger_source_id) {
+      // Autofixer retry = configure + start a fresh analysis on the same
+      // error group. The dialog prefills this run's stored config.
+      setShowRetryConfig(true)
+      return
+    }
     setIsRetrying(true)
     try {
-      if (isAutofixer && run.trigger_source_id) {
-        // Autofixer retry = start a fresh analysis on the same error group
-        const { data: newRun } = await startAnalysis({
-          path: { project_id: project.id },
-          body: { error_group_id: run.trigger_source_id },
-          throwOnError: true,
-        })
-        navigate(`../agents/${newRun.id}`)
-      } else {
-        const { data: newRun } = await retryRun({
-          path: { project_id: project.id, run_id: run.id },
-          throwOnError: true,
-        })
-        navigate(`../agents/${newRun.id}`)
-      }
+      const { data: newRun } = await retryRun({
+        path: { project_id: project.id, run_id: run.id },
+        throwOnError: true,
+      })
+      navigate(`../agents/${newRun.id}`)
     } catch (e) {
       console.error('Failed to retry run:', e)
       toast.error(e instanceof Error ? e.message : 'Retry failed')
@@ -1086,23 +1239,11 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     }
   }
 
-  // "Start Over" — for autofixer runs only. Kicks off a fresh analysis on the
-  // same error group, then navigates to the new run.
-  const onStartOver = async () => {
+  // "Start Over" — for autofixer runs only. Opens the run-config dialog
+  // (prefilled from this run) and kicks off a fresh analysis on submit.
+  const onStartOver = () => {
     if (!run.trigger_source_id) return
-    setIsStartingOver(true)
-    try {
-      const { data: newRun } = await startAnalysis({
-        path: { project_id: project.id },
-        body: { error_group_id: run.trigger_source_id },
-        throwOnError: true,
-      })
-      navigate(`../agents/${newRun.id}`)
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to start over')
-    } finally {
-      setIsStartingOver(false)
-    }
+    setShowRetryConfig(true)
   }
 
   const onCancel = async () => {
@@ -1197,7 +1338,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
               ? 'border-green-500/20 bg-green-500/5'
               : run.status === 'failed' || run.status === 'cancelled'
                 ? 'border-red-500/20 bg-red-500/5'
-                : 'border-blue-500/20 bg-blue-500/5',
+                : 'border-blue-500/20 bg-blue-500/5'
           )}
         >
           <CardContent className="p-4 flex items-center justify-between gap-4 flex-wrap">
@@ -1206,20 +1347,21 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                 'Analysis complete. Generate a fix, or open feedback to refine.'}
               {phase === 'fix_ready' &&
                 'Fix is ready. Review the changes, then create a pull request.'}
-              {(phase === 'completed' || phase === 'pr_created') && run.pr_url && (
-                <span className="flex items-center gap-2">
-                  Pull request created —
-                  <a
-                    href={run.pr_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-green-400 hover:underline font-medium inline-flex items-center gap-1"
-                  >
-                    View PR #{run.pr_number}{' '}
-                    <ExternalLink className="h-3 w-3" />
-                  </a>
-                </span>
-              )}
+              {(phase === 'completed' || phase === 'pr_created') &&
+                run.pr_url && (
+                  <span className="flex items-center gap-2">
+                    Pull request created —
+                    <a
+                      href={run.pr_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-green-400 hover:underline font-medium inline-flex items-center gap-1"
+                    >
+                      View PR #{run.pr_number}{' '}
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </span>
+                )}
               {phase === 'no_fix' && (
                 <span className="text-muted-foreground">
                   No automatic fix available. Send feedback to retry.
@@ -1233,19 +1375,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             </div>
             <div className="flex gap-2 flex-shrink-0">
               {(['completed', 'failed', 'cancelled'] as const).includes(
-                run.status as 'completed' | 'failed' | 'cancelled',
+                run.status as 'completed' | 'failed' | 'cancelled'
               ) && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={isStartingOver}
-                  onClick={onStartOver}
-                >
-                  {isStartingOver ? (
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : (
-                    <RefreshCw className="h-4 w-4 mr-2" />
-                  )}
+                <Button variant="outline" size="sm" onClick={onStartOver}>
+                  <RefreshCw className="h-4 w-4 mr-2" />
                   Start Over
                 </Button>
               )}
@@ -1266,11 +1399,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                 </Button>
               )}
               {phase === 'analyzed' && (
-                <Button
-                  onClick={onStartFix}
-                  disabled={isStartingFix}
-                  size="sm"
-                >
+                <Button onClick={onStartFix} disabled={isStartingFix} size="sm">
                   {isStartingFix ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                   ) : (
@@ -1280,11 +1409,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                 </Button>
               )}
               {phase === 'fix_ready' && (
-                <Button
-                  onClick={onCreatePr}
-                  disabled={isCreatingPr}
-                  size="sm"
-                >
+                <Button onClick={onCreatePr} disabled={isCreatingPr} size="sm">
                   {isCreatingPr ? (
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                   ) : (
@@ -1338,24 +1463,23 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     </>
   ) : null
 
-
-
   // ── Tab contents ──────────────────────────────────────────────────────
-  const ConversationTab = combinedAiOutput || run.prompt_text ? (
-    <ConversationViewer
-      output={combinedAiOutput}
-      systemPrompt={run.prompt_text}
-      live={showLiveAi && isStreaming}
-    />
-  ) : (
-    <Card>
-      <CardContent className="p-6 text-center text-sm text-muted-foreground">
-        {isActive
-          ? 'Waiting for the agent to start the conversation…'
-          : 'No conversation recorded for this run.'}
-      </CardContent>
-    </Card>
-  )
+  const ConversationTab =
+    combinedAiOutput || run.prompt_text ? (
+      <ConversationViewer
+        output={combinedAiOutput}
+        systemPrompt={run.prompt_text}
+        live={showLiveAi && isStreaming}
+      />
+    ) : (
+      <Card>
+        <CardContent className="p-6 text-center text-sm text-muted-foreground">
+          {isActive
+            ? 'Waiting for the agent to start the conversation…'
+            : 'No conversation recorded for this run.'}
+        </CardContent>
+      </Card>
+    )
 
   const ReportTab = run.analysis ? (
     <Card>
@@ -1371,41 +1495,42 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     </Card>
   )
 
-  const LogsTab = systemLogs.length > 0 ? (
-    <Card>
-      <CardContent className="p-4 space-y-2">
-        {systemLogs.map((log: AgentRunLog) => (
-          <div key={log.id} className="flex items-start gap-3">
-            <div className="flex flex-col items-center pt-1.5">
-              <div
-                className={cn(
-                  'h-2 w-2 rounded-full flex-shrink-0',
-                  logLevelColor(log.level),
-                )}
-              />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground whitespace-nowrap">
-                  {formatTimestamp(log.created_at)}
-                </span>
-                <span className="text-xs font-medium uppercase text-muted-foreground">
-                  {log.level}
-                </span>
+  const LogsTab =
+    systemLogs.length > 0 ? (
+      <Card>
+        <CardContent className="p-4 space-y-2">
+          {systemLogs.map((log: AgentRunLog) => (
+            <div key={log.id} className="flex items-start gap-3">
+              <div className="flex flex-col items-center pt-1.5">
+                <div
+                  className={cn(
+                    'h-2 w-2 rounded-full flex-shrink-0',
+                    logLevelColor(log.level)
+                  )}
+                />
               </div>
-              <p className="text-sm break-words">{log.message}</p>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">
+                    {formatTimestamp(log.created_at)}
+                  </span>
+                  <span className="text-xs font-medium uppercase text-muted-foreground">
+                    {log.level}
+                  </span>
+                </div>
+                <p className="text-sm break-words">{log.message}</p>
+              </div>
             </div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  ) : (
-    <Card>
-      <CardContent className="p-6 text-center text-sm text-muted-foreground">
-        No system logs recorded.
-      </CardContent>
-    </Card>
-  )
+          ))}
+        </CardContent>
+      </Card>
+    ) : (
+      <Card>
+        <CardContent className="p-6 text-center text-sm text-muted-foreground">
+          No system logs recorded.
+        </CardContent>
+      </Card>
+    )
 
   const DetailsTab = (
     <div className="space-y-4">
@@ -1456,9 +1581,30 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       {run.error_message && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Error</AlertTitle>
-          <AlertDescription className="whitespace-pre-wrap font-mono text-xs">
-            {run.error_message}
+          <AlertTitle className="flex items-center justify-between gap-2">
+            Error
+            {run.error_message.length > 1200 && (
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="outline" size="sm">
+                    View full
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-3xl">
+                  <DialogHeader>
+                    <DialogTitle>Full error message</DialogTitle>
+                  </DialogHeader>
+                  <pre className="text-xs bg-muted/40 border border-border rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap break-words">
+                    {run.error_message}
+                  </pre>
+                </DialogContent>
+              </Dialog>
+            )}
+          </AlertTitle>
+          <AlertDescription className="whitespace-pre-wrap font-mono text-xs max-h-48 overflow-y-auto break-words">
+            {run.error_message.length > 1200
+              ? run.error_message.slice(0, 1200) + '\n\n… (truncated)'
+              : run.error_message}
           </AlertDescription>
         </Alert>
       )}
@@ -1617,83 +1763,116 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
 
   return (
     <div className="space-y-6 pb-24 lg:pb-6">
-          <div className="space-y-2">
-            {/* Single compact row: back · run id · status · agent name · inline metrics · actions */}
-            <div className="flex items-center gap-2 flex-wrap">
-              <Button variant="ghost" size="icon" asChild className="shrink-0 -ml-2 h-7 w-7">
-                <Link to="../agents">
-                  <ArrowLeft className="h-4 w-4" />
-                </Link>
-              </Button>
-              <span className="text-xs text-muted-foreground font-mono shrink-0">
-                #{run.id}
-              </span>
-              <AutopilotStatusBadge status={run.status} />
-              {run.agent_name && (
-                <h1 className="text-sm font-semibold truncate min-w-0">
-                  {run.agent_name}
-                </h1>
-              )}
-              {isStreaming && (
-                <span className="text-[10px] font-medium text-emerald-500 animate-pulse tracking-wide">
-                  ● LIVE
-                </span>
-              )}
-              <span className="hidden sm:inline text-xs text-muted-foreground tabular-nums ml-auto">
-                {run.files_changed ?? 0} files · {durationText}
-                {costText ? ` · ${costText}` : ''}
-              </span>
-              <div className="flex items-center gap-1 shrink-0 ml-auto sm:ml-2">
-                {PrimaryActions}
-              </div>
-            </div>
-
-            {autofixerActionBar && (
-              <div className="space-y-2">{autofixerActionBar}</div>
-            )}
-
-            {/* Tabs as plain text links, no pill, no card */}
-            <Tabs defaultValue="conversation" className="w-full">
-              <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
-                <TabsTrigger
-                  value="conversation"
-                  className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
-                >
-                  Conversation
-                </TabsTrigger>
-                <TabsTrigger
-                  value="report"
-                  className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
-                >
-                  Report
-                </TabsTrigger>
-                <TabsTrigger
-                  value="details"
-                  className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
-                >
-                  Details
-                </TabsTrigger>
-                <TabsTrigger
-                  value="logs"
-                  className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
-                >
-                  Logs
-                </TabsTrigger>
-              </TabsList>
-              <TabsContent value="conversation" className="mt-2">
-                {ConversationTab}
-              </TabsContent>
-              <TabsContent value="report" className="mt-4">
-                {ReportTab}
-              </TabsContent>
-              <TabsContent value="details" className="mt-4">
-                {DetailsTab}
-              </TabsContent>
-              <TabsContent value="logs" className="mt-4">
-                {LogsTab}
-              </TabsContent>
-            </Tabs>
+      <div className="space-y-2">
+        {/* Single compact row: back · run id · status · agent name · inline metrics · actions */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            variant="ghost"
+            size="icon"
+            asChild
+            className="shrink-0 -ml-2 h-7 w-7"
+          >
+            <Link to="../agents">
+              <ArrowLeft className="h-4 w-4" />
+            </Link>
+          </Button>
+          <span className="text-xs text-muted-foreground font-mono shrink-0">
+            #{run.id}
+          </span>
+          <AutopilotStatusBadge status={run.status} />
+          {run.agent_name && (
+            <h1 className="text-sm font-semibold truncate min-w-0">
+              {run.agent_name}
+            </h1>
+          )}
+          {isStreaming && (
+            <span className="text-[10px] font-medium text-emerald-500 animate-pulse tracking-wide">
+              ● LIVE
+            </span>
+          )}
+          <span className="hidden sm:inline text-xs text-muted-foreground tabular-nums ml-auto">
+            {run.files_changed ?? 0} files · {durationText}
+            {costText ? ` · ${costText}` : ''}
+          </span>
+          <div className="flex items-center gap-1 shrink-0 ml-auto sm:ml-2">
+            {PrimaryActions}
           </div>
+        </div>
+
+        {autofixerActionBar && (
+          <div className="space-y-2">{autofixerActionBar}</div>
+        )}
+
+        {/* Tabs as plain text links, no pill, no card */}
+        <Tabs defaultValue="conversation" className="w-full">
+          <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
+            <TabsTrigger
+              value="conversation"
+              className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
+            >
+              Conversation
+            </TabsTrigger>
+            <TabsTrigger
+              value="report"
+              className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
+            >
+              Report
+            </TabsTrigger>
+            <TabsTrigger
+              value="details"
+              className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
+            >
+              Details
+            </TabsTrigger>
+            <TabsTrigger
+              value="logs"
+              className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
+            >
+              Logs
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="conversation" className="mt-2">
+            {ConversationTab}
+          </TabsContent>
+          <TabsContent value="report" className="mt-4">
+            {ReportTab}
+          </TabsContent>
+          <TabsContent value="details" className="mt-4">
+            {DetailsTab}
+          </TabsContent>
+          <TabsContent value="logs" className="mt-4">
+            {LogsTab}
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      {/* Retry / start-over config dialog (autofixer runs). Prefilled from
+          this run's stored config; notes become the new run's user context. */}
+      <Dialog open={showRetryConfig} onOpenChange={setShowRetryConfig}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Start a new autofix run</DialogTitle>
+            <DialogDescription>
+              Adjust the harness, model, turn limit, or branch — and tell the
+              model what to do differently this time.
+            </DialogDescription>
+          </DialogHeader>
+          {run.trigger_source_id != null && (
+            <AutofixRunConfigForm
+              project={project}
+              errorGroupId={run.trigger_source_id}
+              initialConfig={run.run_config}
+              notesPlaceholder="Notes for this retry — e.g. what went wrong last time, or where to focus..."
+              submitLabel="Start New Run"
+              onStarted={(newRunId) => {
+                setShowRetryConfig(false)
+                navigate(`../agents/${newRunId}`)
+              }}
+              onCancel={() => setShowRetryConfig(false)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

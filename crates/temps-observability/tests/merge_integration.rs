@@ -17,6 +17,32 @@ use temps_observability::{
 };
 use uuid::Uuid;
 
+/// Build the merge service over the default TimescaleDB storage backends —
+/// the same wiring `configure_routes` produces on a server without
+/// `TEMPS_CLICKHOUSE_*`. (The ClickHouse path is covered by
+/// `clickhouse_observe_test.rs`.)
+fn build_service(db: &Arc<DatabaseConnection>) -> ObservabilityService {
+    let geo = Arc::new(temps_geo::GeoIpService::Mock(
+        temps_geo::MockGeoIpService::new(),
+    ));
+    let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geo));
+    let storage = Arc::new(temps_proxy::storage::TimescaleDbProxyLogStore::new(
+        db.clone(),
+        ip_service.clone(),
+    ));
+    let proxy_logs = Arc::new(
+        temps_proxy::service::proxy_log_service::ProxyLogService::with_storage(
+            db.clone(),
+            ip_service,
+            storage,
+        ),
+    );
+    let otel: Arc<dyn temps_otel::storage::OtelStorage> = Arc::new(
+        temps_otel::storage::timescaledb::TimescaleDbStorage::new(db.clone(), None),
+    );
+    ObservabilityService::new(db.clone(), proxy_logs, otel)
+}
+
 async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
     use temps_entities::preset::Preset;
     let slug = format!("obs-{}", Uuid::new_v4());
@@ -117,13 +143,16 @@ async fn merge_returns_rows_in_descending_ts_across_kinds() {
     .await
     .expect("insert revenue event");
 
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
     let events = service
         .query(EventFilters {
             project_id,
             kinds: EventKind::ALL.iter().copied().collect(),
-            from: None,
-            to: None,
+            // Fixture rows sit at a fixed 2026-05-01 timestamp, not "now" — an
+            // omitted range now defaults to the last hour (see
+            // `temps_core::time_window`), which would silently exclude them.
+            from: Some(t_revenue - Duration::minutes(1)),
+            to: Some(t_request + Duration::minutes(1)),
             deployment_id: None,
             environment_id: None,
             search: None,
@@ -181,7 +210,7 @@ async fn kinds_filter_excludes_unselected_tables() {
     .await
     .expect("insert error");
 
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
 
     let only_errors = service
         .query(EventFilters {
@@ -230,7 +259,7 @@ async fn time_range_filters_old_rows() {
         .expect("insert");
     }
 
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
     let recent = service
         .query(EventFilters {
             project_id,
@@ -251,6 +280,83 @@ async fn time_range_filters_old_rows() {
         panic!("expected request");
     };
     assert_eq!(r.path, "/new");
+    // Row identity is the request_id string (backend-agnostic), not the PK.
+    assert_eq!(r.id, "new");
+}
+
+#[tokio::test]
+async fn hide_bots_tri_state_filters_bot_rows_on_timescaledb() {
+    let test_db = TestDatabase::with_migrations().await.expect("test db");
+    let db = test_db.connection_arc();
+    let project_id = create_test_project(&db).await;
+
+    let now = Utc::now();
+    // Three rows: detected bot, detected non-bot, and NULL is_bot (older row
+    // without detection metadata).
+    for (req_id, is_bot) in [
+        ("bot-row", Some(true)),
+        ("human-row", Some(false)),
+        ("legacy-row", None),
+    ] {
+        proxy_logs::ActiveModel {
+            timestamp: Set(now),
+            method: Set("GET".into()),
+            path: Set(format!("/{}", req_id)),
+            host: Set("h".into()),
+            status_code: Set(200),
+            request_source: Set("proxy".into()),
+            is_system_request: Set(false),
+            routing_status: Set("routed".into()),
+            project_id: Set(Some(project_id)),
+            request_id: Set(req_id.into()),
+            is_bot: Set(is_bot),
+            created_date: Set(now.date_naive()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert");
+    }
+
+    let service = build_service(&db);
+    let query = |hide_bots| {
+        service.query(EventFilters {
+            project_id,
+            kinds: [EventKind::Request].iter().copied().collect(),
+            from: None,
+            to: None,
+            deployment_id: None,
+            environment_id: None,
+            search: None,
+            limit: 50,
+            hide_bots,
+        })
+    };
+
+    // hide_bots=true — drop detected bots, KEEP the NULL-is_bot row.
+    let hidden = query(Some(true)).await.expect("hide bots");
+    let ids: Vec<String> = hidden
+        .iter()
+        .map(|e| match e {
+            ObservabilityEvent::Request(r) => r.id.clone(),
+            other => panic!("expected request, got {:?}", other.kind()),
+        })
+        .collect();
+    assert_eq!(hidden.len(), 2, "bot row must be excluded, NULL row kept");
+    assert!(ids.contains(&"human-row".to_string()));
+    assert!(ids.contains(&"legacy-row".to_string()));
+
+    // hide_bots=false — ONLY detected bots.
+    let only_bots = query(Some(false)).await.expect("only bots");
+    assert_eq!(only_bots.len(), 1);
+    let ObservabilityEvent::Request(r) = &only_bots[0] else {
+        panic!("expected request");
+    };
+    assert_eq!(r.id, "bot-row");
+
+    // hide_bots=None — everything.
+    let all = query(None).await.expect("no bot filter");
+    assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]
@@ -260,7 +366,7 @@ async fn fetch_full_returns_untruncated_request() {
     let project_id = create_test_project(&db).await;
 
     let now = Utc::now();
-    let inserted = proxy_logs::ActiveModel {
+    proxy_logs::ActiveModel {
         timestamp: Set(now),
         method: Set("POST".into()),
         path: Set("/checkout".into()),
@@ -284,9 +390,11 @@ async fn fetch_full_returns_untruncated_request() {
     .await
     .expect("insert");
 
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
+    // Rows are identified by request_id (backend-agnostic), with the row's
+    // timestamp as a lookup-bounding hint.
     let full = service
-        .fetch_full(project_id, EventKind::Request, &inserted.id.to_string())
+        .fetch_full(project_id, EventKind::Request, "rid", Some(now))
         .await
         .expect("fetch full");
 
@@ -306,10 +414,10 @@ async fn fetch_full_404s_for_unknown_id() {
     let test_db = TestDatabase::with_migrations().await.expect("test db");
     let db = test_db.connection_arc();
     let project_id = create_test_project(&db).await;
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
 
     let err = service
-        .fetch_full(project_id, EventKind::Request, "999999")
+        .fetch_full(project_id, EventKind::Request, "999999", None)
         .await
         .unwrap_err();
     assert!(matches!(err, ObservabilityError::EventNotFound { .. }));
@@ -323,7 +431,7 @@ async fn fetch_full_404s_for_wrong_project() {
     let project_b = create_test_project(&db).await;
 
     let now = Utc::now();
-    let inserted = proxy_logs::ActiveModel {
+    proxy_logs::ActiveModel {
         timestamp: Set(now),
         method: Set("GET".into()),
         path: Set("/x".into()),
@@ -341,23 +449,26 @@ async fn fetch_full_404s_for_wrong_project() {
     .await
     .expect("insert");
 
-    let service = ObservabilityService::new(db.clone());
-    // Same id, but wrong project — must not leak across project boundaries.
+    let service = build_service(&db);
+    // Same request_id, but wrong project — must not leak across project
+    // boundaries even though the storage lookup itself is not project-scoped.
     let err = service
-        .fetch_full(project_b, EventKind::Request, &inserted.id.to_string())
+        .fetch_full(project_b, EventKind::Request, "r", Some(now))
         .await
         .unwrap_err();
     assert!(matches!(err, ObservabilityError::EventNotFound { .. }));
 }
 
 #[tokio::test]
-async fn fetch_full_rejects_malformed_id() {
+async fn fetch_full_404s_for_span_id_without_composite_separator() {
     let test_db = TestDatabase::with_migrations().await.expect("test db");
     let db = test_db.connection_arc();
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
 
+    // Span identities are `{trace_id}:{span_id}`; anything without the
+    // separator must 404 rather than error out.
     let err = service
-        .fetch_full(1, EventKind::Request, "not-an-int")
+        .fetch_full(1, EventKind::Span, "not-a-composite-id", None)
         .await
         .unwrap_err();
     assert!(matches!(err, ObservabilityError::EventNotFound { .. }));
@@ -373,7 +484,10 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
 
     // otel_spans has no Sea-ORM entity — insert raw via SQL, then query
     // through the merge service.
-    let t = Utc.with_ymd_and_hms(2026, 5, 1, 12, 6, 0).unwrap();
+    // Recent timestamp: these raw inserts have no otel_trace_summaries row,
+    // and the TimescaleDB get_trace fallback for summary-less traces only
+    // scans the last 7 days.
+    let t = Utc::now() - Duration::hours(1);
     let trace_id = "deadbeefdeadbeefdeadbeefdeadbeef";
     let span_id = "1111111111111111";
     db.execute(Statement::from_sql_and_values(
@@ -398,12 +512,40 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
     .await
     .expect("insert otel_spans");
 
-    let service = ObservabilityService::new(db.clone());
+    // A CHILD span in the same trace — must be EXCLUDED by the root-only
+    // default (this falsifies the `root_only` predicate: without it the feed
+    // would return two rows) and FOUND when a name search widens the scope.
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO otel_spans \
+         (project_id, deployment_id, service_name, trace_id, span_id, parent_span_id, \
+          name, kind, start_time, end_time, duration_ms, status_code, status_message, \
+          attributes, events) \
+         VALUES ($1, NULL, $2, $3, $4, $5, $6, 'CLIENT', $7, $8, $9, 'OK', '', \
+                 '{}'::jsonb, '[]'::jsonb)",
+        vec![
+            project_id.into(),
+            "checkout".into(),
+            trace_id.into(),
+            "3333333333333333".into(),
+            span_id.into(),
+            "SELECT checkout_items".into(),
+            (t + Duration::milliseconds(5)).into(),
+            (t + Duration::milliseconds(20)).into(),
+            15.0_f64.into(),
+        ],
+    ))
+    .await
+    .expect("insert child otel_span");
+
+    let service = build_service(&db);
     let events = service
         .query(EventFilters {
             project_id,
             kinds: [EventKind::Span].iter().copied().collect(),
-            from: None,
+            // `t` sits exactly at the default 1h lookback boundary — pin an
+            // explicit `from` so this doesn't flake on execution timing.
+            from: Some(t - Duration::minutes(5)),
             to: None,
             deployment_id: None,
             environment_id: None,
@@ -414,7 +556,7 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
         .await
         .expect("query spans");
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 1, "root-only default must exclude the child");
     let ObservabilityEvent::Span(row) = &events[0] else {
         panic!("expected span row");
     };
@@ -422,12 +564,53 @@ async fn fetch_spans_returns_span_rows_from_otel_table() {
     assert_eq!(row.operation, "GET /checkout");
     assert_eq!(row.trace_id, trace_id);
     assert_eq!(row.span_id, span_id);
+    // Composite backend-agnostic identity.
+    assert_eq!(row.id, format!("{trace_id}:{span_id}"));
     assert_eq!(row.duration_ms, Some(42.0));
     assert_eq!(row.status.as_deref(), Some("OK"));
     assert_eq!(
         row.attributes.get("http.method").and_then(|v| v.as_str()),
         Some("GET"),
     );
+
+    // A name search drops the root restriction so child spans are found.
+    let searched = service
+        .query(EventFilters {
+            project_id,
+            kinds: [EventKind::Span].iter().copied().collect(),
+            from: Some(t - Duration::minutes(5)),
+            to: None,
+            deployment_id: None,
+            environment_id: None,
+            search: Some("SELECT".into()),
+            limit: 50,
+            hide_bots: None,
+        })
+        .await
+        .expect("span search");
+    assert_eq!(searched.len(), 1);
+    let ObservabilityEvent::Span(child) = &searched[0] else {
+        panic!("expected span row");
+    };
+    assert_eq!(child.operation, "SELECT checkout_items");
+    assert_eq!(child.parent_span_id.as_deref(), Some(span_id));
+
+    // fetch_full resolves the composite id through the trace lookup on the
+    // TimescaleDB backend too.
+    let full = service
+        .fetch_full(
+            project_id,
+            EventKind::Span,
+            &format!("{trace_id}:3333333333333333"),
+            None,
+        )
+        .await
+        .expect("fetch_full span on TimescaleDB");
+    let FullEvent::Span(full_span) = full else {
+        panic!("expected span full event");
+    };
+    assert_eq!(full_span.operation, "SELECT checkout_items");
+    assert_eq!(full_span.span_id, "3333333333333333");
 }
 
 #[tokio::test]
@@ -513,13 +696,16 @@ async fn merge_interleaves_spans_with_other_kinds() {
     .await
     .expect("insert revenue");
 
-    let service = ObservabilityService::new(db.clone());
+    let service = build_service(&db);
     let events = service
         .query(EventFilters {
             project_id,
             kinds: EventKind::ALL.iter().copied().collect(),
-            from: None,
-            to: None,
+            // Fixture rows sit at a fixed 2026-05-01 timestamp, not "now" — an
+            // omitted range now defaults to the last hour (see
+            // `temps_core::time_window`), which would silently exclude them.
+            from: Some(t_revenue - Duration::minutes(1)),
+            to: Some(t_request + Duration::minutes(1)),
             deployment_id: None,
             environment_id: None,
             search: None,

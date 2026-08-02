@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { Plus } from 'lucide-react'
 import { Button, type ButtonProps } from '@/components/ui/button'
 import { KbdBadge } from '@/components/ui/kbd-badge'

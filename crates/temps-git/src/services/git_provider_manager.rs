@@ -1557,6 +1557,7 @@ impl GitProviderManager {
     /// Get connections for a user with pagination and sorting
     pub async fn get_user_connections_paginated(
         &self,
+        caller_user_id: i32,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1565,7 +1566,8 @@ impl GitProviderManager {
         use sea_orm::QueryOrder;
 
         let mut query = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true));
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(caller_user_id)));
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {
@@ -1835,6 +1837,36 @@ impl GitProviderManager {
                 }
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Classify a failed provider HTTP response into a typed error.
+    ///
+    /// Provider 401/403 responses MUST become
+    /// [`GitProviderError::AuthenticationFailed`] rather than a generic
+    /// `ApiError`, for two reasons:
+    ///
+    /// 1. [`Self::is_authentication_error`] drives the token
+    ///    force-refresh-and-retry path. A 401 flattened into `ApiError`
+    ///    silently skips that retry, so an expired-but-refreshable token
+    ///    hard-fails instead of recovering.
+    /// 2. The HTTP layer maps `AuthenticationFailed` to a distinct problem
+    ///    type, so clients can tell "reconnect this git account" apart from
+    ///    "the provider is having a bad day" and say so to the user.
+    ///
+    /// `operation` names what was being fetched, so the message stays
+    /// greppable and specific (e.g. "get tree for owner/repo@main").
+    fn classify_provider_response_error(
+        status: reqwest::StatusCode,
+        operation: &str,
+    ) -> GitProviderError {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::AuthenticationFailed(format!(
+                "provider rejected the stored credential while trying to {}: HTTP {}",
+                operation, status
+            ))
+        } else {
+            GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
         }
     }
 
@@ -3121,7 +3153,7 @@ impl GitProviderManager {
         owner: &str,
         repo: &str,
         branch: &str,
-    ) -> Result<Vec<String>, GitProviderManagerError> {
+    ) -> Result<Vec<String>, GitProviderError> {
         // For GitHub, we can use the tree API to get file list
         // For other providers, we may need different approaches
 
@@ -3145,35 +3177,23 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: serde_json::Value = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data["tree"]
                     .as_array()
-                    .ok_or_else(|| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(
-                            "No tree in response".to_string(),
-                        ))
-                    })?
+                    .ok_or_else(|| GitProviderError::ApiError("No tree in response".to_string()))?
                     .iter()
                     .filter_map(|item| {
                         if item["type"].as_str() == Some("blob") {
@@ -3200,26 +3220,18 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data
@@ -3301,31 +3313,41 @@ impl GitProviderManager {
         // Repository always has a git provider connection (required field)
         let connection_id = repository.git_provider_connection_id;
 
-        // Get the git provider connection
-        let connection = self.get_connection(connection_id).await?;
-        let provider_service = self.get_provider_service(connection.provider_id).await?;
-
-        // Decrypt access token
-        let access_token = if let Some(ref encrypted) = connection.access_token {
-            self.decrypt_string(encrypted).await?
-        } else {
-            return Err(GitProviderManagerError::InvalidConfiguration(
-                "Git provider connection has no access token configured".to_string(),
-            ));
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
         };
 
         // Use provided branch or fall back to repository's default branch
         let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
 
-        // Get all files in the repository
+        // Get all files in the repository.
+        //
+        // Routed through `execute_with_refresh` so an expired-but-refreshable
+        // access token is refreshed and retried instead of surfacing a 401 to
+        // the user. This previously decrypted the token inline and called
+        // directly, so preset detection was the one provider path that never
+        // got the refresh treatment — and because a provider 401 was also
+        // flattened into a generic `ApiError`, the retry could not have fired
+        // even if it had been wrapped (see
+        // `classify_provider_response_error`).
         let files = self
-            .get_repository_files(
-                &provider_service,
-                &access_token,
-                &repository.owner,
-                &repository.name,
-                &target_branch,
-            )
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                async move {
+                    self.get_repository_files(
+                        &provider_service,
+                        &access_token,
+                        &owner,
+                        &name,
+                        &target_branch,
+                    )
+                    .await
+                }
+            })
             .await?;
 
         // Detect presets in root and subdirectories
@@ -3397,22 +3419,30 @@ impl GitProviderManager {
         detected_presets
             .into_iter()
             .map(|preset| {
-                // Parse preset slug to get metadata from entity enum
-                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
-
-                let exposed_port = preset_enum
+                let runtime_preset = temps_presets::get_preset_by_slug(&preset.slug);
+                let preset_enum = runtime_preset
                     .as_ref()
-                    .and_then(|p| p.exposed_port())
-                    .or(preset.exposed_port);
+                    .and_then(|preset| preset.stored_preset());
 
-                let icon_url = preset_enum
-                    .as_ref()
-                    .and_then(|p| p.icon_url())
-                    .map(|s| s.to_string());
+                // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
+                let exposed_port = preset
+                    .exposed_port
+                    .or_else(|| preset_enum.as_ref().and_then(|p| p.exposed_port()));
 
-                let project_type = preset_enum
+                let icon_url = runtime_preset
                     .as_ref()
-                    .map(|p| p.project_type().to_string())
+                    .map(|preset| preset.icon_url())
+                    .or_else(|| {
+                        preset_enum
+                            .as_ref()
+                            .and_then(|p| p.icon_url())
+                            .map(|s| s.to_string())
+                    });
+
+                let project_type = runtime_preset
+                    .as_ref()
+                    .map(|preset| preset.project_type().to_string())
+                    .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                     .unwrap_or_else(|| "unknown".to_string());
 
                 ProjectPresetDomain {
@@ -5349,6 +5379,84 @@ impl GitProviderManagerTrait for GitProviderManager {
                 connection_id, owner, repo, e
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod classify_provider_response_error_tests {
+    use super::*;
+
+    /// A provider 401 MUST become `AuthenticationFailed`, not `ApiError`.
+    /// `is_authentication_error` keys off this variant to drive the token
+    /// force-refresh-and-retry, and the HTTP layer maps it to 401 +
+    /// `errors/authentication_failed` so clients can say "reconnect this
+    /// account" instead of "the provider is down".
+    #[test]
+    fn unauthorized_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "401 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// 403 is the other shape a revoked/insufficient credential takes
+    /// (GitHub returns it for token scope problems and some rate limits).
+    #[test]
+    fn forbidden_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::FORBIDDEN,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "403 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// Everything else stays a generic API error — a provider outage is not
+    /// a credential problem and must not tell the user to reconnect.
+    #[test]
+    fn server_error_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::ApiError(_)),
+            "500 must stay ApiError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_found_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "get tree for owner/repo@main",
+        );
+        assert!(matches!(err, GitProviderError::ApiError(_)));
+    }
+
+    /// The operation and status must survive into the message — these errors
+    /// are the only breadcrumb when a self-hosted user debugs alone.
+    #[test]
+    fn message_names_the_operation_and_status() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for gotempsh/temps-examples@main",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gotempsh/temps-examples@main"),
+            "message should name the operation: {msg}"
+        );
+        assert!(
+            msg.contains("401"),
+            "message should carry the status: {msg}"
+        );
     }
 }
 

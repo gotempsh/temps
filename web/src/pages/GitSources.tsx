@@ -37,16 +37,15 @@ import {
   ChevronRight,
   EllipsisVertical,
   GitBranch,
-  GitFork,
-  Globe,
   Loader2,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 // Helper function to check if provider is GitHub App
@@ -247,15 +246,10 @@ export function GitSources() {
               provider: ProviderResponse
               className?: string
             }) =>
-              provider.provider_type === 'github' ? (
-                <GithubIcon className={className} />
-              ) : provider.provider_type === 'gitea' ? (
-                <GitFork className={className} />
-              ) : provider.provider_type === 'generic' ? (
-                <Globe className={className} />
-              ) : (
-                <GitBranch className={className} />
-              )
+              <ProviderLogo
+                providerType={provider.provider_type}
+                className={className}
+              />
 
             const ActionsMenu = ({ provider }: { provider: ProviderResponse }) => (
               <div

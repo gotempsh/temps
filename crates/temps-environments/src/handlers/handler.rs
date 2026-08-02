@@ -1,12 +1,13 @@
 use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
+    EnvironmentVariableValueRevealedAudit,
 };
 use super::types::AppState;
 use axum::Router;
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Json,
@@ -68,6 +69,16 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
+            EnvVarError::SecretValueCannotBeRevealed { .. } => {
+                temps_core::error_builder::forbidden()
+                    .title("Secret environment variable is write-only")
+                    .detail(err.to_string())
+                    .build()
+            }
+            EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
+                .title("Environment variable value is ambiguous")
+                .detail(err.to_string())
+                .build(),
             EnvVarError::AlreadyExists { .. } => temps_core::error_builder::conflict()
                 .title("Environment Variable Already Exists")
                 .detail(err.to_string())
@@ -77,6 +88,12 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                 .build(),
         }
     }
+}
+
+fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    permission_guard!(auth, SecretsRead);
+    Ok(())
 }
 
 impl From<crate::services::secret_service::SecretError> for Problem {
@@ -536,6 +553,7 @@ pub async fn get_resolved_environment_variables(
             service_name: svc.service.service_name.clone(),
             service_type: svc.service.service_type.clone(),
             service_slug: svc.service.service_slug.clone(),
+            service_updated_at: svc.service.service_updated_at.clone(),
         };
         for var in &svc.variables {
             if let Some(prev) = integration_by_key.insert(var.key.clone(), info.clone()) {
@@ -585,6 +603,7 @@ pub async fn get_resolved_environment_variables(
             service_name: svc.service.service_name,
             service_type: svc.service.service_type,
             service_slug: svc.service.service_slug,
+            service_updated_at: svc.service.service_updated_at,
         };
         for var in svc.variables {
             if manual_keys.contains(&var.key) {
@@ -611,9 +630,9 @@ pub async fn get_resolved_environment_variables(
 /// from linked integrations (which are not stored in the `env_vars` table).
 /// Resolution order mirrors the merged view:
 ///
-/// 1. Manual env var with this key (already audit-logged via the existing reveal
-///    endpoint flow) — this endpoint defers to the manual store when the key
-///    exists there, so callers can use a single endpoint regardless of source.
+/// 1. Manual env var with this key — this endpoint reads the manual store when
+///    the key exists there, then writes its own reveal audit event so callers
+///    can safely use one endpoint regardless of source.
 /// 2. Integration env var supplied by a linked external service.
 ///
 /// Returns 404 when neither a manual var nor an integration produces the key.
@@ -623,13 +642,17 @@ pub async fn get_resolved_environment_variables(
     tag = "Projects",
     responses(
         (status = 200, description = "Resolved environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project, key, or integration not found"),
+        (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("key" = String, Path, description = "Environment variable key"),
-        ("environment_id" = Option<i32>, Query, description = "Optional environment ID (manual vars only)")
+        ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
+        ("var_id" = Option<i32>, Query, description = "Exact manual environment-variable row ID"),
+        ("service_id" = Option<i32>, Query, description = "Integration service ID shown by the resolved list")
     )
 )]
 pub async fn get_resolved_environment_variable_value(
@@ -637,8 +660,9 @@ pub async fn get_resolved_environment_variable_value(
     Path((project_id, key)): Path<(i32, String)>,
     Query(params): Query<GetEnvironmentVariablesQuery>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsRead);
+    require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -650,18 +674,35 @@ pub async fn get_resolved_environment_variable_value(
         "env_var.reveal_resolved"
     );
 
-    // Prefer a manual value when one exists — same audit surface as the
-    // per-key reveal endpoint, and manual values shadow integration values.
-    match state
-        .env_var_service
-        .get_environment_variable_value(project_id, &key, params.environment_id)
-        .await
-    {
-        Ok(value) => return Ok(Json(EnvironmentVariableValueResponse { value })),
-        Err(crate::services::env_var_service::EnvVarError::NotFound(_)) => {
-            // Fall through to integration lookup.
+    // Prefer a manual value when one exists; manual values shadow integration
+    // values in the resolved view.
+    if params.service_id.is_none() {
+        match state
+            .env_var_service
+            .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
+            .await
+        {
+            Ok(value) => {
+                audit_environment_variable_reveal(
+                    state.audit_service.as_ref(),
+                    reveal_audit_context(&auth, &metadata),
+                    EnvironmentVariableRevealTarget {
+                        project_id,
+                        key: &key,
+                        var_id: params.var_id,
+                        environment_id: params.environment_id,
+                        service_id: None,
+                        source: "manual",
+                    },
+                )
+                .await?;
+                return Ok(environment_variable_value_response(value));
+            }
+            Err(crate::services::env_var_service::EnvVarError::NotFound(_)) => {
+                // Fall through to integration lookup.
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => return Err(e.into()),
     }
 
     // No manual entry — look the key up in the integration provider.
@@ -685,19 +726,38 @@ pub async fn get_resolved_environment_variable_value(
                 .build()
         })?;
 
-    // Walk services in order; later services win on collisions (matches the
-    // list endpoint).
-    let mut resolved_value: Option<String> = None;
-    for svc in &services {
-        for var in &svc.variables {
-            if var.key == key {
-                resolved_value = Some(var.value.clone());
-            }
-        }
-    }
+    let resolved_value = resolve_integration_environment_variable(
+        &services,
+        &key,
+        params.service_id,
+    )
+    .map_err(|IntegrationEnvironmentVariableResolutionError::Ambiguous| {
+        temps_core::error_builder::conflict()
+            .title("Environment variable key is ambiguous")
+            .detail(format!(
+                "Environment variable '{}' is provided by multiple integration services; specify service_id",
+                key
+            ))
+            .build()
+    })?;
 
     match resolved_value {
-        Some(value) => Ok(Json(EnvironmentVariableValueResponse { value })),
+        Some(value) => {
+            audit_environment_variable_reveal(
+                state.audit_service.as_ref(),
+                reveal_audit_context(&auth, &metadata),
+                EnvironmentVariableRevealTarget {
+                    project_id,
+                    key: &key,
+                    var_id: None,
+                    environment_id: params.environment_id,
+                    service_id: params.service_id,
+                    source: "integration",
+                },
+            )
+            .await?;
+            Ok(environment_variable_value_response(value))
+        }
         None => Err(temps_core::error_builder::not_found()
             .title("Environment variable not found")
             .detail(format!(
@@ -884,13 +944,16 @@ pub async fn update_environment_variable(
     tag = "Projects",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Project or variable not found"),
+        (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("key" = String, Path, description = "Environment variable key"),
-        ("environment_id" = Option<i32>, Query, description = "Optional environment ID")
+        ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
+        ("var_id" = Option<i32>, Query, description = "Exact environment-variable row ID")
     )
 )]
 pub async fn get_environment_variable_value(
@@ -898,15 +961,12 @@ pub async fn get_environment_variable_value(
     Path((project_id, key)): Path<(i32, String)>,
     Query(params): Query<GetEnvironmentVariablesQuery>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsRead);
+    require_plaintext_environment_read(&auth)?;
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Reveal of a single decrypted secret. Logged at info so any
-    // bulk-reveal pattern (one of the obvious post-compromise behaviors)
-    // is grep-able in the structured logs even before a dedicated audit
-    // event is added.
     info!(
         user_id = auth.user_id(),
         project_id = project_id,
@@ -917,10 +977,115 @@ pub async fn get_environment_variable_value(
 
     let value = state
         .env_var_service
-        .get_environment_variable_value(project_id, &key, params.environment_id)
+        .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
         .await?;
 
-    Ok(Json(EnvironmentVariableValueResponse { value }))
+    audit_environment_variable_reveal(
+        state.audit_service.as_ref(),
+        reveal_audit_context(&auth, &metadata),
+        EnvironmentVariableRevealTarget {
+            project_id,
+            key: &key,
+            var_id: params.var_id,
+            environment_id: params.environment_id,
+            service_id: None,
+            source: "manual",
+        },
+    )
+    .await?;
+
+    Ok(environment_variable_value_response(value))
+}
+
+fn reveal_audit_context(
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+) -> AuditContext {
+    AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+async fn audit_environment_variable_reveal(
+    audit_service: &dyn temps_core::AuditLogger,
+    context: AuditContext,
+    target: EnvironmentVariableRevealTarget<'_>,
+) -> Result<(), Problem> {
+    let audit_event = EnvironmentVariableValueRevealedAudit {
+        context,
+        project_id: target.project_id,
+        key: target.key.to_string(),
+        var_id: target.var_id,
+        environment_id: target.environment_id,
+        service_id: target.service_id,
+        source: target.source,
+    };
+    audit_service
+        .create_audit_log(&audit_event)
+        .await
+        .map_err(|audit_error| {
+            error!(
+                project_id = target.project_id,
+                env_var_key = %target.key,
+                var_id = ?target.var_id,
+                environment_id = ?target.environment_id,
+                source = target.source,
+                error = %audit_error,
+                "Failed to audit environment variable reveal"
+            );
+            temps_core::error_builder::internal_server_error()
+                .title("Environment variable could not be revealed")
+                .detail("The audit record for this reveal could not be written")
+                .build()
+        })
+}
+
+struct EnvironmentVariableRevealTarget<'a> {
+    project_id: i32,
+    key: &'a str,
+    var_id: Option<i32>,
+    environment_id: Option<i32>,
+    service_id: Option<i32>,
+    source: &'static str,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IntegrationEnvironmentVariableResolutionError {
+    Ambiguous,
+}
+
+fn resolve_integration_environment_variable(
+    services: &[temps_core::ProjectIntegrationEnvVars],
+    key: &str,
+    service_id: Option<i32>,
+) -> Result<Option<String>, IntegrationEnvironmentVariableResolutionError> {
+    let mut matches = services
+        .iter()
+        .filter(|service| {
+            service_id.is_none_or(|requested_id| service.service.service_id == requested_id)
+        })
+        .flat_map(|service| service.variables.iter())
+        .filter(|variable| variable.key == key)
+        .map(|variable| variable.value.clone());
+    let value = matches.next();
+    if matches.next().is_some() {
+        return Err(IntegrationEnvironmentVariableResolutionError::Ambiguous);
+    }
+    Ok(value)
+}
+
+fn environment_variable_value_response(
+    value: String,
+) -> (
+    [(header::HeaderName, &'static str); 1],
+    Json<EnvironmentVariableValueResponse>,
+) {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(EnvironmentVariableValueResponse { value }),
+    )
 }
 
 /// Update environment settings
@@ -1512,10 +1677,17 @@ pub async fn delete_environment(
     // Get environment details before deletion for audit log
     let environment = state
         .environment_service
-        .get_environment(project_id, env_id)
+        .get_environment_for_deletion(project_id, env_id)
         .await?;
 
     let project = state.environment_service.get_project(project_id).await?;
+
+    // Persist the deletion fence before cancelling workflows or touching
+    // Docker. Deployment workers already reject soft-deleted environments.
+    state
+        .environment_service
+        .delete_environment(project_id, env_id)
+        .await?;
 
     // Cancel all active deployments for this environment
     match state
@@ -1531,20 +1703,38 @@ pub async fn delete_environment(
                 );
             }
         }
-        Err(e) => {
+        Err(error) => {
             error!(
-                "Failed to cancel deployments for environment {}: {:?}",
-                env_id, e
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to cancel environment deployments"
             );
-            // Continue with deletion even if cancellation fails
+            return Err(
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Deployment Cancellation Failed")
+                    .with_detail(format!(
+                        "Failed to cancel active deployments for environment {env_id}: {error}"
+                    )),
+            );
         }
     }
 
-    // Delete the environment
     state
-        .environment_service
-        .delete_environment(project_id, env_id)
-        .await?;
+        .deployment_container_cleaner
+        .cleanup_environment_containers(project_id, env_id)
+        .await
+        .map_err(|error| {
+            error!(
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to clean up environment containers"
+            );
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Environment Container Cleanup Failed")
+                .with_detail(error.to_string())
+        })?;
 
     // Create audit event
     let audit_context = temps_core::AuditContext {
@@ -2013,3 +2203,206 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use temps_core::{AuditLogger, AuditOperation};
+
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        serialized_operations: Mutex<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> Result<(), temps_core::anyhow::Error> {
+            if self.fail {
+                return Err(temps_core::anyhow::anyhow!("audit database unavailable"));
+            }
+            self.serialized_operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .push((operation.operation_type(), operation.serialize()?));
+            Ok(())
+        }
+    }
+
+    fn test_audit_context() -> AuditContext {
+        AuditContext {
+            user_id: 42,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "environment-reveal-test".to_string(),
+        }
+    }
+
+    fn test_auth_context(role: temps_auth::Role) -> temps_auth::AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed_password".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[test]
+    fn reader_cannot_reveal_plaintext_environment_values() {
+        let problem =
+            require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Reader))
+                .expect_err("reader must not reveal plaintext environment values");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_reveal_plaintext_environment_values() {
+        require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Admin))
+            .expect("admin should be allowed to reveal plaintext environment values");
+    }
+
+    #[tokio::test]
+    async fn environment_variable_reveal_audit_records_identifiers_without_value() {
+        let audit_logger = RecordingAuditLogger::default();
+
+        audit_environment_variable_reveal(
+            &audit_logger,
+            test_audit_context(),
+            EnvironmentVariableRevealTarget {
+                project_id: 17,
+                key: "DATABASE_URL",
+                var_id: None,
+                environment_id: Some(9),
+                service_id: Some(23),
+                source: "integration",
+            },
+        )
+        .await
+        .expect("audit write should succeed");
+
+        let operations = audit_logger
+            .serialized_operations
+            .lock()
+            .expect("recording audit mutex should not be poisoned");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "ENVIRONMENT_VARIABLE_VALUE_REVEALED");
+        let payload: serde_json::Value =
+            serde_json::from_str(&operations[0].1).expect("audit payload should be valid JSON");
+        assert_eq!(payload["project_id"], 17);
+        assert_eq!(payload["key"], "DATABASE_URL");
+        assert_eq!(payload["environment_id"], 9);
+        assert_eq!(payload["service_id"], 23);
+        assert_eq!(payload["source"], "integration");
+        assert!(
+            payload.get("value").is_none(),
+            "audit payload must never contain revealed plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_variable_reveal_fails_closed_when_audit_write_fails() {
+        let audit_logger = RecordingAuditLogger {
+            fail: true,
+            ..Default::default()
+        };
+
+        let problem = audit_environment_variable_reveal(
+            &audit_logger,
+            test_audit_context(),
+            EnvironmentVariableRevealTarget {
+                project_id: 17,
+                key: "DATABASE_URL",
+                var_id: None,
+                environment_id: None,
+                service_id: None,
+                source: "manual",
+            },
+        )
+        .await
+        .expect_err("reveal must fail if the audit cannot be persisted");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn environment_variable_reveal_response_disables_storage() {
+        let response =
+            environment_variable_value_response("revealed-value".to_string()).into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
+    }
+
+    #[test]
+    fn integration_reveal_selects_the_requested_service_during_key_collision() {
+        let services = vec![
+            temps_core::ProjectIntegrationEnvVars {
+                service: temps_core::IntegrationServiceInfo {
+                    service_id: 10,
+                    service_name: "Postgres A".to_string(),
+                    service_type: "postgres".to_string(),
+                    service_slug: Some("postgres-a".to_string()),
+                    service_updated_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                variables: vec![temps_core::IntegrationEnvVar {
+                    key: "DATABASE_URL".to_string(),
+                    value: "postgres://first-secret".to_string(),
+                }],
+            },
+            temps_core::ProjectIntegrationEnvVars {
+                service: temps_core::IntegrationServiceInfo {
+                    service_id: 11,
+                    service_name: "Postgres B".to_string(),
+                    service_type: "postgres".to_string(),
+                    service_slug: Some("postgres-b".to_string()),
+                    service_updated_at: "2026-01-02T00:00:00Z".to_string(),
+                },
+                variables: vec![temps_core::IntegrationEnvVar {
+                    key: "DATABASE_URL".to_string(),
+                    value: "postgres://second-secret".to_string(),
+                }],
+            },
+        ];
+
+        assert_eq!(
+            resolve_integration_environment_variable(&services, "DATABASE_URL", Some(10))
+                .expect("service-specific lookup should not be ambiguous")
+                .as_deref(),
+            Some("postgres://first-secret")
+        );
+        assert_eq!(
+            resolve_integration_environment_variable(&services, "DATABASE_URL", Some(11))
+                .expect("service-specific lookup should not be ambiguous")
+                .as_deref(),
+            Some("postgres://second-secret")
+        );
+        assert_eq!(
+            resolve_integration_environment_variable(&services, "DATABASE_URL", None),
+            Err(IntegrationEnvironmentVariableResolutionError::Ambiguous)
+        );
+    }
+}

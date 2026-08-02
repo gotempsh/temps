@@ -9,9 +9,9 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "next": "16.2.11",
     "react": "19.2.3",
-    "react-dom": "19.2.3",
-    "next": "16.2.6"
+    "react-dom": "19.2.3"
   },
   "devDependencies": {
     "babel-plugin-react-compiler": "1.0.0",

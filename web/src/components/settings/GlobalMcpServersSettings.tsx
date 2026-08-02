@@ -8,6 +8,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -40,10 +41,11 @@ import {
   Server,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import {
   createGlobalMcp,
+  revealGlobalMcpConfig,
   updateGlobalMcp,
 } from '@/api/client/sdk.gen'
 import {
@@ -380,6 +382,14 @@ function GlobalMcpDialog({
     }
   }
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      setConfigText('')
+      setConfigError(null)
+    }
+    onOpenChange(nextOpen)
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim() || !slug.trim()) return
@@ -417,12 +427,11 @@ function GlobalMcpDialog({
         })
         toast.success('MCP server created')
       }
+      setConfigText('')
       onSuccess()
     } catch {
       toast.error(
-        isEdit
-          ? 'Failed to update MCP server'
-          : 'Failed to create MCP server'
+        isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
       )
     } finally {
       setIsPending(false)
@@ -430,7 +439,7 @@ function GlobalMcpDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
@@ -500,18 +509,29 @@ function GlobalMcpDialog({
               <p className="text-xs text-destructive">{configError}</p>
             )}
           </div>
+          {isEdit && (
+            <McpCredentialRevealControls
+              key={`${mcp!.slug}:${mcp!.updated_at}:${open}`}
+              configText={configText}
+              onConfigTextChange={handleConfigChange}
+              onRevealCredential={async (field) => {
+                const { data } = await revealGlobalMcpConfig({
+                  path: { slug: mcp!.slug, field },
+                  throwOnError: true,
+                })
+                return data.value
+              }}
+            />
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={() => handleOpenChange(false)}
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={isPending || configError !== null}
-            >
+            <Button type="submit" disabled={isPending || configError !== null}>
               {isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
               ) : null}

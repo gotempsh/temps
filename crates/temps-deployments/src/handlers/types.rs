@@ -619,6 +619,8 @@ pub struct DeploymentJobResponse {
     pub finished_at: Option<i64>,
     pub log_id: String,
     pub error_message: Option<String>,
+    /// Internal workflow configuration is intentionally redacted. It can
+    /// contain legacy plaintext secrets or encrypted secret envelopes.
     pub job_config: Option<serde_json::Value>,
     pub outputs: Option<serde_json::Value>,
     pub dependencies: Option<serde_json::Value>,
@@ -641,7 +643,10 @@ impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
             finished_at: job.finished_at.map(|t| t.timestamp_millis()),
             log_id: job.log_id,
             error_message: job.error_message,
-            job_config: job.job_config,
+            // Job configuration is executor-internal. Returning it here would
+            // expose legacy plaintext secrets and encrypted envelopes to roles
+            // that only have deployment-read access.
+            job_config: None,
             outputs: job.outputs,
             dependencies: job.dependencies,
             execution_order: job.execution_order,
@@ -742,6 +747,11 @@ impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
 pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerEnvironmentVariableValueResponse {
+    pub value: String,
 }
 
 /// Detailed container information with environment variables and metrics

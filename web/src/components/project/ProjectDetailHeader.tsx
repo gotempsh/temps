@@ -9,7 +9,7 @@ import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, Users } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 
 const healthDotColors: Record<string, string> = {
   operational: 'bg-emerald-500',

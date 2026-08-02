@@ -97,6 +97,10 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
             context.register_service(deployment_canceller);
 
+            let deployment_container_cleaner =
+                deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
+            context.register_service(deployment_container_cleaner);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile
@@ -145,6 +149,13 @@ impl TempsPlugin for DeploymentsPlugin {
             // Register database_cron_service for handlers
             context.register_service(database_cron_service.clone());
 
+            // Create DatabaseMetricAlertConfigService for reconciling .temps.yaml alerts.
+            let database_alert_service = Arc::new(
+                crate::services::DatabaseMetricAlertConfigService::new(db.clone()),
+            );
+            let alert_service =
+                database_alert_service.clone() as Arc<dyn crate::jobs::MetricAlertConfigService>;
+
             // Start cron scheduler in background
             let scheduler_service = database_cron_service.clone();
             tokio::spawn(async move {
@@ -190,11 +201,12 @@ impl TempsPlugin for DeploymentsPlugin {
                 db.clone(),
                 queue_service.clone(),
                 git_provider,
-                image_builder,
+                image_builder.clone(),
                 deployer,
                 static_deployer,
                 log_service.clone(),
                 cron_service,
+                alert_service,
                 context
                     .get_service::<dyn crate::jobs::AgentSyncService>()
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
@@ -211,9 +223,16 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Source map service wired into workflow execution service");
             }
 
-            // Wire NodeScheduler for multi-node deployments
+            // Wire NodeScheduler for multi-node deployments. It needs the
+            // control plane's own container platform so the `Local` slot takes
+            // part in architecture filtering like any worker: on a cluster
+            // where the CP is amd64 and an arm64-only image is deployed, Local
+            // must drop out of the pool instead of taking the replica.
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
-            let node_scheduler = Arc::new(crate::services::NodeScheduler::new(node_service));
+            let node_scheduler = Arc::new(
+                crate::services::NodeScheduler::new(node_service)
+                    .with_platform_source(image_builder.clone()),
+            );
             workflow_execution_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments

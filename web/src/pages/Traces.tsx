@@ -1,4 +1,4 @@
-import { Routes, Route } from 'react-router-dom'
+import { Routes, Route } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import TracesList from './TracesList'
 import TraceDetail from './TraceDetail'

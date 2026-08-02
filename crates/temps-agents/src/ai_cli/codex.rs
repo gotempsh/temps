@@ -121,7 +121,7 @@ impl AiCliProvider for CodexCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr,
+                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &stderr),
             });
         }
 

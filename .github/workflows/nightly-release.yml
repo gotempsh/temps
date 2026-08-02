@@ -1,0 +1,150 @@
+name: Nightly Release
+
+# Cuts a nightly prerelease build from main once a day, but only when main
+# has moved since the last nightly tag. The tag it mints
+# (v<version>-nightly.<date>.<short-sha>) contains a `-`, so it matches the
+# `release.yml` tag trigger (`v*.*.*-*`). Tags pushed with GITHUB_TOKEN do
+# not trigger other workflows, so this workflow explicitly dispatches the
+# release pipeline at the newly-created tag.
+
+on:
+  schedule:
+    # 03:00 UTC daily
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
+jobs:
+  check-and-tag:
+    name: Check for new commits and tag
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Determine if a nightly build is needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          echo "HEAD is at $head_sha"
+
+          # Last nightly tag, if any, sorted by tag creation date.
+          last_nightly_tag="$(git tag -l 'v*-nightly.*' --sort=-creatordate | head -n1 || true)"
+          last_nightly_sha=""
+          release_exists=false
+          release_run_state=missing
+
+          if [[ -n "$last_nightly_tag" ]]; then
+            last_nightly_sha="$(git rev-list -n1 "$last_nightly_tag")"
+            echo "Last nightly tag: $last_nightly_tag ($last_nightly_sha)"
+
+            if [[ "$last_nightly_sha" == "$head_sha" ]]; then
+              if gh release view "$last_nightly_tag" >/dev/null 2>&1; then
+                release_exists=true
+              fi
+
+              release_run_state="$(
+                gh run list \
+                  --workflow release.yml \
+                  --branch "$last_nightly_tag" \
+                  --commit "$head_sha" \
+                  --event workflow_dispatch \
+                  --limit 1 \
+                  --json conclusion,status \
+                  --jq '
+                    if length == 0 then "missing"
+                    elif .[0].status != "completed" then "active"
+                    elif .[0].conclusion == "success" then "success"
+                    else "failed"
+                    end
+                  '
+              )"
+            fi
+          fi
+
+          decision="$(
+            .github/scripts/nightly-release-decision.sh \
+              "$head_sha" \
+              "$last_nightly_tag" \
+              "$last_nightly_sha" \
+              "$release_exists" \
+              "$release_run_state"
+          )"
+          printf '%s\n' "$decision" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$decision"
+
+          if grep -q '^should_release=true$' <<< "$decision"; then
+            if [[ -n "$last_nightly_tag" && "$last_nightly_sha" == "$head_sha" ]]; then
+              echo "Nightly release is missing or failed -- reusing $last_nightly_tag."
+            else
+              echo "New commits since the last nightly -- creating a tag."
+            fi
+          else
+            echo "Nightly release already exists or is currently running -- skipping."
+          fi
+
+      - name: Compute nightly tag
+        id: tag
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          EXISTING_TAG: ${{ steps.check.outputs.existing_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$EXISTING_TAG" ]]; then
+            tag="$EXISTING_TAG"
+          else
+            base_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/' | sed -E 's/-.*//')"
+            date_stamp="$(date -u +%Y%m%d)"
+            short_sha="$(git rev-parse --short HEAD)"
+            tag="v${base_version}-nightly.${date_stamp}.${short_sha}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Nightly tag: $tag"
+
+      - name: Create and push nightly tag
+        if: steps.check.outputs.should_create_tag == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Nightly build $TAG"
+          git push origin "$TAG"
+
+  dispatch-release:
+    name: Dispatch release workflow
+    needs: check-and-tag
+    if: needs.check-and-tag.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start release workflow for nightly tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.check-and-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "$REPOSITORY" \
+            --ref "$TAG" \
+            --field dry_run=false
+          echo "Dispatched release workflow for $TAG"

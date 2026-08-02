@@ -16,7 +16,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { Bot, ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
 import { useMemo } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router'
 
 const ALL = '__all__'
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const

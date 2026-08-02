@@ -9,6 +9,7 @@ import {
   updateSlackProviderMutation,
   updateWebhookProviderMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { NotificationProviderResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -31,12 +32,12 @@ import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Bell, EllipsisVertical, Plus } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { ProviderForm } from './ProviderForm'
-import { ProviderFormData, providerSchema } from './schemas'
+import { ProviderFormData, providerUpdateSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
   provider_type: 'email' | 'slack' | 'webhook' | 'cloudflare'
@@ -165,7 +166,7 @@ export function ProvidersManagement() {
   })
 
   const editForm = useForm<ProviderFormData>({
-    resolver: zodResolver(providerSchema),
+    resolver: zodResolver(providerUpdateSchema),
     defaultValues: {
       name: '',
       provider_type: 'email',
@@ -242,6 +243,21 @@ export function ProvidersManagement() {
         },
       })
     }
+  }
+
+  const handleRevealCredential = async (field: string) => {
+    if (!editingProvider) {
+      throw new Error('No notification provider is selected')
+    }
+
+    const { data } = await revealNotificationProviderConfig({
+      path: {
+        id: editingProvider.id,
+        field,
+      },
+      throwOnError: true,
+    })
+    return data.value
   }
 
   const handleDelete = async (provider: ExtendedNotificationProvider) => {
@@ -425,6 +441,8 @@ export function ProvidersManagement() {
               onSubmit={onEditSubmit}
               isEdit
               isLoading={isLoadingProviderType}
+              revealScopeKey={`${editingProvider?.id}:${editingProvider?.updated_at}`}
+              onRevealCredential={handleRevealCredential}
             />
           </div>
         </DialogContent>

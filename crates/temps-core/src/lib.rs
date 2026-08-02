@@ -24,6 +24,7 @@ pub mod retention;
 pub mod retry;
 pub mod secrets_manager;
 pub mod telemetry;
+pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;

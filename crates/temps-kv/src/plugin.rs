@@ -12,7 +12,9 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_core::AuditLogger;
-use temps_providers::externalsvc::{ExternalService, RedisService};
+use temps_providers::externalsvc::{
+    managed_instance_name, ExternalService, RedisService, ServiceType,
+};
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -60,9 +62,18 @@ impl TempsPlugin for KvPlugin {
             let docker = context.require_service::<bollard::Docker>();
 
             // Create RedisService from temps-providers for container management
-            // This gives us version tracking, upgrades, and backup support
-            let redis_service =
-                Arc::new(RedisService::new(KV_REDIS_SERVICE_NAME.to_string(), docker));
+            // This gives us version tracking, upgrades, and backup support.
+            //
+            // The instance name comes from `managed_instance_name` so this
+            // plugin and `ExternalServiceManager::create_service_instance`
+            // provably target the same container. `kv_enable` persists
+            // `ServiceType::Redis`, so the `Kv` branch isn't on a live path
+            // today — deriving the name here anyway keeps that an accident
+            // that can't turn into #495 if the type is ever corrected.
+            let redis_service = Arc::new(RedisService::new(
+                managed_instance_name(KV_REDIS_SERVICE_NAME, ServiceType::Kv),
+                docker,
+            ));
 
             // Create KV service that uses the RedisService
             let kv_service = Arc::new(KvService::new(redis_service.clone()));
@@ -165,6 +176,9 @@ impl TempsPlugin for KvPlugin {
         let redis_service = context.require_service::<RedisService>();
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
+        // Optional team-based access checker (present only when a plugin
+        // registers one); confines data-plane access to reachable projects.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         // Create app state for handlers
         let app_state = Arc::new(KvAppState {
@@ -172,6 +186,7 @@ impl TempsPlugin for KvPlugin {
             redis_service,
             external_service_manager,
             audit_service,
+            project_access_checker,
         });
 
         // Configure routes with the app state

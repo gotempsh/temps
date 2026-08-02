@@ -952,6 +952,7 @@ async function exportEnvVars(
 // ============ Resources Command ============
 
 interface ResourcesOptions {
+  project?: string
   cpu?: string
   memory?: string
   cpuRequest?: string
@@ -959,15 +960,12 @@ interface ResourcesOptions {
   json?: boolean
 }
 
-async function resourcesCmd(
-  project: string,
-  environment: string,
-  options: ResourcesOptions
-): Promise<void> {
+async function resourcesCmd(environment: string, options: ResourcesOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = await getProjectId(project)
+  const resolved = await requireProjectSlug(options.project)
+  const projectId = await getProjectId(resolved.slug)
 
   // Find environment by slug
   const envs = await withSpinner('Fetching environments...', async () => {
@@ -1072,7 +1070,7 @@ async function resourcesCmd(
     }
 
     newline()
-    success(`Resources updated for ${project}/${environment}`)
+    success(`Resources updated for ${resolved.slug}/${environment}`)
     newline()
     displayResources(updatedEnv)
   } else {
@@ -1090,7 +1088,7 @@ async function resourcesCmd(
     }
 
     newline()
-    header(`${icons.folder} Resources for ${project}/${environment}`)
+    header(`${icons.folder} Resources for ${resolved.slug}/${environment}`)
     newline()
     displayResources(targetEnv)
   }

@@ -2,6 +2,7 @@ pub mod docker;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod local;
+pub mod managed;
 pub mod pty_agent_bundle;
 pub mod routing;
 pub mod user;
@@ -170,6 +171,11 @@ pub struct SandboxCreateConfig {
     /// default. Only meaningful when the registered provider is the
     /// routing provider; single-backend hosts ignore it.
     pub backend: Option<SandboxBackend>,
+    /// User to attribute the sandbox to in the standalone sandbox API
+    /// (`sandboxes.user_id`). Only read by the managed run-sandbox path
+    /// ([`managed::RunSandboxService`]); providers ignore it. `None` for
+    /// webhook-triggered runs with no acting user.
+    pub owner_user_id: Option<i32>,
 }
 
 /// A cached rootfs image (Firecracker backend). Digest-keyed build artifact

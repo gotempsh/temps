@@ -14,7 +14,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, Monitor, Smartphone, Tablet } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 function OsIcon({ os, size = 20 }: { os: string; size?: number }) {

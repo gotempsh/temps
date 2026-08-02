@@ -231,8 +231,8 @@ fn default_username() -> String {
 }
 
 pub fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(16)
         .map(char::from)
@@ -244,9 +244,9 @@ pub fn generate_password() -> String {
 /// matches what `openssl rand -base64 32` produces in MongoDB's own docs.
 pub fn generate_keyfile_content() -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     STANDARD.encode(bytes)
 }
 

@@ -9,7 +9,7 @@ import {
   getProjectsOptions,
   listDomainsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { DomainResponse } from '@/api/client/types.gen'
 import { NetworkMode } from './NetworkModeSelector'
 

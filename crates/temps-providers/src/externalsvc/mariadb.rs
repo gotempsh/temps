@@ -418,8 +418,8 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 }
 
 fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(24)
         .map(char::from)

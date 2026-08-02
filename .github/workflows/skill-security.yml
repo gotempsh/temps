@@ -1,0 +1,217 @@
+name: Skill Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "skills/**"
+      - ".github/workflows/skill-security.yml"
+      - ".github/skill-scanner-requirements.in"
+      - ".github/skill-scanner-requirements.txt"
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  select-skills:
+    name: Select agent skills
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      scan-mode: ${{ steps.select.outputs.scan-mode }}
+      skill-paths: ${{ steps.select.outputs.skill-paths }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build skill matrix
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          skills_root = Path("skills")
+          control_files = {
+              ".github/skill-scanner-requirements.in",
+              ".github/skill-scanner-requirements.txt",
+              ".github/workflows/skill-security.yml",
+          }
+          name_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+          if skills_root.is_symlink() or not skills_root.is_dir():
+              raise SystemExit(
+                  "The skills root must be a real directory: "
+                  f"{skills_root}"
+              )
+
+          def validate_skill(path: Path) -> str | None:
+              if not name_pattern.fullmatch(path.name):
+                  raise SystemExit(f"Invalid skill directory name: {path.name!r}")
+              if path.is_symlink():
+                  raise SystemExit(f"Skill directories cannot be symlinks: {path}")
+              if not path.exists():
+                  return None
+              if not path.is_dir():
+                  return None
+              skill_file = path / "SKILL.md"
+              if skill_file.is_symlink():
+                  raise SystemExit(f"SKILL.md cannot be a symlink: {skill_file}")
+              if not skill_file.is_file():
+                  raise SystemExit(f"Skill is missing SKILL.md: {path}")
+              for child in path.rglob("*"):
+                  if child.is_symlink():
+                      raise SystemExit(f"Skill content cannot be a symlink: {child}")
+              return path.as_posix()
+
+          def all_skills() -> list[str]:
+              paths = []
+              for entry in skills_root.iterdir():
+                  if entry.is_symlink():
+                      raise SystemExit(
+                          f"Top-level skill entries cannot be symlinks: {entry}"
+                      )
+                  if not entry.is_dir():
+                      continue
+                  validated = validate_skill(entry)
+                  if validated is not None:
+                      paths.append(validated)
+              return sorted(paths)
+
+          scan_mode = "full"
+          skill_paths = []
+          if os.environ["EVENT_NAME"] == "pull_request":
+              changed = subprocess.check_output(
+                  [
+                      "git",
+                      "diff",
+                      "--name-only",
+                      "-z",
+                      "--no-renames",
+                      "--diff-filter=ACMDT",
+                      os.environ["BASE_SHA"],
+                      os.environ["HEAD_SHA"],
+                  ]
+              ).decode("utf-8").split("\0")
+              changed = list(filter(None, changed))
+
+              selected = set()
+              for changed_path in changed:
+                  parts = changed_path.split("/")
+                  if len(parts) < 2 or parts[0] != "skills":
+                      continue
+                  if not name_pattern.fullmatch(parts[1]):
+                      raise SystemExit(
+                          f"Invalid skill directory name: {parts[1]!r}"
+                      )
+                  validated = validate_skill(skills_root / parts[1])
+                  if validated is not None:
+                      selected.add(validated)
+
+              if not control_files.intersection(changed):
+                  scan_mode = "changed"
+                  skill_paths = sorted(selected)
+
+          if scan_mode == "full":
+              skill_paths = all_skills()
+              if not skill_paths:
+                  raise SystemExit("Full audit found no skill directories")
+
+          with open(
+              os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8"
+          ) as output:
+              print(f"scan-mode={scan_mode}", file=output)
+              print(
+                  "skill-paths="
+                  + json.dumps(skill_paths, separators=(",", ":")),
+                  file=output,
+              )
+          PY
+
+  skill-security:
+    name: Scan ${{ matrix.skill-path }}
+    needs: select-skills
+    if: needs.select-skills.outputs.skill-paths != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        skill-path: ${{ fromJSON(needs.select-skills.outputs.skill-paths) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install hash-locked Cisco Skill Scanner
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install
+          --require-hashes
+          --only-binary=:all:
+          --requirement .github/skill-scanner-requirements.txt
+
+      - name: Scan skill
+        env:
+          SKILL_PATH: ${{ matrix.skill-path }}
+        run: >-
+          skill-scanner scan "$SKILL_PATH"
+          --policy balanced
+          --use-behavioral
+          --format table
+          --fail-on-severity high
+
+  skill-security-gate:
+    name: Skill security gate
+    needs:
+      - select-skills
+      - skill-security
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      DISCOVERY_RESULT: ${{ needs.select-skills.result }}
+      SCAN_MODE: ${{ needs.select-skills.outputs.scan-mode }}
+      SCAN_RESULT: ${{ needs.skill-security.result }}
+      SKILL_PATHS: ${{ needs.select-skills.outputs.skill-paths }}
+    steps:
+      - name: Enforce scan result
+        run: |
+          set -euo pipefail
+          if [[ "$DISCOVERY_RESULT" != "success" ]]; then
+            echo "Skill discovery failed." >&2
+            exit 1
+          fi
+          if [[ "$SKILL_PATHS" != "[]" && "$SCAN_RESULT" != "success" ]]; then
+            echo "At least one selected skill failed security scanning." >&2
+            exit 1
+          fi
+          echo "Skill security gate passed in $SCAN_MODE mode."

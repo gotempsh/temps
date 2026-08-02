@@ -3,6 +3,40 @@ use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVariableValueRevealedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub key: String,
+    pub var_id: Option<i32>,
+    pub environment_id: Option<i32>,
+    pub service_id: Option<i32>,
+    pub source: &'static str,
+}
+
+impl AuditOperation for EnvironmentVariableValueRevealedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_VARIABLE_VALUE_REVEALED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EnvironmentSettingsUpdatedFields {
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,

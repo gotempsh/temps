@@ -174,6 +174,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_ai_chat={level},\
              temps_ai_api_tools={level},\
              temps_agents={level},\
+             temps_sandbox={level},\
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\

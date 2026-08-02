@@ -25,7 +25,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import {
   InsightsPanel,
   InsightsToggleButton,

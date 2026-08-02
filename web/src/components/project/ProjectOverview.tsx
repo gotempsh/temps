@@ -5,6 +5,9 @@ import {
   getUniqueCountsOptions,
   hasAnalyticsEventsOptions,
   hasErrorGroupsOptions,
+  listCustomDomainsForProjectOptions,
+  listMonitorsOptions,
+  listProjectServicesOptions,
   revenueListIntegrationsOptions,
   revenueMetricsSummaryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -15,12 +18,15 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
+  Activity,
   BarChart3,
   Bug,
   Check,
   ChevronRight,
   Circle,
+  Database,
   DollarSign,
+  Globe,
   Minus,
   Sparkles,
   TrendingDown,
@@ -28,7 +34,7 @@ import {
   Users,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { MetricCard } from '../dashboard/MetricCard'
 import { DeploymentActivityGraph } from './DeploymentActivityGraph'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
@@ -67,7 +73,12 @@ function getChangeDisplay(change: number | undefined, inverse = false) {
   }
 }
 
-type OnboardingStepId = 'analytics' | 'errors'
+type OnboardingStepId =
+  | 'analytics'
+  | 'errors'
+  | 'domain'
+  | 'monitoring'
+  | 'storage'
 
 interface OnboardingStep {
   id: OnboardingStepId
@@ -133,6 +144,27 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
+  const { data: customDomainsData, isLoading: isCheckingDomain } = useQuery({
+    ...listCustomDomainsForProjectOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
+  const { data: monitorsData, isLoading: isCheckingMonitoring } = useQuery({
+    ...listMonitorsOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
+  const { data: servicesLinkedData, isLoading: isCheckingStorage } = useQuery({
+    ...listProjectServicesOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
   const { data: freshLastDeployment, refetch: refetchDeployment } = useQuery({
     ...getLastDeploymentOptions({
       path: {
@@ -166,9 +198,17 @@ export function ProjectOverview({
     }
   }, [project?.id, refetchDeployment])
 
-  const isLoadingOnboarding = isCheckingAnalytics || isCheckingErrors
+  const isLoadingOnboarding =
+    isCheckingAnalytics ||
+    isCheckingErrors ||
+    isCheckingDomain ||
+    isCheckingMonitoring ||
+    isCheckingStorage
   const hasAnalytics = !!hasAnalyticsData?.has_events
   const hasErrors = !!hasErrorsData?.has_error_groups
+  const hasDomain = (customDomainsData?.domains?.length ?? 0) > 0
+  const hasMonitoring = (monitorsData?.length ?? 0) > 0
+  const hasStorage = (servicesLinkedData?.length ?? 0) > 0
 
   const steps: OnboardingStep[] = [
     {
@@ -190,6 +230,34 @@ export function ProjectOverview({
       done: hasErrors,
       icon: <Bug className="size-4" />,
       estimate: '3 min',
+    },
+    {
+      id: 'domain',
+      title: 'Connect a custom domain',
+      description: 'Point your own domain at this project with auto TLS.',
+      href: `/projects/${project.slug}/domains`,
+      done: hasDomain,
+      icon: <Globe className="size-4" />,
+      estimate: '2 min',
+    },
+    {
+      id: 'monitoring',
+      title: 'Add an uptime monitor',
+      description: 'Get alerted the moment your app stops responding.',
+      href: `/projects/${project.slug}/monitors`,
+      done: hasMonitoring,
+      icon: <Activity className="size-4" />,
+      estimate: '1 min',
+    },
+    {
+      id: 'storage',
+      title: 'Link a database or storage service',
+      description:
+        'Attach a managed Postgres, Redis, or S3-compatible service.',
+      href: `/projects/${project.slug}/storage`,
+      done: hasStorage,
+      icon: <Database className="size-4" />,
+      estimate: '2 min',
     },
   ]
 
@@ -213,8 +281,8 @@ export function ProjectOverview({
                 </Badge>
               </div>
               <p className="mt-1 text-sm text-muted-foreground">
-                Wire up observability so Temps can start capturing data from
-                your app.
+                Wire up observability and infrastructure so Temps can start
+                capturing data and serving your app.
               </p>
             </div>
             <div className="flex items-center gap-3 sm:w-64 sm:shrink-0">

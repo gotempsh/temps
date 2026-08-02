@@ -9,7 +9,7 @@ use chrono;
 use colored::Colorize;
 use futures::FutureExt;
 use include_dir::{include_dir, Dir};
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -389,10 +389,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
 fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -2512,6 +2512,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         notification_service: service_context
             .get_service::<dyn temps_core::notifications::NotificationService>(),
+        audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
@@ -3308,6 +3309,37 @@ mod ai_tool_allowlist_tests {
             "DeploymentMetricsToggle is a write (PATCH) operation and must never be \
              resolvable via the read-only AI tool allowlist"
         );
+    }
+
+    /// `describe_api` only ever surfaces an operation's `summary`/`description`
+    /// to the model — never response-body field docs — so a span's
+    /// `duration_ms` vs. unlabeled `attributes` units can only be explained via
+    /// the operation description itself. This proves the unit-guidance text
+    /// added to the trace/GenAI-trace handler doc comments actually survives
+    /// into the real compiled `OtelApiDoc` and would reach the model through
+    /// `describe_api`, rather than just existing as a comment nobody reads.
+    #[test]
+    fn trace_tool_descriptions_warn_about_unlabeled_attribute_units() {
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let index = ReadOnlyApiIndex::from_openapi(&openapi, &[]);
+
+        for operation_id in [
+            "get_trace",
+            "query_traces",
+            "query_genai_traces",
+            "get_genai_trace",
+        ] {
+            let op = index
+                .get(operation_id)
+                .unwrap_or_else(|| panic!("{operation_id} missing from OtelApiDoc"));
+            let description = op.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("duration_ms") && description.contains("milliseconds"),
+                "{operation_id}'s OpenAPI description must warn the model that only \
+                 `duration_ms` is guaranteed to be milliseconds and other numeric \
+                 fields carry unlabeled/different units — got: {description:?}"
+            );
+        }
     }
 }
 

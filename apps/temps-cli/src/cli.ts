@@ -4,6 +4,7 @@ import { colors } from './ui/output.js'
 import { setQuietMode } from './ui/spinner.js'
 import { handleError } from './utils/errors.js'
 import { createRequire } from 'module'
+import { listContexts, contextExists } from './config/contexts.js'
 
 // Import command modules
 import { registerAuthCommands } from './commands/auth/index.js'
@@ -43,7 +44,6 @@ import { registerIncidentsCommands } from './commands/incidents/index.js'
 import { registerEmailsCommands } from './commands/emails/index.js'
 import { registerLoadBalancerCommands } from './commands/load-balancer/index.js'
 import { registerImportsCommands } from './commands/imports/index.js'
-import { registerMigrateCommands } from './commands/migrate/index.js'
 import { registerTemplatesCommands } from './commands/templates/index.js'
 import { registerPlatformCommands } from './commands/platform/index.js'
 import { registerPresetsCommands } from './commands/presets/index.js'
@@ -92,13 +92,50 @@ export function createProgram(): Command {
     .version(VERSION, '-V, --version', 'Display version number')
     .option('--no-color', 'Disable colored output')
     .option('--debug', 'Enable debug output')
-    .hook('preAction', (thisCommand, actionCommand) => {
+    .option(
+      '--target-context <name>',
+      'Target this context for this command only, without changing the ' +
+        'active context (see `temps context list`). Prefer this over ' +
+        '`temps context use` / relying on `login`\'s side effect of ' +
+        'flipping which context is active — that shared, mutable state is ' +
+        'easy to drift out from under you (e.g. across scripts, shells, or ' +
+        'agent sessions) and a command then silently runs against the ' +
+        'wrong server. Equivalent to setting TEMPS_CONTEXT for just this ' +
+        'invocation. Named distinctly from `login`/`logout`\'s own ' +
+        '`--context <name>` (which names a context to save/remove, not ' +
+        'target) so the two never collide when both could apply to the ' +
+        'same invocation.'
+    )
+    .hook('preAction', async (thisCommand, actionCommand) => {
       const opts = thisCommand.opts()
       if (opts.debug) {
         process.env.DEBUG = '1'
       }
       if (opts.noColor) {
         chalk.level = 0
+      }
+      if (opts.targetContext) {
+        // Validate eagerly and exit rather than letting an unrecognized name
+        // silently fall through to whatever the legacy single-instance
+        // store (or on-disk `isActive` flag) happens to point at — that
+        // silent fallback is exactly the failure mode this flag exists to
+        // prevent. A typo in --target-context must be loud, not quietly wrong.
+        const contexts = await listContexts()
+        if (!contextExists(opts.targetContext, contexts)) {
+          const names = contexts.map((c) => c.name).join(', ') || '(none configured)'
+          process.stderr.write(
+            `Error: --target-context "${opts.targetContext}" does not match any configured context.\n` +
+              `Available: ${names}\n` +
+              `Run \`temps context list\` to see all contexts, or \`temps login <url>\` to add this one.\n`
+          )
+          // Hard exit — a preAction hook returning doesn't stop the action
+          // handler from still running afterward, and letting an invalid
+          // --target-context silently continue (e.g. falling back to the
+          // legacy single-instance store) is exactly the failure mode this
+          // flag exists to prevent.
+          process.exit(1)
+        }
+        process.env.TEMPS_CONTEXT = opts.targetContext
       }
       // Any leaf command invoked with --json should render machine-readable
       // output only: suppress spinners and other terminal chrome so callers
@@ -145,7 +182,6 @@ export function createProgram(): Command {
   registerEmailsCommands(program)
   registerLoadBalancerCommands(program)
   registerImportsCommands(program)
-  registerMigrateCommands(program)
   registerTemplatesCommands(program)
   registerPlatformCommands(program)
   registerPresetsCommands(program)

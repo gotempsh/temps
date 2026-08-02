@@ -70,6 +70,13 @@ pub struct ImportPlan {
     pub summary: MigrationSummary,
     /// Plan metadata
     pub metadata: PlanMetadata,
+
+    // -- Cluster cost + rightsizing analysis (cluster-level sources only) --
+    /// Cost, overprovisioning, and savings analysis. Populated by importers
+    /// that can observe the whole source cluster (currently Kubernetes);
+    /// `None` for container/platform imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_analysis: Option<crate::cost::CostAnalysis>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +312,14 @@ pub struct DomainPlan {
     pub action: DomainAction,
     /// Human-readable explanation
     pub action_description: String,
+    /// The temps-side address that replaces this domain when it is skipped.
+    ///
+    /// Source-generated domains (sslip.io / traefik.me / platform subdomains)
+    /// embed the source server's IP and would keep pointing at the old
+    /// machine — this tells the user where the app will be reachable on
+    /// temps instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
 }
 
 /// What to do with a domain during migration
@@ -383,6 +398,29 @@ pub struct DeploymentConfiguration {
     pub working_dir: Option<String>,
     /// Health check configuration
     pub health_check: Option<HealthCheckConfiguration>,
+    /// Where the application's source code lives, when the source platform
+    /// builds from a git repository. Execution uses this to link the temps
+    /// project to the same repository so the real deployment pipeline can
+    /// clone and build it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSourcePlan>,
+}
+
+/// Git repository the source platform deploys from
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GitSourcePlan {
+    /// Repository owner (organization or user)
+    pub owner: String,
+    /// Repository name
+    pub repo: String,
+    /// Branch the source platform deploys
+    pub branch: String,
+    /// Full clone URL, e.g. `https://github.com/owner/repo.git`
+    pub clone_url: Option<String>,
+    /// True when the repository is public (no credentials on the source
+    /// platform) — the project can then build without a git provider
+    /// connection.
+    pub is_public: bool,
 }
 
 /// Build configuration (for building images from source)
@@ -408,6 +446,34 @@ pub enum DeploymentStrategy {
     BlueGreen,
     /// Rolling update
     Rolling,
+}
+
+/// Heuristic: does this env var key look like it holds a secret value?
+///
+/// Importers that read real env values back from a source platform's API
+/// (Dokploy, Coolify, CapRover, Portainer) must classify every variable
+/// through this before putting it in a plan — an unclassified `is_secret:
+/// false` default would carry passwords and API keys in plaintext into
+/// `POST /imports/plan` and `GET /imports/{session_id}` responses.
+///
+/// Includes connection-string-shaped keys (`DATABASE_URL`, `REDIS_URL`,
+/// `MONGO_URI`, `SMTP_DSN`, ...) since their *value* commonly embeds a
+/// password even though the key itself isn't `PASSWORD`/`SECRET`/`TOKEN`.
+/// This over-masks a few harmless keys too (e.g. `PUBLIC_APP_URL`) — an
+/// acceptable trade since masking only affects what's echoed back in the
+/// plan response, never the real value `execute()` deploys with.
+pub fn looks_like_secret_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("TOKEN")
+        || upper.contains("KEY")
+        || upper.contains("API_KEY")
+        || upper.contains("_URL")
+        || upper.contains("_URI")
+        || upper.contains("DSN")
+        || upper.contains("CONNECTION_STRING")
+        || upper.contains("CONN_STRING")
 }
 
 /// Environment variable
@@ -552,5 +618,61 @@ impl ImportPlan {
     /// Backward-compatible accessor for `source_id` (was `source_container_id`)
     pub fn source_container_id(&self) -> &str {
         &self.source_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_secret_env_key_matches_classic_secret_keys() {
+        for key in [
+            "SECRET",
+            "APP_SECRET",
+            "PASSWORD",
+            "DB_PASSWORD",
+            "TOKEN",
+            "AUTH_TOKEN",
+            "API_KEY",
+            "SOME_KEY",
+        ] {
+            assert!(
+                looks_like_secret_env_key(key),
+                "{key} should be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_secret_env_key_matches_connection_string_shaped_keys() {
+        // These commonly embed a password in the *value* even though the
+        // key itself has no PASSWORD/SECRET/TOKEN substring.
+        for key in [
+            "DATABASE_URL",
+            "REDIS_URL",
+            "MONGO_URI",
+            "RABBITMQ_URL",
+            "AMQP_URL",
+            "SMTP_DSN",
+            "SENTRY_DSN",
+            "CONNECTION_STRING",
+            "DB_CONN_STRING",
+        ] {
+            assert!(
+                looks_like_secret_env_key(key),
+                "{key} should be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_secret_env_key_does_not_match_plain_config_keys() {
+        for key in ["NODE_ENV", "PORT", "LOG_LEVEL", "FEATURE_CHECKOUT", "PLAN"] {
+            assert!(
+                !looks_like_secret_env_key(key),
+                "{key} should not be classified as secret"
+            );
+        }
     }
 }

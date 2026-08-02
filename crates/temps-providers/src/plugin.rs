@@ -128,13 +128,20 @@ impl TempsPlugin for ProvidersPlugin {
         });
 
         // Configure routes with the app state
-        let providers_routes = handlers::configure_routes().with_state(app_state);
+        let providers_routes = handlers::configure_routes().with_state(app_state.clone());
+        let pg_stat_routes =
+            crate::handlers::pg_stat_statements_handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes::new(providers_routes))
+        let router = providers_routes.merge(pg_stat_routes);
+        Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<handlers::ExternalServiceApiDoc as OpenApiTrait>::openapi())
+        use temps_core::openapi::merge_openapi_schemas;
+        let base = <handlers::ExternalServiceApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::pg_stat_statements_handlers::PgStatStatementsApiDoc;
+        let pg_stat = <PgStatStatementsApiDoc as OpenApiTrait>::openapi();
+        Some(merge_openapi_schemas(base, vec![pg_stat]))
     }
 }
 

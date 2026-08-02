@@ -50,7 +50,7 @@ import {
 } from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 interface DomainsManagementProps {
   domains?: DomainResponse[]

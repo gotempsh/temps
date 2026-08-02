@@ -8,6 +8,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -26,7 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
   deleteGlobalMcpMutation,
@@ -34,6 +35,7 @@ import {
   listGlobalMcpsQueryKey,
   updateGlobalMcpMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealGlobalMcpConfig } from '@/api/client/sdk.gen'
 
 export function GlobalMcpServerDetail() {
   const { slug } = useParams<{ slug: string }>()
@@ -78,9 +80,13 @@ export function GlobalMcpServerDetail() {
 
   const updateMutation = useMutation({
     ...updateGlobalMcpMutation(),
-    onSuccess: () => {
+    onSuccess: (updatedMcp) => {
       toast.success('MCP server updated')
       queryClient.invalidateQueries({ queryKey: listGlobalMcpsQueryKey() })
+      setName(updatedMcp.name)
+      setDescription(updatedMcp.description ?? '')
+      setConfigText(JSON.stringify(updatedMcp.config, null, 2))
+      setConfigError(null)
       setIsEditing(false)
     },
     onError: () => toast.error('Failed to update MCP server'),
@@ -297,6 +303,18 @@ export function GlobalMcpServerDetail() {
                     <p className="text-xs text-destructive">{configError}</p>
                   )}
                 </div>
+                <McpCredentialRevealControls
+                  key={`${mcp.slug}:${mcp.updated_at}:${isEditing}`}
+                  configText={configText}
+                  onConfigTextChange={handleConfigChange}
+                  onRevealCredential={async (field) => {
+                    const { data } = await revealGlobalMcpConfig({
+                      path: { slug: mcp.slug, field },
+                      throwOnError: true,
+                    })
+                    return data.value
+                  }}
+                />
               </form>
             ) : (
               <div className="space-y-3">
@@ -345,7 +363,6 @@ export function GlobalMcpServerDetail() {
             )}
           </CardContent>
         </Card>
-
       </div>
 
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>

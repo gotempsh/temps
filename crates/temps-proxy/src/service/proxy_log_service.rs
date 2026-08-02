@@ -311,20 +311,17 @@ impl ProxyLogService {
     }
 
     /// Get proxy logs with filters and pagination
-    pub async fn list_with_filters(
-        &self,
+    /// Build the filtered + sorted Sea-ORM select for the proxy-log list.
+    ///
+    /// Returns the query plus whether any narrowing predicate was applied
+    /// (drives the planner-stats approximate-count fast path in
+    /// [`Self::list_with_filters`]). Shared by the counted pagination path and
+    /// the count-free [`Self::list_page`] feed path so the two can never drift.
+    fn build_list_query(
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         filters: crate::handler::proxy_logs::ProxyLogsQuery,
-        page: u64,
-        page_size: u64,
-    ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
-        if let Some(storage) = &self.storage {
-            return storage
-                .list_with_filters(start_date, end_date, filters, page, page_size)
-                .await;
-        }
-
+    ) -> (sea_orm::Select<proxy_logs::Entity>, bool) {
         let mut query = proxy_logs::Entity::find();
 
         // Whether any narrowing predicate is set. When nothing is filtered,
@@ -356,6 +353,7 @@ impl ProxyLogService {
             || filters.operating_system.is_some()
             || filters.device_type.is_some()
             || filters.is_bot.is_some()
+            || filters.exclude_bots == Some(true)
             || filters.bot_name.is_some()
             || filters.ai_provider.is_some()
             || filters.ai_agent.is_some()
@@ -447,6 +445,15 @@ impl ProxyLogService {
         // Bot filters
         if let Some(is_bot) = filters.is_bot {
             query = query.filter(proxy_logs::Column::IsBot.eq(is_bot));
+        }
+        if filters.exclude_bots == Some(true) {
+            // Tri-state exclusion: drop detected bots but keep rows whose
+            // is_bot is NULL (older rows without detection metadata).
+            query = query.filter(
+                proxy_logs::Column::IsBot
+                    .eq(false)
+                    .or(proxy_logs::Column::IsBot.is_null()),
+            );
         }
         if let Some(bot_name) = filters.bot_name {
             query = query.filter(proxy_logs::Column::BotName.contains(&bot_name));
@@ -560,6 +567,82 @@ impl ProxyLogService {
             _ => query.order_by_desc(sort_col),
         };
 
+        (query, has_filters)
+    }
+
+    /// Resolve a caller-supplied range into a bounded, capped window.
+    ///
+    /// Delegates to [`temps_core::time_window`], which owns the contract shared
+    /// by every high-volume read endpoint: a default lower bound so omitting a
+    /// date never means "scan the retention window", and a maximum span so a
+    /// single request cannot ask for a query that takes tens of seconds. See
+    /// that module for the measurements behind both numbers.
+    ///
+    /// `project_scoped` selects which cap applies — pass `true` only when the
+    /// caller's OWN filters already narrow to one `project_id`. A query with no
+    /// project filter scans every project's rows and must stay on the tighter
+    /// unscoped cap no matter what the caller intends to do with the result.
+    ///
+    /// Returns the window as the `(start, end)` pair the storage layer takes,
+    /// so callers stay unchanged apart from the `?`.
+    fn resolve_window(
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        project_scoped: bool,
+    ) -> Result<(Option<UtcDateTime>, Option<UtcDateTime>), ProxyLogServiceError> {
+        let max_days = if project_scoped {
+            temps_core::time_window::MAX_WINDOW_DAYS_SCOPED
+        } else {
+            temps_core::time_window::MAX_WINDOW_DAYS
+        };
+        let window = temps_core::time_window::resolve_with_max(
+            start_date,
+            end_date,
+            chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS),
+            chrono::Duration::days(max_days),
+        )
+        .map_err(|e| ProxyLogServiceError::InvalidFilter(e.to_string()))?;
+        Ok((Some(window.start), window.end))
+    }
+
+    /// Reject a range wider than the applicable cap (see [`Self::resolve_window`]
+    /// for how `project_scoped` is chosen).
+    ///
+    /// The stats endpoints take a REQUIRED range, so there is nothing to
+    /// default — only the width needs enforcing. These are GROUP BY scans
+    /// rather than sorted pages, so they are cheaper per row, but an unscoped
+    /// one still reads every row in the window and a month-wide request is
+    /// seconds of work on a 150M-row table.
+    fn enforce_window_span(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        project_scoped: bool,
+    ) -> Result<(), ProxyLogServiceError> {
+        Self::resolve_window(Some(start_time), Some(end_time), project_scoped).map(|_| ())
+    }
+
+    pub async fn list_with_filters(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: crate::handler::proxy_logs::ProxyLogsQuery,
+        page: u64,
+        page_size: u64,
+    ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError> {
+        // Bound the window before dispatching so BOTH storage backends get the
+        // same treatment — the TimescaleDB hypertable needs chunk exclusion for
+        // the same reason ClickHouse needs partition pruning.
+        let (start_date, end_date) =
+            Self::resolve_window(start_date, end_date, filters.project_id.is_some())?;
+
+        if let Some(storage) = &self.storage {
+            return storage
+                .list_with_filters(start_date, end_date, filters, page, page_size)
+                .await;
+        }
+
+        let (query, has_filters) = Self::build_list_query(start_date, end_date, filters);
+
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let (total, _) = temps_database::count_for_pagination(
             self.db.as_ref(),
@@ -571,6 +654,36 @@ impl ProxyLogService {
         let items = paginator.fetch_page(page - 1).await?;
 
         Ok((items, total))
+    }
+
+    /// Newest-first page of proxy logs WITHOUT the pagination total.
+    ///
+    /// [`Self::list_with_filters`] always computes the total (an exact
+    /// `COUNT(*)` over the filtered hypertable range when any predicate
+    /// narrows the set; a merge-on-read `count() FINAL` on ClickHouse).
+    /// Feed-style callers — the unified Observe stream — render a page and
+    /// discard the total, so this path skips the aggregate entirely and does
+    /// a single LIMIT'd, index-friendly select.
+    pub async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: crate::handler::proxy_logs::ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        // Same bounding as list_with_filters — this is the count-free variant
+        // the Observe feed uses, not a laxer one. The Observe feed always sets
+        // `project_id`, so its requests get the scoped cap here too.
+        let (start_date, end_date) =
+            Self::resolve_window(start_date, end_date, filters.project_id.is_some())?;
+
+        if let Some(storage) = &self.storage {
+            return storage
+                .list_page(start_date, end_date, filters, limit)
+                .await;
+        }
+        let (query, _has_filters) = Self::build_list_query(start_date, end_date, filters);
+        Ok(query.limit(limit).all(self.db.as_ref()).await?)
     }
 
     /// Legacy method - kept for backward compatibility
@@ -608,6 +721,7 @@ impl ProxyLogService {
             operating_system: None,
             device_type: None,
             is_bot: None,
+            exclude_bots: None,
             bot_name: None,
             ai_provider: None,
             ai_agent: None,
@@ -770,6 +884,9 @@ impl ProxyLogService {
         bucket_interval: String, // e.g., "1 hour", "1 day", "5 minutes"
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
+        let project_scoped = filters.as_ref().is_some_and(|f| f.project_id.is_some());
+        Self::enforce_window_span(start_time, end_time, project_scoped)?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
@@ -971,6 +1088,11 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         is_bot: Option<bool>,
     ) -> Result<Vec<ProjectHealthSummary>, ProxyLogServiceError> {
+        // The handler validates `project_ids` non-empty (and caps it at 100),
+        // so this is always scoped to an explicit project list, never "every
+        // project" — the scoped cap applies.
+        Self::enforce_window_span(start_time, end_time, !project_ids.is_empty())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_projects_health_summary(project_ids, start_time, end_time, is_bot)
@@ -1388,6 +1510,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_breakdown(
@@ -1518,6 +1642,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiPageBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_page_breakdown(
@@ -1625,6 +1751,8 @@ impl ProxyLogService {
         end_time: UtcDateTime,
         limit: u64,
     ) -> Result<Vec<AiAgentPageRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         let known = crate::ai_agent_detector::known_agents();
         if !known.iter().any(|(_, m)| m.agent == agent) {
             return Ok(vec![]);
@@ -1711,6 +1839,8 @@ impl ProxyLogService {
         bucket_interval: String,
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_agent_timeline(
@@ -1916,6 +2046,8 @@ impl ProxyLogService {
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<Vec<AiStatusBreakdownRow>, ProxyLogServiceError> {
+        Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+
         if let Some(storage) = &self.storage {
             return storage
                 .get_ai_status_breakdown(project_id, environment_id, start_time, end_time)
@@ -2152,6 +2284,92 @@ pub struct ProjectHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Listing window ────────────────────────────────────────────────────
+    // `GET /proxy-logs` must never issue an unbounded scan (on a 100M-row
+    // deployment that means considering the whole retention window to return 20
+    // rows) and must never accept a window so wide the query takes tens of
+    // seconds. The rules themselves live in temps_core::time_window and are
+    // tested there; these cover the SERVICE's contract — that it applies them,
+    // and that a violation surfaces as a 400-mapped InvalidFilter rather than
+    // an opaque 500.
+
+    #[test]
+    fn resolve_window_bounds_an_open_request() {
+        let lookback = chrono::Duration::hours(temps_core::time_window::DEFAULT_LOOKBACK_HOURS);
+        let before = chrono::Utc::now();
+        let (start, end) =
+            ProxyLogService::resolve_window(None, None, false).expect("open request is bounded");
+        let after = chrono::Utc::now();
+
+        let start = start.expect("a lower bound is always produced");
+        assert!(
+            start >= before - lookback && start <= after - lookback,
+            "expected ~{}h before now, got {start}",
+            temps_core::time_window::DEFAULT_LOOKBACK_HOURS
+        );
+        assert_eq!(end, None, "an open upper bound stays open");
+    }
+
+    #[test]
+    fn resolve_window_preserves_an_explicit_range_within_the_cap() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-14T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        // Widening past the default is exactly how the UI's range picker works.
+        assert_eq!(
+            ProxyLogService::resolve_window(Some(start), Some(end), false).expect("within cap"),
+            (Some(start), Some(end))
+        );
+    }
+
+    #[test]
+    fn resolve_window_rejects_a_range_wider_than_the_unscoped_cap_as_a_bad_request() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let err = ProxyLogService::resolve_window(Some(start), Some(end), false)
+            .expect_err("30 days exceeds the unscoped 7-day cap");
+
+        // InvalidFilter is the variant the handler maps to 400; anything else
+        // would surface a client mistake as a server error.
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        // The detail reaches the client verbatim, so it must stay actionable.
+        assert!(msg.contains("7-day maximum"), "{msg}");
+        assert!(msg.contains("still"), "must name the workaround: {msg}");
+    }
+
+    /// The exact regression this cap once caused: the Observe feed and the
+    /// Project Analytics AI Agents tab both ship a "Last 30 Days" option that
+    /// always scopes to one project (`ObserveFilterBar.tsx`,
+    /// `useAnalyticsDateRange.ts`). A project-scoped request for the same 30
+    /// days the previous test rejects must be ALLOWED, or those existing menu
+    /// items 400 instead of loading.
+    #[test]
+    fn resolve_window_allows_the_same_span_when_project_scoped() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            ProxyLogService::resolve_window(Some(start), Some(end), true)
+                .expect("30 days is within the scoped cap"),
+            (Some(start), Some(end))
+        );
+    }
 
     #[test]
     fn test_is_valid_interval_valid_formats() {

@@ -5,7 +5,7 @@ use aws_sdk_s3::Client;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -136,11 +136,11 @@ fn default_host() -> String {
 
 fn default_access_key() -> String {
     // AWS Access Key format: AKIA + 16 uppercase alphanumeric characters = 20 chars total
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let random_part: String = (0..16)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect();
     format!("AKIA{}", random_part)
@@ -148,11 +148,11 @@ fn default_access_key() -> String {
 
 fn default_secret_key() -> String {
     // AWS Secret Key format: 40 characters of base64-like characters (alphanumeric + / +)
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..40)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect()
 }

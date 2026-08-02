@@ -41,8 +41,13 @@ impl ScreenshotProvider for TestProvider {
         "test-provider"
     }
 
-    async fn is_available(&self) -> bool {
-        !self.should_fail
+    async fn check_availability(&self) -> ScreenshotResult<()> {
+        if self.should_fail {
+            return Err(ScreenshotError::ProviderError(
+                "Test provider unavailable".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

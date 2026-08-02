@@ -21,7 +21,7 @@ import { VulnerabilityList } from '@/components/vulnerabilities/VulnerabilityLis
 import { Input } from '@/components/ui/input'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft, Shield, Download, FileJson, FileSpreadsheet, Search, Package, Code, Filter, Sparkles, Copy } from 'lucide-react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { useState, useMemo } from 'react'
 import Fuse from 'fuse.js'

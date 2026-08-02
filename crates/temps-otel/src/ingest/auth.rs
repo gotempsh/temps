@@ -43,11 +43,28 @@ pub enum IngestAuth {
 /// Service for authenticating OTel ingest requests.
 pub struct OtelAuthService {
     db: Arc<DatabaseConnection>,
+    /// ADR-028 team-based project access checker, injected after plugin
+    /// registration (see `set_project_access_checker`). `tk_` keys carry a
+    /// user identity, so ingest must honour the same project-access grants
+    /// as the query-side `project_access_guard!` — otherwise any valid key
+    /// could ingest telemetry into any project by ID. Absent (plain OSS
+    /// binary, no checker plugin) → allow, matching the guard's no-op
+    /// semantics.
+    project_access_checker: std::sync::OnceLock<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 impl OtelAuthService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            project_access_checker: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Inject the ADR-028 project access checker once plugins have registered.
+    /// Later calls are no-ops (first registration wins).
+    pub fn set_project_access_checker(&self, checker: Arc<dyn temps_core::ProjectAccessChecker>) {
+        let _ = self.project_access_checker.set(checker);
     }
 
     /// Authenticate any ingest token — project (`tk_`/`dt_`) or service (`si_`).
@@ -198,9 +215,13 @@ impl OtelAuthService {
         hasher.update(api_key.as_bytes());
         let key_hash = hex::encode(hasher.finalize());
 
-        // Look up key + verify user has access to the requested project
+        // Look up the key and confirm the target project exists. The JOIN on a
+        // bound constant only proves project existence — the user→project
+        // access check happens below via the ADR-028 ProjectAccessChecker,
+        // mirroring `project_access_guard!` (admin bypass, fail-closed on
+        // infrastructure errors, allow when no checker is registered).
         let sql = r#"
-            SELECT ak.id AS key_id, p.name AS project_name
+            SELECT ak.id AS key_id, ak.user_id, ak.role_type, p.name AS project_name
             FROM api_keys ak
             JOIN projects p ON p.id = $2
             WHERE ak.key_hash = $1
@@ -228,11 +249,24 @@ impl OtelAuthService {
                     .map_err(|_| OtelError::AuthFailed {
                         reason: "Failed to parse auth result".into(),
                     })?;
+                let user_id: i32 =
+                    row.try_get("", "user_id")
+                        .map_err(|_| OtelError::AuthFailed {
+                            reason: "Failed to parse auth result".into(),
+                        })?;
+                let role_type: String =
+                    row.try_get("", "role_type")
+                        .map_err(|_| OtelError::AuthFailed {
+                            reason: "Failed to parse auth result".into(),
+                        })?;
                 let project_name: String =
                     row.try_get("", "project_name")
                         .map_err(|_| OtelError::AuthFailed {
                             reason: "Failed to parse project name".into(),
                         })?;
+
+                self.check_project_access(user_id, &role_type, project_id)
+                    .await?;
 
                 // Update last_used_at (fire-and-forget)
                 let db = self.db.clone();
@@ -261,6 +295,57 @@ impl OtelAuthService {
             None => Err(OtelError::AuthFailed {
                 reason: "Invalid or expired API key, or project not found".into(),
             }),
+        }
+    }
+
+    /// Enforce ADR-028 team-based project access for a `tk_` key's user,
+    /// mirroring `project_access_guard!` semantics exactly:
+    ///
+    /// - Instance `admin` / `platform_admin` roles bypass the check.
+    /// - No checker registered (plain OSS binary) → allow.
+    /// - `Ok(false)` → deny.
+    /// - `Err` → deny (**fail-closed**): a broken check must never silently
+    ///   grant cross-project ingest.
+    ///
+    /// (`dt_` tokens never reach this path — they are confined to their bound
+    /// project by construction and carry no user identity.)
+    async fn check_project_access(
+        &self,
+        user_id: i32,
+        role_type: &str,
+        project_id: i32,
+    ) -> Result<(), OtelError> {
+        use temps_auth::permissions::Role;
+
+        let is_instance_admin = matches!(
+            Role::from_str(role_type),
+            Some(Role::Admin) | Some(Role::PlatformAdmin)
+        );
+        if is_instance_admin {
+            return Ok(());
+        }
+
+        let Some(checker) = self.project_access_checker.get() else {
+            return Ok(());
+        };
+
+        match checker.user_can_access_project(user_id, project_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(OtelError::AuthFailed {
+                reason: format!("API key user does not have access to project {project_id}"),
+            }),
+            Err(e) => {
+                warn!(
+                    user_id,
+                    project_id,
+                    error = %e,
+                    "ProjectAccessChecker infrastructure failure during OTel \
+                     ingest auth — denying (fail-closed)"
+                );
+                Err(OtelError::AuthFailed {
+                    reason: "Project access check failed".into(),
+                })
+            }
         }
     }
 
@@ -439,6 +524,93 @@ mod tests {
         assert!(!token.starts_with("si_"));
         assert!(!token.starts_with("tk_"));
         assert!(!token.starts_with("dt_"));
+    }
+
+    // ── check_project_access (ADR-028 enforcement on tk_ ingest) ─────────────
+
+    /// Stub checker: `Some(bool)` answers, `None` simulates infrastructure
+    /// failure. Counts calls so admin-bypass tests can assert it was skipped.
+    struct StubChecker {
+        allow: Option<bool>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for StubChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.allow {
+                Some(b) => Ok(b),
+                None => Err("checker database unreachable".into()),
+            }
+        }
+    }
+
+    fn service_with_checker(allow: Option<bool>) -> (OtelAuthService, Arc<StubChecker>) {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let svc = OtelAuthService::new(db);
+        let checker = Arc::new(StubChecker {
+            allow,
+            calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        svc.set_project_access_checker(checker.clone());
+        (svc, checker)
+    }
+
+    #[tokio::test]
+    async fn access_allowed_without_registered_checker() {
+        // Plain OSS binary: no checker plugin → allow (guard no-op parity).
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let svc = OtelAuthService::new(db);
+        assert!(svc.check_project_access(1, "user", 42).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_roles_bypass_checker() {
+        let (svc, checker) = service_with_checker(Some(false)); // would deny
+        assert!(svc.check_project_access(1, "admin", 42).await.is_ok());
+        assert!(svc
+            .check_project_access(1, "platform_admin", 42)
+            .await
+            .is_ok());
+        assert_eq!(
+            checker.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "instance admins must not consult the checker"
+        );
+    }
+
+    #[tokio::test]
+    async fn checker_verdict_is_enforced_for_non_admins() {
+        let (svc, _) = service_with_checker(Some(true));
+        assert!(svc.check_project_access(1, "user", 42).await.is_ok());
+
+        let (svc, _) = service_with_checker(Some(false));
+        assert!(matches!(
+            svc.check_project_access(1, "user", 42).await,
+            Err(OtelError::AuthFailed { .. })
+        ));
+
+        // Unknown/custom role strings get no bypass either.
+        let (svc, _) = service_with_checker(Some(false));
+        assert!(svc.check_project_access(1, "custom", 42).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn checker_infrastructure_failure_is_fail_closed() {
+        let (svc, _) = service_with_checker(None); // simulates Err from checker
+        assert!(matches!(
+            svc.check_project_access(1, "user", 42).await,
+            Err(OtelError::AuthFailed { .. })
+        ));
     }
 
     // ── ServiceAuth struct ───────────────────────────────────────────────────

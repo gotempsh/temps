@@ -35,10 +35,12 @@ import {
   Bell,
   ChevronDown,
   ChevronLeft,
+  PanelLeft,
   ExternalLink,
   FolderGit2,
   GitBranch,
   Loader2,
+  Maximize2,
   MessageSquare,
   Pencil,
   Plus,
@@ -50,7 +52,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { DebugChatPanel } from './DebugChatPanel'
@@ -210,15 +212,28 @@ export function AiAssistantDock() {
   )
 }
 
-function DockBody({
+/**
+ * The assistant itself: conversation list, message thread and composer.
+ *
+ * Exported so it can be mounted outside the dock — `/chat` renders it
+ * full-screen with `layout="page"`, which keeps the conversation list as a
+ * collapsible rail beside the thread instead of stacking behind it.
+ */
+export function DockBody({
   initialContext,
   onClose,
+  layout = 'dock',
 }: {
   initialContext?: AiChatContext
   onClose: () => void
+  layout?: 'dock' | 'page'
 }) {
   const navigate = useNavigate()
-  const { projectId: openedProjectId, currentProject } = useAiAssistant()
+  const {
+    projectId: openedProjectId,
+    currentProject,
+    open: openAssistant,
+  } = useAiAssistant()
 
   // Navigate to a chat's source. On narrow screens the dock covers the whole
   // viewport, so close it after navigating — otherwise it looks like nothing
@@ -401,18 +416,96 @@ function DockBody({
     }
   }
 
+  const isPage = layout === 'page'
+  const [railOpen, setRailOpen] = useState(true)
+
+  // Dock -> `/chat`. The open conversation is handed over through the provider
+  // so the full-screen view lands on the same thread rather than dumping the
+  // user back on the chat list; the dock closes so only one copy is on screen.
+  const goFullScreen = () => {
+    if (active) {
+      openAssistant({
+        projectId: active.projectId,
+        context: {
+          contextType: active.contextType,
+          contextId: active.contextId,
+          title: active.title,
+          projectSlug: active.projectSlug,
+          projectName: active.projectName,
+        },
+      })
+    }
+    navigate('/chat')
+    onClose()
+  }
   const inConversation = active !== null
   const href = active ? sourceHref(active) : null
   const sourceLabel = active
     ? `${metaFor(active.contextType).label}${active.projectName ? ` · ${active.projectName}` : ''}`
     : ''
 
+  // Full-height chat rail, only in page layout. It sits beside the whole
+  // column (header included) so the list lines up with the top of the page
+  // instead of starting under the conversation title.
+  const rail = isPage && railOpen && (
+    <aside className="flex h-full w-80 shrink-0 flex-col border-r">
+      <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
+        <h2 className="text-sm font-medium text-muted-foreground">Chats</h2>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {conversations.length}
+        </span>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
+        <ConversationList
+          loading={loadingList}
+          conversations={conversations}
+          activeId={activePublicId}
+          onOpen={openConversation}
+          onOpenSource={(c) => {
+            const h = sourceHref({
+              contextType: c.context_type,
+              contextId: c.context_id,
+              projectSlug: c.project_slug ?? undefined,
+            })
+            if (h) goToSource(h)
+          }}
+          onRename={startRename}
+          onDelete={(c) =>
+            setPendingDelete({
+              projectId: c.project_id,
+              publicId: c.public_id,
+              title:
+                c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+            })
+          }
+        />
+      </div>
+    </aside>
+  )
+
   return (
-    <div className="flex h-full flex-col gap-3 p-4">
+    <div className={cn('flex h-full', !isPage && 'flex-col gap-3 p-4')}>
+      {rail}
+      <div
+        className={cn(
+          isPage && 'flex h-full min-w-0 flex-1 flex-col gap-3 p-4',
+          !isPage && 'contents'
+        )}
+      >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 space-y-1">
           <div className="flex items-center gap-2">
-            {inConversation || picking ? (
+            {isPage ? (
+              <button
+                type="button"
+                onClick={() => setRailOpen((v) => !v)}
+                className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
+                title={railOpen ? 'Hide chat list' : 'Show chat list'}
+              >
+                <PanelLeft className="h-4 w-4" />
+              </button>
+            ) : inConversation || picking ? (
               <button
                 type="button"
                 onClick={inConversation ? backToList : () => setPicking(false)}
@@ -505,6 +598,17 @@ function DockBody({
                 New chat
               </Button>
             ))}
+          {!isPage && (
+            <button
+              type="button"
+              onClick={goFullScreen}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              title="Open full screen"
+              aria-label="Open chat full screen"
+            >
+              <Maximize2 className="h-4 w-4" />
+            </button>
+          )}
           {inConversation && (
             <button
               type="button"
@@ -657,6 +761,7 @@ function DockBody({
           </form>
         </DialogContent>
       </Dialog>
+      </div>
     </div>
   )
 }
@@ -664,6 +769,7 @@ function DockBody({
 function ConversationList({
   loading,
   conversations,
+  activeId,
   onOpen,
   onOpenSource,
   onRename,
@@ -671,6 +777,8 @@ function ConversationList({
 }: {
   loading: boolean
   conversations: GlobalConversationResponse[]
+  /** Public id of the chat currently open, highlighted in list-detail layouts. */
+  activeId?: string | null
   onOpen: (c: GlobalConversationResponse) => void
   onOpenSource: (c: GlobalConversationResponse) => void
   onRename: (c: GlobalConversationResponse) => void
@@ -709,7 +817,10 @@ function ConversationList({
         return (
           <div
             key={c.public_id}
-            className="group flex items-center gap-2 rounded-md border border-transparent pr-1 transition-colors hover:border-border hover:bg-accent"
+            className={cn(
+              'group relative flex items-center gap-2 rounded-md border border-transparent transition-colors hover:border-border hover:bg-accent',
+              c.public_id === activeId && 'border-border bg-muted'
+            )}
           >
             <button
               type="button"
@@ -725,48 +836,57 @@ function ConversationList({
                 <div className="truncate text-sm font-medium">
                   {c.title ?? `${label} ${c.context_id}`}
                 </div>
-                <div className="flex items-center gap-1.5 truncate text-xs text-muted-foreground">
-                  <span>{label}</span>
-                  {c.project_name && (
-                    <>
-                      <span>·</span>
-                      <span className="truncate">{c.project_name}</span>
-                    </>
-                  )}
-                  <span>·</span>
-                  <TimeAgo date={c.last_activity_at} />
+                {/* One identifier + time. Showing the context label *and* the
+                    project name *and* the timestamp left no room in a 320px
+                    rail: the name collapsed to zero width, leaving a stray
+                    "· ·" gap. The avatar badge already encodes the context
+                    type, so the project name replaces the label when present. */}
+                <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                  <span className="min-w-0 flex-1 truncate">
+                    {c.project_name ?? label}
+                  </span>
+                  <span className="shrink-0">
+                    <TimeAgo date={c.last_activity_at} />
+                  </span>
                 </div>
               </div>
             </button>
-            {hasSource && (
+            {/* Overlaid rather than laid out inline: as flex siblings these
+                three buttons reserved ~90px of a 320px row permanently, so
+                titles truncated to "Checkout latency …" even though they were
+                invisible until hover. Absolute positioning gives the text the
+                full row and fades the actions in over it. */}
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-0.5 rounded-r-md bg-gradient-to-l from-accent via-accent to-transparent pl-8 pr-1 opacity-0 transition-opacity focus-within:pointer-events-auto focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+              {hasSource && (
+                <button
+                  type="button"
+                  onClick={() => onOpenSource(c)}
+                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
+                  title="Go to source"
+                  aria-label="Go to source"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => onOpenSource(c)}
-                className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-foreground group-hover:opacity-100"
-                title="Go to source"
-                aria-label="Go to source"
+                onClick={() => onRename(c)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
+                title="Rename chat"
+                aria-label="Rename chat"
               >
-                <ExternalLink className="h-3.5 w-3.5" />
+                <Pencil className="h-3.5 w-3.5" />
               </button>
-            )}
-            <button
-              type="button"
-              onClick={() => onRename(c)}
-              className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-foreground group-hover:opacity-100"
-              title="Rename chat"
-              aria-label="Rename chat"
-            >
-              <Pencil className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => onDelete(c)}
-              className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-destructive group-hover:opacity-100"
-              title="Delete chat"
-              aria-label="Delete chat"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
+              <button
+                type="button"
+                onClick={() => onDelete(c)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-destructive"
+                title="Delete chat"
+                aria-label="Delete chat"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
         )
       })}

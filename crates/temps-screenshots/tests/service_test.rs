@@ -40,8 +40,13 @@ impl ScreenshotProvider for MockScreenshotProvider {
         "mock-provider"
     }
 
-    async fn is_available(&self) -> bool {
-        !self.should_fail
+    async fn check_availability(&self) -> Result<(), ScreenshotError> {
+        if self.should_fail {
+            return Err(ScreenshotError::ProviderError(
+                "Mock provider unavailable".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -44,7 +44,7 @@ impl From<ProxyLogServiceError> for Problem {
 }
 
 /// Query parameters for listing proxy logs
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ProxyLogsQuery {
     /// Filter by project ID
     pub project_id: Option<i32>,
@@ -58,9 +58,21 @@ pub struct ProxyLogsQuery {
     pub visitor_id: Option<i32>,
 
     // Date range filters
-    /// Start date for filtering (ISO 8601 format)
+    /// Start date for filtering (ISO 8601 format).
+    ///
+    /// **Defaults to 1 hour before `end_date` (or before now) when omitted.**
+    /// The listing is always time-bounded: an unbounded query would have to
+    /// consider the entire retention window — 100M+ rows on a busy deployment —
+    /// to return a single page. Pass an explicit `start_date` to widen the
+    /// window, up to the configured retention horizon.
+    ///
+    /// The maximum span between `start_date` and `end_date` is 7 days when
+    /// `project_id` is omitted, or 30 days when a single `project_id` is set —
+    /// a project-scoped query is bounded by that project's own row count
+    /// rather than the whole deployment's. A wider request is rejected with a
+    /// 400 naming the applicable cap.
     pub start_date: Option<DateTime>,
-    /// End date for filtering (ISO 8601 format)
+    /// End date for filtering (ISO 8601 format). Defaults to now.
     pub end_date: Option<DateTime>,
 
     // Request filters
@@ -102,6 +114,11 @@ pub struct ProxyLogsQuery {
     // Bot detection filters
     /// Filter by bot detection
     pub is_bot: Option<bool>,
+    /// When `true`, exclude rows flagged as bots while KEEPING rows whose
+    /// `is_bot` is NULL (older rows without detection metadata). This is the
+    /// tri-state complement of `is_bot=false`, which matches only rows
+    /// explicitly detected as non-bots. `false`/omitted is a no-op.
+    pub exclude_bots: Option<bool>,
     /// Filter by bot name
     pub bot_name: Option<String>,
     /// Filter by AI provider (e.g. `OpenAI`, `Anthropic`, `Perplexity`). Matches

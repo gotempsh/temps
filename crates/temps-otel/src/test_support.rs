@@ -11,6 +11,9 @@ use crate::error::OtelError;
 use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
 use crate::types::*;
 
+/// Cross-project trace refs: `(trace_id, project_id)` → `first_seen`.
+pub type TraceRefMap = HashMap<(String, i32), chrono::DateTime<chrono::Utc>>;
+
 /// In-memory storage backend for tests.
 ///
 /// Stores all data in `Arc<Mutex<...>>` collections so tests can
@@ -23,6 +26,9 @@ pub struct MockOtelStorage {
     pub archived_logs: Arc<Mutex<Vec<LogRecord>>>,
     pub insights: Arc<Mutex<Vec<Insight>>>,
     pub health_summaries: Arc<Mutex<Vec<HealthSummary>>>,
+    /// Cross-project trace refs keyed by `(trace_id, project_id)` — value is
+    /// the `first_seen` of the FIRST recording (later re-recordings are no-ops).
+    pub trace_refs: Arc<Mutex<TraceRefMap>>,
     pub next_insight_id: Arc<Mutex<i64>>,
     /// If set, store_spans will return this error instead.
     pub fail_store_spans: Arc<Mutex<Option<String>>>,
@@ -247,6 +253,34 @@ impl OtelStorage for MockOtelStorage {
             .cloned()
             .collect();
         Ok(filtered)
+    }
+
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        let mut refs = self.trace_refs.lock().unwrap();
+        for tid in trace_ids {
+            // First write per (trace_id, project_id) wins, matching both
+            // production backends.
+            refs.entry((tid.clone(), project_id))
+                .or_insert_with(chrono::Utc::now);
+        }
+        Ok(trace_ids.len() as u64)
+    }
+
+    async fn get_trace_ref_projects(
+        &self,
+        trace_id: &str,
+    ) -> StorageResult<Vec<crate::storage::TraceRefProject>> {
+        let refs = self.trace_refs.lock().unwrap();
+        Ok(refs
+            .iter()
+            .filter(|((tid, _), _)| tid == trace_id)
+            .map(
+                |((_, project_id), first_seen)| crate::storage::TraceRefProject {
+                    project_id: *project_id,
+                    first_seen: *first_seen,
+                },
+            )
+            .collect())
     }
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {

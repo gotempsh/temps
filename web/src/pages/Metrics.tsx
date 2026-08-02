@@ -1,4 +1,4 @@
-import { Routes, Route, Link, Navigate, useLocation } from 'react-router-dom'
+import { Routes, Route, Link, Navigate, useLocation } from 'react-router'
 import { ProjectResponse } from '@/api/client'
 import { Bell, ChevronRight, LayoutDashboard, LineChart } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'

@@ -5,7 +5,12 @@
  */
 
 import { Button } from '@/components/ui/button'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  TOOLTIP_CONTENT_STYLE,
+  TOOLTIP_LABEL_STYLE,
+  formatChartTick,
+  formatChartTooltipLabel,
+} from '@/lib/chart-tooltip'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -62,7 +67,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   LineChart,
@@ -833,10 +838,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
   })
 
   const chartData = (rangeData ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
+    time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
@@ -923,10 +925,12 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
               >
                 <XAxis
                   dataKey="time"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
                   tickLine={false}
                   axisLine={false}
-                  interval="preserveStartEnd"
+                  tickFormatter={formatChartTick}
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -951,6 +955,9 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                   labelStyle={TOOLTIP_LABEL_STYLE}
                   itemStyle={{ color: CHART_LINE_COLOR }}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
+                  labelFormatter={(label) =>
+                    formatChartTooltipLabel(Number(label))
+                  }
                   formatter={(v) => [
                     formatMetricValue(selectedMetric, Number(v)),
                     labelForMetric(selectedMetric),

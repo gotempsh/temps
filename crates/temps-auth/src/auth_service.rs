@@ -4,7 +4,7 @@ use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use cookie::Cookie;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     Set, TransactionTrait,
@@ -177,9 +177,9 @@ impl AuthService {
     }
 
     fn generate_session_token(&self) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..64)
-            .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+            .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
             .collect()
     }
 

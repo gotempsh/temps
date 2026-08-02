@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
 use temps_core::{AuditContext, AuditOperation};
 
 // Add these after the other audit structs
@@ -19,7 +18,22 @@ pub struct ExternalServiceUpdatedAudit {
     pub service_id: i32,
     pub name: String,
     pub service_type: String,
-    pub updated_parameters: HashMap<String, String>,
+    pub updated_parameter_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceParameterRevealedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub parameter_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceEnvironmentVariableRevealedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub project_id: i32,
+    pub variable_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +129,52 @@ impl AuditOperation for ExternalServiceCreatedAudit {
 impl AuditOperation for ExternalServiceUpdatedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceParameterRevealedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_PARAMETER_REVEALED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceEnvironmentVariableRevealedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_ENVIRONMENT_VARIABLE_REVEALED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

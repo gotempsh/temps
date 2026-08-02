@@ -18,6 +18,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
@@ -35,7 +36,7 @@ import {
   Shield,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 
 const ITEMS_PER_PAGE = 20
 const STATS_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
@@ -47,6 +48,7 @@ export function UserDetail() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [page, setPage] = useState(1)
+  const canViewAuditLogs = useCanViewAuditLogs()
 
   const { data: users, isLoading: isLoadingUser } = useQuery(
     listUsersOptions({ query: { include_deleted: true } })
@@ -68,7 +70,7 @@ export function UserDetail() {
         to: undefined,
       },
     }),
-    enabled: Number.isFinite(parsedId),
+    enabled: Number.isFinite(parsedId) && canViewAuditLogs,
   })
 
   // Separate query for stats — pull a larger recent batch so we can
@@ -85,7 +87,7 @@ export function UserDetail() {
         to: undefined,
       },
     }),
-    enabled: Number.isFinite(parsedId),
+    enabled: Number.isFinite(parsedId) && canViewAuditLogs,
   })
 
   const stats = useMemo(() => {
@@ -118,8 +120,7 @@ export function UserDetail() {
     return { actions30d, failedLogins30d, lastLogin, lastActivity }
   }, [statsLogs])
 
-  const userDisplayName =
-    target?.user.name || target?.user.username || 'User'
+  const userDisplayName = target?.user.name || target?.user.username || 'User'
 
   useEffect(() => {
     setBreadcrumbs([
@@ -157,9 +158,7 @@ export function UserDetail() {
   }
 
   const lastLoginLocation = stats?.lastLogin
-    ? [stats.lastLogin.city, stats.lastLogin.country]
-        .filter(Boolean)
-        .join(', ')
+    ? [stats.lastLogin.city, stats.lastLogin.country].filter(Boolean).join(', ')
     : ''
 
   return (
@@ -272,9 +271,7 @@ export function UserDetail() {
           icon={<Calendar className="h-4 w-4" />}
           label="Member since"
           value={
-            target
-              ? format(new Date(target.user.created_at), 'PP')
-              : undefined
+            target ? format(new Date(target.user.created_at), 'PP') : undefined
           }
           hint={
             target
@@ -283,168 +280,179 @@ export function UserDetail() {
           }
           loading={isLoadingUser}
         />
-        <StatCard
-          icon={<LogIn className="h-4 w-4" />}
-          label="Last login"
-          value={
-            stats?.lastLogin
-              ? formatDistanceToNow(new Date(stats.lastLogin.at), {
-                  addSuffix: true,
-                })
-              : statsLogs
-              ? 'Never'
-              : undefined
-          }
-          hint={
-            stats?.lastLogin
-              ? lastLoginLocation ||
-                format(new Date(stats.lastLogin.at), 'PP p')
-              : undefined
-          }
-          loading={!statsLogs}
-        />
-        <StatCard
-          icon={<Activity className="h-4 w-4" />}
-          label="Actions (30d)"
-          value={
-            stats
-              ? stats.actions30d >= STATS_BATCH_SIZE
-                ? `${STATS_BATCH_SIZE}+`
-                : String(stats.actions30d)
-              : undefined
-          }
-          hint={
-            stats?.lastActivity
-              ? `last ${formatDistanceToNow(
-                  new Date(stats.lastActivity)
-                )} ago`
-              : undefined
-          }
-          loading={!statsLogs}
-        />
-        <StatCard
-          icon={
-            stats && stats.failedLogins30d > 0 ? (
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-            ) : (
-              <Clock className="h-4 w-4" />
-            )
-          }
-          label="Failed logins (30d)"
-          value={stats ? String(stats.failedLogins30d) : undefined}
-          hint={
-            stats && stats.failedLogins30d === 0
-              ? 'No failed attempts'
-              : undefined
-          }
-          tone={
-            stats && stats.failedLogins30d > 0 ? 'warning' : undefined
-          }
-          loading={!statsLogs}
-        />
-      </div>
-
-      {/* Audit log section — reuses AuditLogItemRow to match /audit rendering */}
-      <div className="space-y-3">
-        <div className="flex flex-col gap-1">
-          <h2 className="text-lg font-semibold">Audit logs</h2>
-          <p className="text-sm text-muted-foreground">
-            Actions performed by {userDisplayName}.
-          </p>
-        </div>
-
-        <Card>
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-8" />
-                  <TableHead className="w-[110px]">Type</TableHead>
-                  <TableHead>Operation</TableHead>
-                  <TableHead className="hidden md:table-cell">Actor</TableHead>
-                  <TableHead className="hidden lg:table-cell">Origin</TableHead>
-                  <TableHead className="text-right">When</TableHead>
-                  <TableHead className="w-8" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoadingLogs ? (
-                  Array.from({ length: 6 }).map((_, i) => (
-                    <TableRow key={i}>
-                      <TableCell />
-                      <TableCell>
-                        <Skeleton className="h-5 w-16" />
-                      </TableCell>
-                      <TableCell>
-                        <Skeleton className="h-4 w-64" />
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <Skeleton className="h-4 w-24" />
-                      </TableCell>
-                      <TableCell className="hidden lg:table-cell">
-                        <Skeleton className="h-4 w-32" />
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Skeleton className="ml-auto h-4 w-32" />
-                      </TableCell>
-                      <TableCell />
-                    </TableRow>
-                  ))
-                ) : showEmptyState ? (
-                  <TableRow className="hover:bg-transparent">
-                    <TableCell colSpan={7} className="p-0">
-                      <EmptyState
-                        icon={ScrollText}
-                        title="No activity yet"
-                        description="Actions performed by this user will show up here."
-                      />
-                    </TableCell>
-                  </TableRow>
+        {canViewAuditLogs && (
+          <>
+            <StatCard
+              icon={<LogIn className="h-4 w-4" />}
+              label="Last login"
+              value={
+                stats?.lastLogin
+                  ? formatDistanceToNow(new Date(stats.lastLogin.at), {
+                      addSuffix: true,
+                    })
+                  : statsLogs
+                    ? 'Never'
+                    : undefined
+              }
+              hint={
+                stats?.lastLogin
+                  ? lastLoginLocation ||
+                    format(new Date(stats.lastLogin.at), 'PP p')
+                  : undefined
+              }
+              loading={!statsLogs}
+            />
+            <StatCard
+              icon={<Activity className="h-4 w-4" />}
+              label="Actions (30d)"
+              value={
+                stats
+                  ? stats.actions30d >= STATS_BATCH_SIZE
+                    ? `${STATS_BATCH_SIZE}+`
+                    : String(stats.actions30d)
+                  : undefined
+              }
+              hint={
+                stats?.lastActivity
+                  ? `last ${formatDistanceToNow(
+                      new Date(stats.lastActivity)
+                    )} ago`
+                  : undefined
+              }
+              loading={!statsLogs}
+            />
+            <StatCard
+              icon={
+                stats && stats.failedLogins30d > 0 ? (
+                  <AlertTriangle className="h-4 w-4 text-amber-500" />
                 ) : (
-                  logs?.map((log) => (
-                    <AuditLogItemRow
-                      key={log.id}
-                      id={log.id}
-                      operation_type={log.operation_type}
-                      audit_date={log.audit_date}
-                      user={log.user ?? undefined}
-                      ip_address={log.ip_address ?? undefined}
-                      data={log.data as Record<string, unknown> | undefined}
-                    />
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </Card>
-
-        {!showEmptyState && (
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-muted-foreground">
-              Page {page}
-              {logs && ` · ${logs.length} result${logs.length === 1 ? '' : 's'}`}
-            </p>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={page === 1 || isLoadingLogs}
-              >
-                Previous
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => p + 1)}
-                disabled={!hasMore || isLoadingLogs}
-              >
-                Next
-              </Button>
-            </div>
-          </div>
+                  <Clock className="h-4 w-4" />
+                )
+              }
+              label="Failed logins (30d)"
+              value={stats ? String(stats.failedLogins30d) : undefined}
+              hint={
+                stats && stats.failedLogins30d === 0
+                  ? 'No failed attempts'
+                  : undefined
+              }
+              tone={stats && stats.failedLogins30d > 0 ? 'warning' : undefined}
+              loading={!statsLogs}
+            />
+          </>
         )}
       </div>
+
+      {/* Audit log section — reuses AuditLogItemRow to match /audit rendering.
+          Gated to audit-log viewers: only administration roles may read
+          another user's activity. */}
+      {canViewAuditLogs && (
+        <div className="space-y-3">
+          <div className="flex flex-col gap-1">
+            <h2 className="text-lg font-semibold">Audit logs</h2>
+            <p className="text-sm text-muted-foreground">
+              Actions performed by {userDisplayName}.
+            </p>
+          </div>
+
+          <Card>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-8" />
+                    <TableHead className="w-[110px]">Type</TableHead>
+                    <TableHead>Operation</TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Actor
+                    </TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Origin
+                    </TableHead>
+                    <TableHead className="text-right">When</TableHead>
+                    <TableHead className="w-8" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {isLoadingLogs ? (
+                    Array.from({ length: 6 }).map((_, i) => (
+                      <TableRow key={i}>
+                        <TableCell />
+                        <TableCell>
+                          <Skeleton className="h-5 w-16" />
+                        </TableCell>
+                        <TableCell>
+                          <Skeleton className="h-4 w-64" />
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <Skeleton className="h-4 w-24" />
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          <Skeleton className="h-4 w-32" />
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Skeleton className="ml-auto h-4 w-32" />
+                        </TableCell>
+                        <TableCell />
+                      </TableRow>
+                    ))
+                  ) : showEmptyState ? (
+                    <TableRow className="hover:bg-transparent">
+                      <TableCell colSpan={7} className="p-0">
+                        <EmptyState
+                          icon={ScrollText}
+                          title="No activity yet"
+                          description="Actions performed by this user will show up here."
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    logs?.map((log) => (
+                      <AuditLogItemRow
+                        key={log.id}
+                        id={log.id}
+                        operation_type={log.operation_type}
+                        audit_date={log.audit_date}
+                        user={log.user ?? undefined}
+                        ip_address={log.ip_address ?? undefined}
+                        data={log.data as Record<string, unknown> | undefined}
+                      />
+                    ))
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </Card>
+
+          {!showEmptyState && (
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                Page {page}
+                {logs &&
+                  ` · ${logs.length} result${logs.length === 1 ? '' : 's'}`}
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page === 1 || isLoadingLogs}
+                >
+                  Previous
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage((p) => p + 1)}
+                  disabled={!hasMore || isLoadingLogs}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

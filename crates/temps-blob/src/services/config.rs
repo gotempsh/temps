@@ -1,6 +1,6 @@
 //! Blob Service configuration types
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 /// Default RustFS Docker image
@@ -130,19 +130,19 @@ impl BlobConfig {
 
 /// Generate a random access key (16 alphanumeric characters)
 fn generate_access_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     (0..16)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
 /// Generate a random secret key (32 alphanumeric characters)
 fn generate_secret_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     (0..32)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 

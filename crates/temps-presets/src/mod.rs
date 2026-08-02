@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 mod docker;
 mod docker_compose;
+mod docker_custom;
 mod docusaurus;
 mod nextjs;
 mod nixpacks_preset;
@@ -10,7 +11,6 @@ mod react_app;
 mod rsbuild;
 mod vite;
 mod build_system;
-mod docker_custom;
 mod preset_config;
 mod framework_detector;
 mod rust_preset;
@@ -29,9 +29,13 @@ pub mod providers;
 
 // Re-export Preset enum from temps-entities
 pub use temps_entities::preset::Preset as PresetType;
+use temps_entities::preset::{
+    DockerfileVariant, NixpacksConfig, PresetConfig as StoredPresetConfig,
+};
 use build_system::BuildSystem;
 use docusaurus::Docusaurus;
 use docker::DockerfilePreset;
+use docker_custom::DockerCustomPreset;
 pub use nextjs::NextJs;
 pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
 pub use react_app::CreateReactApp;
@@ -49,6 +53,34 @@ pub use java_preset::JavaPreset;
 pub enum ProjectType {
     Server,
     Static,
+}
+
+/// Canonical representation of a selectable catalog preset.
+///
+/// Catalog slugs are presentation-level variants such as `nixpacks-node` or
+/// `react-app`. Projects persist the canonical preset plus its typed config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPreset {
+    pub preset: PresetType,
+    pub config: Option<StoredPresetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PresetResolutionError {
+    #[error("Unknown preset: {slug}")]
+    UnknownSlug { slug: String },
+
+    #[error("Preset '{slug}' cannot be persisted")]
+    NotPersistable { slug: String },
+
+    #[error("Preset config for '{config_preset}' cannot be used with '{slug}'")]
+    ConfigMismatch {
+        config_preset: PresetType,
+        slug: String,
+    },
+
+    #[error("Invalid config for preset '{slug}': {reason}")]
+    InvalidConfig { slug: String, reason: String },
 }
 
 impl std::fmt::Display for ProjectType {
@@ -240,6 +272,30 @@ pub trait Preset: fmt::Display + Send + Sync {
     fn dirs_to_upload(&self) -> Vec<String>;
     fn slug(&self) -> String;
 
+    /// Canonical database preset represented by this catalog entry.
+    ///
+    /// Most presets have identical catalog and storage slugs. Variants override
+    /// this method. Entries without a persistable identity return `None`.
+    fn stored_preset(&self) -> Option<PresetType> {
+        self.slug().parse().ok()
+    }
+
+    /// Resolve this catalog entry with optional user configuration.
+    fn resolve_storage(
+        &self,
+        config: Option<StoredPresetConfig>,
+    ) -> Result<StoredPreset, PresetResolutionError> {
+        let preset = self
+            .stored_preset()
+            .ok_or_else(|| PresetResolutionError::NotPersistable { slug: self.slug() })?;
+
+        if let Some(config) = config.as_ref() {
+            validate_preset_config(preset, config)?;
+        }
+
+        Ok(StoredPreset { preset, config })
+    }
+
     /// Returns the default exposed port for this preset
     /// This is the port the application listens on inside the container
     fn default_port(&self) -> u16 {
@@ -270,7 +326,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         // Generic presets
         Box::new(docker_compose::DockerComposePreset),
         Box::new(DockerfilePreset),
-        Box::new(docker_custom::DockerCustomPreset),
+        Box::new(DockerCustomPreset),
         // Nixpacks auto-detect
         Box::new(NixpacksPreset::auto()),
         // Nixpacks provider-specific variants
@@ -293,6 +349,94 @@ pub fn get_preset_by_slug(slug: &str) -> Option<Box<dyn Preset>> {
     all_presets()
         .into_iter()
         .find(|preset| preset.slug() == slug)
+}
+
+/// Resolve a public catalog slug to its canonical persisted representation.
+pub fn resolve_preset_slug(
+    slug: &str,
+    config: Option<StoredPresetConfig>,
+) -> Result<StoredPreset, PresetResolutionError> {
+    let preset =
+        get_preset_by_slug(slug).ok_or_else(|| PresetResolutionError::UnknownSlug {
+            slug: slug.to_string(),
+        })?;
+    preset.resolve_storage(config)
+}
+
+/// Validate typed configuration for its canonical stored preset.
+///
+/// This is intentionally public so create, full-update, and config-only patch
+/// paths share the same validation boundary.
+pub fn validate_preset_config(
+    preset: PresetType,
+    config: &StoredPresetConfig,
+) -> Result<(), PresetResolutionError> {
+    if config.preset_type() != preset {
+        return Err(PresetResolutionError::ConfigMismatch {
+            config_preset: config.preset_type(),
+            slug: preset.as_str().to_string(),
+        });
+    }
+
+    if let StoredPresetConfig::Nixpacks(config) = config {
+        NixpacksPreset::validate_config(config)?;
+    }
+
+    Ok(())
+}
+
+/// Instantiate the build preset for a canonical stored project configuration.
+pub fn get_preset_for_storage(
+    preset: PresetType,
+    config: Option<&StoredPresetConfig>,
+) -> Result<Option<Box<dyn Preset>>, PresetResolutionError> {
+    if let Some(config) = config {
+        validate_preset_config(preset, config)?;
+    }
+
+    if preset == PresetType::Nixpacks {
+        let nixpacks_config = match config {
+            Some(StoredPresetConfig::Nixpacks(config)) => config.clone(),
+            _ => NixpacksConfig::default(),
+        };
+        return Ok(Some(Box::new(NixpacksPreset::from_config(
+            nixpacks_config,
+        ))));
+    }
+
+    if preset == PresetType::Dockerfile {
+        let is_custom = matches!(
+            config,
+            Some(StoredPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::Custom
+        );
+        let runtime_preset: Box<dyn Preset> = if is_custom {
+            Box::new(DockerCustomPreset)
+        } else {
+            Box::new(DockerfilePreset)
+        };
+        return Ok(Some(runtime_preset));
+    }
+
+    Ok(all_presets()
+        .into_iter()
+        .find(|candidate| candidate.stored_preset() == Some(preset)))
+}
+
+/// Public catalog slug corresponding to a stored project.
+///
+/// Multi-provider Nixpacks configurations intentionally use the canonical
+/// `nixpacks` slug because no single catalog variant can represent them.
+pub fn runtime_slug(
+    preset: PresetType,
+    config: Option<&StoredPresetConfig>,
+) -> String {
+    get_preset_for_storage(preset, config)
+        .ok()
+        .flatten()
+        .map(|runtime_preset| runtime_preset.slug())
+        .filter(|slug| get_preset_by_slug(slug).is_some())
+        .unwrap_or_else(|| preset.as_str().to_string())
 }
 
 pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {

@@ -28,7 +28,7 @@ use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBundleInfo};
@@ -148,6 +148,112 @@ pub struct DeployFromImageUploadQuery {
 /// - Capped at 2048 bytes
 ///
 /// Returns a 400 `Problem` on failure.
+/// Reject an uploaded image only when **no** node in the cluster could run it.
+///
+/// The control plane's own platform is always a candidate (it is a scheduling
+/// target), plus the architecture of every active worker node. An image
+/// matching any of them is accepted; the scheduler then places it on a node
+/// that can actually execute it.
+///
+/// Failing to inspect the image, or to list nodes, is not treated as a
+/// rejection — a transient database error must not turn a valid upload into a
+/// 400. The deploy path re-checks the architecture before transferring to a
+/// node, so a genuinely unrunnable image still fails there, with context.
+/// Whether an uploaded image may be accepted, given the platforms the cluster
+/// is known to run.
+///
+/// An **empty** `cluster_platforms` means we know nothing — the daemon didn't
+/// answer and no node reported an architecture — and accepts. Rejecting on
+/// absence of information would turn a transient failure into a 400 on a valid
+/// upload, and the deploy path re-checks the architecture before the image
+/// reaches any node.
+fn uploaded_image_is_runnable(image_platform: &str, cluster_platforms: &[String]) -> bool {
+    if cluster_platforms.is_empty() {
+        return true;
+    }
+    cluster_platforms
+        .iter()
+        .any(|p| temps_deployer::platform::platforms_match(p, image_platform))
+}
+
+async fn validate_uploaded_image_platform(
+    state: &Arc<AppState>,
+    image_tag: &str,
+) -> Result<(), Problem> {
+    let image_platform = match state.image_builder.inspect_image(image_tag).await {
+        Ok(info) => info.platform,
+        Err(e) => {
+            warn!(
+                image = %image_tag,
+                "Could not inspect uploaded image to validate its platform: {}", e
+            );
+            return Ok(());
+        }
+    };
+
+    // Only a platform the daemon confirmed counts. `get_native_platform()`
+    // would answer with this process's architecture when discovery hasn't
+    // landed, and on a cross-architecture `DOCKER_HOST` that rejects images the
+    // daemon can run — or accepts ones it can't. We just inspected an image, so
+    // Docker is reachable and asking costs one `docker info`.
+    let mut cluster_platforms: Vec<String> = state
+        .image_builder
+        .ensure_platform_discovered()
+        .await
+        .into_iter()
+        .collect();
+
+    match state.node_service.list_active(90).await {
+        Ok(nodes) => {
+            for node in nodes {
+                if let Some(architecture) = node.architecture {
+                    if !cluster_platforms.contains(&architecture) {
+                        cluster_platforms.push(architecture);
+                    }
+                }
+            }
+        }
+        // We can't see the fleet, so we can't say this image has nowhere to
+        // run. Rejecting here would turn a transient database read error into
+        // a 400 on a perfectly valid upload; the deploy path re-checks the
+        // architecture before the image reaches any node.
+        Err(e) => {
+            warn!(
+                "Could not list active nodes while validating uploaded image platform ({}); \
+                 accepting the upload",
+                e
+            );
+            return Ok(());
+        }
+    }
+
+    if uploaded_image_is_runnable(&image_platform, &cluster_platforms) {
+        info!(
+            image = %image_tag,
+            platform = %image_platform,
+            "Image platform validation passed"
+        );
+        return Ok(());
+    }
+
+    error!(
+        image = %image_tag,
+        image_platform = %image_platform,
+        cluster_platforms = ?cluster_platforms,
+        "Rejecting uploaded image: no node in the cluster runs its architecture"
+    );
+    Err(problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Platform Mismatch")
+        .with_detail(format!(
+            "The uploaded image is built for {}, but no node in this cluster runs that \
+             architecture (available: {}). Rebuild the image for one of those platforms, \
+             or join a {} worker node first.",
+            image_platform,
+            cluster_platforms.join(", "),
+            image_platform
+        )))
+}
+
 fn validate_health_check_path(path: &str) -> Result<(), Problem> {
     let invalid = |detail: &str| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -376,6 +482,7 @@ pub async fn deploy_from_image(
 
     // 1. Verify project exists and has DockerImage source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -619,6 +726,7 @@ pub async fn deploy_from_static(
 
     // 1. Verify project exists and has StaticFiles source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -894,6 +1002,7 @@ pub async fn deploy_from_image_upload(
 
     // 1. Verify project exists and has DockerImage source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -1047,23 +1156,13 @@ pub async fn deploy_from_image_upload(
         imported_image_id, image_tag
     );
 
-    // 7. Validate image platform matches the target platform
-    if let Err(e) = state
-        .image_builder
-        .validate_image_platform(&image_tag)
-        .await
-    {
-        error!("Image platform validation failed: {}", e);
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Platform Mismatch")
-            .with_detail(format!(
-                "The uploaded image architecture does not match the target platform. {}. \
-                Please ensure you're uploading an image built for the correct architecture.",
-                e
-            )));
-    }
-
-    info!("Image platform validation passed for tag: {}", image_tag);
+    // 7. Validate the image can run *somewhere* in this cluster.
+    //
+    // This deliberately checks against every node's architecture, not just the
+    // control plane's: on a mixed cluster an arm64 image is perfectly valid
+    // when an arm64 worker exists, and rejecting it because the control plane
+    // is amd64 would block a legitimate deploy.
+    validate_uploaded_image_platform(&state, &image_tag).await?;
 
     // 8. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
@@ -1286,6 +1385,7 @@ pub async fn upload_static_bundle(
 
     // 1. Verify project exists and has StaticFiles source type
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -2009,6 +2109,34 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_image_accepted_when_a_cluster_platform_matches() {
+        let cluster = vec!["linux/amd64".to_string(), "linux/arm64".to_string()];
+        assert!(uploaded_image_is_runnable("linux/arm64", &cluster));
+        // An arm64 worker makes an arm64 upload valid even though the control
+        // plane is amd64 — the case that used to be rejected outright.
+        assert!(uploaded_image_is_runnable(
+            "linux/aarch64",
+            &["linux/amd64".to_string(), "linux/arm64".to_string()]
+        ));
+    }
+
+    #[test]
+    fn uploaded_image_rejected_when_no_node_runs_its_architecture() {
+        let cluster = vec!["linux/amd64".to_string()];
+        assert!(!uploaded_image_is_runnable("linux/arm64", &cluster));
+    }
+
+    /// Knowing nothing is not the same as knowing it won't run. A daemon that
+    /// didn't answer, or a transient failure listing nodes, must not turn a
+    /// valid upload into a permanent 400 — the deploy path checks the
+    /// architecture again before the image reaches a node.
+    #[test]
+    fn uploaded_image_accepted_when_no_cluster_platform_is_known() {
+        assert!(uploaded_image_is_runnable("linux/arm64", &[]));
+        assert!(uploaded_image_is_runnable("linux/riscv64", &[]));
+    }
 
     #[test]
     fn health_check_path_accepts_valid_paths() {

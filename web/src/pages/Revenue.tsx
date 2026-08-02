@@ -29,7 +29,7 @@ import { format } from 'date-fns'
 import { DollarSign, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 const ALL_PROJECTS = '__all_projects__'
 const ALL_TYPES = '__all_types__'

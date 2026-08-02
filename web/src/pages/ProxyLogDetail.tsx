@@ -4,7 +4,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router'
 
 export default function ProxyLogDetailPage() {
   const { id } = useParams<{ id: string }>()

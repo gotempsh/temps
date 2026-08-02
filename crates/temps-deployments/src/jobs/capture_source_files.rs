@@ -4,7 +4,13 @@
 //! Python, …) stack frames can be shown with source context — the counterpart
 //! to [`super::capture_source_maps`], which extracts `.map` files from the built
 //! image for JavaScript. Native source is NOT in the compiled image (the binary
-//! strips it), so this reads the `DownloadRepoJob` checkout (`repo_dir`) instead.
+//! strips it), so this reads the git checkout instead.
+//!
+//! By default it captures from the deployment's **Docker build context** (the
+//! exact directory the image was built from) — the correct root for Dockerfile
+//! deploys and monorepos, since frame paths are relative to what was copied in.
+//! `.temps.yaml sourceContext.root` and the project `error_source_root` setting
+//! override that default (see [`resolve_capture_root`]).
 //!
 //! Runs as a post-deployment job (never blocks the pipeline) and is only
 //! scheduled when the project has opted into source context, so it is a no-op
@@ -54,10 +60,15 @@ pub struct CaptureSourceFilesJob {
     release: String,
     /// Job whose `repo_dir` output holds the checkout path (the DownloadRepoJob).
     download_job_id: String,
-    /// Project subdirectory (module root) within the checkout; frame paths are
-    /// reported relative to this, so files are keyed relative to it too.
-    project_directory: String,
-    /// File extensions (without a dot) to upload.
+    /// Job whose `build_context` output holds the Docker build-context dir (the
+    /// BuildImageJob). This is the default capture root.
+    build_job_id: String,
+    /// Project-level override for the capture root, relative to the checkout.
+    /// `None` = default to the build context. `.temps.yaml sourceContext.root`
+    /// takes precedence over this when present.
+    error_source_root: Option<String>,
+    /// Default file extensions (without a dot) to upload. `.temps.yaml`
+    /// `sourceContext.include` overrides this when present.
     extensions: Vec<String>,
     source_map_service: Arc<SourceMapService>,
     log_id: Option<String>,
@@ -71,7 +82,8 @@ impl std::fmt::Debug for CaptureSourceFilesJob {
             .field("project_id", &self.project_id)
             .field("release", &self.release)
             .field("download_job_id", &self.download_job_id)
-            .field("project_directory", &self.project_directory)
+            .field("build_job_id", &self.build_job_id)
+            .field("error_source_root", &self.error_source_root)
             .field("extensions", &self.extensions)
             .finish()
     }
@@ -84,7 +96,8 @@ impl CaptureSourceFilesJob {
         project_id: i32,
         release: String,
         download_job_id: String,
-        project_directory: String,
+        build_job_id: String,
+        error_source_root: Option<String>,
         extensions: Vec<String>,
         source_map_service: Arc<SourceMapService>,
     ) -> Self {
@@ -93,7 +106,8 @@ impl CaptureSourceFilesJob {
             project_id,
             release,
             download_job_id,
-            project_directory,
+            build_job_id,
+            error_source_root,
             extensions,
             source_map_service,
             log_id: None,
@@ -135,6 +149,62 @@ impl CaptureSourceFilesJob {
             LogLevel::Info
         }
     }
+}
+
+/// Read `.temps.yaml sourceContext` from the checkout root. Returns
+/// `(root, include)`; both `None` when the file is absent, unparsable, or has
+/// no `sourceContext` block.
+fn read_temps_source_context(repo_dir: &Path) -> (Option<String>, Option<Vec<String>>) {
+    let contents = match std::fs::read_to_string(repo_dir.join(".temps.yaml")) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    match temps_core::TempsConfig::from_yaml(&contents) {
+        Ok(cfg) => cfg
+            .source_context
+            .map(|sc| (sc.root, sc.include))
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Resolve the directory to capture source from, in precedence order:
+///   1. `.temps.yaml sourceContext.root` (repo-relative)
+///   2. project `error_source_root` (repo-relative)
+///   3. the Docker build context (absolute, from BuildImageJob)
+///   4. the checkout root
+///
+/// Repo-relative overrides are confined to the checkout (reject `..`/symlink
+/// escapes). The build context is confined defensively; on any mismatch it
+/// falls back to the checkout root rather than capturing outside it.
+fn resolve_capture_root(
+    repo_dir: &Path,
+    build_context: Option<&Path>,
+    yaml_root: Option<&str>,
+    project_root: Option<&str>,
+) -> Result<PathBuf, WorkflowError> {
+    use crate::jobs::deploy_compose::canonicalize_confined_repo_path;
+
+    for (candidate, field) in [
+        (yaml_root, "sourceContext.root"),
+        (project_root, "error_source_root"),
+    ] {
+        if let Some(rel) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return canonicalize_confined_repo_path(repo_dir, Path::new(rel), field);
+        }
+    }
+
+    if let Some(bc) = build_context {
+        if let (Ok(canon_repo), Ok(canon_bc)) =
+            (std::fs::canonicalize(repo_dir), std::fs::canonicalize(bc))
+        {
+            if canon_bc.starts_with(&canon_repo) {
+                return Ok(canon_bc);
+            }
+        }
+    }
+
+    canonicalize_confined_repo_path(repo_dir, Path::new("."), "checkout")
 }
 
 /// Recursively collect files under `root` whose extension is in `exts`,
@@ -222,35 +292,45 @@ impl WorkflowTask for CaptureSourceFilesJob {
             }
         };
 
-        // Resolve the module root (project subdirectory within the checkout).
-        // `project.directory` is user-controlled, so confine it to the checkout:
-        // reject `../` traversal and symlink escapes out of the repo (the returned
-        // path is canonicalized and asserted to live under the checkout).
-        let dir = {
-            let d = self.project_directory.trim_matches('/');
-            if d.is_empty() {
-                "."
-            } else {
-                d
-            }
-        };
-        let source_root = match crate::jobs::deploy_compose::canonicalize_confined_repo_path(
+        // Default capture root: the Docker build context — the exact directory
+        // the image was built from (BuildImageJob's `build_context` output).
+        // This is the correct root for Dockerfile deploys and monorepos, since
+        // frame paths are reported relative to what was copied into the build.
+        let build_context = context
+            .get_output::<String>(&self.build_job_id, "build_context")?
+            .map(PathBuf::from);
+
+        // `.temps.yaml sourceContext` (read from the checkout root) can override
+        // the root and the extension set per-repo.
+        let (yaml_root, yaml_include) = read_temps_source_context(&repo_dir);
+
+        // Precedence: .temps.yaml root > project error_source_root > build
+        // context > checkout root. Repo-relative overrides are confined to the
+        // checkout (reject `..` and symlink escapes).
+        let source_root = match resolve_capture_root(
             &repo_dir,
-            std::path::Path::new(dir),
-            "project_directory",
+            build_context.as_deref(),
+            yaml_root.as_deref(),
+            self.error_source_root.as_deref(),
         ) {
             Ok(p) => p,
             Err(e) => {
                 self.log(format!(
-                    "⚠️ Source root '{}' not usable ({}); skipping source capture",
-                    dir, e
+                    "⚠️ Source root not usable ({}); skipping source capture",
+                    e
                 ))
                 .await?;
                 return Ok(JobResult::success(context));
             }
         };
+        self.log(format!(
+            "📂 Capturing source from {}",
+            source_root.display()
+        ))
+        .await?;
 
-        let files = collect_source_files(&source_root, &self.extensions);
+        let extensions = yaml_include.unwrap_or_else(|| self.extensions.clone());
+        let files = collect_source_files(&source_root, &extensions);
         if files.len() >= MAX_FILES {
             self.log(format!(
                 "⚠️ Source file cap reached ({} files); uploading the first {}",
@@ -380,5 +460,115 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // --- capture-root resolution (the error_source_root / build-context logic) ---
+
+    fn tmp_repo(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("tsf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap()
+    }
+
+    #[test]
+    fn resolve_root_precedence_yaml_then_project_then_context_then_root() {
+        let repo = tmp_repo("prec");
+        for d in ["services/api", "services/web", "ctx"] {
+            std::fs::create_dir_all(repo.join(d)).unwrap();
+        }
+        let ctx = repo.join("ctx");
+
+        // 1. .temps.yaml root wins over everything.
+        let r = resolve_capture_root(
+            &repo,
+            Some(&ctx),
+            Some("services/api"),
+            Some("services/web"),
+        )
+        .unwrap();
+        assert_eq!(r, canon(&repo.join("services/api")));
+
+        // 2. project error_source_root wins when there is no yaml root.
+        let r = resolve_capture_root(&repo, Some(&ctx), None, Some("services/web")).unwrap();
+        assert_eq!(r, canon(&repo.join("services/web")));
+
+        // 3. Docker build context is the default.
+        let r = resolve_capture_root(&repo, Some(&ctx), None, None).unwrap();
+        assert_eq!(r, canon(&ctx));
+
+        // 4. Checkout root when there is no build context either.
+        let r = resolve_capture_root(&repo, None, None, None).unwrap();
+        assert_eq!(r, canon(&repo));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_root_rejects_traversal_overrides() {
+        let repo = tmp_repo("trav");
+        assert!(resolve_capture_root(&repo, None, None, Some("../../etc")).is_err());
+        assert!(resolve_capture_root(&repo, None, Some(".."), None).is_err());
+        assert!(resolve_capture_root(&repo, None, Some("a/../../b"), None).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_root_ignores_empty_overrides() {
+        let repo = tmp_repo("empty");
+        std::fs::create_dir_all(repo.join("ctx")).unwrap();
+        let ctx = repo.join("ctx");
+        // whitespace/empty overrides are treated as unset → fall through to context.
+        let r = resolve_capture_root(&repo, Some(&ctx), Some("   "), Some("")).unwrap();
+        assert_eq!(r, canon(&ctx));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_root_build_context_outside_repo_falls_back_to_root() {
+        let repo = tmp_repo("bc-in");
+        let outside = tmp_repo("bc-out");
+        // A build context that resolves outside the checkout is rejected; capture
+        // falls back to the checkout root rather than reading outside it.
+        let r = resolve_capture_root(&repo, Some(&outside), None, None).unwrap();
+        assert_eq!(r, canon(&repo));
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn read_temps_source_context_parses_root_and_include() {
+        let repo = tmp_repo("yaml-ok");
+        std::fs::write(
+            repo.join(".temps.yaml"),
+            "sourceContext:\n  root: services/api\n  include: [go, rs]\n",
+        )
+        .unwrap();
+        let (root, include) = read_temps_source_context(&repo);
+        assert_eq!(root.as_deref(), Some("services/api"));
+        assert_eq!(include, Some(vec!["go".to_string(), "rs".to_string()]));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn read_temps_source_context_absent_or_no_block() {
+        let repo = tmp_repo("yaml-none");
+        // No .temps.yaml at all.
+        assert_eq!(read_temps_source_context(&repo), (None, None));
+        // Present, but no sourceContext block.
+        std::fs::write(
+            repo.join(".temps.yaml"),
+            "health:\n  path: /health\n  status: 200\n",
+        )
+        .unwrap();
+        assert_eq!(read_temps_source_context(&repo), (None, None));
+        // Malformed YAML.
+        std::fs::write(repo.join(".temps.yaml"), "sourceContext: [not, a, map").unwrap();
+        assert_eq!(read_temps_source_context(&repo), (None, None));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

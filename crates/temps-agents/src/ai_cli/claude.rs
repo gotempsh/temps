@@ -248,7 +248,7 @@ impl AiCliProvider for ClaudeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: error_output,
+                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
@@ -380,7 +380,7 @@ impl AiCliProvider for ClaudeCliProvider {
             return Err(AgentError::AiCliFailed {
                 provider: self.name().to_string(),
                 exit_code,
-                stderr: error_output,
+                stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
             });
         }
 
