@@ -149,21 +149,35 @@ export async function findRepositoryByName(
   owner: string,
   repoName: string
 ): Promise<RepositoryResponse | null> {
+  // Search server-side rather than paging through everything. Without this the
+  // call fetched an arbitrary first 100 repositories and matched client-side,
+  // so on any organisation with more than 100 repos a perfectly valid --repo
+  // was reported as "not found in connection" purely because it happened to
+  // sort past the first page.
   const { data, error: apiError } = await listRepositoriesByConnection({
     client,
     path: { connection_id: connectionId },
-    query: { per_page: 100 },
+    query: { per_page: 100, search: repoName },
   })
 
   if (apiError || !data?.repositories) {
     return null
   }
 
-  return (
-    data.repositories.find(
-      (r) => r.owner.toLowerCase() === owner.toLowerCase() && r.name.toLowerCase() === repoName.toLowerCase()
-    ) || null
-  )
+  const match = (r: RepositoryResponse) =>
+    r.owner.toLowerCase() === owner.toLowerCase() && r.name.toLowerCase() === repoName.toLowerCase()
+
+  const found = data.repositories.find(match)
+  if (found) return found
+
+  // Fall back to an unfiltered page for providers that ignore `search`, so this
+  // is never worse than the previous behaviour.
+  const { data: unfiltered } = await listRepositoriesByConnection({
+    client,
+    path: { connection_id: connectionId },
+    query: { per_page: 100 },
+  })
+  return unfiltered?.repositories?.find(match) ?? null
 }
 
 /**

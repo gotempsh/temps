@@ -255,7 +255,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Latency breakdown',
     description:
-      'Mean request duration per interval, split into backend time and proxy overhead (proxied requests only for the split)',
+      'Mean request duration per interval, split into backend time and proxy overhead (proxied requests only for the split). Excludes WebSocket/SSE sessions, whose duration is a connection lifetime rather than a latency — see the streaming panel below',
     series: [
       {
         metric: 'proxy.request_duration_avg_ms',
@@ -274,6 +274,59 @@ const NODE_PANELS: NodePanelDef[] = [
         dataKey: 'proxy.self_duration_avg_ms',
         label: 'Proxy avg',
         color: '#16a34a',
+      },
+    ],
+    valueFormatter: formatMs,
+  },
+  {
+    title: 'Proxy overhead percentiles',
+    description:
+      'Proxy self time p50 / p95 / p99. Read these alongside the mean above: a mean that moves while the percentiles stay flat is a handful of outlier requests, not a broad latency regression',
+    series: [
+      {
+        metric: 'proxy.self_duration_p50_ms',
+        dataKey: 'proxy.self_duration_p50_ms',
+        label: 'p50',
+        color: '#16a34a',
+      },
+      {
+        metric: 'proxy.self_duration_p95_ms',
+        dataKey: 'proxy.self_duration_p95_ms',
+        label: 'p95',
+        color: '#d97706',
+      },
+      {
+        metric: 'proxy.self_duration_p99_ms',
+        dataKey: 'proxy.self_duration_p99_ms',
+        label: 'p99',
+        color: '#dc2626',
+      },
+    ],
+    valueFormatter: formatMs,
+  },
+  {
+    title: 'Streaming sessions',
+    description:
+      'WebSocket tunnels and SSE streams that closed in the interval, and their mean lifetime. These are held open deliberately (up to 1h idle for WebSockets), so a long mean here is expected and is not proxy latency',
+    series: [
+      {
+        metric: 'proxy.streaming_sessions',
+        dataKey: 'proxy.streaming_sessions',
+        label: 'Sessions closed',
+        color: '#7c3aed',
+      },
+    ],
+    valueFormatter: formatCount,
+  },
+  {
+    title: 'Streaming session lifetime',
+    description: 'Mean time a WebSocket/SSE session stayed open before closing',
+    series: [
+      {
+        metric: 'proxy.streaming_duration_avg_ms',
+        dataKey: 'proxy.streaming_duration_avg_ms',
+        label: 'Mean lifetime',
+        color: '#7c3aed',
       },
     ],
     valueFormatter: formatMs,

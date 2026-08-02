@@ -1274,6 +1274,33 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
 /// challenge, so on-demand TLS would never fire. This is the only condition
 /// that gates ADR-018 §6 on-demand-TLS auto-enablement; any other (non-empty,
 /// non-loopback) base domain qualifies, regardless of whether it is sslip.io.
+/// Build the wildcard-DNS base domain for `ip`, using the **dashed** spelling.
+///
+/// Wildcard-DNS services (sslip.io and friends) locate the target address by
+/// scanning the hostname for four numeric components joined by a *single*
+/// separator style, taking the leftmost match — and that match is not anchored
+/// to the base domain. With a dotted base, any generated label ending in a
+/// number donates it to the front of the IP and the name resolves elsewhere:
+///
+/// ```text
+/// observability-starter-1.127.0.0.1.sslip.io  ->  1.127.0.0
+/// pr-42.127.0.0.1.sslip.io                    ->  42.127.0.0
+/// ```
+///
+/// Deployment slugs are `{project}-{n}` and preview environments are
+/// `pr-{number}`, so on a dotted base that is *every* generated hostname. The
+/// dashed spelling makes the separator styles disagree (`1.127-0-0` mixes a dot
+/// and dashes, so it is rejected) and the real `127-0-0-1` wins.
+///
+/// The published installer emits the same dashed form and passes it via
+/// `--wildcard-domain`; this covers `temps setup --auto` generating its own.
+///
+/// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
+/// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
+fn sslip_domain_for(ip: &str) -> String {
+    format!("{}.sslip.io", ip.replace('.', "-"))
+}
+
 fn is_loopback_zone(zone: &str) -> bool {
     let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
     z == "localhost"
@@ -1317,7 +1344,7 @@ impl SetupCommand {
                         ip
                     }
                 };
-                let sslip_domain = format!("{}.sslip.io", ip);
+                let sslip_domain = sslip_domain_for(&ip);
                 print_success(&format!(
                     "Using sslip.io domain: {}",
                     format!("*.{}", sslip_domain).bright_cyan()
@@ -2821,6 +2848,20 @@ fn finish_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the dashed spelling. Reverting this to the dotted form still
+    /// compiles and passes every other check, while silently making every
+    /// generated app hostname on a quick-start install resolve to a third
+    /// party — so the behaviour needs an assertion, not just a comment.
+    #[test]
+    fn sslip_domain_uses_the_dashed_ip_spelling() {
+        assert_eq!(sslip_domain_for("127.0.0.1"), "127-0-0-1.sslip.io");
+        assert_eq!(sslip_domain_for("203.0.113.42"), "203-0-113-42.sslip.io");
+        // The generated base must stay loopback-detectable, or `temps setup`
+        // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
+        assert!(is_loopback_zone(&sslip_domain_for("127.0.0.1")));
+        assert!(!is_loopback_zone(&sslip_domain_for("203.0.113.42")));
+    }
 
     #[test]
     fn test_is_loopback_zone() {
