@@ -142,6 +142,14 @@ describe('resolvePrimaryUrl', () => {
     // Parses to origin evil.com without a base, but resolves base-relative in
     // a browser — the validated origin and the linked origin disagree.
     'https:evil.com',
+    // The URL parser strips tab/LF/CR from anywhere in the input, so a leading
+    // control character would otherwise carry a protocol-relative value past a
+    // raw prefix check and still parse as `//evil.com`.
+    `${String.fromCharCode(9)}//evil.com`,
+    `${String.fromCharCode(10)}//evil.com`,
+    `${String.fromCharCode(13)}//evil.com`,
+    `${String.fromCharCode(9)}/\\evil.com`,
+    ` //evil.com`,
   ]
   for (const hostile of hostileDomains) {
     test(`rejects non-http(s) candidate ${hostile}`, () => {
