@@ -96,8 +96,17 @@ jobs:
       # `release.yml` about the 10GB pool being flooded by dead tag-scoped
       # buildkit blobs, which is what made this miss outright and turned a
       # ~5 minute incremental build into 81 minutes of cold compile.
-      - name: Cache cargo target dir (musl, fast profile)
-        uses: actions/cache@v6
+      #
+      # Restore always, save from `main` only. This is the largest single
+      # cache in the repo (a musl target dir plus cargo registry for 55
+      # crates), so a per-ref copy of it is what pushed the pool over its
+      # 10GB limit fastest — four open PRs each holding their own was several
+      # GB spent guaranteeing that nobody's copy survived. A PR that changes
+      # Cargo.lock now rebuilds the delta on top of main's copy on every
+      # push, instead of everyone cold-building because the pool thrashed.
+      - name: Restore cargo target dir (musl, fast profile)
+        id: musl-cache
+        uses: actions/cache/restore@v6
         with:
           path: ci-build-cache
           key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
@@ -131,6 +140,13 @@ jobs:
             '
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
+
+      - name: Save cargo target dir (musl, fast profile)
+        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ci-build-cache
+          key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
 
       - name: Upload temps binary
         uses: actions/upload-artifact@v7
@@ -209,10 +225,18 @@ jobs:
           # Share the same cache slot as build-tests/clippy instead of each
           # getting its own — they compile largely the same dependency graph,
           # and per-job caches were bloating the repo's total cache footprint
-          # enough to evict other workflows' caches (e.g. e2e-tests.yml's
-          # release build) well before their 7-day idle expiry.
+          # enough to evict other workflows' caches well before their 7-day
+          # idle expiry.
+          #
+          # Deduping by key was only half of it: writes are also scoped to the
+          # producing ref, so `save-if: true` stored a separate ~886MB copy in
+          # every open PR's scope. A snapshot with three PRs in flight held
+          # 2.66GB of this one key. Save from `main` — the scope every ref can
+          # read — and let PRs restore from it. A PR that shifts the
+          # dependency graph rebuilds the delta on top of main's copy, which
+          # is what the prefix restore-keys are for.
           shared-key: test-build
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
@@ -261,8 +285,11 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
+      # Restore always, save only from `main` — see the cache-scoping note on
+      # the toolchain export above.
+      - name: Restore Bun dependencies
+        id: bun-cache
+        uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -271,6 +298,13 @@ jobs:
 
       - name: Install dependencies
         run: cd web && bun install
+
+      - name: Save Bun dependencies
+        if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       # react/react-dom drifting apart is invisible to tsc and rsbuild but
       # blanks the console at runtime with React error #527 (issue #504).
@@ -302,9 +336,10 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # See the check job above for why this shares build-tests' key.
+          # See the check job above for why this shares build-tests' key
+          # and why it only saves from `main`.
           shared-key: test-build
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache wasm-pack binary
         uses: actions/cache@v6
@@ -375,7 +410,10 @@ jobs:
           # so there's no cross-scope resolver mismatch to worry about (see
           # the removed per-group cache keys this replaces).
           shared-key: nextest-archive
-          save-if: true
+          # Save from `main` only — this key's archive runs ~1.3GB, and
+          # per-PR copies of it were a top-three consumer of the repo's 10GB
+          # cache pool. See the check job for the full reasoning.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

@@ -88,8 +88,13 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
+      # Restore always, save only from `main` — see the cache-scoping note in
+      # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
+      # node_modules copy in each open PR's scope (5 copies, ~805MB) for a
+      # `bun install` that takes seconds to redo.
+      - name: Restore Bun dependencies
+        id: bun-cache
+        uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -98,6 +103,13 @@ jobs:
 
       - name: Install web dependencies (Playwright tests)
         run: cd web && bun install
+
+      - name: Save Bun dependencies
+        if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       - name: Generate self-signed localho.st certificate
         run: |
