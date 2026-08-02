@@ -12,6 +12,7 @@ import {
 
 import { cn } from '@/lib/utils'
 import { ButtonProps } from '@/components/ui/button'
+import { writeToClipboard } from '@/lib/clipboard'
 
 interface CopyButtonProps extends ButtonProps {
   value: string
@@ -31,41 +32,6 @@ interface CopyButtonProps extends ButtonProps {
  * over an empty clipboard is only discovered later, by pasting the wrong thing
  * somewhere it matters.
  */
-async function writeToClipboard(value: string): Promise<void> {
-  // The modern path — secure contexts only (https / localhost).
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value)
-    return
-  }
-
-  // Fallback for http origins: copy from an off-screen readonly textarea.
-  // `readOnly` keeps mobile keyboards shut; fixed positioning with zero opacity
-  // stops the page jumping to the element when it takes focus.
-  const textarea = document.createElement('textarea')
-  textarea.value = value
-  textarea.setAttribute('readonly', '')
-  textarea.style.position = 'fixed'
-  textarea.style.top = '0'
-  textarea.style.left = '0'
-  textarea.style.opacity = '0'
-  document.body.appendChild(textarea)
-
-  const previous = document.activeElement as HTMLElement | null
-  try {
-    textarea.select()
-    textarea.setSelectionRange(0, value.length)
-    // Deprecated, but the only thing that works without a secure context.
-    if (!document.execCommand('copy')) {
-      throw new Error(
-        'The browser refused the copy. This page is not on a secure origin (https or localhost), so copying has to be done manually.'
-      )
-    }
-  } finally {
-    document.body.removeChild(textarea)
-    previous?.focus?.()
-  }
-}
-
 export function CopyButton({
   value,
   className,

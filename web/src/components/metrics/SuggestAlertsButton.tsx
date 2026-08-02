@@ -26,6 +26,11 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  ENABLE_AI_WRITES_BODY,
+  focusedStartPrompt,
+  suggestAlertsState,
+} from './suggest-alerts-state'
 
 const START_PROMPT =
   'Look at what this project already alerts on and what metrics it actually reports, then propose the alert rules worth adding. Ground every threshold in real values you queried, and backtest anomaly detectors before proposing them.'
@@ -36,9 +41,6 @@ const START_PROMPT =
  * the whole survey, while still letting the assistant mention anything else
  * obviously worth covering.
  */
-const focusedStartPrompt = (metric: string) =>
-  `I'm looking at the metric \`${metric}\`. Query its real values, decide whether it's worth alerting on, and if so propose a rule with a threshold grounded in what you find (backtest it first). Check what this project already alerts on so you don't duplicate an existing rule. Afterwards, mention briefly if any other reported metric obviously deserves an alert too.`
-
 interface SuggestAlertsButtonProps {
   projectId: number
   projectSlug?: string
@@ -115,7 +117,9 @@ export function SuggestAlertsButton({
         title: 'Suggest alerts',
         description:
           'Ask AI which metrics are worth alerting on. Each suggested rule is proposed for you to review — nothing is created until you confirm it.',
-        startPrompt: focusMetric ? focusedStartPrompt(focusMetric) : START_PROMPT,
+        startPrompt: focusMetric
+          ? focusedStartPrompt(focusMetric)
+          : START_PROMPT,
         projectSlug,
         projectName,
       },
@@ -124,16 +128,22 @@ export function SuggestAlertsButton({
   const readiness = readinessQuery.data
   const aiConfigured = readiness?.ai_configured === true
   const writeEnabled = readiness?.write_actions_enabled === true
+  const state = suggestAlertsState({
+    isPending: readinessQuery.isPending,
+    isError: readinessQuery.isError,
+    aiConfigured,
+    writeEnabled,
+  })
 
   // Don't offer an action whose outcome we can't predict yet.
-  if (readinessQuery.isPending) {
+  if (state === 'loading') {
     return <Skeleton className="h-8 w-40" />
   }
 
   // A failed readiness check is not a reason to hide the feature — but it IS a
   // reason not to promise it works. Let the click through to the chat, which
   // surfaces its own error if the prerequisites really are missing.
-  const needsSetup = !readinessQuery.isError && (!aiConfigured || !writeEnabled)
+  const needsSetup = state !== 'ready'
 
   return (
     <>
@@ -149,7 +159,7 @@ export function SuggestAlertsButton({
 
       <AlertDialog open={setupOpen} onOpenChange={setSetupOpen}>
         <AlertDialogContent>
-          {!aiConfigured ? (
+          {state === 'configure-provider' ? (
             <>
               <AlertDialogHeader>
                 <AlertDialogTitle className="flex items-center gap-2">
@@ -158,10 +168,10 @@ export function SuggestAlertsButton({
                 </AlertDialogTitle>
                 <AlertDialogDescription>
                   Suggesting alerts needs a model to reason over your metrics,
-                  and this instance has no AI provider configured yet. Add one in
-                  Settings → AI Providers (you bring your own key — Temps stores
-                  it encrypted and calls the provider directly). Come back here
-                  afterwards and this button will open the chat.
+                  and this instance has no AI provider configured yet. Add one
+                  in Settings → AI Providers (you bring your own key — Temps
+                  stores it encrypted and calls the provider directly). Come
+                  back here afterwards and this button will open the chat.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -201,10 +211,7 @@ export function SuggestAlertsButton({
                       // Enable the read-only chat too, so the project can never
                       // end up with write actions on but the chat they're
                       // proposed in switched off.
-                      body: {
-                        ai_write_actions_enabled: true,
-                        ai_debug_chat_enabled: true,
-                      },
+                      body: ENABLE_AI_WRITES_BODY,
                     })
                   }}
                 >

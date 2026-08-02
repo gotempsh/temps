@@ -94,7 +94,7 @@ impl TempsPlugin for AiChatPlugin {
             let providers: Vec<Arc<dyn ConversationContextProvider>> = vec![
                 Arc::new(DeploymentChatProvider::new(db.clone(), log_service)),
                 Arc::new(AlertChatProvider::new(db.clone())),
-                Arc::new(AlertSuggestChatProvider::new(db.clone())),
+                Arc::new(AlertSuggestChatProvider::new()),
                 Arc::new(ProjectChatProvider::new(db.clone())),
                 // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
                 // Uses the sentinel context_type "__api_tools__" — never selected as a

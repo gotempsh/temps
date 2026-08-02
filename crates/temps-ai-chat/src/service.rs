@@ -133,6 +133,14 @@ pub struct ConversationWithProject {
     pub project_slug: Option<String>,
 }
 
+/// Domain result used by the readiness HTTP adapter and other callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatReadiness {
+    pub ai_configured: bool,
+    pub chat_enabled: bool,
+    pub write_actions_enabled: bool,
+}
+
 /// Optional write-tool support wired into a `ConversationService` via
 /// [`ConversationService::with_write_support`].
 struct WriteSupport {
@@ -198,6 +206,22 @@ impl ConversationService {
         self.ai.is_available().await
     }
 
+    /// Load all independent gates for running an AI chat in a project.
+    pub async fn chat_readiness(&self, project_id: i32) -> Result<ChatReadiness, ChatError> {
+        let project = temps_entities::projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| ChatError::ProjectLookup { project_id, source })?
+            .ok_or(ChatError::ProjectNotFound(project_id))?;
+
+        Ok(ChatReadiness {
+            ai_configured: self.ai_available().await,
+            chat_enabled: !matches!(project.ai_debug_chat_enabled, Some(false))
+                || project.ai_write_actions_enabled,
+            write_actions_enabled: project.ai_write_actions_enabled,
+        })
+    }
+
     /// The active conversation for a context, if one exists.
     pub async fn find_by_context(
         &self,
@@ -212,6 +236,20 @@ impl ConversationService {
             .filter(ai_conversations::Column::Status.eq("active"))
             .one(self.db.as_ref())
             .await?)
+    }
+
+    /// Load a conversation by its internal id while retaining project scope.
+    /// Used only to authorize child resources such as pending actions.
+    pub async fn get_by_id(
+        &self,
+        project_id: i32,
+        conversation_id: i64,
+    ) -> Result<ai_conversations::Model, ChatError> {
+        ai_conversations::Entity::find_by_id(conversation_id)
+            .filter(ai_conversations::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ChatError::NotFound(conversation_id.to_string()))
     }
 
     /// All active conversations for a project, most-recently-active first. Powers
@@ -1411,6 +1449,7 @@ mod tests {
         /// Counts `chat_stream_turn` invocations (kept named `chat_calls` for the
         /// round-cap assertions).
         chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+        available: bool,
     }
 
     impl ScriptedAi {
@@ -1418,6 +1457,14 @@ mod tests {
             Self {
                 rounds: Mutex::new(rounds.into_iter().collect()),
                 chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                available: true,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                available: false,
+                ..Self::new(vec![])
             }
         }
     }
@@ -1425,7 +1472,7 @@ mod tests {
     #[async_trait]
     impl AiService for ScriptedAi {
         async fn is_available(&self) -> bool {
-            true
+            self.available
         }
         async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
             Err(AiError::NotAvailable)
@@ -1825,6 +1872,15 @@ mod tests {
         }
     }
 
+    fn db_service_with_ai(db: DatabaseConnection, ai: Arc<dyn AiService>) -> ConversationService {
+        ConversationService {
+            db: Arc::new(db),
+            ai,
+            providers: HashMap::new(),
+            write_support: None,
+        }
+    }
+
     /// Build a conversation row for a given project, with controllable public_id.
     fn conv_for(id: i64, project_id: i32, public_id: &str) -> ai_conversations::Model {
         let now = Utc::now();
@@ -1892,6 +1948,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_readiness_reports_independent_gates() {
+        let mut project = project_with_toggle(7, "Alpha", "alpha", Some(false));
+        project.ai_write_actions_enabled = true;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project]])
+            .into_connection();
+
+        let readiness = db_service(db).chat_readiness(7).await.expect("readiness");
+        assert_eq!(
+            readiness,
+            ChatReadiness {
+                ai_configured: true,
+                chat_enabled: true,
+                write_actions_enabled: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_readiness_reports_unconfigured_ai() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_with_toggle(
+                7,
+                "Alpha",
+                "alpha",
+                Some(true),
+            )]])
+            .into_connection();
+        let svc = db_service_with_ai(db, Arc::new(ScriptedAi::unavailable()));
+
+        let readiness = svc.chat_readiness(7).await.expect("readiness");
+        assert!(!readiness.ai_configured);
+        assert!(readiness.chat_enabled);
+        assert!(!readiness.write_actions_enabled);
+    }
+
+    #[tokio::test]
+    async fn chat_readiness_returns_typed_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::projects::Model>::new()])
+            .into_connection();
+
+        let err = db_service(db)
+            .chat_readiness(404)
+            .await
+            .expect_err("missing project");
+        assert!(matches!(err, ChatError::ProjectNotFound(404)));
+    }
+
+    #[tokio::test]
+    async fn chat_readiness_preserves_project_context_on_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())])
+            .into_connection();
+
+        let err = db_service(db)
+            .chat_readiness(42)
+            .await
+            .expect_err("query failure");
+        assert!(matches!(
+            err,
+            ChatError::ProjectLookup { project_id: 42, .. }
+        ));
+    }
+
     // find_by_context: returns the active conversation when one exists.
     #[tokio::test]
     async fn test_find_by_context_returns_match() {
@@ -1922,6 +2044,24 @@ mod tests {
             .await
             .expect("query ok");
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_by_id_retains_project_scope() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![conv_for(1, 7, "pubA")]])
+            .into_connection();
+        let conv = db_service(db).get_by_id(7, 1).await.expect("conversation");
+        assert_eq!(conv.public_id, "pubA");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<ai_conversations::Model>::new()])
+            .into_connection();
+        let err = db_service(db)
+            .get_by_id(8, 1)
+            .await
+            .expect_err("cross-project child lookup must not resolve");
+        assert!(matches!(err, ChatError::NotFound(_)));
     }
 
     // list_conversations: returns the project's active conversations.

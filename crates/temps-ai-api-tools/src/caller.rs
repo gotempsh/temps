@@ -255,11 +255,20 @@ pub fn build_request_parts(
         })
         .map(|param| param.name.as_str())
         .collect();
-    if missing.len() > 1 {
-        return Err(ApiToolError::MissingParams {
-            names: missing.join(", "),
-            operation_id: op.operation_id.clone(),
-        });
+    match missing.as_slice() {
+        [] => {}
+        [name] => {
+            return Err(ApiToolError::MissingParam {
+                name: (*name).to_string(),
+                operation_id: op.operation_id.clone(),
+            });
+        }
+        _ => {
+            return Err(ApiToolError::MissingParams {
+                names: missing.join(", "),
+                operation_id: op.operation_id.clone(),
+            });
+        }
     }
 
     let mut path = op.path.clone();
@@ -1002,8 +1011,8 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// is acceptable. This is a *shape* check, not full JSON Schema validation: it
 /// verifies the discriminator and the required keys, which is what separates a
 /// call that can possibly succeed from one that cannot. Type-checking
-/// individual fields stays the API's job — being stricter here would risk
-/// rejecting valid calls the router would have accepted.
+/// fields whose schema metadata is available here as well, so a confirmation
+/// card never presents a request the router is guaranteed to reject.
 fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
     let Some(obj) = value.as_object() else {
         return Some(format!("expected a JSON object, got {}", json_kind(value)));
@@ -1034,7 +1043,7 @@ fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
 
     let missing: Vec<&str> = fields
         .iter()
-        .filter(|f| f.required && !obj.contains_key(&f.name))
+        .filter(|f| f.required && obj.get(&f.name).is_none_or(serde_json::Value::is_null))
         .map(|f| f.name.as_str())
         .collect();
     if !missing.is_empty() {
@@ -1224,6 +1233,9 @@ pub(crate) fn required_write_permission(op: &ApiOperation) -> Option<Permission>
             "DELETE" => Permission::DomainsDelete,
             _ => Permission::DomainsWrite,
         }
+    } else if tag.contains("alert") {
+        // Metric alert create/update/delete routes share the OTel write gate.
+        Permission::OtelWrite
     } else {
         // Unknown / unsupported domain — show it (router still guards).
         return None;
@@ -1630,6 +1642,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn required_null_body_param_returns_missing_param_error() {
+        let op = make_write_op(
+            "create_thing",
+            "POST",
+            "/things",
+            "Things",
+            vec![body_param("name", true)],
+        );
+
+        let err = build_request_parts(&op, &serde_json::json!({ "name": null }), &[], 20, 100)
+            .expect_err("a required body field cannot be null");
+        assert!(matches!(
+            err,
+            ApiToolError::MissingParam { ref name, .. } if name == "name"
+        ));
+    }
+
     /// Several missing required fields must be reported in ONE error.
     ///
     /// Discovered against a live model: `create_alert` has eight required body
@@ -1775,6 +1805,25 @@ mod tests {
             panic!("expected BadObjectShape, got {err:?}");
         };
         assert!(problem.contains("comparator"), "{problem}");
+        assert!(problem.contains("threshold"), "{problem}");
+    }
+
+    #[test]
+    fn object_body_param_required_null_key_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": {
+                "kind": "static",
+                "comparator": "gt",
+                "threshold": null
+            }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a required nested field cannot be null");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
         assert!(problem.contains("threshold"), "{problem}");
     }
 
@@ -2373,6 +2422,18 @@ mod tests {
             required_write_permission(&op),
             Some(Permission::EnvironmentsWrite)
         );
+    }
+
+    #[test]
+    fn required_write_permission_alerts_uses_otel_write() {
+        for method in ["POST", "PATCH", "DELETE"] {
+            let op = op_tagged_with_method("Alerts", method);
+            assert_eq!(
+                required_write_permission(&op),
+                Some(Permission::OtelWrite),
+                "method {method}"
+            );
+        }
     }
 
     #[test]

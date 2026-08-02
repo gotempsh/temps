@@ -1,6 +1,6 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
-import { setupClient, client } from '../../lib/api-client.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { getProjectBySlug, getChatReadiness } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -37,7 +37,10 @@ async function readiness(
       client,
       path: { slug: resolved.slug },
     })
-    if (error || !data) {
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    if (!data) {
       throw new Error(`Project "${resolved.slug}" not found`)
     }
     return data
@@ -48,8 +51,11 @@ async function readiness(
       client,
       path: { project_id: project.id },
     })
-    if (error || !data) {
-      throw new Error(`Failed to check AI readiness for "${resolved.slug}"`)
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    if (!data) {
+      throw new Error(`AI readiness returned no data for "${resolved.slug}"`)
     }
     return data
   })
