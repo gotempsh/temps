@@ -78,7 +78,16 @@ jobs:
           cache-from: |
             type=gha,scope=temps-toolchain
             type=gha,scope=compose-security-toolchain
-          cache-to: type=gha,scope=temps-toolchain,mode=max
+          # Write from `main` only. Cache writes are scoped to the producing
+          # ref, so exporting from PRs stored a private copy of a
+          # byte-identical image in every open PR's scope — four concurrent
+          # PRs held four copies of the same layer set, ~718MB each, ~2.9GB
+          # of a 10GB pool, evicting the cargo caches this job depends on.
+          # Reads see `main`'s copy, which is what every ref can read anyway.
+          # A PR touching the Dockerfile's toolchain stage rebuilds it (~7min)
+          # and can't cache that for its own next push; toolchain changes are
+          # rare enough that this is the cheaper side of the trade.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=temps-toolchain,mode=max' || '' }}
 
       # Keyed on Cargo.lock + Dockerfile, so any dependency bump misses. The
       # `restore-keys` prefix is what makes that survivable: it falls back to
