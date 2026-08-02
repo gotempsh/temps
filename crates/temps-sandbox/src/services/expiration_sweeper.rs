@@ -36,6 +36,14 @@ use crate::services::registry::StandaloneSandboxRegistry;
 /// negligible blast radius relative to the minimum 60s `timeout_secs`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How many expiration sweeps pass between orphaned-volume reaps.
+///
+/// Reclaiming disk is not urgent — an orphan costs bytes, not correctness —
+/// and the reap does a `GET /volumes` against the Docker daemon, so running
+/// it every minute alongside the expiry scan would be pure overhead on a
+/// host that hasn't destroyed anything. At 60s per sweep this is hourly.
+const REAP_EVERY_N_SWEEPS: u32 = 60;
+
 pub struct SandboxExpirationSweeper {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
@@ -53,11 +61,34 @@ impl SandboxExpirationSweeper {
             "Sandbox expiration sweeper started (interval: {}s)",
             SWEEP_INTERVAL.as_secs()
         );
+        // Reap once at startup, before the first sleep: a host upgrading
+        // into this build is exactly the case that has already accumulated
+        // orphans, and making the operator wait an hour to get that disk
+        // back would be the wrong default.
+        self.reap_orphaned_volumes().await;
+
+        let mut sweeps: u32 = 0;
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
             if let Err(e) = self.tick().await {
                 tracing::error!("Sandbox expiration sweep failed: {}", e);
             }
+            sweeps = sweeps.wrapping_add(1);
+            if sweeps.is_multiple_of(REAP_EVERY_N_SWEEPS) {
+                self.reap_orphaned_volumes().await;
+            }
+        }
+    }
+
+    /// Ask the provider to reclaim sandbox volumes no container references.
+    ///
+    /// Never propagates: a Docker daemon that can't list volumes must not
+    /// take down the expiry loop, which is doing the more important job.
+    async fn reap_orphaned_volumes(&self) {
+        match self.registry.provider().reap_orphaned_volumes().await {
+            Ok(0) => tracing::debug!("Sandbox volume reap: nothing to reclaim"),
+            Ok(n) => tracing::info!("Sandbox volume reap: reclaimed {} orphaned volume(s)", n),
+            Err(e) => tracing::warn!("Sandbox volume reap failed: {}", e),
         }
     }
 

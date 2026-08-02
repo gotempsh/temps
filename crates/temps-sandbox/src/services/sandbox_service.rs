@@ -11,7 +11,7 @@
 //! here so handlers have a single service to call into.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,6 +204,23 @@ fn run_status_is_terminal(status: Option<&str>) -> bool {
     status
         .map(|s| TERMINAL_RUN_STATUSES.contains(&s))
         .unwrap_or(true)
+}
+
+/// Which host directory (if any) `destroy_sandbox` may recursively delete
+/// for a given public id.
+///
+/// Split out from `remove_work_dir` so the guard is unit-testable without
+/// standing up a whole service. `data_root.join(s)` silently resolves
+/// absolute paths and `..` segments, so a public id of `../../etc` would
+/// aim a recursive delete outside the data dir entirely. Ids are generated
+/// internally today, but "the caller is trusted" is not something a
+/// `remove_dir_all` should rely on — accept only the exact `sbx_<16 hex>`
+/// shape `public_id::generate` produces.
+fn work_dir_to_remove(data_root: &Path, public_id_value: &str) -> Option<PathBuf> {
+    if !public_id::is_valid(public_id_value) {
+        return None;
+    }
+    Some(data_root.join(public_id_value))
 }
 
 /// Bounds on `timeout_secs` at the service layer. The upper bound
@@ -1062,9 +1079,42 @@ TEMPS_ASKPASS_EOF\n\
                 e
             );
         }
+        self.remove_work_dir(public_id_value).await;
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
         Ok(())
+    }
+
+    /// Delete the host-side `/workspace` directory backing a destroyed
+    /// sandbox.
+    ///
+    /// `create_sandbox` makes `data_root/<public_id>` and bind-mounts it
+    /// into the container; nothing used to remove it, so every
+    /// create+destroy cycle left the full working tree (node_modules, build
+    /// output, cloned repos — routinely hundreds of MB) on the host
+    /// forever. Deliberately best-effort and non-fatal: the sandbox is
+    /// already gone from the user's point of view, and failing the API call
+    /// over leftover bytes would strand the row instead.
+    ///
+    /// Only called for standalone sandboxes. Agent-run sandboxes get their
+    /// work dir from the executor, which owns that directory's lifecycle.
+    async fn remove_work_dir(&self, public_id_value: &str) {
+        let Some(work_dir) = work_dir_to_remove(&self.data_root, public_id_value) else {
+            tracing::warn!(
+                "Refusing to remove sandbox work dir for malformed public id {:?}",
+                public_id_value
+            );
+            return;
+        };
+        match tokio::fs::remove_dir_all(&work_dir).await {
+            Ok(()) => tracing::debug!("Removed sandbox work dir {}", work_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "Failed to remove sandbox work dir {}: {} — disk space stays claimed",
+                work_dir.display(),
+                e
+            ),
+        }
     }
 
     /// Pause a running sandbox (non-destructive). Stops the underlying
@@ -1586,6 +1636,46 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(r.preview_password.as_deref(), Some("hunter2secret"));
+    }
+
+    /// Destroy must actually target the directory create allocated —
+    /// nothing removed it before, so every create/destroy cycle left the
+    /// full working tree (node_modules, build output, cloned repos) on the
+    /// host and the disk filled up with directories no API could reach.
+    #[test]
+    fn work_dir_to_remove_targets_the_directory_create_allocated() {
+        let root = Path::new("/var/lib/temps/sandboxes");
+        let id = "sbx_deadbeef01234567";
+        assert_eq!(
+            work_dir_to_remove(root, id),
+            // Same expression create_sandbox uses to build host_work_dir.
+            Some(root.join(id))
+        );
+    }
+
+    /// The guard in front of a recursive delete. A public id is only ever
+    /// generated internally, but if a malformed one ever reached here
+    /// `data_root.join()` would happily resolve out of the data dir — an
+    /// absolute id replaces the root outright.
+    #[test]
+    fn work_dir_to_remove_refuses_ids_that_escape_the_data_root() {
+        let root = Path::new("/var/lib/temps/sandboxes");
+        for bad in [
+            "../../etc",
+            "sbx_../../etc",
+            "/etc",
+            "sbx_",
+            "sbx_short",
+            "sbx_zzzzzzzzzzzzzzzz",
+            "",
+        ] {
+            assert_eq!(
+                work_dir_to_remove(root, bad),
+                None,
+                "{:?} must not resolve to a directory we would recursively delete",
+                bad
+            );
+        }
     }
 
     #[test]

@@ -411,6 +411,27 @@ pub trait SandboxProvider: Send + Sync {
     /// close+reopen cycle.
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError>;
 
+    /// Reclaim per-sandbox persistent storage that no longer belongs to any
+    /// sandbox, returning how many items were freed.
+    ///
+    /// This is the backstop for the disk-fill failure mode: a host that
+    /// creates and destroys many sandboxes accumulates storage whenever a
+    /// destroy can't complete its own cleanup — the provider was
+    /// unreachable mid-destroy, the process was killed between removing the
+    /// container and removing the volume, or the sandbox predates a naming
+    /// fix. Destroy staying best-effort is deliberate (a user must always
+    /// be able to delete a sandbox even when Docker is unhappy), so
+    /// something has to sweep up afterwards.
+    ///
+    /// Implementations MUST only reclaim storage that is provably
+    /// unreferenced, and MUST NOT touch anything belonging to a live or
+    /// merely-stopped sandbox — "stopped" is a normal long-lived state that
+    /// the user resumes later. The default implementation reclaims nothing,
+    /// which is correct for backends that own no detachable storage.
+    async fn reap_orphaned_volumes(&self) -> Result<u32, AgentError> {
+        Ok(0)
+    }
+
     /// Stop a running sandbox without removing it. Default implementation
     /// reports the operation as unsupported so non-Docker backends compile
     /// unchanged. Docker-backed providers override this with a real stop.

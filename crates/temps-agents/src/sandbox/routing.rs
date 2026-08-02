@@ -186,6 +186,27 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).destroy(handle, purge_volumes).await
     }
 
+    /// Fan out to every registered backend — orphans are per-backend host
+    /// state with no handle to route by, so "which backend" is not a
+    /// question that can be answered here. One backend failing must not
+    /// stop the others from reclaiming their own disk, so failures are
+    /// logged and the sweep continues; the count returned is what was
+    /// actually freed.
+    async fn reap_orphaned_volumes(&self) -> Result<u32, AgentError> {
+        let mut reclaimed = 0u32;
+        for provider in self.scan_order() {
+            match provider.reap_orphaned_volumes().await {
+                Ok(n) => reclaimed += n,
+                Err(e) => tracing::warn!(
+                    "Orphan volume reap failed for sandbox backend '{}': {}",
+                    provider.name(),
+                    e
+                ),
+            }
+        }
+        Ok(reclaimed)
+    }
+
     async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         self.owner_of(handle).stop(handle).await
     }
