@@ -20,6 +20,24 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// Several required parameters were absent at once.
+    ///
+    /// Reported together rather than one-at-a-time on purpose: the model gets a
+    /// single round to fix the whole call. Naming only the first missing field
+    /// costs one model round (and one wasted proposal) per field, so an
+    /// operation with eight required fields — `create_alert` is one — can
+    /// exhaust the tool loop's round cap before it ever manages a valid call.
+    #[error(
+        "Missing required parameters for operation '{operation_id}': {names}. \
+         Provide ALL of them in the flat parameters object."
+    )]
+    MissingParams {
+        /// Comma-separated names of every missing required parameter.
+        names: String,
+        /// The operation that required them.
+        operation_id: String,
+    },
+
     /// A parameter value is not one of the declared enum members.
     #[error(
         "Parameter '{name}' has value '{value}' which is not one of the allowed values: \

@@ -187,6 +187,49 @@ pub fn build_request_parts(
 ) -> Result<BuiltRequest, ApiToolError> {
     let params_obj = params.as_object();
 
+    // Pre-pass: report EVERY missing required parameter at once.
+    //
+    // The per-param loop below fails on the first one it meets, which reads fine
+    // to a human running a CLI but is expensive for a model: each failure costs a
+    // whole round, and the model only learns the next field's name by failing
+    // again. An operation with many required fields therefore burns its way
+    // through the tool loop's round cap discovering the signature one name at a
+    // time, and never reaches a valid call. Collecting them means one round.
+    //
+    // The rules mirror the loop exactly — auto-filled project selectors and the
+    // injected `limit` are not "missing", and absent query params are left to the
+    // router (OpenAPI required-ness is frequently wrong for those).
+    let missing: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|param| {
+            if params_obj
+                .and_then(|o| o.get(&param.name))
+                .is_some_and(|v| !v.is_null())
+            {
+                return false;
+            }
+            if is_project_scope_param(op, param) && allowed_project_ids.len() == 1 {
+                return false; // auto-filled
+            }
+            if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
+                return false; // injected with a default
+            }
+            match param.location {
+                ParamLocation::Path => true,
+                ParamLocation::Body => param.required,
+                ParamLocation::Query => false,
+            }
+        })
+        .map(|param| param.name.as_str())
+        .collect();
+    if missing.len() > 1 {
+        return Err(ApiToolError::MissingParams {
+            names: missing.join(", "),
+            operation_id: op.operation_id.clone(),
+        });
+    }
+
     let mut path = op.path.clone();
     let mut query_parts: Vec<String> = Vec::new();
     let mut body_map = serde_json::Map::new();
@@ -1359,6 +1402,44 @@ mod tests {
         assert!(
             matches!(err, ApiToolError::MissingParam { ref name, .. } if name == "name"),
             "unexpected error: {err:?}"
+        );
+    }
+
+    /// Several missing required fields must be reported in ONE error.
+    ///
+    /// Discovered against a live model: `create_alert` has eight required body
+    /// fields, and one-at-a-time reporting made the model spend a full tool
+    /// round per field, exhausting the round cap before it could ever stage a
+    /// valid proposal.
+    #[test]
+    fn all_missing_required_body_params_are_reported_together() {
+        let op = make_write_op(
+            "create_alert",
+            "POST",
+            "/otel/alerts",
+            "Alerts",
+            vec![
+                body_param("name", true),
+                body_param("metric_name", true),
+                body_param("aggregation", true),
+                body_param("severity", true),
+                body_param("note", false),
+            ],
+        );
+
+        let params = serde_json::json!({ "name": "p95 latency" });
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("must fail while required fields are absent");
+
+        let ApiToolError::MissingParams { names, .. } = &err else {
+            panic!("expected MissingParams, got {err:?}");
+        };
+        // Compare whole names — "metric_name" contains "name" as a substring.
+        let listed: Vec<&str> = names.split(", ").collect();
+        assert_eq!(
+            listed,
+            vec!["metric_name", "aggregation", "severity"],
+            "expected exactly the absent required fields, got: {names}"
         );
     }
 

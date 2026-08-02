@@ -597,9 +597,17 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         let required = obj.required.contains(prop_name);
         let (ty, enum_values) = extract_type_and_enum(Some(prop_schema));
 
-        // Try to get a description from the property schema if it's an Object.
+        // Description from the property schema.
+        //
+        // The `$ref` arm matters more than it looks. A property that points at a
+        // component schema still carries its own sibling `description` — and for
+        // a field whose type resolves to a bare "object" here (a discriminated
+        // union, say), that prose is the ONLY place the required shape is
+        // written down. Dropping it left the model guessing at the JSON, and
+        // guessing wrong: it has no other way to learn the discriminator's name.
         let description = match prop_schema {
             RefOr::T(Schema::Object(prop_obj)) => prop_obj.description.clone(),
+            RefOr::Ref(r) if !r.description.trim().is_empty() => Some(r.description.clone()),
             _ => None,
         };
 
@@ -1230,6 +1238,101 @@ mod tests {
         assert_eq!(allowlist_index.len(), 1);
         assert!(allowlist_index.get("list_projects").is_some());
         assert!(allowlist_index.get("create_project").is_none());
+    }
+
+    /// A `$ref` body property's own description must survive into the param
+    /// spec.
+    ///
+    /// Found against a live model: `create_alert`'s `detection_config` is a
+    /// discriminated union, so it resolves to a bare "object" here. Its sibling
+    /// description is the only place the required shape (the `kind`
+    /// discriminator) is written down, and dropping it left the model to guess
+    /// the JSON — it guessed `{"type": ...}` instead of `{"kind": ...}` and the
+    /// confirmed write failed with a 422.
+    #[test]
+    fn ref_body_property_keeps_its_own_description() {
+        use utoipa::openapi::{
+            request_body::RequestBodyBuilder, schema::ComponentsBuilder, ContentBuilder,
+        };
+
+        const SHAPE: &str = "Discriminated union keyed by `kind`, e.g. \
+                             `{ \"kind\": \"static\", \"threshold\": 500 }`.";
+
+        let components = ComponentsBuilder::new()
+            .schema(
+                "Detector",
+                RefOr::T(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .build(),
+                )),
+            )
+            .schema(
+                "CreateAlertRequest",
+                RefOr::T(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .property(
+                            "detection_config",
+                            RefOr::Ref(
+                                utoipa::openapi::schema::Ref::builder()
+                                    .ref_location_from_schema_name("Detector")
+                                    .description(Some(SHAPE))
+                                    .build(),
+                            ),
+                        )
+                        .required("detection_config")
+                        .build(),
+                )),
+            )
+            .build();
+
+        let create = OperationBuilder::new()
+            .operation_id(Some("create_alert"))
+            .tag("Alerts")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        ContentBuilder::new()
+                            .schema(Some(RefOr::Ref(
+                                utoipa::openapi::schema::Ref::from_schema_name(
+                                    "CreateAlertRequest",
+                                ),
+                            )))
+                            .build(),
+                    )
+                    .build(),
+            ))
+            .build();
+
+        let paths = PathsBuilder::new()
+            .path("/otel/alerts", {
+                let mut item = PathItem::default();
+                item.post = Some(create);
+                item
+            })
+            .build();
+
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(paths)
+            .components(Some(components))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_alert"]);
+        let op = index.get("create_alert").expect("indexed");
+        let param = op
+            .params
+            .iter()
+            .find(|p| p.name == "detection_config")
+            .expect("body param resolved");
+
+        assert_eq!(
+            param.description.as_deref(),
+            Some(SHAPE),
+            "the shape guidance must reach the model — it is the only description of the JSON"
+        );
     }
 
     #[test]

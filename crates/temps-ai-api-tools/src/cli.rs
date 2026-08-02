@@ -300,12 +300,16 @@ fn render_operation_help(op: &ApiOperation) -> String {
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required; query params are optional
-            // filters (omit the ones you don't need).
-            let req = if matches!(p.location, ParamLocation::Path) {
-                " (required)"
-            } else {
-                ""
+            // Path params are structurally required, and so are body fields the
+            // schema marks required — a write call fails without them, so the
+            // help has to say which ones they are. (Query params stay unmarked:
+            // they're optional filters, and OpenAPI required-ness is frequently
+            // wrong for them, so claiming "required" would send the model
+            // inventing values for filters it should simply omit.)
+            let req = match p.location {
+                ParamLocation::Path => " (required)",
+                ParamLocation::Body if p.required => " (required)",
+                _ => "",
             };
             out.push_str(&format!("  --{} <{}>{}", p.name, p.ty, req));
             if !p.enum_values.is_empty() {

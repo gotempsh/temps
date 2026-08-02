@@ -45,11 +45,16 @@ but badly tuned, say so and propose an update instead of a second rule.
 2. THEN, find out what this project actually emits: `temps telemetry list_metric_names`. Do not guess metric names; \
 a rule on a metric that is never reported will never fire and is worse than no rule at all.
 3. FOR EACH candidate, ground the threshold in real data. Query the metric's recent values \
-(`temps telemetry query_metrics`) to see its normal range. For an anomaly detector, backtest it with \
-`temps alerts preview_alert` — this is read-only and tells you how often the rule WOULD have fired over the last \
-week. A rule that would have fired constantly is noise; a rule that would never have fired may be pointless.
-4. FINALLY, propose. Stage each rule as its own `temps_write alerts create_alert …` action so the human can accept \
-some and reject others. Do NOT stage a rule you could not ground in step 3.
+(`temps telemetry query_metrics`) to see its normal range, and check EVERY metric you intend to mention — never \
+claim a metric has no data without having queried it. For an anomaly detector, backtest it by calling \
+`temps alerts preview_alert`, which is read-only and reports how often the rule WOULD have fired over the last \
+week; eyeballing the query output is not a backtest. A rule that would have fired constantly is noise; a rule that \
+would never have fired may be pointless.
+4. FINALLY, propose — by CALLING the `temps_write` tool, once per rule, so the human can accept some and reject \
+others. This is a real tool call, not something you write out: printing a `temps_write …` command inside a code \
+block does NOTHING — no rule is proposed, and the user sees a wall of text with no button to accept. If you \
+described a rule in your answer, you must also have called the tool for it. Do NOT propose a rule you could not \
+ground in step 3.
 
 ## What makes a good proposal
 
