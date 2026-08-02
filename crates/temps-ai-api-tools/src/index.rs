@@ -67,65 +67,111 @@ impl std::fmt::Display for ParamLocation {
     }
 }
 
+/// One field inside a `$ref`'d body object.
+///
+/// Carries the type and enum members, not just the name: knowing a key is
+/// *required* only catches half the mistakes. A `threshold` supplied as the
+/// string `"0.5"` and a `comparator` of `">"` (the schema wants `gt`) are both
+/// present and both fatal, and both used to survive validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectField {
+    pub name: String,
+    pub required: bool,
+    /// Short JSON Schema type: `string`, `number`, `integer`, `boolean`,
+    /// `array`, `object`, or `any` when it could not be determined.
+    pub ty: String,
+    /// Permitted values, when the field is an enum. Empty otherwise.
+    pub enum_values: Vec<String>,
+}
+
+impl ObjectField {
+    /// `"name": <type>` or `"name": one of a|b|c` — the form used in help text
+    /// and in the validation error.
+    fn describe(&self) -> String {
+        if self.enum_values.is_empty() {
+            format!("\"{}\": <{}>", self.name, self.ty)
+        } else {
+            format!("\"{}\": one of {}", self.name, self.enum_values.join("|"))
+        }
+    }
+}
+
 /// The inner shape of a body parameter whose type is a `$ref`'d object.
 ///
 /// Without this, such a parameter reaches the model as a bare `object` with no
 /// hint of what belongs inside it, and a wrong guess is not caught until the
 /// request is actually executed — which, on the propose-then-confirm path,
-/// means *after* a human has approved it. Capturing the required keys lets the
-/// call be rejected at validation time, while the model can still fix it.
+/// means *after* a human has approved it. Capturing the fields lets the call be
+/// rejected at validation time, while the model can still fix it.
 ///
 /// Two shapes are modelled:
 ///
-/// - a plain object → [`Self::required`] lists its required keys;
+/// - a plain object → [`Self::fields`] describes it;
 /// - a tagged union (`oneOf` where every variant pins one property to a single
 ///   enum value) → [`Self::discriminator`] names that property and
-///   [`Self::variants`] maps each tag to that variant's required keys.
+///   [`Self::variants`] maps each tag to that variant's fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectShape {
     /// Property that selects the variant (e.g. `kind`), for a tagged union.
     pub discriminator: Option<String>,
-    /// Variant tag → the keys that variant requires (discriminator included).
+    /// Variant tag → that variant's fields (discriminator included).
     /// Empty for a plain object.
-    pub variants: BTreeMap<String, Vec<String>>,
-    /// Required keys for a plain (non-union) object.
-    pub required: Vec<String>,
+    pub variants: BTreeMap<String, Vec<ObjectField>>,
+    /// Fields of a plain (non-union) object.
+    pub fields: Vec<ObjectField>,
 }
 
 impl ObjectShape {
     /// Is there anything worth validating or showing? A resolved-but-empty
-    /// shape (no required keys, no variants) tells the model nothing.
+    /// shape tells the model nothing.
     pub fn is_informative(&self) -> bool {
-        !self.required.is_empty() || !self.variants.is_empty()
+        !self.fields.is_empty() || !self.variants.is_empty()
+    }
+
+    /// The fields that apply to a value carrying the given discriminator tag,
+    /// or the plain object's fields when this is not a union.
+    pub fn fields_for(&self, tag: Option<&str>) -> Option<&[ObjectField]> {
+        match tag {
+            Some(tag) => self.variants.get(tag).map(Vec::as_slice),
+            None => Some(&self.fields),
+        }
     }
 
     /// One-line summary of the accepted JSON, for `--help` and error messages.
     ///
     /// The model does not reliably run `--help` before calling a write
     /// operation, so this same text is repeated in the validation error — that
-    /// is the one place it is guaranteed to be read.
+    /// is the one place it is guaranteed to be read. Types and enum members are
+    /// included because the mistakes seen in practice are a quoted number and a
+    /// plausible-but-wrong enum spelling (`">"` for `gt`), neither of which a
+    /// bare list of key names would have prevented.
     pub fn describe(&self) -> String {
         match &self.discriminator {
             Some(d) => {
                 let variants: Vec<String> = self
                     .variants
                     .iter()
-                    .map(|(tag, keys)| format!("{{\"{d}\": \"{tag}\", {}}}", quoted_keys(keys, d)))
+                    .map(|(tag, fields)| {
+                        let rest: Vec<String> = fields
+                            .iter()
+                            .filter(|f| f.name != *d)
+                            .map(ObjectField::describe)
+                            .collect();
+                        format!("{{\"{d}\": \"{tag}\", {}}}", rest.join(", "))
+                    })
                     .collect();
                 format!("object, one of: {}", variants.join(" | "))
             }
-            None => format!("object with required keys: {}", self.required.join(", ")),
+            None => format!(
+                "object: {{{}}}",
+                self.fields
+                    .iter()
+                    .map(ObjectField::describe)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
-}
-
-/// `"a": …, "b": …` for every key except the discriminator.
-fn quoted_keys(keys: &[String], discriminator: &str) -> String {
-    keys.iter()
-        .filter(|k| k.as_str() != discriminator)
-        .map(|k| format!("\"{k}\": …"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Compact description of a single parameter, extracted from the utoipa schema.
@@ -711,14 +757,14 @@ fn resolve_object_shape(
         Schema::Object(o) => Some(ObjectShape {
             discriminator: None,
             variants: BTreeMap::new(),
-            required: o.required.clone(),
+            fields: object_fields(o, openapi),
         }),
         Schema::OneOf(one_of) => {
             let mut discriminator: Option<String> = None;
-            let mut variants: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut variants: BTreeMap<String, Vec<ObjectField>> = BTreeMap::new();
 
             for item in &one_of.items {
-                let (tag_prop, tag_value, required) = variant_shape(item, openapi)?;
+                let (tag_prop, tag_value, fields) = variant_shape(item, openapi)?;
                 // Every variant must agree on the discriminator, otherwise this
                 // is not a tagged union and we should not pretend it is.
                 match &discriminator {
@@ -726,17 +772,50 @@ fn resolve_object_shape(
                     Some(_) => {}
                     None => discriminator = Some(tag_prop),
                 }
-                variants.insert(tag_value, required);
+                variants.insert(tag_value, fields);
             }
 
             discriminator.map(|d| ObjectShape {
                 discriminator: Some(d),
                 variants,
-                required: Vec::new(),
+                fields: Vec::new(),
             })
         }
         _ => None,
     }
+}
+
+/// Describe every property of an object schema, resolving each property's own
+/// `$ref` so an enum defined as its own component (utoipa's default for a Rust
+/// enum) still yields its permitted values rather than an opaque "string".
+fn object_fields(
+    obj: &utoipa::openapi::schema::Object,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Vec<ObjectField> {
+    obj.properties
+        .iter()
+        .map(|(name, prop)| {
+            let resolved = deref_schema(prop, openapi);
+            let (ty, enum_values) = match resolved {
+                Some(Schema::Object(o)) => (
+                    schema_type_to_string(&o.schema_type),
+                    o.enum_values
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ),
+                _ => ("any".to_string(), Vec::new()),
+            };
+            ObjectField {
+                name: name.clone(),
+                required: obj.required.contains(name),
+                ty,
+                enum_values,
+            }
+        })
+        .collect()
 }
 
 /// Follow one level of `$ref` into `components.schemas`.
@@ -764,21 +843,21 @@ fn deref_schema<'a>(
 fn variant_shape(
     item: &RefOr<Schema>,
     openapi: &utoipa::openapi::OpenApi,
-) -> Option<(String, String, Vec<String>)> {
+) -> Option<(String, String, Vec<ObjectField>)> {
     let Schema::AllOf(all_of) = deref_schema(item, openapi)? else {
         return None;
     };
 
-    let mut required: Vec<String> = Vec::new();
+    let mut fields: Vec<ObjectField> = Vec::new();
     let mut tag: Option<(String, String)> = None;
 
     for member in &all_of.items {
         let Some(Schema::Object(o)) = deref_schema(member, openapi) else {
             continue;
         };
-        for key in &o.required {
-            if !required.contains(key) {
-                required.push(key.clone());
+        for field in object_fields(o, openapi) {
+            if !fields.iter().any(|f| f.name == field.name) {
+                fields.push(field);
             }
         }
         // The tag is a property whose enum admits exactly one value.
@@ -796,7 +875,7 @@ fn variant_shape(
     }
 
     let (tag_prop, tag_value) = tag?;
-    Some((tag_prop, tag_value, required))
+    Some((tag_prop, tag_value, fields))
 }
 
 /// Convert a single utoipa [`Parameter`] into a [`ParamSpec`].
@@ -1661,12 +1740,12 @@ mod tests {
         let static_keys = shape.variants.get("static").expect("static variant");
         for key in ["kind", "comparator", "threshold"] {
             assert!(
-                static_keys.iter().any(|k| k == key),
+                static_keys.iter().any(|f| f.name == key),
                 "missing {key} in {static_keys:?}"
             );
         }
         let anomaly_keys = shape.variants.get("anomaly").expect("anomaly variant");
-        assert!(anomaly_keys.iter().any(|k| k == "deviations"));
+        assert!(anomaly_keys.iter().any(|f| f.name == "deviations"));
 
         // And the rendered form names the discriminator, which is the detail
         // the model needs and cannot otherwise discover.

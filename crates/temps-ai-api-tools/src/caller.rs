@@ -1009,17 +1009,17 @@ fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
         return Some(format!("expected a JSON object, got {}", json_kind(value)));
     };
 
-    let required = match &shape.discriminator {
+    let fields = match &shape.discriminator {
         Some(discriminator) => {
-            // Tagged union: the discriminator decides which keys are required,
-            // so it has to be present and recognised before anything else.
+            // Tagged union: the discriminator decides which fields apply, so it
+            // has to be present and recognised before anything else.
             let Some(tag) = obj.get(discriminator) else {
                 return Some(format!("missing the '{discriminator}' discriminator"));
             };
             let Some(tag) = tag.as_str() else {
                 return Some(format!("'{discriminator}' must be a string"));
             };
-            let Some(required) = shape.variants.get(tag) else {
+            let Some(fields) = shape.fields_for(Some(tag)) else {
                 let mut known: Vec<&str> = shape.variants.keys().map(String::as_str).collect();
                 known.sort_unstable();
                 return Some(format!(
@@ -1027,20 +1027,85 @@ fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
                     known.join(", ")
                 ));
             };
-            required
+            fields
         }
-        None => &shape.required,
+        None => shape.fields_for(None)?,
     };
 
-    let missing: Vec<&str> = required
+    let missing: Vec<&str> = fields
         .iter()
-        .filter(|key| !obj.contains_key(key.as_str()))
-        .map(String::as_str)
+        .filter(|f| f.required && !obj.contains_key(&f.name))
+        .map(|f| f.name.as_str())
         .collect();
     if !missing.is_empty() {
         return Some(format!("missing key(s): {}", missing.join(", ")));
     }
+
+    // Type and enum checks on what WAS supplied. Presence alone is not enough:
+    // a quoted number (`"0.5"` for an f64) and a plausible-but-wrong enum
+    // spelling (`">"` where the schema wants `gt`) are both present, both
+    // fatal, and both indistinguishable from correct until the API rejects
+    // them.
+    for field in fields {
+        let Some(supplied) = obj.get(&field.name) else {
+            continue; // optional and absent
+        };
+        if supplied.is_null() {
+            continue;
+        }
+        if !field.enum_values.is_empty() {
+            let ok = supplied
+                .as_str()
+                .is_some_and(|v| field.enum_values.iter().any(|allowed| allowed == v));
+            if !ok {
+                return Some(format!(
+                    "'{}' is {}, which is not one of: {}",
+                    field.name,
+                    render_value(supplied),
+                    field.enum_values.join(", ")
+                ));
+            }
+            continue;
+        }
+        if !json_matches_type(supplied, &field.ty) {
+            return Some(format!(
+                "'{}' is {}, expected {}",
+                field.name,
+                render_value(supplied),
+                field.ty
+            ));
+        }
+    }
     None
+}
+
+/// Does a JSON value satisfy a short JSON Schema type name?
+///
+/// Deliberately permissive in one direction only: an integer is accepted where
+/// a number is wanted (`300` for an f64 is fine), but a *string* is never
+/// accepted for a number even when it would parse. Quoting a number is the
+/// exact mistake this catches, and silently accepting it would just move the
+/// failure back to the API.
+fn json_matches_type(value: &Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        // "any" or an unrecognised type — nothing to assert.
+        _ => true,
+    }
+}
+
+/// Render a supplied value compactly for an error message, so the caller can
+/// see that it sent `"0.5"` rather than `0.5`.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("the string \"{s}\""),
+        other => other.to_string(),
+    }
 }
 
 /// Name a JSON value's kind, for error messages.
@@ -1238,7 +1303,7 @@ pub(crate) fn value_as_i32(v: &Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{ApiOperation, ParamLocation, ParamSpec};
+    use crate::index::{ApiOperation, ObjectField, ParamLocation, ParamSpec};
 
     // -----------------------------------------------------------------------
     // Test-only helpers
@@ -1606,23 +1671,35 @@ mod tests {
     /// Build the real-world shape: `detection_config` is an internally-tagged
     /// union, the exact field a live model kept getting wrong.
     fn detector_shape() -> ObjectShape {
+        fn field(name: &str, ty: &str, enum_values: &[&str]) -> ObjectField {
+            ObjectField {
+                name: name.to_string(),
+                required: true,
+                ty: ty.to_string(),
+                enum_values: enum_values.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
         let mut variants = std::collections::BTreeMap::new();
         variants.insert(
             "static".to_string(),
             vec![
-                "kind".to_string(),
-                "comparator".to_string(),
-                "threshold".to_string(),
+                field("kind", "string", &[]),
+                field("comparator", "string", &["gt", "gte", "lt", "lte"]),
+                field("threshold", "number", &[]),
             ],
         );
         variants.insert(
             "anomaly".to_string(),
-            vec!["kind".to_string(), "deviations".to_string()],
+            vec![
+                field("kind", "string", &[]),
+                field("deviations", "number", &[]),
+            ],
         );
         ObjectShape {
             discriminator: Some("kind".to_string()),
             variants,
-            required: Vec::new(),
+            fields: Vec::new(),
         }
     }
 
@@ -1724,7 +1801,15 @@ mod tests {
         param.object_shape = Some(ObjectShape {
             discriminator: None,
             variants: std::collections::BTreeMap::new(),
-            required: vec!["from".to_string(), "to".to_string()],
+            fields: ["from", "to"]
+                .iter()
+                .map(|n| ObjectField {
+                    name: n.to_string(),
+                    required: true,
+                    ty: "string".to_string(),
+                    enum_values: Vec::new(),
+                })
+                .collect(),
         });
         let op = make_write_op("create_thing", "POST", "/things", "Things", vec![param]);
 
@@ -1838,6 +1923,94 @@ mod tests {
         let transposed: String = chars.into_iter().collect();
         assert_eq!(nearest_param(&transposed, &valid), Some("metric_name"));
         assert_eq!(nearest_param("zzzzzzzzzz", &valid), None);
+    }
+
+    /// A quoted number is present, required, and fatal.
+    ///
+    /// Seen live: `{"kind":"static","threshold":"0.5","comparator":">"}` passed
+    /// the presence check, was staged, the user clicked Confirm, and the API
+    /// answered `invalid type: string "0.5", expected f64`. Checking that a key
+    /// exists catches only half the mistakes.
+    #[test]
+    fn quoted_number_in_object_body_param_is_rejected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": "gt", "threshold": "0.5" }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100)
+            .expect_err("a string where the API wants f64 must not be staged");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("threshold"), "{problem}");
+        // Showing the quotes is the whole point — `0.5` and `"0.5"` are
+        // indistinguishable in a message that just echoes the value.
+        assert!(problem.contains("the string \"0.5\""), "{problem}");
+        assert!(problem.contains("number"), "{problem}");
+    }
+
+    /// The other half of the same payload: `>` is a natural way to write a
+    /// comparator and not what the schema accepts (`gt|gte|lt|lte`). The
+    /// schema's own description even warns "NOT the SQL operators" — but that
+    /// text never reaches the model, so the enum has to be enforced.
+    #[test]
+    fn wrong_enum_spelling_in_object_body_param_lists_the_allowed_values() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": ">", "threshold": 0.5 }
+        });
+
+        let err = build_request_parts(&op, &params, &[], 20, 100).expect_err("bad comparator");
+        let ApiToolError::BadObjectShape { problem, .. } = &err else {
+            panic!("expected BadObjectShape, got {err:?}");
+        };
+        assert!(problem.contains("comparator"), "{problem}");
+        for allowed in ["gt", "gte", "lt", "lte"] {
+            assert!(
+                problem.contains(allowed),
+                "should list {allowed}: {problem}"
+            );
+        }
+    }
+
+    /// An integer is a valid f64 — `300` must not be rejected for a number
+    /// field, or every whole-numbered threshold breaks.
+    #[test]
+    fn integer_is_accepted_where_a_number_is_expected() {
+        let op = op_with_detector();
+        let params = serde_json::json!({
+            "detection_config": { "kind": "static", "comparator": "gt", "threshold": 300 }
+        });
+        build_request_parts(&op, &params, &[], 20, 100).expect("integers are valid numbers");
+    }
+
+    /// Optional fields that are absent must not trip the type check.
+    #[test]
+    fn absent_optional_object_fields_are_not_type_checked() {
+        let mut param = body_param("window", true);
+        param.object_shape = Some(ObjectShape {
+            discriminator: None,
+            variants: std::collections::BTreeMap::new(),
+            fields: vec![
+                ObjectField {
+                    name: "from".to_string(),
+                    required: true,
+                    ty: "string".to_string(),
+                    enum_values: Vec::new(),
+                },
+                ObjectField {
+                    name: "step".to_string(),
+                    required: false,
+                    ty: "integer".to_string(),
+                    enum_values: Vec::new(),
+                },
+            ],
+        });
+        let op = make_write_op("create_thing", "POST", "/things", "Things", vec![param]);
+
+        let params = serde_json::json!({ "window": { "from": "now-1h" } });
+        build_request_parts(&op, &params, &[], 20, 100).expect("absent optional field is fine");
     }
 
     #[test]

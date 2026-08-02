@@ -478,6 +478,18 @@ fn coerce(s: &str) -> Value {
     if let Ok(n) = s.parse::<i64>() {
         return Value::from(n);
     }
+    // Floats too, or every fractional value becomes a string and the API
+    // rejects it with `invalid type: string "0.5", expected f64`. Thresholds
+    // are the obvious case: `--threshold 0.5` has to arrive as a number.
+    // Guarded against `f64::from_str` accepting "inf"/"NaN", which are not
+    // representable in JSON and would serialize as `null`.
+    if let Ok(n) = s.parse::<f64>() {
+        if n.is_finite() {
+            if let Some(v) = serde_json::Number::from_f64(n) {
+                return Value::Number(v);
+            }
+        }
+    }
     match s {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
@@ -539,6 +551,41 @@ mod tests {
         assert_eq!(v["limit"], Value::from(20));
         assert_eq!(v["name"], Value::from("foo"));
         assert_eq!(v["flag"], Value::Bool(true));
+    }
+
+    /// `--threshold 0.5` must arrive as a JSON number. It used to fall through
+    /// to a string (only `i64` was attempted), and the API answered
+    /// `invalid type: string "0.5", expected f64`.
+    #[test]
+    fn parse_flags_coerces_floats_to_numbers() {
+        let v = parse_flags(&[
+            "--threshold".into(),
+            "0.5".into(),
+            "--ratio".into(),
+            "-1.25".into(),
+        ])
+        .unwrap();
+        assert_eq!(v["threshold"], serde_json::json!(0.5));
+        assert_eq!(v["ratio"], serde_json::json!(-1.25));
+        assert!(v["threshold"].is_number() && !v["threshold"].is_string());
+    }
+
+    /// Integers must keep parsing as integers, not become floats.
+    #[test]
+    fn parse_flags_keeps_integers_integral() {
+        let v = parse_flags(&["--window_secs".into(), "300".into()]).unwrap();
+        assert_eq!(v["window_secs"], Value::from(300));
+        assert!(v["window_secs"].is_i64());
+    }
+
+    /// `f64::from_str` accepts these; JSON cannot represent them, and
+    /// `Number::from_f64` would yield `null`. They stay strings.
+    #[test]
+    fn parse_flags_leaves_non_finite_floats_as_strings() {
+        for token in ["inf", "-inf", "NaN"] {
+            let v = parse_flags(&["--x".into(), token.into()]).unwrap();
+            assert!(v["x"].is_string(), "{token} became {:?}", v["x"]);
+        }
     }
 
     #[test]

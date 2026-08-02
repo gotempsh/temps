@@ -3373,7 +3373,24 @@ mod ai_tool_allowlist_tests {
             "must show the accepted variants — the model does not run --help: {msg}"
         );
 
-        // 2. The correct payload still validates and is staged.
+        // 2. A quoted number and a natural-but-wrong comparator: both present,
+        //    both fatal, both used to reach the human before failing.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \">\", \"threshold\": \"0.5\"}}'"
+            ),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(
+            msg.contains("gt") && msg.contains("lte"),
+            "the real Comparator enum must be listed: {msg}"
+        );
+
+        // 3. The correct payload still validates and is staged.
         let outcome = caller.prepare_write_cli(
             &format!(
                 "{base} --detection_config \
