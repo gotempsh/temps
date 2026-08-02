@@ -267,6 +267,68 @@ impl ReadOnlyApiIndex {
         }
     }
 
+    /// Build the read index from an OpenAPI document: allowlisted `GET`
+    /// operations PLUS a separate, explicitly-vetted set of **read-only
+    /// `POST`** operations.
+    ///
+    /// ## Why this exists
+    ///
+    /// HTTP method is the crate's structural proxy for "does this mutate?", and
+    /// it is right almost everywhere. A handful of genuinely read-only
+    /// operations are nonetheless `POST` because their *input* is too large or
+    /// too structured for a query string — the motivating case is the metric
+    /// alert backtest (`preview_alert`), which takes a whole detector config and
+    /// returns "would this rule have fired?" without writing anything.
+    ///
+    /// Routing those through the *write* tool would be wrong in the other
+    /// direction: the write tool is propose-then-confirm, so a backtest would
+    /// stage a pending action and wait for a human — turning the cheap
+    /// "check before you propose" step into the very thing it is meant to
+    /// inform.
+    ///
+    /// ## Security posture
+    ///
+    /// `safe_posts` is a SECOND allowlist, deliberately separate from the GET
+    /// allowlist so that adding an entry is a conscious act with its own review:
+    /// **an operation belongs here only if it has no side effects.** A `POST`
+    /// that writes anything must go in the write allowlist instead. Membership
+    /// in `allowlist` does NOT grant POST access and membership here does NOT
+    /// grant GET access — the two lists are matched against disjoint sets of
+    /// operations. The router's `permission_guard!` remains the real boundary;
+    /// this is defence in depth for what the model can even name.
+    ///
+    /// Request-body fields are resolved exactly as for the write index, so the
+    /// model can pass body params as CLI flags.
+    pub fn from_openapi_allowlist_with_safe_posts(
+        openapi: &utoipa::openapi::OpenApi,
+        allowlist: &[&str],
+        safe_posts: &[&str],
+    ) -> Self {
+        let mut index = Self::from_openapi_allowlist(openapi, allowlist);
+
+        for (path, path_item) in &openapi.paths.paths {
+            let Some(op) = path_item.post.as_ref() else {
+                continue;
+            };
+            let Some(ref op_id) = op.operation_id else {
+                continue;
+            };
+            if !safe_posts.contains(&op_id.as_str()) {
+                continue;
+            }
+            let body_params = resolve_body_params(op, openapi);
+            index.operations.push(build_api_operation(
+                op_id.clone(),
+                path.clone(),
+                "POST",
+                op,
+                &body_params,
+            ));
+        }
+
+        index
+    }
+
     /// Build the write index from an OpenAPI document, including ONLY non-GET
     /// operations whose `operation_id` is in `allowlist` (opt-in /
     /// secure-by-default).
@@ -1168,5 +1230,69 @@ mod tests {
         assert_eq!(allowlist_index.len(), 1);
         assert!(allowlist_index.get("list_projects").is_some());
         assert!(allowlist_index.get("create_project").is_none());
+    }
+
+    #[test]
+    fn safe_posts_are_indexed_with_post_method_and_body_params() {
+        let api = write_test_openapi();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &["list_projects"],
+            &["create_project"],
+        );
+
+        assert_eq!(index.len(), 2, "the GET plus the vetted read-only POST");
+
+        let post = index.get("create_project").expect("safe POST indexed");
+        assert_eq!(post.method, "POST", "must dispatch as a real POST");
+        let name = post
+            .params
+            .iter()
+            .find(|p| p.name == "name")
+            .expect("body params resolved through the $ref");
+        assert_eq!(name.location, ParamLocation::Body);
+        assert!(name.required);
+    }
+
+    /// The two allowlists are disjoint: naming an operation in one does not
+    /// grant it through the other. This is the property that keeps "vetted
+    /// read-only POST" from quietly widening into "any POST".
+    #[test]
+    fn safe_post_and_get_allowlists_do_not_leak_into_each_other() {
+        let api = write_test_openapi();
+
+        // A POST named only in the GET allowlist stays out.
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &["create_project"],
+            &[],
+        );
+        assert!(
+            index.get("create_project").is_none(),
+            "a POST must never be reachable via the GET allowlist"
+        );
+
+        // A GET named only in the safe-POST list stays out.
+        let index =
+            ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&api, &[], &["list_projects"]);
+        assert!(index.get("list_projects").is_none());
+        assert_eq!(index.len(), 0);
+    }
+
+    /// PATCH/PUT/DELETE can never enter the read index, even if someone
+    /// mistakenly adds one to `safe_posts` — only `path_item.post` is consulted.
+    #[test]
+    fn safe_posts_never_admit_non_post_write_methods() {
+        let api = write_test_openapi();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &[],
+            &["update_project", "delete_project"],
+        );
+        assert_eq!(
+            index.len(),
+            0,
+            "PATCH/DELETE must be structurally unreachable from the read index"
+        );
     }
 }

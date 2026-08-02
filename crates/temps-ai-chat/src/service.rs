@@ -838,6 +838,10 @@ impl ConversationService {
             // IDs of ai_pending_actions rows created during this turn; linked to the
             // assistant message after it is persisted (best-effort).
             let mut proposed_action_ids: Vec<i64> = Vec::new();
+            // The last provider error seen while trying to produce this turn. Kept
+            // so that a turn which ends up with nothing to show can explain WHY
+            // instead of just stopping — see the empty-turn check after salvage.
+            let mut last_provider_error: Option<String> = None;
 
             'rounds: for _ in 0..MAX_ROUNDS {
                 let req = ChatTurnRequest {
@@ -854,6 +858,7 @@ impl ConversationService {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("chat_stream_turn failed for conv {conv_id} (round): {e}");
+                        last_provider_error = Some(e.to_string());
                         break 'rounds;
                     }
                 };
@@ -1056,7 +1061,12 @@ impl ConversationService {
                     messages: final_messages,
                     ..Default::default()
                 };
-                if let Ok(mut stream) = ai.chat_stream_turn(req).await {
+                let salvage = ai.chat_stream_turn(req).await;
+                if let Err(e) = &salvage {
+                    tracing::warn!("chat_stream_turn failed for conv {conv_id} (salvage): {e}");
+                    last_provider_error = Some(e.to_string());
+                }
+                if let Ok(mut stream) = salvage {
                     let mut salvage_text = String::new();
                     while let Some(item) = stream.next().await {
                         if let Ok(ChatStreamDelta::Text(t)) = item {
@@ -1080,6 +1090,29 @@ impl ConversationService {
                         parts.push(serde_json::json!({ "type": "text", "text": salvage_text }));
                     }
                 }
+            }
+
+            // A turn that produced nothing at all — no prose, no tool work — is
+            // indistinguishable from a hung request in the UI: the user's own
+            // message sits there and nothing ever arrives. That is the worst
+            // possible outcome for a self-hosted operator with no support channel
+            // to ask, so say what went wrong. The client already renders an
+            // `error` SSE event; before this it simply never received one, because
+            // a provider failure just ended the loop.
+            //
+            // Only when the client is still listening (`client_gone` means the
+            // user navigated away or pressed Stop — an empty turn is expected and
+            // explaining it to no one is pointless).
+            if content.is_empty() && tools_meta.is_empty() && !client_gone {
+                // `ChatError::Ai` already renders an "AI provider error: " prefix,
+                // so the message continues that sentence rather than restating it.
+                let detail = last_provider_error
+                    .unwrap_or_else(|| "the provider returned no response".to_string());
+                let _ = tx.send(Err(ChatError::Ai(format!(
+                    "no reply was produced. {detail} \
+                     Check the provider's key and model in Settings → AI Providers, \
+                     then try again."
+                ))));
             }
 
             // Persist the assistant turn once complete. `content` is the full prose
@@ -2023,5 +2056,61 @@ mod tests {
 
         let conv = conv_for(1, 7, "pubA");
         svc.archive(&conv).await.expect("archive ok");
+    }
+
+    /// A turn that produces nothing must SAY so.
+    ///
+    /// Before this, a provider failure just ended the round loop: the SSE stream
+    /// closed with zero events, so the UI showed the user's own message and then
+    /// nothing, forever — indistinguishable from a hang, and with no hint that
+    /// the provider key was the problem. A self-hosted operator has no support
+    /// channel to ask, so the error has to reach the screen.
+    #[tokio::test]
+    async fn empty_turn_emits_an_actionable_error_instead_of_silence() {
+        // Every model call fails, including the tool-free salvage call.
+        let ai = Arc::new(ScriptedAi::new(vec![
+            Err(AiError::Provider {
+                purpose: "chat.test.tools".to_string(),
+                reason: "bad api key".to_string(),
+            }),
+            Err(AiError::Provider {
+                purpose: "chat.test.tools.final".to_string(),
+                reason: "bad api key".to_string(),
+            }),
+        ]));
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (svc, tools) = service_with(ai);
+
+        let conv = test_conversation();
+        let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
+        let mut stream = svc
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .await;
+
+        let mut errors = Vec::new();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(ev) => events.push(ev),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+
+        assert!(
+            events.is_empty(),
+            "a failed turn should stream no content, got {events:?}"
+        );
+        assert_eq!(errors.len(), 1, "expected exactly one error event");
+        let msg = &errors[0];
+        assert!(
+            msg.contains("bad api key"),
+            "the underlying provider error must survive to the user: {msg}"
+        );
+        assert!(
+            msg.contains("AI Providers"),
+            "the error must point at the place that fixes it: {msg}"
+        );
     }
 }

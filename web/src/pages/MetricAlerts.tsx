@@ -48,6 +48,7 @@ import {
   StatusDot,
 } from '@/components/metrics/alert-format'
 import { ruleStatus, statusRank } from '@/components/metrics/alert-status'
+import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
 
 interface MetricAlertsProps {
   project: ProjectResponse
@@ -100,10 +101,17 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
             Threshold alerts on OpenTelemetry metrics for {project.name}.
           </p>
         </div>
-        <Button size="sm" onClick={goToNew} className="gap-1.5 self-start">
-          <Plus className="size-4" />
-          New alert
-        </Button>
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <SuggestAlertsButton
+            projectId={project.id}
+            projectSlug={project.slug}
+            projectName={project.name}
+          />
+          <Button size="sm" onClick={goToNew} className="gap-1.5">
+            <Plus className="size-4" />
+            New alert
+          </Button>
+        </div>
       </div>
 
       {alertsQuery.isPending ? (

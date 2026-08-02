@@ -407,6 +407,35 @@ impl InternalApiCaller {
         }
     }
 
+    /// Like [`Self::new_allowlisted`], but additionally indexes a separate,
+    /// explicitly-vetted set of **read-only `POST`** operations (`safe_posts`).
+    ///
+    /// See [`ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts`] for the
+    /// security rationale and the rule for what may be listed: an operation
+    /// belongs in `safe_posts` only if it has no side effects. Anything that
+    /// mutates must go through the propose-then-confirm write tool instead.
+    pub fn new_allowlisted_with_safe_posts(
+        router: axum::Router,
+        openapi: &utoipa::openapi::OpenApi,
+        allowlist: Vec<String>,
+        safe_posts: Vec<String>,
+    ) -> Self {
+        let allowlist_refs: Vec<&str> = allowlist.iter().map(|s| s.as_str()).collect();
+        let safe_post_refs: Vec<&str> = safe_posts.iter().map(|s| s.as_str()).collect();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            openapi,
+            &allowlist_refs,
+            &safe_post_refs,
+        );
+        Self {
+            router,
+            index,
+            default_limit: 20,
+            max_limit: 100,
+            max_response_bytes: 128 * 1024, // 128 KiB
+        }
+    }
+
     /// Construct a caller whose index contains ONLY the allowlisted write
     /// (`POST`/`PUT`/`PATCH`/`DELETE`) operation IDs.
     ///

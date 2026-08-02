@@ -983,8 +983,85 @@ pub async fn reject_pending_action(
     Ok(Json(PendingActionResponse::from(updated)))
 }
 
+/// What still has to be true before an AI chat can run a turn in this project.
+///
+/// The three gates are independent and fail for different reasons with different
+/// fixes, so they are reported separately rather than collapsed into one boolean:
+/// an instance admin configures a provider (instance-wide), while the two toggles
+/// are per-project. Collapsing them would leave the user with "AI unavailable"
+/// and no idea which of three places to go.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatReadinessResponse {
+    /// An AI provider is configured on this instance. Fixed in
+    /// Settings → AI Providers; instance-wide, not per project.
+    pub ai_configured: bool,
+    /// The per-project read-only chat toggle is on (the default).
+    pub chat_enabled: bool,
+    /// The per-project write-actions opt-in is on. Required for any flow where
+    /// the assistant *proposes* changes; irrelevant for read-only questions.
+    pub write_actions_enabled: bool,
+}
+
+/// Report which AI prerequisites this project satisfies.
+///
+/// Read-only and cheap, so the UI can decide up front whether to show a working
+/// entry point, an onboarding path, or nothing — instead of letting the user
+/// click something that fails with a 409 they can't act on.
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/projects/{project_id}/ai/readiness",
+    params(("project_id" = i32, Path,)),
+    responses(
+        (status = 200, description = "Which AI prerequisites are met", body = ChatReadinessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_chat_readiness(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<Json<ChatReadinessResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let project = temps_entities::projects::Entity::find_by_id(project_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(format!(
+                    "Failed to load project {project_id} for AI readiness: {e}"
+                ))
+        })?;
+
+    // Mirrors `ensure_chat_enabled`: read-only chat is on unless explicitly
+    // opted out, and write actions being on always implies chat access.
+    let (chat_enabled, write_actions_enabled) = match &project {
+        Some(p) => (
+            !matches!(p.ai_debug_chat_enabled, Some(false)) || p.ai_write_actions_enabled,
+            p.ai_write_actions_enabled,
+        ),
+        None => (false, false),
+    };
+
+    Ok(Json(ChatReadinessResponse {
+        ai_configured: state.service.ai_available().await,
+        chat_enabled,
+        write_actions_enabled,
+    }))
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        // Readiness for the chat, so the UI can onboard instead of guessing.
+        .route(
+            "/projects/{project_id}/ai/readiness",
+            get(get_chat_readiness),
+        )
         // Unified cross-project switcher.
         .route("/ai/conversations", get(list_all_conversations))
         .route(
@@ -1031,6 +1108,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        get_chat_readiness,
         find_conversation,
         list_conversations,
         list_all_conversations,
@@ -1057,6 +1135,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ToolCallEvent,
         ToolResultEvent,
         PendingActionResponse,
+        ChatReadinessResponse,
     ))
 )]
 pub struct AiChatApiDoc;

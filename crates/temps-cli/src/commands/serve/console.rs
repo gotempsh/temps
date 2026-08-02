@@ -1411,6 +1411,11 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_error_groups",
         "list_alert_rules",
         "get_alert_rule",
+        // ── Metric alert rules (OTel) — the rules themselves, so the AI can
+        //    see what is already alerted on before proposing anything new.
+        //    Without these it proposes duplicates of rules that exist.
+        "list_alerts",
+        "get_alert",
         // ── Service status / health / types (NOT params/env) ──
         "get_service_health_status",
         "list_service_health_statuses",
@@ -1599,6 +1604,41 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Import ──
         "list_sources",
         "get_import_status",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Vetted **read-only `POST`** operations for the AI read tool.
+///
+/// HTTP method is this codebase's structural proxy for "does this mutate?", and
+/// `ai_read_allowlist` above is GET-only for exactly that reason. This is the
+/// narrow, separately-reviewed exception: operations that are genuinely
+/// side-effect-free but are `POST` because their input is a structured document
+/// rather than a handful of query params.
+///
+/// **The rule for adding an entry: the operation must write nothing.** Not a
+/// row, not a file, not a queued job. If it mutates anything at all it belongs
+/// in the propose-then-confirm write allowlist instead, never here. Keeping this
+/// list separate from the GET allowlist is what makes each addition a conscious
+/// decision rather than a line lost in a 200-entry list.
+///
+/// Deliberately NOT here: anything that creates, updates, deletes, triggers, or
+/// enqueues — including the metric-alert CRUD operations that live next to
+/// `preview_alert` in the same handler module.
+fn ai_read_safe_posts() -> Vec<String> {
+    [
+        // Backtest a metric-alert detector over historical data: replays the
+        // metric against the band the evaluator would use and returns which
+        // points would have fired. Explicitly documented read-only, guarded by
+        // OtelRead + project_access_guard!, and persists nothing. It is a POST
+        // only because the request body is a whole detector config.
+        //
+        // This is what lets the assistant check "would this rule actually have
+        // fired?" *before* proposing it, so a suggested alert arrives with
+        // evidence attached instead of a guessed threshold.
+        "preview_alert",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -2631,11 +2671,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // `ai_read_allowlist()` below for the full curated list and
                     // the security rationale behind what is/isn't included.
                     let allowlist: Vec<String> = ai_read_allowlist();
-                    let caller = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
-                        split.admin.clone(),
-                        &openapi,
-                        allowlist.clone(),
-                    );
+                    // Plus the narrow, separately-vetted set of read-only POSTs
+                    // — see `ai_read_safe_posts()` for the rule governing it.
+                    let safe_posts: Vec<String> = ai_read_safe_posts();
+                    let caller =
+                        temps_ai_api_tools::InternalApiCaller::new_allowlisted_with_safe_posts(
+                            split.admin.clone(),
+                            &openapi,
+                            allowlist.clone(),
+                            safe_posts.clone(),
+                        );
                     // Diagnostic: report which allowlist entries actually
                     // resolved to a real operation in the OpenAPI doc, and
                     // loudly flag any that did not (a typo or a wrong
@@ -2645,11 +2690,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     let resolved = caller.indexed_operation_ids();
                     let unresolved: Vec<&String> = allowlist
                         .iter()
+                        .chain(safe_posts.iter())
                         .filter(|id| !resolved.contains(id))
                         .collect();
                     info!(
                         resolved_count = resolved.len(),
-                        allowlist_count = allowlist.len(),
+                        allowlist_count = allowlist.len() + safe_posts.len(),
                         "AI read tool: indexed read operations"
                     );
                     if !unresolved.is_empty() {
@@ -2723,6 +2769,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                             //    unlinked / left running unused; nothing is deleted).
                             "create_service",
                             "link_service_to_project",
+                            // ── Metric alert rules (OTel) ──
+                            // Create/update an alert rule. Reversible (a rule
+                            // can be disabled or deleted) and non-destructive:
+                            // creating one changes no running workload, it only
+                            // starts evaluating a metric. This is what lets the
+                            // assistant turn "your p95 has no alert on it" into
+                            // a concrete rule the human confirms.
+                            //
+                            // `delete_alert` is deliberately excluded: deleting
+                            // an alert silently removes monitoring, which is the
+                            // kind of change that is only noticed when the
+                            // incident it would have caught happens.
+                            "create_alert",
+                            "update_alert",
                         ]
                         .iter()
                         .map(|s| s.to_string())

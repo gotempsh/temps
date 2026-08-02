@@ -1891,6 +1891,32 @@ export type ChatMessage = {
 };
 
 /**
+ * What still has to be true before an AI chat can run a turn in this project.
+ *
+ * The three gates are independent and fail for different reasons with different
+ * fixes, so they are reported separately rather than collapsed into one boolean:
+ * an instance admin configures a provider (instance-wide), while the two toggles
+ * are per-project. Collapsing them would leave the user with "AI unavailable"
+ * and no idea which of three places to go.
+ */
+export type ChatReadinessResponse = {
+    /**
+     * An AI provider is configured on this instance. Fixed in
+     * Settings → AI Providers; instance-wide, not per project.
+     */
+    ai_configured: boolean;
+    /**
+     * The per-project read-only chat toggle is on (the default).
+     */
+    chat_enabled: boolean;
+    /**
+     * The per-project write-actions opt-in is on. Required for any flow where
+     * the assistant *proposes* changes; irrelevant for read-only questions.
+     */
+    write_actions_enabled: boolean;
+};
+
+/**
  * A single child backup entry in the `GET /backups/{id}/children` response.
  *
  * Each entry corresponds to one `external_service_backups` row joined with
@@ -35951,6 +35977,35 @@ export type RejectPendingActionResponses = {
 };
 
 export type RejectPendingActionResponse = RejectPendingActionResponses[keyof RejectPendingActionResponses];
+
+export type GetChatReadinessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/readiness';
+};
+
+export type GetChatReadinessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetChatReadinessResponses = {
+    /**
+     * Which AI prerequisites are met
+     */
+    200: ChatReadinessResponse;
+};
+
+export type GetChatReadinessResponse = GetChatReadinessResponses[keyof GetChatReadinessResponses];
 
 export type ListProjectAlarmsData = {
     body?: never;

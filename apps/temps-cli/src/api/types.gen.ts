@@ -1891,6 +1891,32 @@ export type ChatMessage = {
 };
 
 /**
+ * What still has to be true before an AI chat can run a turn in this project.
+ *
+ * The three gates are independent and fail for different reasons with different
+ * fixes, so they are reported separately rather than collapsed into one boolean:
+ * an instance admin configures a provider (instance-wide), while the two toggles
+ * are per-project. Collapsing them would leave the user with "AI unavailable"
+ * and no idea which of three places to go.
+ */
+export type ChatReadinessResponse = {
+    /**
+     * An AI provider is configured on this instance. Fixed in
+     * Settings → AI Providers; instance-wide, not per project.
+     */
+    ai_configured: boolean;
+    /**
+     * The per-project read-only chat toggle is on (the default).
+     */
+    chat_enabled: boolean;
+    /**
+     * The per-project write-actions opt-in is on. Required for any flow where
+     * the assistant *proposes* changes; irrelevant for read-only questions.
+     */
+    write_actions_enabled: boolean;
+};
+
+/**
  * A single child backup entry in the `GET /backups/{id}/children` response.
  *
  * Each entry corresponds to one `external_service_backups` row joined with
@@ -4274,6 +4300,27 @@ export type DeploymentConfig = {
      * `n / 1_000_000` cores into Docker nano_cpus.
      */
     cpuRequest?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run.
+     *
+     * `None`/`false` (the default) builds exactly once, on the control
+     * plane's native platform — byte-for-byte the behaviour of a
+     * single-architecture cluster. When enabled and the nodes this
+     * deployment could land on span more than one architecture, the build
+     * job produces one image per architecture; the non-native ones go
+     * through the daemon's `platform` option, which requires QEMU binfmt
+     * handlers registered on the control plane.
+     *
+     * **Opt-in on purpose.** Cross-architecture builds are emulated and
+     * substantially slower, and deriving them from cluster topology would
+     * mean a single node joining silently changes build behaviour for every
+     * deployment in the cluster. It also keeps the decision on operator
+     * config rather than on a value each node reports about itself.
+     *
+     * `Option<bool>` so an environment inherits the project's setting
+     * (`None`) or overrides it, matching `automatic_deploy`.
+     */
+    crossArchitectureBuilds?: boolean | null;
     /**
      * Port exposed by the container
      * If not specified, will be auto-detected from Docker image or default to 3000
@@ -7950,6 +7997,12 @@ export type HealthSummary = {
 
 export type HeartbeatApiRequest = {
     /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`), read from `docker info` by the agent. Absent from
+     * pre-multi-arch agents; the stored value is then left untouched.
+     */
+    architecture?: string | null;
+    /**
      * Resource capacity/usage info as JSON (cpu_usage, memory_usage, etc.)
      */
     capacity?: unknown;
@@ -10039,6 +10092,11 @@ export type NodeCostInfo = {
 
 export type NodeInfoResponse = {
     address: string;
+    /**
+     * Container platform this node runs (`linux/amd64`, `linux/arm64`).
+     * `None` until an agent that reports it has heartbeated.
+     */
+    architecture?: string | null;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -12752,6 +12810,12 @@ export type RegisterNodeApiRequest = {
      * Node's reachable address (e.g., "10.100.0.2" or "192.168.1.50")
      */
     address: string;
+    /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`). Optional: agents older than multi-arch support omit it
+     * and the value is learned from the first heartbeat instead.
+     */
+    architecture?: string | null;
     /**
      * Node-generated certificate signing request (PEM) for multi-node mTLS
      * (ADR-020 WS-2.1). When present, the control plane signs it with the
@@ -16757,6 +16821,13 @@ export type UpdateDeploymentConfigRequest = {
     automaticDeploy?: boolean | null;
     cpuLimit?: number | null;
     cpuRequest?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run. Off by
+     * default; environments inherit this and may override it. Cross-builds
+     * are emulated on the control plane and substantially slower, so they are
+     * opted into rather than triggered by cluster topology.
+     */
+    crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
@@ -16844,6 +16915,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Absent leaves the current value unchanged.
      */
     cpu_request?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run (overrides the
+     * project-level setting). Off by default: cross-architecture builds are
+     * emulated on the control plane and substantially slower, so they are
+     * opted into per environment rather than triggered by cluster topology.
+     */
+    cross_architecture_builds?: boolean | null;
     /**
      * Port exposed by the container (overrides project-level port for this environment)
      *
@@ -35922,6 +36000,35 @@ export type RejectPendingActionResponses = {
 };
 
 export type RejectPendingActionResponse = RejectPendingActionResponses[keyof RejectPendingActionResponses];
+
+export type GetChatReadinessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/readiness';
+};
+
+export type GetChatReadinessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetChatReadinessResponses = {
+    /**
+     * Which AI prerequisites are met
+     */
+    200: ChatReadinessResponse;
+};
+
+export type GetChatReadinessResponse = GetChatReadinessResponses[keyof GetChatReadinessResponses];
 
 export type ListProjectAlarmsData = {
     body?: never;
