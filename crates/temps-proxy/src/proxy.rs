@@ -19,15 +19,16 @@
 
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
-    generate_preview_form_html_labeled, sanitize_next, PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
+    generate_preview_bridge_html, generate_preview_form_html_labeled, sanitize_next,
+    PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2,
-    verify_preview_session_grant, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
-    PreviewSandboxLookup, SandboxLookupCache, PREVIEW_GATEWAY_PEER,
+    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
+    PREVIEW_GATEWAY_PEER,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -2974,8 +2975,17 @@ impl ProxyHttp for LoadBalancer {
 
                     let subject = format!("sbx_{}", hex);
                     let now = std::time::SystemTime::now();
-                    let valid_session_grant =
-                        verify_preview_session_grant(&self.crypto, session_grant, &subject, now);
+                    // Grants are bound to the password hash that existed when
+                    // they were minted. Authenticate the self-contained grant
+                    // envelope before touching the database so random public
+                    // input cannot amplify into an uncached lookup. A valid
+                    // candidate then bypasses the cache so password rotation
+                    // revokes it immediately rather than after the cache TTL.
+                    let grant_password_hash = self
+                        .sandbox_lookup_cache
+                        .verify_session_grant(&self.crypto, session_grant, &hex, now)
+                        .await;
+                    let valid_session_grant = grant_password_hash.is_some();
 
                     // A valid platform-session grant is not a password guess
                     // and must remain usable even if this IP previously hit
@@ -2991,6 +3001,7 @@ impl ProxyHttp for LoadBalancer {
                             ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
                         response.insert_header("Retry-After", "60")?;
                         response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
                         session
@@ -3011,9 +3022,9 @@ impl ProxyHttp for LoadBalancer {
                     // hash in its short-lived lookup cache. The owner bridge
                     // already has the new password, so retry against a fresh
                     // row before showing a manual password wall.
-                    let verified_hash = if valid_session_grant
-                        || verify_argon2(password, &stored_hash)
-                    {
+                    let verified_hash = if let Some(password_hash) = grant_password_hash {
+                        Some(password_hash)
+                    } else if verify_argon2(password, &stored_hash) {
                         Some(stored_hash)
                     } else {
                         match self.sandbox_lookup_cache.lookup_fresh(&hex).await {
@@ -3119,6 +3130,7 @@ impl ProxyHttp for LoadBalancer {
                             response.append_header("Set-Cookie", &legacy_cookie)?;
                         }
                         response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         session
                             .write_response_header(Box::new(response), true)
@@ -3139,6 +3151,7 @@ impl ProxyHttp for LoadBalancer {
                         let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
                         response.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         session
                             .write_response_header(Box::new(response), false)
@@ -3164,12 +3177,32 @@ impl ProxyHttp for LoadBalancer {
                         .unwrap_or_else(|| "/".to_string());
                     let next = sanitize_next(&next_raw);
                     let label = format!("sandbox sbx_{}", hex);
-                    let html =
-                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false);
+
+                    // A share link carries its grant in the URL fragment, which
+                    // never reaches this request. The non-secret `grant=1`
+                    // marker selects a bridge whose JavaScript reads the
+                    // fragment, clears browser history, and POSTs the grant to
+                    // the existing verification/cookie path.
+                    let has_session_grant = ctx
+                        .query_string
+                        .as_deref()
+                        .and_then(|qs| {
+                            url::form_urlencoded::parse(qs.as_bytes())
+                                .find(|(k, _)| k == "grant")
+                                .map(|(_, v)| v == "1")
+                        })
+                        .unwrap_or(false);
+
+                    let html = if has_session_grant {
+                        generate_preview_bridge_html(&label, &next)
+                    } else {
+                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false)
+                    };
                     let html_bytes = Bytes::from(html);
                     let mut response = ResponseHeader::build(StatusCode::OK, None)?;
                     response.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
                     response.insert_header("X-Request-ID", &ctx.request_id)?;
                     session
                         .write_response_header(Box::new(response), false)

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use sea_orm::{
@@ -218,6 +218,7 @@ pub struct SandboxService {
     registry: Arc<StandaloneSandboxRegistry>,
     jobs: Arc<JobTracker>,
     platform_config: Arc<ConfigService>,
+    cookie_crypto: Arc<temps_core::CookieCrypto>,
     /// Resolves stored provider connections to access tokens so callers
     /// can clone private repos by `git_connection_id` without handing us
     /// raw credentials. Required — the git plugin registers it, and the
@@ -235,6 +236,7 @@ impl SandboxService {
         registry: Arc<StandaloneSandboxRegistry>,
         jobs: Arc<JobTracker>,
         platform_config: Arc<ConfigService>,
+        cookie_crypto: Arc<temps_core::CookieCrypto>,
         git_provider_manager: Arc<GitProviderManager>,
         data_root: PathBuf,
     ) -> Self {
@@ -243,6 +245,7 @@ impl SandboxService {
             registry,
             jobs,
             platform_config,
+            cookie_crypto,
             git_provider_manager,
             data_root,
         }
@@ -1539,6 +1542,78 @@ TEMPS_ASKPASS_EOF\n\
         let parts = self.preview_parts().await;
         Ok(parts.url_for(public_id_value, port))
     }
+
+    /// Build a shareable preview link that carries its own authorization.
+    ///
+    /// `domain()` returns the bare preview URL, which is useless to anyone who
+    /// does not already hold the preview password — so sharing a protected
+    /// preview meant sharing the password itself, which then cannot be revoked
+    /// for one recipient. This returns that URL plus a minted `session_grant`
+    /// aimed at the login bridge: the recipient's browser exchanges it for the
+    /// ordinary preview cookie and lands on `path`.
+    ///
+    /// The grant is scoped to this one sandbox, expires, and is never
+    /// forwarded to the sandbox itself.
+    pub async fn preview_share_link(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        port: u16,
+        path: &str,
+        ttl: Duration,
+    ) -> Result<(String, u64), SandboxError> {
+        if port == 0 {
+            return Err(SandboxError::Validation {
+                message: "port must be between 1 and 65535".into(),
+            });
+        }
+        let (row, _) = self.resolve_id(public_id_value, user_id).await?;
+        let password_hash =
+            row.preview_password_hash
+                .as_deref()
+                .ok_or_else(|| SandboxError::InvalidState {
+                    sandbox_id: public_id_value.to_string(),
+                    state: "preview password disabled".into(),
+                    operation: "mint an expiring preview link; set a preview password first".into(),
+                })?;
+
+        let now = SystemTime::now();
+        let (grant, expires_at) = temps_core::encode_preview_session_grant(
+            &self.cookie_crypto,
+            public_id_value,
+            password_hash,
+            ttl,
+            now,
+        )
+        .map_err(|source| SandboxError::PreviewGrantFailed {
+            sandbox_id: public_id_value.to_string(),
+            source,
+        })?;
+        let granted_ttl = ttl.min(temps_core::PREVIEW_SESSION_GRANT_MAX_TTL);
+
+        let next = temps_core::sanitize_preview_next(path);
+
+        let base = self.preview_parts().await.url_for(public_id_value, port);
+        let url = format!(
+            "{}/__temps/preview/login?grant=1&next={}#session_grant={}",
+            base.trim_end_matches('/'),
+            url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(grant.as_bytes()).collect::<String>(),
+        );
+        self.record_event(
+            row.id,
+            "preview_share_link_created",
+            Some(serde_json::json!({
+                "actor_user_id": user_id,
+                "port": port,
+                "path": next,
+                "ttl_seconds": granted_ttl.as_secs(),
+                "expires_at": expires_at,
+            })),
+        )
+        .await;
+        Ok((url, expires_at))
+    }
 }
 
 /// Placeholder "public id" used in error messages when the source-seed
@@ -1567,6 +1642,89 @@ fn shell_escape_service(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::{Job, JobQueue, JobReceiver, QueueError};
+
+    struct NoopJobQueue;
+
+    #[async_trait::async_trait]
+    impl JobQueue for NoopJobQueue {
+        async fn send(&self, _job: Job) -> Result<(), QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("preview link tests never subscribe to the job queue")
+        }
+    }
+
+    fn test_server_config() -> temps_config::ServerConfig {
+        temps_config::ServerConfig {
+            address: "127.0.0.1:0".into(),
+            database_url: "postgres://test".into(),
+            tls_address: None,
+            console_address: "127.0.0.1:0".into(),
+            console_admin_address: None,
+            admin_allowed_ips: Vec::new(),
+            admin_allowed_hosts: Vec::new(),
+            admin_trust_forwarded_for: false,
+            data_dir: PathBuf::from("/tmp/temps-sandbox-preview-tests"),
+            auth_secret: "default-32-byte-key-for-testing!".into(),
+            encryption_key: "another-32-byte-key-for-testing!".into(),
+            api_base_url: "/api".into(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
+        }
+    }
+
+    fn preview_test_service(
+        query_results: Vec<Vec<sandboxes::Model>>,
+    ) -> (SandboxService, Arc<DatabaseConnection>) {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(query_results)
+                .into_connection(),
+        );
+        let service = preview_test_service_with_db(db.clone());
+        (service, db)
+    }
+
+    fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> SandboxService {
+        let platform_config = Arc::new(ConfigService::new(
+            Arc::new(test_server_config()),
+            db.clone(),
+        ));
+        let git_provider_manager = Arc::new(GitProviderManager::new(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password("test")),
+            Arc::new(NoopJobQueue),
+            platform_config.clone(),
+        ));
+        let registry = Arc::new(StandaloneSandboxRegistry::new(Arc::new(
+            temps_agents::sandbox::local::LocalSandboxProvider::new(),
+        )));
+        SandboxService::new(
+            db.clone(),
+            registry,
+            Arc::new(JobTracker::new()),
+            platform_config,
+            Arc::new(
+                temps_core::CookieCrypto::new("default-32-byte-key-for-testing!")
+                    .expect("valid test cookie key"),
+            ),
+            git_provider_manager,
+            PathBuf::from("/tmp/temps-sandbox-preview-tests"),
+        )
+    }
 
     #[test]
     fn default_request_is_empty() {
@@ -1618,6 +1776,131 @@ mod tests {
             preview_password_hash: None,
             preview_password_hint: None,
         }
+    }
+
+    fn protected_preview_row(user_id: i32) -> sandboxes::Model {
+        let mut row = agent_run_row(None);
+        row.user_id = Some(user_id);
+        row.preview_password_hash = Some("argon2-current".into());
+        row.preview_password_hint = Some("rent".into());
+        row
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_uses_fragment_clamps_ttl_and_records_safe_event() {
+        let row = protected_preview_row(1);
+        let (service, db) = preview_test_service(vec![vec![row]]);
+
+        let before = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_secs();
+        let (url, expires_at) = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/\\evil.example",
+                temps_core::PREVIEW_SESSION_GRANT_MAX_TTL * 30,
+            )
+            .await
+            .expect("protected sandbox should mint a link");
+
+        assert!(url.starts_with(
+            "https://ws-deadbeef01234567-3000.localho.st/__temps/preview/login?grant=1&next=%2F#session_grant="
+        ));
+        assert!(!url.contains("?session_grant="));
+        assert!(expires_at >= before + temps_core::PREVIEW_SESSION_GRANT_MAX_TTL.as_secs());
+        assert!(expires_at <= before + temps_core::PREVIEW_SESSION_GRANT_MAX_TTL.as_secs() + 1);
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service owns no database references after drop")
+            .into_transaction_log();
+        let statements = format!("{log:?}");
+        assert!(statements.contains("sandbox_events"), "log: {statements}");
+        assert!(
+            statements.contains("preview_share_link_created"),
+            "log: {statements}"
+        );
+        assert!(!statements.contains("session_grant"), "log: {statements}");
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_requires_a_preview_password() {
+        let row = agent_run_row(None);
+        let (service, _) = preview_test_service(vec![vec![row]]);
+
+        let error = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/pricing",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("open sandbox must not receive a non-expiring share link");
+
+        assert!(matches!(error, SandboxError::InvalidState { .. }));
+        assert!(error.to_string().contains("set a preview password first"));
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_hides_cross_user_sandboxes() {
+        let row = protected_preview_row(2);
+        let (service, _) = preview_test_service(vec![vec![row]]);
+
+        let error = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("another user's sandbox must stay hidden");
+
+        assert!(matches!(error, SandboxError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_rejects_zero_port_before_database_access() {
+        let (service, _) = preview_test_service(Vec::new());
+
+        let error = service
+            .preview_share_link("sbx_deadbeef01234567", 1, 0, "/", Duration::from_secs(60))
+            .await
+            .expect_err("port zero must be rejected");
+
+        assert!(matches!(error, SandboxError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_preserves_database_errors() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "preview lookup unavailable".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = preview_test_service_with_db(db);
+
+        let error = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("database failures must not be collapsed into not-found");
+
+        assert!(matches!(error, SandboxError::Database(_)));
+        assert!(error.to_string().contains("preview lookup unavailable"));
     }
 
     /// Lifecycle ops on agent-run rows must be rejected with a typed

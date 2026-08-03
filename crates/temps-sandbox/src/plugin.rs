@@ -89,6 +89,7 @@ impl TempsPlugin for SandboxPlugin {
 
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let platform_config = context.require_service::<ConfigService>();
+            let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
             let git_provider_manager = context.require_service::<GitProviderManager>();
 
             let registry = Arc::new(StandaloneSandboxRegistry::new(provider));
@@ -112,6 +113,7 @@ impl TempsPlugin for SandboxPlugin {
                 registry,
                 jobs,
                 platform_config,
+                cookie_crypto,
                 git_provider_manager,
                 root,
             ));
