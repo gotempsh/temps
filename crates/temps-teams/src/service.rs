@@ -584,24 +584,22 @@ impl TeamService for DefaultTeamService {
             }
         }
 
-        // Team existence: for a non-admin this must not distinguish "no such
-        // team" from "not allowed", or the endpoint becomes an oracle for
-        // enumerating the instance's teams — the same leak `list_team_projects`
-        // was moved to `UsersRead` to close.
+        // Reporting "no such team" here is not the enumeration oracle that
+        // `list_team_projects` was: every check that could deny is above
+        // this line, so only an instance admin or someone who already holds
+        // `projects:write` on this project gets here — and they can tell an
+        // existing team from a missing one anyway, because for an existing
+        // one the grant simply succeeds. Answering generically would buy no
+        // secrecy and would tell a project admin they lack a permission they
+        // hold, sending them to look for a problem that isn't there.
+        // Keep this lookup last.
         if teams::Entity::find_by_id(req.team_id)
             .one(&txn)
             .await?
             .is_none()
         {
-            return Err(if authz.is_instance_admin {
-                TeamError::NotFound {
-                    team_id: req.team_id,
-                }
-            } else {
-                TeamError::ProjectPermissionDenied {
-                    project_id,
-                    required: Permission::ProjectsWrite.to_string(),
-                }
+            return Err(TeamError::NotFound {
+                team_id: req.team_id,
             });
         }
         // A non-existent project_id violates `fk_project_team_access_project`
@@ -1134,8 +1132,12 @@ mod tests {
         ));
     }
 
+    /// The team lookup is deliberately last: every denial is decided before
+    /// it, so reaching it means the caller could have granted the team had
+    /// it existed. Moving it earlier would turn the endpoint into a team
+    /// enumeration oracle for callers who cannot manage this project.
     #[tokio::test]
-    async fn grant_does_not_tell_non_admins_which_teams_exist() {
+    async fn grant_reports_an_unknown_team_only_after_every_denial() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
             .append_query_results(vec![Vec::<teams::Model>::new()])
@@ -1150,19 +1152,18 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // Not `NotFound`: distinguishing the two turns this endpoint into an
-        // oracle for enumerating every team on the instance.
-        assert!(matches!(
-            err,
-            TeamError::ProjectPermissionDenied { project_id: 42, .. }
-        ));
+        assert!(matches!(err, TeamError::NotFound { team_id: 9999 }));
     }
 
     #[tokio::test]
-    async fn grant_does_report_unknown_teams_to_instance_admins() {
+    async fn grant_denies_a_caller_without_project_write_before_looking_up_the_team() {
+        // Only one query result is queued — the grants. If the team lookup
+        // ran before the permission check this would panic on the missing
+        // second result instead of denying, which is the property being
+        // pinned: a caller who cannot manage the project never learns
+        // whether the team exists.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
-            .append_query_results(vec![Vec::<teams::Model>::new()])
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
@@ -1170,11 +1171,14 @@ mod tests {
                 1,
                 42,
                 grant_req(9999, TeamRole::Viewer),
-                &GrantAuthz::instance_admin(),
+                &authz_for(TeamRole::Viewer),
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, TeamError::NotFound { team_id: 9999 }));
+        assert!(matches!(
+            err,
+            TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
     }
 
     #[tokio::test]
