@@ -73,7 +73,15 @@ import {
   Zap,
 } from 'lucide-react'
 
-import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ProjectResponse } from '@/api/client'
+import {
+  getProjectBySlugOptions,
+  hasAnalyticsEventsOptions,
+  hasErrorGroupsOptions,
+  listCustomDomainsForProjectOptions,
+  listMonitorsOptions,
+  listProjectServicesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
@@ -351,13 +359,10 @@ export default function AppSidebar() {
       : null
 
   // Override: user pressed Back from a route-driven swap; show DefaultNav
-  // even though we're still on /settings or /projects/:slug. Cleared on
-  // any pathname change (so re-clicking Settings or any sub-link
-  // re-triggers the swap).
-  const [forceDefault, setForceDefault] = useState(false)
-  useEffect(() => {
-    setForceDefault(false)
-  }, [location.pathname])
+  // only for that exact pathname. Navigating anywhere else clears the override
+  // by derivation, without a setState-in-effect render cycle.
+  const [forceDefaultPath, setForceDefaultPath] = useState<string | null>(null)
+  const forceDefault = forceDefaultPath === location.pathname
 
   const compact = isMinimal && !isMobile
 
@@ -409,12 +414,15 @@ export default function AppSidebar() {
           <DefaultNav
             pluginItems={pluginItems}
             pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
-            onReturnToProject={() => setForceDefault(false)}
+            onReturnToProject={() => setForceDefaultPath(null)}
           />
         ) : settingsMode ? (
-          <SettingsNav onBack={() => setForceDefault(true)} />
+          <SettingsNav onBack={() => setForceDefaultPath(location.pathname)} />
         ) : projectSlug ? (
-          <ProjectNav slug={projectSlug} onBack={() => setForceDefault(true)} />
+          <ProjectNav
+            slug={projectSlug}
+            onBack={() => setForceDefaultPath(location.pathname)}
+          />
         ) : null}
       </SidebarContent>
       <SidebarFooter>
@@ -977,6 +985,162 @@ const projectBaseNav: ProjectNavItem[] = [
   },
 ]
 
+interface ProjectSetupStep {
+  id: string
+  title: string
+  href: string
+  done: boolean
+  icon: LucideIcon
+}
+
+function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+
+  const analyticsQuery = useQuery({
+    ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
+  })
+  const errorsQuery = useQuery({
+    ...hasErrorGroupsOptions({ path: { project_id: project.id } }),
+  })
+  const domainsQuery = useQuery({
+    ...listCustomDomainsForProjectOptions({
+      path: { project_id: project.id },
+    }),
+  })
+  const monitorsQuery = useQuery({
+    ...listMonitorsOptions({ path: { project_id: project.id } }),
+  })
+  const servicesQuery = useQuery({
+    ...listProjectServicesOptions({ path: { project_id: project.id } }),
+  })
+
+  const isLoading =
+    analyticsQuery.isLoading ||
+    errorsQuery.isLoading ||
+    domainsQuery.isLoading ||
+    monitorsQuery.isLoading ||
+    servicesQuery.isLoading
+
+  const steps: ProjectSetupStep[] = [
+    {
+      id: 'analytics',
+      title: 'Install analytics SDK',
+      href: `/projects/${project.slug}/analytics/setup`,
+      done: !!analyticsQuery.data?.has_events,
+      icon: BarChart3,
+    },
+    {
+      id: 'errors',
+      title: 'Install error tracking SDK',
+      href: `/projects/${project.slug}/errors/setup`,
+      done: !!errorsQuery.data?.has_error_groups,
+      icon: ShieldAlert,
+    },
+    {
+      id: 'domain',
+      title: 'Connect a custom domain',
+      href: `/projects/${project.slug}/domains`,
+      done: (domainsQuery.data?.domains?.length ?? 0) > 0,
+      icon: Globe,
+    },
+    {
+      id: 'monitoring',
+      title: 'Add an uptime monitor',
+      href: `/projects/${project.slug}/monitors`,
+      done: (monitorsQuery.data?.length ?? 0) > 0,
+      icon: Activity,
+    },
+    {
+      id: 'storage',
+      title: 'Link database or storage',
+      href: `/projects/${project.slug}/storage`,
+      done: (servicesQuery.data?.length ?? 0) > 0,
+      icon: Database,
+    },
+  ]
+
+  const remainingSteps = steps.filter((step) => !step.done)
+  const completedCount = steps.length - remainingSteps.length
+  const percent = Math.round((completedCount / steps.length) * 100)
+
+  if (isLoading || remainingSteps.length === 0) return null
+
+  if (compact) {
+    const nextStep = remainingSteps[0]
+    return (
+      <SidebarGroup className="py-0 pb-2">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              tooltip={`Project setup — ${completedCount}/${steps.length}`}
+              className="justify-center"
+            >
+              <Link to={nextStep.href}>
+                <BadgeCheck />
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+
+  const visibleSteps = remainingSteps.slice(0, 2)
+  const hiddenCount = remainingSteps.length - visibleSteps.length
+
+  return (
+    <SidebarGroup className="py-0 pb-2">
+      <div className="overflow-hidden rounded-lg border border-sidebar-border bg-sidebar-accent/30">
+        <div className="px-3 py-2.5">
+          <div className="flex items-center gap-2">
+            <BadgeCheck className="size-4 shrink-0 text-primary" />
+            <span className="flex-1 text-sm font-medium">Project setup</span>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {completedCount}/{steps.length}
+            </span>
+          </div>
+          <div
+            className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sidebar-border"
+            role="progressbar"
+            aria-label={`${project.name} setup progress`}
+            aria-valuemin={0}
+            aria-valuemax={steps.length}
+            aria-valuenow={completedCount}
+          >
+            <div
+              className="h-full rounded-full bg-primary transition-all duration-500"
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+        </div>
+        <ul role="list" className="border-t border-sidebar-border p-1.5">
+          {visibleSteps.map((step) => (
+            <li key={step.id}>
+              <Link
+                to={step.href}
+                className="group flex items-center gap-2 rounded-md px-1.5 py-2 text-xs transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                <step.icon className="size-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
+                <span className="min-w-0 flex-1 leading-tight">
+                  {step.title}
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+              </Link>
+            </li>
+          ))}
+          {hiddenCount > 0 && (
+            <li className="px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground">
+              +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+            </li>
+          )}
+        </ul>
+      </div>
+    </SidebarGroup>
+  )
+}
+
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery({
     ...getProjectBySlugOptions({ path: { slug } }),
@@ -1040,6 +1204,8 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     if (didSyncDrillRef.current || !activeRoute) return
     didSyncDrillRef.current = true
     const parent = findDrillParent(activeRoute)
+    // Reconcile the async project lookup with the route-derived initial view.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (parent) setDrilledTo(parent)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRoute])
@@ -1132,6 +1298,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         onBack={onBack}
         backLabel="Back to menu"
       />
+      <ProjectSetupNavItem project={project} />
       <SidebarGroup className="pt-0">
         <SidebarMenu>
           {items.map((item) => {
