@@ -1016,6 +1016,26 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         Ok(())
     }
 
+    /// Reclaim rootfs-cache entries no live VM references.
+    ///
+    /// Firecracker does own storage that outlives a sandbox: each cache
+    /// entry under `rootfs-cache/<digest>.ext4` is multi-GB, and until now
+    /// it was collected only as a side effect of `destroy` or from a manual
+    /// admin endpoint. A host whose sandboxes stop being destroyed cleanly
+    /// — the exact scenario this sweep exists for — kept them forever.
+    ///
+    /// `claimed` is not consulted: `gc_rootfs` derives its own liveness set
+    /// from the VM directories on disk (`referenced_digests`) under the
+    /// cache lock, which is strictly more precise than a name list the
+    /// caller could supply, and it never removes a referenced digest.
+    async fn reap_orphaned_volumes(
+        &self,
+        _claimed: &std::collections::HashSet<String>,
+    ) -> Result<u32, AgentError> {
+        let report = self.gc_rootfs().await?;
+        Ok(report.removed_digests.len() as u32)
+    }
+
     async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         let name = &handle.sandbox_name;
         let Some(pid) = self.vm_pid(name) else {

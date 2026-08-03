@@ -20,6 +20,8 @@
 //! One bad row (provider unreachable, DB write conflict) must not halt the
 //! sweeper — that would defer cleanup of every other expired sandbox.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +29,10 @@ use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
-use temps_entities::sandboxes;
+use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
+use temps_entities::{agent_runs, sandboxes};
 
+use crate::services::public_id;
 use crate::services::registry::StandaloneSandboxRegistry;
 
 /// How often the sweeper wakes up to scan for expired sandboxes. At most
@@ -44,14 +48,31 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// host that hasn't destroyed anything. At 60s per sweep this is hourly.
 const REAP_EVERY_N_SWEEPS: u32 = 60;
 
+/// Prefix of the Docker volume holding a sandbox's home dir. Duplicated
+/// from the Docker provider on purpose: the sweeper's job is to name the
+/// volumes it wants *kept*, and it must be able to do that without
+/// depending on a Docker-specific type.
+const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+
 pub struct SandboxExpirationSweeper {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
+    /// Same root `SandboxService` allocates work dirs under. Needed so the
+    /// sweeper can reclaim directories whose sandbox is long gone.
+    data_root: PathBuf,
 }
 
 impl SandboxExpirationSweeper {
-    pub fn new(db: Arc<DatabaseConnection>, registry: Arc<StandaloneSandboxRegistry>) -> Self {
-        Self { db, registry }
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        registry: Arc<StandaloneSandboxRegistry>,
+        data_root: PathBuf,
+    ) -> Self {
+        Self {
+            db,
+            registry,
+            data_root,
+        }
     }
 
     /// Run forever. Spawned as a `tokio::spawn` background task by the
@@ -65,7 +86,7 @@ impl SandboxExpirationSweeper {
         // into this build is exactly the case that has already accumulated
         // orphans, and making the operator wait an hour to get that disk
         // back would be the wrong default.
-        self.reap_orphaned_volumes().await;
+        self.reap_orphans().await;
 
         let mut sweeps: u32 = 0;
         loop {
@@ -73,23 +94,170 @@ impl SandboxExpirationSweeper {
             if let Err(e) = self.tick().await {
                 tracing::error!("Sandbox expiration sweep failed: {}", e);
             }
-            sweeps = sweeps.wrapping_add(1);
-            if sweeps.is_multiple_of(REAP_EVERY_N_SWEEPS) {
-                self.reap_orphaned_volumes().await;
+            sweeps = (sweeps + 1) % REAP_EVERY_N_SWEEPS;
+            if sweeps == 0 {
+                self.reap_orphans().await;
             }
         }
     }
 
-    /// Ask the provider to reclaim sandbox volumes no container references.
-    ///
-    /// Never propagates: a Docker daemon that can't list volumes must not
-    /// take down the expiry loop, which is doing the more important job.
-    async fn reap_orphaned_volumes(&self) {
-        match self.registry.provider().reap_orphaned_volumes().await {
-            Ok(0) => tracing::debug!("Sandbox volume reap: nothing to reclaim"),
-            Ok(n) => tracing::info!("Sandbox volume reap: reclaimed {} orphaned volume(s)", n),
-            Err(e) => tracing::warn!("Sandbox volume reap failed: {}", e),
+    /// Reclaim both halves of a leaked sandbox: the provider's storage and
+    /// the host work dir. Never propagates — a Docker daemon that can't
+    /// list volumes, or an unreadable data dir, must not take down the
+    /// expiry loop, which is doing the more important job.
+    async fn reap_orphans(&self) {
+        match self.claimed_volumes().await {
+            Ok(claimed) => match self
+                .registry
+                .provider()
+                .reap_orphaned_volumes(&claimed)
+                .await
+            {
+                Ok(0) => tracing::debug!("Sandbox volume reap: nothing to reclaim"),
+                Ok(n) => tracing::info!("Sandbox volume reap: reclaimed {} orphaned volume(s)", n),
+                Err(e) => tracing::warn!("Sandbox volume reap failed: {}", e),
+            },
+            Err(e) => {
+                // Fail closed. Reaping with a partial claim set would
+                // delete the home volumes of sandboxes we simply failed to
+                // read — the one outcome worse than not reclaiming disk.
+                tracing::warn!(
+                    "Sandbox volume reap skipped: could not read live sandboxes: {}",
+                    e
+                );
+            }
         }
+
+        match self.reap_orphaned_work_dirs().await {
+            Ok(0) => tracing::debug!("Sandbox work dir reap: nothing to reclaim"),
+            Ok(n) => tracing::info!("Sandbox work dir reap: reclaimed {} orphaned dir(s)", n),
+            Err(e) => tracing::warn!("Sandbox work dir reap failed: {}", e),
+        }
+    }
+
+    /// Every volume name a live sandbox may still need.
+    ///
+    /// "No container references it" is not the same question as "no sandbox
+    /// wants it", and the gap between them is where data gets destroyed: a
+    /// sandbox being recreated has no container while its image pulls, and
+    /// a volume kept by `destroy(purge_volumes: false)` has none by design.
+    /// Only the database can tell those apart from a genuine leak.
+    ///
+    /// Deliberately over-claims. Every name is cheap; a wrong deletion is
+    /// not. So this covers all three naming schemes a live sandbox could be
+    /// using — agent-run numeric, standalone `public_id` label, and the
+    /// pre-fix numeric row id that upgraded hosts still have mounted — and
+    /// adds non-terminal agent runs directly, in case a run outlives the
+    /// `sandboxes` row that pointed at it.
+    async fn claimed_volumes(&self) -> Result<HashSet<String>, sea_orm::DbErr> {
+        let mut claimed = HashSet::new();
+
+        let live = sandboxes::Entity::find()
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await?;
+        for row in live {
+            match row.agent_run_id {
+                // Agent runs keep numeric container naming.
+                Some(run_id) => {
+                    claimed.insert(format!("{}{}", HOME_VOLUME_PREFIX, run_id));
+                }
+                // Standalone sandboxes are named after the public id label.
+                None => {
+                    let label = row
+                        .public_id
+                        .strip_prefix(public_id::PUBLIC_ID_PREFIX)
+                        .unwrap_or(&row.public_id);
+                    claimed.insert(format!("{}{}", HOME_VOLUME_PREFIX, label));
+                }
+            }
+            // Pre-fix naming: standalone sandboxes created before the
+            // volume name was keyed on the container label still have
+            // `temps-sandbox-home-<row.id>` mounted. Dangling protects them
+            // while their container exists, but claiming them costs one
+            // string and removes any dependence on that.
+            claimed.insert(format!("{}{}", HOME_VOLUME_PREFIX, row.id));
+        }
+
+        let active_runs = agent_runs::Entity::find()
+            .filter(agent_runs::Column::Status.is_not_in(TERMINAL_RUN_STATUSES.iter().copied()))
+            .all(self.db.as_ref())
+            .await?;
+        for run in active_runs {
+            claimed.insert(format!("{}{}", HOME_VOLUME_PREFIX, run.id));
+        }
+
+        Ok(claimed)
+    }
+
+    /// Delete work dirs under `data_root` with no live sandbox row.
+    ///
+    /// The counterpart to the volume reap, and the reason `destroy_sandbox`
+    /// can afford to skip its own cleanup when the provider destroy failed.
+    /// It also covers the create-failure paths, where a directory can
+    /// already hold a cloned repo before anything goes wrong.
+    ///
+    /// Only `sbx_<16 hex>` directory names are considered, so anything an
+    /// operator put in the data dir is out of scope by construction.
+    async fn reap_orphaned_work_dirs(&self) -> Result<usize, std::io::Error> {
+        let mut dir = match tokio::fs::read_dir(&self.data_root).await {
+            Ok(d) => d,
+            // No data root yet means no sandbox has ever been created.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+        while let Some(entry) = dir.next_entry().await? {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if public_id::is_valid(&name) {
+                candidates.push(name);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // One query for the whole batch rather than one per directory.
+        let live: HashSet<String> = match sandboxes::Entity::find()
+            .filter(sandboxes::Column::PublicId.is_in(candidates.clone()))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|r| r.public_id).collect(),
+            Err(e) => {
+                // Fail closed, same reasoning as the volume reap.
+                tracing::warn!(
+                    "Sandbox work dir reap skipped: could not read live sandboxes: {}",
+                    e
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut reclaimed = 0usize;
+        for name in candidates {
+            if live.contains(&name) {
+                continue;
+            }
+            let path = self.data_root.join(&name);
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    reclaimed += 1;
+                    tracing::info!("Reclaimed orphaned sandbox work dir {}", path.display());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    "Failed to reclaim orphaned sandbox work dir {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// One sweep pass. Finds running sandboxes whose `expires_at` is in
@@ -205,6 +373,20 @@ mod tests {
         // test surfaces it instead of silently drifting.
         assert!(SWEEP_INTERVAL.as_secs() >= 10);
         assert!(SWEEP_INTERVAL.as_secs() <= 300);
+    }
+
+    /// The reap cadence is expressed in sweeps, so it silently rescales
+    /// with `SWEEP_INTERVAL` — which the test above lets range from 10s to
+    /// 5min, i.e. the same constant could mean 10 minutes or 5 hours. Pin
+    /// the wall-clock period the doc comment actually promises.
+    #[test]
+    fn orphan_reap_runs_about_hourly() {
+        let period = SWEEP_INTERVAL * REAP_EVERY_N_SWEEPS;
+        assert!(
+            period.as_secs() >= 30 * 60 && period.as_secs() <= 90 * 60,
+            "orphan reap period is {}s — the documented cadence is roughly hourly",
+            period.as_secs()
+        );
     }
 
     #[tokio::test]

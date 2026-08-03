@@ -423,12 +423,27 @@ pub trait SandboxProvider: Send + Sync {
     /// be able to delete a sandbox even when Docker is unhappy), so
     /// something has to sweep up afterwards.
     ///
-    /// Implementations MUST only reclaim storage that is provably
-    /// unreferenced, and MUST NOT touch anything belonging to a live or
-    /// merely-stopped sandbox — "stopped" is a normal long-lived state that
-    /// the user resumes later. The default implementation reclaims nothing,
-    /// which is correct for backends that own no detachable storage.
-    async fn reap_orphaned_volumes(&self) -> Result<u32, AgentError> {
+    /// `claimed` is the set of storage names the caller knows a live
+    /// sandbox may still want — for Docker, home volume names. Providers
+    /// MUST NOT reclaim anything in it. The caller owns this judgement
+    /// because only it can see the database: "no container references this
+    /// volume" is a much weaker statement than "no sandbox wants this
+    /// volume", and the gap between them is where user data gets destroyed
+    /// (a sandbox mid-recreate, or a volume deliberately kept by
+    /// `destroy(purge_volumes: false)`, has no container either).
+    ///
+    /// Beyond that, implementations MUST only reclaim storage that is
+    /// provably unreferenced and provably theirs.
+    ///
+    /// The default reclaims nothing. That is correct only for backends that
+    /// own no storage outliving a sandbox — `LocalSandboxProvider`, whose
+    /// work dirs belong to the executor. Docker and Firecracker both
+    /// override it.
+    async fn reap_orphaned_volumes(
+        &self,
+        claimed: &std::collections::HashSet<String>,
+    ) -> Result<u32, AgentError> {
+        let _ = claimed;
         Ok(0)
     }
 

@@ -192,10 +192,13 @@ impl SandboxProvider for RoutingSandboxProvider {
     /// stop the others from reclaiming their own disk, so failures are
     /// logged and the sweep continues; the count returned is what was
     /// actually freed.
-    async fn reap_orphaned_volumes(&self) -> Result<u32, AgentError> {
+    async fn reap_orphaned_volumes(
+        &self,
+        claimed: &std::collections::HashSet<String>,
+    ) -> Result<u32, AgentError> {
         let mut reclaimed = 0u32;
         for provider in self.scan_order() {
-            match provider.reap_orphaned_volumes().await {
+            match provider.reap_orphaned_volumes(claimed).await {
                 Ok(n) => reclaimed += n,
                 Err(e) => tracing::warn!(
                     "Orphan volume reap failed for sandbox backend '{}': {}",

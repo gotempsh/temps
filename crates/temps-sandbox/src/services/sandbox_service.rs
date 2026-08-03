@@ -697,6 +697,10 @@ impl SandboxService {
         let handle = match self.registry.create(config).await {
             Ok(h) => h,
             Err(e) => {
+                // The work dir was already created above; without this the
+                // row goes to "destroyed" and no later `destroy_sandbox`
+                // can ever reach the directory again.
+                self.remove_work_dir(&public_id_value).await;
                 self.mark_destroyed(row.id).await.ok();
                 return Err(SandboxError::CreateFailed {
                     user_id,
@@ -745,6 +749,10 @@ impl SandboxService {
                     e
                 );
                 let _ = self.registry.destroy(row.id, &public_id_value).await;
+                // Seeding runs after the clone/extract, so by here the work
+                // dir can already hold a full repository — the largest
+                // single thing this service puts on disk.
+                self.remove_work_dir(&public_id_value).await;
                 self.mark_destroyed(row.id).await.ok();
                 return Err(e);
             }
@@ -1068,18 +1076,30 @@ TEMPS_ASKPASS_EOF\n\
         }
 
         self.jobs.abort_all(row.id).await;
-        if let Err(e) = self.registry.destroy(row.id, public_id_value).await {
-            // Even if the container destroy failed, mark the row
-            // destroyed — otherwise the user is stuck with a zombie
-            // they can't delete. Log the provider error loudly.
-            tracing::error!(
-                "Provider destroy failed for sandbox {} (internal {}): {} — marking row destroyed anyway",
-                public_id_value,
-                row.id,
-                e
-            );
+        let container_gone = match self.registry.destroy(row.id, public_id_value).await {
+            Ok(()) => true,
+            Err(e) => {
+                // Even if the container destroy failed, mark the row
+                // destroyed — otherwise the user is stuck with a zombie
+                // they can't delete. Log the provider error loudly.
+                tracing::error!(
+                    "Provider destroy failed for sandbox {} (internal {}): {} — marking row destroyed anyway",
+                    public_id_value,
+                    row.id,
+                    e
+                );
+                false
+            }
+        };
+        // Only pull the work dir out from under the container once we know
+        // the container is actually gone. If the provider destroy failed
+        // the container may still be running with this directory bind-mounted
+        // at /workspace, and deleting it live would half-succeed against an
+        // active writer. The sweeper's work-dir reap reclaims it later —
+        // the row is already destroyed, so it will not be claimed.
+        if container_gone {
+            self.remove_work_dir(public_id_value).await;
         }
-        self.remove_work_dir(public_id_value).await;
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
         Ok(())

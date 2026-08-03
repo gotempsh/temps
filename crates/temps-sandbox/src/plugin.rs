@@ -234,7 +234,11 @@ impl TempsPlugin for SandboxPlugin {
             // but not find their handles in the registry — we'd still
             // flip the DB status (by design, so zombie rows don't linger)
             // but we'd skip the provider-side container stop.
-            let sweeper = Arc::new(SandboxExpirationSweeper::new(db.clone(), registry.clone()));
+            let sweeper = Arc::new(SandboxExpirationSweeper::new(
+                db.clone(),
+                registry.clone(),
+                data_root(),
+            ));
             tokio::spawn(async move {
                 sweeper.run().await;
             });

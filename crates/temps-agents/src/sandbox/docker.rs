@@ -19,10 +19,12 @@ use crate::error::AgentError;
 const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
 
 /// Naming prefix for the named volume backing a sandbox's `/home/temps`.
-/// Every volume the Docker provider creates carries this prefix, which is
-/// what makes the orphan reaper safe: it only ever considers volumes it
-/// could have created itself.
 const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+
+/// Label stamped on every home volume this provider creates. The orphan
+/// reaper prefers it over the name prefix as proof of ownership: a name is
+/// something an operator can accidentally collide with, a label is not.
+const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
 
 /// Single-quote a string for safe embedding in a `sh -c` command line.
 /// Handles embedded single quotes via the `'\''` idiom.
@@ -1061,6 +1063,25 @@ impl DockerSandboxProvider {
         format!("{}{}", SANDBOX_NAME_PREFIX, run_id)
     }
 
+    /// The container name and home-volume name for a create request.
+    ///
+    /// `create` must take both from here rather than computing either
+    /// itself. The leak this replaced came from exactly that: create
+    /// derived the volume from `config.run_id` while destroy derived it
+    /// from the container name, and nothing forced the two to agree. With
+    /// one function owning the pair, a future change to either name has to
+    /// go through a single place, and `sandbox_names_agree_for_*` fails if
+    /// they ever diverge again — without needing a Docker daemon.
+    fn sandbox_names(config: &SandboxCreateConfig) -> (String, String) {
+        let container_name = config
+            .container_name_override
+            .clone()
+            .map(|id| format!("{}{}", SANDBOX_NAME_PREFIX, id))
+            .unwrap_or_else(|| Self::container_name(config.run_id));
+        let home_volume_name = Self::home_volume_name(&container_name);
+        (container_name, home_volume_name)
+    }
+
     /// Name of the named volume holding a sandbox's `/home/temps`.
     ///
     /// Derived from the **container** name, never from `run_id` directly.
@@ -1084,6 +1105,28 @@ impl DockerSandboxProvider {
                 .strip_prefix(SANDBOX_NAME_PREFIX)
                 .unwrap_or(container_name)
         )
+    }
+
+    /// Could this provider have generated `name` as a home volume?
+    ///
+    /// Ownership evidence for the reaper, used when the volume carries no
+    /// `HOME_VOLUME_LABEL` — which is every volume created before the label
+    /// existed, i.e. exactly the backlog the reaper is meant to reclaim.
+    /// Requiring the label outright would mean never cleaning any of them.
+    ///
+    /// The suffix is a container-name suffix, so it is either an agent
+    /// run's decimal id or a standalone sandbox's 16-hex `public_id` label.
+    /// Anything else — `temps-sandbox-home-backup`, a hand-pinned golden
+    /// home, an operator's pre-upgrade copy — is not something we could
+    /// have produced, so it is not ours to delete.
+    fn looks_like_generated_home_volume(name: &str) -> bool {
+        let Some(suffix) = name.strip_prefix(HOME_VOLUME_PREFIX) else {
+            return false;
+        };
+        let is_run_id = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+        let is_public_id_label =
+            suffix.len() == 16 && suffix.chars().all(|c| c.is_ascii_hexdigit());
+        is_run_id || is_public_id_label
     }
 
     /// Shared recovery by absolute container name — looks up the container
@@ -1318,11 +1361,34 @@ impl SandboxProvider for DockerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         self.ensure_network().await?;
 
-        let container_name = config
-            .container_name_override
-            .clone()
-            .map(|id| format!("{}{}", SANDBOX_NAME_PREFIX, id))
-            .unwrap_or_else(|| Self::container_name(config.run_id));
+        let (container_name, home_volume_name) = Self::sandbox_names(&config);
+
+        // Create the home volume up front, labelled, rather than letting
+        // the bind auto-create it unlabelled. The label is what proves to
+        // the orphan reaper that this volume is ours to reclaim later.
+        // Idempotent: Docker returns the existing volume unchanged, which
+        // is what recreating a sandbox over a surviving home relies on.
+        if let Err(e) = self
+            .docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(home_volume_name.clone()),
+                labels: Some(HashMap::from([(
+                    HOME_VOLUME_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+        {
+            // Non-fatal: the bind below still auto-creates it. The only
+            // loss is the ownership label, and `looks_like_generated_home_volume`
+            // covers unlabelled volumes for exactly this reason.
+            tracing::warn!(
+                "Could not pre-create labelled home volume {}: {} — continuing",
+                home_volume_name,
+                e
+            );
+        }
 
         // Remove existing container with the same name if any (leftover from crash)
         let _ = self
@@ -1418,11 +1484,9 @@ impl SandboxProvider for DockerSandboxProvider {
         // the sandbox would lose all conversation continuity even though the
         // work_dir survives via the bind mount above.
         //
-        // The volume name is keyed on the container name suffix so each
-        // sandbox keeps its own home isolated, and the volume is
-        // auto-created on first mount. `destroy` derives the same name via
-        // `home_volume_name`, which is what keeps create/destroy in sync.
-        let home_volume_name = Self::home_volume_name(&container_name);
+        // `home_volume_name` came from `sandbox_names` above, alongside the
+        // container name — `destroy` re-derives it from the container name
+        // via `home_volume_name`, which is what keeps the two in sync.
         let binds = vec![
             format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
             format!("{}:{}", home_volume_name, SANDBOX_HOME),
@@ -1782,19 +1846,37 @@ impl SandboxProvider for DockerSandboxProvider {
         Ok(())
     }
 
-    /// Remove every `temps-sandbox-home-*` volume Docker reports as
-    /// dangling.
+    /// Remove home volumes that are unreferenced by Docker *and* unclaimed
+    /// by the caller.
     ///
-    /// Safety rests entirely on the server-side `dangling=1` filter, which
-    /// is Docker's own "not referenced by any container" predicate. A
-    /// stopped sandbox still has a container, so its home volume is never
-    /// dangling and can never be reaped — which matters because the
-    /// expiration sweeper parks idle sandboxes in exactly that state and
-    /// the user expects to resume them with their home dir intact. We also
-    /// never pass `force`, so a volume that gets attached between the list
+    /// Three independent conditions must hold before anything is deleted,
+    /// because a wrong deletion here is silent, irreversible user data loss:
+    ///
+    /// 1. **`claimed` does not contain it.** The caller passes every volume
+    ///    name a live sandbox could still want. Docker's `dangling` alone is
+    ///    not enough: `create` force-removes a same-named leftover container
+    ///    *before* pulling the image, so a sandbox being recreated has an
+    ///    unreferenced home volume for the length of an image pull — minutes,
+    ///    on a cold pull. Reaping in that window would hand the recreated
+    ///    container an empty home, which is precisely the continuity the
+    ///    volume exists to provide. The same check is what lets
+    ///    `destroy(purge_volumes: false)` mean anything: a preserved volume
+    ///    has no container either, so only an explicit claim distinguishes
+    ///    "kept on purpose" from "leaked".
+    /// 2. **Docker reports it dangling.** Server-side, evaluated against
+    ///    real container references. A *stopped* sandbox still has a
+    ///    container, so the expiration sweeper's park-as-stopped state is
+    ///    never at risk.
+    /// 3. **We could have created it** — it carries our label, or its name
+    ///    has the exact shape this provider generates.
+    ///
+    /// Removal never passes `force`, so a volume attached between the list
     /// and the remove is refused by the daemon rather than yanked out from
     /// under a running container.
-    async fn reap_orphaned_volumes(&self) -> Result<u32, AgentError> {
+    async fn reap_orphaned_volumes(
+        &self,
+        claimed: &std::collections::HashSet<String>,
+    ) -> Result<u32, AgentError> {
         let mut filters: HashMap<&str, Vec<&str>> = HashMap::new();
         filters.insert("dangling", vec!["1"]);
         filters.insert("name", vec![HOME_VOLUME_PREFIX]);
@@ -1807,19 +1889,29 @@ impl SandboxProvider for DockerSandboxProvider {
                     .build(),
             ))
             .await
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: String::new(),
+            .map_err(|e| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
                 reason: format!("Failed to list sandbox home volumes: {}", e),
             })?;
 
+        // A daemon can return partial results with warnings; treating that
+        // page as complete would silently under-reclaim with no explanation.
+        if let Some(warnings) = listed.warnings.as_ref().filter(|w| !w.is_empty()) {
+            tracing::debug!("Docker volume list returned warnings: {:?}", warnings);
+        }
+
         let mut reclaimed = 0u32;
         for volume in listed.volumes.unwrap_or_default() {
+            if claimed.contains(&volume.name) {
+                continue;
+            }
             // Docker's `name` filter is a substring match, not a prefix
-            // match, so re-check the prefix locally before removing
-            // anything — an operator's unrelated
-            // `backup-temps-sandbox-home-x` volume must not be eligible.
-            if !volume.name.starts_with(HOME_VOLUME_PREFIX) {
+            // match, so re-check ownership locally before removing anything
+            // — an operator's `backup-temps-sandbox-home-x` matches the
+            // server-side filter but is not ours.
+            let ours = volume.labels.contains_key(HOME_VOLUME_LABEL)
+                || Self::looks_like_generated_home_volume(&volume.name);
+            if !ours {
                 continue;
             }
             match self
@@ -2685,6 +2777,84 @@ mod tests {
             DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(5));
         let standalone = DockerSandboxProvider::home_volume_name("temps-sandbox-abc123");
         assert_ne!(agent_run, standalone);
+    }
+
+    fn create_config_for(run_id: i32, override_label: Option<&str>) -> SandboxCreateConfig {
+        SandboxCreateConfig {
+            owner_user_id: None,
+            run_id,
+            container_name_override: override_label.map(|s| s.to_string()),
+            host_work_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        }
+    }
+
+    /// The Docker-less guard for the leak. `create` takes both names from
+    /// `sandbox_names`, and `destroy` re-derives the volume from the
+    /// container name — so asserting the pair agrees here catches a
+    /// reintroduction of the original bug on any machine, including CI
+    /// runners with no Docker daemon (where the e2e below skips).
+    #[test]
+    fn sandbox_names_agree_for_standalone_and_agent_run() {
+        // Standalone: opaque public_id label. The old code derived the
+        // volume from run_id instead, producing temps-sandbox-home-7 here
+        // while destroy looked for temps-sandbox-home-a1b2c3d4e5f60718.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(7, Some("a1b2c3d4e5f60718")));
+        assert_eq!(container, "temps-sandbox-a1b2c3d4e5f60718");
+        assert_eq!(volume, "temps-sandbox-home-a1b2c3d4e5f60718");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+        assert_ne!(volume, "temps-sandbox-home-7");
+
+        // Agent run: numeric naming, no override.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(42, None));
+        assert_eq!(container, "temps-sandbox-42");
+        assert_eq!(volume, "temps-sandbox-home-42");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+    }
+
+    /// The reaper's ownership check. Deleting a volume is irreversible, so
+    /// a name merely *containing* our prefix must not be enough.
+    #[test]
+    fn only_generated_shapes_are_reapable_by_name() {
+        // Shapes this provider actually produces.
+        for ours in [
+            "temps-sandbox-home-42",
+            "temps-sandbox-home-1000000",
+            "temps-sandbox-home-a1b2c3d4e5f60718",
+        ] {
+            assert!(
+                DockerSandboxProvider::looks_like_generated_home_volume(ours),
+                "{} is a name we generate and must be reclaimable",
+                ours
+            );
+        }
+        // Operator-owned or unrelated volumes.
+        for theirs in [
+            "temps-sandbox-home-backup",
+            "temps-sandbox-home-golden-home",
+            "temps-sandbox-home-",
+            "temps-sandbox-home-a1b2c3d4e5f6071",   // 15 chars
+            "temps-sandbox-home-a1b2c3d4e5f607189", // 17 chars
+            "backup-temps-sandbox-home-42",
+            "temps-wfrun-42",
+        ] {
+            assert!(
+                !DockerSandboxProvider::looks_like_generated_home_volume(theirs),
+                "{} is not ours and must never be deleted",
+                theirs
+            );
+        }
     }
 
     /// Every name the reaper is willing to delete must carry the prefix it
@@ -3669,17 +3839,27 @@ mod tests {
             return;
         }
 
-        // An orphan: a home-prefixed volume with no container attached,
-        // i.e. what a crash between remove_container and remove_volume
-        // leaves behind.
-        let orphan = format!("{}reap-test-orphan", HOME_VOLUME_PREFIX);
-        docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(orphan.clone()),
-                ..Default::default()
-            })
-            .await
-            .expect("create orphan volume");
+        // An orphan: an unlabelled volume named exactly the way this
+        // provider names them, with no container attached — i.e. what a
+        // crash between remove_container and remove_volume leaves behind,
+        // and what a pre-upgrade host's whole backlog looks like.
+        let orphan = format!("{}00ffee0011223344", HOME_VOLUME_PREFIX);
+        // A dangling volume the caller still claims — the sandbox exists,
+        // it just has no container right now (mid-recreate, or kept by
+        // destroy(purge_volumes: false)). Reaping this is data loss.
+        let claimed_orphan = format!("{}00ffee0055667788", HOME_VOLUME_PREFIX);
+        // An operator's own volume that merely matches the prefix. Not
+        // ours: not labelled, and not a shape we generate.
+        let operator_volume = format!("{}backup", HOME_VOLUME_PREFIX);
+        for name in [&orphan, &claimed_orphan, &operator_volume] {
+            docker
+                .create_volume(bollard::models::VolumeCreateRequest {
+                    name: Some(name.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("create volume {}: {}", name, e));
+        }
 
         // A live sandbox whose volume must survive the sweep.
         let label = "reap-test-live01";
@@ -3711,8 +3891,9 @@ mod tests {
         // volumes" implementation would get wrong.
         provider.stop(&handle).await.expect("stop container");
 
+        let claimed = std::collections::HashSet::from([claimed_orphan.clone()]);
         provider
-            .reap_orphaned_volumes()
+            .reap_orphaned_volumes(&claimed)
             .await
             .expect("reap should not error");
 
@@ -3721,6 +3902,16 @@ mod tests {
             "reaper must reclaim the dangling volume {}",
             orphan
         );
+        docker.inspect_volume(&claimed_orphan).await.expect(
+            "reaper must NOT remove a claimed volume even though Docker \
+             reports it dangling — that is a sandbox mid-recreate, whose \
+             image pull can take minutes, or one deliberately preserved by \
+             destroy(purge_volumes: false)",
+        );
+        docker.inspect_volume(&operator_volume).await.expect(
+            "reaper must NOT remove a volume it could not have created — \
+             the name prefix is not proof of ownership",
+        );
         let live_volume = format!("{}{}", HOME_VOLUME_PREFIX, label);
         docker.inspect_volume(&live_volume).await.expect(
             "reaper must NOT remove the home volume of a stopped sandbox — \
@@ -3728,6 +3919,11 @@ mod tests {
         );
 
         provider.destroy(&handle, true).await.expect("destroy");
+        for name in [&claimed_orphan, &operator_volume] {
+            let _ = docker
+                .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+                .await;
+        }
         let _ = std::fs::remove_dir_all(&work_dir);
     }
 
