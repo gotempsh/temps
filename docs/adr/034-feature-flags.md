@@ -187,10 +187,9 @@ OpenAPI). `temps-flags` should be a sibling and nothing more exotic.
   `web/src/api`). Never hand-roll fetch in `web/`.
 - **R4.4 Kill switch must be one action.** "Disable this flag everywhere,
   immediately" is a single click and a single CLI command, not a rule edit.
-- **R4.5 RBAC**: flag read vs. flag write are distinct permissions under the
-  ADR-028 seam. Production-environment writes should be separately gateable —
-  changing a prod flag is a production change with no deploy record and no
-  review, which is exactly why it needs one.
+- **R4.5 RBAC**: flag read vs. flag write are distinct permissions
+  (`FlagsRead` / `FlagsWrite` / `FlagsDelete`). **Per-environment gating is
+  deliberately not in Phase 1** — see "R4.5, decided" below.
 - **R4.6 Audit logging** on every mutation: who, when, old value, new value,
   environment. Reuse `temps-audit`. This is table stakes for the compliance
   buyers the SOC2 work targets.
@@ -263,6 +262,49 @@ to run Unleash.
 - Approval workflows on flag changes (Enterprise-tier candidate).
 - Flags-as-code / repo-declared flags (Vercel's model). Compelling, but it
   presumes a build step we do not control for every runtime.
+
+## R4.5, decided: per-environment gating is credential scoping, not resource elevation
+
+Phase 1 ships with a known gap: **anyone holding `FlagsWrite` can flip a flag in
+any environment of a project, production included.** That is accepted for now,
+and this section records why, plus the shape the fix should take — so the next
+person doesn't re-derive it.
+
+The tempting fix is resource-side elevation: a column on `environments` plus a
+stronger permission required when writing there. It was rejected. It invents a
+second, flag-specific authorization axis that nothing else in the platform has,
+and it puts the rule on the *resource* when the thing that actually varies is
+the *caller*.
+
+**The direction is capability scoping on the credential.** Deployment tokens
+already demonstrate it: they carry `project_id` and `environment_id`, and
+`AuthContext::is_scoped_to_project` (`crates/temps-auth/src/context.rs:333`)
+already confines them. API keys carry neither — `api_keys::Model` has
+`user_id`, `role_type`, `permissions` and `service_id` and nothing about scope —
+so they fall into that function's `None => true` branch and are unconfined by
+construction.
+
+What that implies, concretely:
+
+- **Project scoping is already wired for flags.** All six project-scoped flag
+  handlers call `project_scope_guard!`. The moment `project_id()` learns about a
+  scoped API key, flags are confined with *zero* changes in `temps-flags`.
+- **Environment scoping needs one new guard.** There is no
+  `environment_scope_guard!(auth, environment_id)` today. Flags need exactly one
+  call site for it — `set_flag_environment` is the only handler taking an
+  `environment_id`.
+- **The data model change belongs to API keys, not to flags.** Scoping columns
+  (or a join table, for keys spanning several projects) go on `api_keys`, and
+  every guard call site across the platform benefits, not just this crate.
+
+An alternative that exists today and was *not* taken: `project_permission_guard!`
+(`crates/temps-auth/src/permission_guard.rs:276`) narrows a permission through
+the ADR-028 seam's `effective_project_permissions`. Its coverage snapshot pins
+`temps-deployments`, `temps-environments`, `temps-projects` — environment
+*variables* are covered, and flags are their direct sibling. Adding `temps-flags`
+would make flag writes respect team-based project roles when a plugin registers
+a checker, and is inert in plain OSS. It is a one-line guard plus a snapshot
+entry if that turns out to be wanted before credential scoping lands.
 
 ## Open questions
 
