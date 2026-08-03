@@ -22,7 +22,7 @@
 //! |---|---|
 //! | `proxy.requests*`, `proxy.error_rate_percent` | every request |
 //! | `proxy.request_duration_*` | every request except streaming sessions |
-//! | `proxy.upstream_duration_*` | every request that reached an upstream, streaming included |
+//! | `proxy.upstream_duration_*` | every request that reached an upstream, streaming included (handshake clamped, see `MAX_HANDSHAKE_OBSERVATION_MS`) |
 //! | `proxy.self_duration_*` | proxied requests except streaming sessions |
 //! | `proxy.streaming_*` | streaming sessions only |
 //!
@@ -40,6 +40,25 @@ pub const DURATION_BUCKETS_MS: [u64; 10] = [5, 10, 25, 50, 100, 250, 500, 1000, 
 
 /// Bucket count including the overflow bucket.
 const NUM_BUCKETS: usize = DURATION_BUCKETS_MS.len() + 1;
+
+/// Ceiling applied to a streaming session's time-to-first-header before it is
+/// recorded as backend latency.
+///
+/// `upstream_peer` gives a WebSocket upgrade a 1h read timeout — 60× the 60s
+/// it gives ordinary traffic — and selects it from the request's own `Upgrade`
+/// header. A hung upstream can therefore produce a single ~3_600_000ms
+/// observation, which is enough to drag `proxy.upstream_duration_avg_ms` into
+/// the millions while every percentile stays flat: the same unweighted-mean
+/// distortion the streaming carve-out exists to prevent, aimed at the backend
+/// series instead.
+///
+/// 60s is the ordinary read timeout, so clamping here makes a streaming
+/// handshake no more able to move the mean than any non-streaming request
+/// already is. The observation is kept rather than dropped: `upstream_count`
+/// stays honest, and 60s still lands in the overflow bucket, so the percentiles
+/// continue to report it as slow. A handshake beyond this bound is a hung
+/// upstream, not a latency worth averaging to the millisecond.
+const MAX_HANDSHAKE_OBSERVATION_MS: u64 = 60_000;
 
 /// Number of status classes tracked: 1xx, 2xx, 3xx, 4xx, 5xx.
 const NUM_CLASSES: usize = 5;
@@ -177,8 +196,9 @@ fn bucket_index(elapsed_ms: u64) -> usize {
 }
 
 impl ProxyMetrics {
-    /// Record one completed request. Hot path: 5 relaxed atomic adds, plus 5
-    /// more for proxied requests (`upstream_ms` present). No locks, no I/O.
+    /// Record one completed request. Hot path: 3 relaxed atomic adds, plus 6
+    /// more for proxied requests (`upstream_ms` present) or 3 more for a
+    /// streaming session. No locks, no allocation, no I/O.
     ///
     /// `upstream_ms` is the backend latency; `None` for requests the proxy
     /// answered itself. Proxy self time is derived as `elapsed − upstream`.
@@ -187,9 +207,12 @@ impl ProxyMetrics {
     /// lifetime*, not a latency: established WebSocket tunnels and SSE
     /// streams, which legitimately stay open for minutes or hours. They are
     /// counted as requests (so the status-class and destination counters still
-    /// partition `proxy.requests`) but are kept out of every duration
-    /// histogram, because `elapsed − upstream` for a one-hour WebSocket is one
-    /// hour of "proxy overhead" that the proxy never actually spent.
+    /// partition `proxy.requests`) but are kept out of the **total** and
+    /// **self-time** histograms, because `elapsed − upstream` for a one-hour
+    /// WebSocket is one hour of "proxy overhead" that the proxy never actually
+    /// spent. They DO contribute to the backend histogram — `upstream_ms` is
+    /// time-to-first-header, a real latency — clamped to
+    /// [`MAX_HANDSHAKE_OBSERVATION_MS`].
     ///
     /// The averages are unweighted, so without this carve-out a small number
     /// of long-lived sessions ending in the same interval can dominate
@@ -229,9 +252,18 @@ impl ProxyMetrics {
             // endpoint — a slow WebSocket handshake would be invisible. Only
             // `elapsed_ms` and the derived self time are lifetimes, so those
             // two are the ones that stay out.
+            //
+            // The value is clamped first: `upstream_peer` grants WebSocket
+            // upgrades a 1h read timeout (vs 60s for ordinary traffic) and
+            // picks that purely from the request's `Upgrade` header, so a hung
+            // upstream can hand us a ~3_600_000ms time-to-first-header. Feeding
+            // that into an unweighted mean is the very distortion this carve-out
+            // exists to prevent, just aimed at the backend series instead. See
+            // `MAX_HANDSHAKE_OBSERVATION_MS`.
             if let Some(upstream) = upstream_ms {
-                self.upstream_buckets[bucket_index(upstream)].fetch_add(1, Ordering::Relaxed);
-                self.upstream_sum_ms.fetch_add(upstream, Ordering::Relaxed);
+                let observed = upstream.min(MAX_HANDSHAKE_OBSERVATION_MS);
+                self.upstream_buckets[bucket_index(observed)].fetch_add(1, Ordering::Relaxed);
+                self.upstream_sum_ms.fetch_add(observed, Ordering::Relaxed);
                 self.upstream_count.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -759,6 +791,79 @@ mod tests {
         // Error rate still reported: it divides by all requests.
         assert!(names.contains(&METRIC_ERROR_RATE));
         assert_eq!(get(METRIC_STREAMING_DURATION_AVG), 120_000.0);
+    }
+
+    /// A WebSocket upgrade gets a 1h upstream read timeout chosen from the
+    /// request's own `Upgrade` header, so a hung upstream can report a
+    /// ~3_600_000ms time-to-first-header. Unclamped, one such observation
+    /// drags the backend mean into the millions — the same unweighted-mean
+    /// distortion the streaming carve-out exists to prevent.
+    #[test]
+    fn test_streaming_handshake_observation_is_clamped() {
+        let m = ProxyMetrics::default();
+        // 99 healthy streaming handshakes at 10ms...
+        for _ in 0..99 {
+            m.record(101, 500_000, Some(10), RequestDestination::Project, true);
+        }
+        // ...and one that sat on a hung upstream for very nearly the full hour.
+        m.record(
+            101,
+            3_600_000,
+            Some(3_599_000),
+            RequestDestination::Project,
+            true,
+        );
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Unclamped this would be (99*10 + 3_599_000)/100 = 35_999.9ms.
+        // Clamped, the outlier contributes at most MAX_HANDSHAKE_OBSERVATION_MS.
+        let expected = (99.0 * 10.0 + MAX_HANDSHAKE_OBSERVATION_MS as f64) / 100.0;
+        assert_eq!(get(METRIC_UPSTREAM_AVG), expected);
+        assert!(
+            get(METRIC_UPSTREAM_AVG) < 1_000.0,
+            "one hung handshake must not move the backend mean into the seconds"
+        );
+        // The observation is kept, not dropped — the count stays honest.
+        assert_eq!(get(METRIC_STREAMING_SESSIONS), 100.0);
+
+        // And the reason a clamp is the only available defence: at 1-in-100 the
+        // outlier sits ABOVE p99, so the percentiles do not react to it however
+        // large it is. The mean is the only series that moves — precisely the
+        // signature that makes this distortion hard to read off a chart.
+        assert!(
+            get(METRIC_UPSTREAM_P99) <= 10.0,
+            "p99 should be unmoved by a single tail observation, got {}",
+            get(METRIC_UPSTREAM_P99)
+        );
+    }
+
+    #[test]
+    fn test_normal_streaming_handshake_is_not_clamped() {
+        let m = ProxyMetrics::default();
+        m.record(101, 120_000, Some(250), RequestDestination::Project, true);
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let avg = samples
+            .iter()
+            .find(|s| s.name == METRIC_UPSTREAM_AVG)
+            .expect("upstream avg present")
+            .value;
+        // Below the ceiling -> recorded verbatim, no distortion of real data.
+        assert_eq!(avg, 250.0);
     }
 
     /// The self-time histogram observes a strict subset of the upstream
