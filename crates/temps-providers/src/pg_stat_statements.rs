@@ -423,14 +423,30 @@ impl PgStatStatementsService {
     where
         C: ConnectionTrait,
     {
-        let schema_row = db
+        let function_row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
                 r#"
-                SELECT n.nspname AS schema_name
+                SELECT
+                    n.nspname AS schema_name,
+                    p.pronargs::integer AS argument_count
                 FROM pg_catalog.pg_extension e
-                JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+                JOIN pg_catalog.pg_depend d
+                  ON d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                 AND d.refobjid = e.oid
+                 AND d.deptype = 'e'
+                JOIN pg_catalog.pg_proc p
+                  ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                 AND d.objid = p.oid
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
                 WHERE e.extname = 'pg_stat_statements'
+                  AND p.proname = 'pg_stat_statements_reset'
+                  AND p.proargtypes IN (
+                      '26 26 20'::pg_catalog.oidvector,
+                      '26 26 20 16'::pg_catalog.oidvector
+                  )
+                ORDER BY p.pronargs DESC
+                LIMIT 1
                 "#
                 .to_owned(),
             ))
@@ -439,29 +455,55 @@ impl PgStatStatementsService {
                 error!(
                     service_id,
                     error = %db_error,
-                    "Failed to resolve pg_stat_statements extension schema"
+                    "Failed to resolve the extension-owned pg_stat_statements reset function"
                 );
                 PgStatStatementsError::ResetFailed { service_id }
             })?
             .ok_or(PgStatStatementsError::ExtensionNotAvailable { service_id })?;
 
-        let schema_name: String = schema_row.try_get("", "schema_name").map_err(|db_error| {
-            error!(
-                service_id,
-                error = %db_error,
-                "Failed to read pg_stat_statements extension schema"
-            );
-            PgStatStatementsError::ResetFailed { service_id }
-        })?;
+        let schema_name: String = function_row
+            .try_get("", "schema_name")
+            .map_err(|db_error| {
+                error!(
+                    service_id,
+                    error = %db_error,
+                    "Failed to read pg_stat_statements extension schema"
+                );
+                PgStatStatementsError::ResetFailed { service_id }
+            })?;
+        let argument_count: i32 =
+            function_row
+                .try_get("", "argument_count")
+                .map_err(|db_error| {
+                    error!(
+                        service_id,
+                        error = %db_error,
+                        "Failed to read pg_stat_statements reset function signature"
+                    );
+                    PgStatStatementsError::ResetFailed { service_id }
+                })?;
 
-        // The schema name comes from pg_catalog, never user input. It is still
-        // quoted as an identifier so unusual extension schemas remain valid
-        // and cannot alter the statement. Qualifying the function and calling
-        // its exact, non-defaulted signature avoids both search-path and
-        // default-argument overload shadowing.
+        // The function is resolved through its pg_extension dependency, not
+        // merely by schema and name, so an unrelated same-schema overload
+        // cannot influence the selected signature. The schema is still quoted
+        // as an identifier so unusual extension schemas remain valid.
         let quoted_schema = format!("\"{}\"", schema_name.replace('"', "\"\""));
-        let reset_sql =
-            format!("SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)");
+        let reset_sql = match argument_count {
+            3 => format!(
+                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
+            ),
+            4 => format!(
+                "SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint, false::boolean)"
+            ),
+            _ => {
+                error!(
+                    service_id,
+                    argument_count,
+                    "Resolved an unsupported pg_stat_statements reset function signature"
+                );
+                return Err(PgStatStatementsError::ResetFailed { service_id });
+            }
+        };
 
         db.execute(Statement::from_string(DatabaseBackend::Postgres, reset_sql))
             .await
@@ -674,11 +716,15 @@ mod tests {
     use sea_orm::{MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
 
-    fn extension_schema_row(schema_name: &str) -> BTreeMap<String, Value> {
+    fn extension_function_row(schema_name: &str, argument_count: i32) -> BTreeMap<String, Value> {
         let mut row = BTreeMap::new();
         row.insert(
             "schema_name".to_owned(),
             Value::String(Some(Box::new(schema_name.to_owned()))),
+        );
+        row.insert(
+            "argument_count".to_owned(),
+            Value::Int(Some(argument_count)),
         );
         row
     }
@@ -753,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn reset_on_connection_executes_global_reset() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![extension_schema_row("extensions")]])
+            .append_query_results([vec![extension_function_row("extensions", 4)]])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
@@ -772,16 +818,38 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(statements
             .iter()
-            .any(|sql| sql.contains("pg_catalog.pg_extension")));
+            .any(|sql| sql.contains("pg_catalog.pg_depend")));
         assert!(statements.contains(
-            &"SELECT \"extensions\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
+            &"SELECT \"extensions\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint, false::boolean)"
         ));
+    }
+
+    #[tokio::test]
+    async fn reset_on_connection_uses_exact_legacy_three_argument_signature() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![extension_function_row("public", 3)]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        PgStatStatementsService::reset_on_connection(&db, 42)
+            .await
+            .expect("legacy reset should succeed");
+
+        let log = db.into_transaction_log();
+        assert!(log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .any(|statement| statement.sql
+                == "SELECT \"public\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"));
     }
 
     #[tokio::test]
     async fn reset_on_connection_quotes_extension_schema_identifier() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![extension_schema_row("odd\"schema")]])
+            .append_query_results([vec![extension_function_row("odd\"schema", 4)]])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
@@ -796,18 +864,18 @@ mod tests {
         let reset_statement = log
             .iter()
             .flat_map(|transaction| transaction.statements())
-            .find(|statement| statement.sql.contains("pg_stat_statements_reset"))
+            .find(|statement| statement.sql.starts_with("SELECT \"odd\"\"schema\""))
             .expect("reset statement should be recorded");
         assert_eq!(
             reset_statement.sql,
-            "SELECT \"odd\"\"schema\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
+            "SELECT \"odd\"\"schema\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint, false::boolean)"
         );
     }
 
     #[tokio::test]
     async fn reset_on_connection_preserves_service_context_on_error() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![extension_schema_row("public")]])
+            .append_query_results([vec![extension_function_row("public", 4)]])
             .append_exec_errors([DbErr::Custom("permission denied for function".to_owned())])
             .into_connection();
 
