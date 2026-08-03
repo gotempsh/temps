@@ -90,6 +90,19 @@ pub struct DeploymentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_bundle_content_type: Option<String>,
 
+    /// Uploaded source archive ID. Source archives are extracted before the
+    /// regular preset build pipeline and do not require Git metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_id: Option<i32>,
+
+    /// Uploaded source archive path in the Temps data directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_path: Option<String>,
+
+    /// Uploaded source archive content type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bundle_content_type: Option<String>,
+
     /// Source type for THIS specific deployment (for Manual/flexible projects)
     /// This allows Manual projects to have deployments via different methods
     /// (docker_image, static_files, or git) while keeping per-deployment tracking

@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 /// - `Git`: Source code from a Git repository (traditional flow)
 /// - `DockerImage`: Pre-built Docker image from external registry
 /// - `StaticFiles`: Pre-built static files uploaded as a bundle
+/// - `UploadedSource`: Source archive uploaded without a Git repository
 /// - `Manual`: Flexible type that accepts any deployment method
 #[derive(
     Debug,
@@ -47,6 +48,11 @@ pub enum SourceType {
     #[sea_orm(string_value = "static_files")]
     StaticFiles,
 
+    /// Source code uploaded as an archive, built with the selected preset,
+    /// and deployed through the normal source build pipeline.
+    #[sea_orm(string_value = "uploaded_source")]
+    UploadedSource,
+
     /// Manual/Flexible deployments
     /// Accepts any deployment method: Docker images, static files, or Git-based
     /// Allows switching between deployment methods without recreating the project
@@ -60,6 +66,7 @@ impl std::fmt::Display for SourceType {
             SourceType::Git => write!(f, "git"),
             SourceType::DockerImage => write!(f, "docker_image"),
             SourceType::StaticFiles => write!(f, "static_files"),
+            SourceType::UploadedSource => write!(f, "uploaded_source"),
             SourceType::Manual => write!(f, "manual"),
         }
     }
@@ -75,7 +82,10 @@ impl SourceType {
     pub fn supports_crons(&self) -> bool {
         matches!(
             self,
-            SourceType::Git | SourceType::DockerImage | SourceType::Manual
+            SourceType::Git
+                | SourceType::DockerImage
+                | SourceType::UploadedSource
+                | SourceType::Manual
         )
     }
 
@@ -83,7 +93,10 @@ impl SourceType {
     pub fn is_container_based(&self) -> bool {
         matches!(
             self,
-            SourceType::Git | SourceType::DockerImage | SourceType::Manual
+            SourceType::Git
+                | SourceType::DockerImage
+                | SourceType::UploadedSource
+                | SourceType::Manual
         )
     }
 
@@ -127,6 +140,7 @@ mod tests {
         assert_eq!(SourceType::Git.to_string(), "git");
         assert_eq!(SourceType::DockerImage.to_string(), "docker_image");
         assert_eq!(SourceType::StaticFiles.to_string(), "static_files");
+        assert_eq!(SourceType::UploadedSource.to_string(), "uploaded_source");
         assert_eq!(SourceType::Manual.to_string(), "manual");
     }
 
@@ -135,6 +149,7 @@ mod tests {
         assert!(SourceType::Git.requires_git_info());
         assert!(!SourceType::DockerImage.requires_git_info());
         assert!(!SourceType::StaticFiles.requires_git_info());
+        assert!(!SourceType::UploadedSource.requires_git_info());
         assert!(!SourceType::Manual.requires_git_info());
     }
 
@@ -143,6 +158,7 @@ mod tests {
         assert!(SourceType::Git.is_container_based());
         assert!(SourceType::DockerImage.is_container_based());
         assert!(!SourceType::StaticFiles.is_container_based());
+        assert!(SourceType::UploadedSource.is_container_based());
         assert!(SourceType::Manual.is_container_based());
     }
 
@@ -151,6 +167,7 @@ mod tests {
         assert!(!SourceType::Git.is_static());
         assert!(!SourceType::DockerImage.is_static());
         assert!(SourceType::StaticFiles.is_static());
+        assert!(!SourceType::UploadedSource.is_static());
         assert!(!SourceType::Manual.is_static());
     }
 
@@ -159,6 +176,7 @@ mod tests {
         assert!(!SourceType::Git.is_flexible());
         assert!(!SourceType::DockerImage.is_flexible());
         assert!(!SourceType::StaticFiles.is_flexible());
+        assert!(!SourceType::UploadedSource.is_flexible());
         assert!(SourceType::Manual.is_flexible());
     }
 
@@ -187,6 +205,7 @@ mod tests {
         assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::StaticFiles));
         assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::Git));
         assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::DockerImage));
+        assert!(SourceType::UploadedSource.allows_deployment_method(&SourceType::UploadedSource));
     }
 
     #[test]
@@ -203,6 +222,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SourceType::Manual).unwrap(),
             "\"manual\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceType::UploadedSource).unwrap(),
+            "\"uploaded_source\""
         );
     }
 
@@ -223,6 +246,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SourceType>("\"manual\"").unwrap(),
             SourceType::Manual
+        );
+        assert_eq!(
+            serde_json::from_str::<SourceType>("\"uploaded_source\"").unwrap(),
+            SourceType::UploadedSource
         );
     }
 }

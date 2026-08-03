@@ -50,6 +50,7 @@ pub use super::session_replay_events::Entity as SessionReplayEvents;
 pub use super::session_replay_sessions::Entity as SessionReplaySessions;
 pub use super::sessions::Entity as Sessions;
 pub use super::settings::Entity as Settings;
+pub use super::source_bundles::Entity as SourceBundles;
 pub use super::source_type::SourceType;
 pub use super::static_bundles::{BundleFormat, Entity as StaticBundles};
 pub use super::tls_acme_certificates::Entity as TlsAcmeCertificates;

@@ -997,6 +997,11 @@ impl WorkflowPlanner {
                 debug!("Inferred StaticFiles deployment from static_bundle_path in metadata");
                 return SourceType::StaticFiles;
             }
+
+            if metadata.source_bundle_path.is_some() {
+                debug!("Inferred UploadedSource deployment from source_bundle_path in metadata");
+                return SourceType::UploadedSource;
+            }
         }
 
         // 4. Non-flexible projects: use project source type
@@ -1132,6 +1137,17 @@ impl WorkflowPlanner {
                 )
                 .await
             }
+            SourceType::UploadedSource => {
+                self.plan_git_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    remote_env_vars,
+                    secrets,
+                )
+                .await
+            }
             SourceType::Manual => {
                 // Manual projects without explicit deployment method
                 // This happens when someone tries to deploy a Manual project without specifying
@@ -1164,6 +1180,16 @@ impl WorkflowPlanner {
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
+
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
+        let source_job_id = if source_bundle_path.is_some() {
+            "prepare_source_bundle"
+        } else {
+            "download_repo"
+        };
 
         // BuildKit's predefined BUILDKIT_CACHE_MOUNT_NS argument is applied to
         // every RUN --mount=type=cache ID. Scope it by project, environment,
@@ -1208,7 +1234,17 @@ impl WorkflowPlanner {
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
         // Job 1: Download repository (only if git info is available)
-        if has_git_info {
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: source_job_id.to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             // Determine which branch/commit to use for this deployment
             // Priority: deployment.branch_ref > deployment.commit_sha > project.main_branch
             let branch_or_commit = deployment
@@ -1261,8 +1297,8 @@ impl WorkflowPlanner {
         // Job 2: Build container image (skip for static deployments)
         // The BuildImageJob will generate Dockerfile from preset if it doesn't exist
         // Depends on download_repo only if git info is available
-        let build_dependencies = if has_git_info {
-            vec!["download_repo".to_string()]
+        let build_dependencies = if has_git_info || source_job_id == "prepare_source_bundle" {
+            vec![source_job_id.to_string()]
         } else {
             vec![]
         };
@@ -1597,7 +1633,7 @@ impl WorkflowPlanner {
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
                     "environment_id": deployment.environment_id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
@@ -1619,7 +1655,7 @@ impl WorkflowPlanner {
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
                     "environment_id": deployment.environment_id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false,
             });
@@ -1637,7 +1673,7 @@ impl WorkflowPlanner {
                 dependencies: vec!["mark_deployment_complete".to_string()],
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false,
             });
@@ -1688,7 +1724,7 @@ impl WorkflowPlanner {
                     "environment_id": deployment.environment_id,
                     "branch": deployment.branch_ref,
                     "commit_hash": deployment.commit_sha,
-                    "download_job_id": "download_repo",
+                    "download_job_id": source_job_id,
                     "build_job_id": "build_image"
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
@@ -1776,7 +1812,7 @@ impl WorkflowPlanner {
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
                     "release": release,
-                    "download_job_id": "download_repo",
+                    "download_job_id": source_job_id,
                     "build_job_id": "build_image",
                     // None = default to the Docker build context; a set value
                     // (or .temps.yaml sourceContext.root) overrides it.

@@ -51,6 +51,9 @@ const Setup = lazy(() =>
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
 )
+const Drop = lazy(() =>
+  import('./pages/Drop').then((m) => ({ default: m.Drop }))
+)
 const Alarms = lazy(() =>
   import('./pages/Alarms').then((m) => ({ default: m.Alarms }))
 )
@@ -475,6 +478,7 @@ const FullAppRoutes = () => {
                 <Route path="/account" element={<Account />} />
                 <Route path="/setup" element={<Setup />} />
                 <Route path="/projects" element={<Projects />} />
+                <Route path="/drop" element={<Drop />} />
                 <Route path="/revenue" element={<Revenue />} />
                 <Route path="/sandboxes" element={<Sandboxes />} />
                 <Route path="/sandboxes/:sandboxId" element={<SandboxDetail />} />

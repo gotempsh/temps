@@ -1927,7 +1927,8 @@ impl ContainerDeployer for DockerRuntime {
             // Docker prefixes inspect names with a leading '/'.
             .map(|n| n.trim_start_matches('/').to_string());
 
-        self.docker
+        let removal = self
+            .docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -1935,8 +1936,20 @@ impl ContainerDeployer for DockerRuntime {
                     ..Default::default()
                 }),
             )
-            .await
-            .map_err(|e| DeployerError::Other(format!("Failed to remove container: {}", e)))?;
+            .await;
+
+        match removal {
+            Ok(()) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Err(DeployerError::ContainerNotFound(container_id.to_string())),
+            Err(error) => {
+                return Err(DeployerError::Other(format!(
+                    "Failed to remove container {}: {}",
+                    container_id, error
+                )))
+            }
+        }
 
         if let Some(name) = container_name {
             let dir = self.secrets_host_dir(&name);

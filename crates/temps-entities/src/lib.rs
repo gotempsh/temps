@@ -91,6 +91,7 @@ pub mod secrets;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod source_bundles;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;

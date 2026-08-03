@@ -3147,6 +3147,122 @@ impl DeploymentService {
         Ok(count)
     }
 
+    /// Remove every container recorded for a project before the project row is
+    /// deleted. This deliberately scans historical container rows too: an older
+    /// best-effort teardown may have marked a row deleted while leaving its
+    /// Docker container behind.
+    pub async fn cleanup_project_deployments(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, DeploymentError> {
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut removed = 0_u64;
+        for container in containers {
+            let container_id = container.container_id.clone();
+            let previous_status = container.status.clone();
+            let previous_deleted_at = container.deleted_at;
+            let deployer = self
+                .deployer_for_node(container.node_id)
+                .await
+                .map_err(|error| {
+                    DeploymentError::Other(format!(
+                        "Failed to resolve runtime for container {} in project {}: {}",
+                        container_id, project_id, error
+                    ))
+                })?;
+
+            // Mark intentional removal before touching the runtime so the
+            // health monitor cannot report a project-deletion crash.
+            let mut removing: deployment_containers::ActiveModel = container.into();
+            removing.status = Set(Some("removing".to_string()));
+            removing.deleted_at = Set(Some(chrono::Utc::now()));
+            let marked = removing.update(self.db.as_ref()).await?;
+
+            let removal = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                deployer.remove_container(&container_id),
+            )
+            .await;
+
+            match removal {
+                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
+                    let mut completed: deployment_containers::ActiveModel = marked.into();
+                    completed.status = Set(Some("removed".to_string()));
+                    completed.update(self.db.as_ref()).await?;
+                    removed += 1;
+                }
+                Ok(Err(error)) => {
+                    let mut restored: deployment_containers::ActiveModel = marked.into();
+                    restored.status = Set(previous_status);
+                    restored.deleted_at = Set(previous_deleted_at);
+                    restored.update(self.db.as_ref()).await?;
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to remove container {} for project {}: {}",
+                        container_id, project_id, error
+                    )));
+                }
+                Err(_) => {
+                    let mut restored: deployment_containers::ActiveModel = marked.into();
+                    restored.status = Set(previous_status);
+                    restored.deleted_at = Set(previous_deleted_at);
+                    restored.update(self.db.as_ref()).await?;
+                    return Err(DeploymentError::Other(format!(
+                        "Timed out after 30s removing container {} for project {}",
+                        container_id, project_id
+                    )));
+                }
+            }
+        }
+
+        let data_dir = self.config_service.data_dir();
+        let source_archives = temps_entities::source_bundles::Entity::find()
+            .filter(temps_entities::source_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let static_archives = temps_entities::static_bundles::Entity::find()
+            .filter(temps_entities::static_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let archive_paths = source_archives
+            .into_iter()
+            .map(|bundle| bundle.archive_path)
+            .chain(static_archives.into_iter().map(|bundle| bundle.blob_path));
+        for relative_path in archive_paths {
+            let archive_path = data_dir.join(&relative_path);
+            if !archive_path.starts_with(&data_dir) {
+                return Err(DeploymentError::InvalidBundlePath {
+                    path: archive_path.display().to_string(),
+                    reason: format!(
+                        "stored path for project {project_id} escapes the data directory"
+                    ),
+                });
+            }
+            match tokio::fs::remove_file(&archive_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to remove archive '{}' for project {}: {}",
+                        archive_path.display(),
+                        project_id,
+                        error
+                    )));
+                }
+            }
+        }
+
+        info!(
+            "Removed {} deployment container(s) before deleting project {}",
+            removed, project_id
+        );
+        Ok(removed)
+    }
+
     /// Cancel a specific deployment
     pub async fn cancel_deployment(
         &self,
@@ -3725,6 +3841,18 @@ impl temps_core::DeploymentCanceller for DeploymentService {
     }
 }
 
+#[async_trait::async_trait]
+impl temps_core::ProjectDeploymentCleanup for DeploymentService {
+    async fn cleanup_project_deployments(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cleanup_project_deployments(project_id)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3811,6 +3939,41 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn create_deployment_service_with_deployer(
+        db: Arc<temps_database::DbConnection>,
+        deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    ) -> DeploymentService {
+        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                "postgresql://test_user:test_password@localhost:5432/test_db".to_string(),
+                None,
+                None,
+            )
+            .expect("create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+        let (queue_service, _keep_alive) =
+            temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(16);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("connect test Docker client"),
+        );
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker));
+
+        DeploymentService {
+            db,
+            log_service,
+            config_service,
+            queue_service,
+            docker_log_service,
+            deployer,
+            encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
+            env_resolver: std::sync::OnceLock::new(),
+        }
     }
 
     async fn setup_test_data(
@@ -5932,6 +6095,99 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("removed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_project_deployments_removes_historical_containers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("project-cleanup-container".to_string()),
+            container_name: Set("project-cleanup-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("removed".to_string())),
+            deleted_at: Set(Some(Utc::now())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_remove_container()
+            .withf(|container_id| container_id == "project-cleanup-container")
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_deployment_service_with_deployer(db.clone(), Arc::new(deployer));
+
+        let removed = service.cleanup_project_deployments(project.id).await?;
+
+        assert_eq!(removed, 1);
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row remains until project cascade");
+        assert_eq!(refreshed.status.as_deref(), Some("removed"));
+        assert!(refreshed.deleted_at.is_some());
+        assert!(projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_project_deployments_restores_row_when_runtime_removal_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("project-cleanup-failure".to_string()),
+            container_name: Set("project-cleanup-failure".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("running".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_remove_container().times(1).returning(|_| {
+            Err(temps_deployer::DeployerError::Other(
+                "runtime unavailable".to_string(),
+            ))
+        });
+        let service = create_deployment_service_with_deployer(db.clone(), Arc::new(deployer));
+
+        let error = service
+            .cleanup_project_deployments(project.id)
+            .await
+            .expect_err("cleanup must fail closed when Docker removal fails");
+
+        assert!(error.to_string().contains("project-cleanup-failure"));
+        assert!(error.to_string().contains(&project.id.to_string()));
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row remains retryable");
+        assert_eq!(refreshed.status.as_deref(), Some("running"));
+        assert!(refreshed.deleted_at.is_none());
+        assert!(projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .is_some());
 
         Ok(())
     }

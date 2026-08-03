@@ -12721,6 +12721,7 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+ "zip 2.4.2",
 ]
 
 [[package]]

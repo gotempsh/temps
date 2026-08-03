@@ -15241,7 +15241,7 @@ export type SourceMapResponse = {
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
  * - `Manual`: Flexible type that accepts any deployment method
  */
-export type SourceType = 'git' | 'docker_image' | 'static_files' | 'manual';
+export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
 
 /**
  * A span event (log-like annotation on a span).

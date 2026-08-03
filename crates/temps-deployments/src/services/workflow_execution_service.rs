@@ -20,7 +20,8 @@ use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
     ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
     DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
-    MetricAlertConfigService, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
+    MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage,
+    VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -1649,6 +1650,26 @@ impl WorkflowExecutionService {
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
+            }
+
+            "PrepareSourceBundleJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+                let archive_path = config
+                    .get("archive_path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "archive_path is required".to_string(),
+                        )
+                    })?;
+                let absolute_path = self.config_service.data_dir().join(archive_path);
+                Ok(Arc::new(PrepareSourceBundleJob::new(
+                    db_job.job_id.clone(),
+                    absolute_path,
+                    project.slug.clone(),
+                )))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use super::audit::{
     DeployFromImageAudit, DeployFromImageUploadAudit, DeployFromStaticAudit,
-    ExternalImageDeletedAudit, ExternalImageRegisteredAudit, StaticBundleDeletedAudit,
-    StaticBundleUploadedAudit,
+    DeployFromUploadedSourceAudit, ExternalImageDeletedAudit, ExternalImageRegisteredAudit,
+    StaticBundleDeletedAudit, StaticBundleUploadedAudit,
 };
 use super::types::AppState;
 use axum::{
@@ -27,7 +27,7 @@ use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDa
 use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
-use temps_entities::{deployments, environments, projects};
+use temps_entities::{deployments, environments, projects, source_bundles};
 use tracing::{debug, error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -39,6 +39,7 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
         deploy_from_image,
         deploy_from_image_upload,
         deploy_from_static,
+        deploy_from_uploaded_source,
         upload_static_bundle,
         register_external_image,
         list_remote_external_images,
@@ -65,6 +66,253 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
     )
 )]
 pub struct RemoteDeploymentsApiDoc;
+
+/// Upload source code and immediately start a preset-based deployment.
+#[utoipa::path(
+    post,
+    tag = "Deployments",
+    path = "/projects/{project_id}/environments/{environment_id}/deploy/source",
+    request_body(content = String, content_type = "multipart/form-data"),
+    responses(
+        (status = 202, description = "Source deployment started", body = RemoteDeploymentResponse),
+        (status = 400, description = "Invalid source archive"),
+        (status = 404, description = "Project or environment not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn deploy_from_uploaded_source(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
+
+    let project = projects::Entity::find_by_id(project_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(format!("Project {project_id} not found"))
+        })?;
+    if project.source_type != SourceType::UploadedSource {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Project Type")
+            .with_detail("Source archives require a project with source_type 'uploaded_source'"));
+    }
+    let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::DeletedAt.is_null())
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .filter(|environment| environment.project_id == project_id)
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail("Environment does not belong to the project")
+        })?;
+
+    const MAX_SOURCE_BYTES: usize = 500 * 1024 * 1024;
+    let mut bytes = None;
+    let mut original_filename = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Multipart Error")
+            .with_detail(error.to_string())
+    })? {
+        if field.name() == Some("file") {
+            original_filename = field.file_name().map(ToString::to_string);
+            let uploaded = field.bytes().await.map_err(|error| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("File Read Error")
+                    .with_detail(error.to_string())
+            })?;
+            if uploaded.len() > MAX_SOURCE_BYTES {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Source Archive Too Large")
+                    .with_detail("Source archive exceeds 500 MiB"));
+            }
+            bytes = Some(uploaded);
+            break;
+        }
+    }
+    let bytes = bytes.ok_or_else(|| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Source Archive")
+            .with_detail("Expected a ZIP archive in multipart field 'file'")
+    })?;
+    zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(error.to_string())
+    })?;
+
+    use sha2::{Digest, Sha256};
+    let checksum = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+    let relative_path = format!("source-bundles/{}.zip", uuid::Uuid::new_v4());
+    let absolute_path = state.data_dir.join(&relative_path);
+    if let Some(parent) = absolute_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Source Storage Failed")
+                .with_detail(error.to_string())
+        })?;
+    }
+    tokio::fs::write(&absolute_path, &bytes)
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Source Storage Failed")
+                .with_detail(error.to_string())
+        })?;
+
+    let now = Utc::now();
+    let bundle = source_bundles::ActiveModel {
+        project_id: Set(project_id),
+        archive_path: Set(relative_path.clone()),
+        original_filename: Set(original_filename),
+        content_type: Set("application/zip".to_string()),
+        size_bytes: Set(bytes.len() as i64),
+        checksum: Set(checksum),
+        directory: Set(project.directory.clone()),
+        preset: Set(project.preset.as_str().to_string()),
+        metadata: Set(None),
+        uploaded_at: Set(now),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(state.db.as_ref())
+    .await
+    .map_err(|error| {
+        let path = absolute_path.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(path).await;
+        });
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Registration Failed")
+            .with_detail(error.to_string())
+    })?;
+
+    let deployment_number = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project_id))
+        .count(state.db.as_ref())
+        .await
+        .unwrap_or(0)
+        + 1;
+    let deployment = deployments::ActiveModel {
+        project_id: Set(project_id),
+        environment_id: Set(environment_id),
+        slug: Set(format!("{}-{deployment_number}", project.slug)),
+        state: Set("pending".to_string()),
+        metadata: Set(Some(DeploymentMetadata {
+            source_bundle_id: Some(bundle.id),
+            source_bundle_path: Some(relative_path),
+            source_bundle_content_type: Some("application/zip".to_string()),
+            deployment_source_type: Some(SourceType::UploadedSource),
+            ..Default::default()
+        })),
+        context_vars: Set(Some(
+            serde_json::json!({"trigger":"drop","source":"uploaded_source","bundle_id":bundle.id}),
+        )),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(state.db.as_ref())
+    .await
+    .map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(error.to_string())
+    })?;
+
+    state
+        .queue_service
+        .send(Job::DeploymentCreated(DeploymentCreatedJob {
+            deployment_id: deployment.id,
+            project_id,
+            environment_id,
+            environment_name: environment.name.clone(),
+            branch: None,
+            commit_sha: None,
+        }))
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Deployment Queue Failed")
+                .with_detail(error.to_string())
+        })?;
+
+    state
+        .workflow_planner
+        .create_deployment_jobs(deployment.id)
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Job Creation Failed")
+                .with_detail(error.to_string())
+        })?;
+    let workflow_executor = state.workflow_executor.clone();
+    let deployment_gate = state.deployment_gate.clone();
+    let db = state.db.clone();
+    let environment_name = environment.name.clone();
+    let deployment_id = deployment.id;
+    tokio::spawn(async move {
+        crate::services::job_processor::JobProcessorService::gate_check_then_run(
+            &db,
+            &workflow_executor,
+            &deployment_gate,
+            project_id,
+            &environment_name,
+            deployment_id,
+        )
+        .await;
+    });
+
+    let audit = DeployFromUploadedSourceAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        environment_id,
+        deployment_id,
+        source_bundle_id: bundle.id,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create uploaded-source audit log: {error}");
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RemoteDeploymentResponse {
+            id: deployment.id,
+            project_id,
+            environment_id,
+            slug: deployment.slug,
+            state: deployment.state,
+            source_type: "uploaded_source".to_string(),
+            created_at: deployment.created_at,
+        }),
+    ))
+}
 
 // Request Types
 
@@ -1976,6 +2224,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/static",
             post(deploy_from_static),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/deploy/source",
+            post(deploy_from_uploaded_source).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
         )
         // Upload endpoints with increased body limit
         .route(

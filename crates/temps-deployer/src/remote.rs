@@ -213,6 +213,11 @@ impl RemoteNodeDeployer {
                     self.node_name, url, e
                 ))
             })?;
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DeployerError::ContainerNotFound(path.to_string()));
+        }
 
         let body: AgentResponse<String> = response.json().await.map_err(|e| {
             DeployerError::NetworkError(format!(

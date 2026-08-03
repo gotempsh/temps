@@ -7,7 +7,7 @@ use utoipa::OpenApi;
 use super::AppState;
 use axum::Router;
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
@@ -28,11 +28,15 @@ use super::types::{
     UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::io::Read;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_entities::source_type::SourceType;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
+    use axum::extract::DefaultBodyLimit;
     let custom_domain_routes = super::custom_domains::configure_routes();
 
     Router::new()
@@ -44,6 +48,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
+        .route(
+            "/drop/inspect",
+            post(inspect_drop_archive).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+        )
         .route("/projects/statistics", get(get_project_statistics))
         // Create project from template
         .route(
@@ -90,6 +98,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[openapi(
     paths(
         create_project,
+        inspect_drop_archive,
         get_project,
         update_project,
         change_project_source,
@@ -113,6 +122,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     components(
         schemas(
             CreateProjectRequest,
+            DropInspectionResponse,
+            DropPresetCandidate,
             ChangeProjectSourceRequest,
             ProjectResponse,
             PaginatedProjectList,
@@ -150,6 +161,177 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct ApiDoc;
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPresetCandidate {
+    pub directory: String,
+    pub preset: String,
+    pub label: String,
+    pub confidence: String,
+    pub reason: String,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DropInspectionResponse {
+    pub suggested_name: String,
+    pub candidates: Vec<DropPresetCandidate>,
+}
+
+/// Inspect a source ZIP without creating a project or retaining the upload.
+#[utoipa::path(
+    post,
+    path = "/drop/inspect",
+    tag = "Projects",
+    request_body(content = String, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Detected deployable project roots", body = DropInspectionResponse),
+        (status = 400, description = "Invalid or unsupported archive")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn inspect_drop_archive(
+    RequireAuth(auth): RequireAuth,
+    mut multipart: Multipart,
+) -> Result<Json<DropInspectionResponse>, Problem> {
+    permission_guard!(auth, ProjectsCreate);
+
+    let mut archive_bytes = None;
+    let mut filename = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Upload")
+            .with_detail(format!("Failed to read multipart upload: {error}"))
+    })? {
+        if field.name() == Some("file") {
+            filename = field.file_name().map(ToString::to_string);
+            archive_bytes = Some(field.bytes().await.map_err(|error| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Upload")
+                    .with_detail(format!("Failed to read uploaded archive: {error}"))
+            })?);
+            break;
+        }
+    }
+
+    let archive_bytes = archive_bytes.ok_or_else(|| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Archive")
+            .with_detail("Expected a ZIP archive in multipart field 'file'")
+    })?;
+    let manifests = inspect_zip_manifests(&archive_bytes)?;
+    let candidates = temps_presets::detect_project_candidates(&manifests)
+        .into_iter()
+        .map(|candidate| {
+            let preset = candidate.catalog_slug().to_string();
+            DropPresetCandidate {
+                directory: candidate.path,
+                preset,
+                label: candidate.preset.display_name().to_string(),
+                confidence: candidate.confidence.to_string(),
+                reason: candidate.reason,
+                is_static: candidate.preset == temps_entities::preset::Preset::Static,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("No Deployable Project Found")
+            .with_detail(
+                "The archive does not contain a supported project manifest or index.html",
+            ));
+    }
+
+    let suggested_name = filename
+        .as_deref()
+        .and_then(|name| name.strip_suffix(".zip"))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("drop-project")
+        .to_string();
+
+    Ok(Json(DropInspectionResponse {
+        suggested_name,
+        candidates,
+    }))
+}
+
+fn inspect_zip_manifests(bytes: &[u8]) -> Result<BTreeMap<String, String>, Problem> {
+    const MAX_FILES: usize = 20_000;
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(format!("Could not open ZIP archive: {error}"))
+    })?;
+    if archive.len() > MAX_FILES {
+        return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+            .with_title("Archive Has Too Many Files")
+            .with_detail(format!("Archive contains more than {MAX_FILES} entries")));
+    }
+
+    let mut manifests = BTreeMap::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid ZIP Entry")
+                .with_detail(format!("Could not inspect ZIP entry {index}: {error}"))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let path = entry.enclosed_name().ok_or_else(|| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Unsafe ZIP Entry")
+                .with_detail(format!(
+                    "Archive entry '{}' escapes the project root",
+                    entry.name()
+                ))
+        })?;
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Unsupported ZIP Entry")
+                .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
+        }
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        let should_read = matches!(
+            basename,
+            "package.json"
+                | "requirements.txt"
+                | "pyproject.toml"
+                | "Cargo.toml"
+                | "go.mod"
+                | "pom.xml"
+                | "build.gradle"
+        );
+        let mut contents = String::new();
+        if should_read {
+            if entry.size() > MAX_MANIFEST_BYTES {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Manifest Is Too Large")
+                    .with_detail(format!("Manifest '{normalized}' exceeds 1 MiB")));
+            }
+            entry
+                .take(MAX_MANIFEST_BYTES + 1)
+                .read_to_string(&mut contents)
+                .map_err(|error| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Manifest")
+                        .with_detail(format!("Could not read '{normalized}': {error}"))
+                })?;
+        }
+        manifests.insert(normalized, contents);
+    }
+    Ok(manifests)
+}
 
 /// Create a new project
 #[utoipa::path(
@@ -536,6 +718,21 @@ pub async fn delete_project(
 
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
+
+    // Runtime resources are external to Postgres and cannot be removed by the
+    // ON DELETE CASCADE below. Clean them up first; if Docker/agent cleanup
+    // fails, preserve the project and its container records so deletion is
+    // safely retryable instead of orphaning undiscoverable containers.
+    state
+        .project_deployment_cleanup
+        .cleanup_project_deployments(id)
+        .await
+        .map_err(
+            |error| crate::services::types::ProjectError::DeploymentCleanupFailed {
+                project_id: id,
+                reason: error.to_string(),
+            },
+        )?;
 
     state
         .project_service

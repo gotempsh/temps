@@ -402,7 +402,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       const fd = new FormData()
       fd.append('file', staticFile)
       const uploadRes = await fetch(
-        `/api/projects/${project.id}/static-bundles`,
+        `/api/projects/${project.id}/upload/static`,
         { method: 'POST', credentials: 'include', body: fd }
       )
       if (!uploadRes.ok) {

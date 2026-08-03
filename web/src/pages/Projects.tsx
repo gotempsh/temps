@@ -27,6 +27,7 @@ import {
   Minus,
   TrendingDown,
   TrendingUp,
+  UploadCloud,
   Users,
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
@@ -310,6 +311,12 @@ export function Projects() {
         actions={
           <>
             <PlatformStrip />
+            <Button asChild variant="outline">
+              <Link to="/drop">
+                <UploadCloud className="mr-2 size-4" />
+                Drop files
+              </Link>
+            </Button>
             <CreateActionButton to="/projects/new" label="New Project" />
           </>
         }

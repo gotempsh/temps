@@ -92,6 +92,12 @@ impl TempsPlugin for DeploymentsPlugin {
             deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
 
+            // Project deletion is only allowed after the deployments service
+            // has synchronously removed every container owned by the project.
+            let project_cleanup =
+                deployment_service.clone() as Arc<dyn temps_core::ProjectDeploymentCleanup>;
+            context.register_service(project_cleanup);
+
             // Also register as DeploymentCanceller trait for temps-environments
             let deployment_canceller =
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
