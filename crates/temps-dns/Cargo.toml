@@ -42,7 +42,7 @@ hex = "0.4"
 
 # GCP service account authentication
 rsa = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 
 # XML parsing for Route53
 quick-xml = { version = "0.41", features = ["serialize"] }

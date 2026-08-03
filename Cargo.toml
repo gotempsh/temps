@@ -202,7 +202,7 @@ hkdf = "0.13"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
 # rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via

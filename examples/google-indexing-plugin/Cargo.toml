@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 include_dir = "0.7"
 mime_guess = "2.0"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
