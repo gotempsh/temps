@@ -361,10 +361,22 @@ fn verify(starter: &Starter) -> Result<(), String> {
 #[ignore = "needs Docker and TEMPS_EXAMPLES_DIR; run explicitly with --ignored"]
 fn every_starter_builds_runs_and_serves() {
     let Some(root) = starters_root() else {
+        // Name what is actually missing. "not set to a directory" covers both
+        // "you forgot the variable" and "the directory is not there", and those
+        // want completely different fixes — the second one usually means the
+        // checkout is on a branch that does not carry `examples/starters` yet.
+        let requested = std::env::var("TEMPS_EXAMPLES_DIR");
         panic!(
-            "TEMPS_EXAMPLES_DIR is not set to a directory. Clone the starters first:\n  \
+            "{}\n\nExpected a checkout of the starters:\n  \
              git clone --depth 1 https://github.com/gotempsh/temps-examples /tmp/temps-examples\n  \
-             export TEMPS_EXAMPLES_DIR=/tmp/temps-examples/examples/starters"
+             export TEMPS_EXAMPLES_DIR=/tmp/temps-examples/examples/starters",
+            match requested {
+                Err(_) => "TEMPS_EXAMPLES_DIR is not set.".to_string(),
+                Ok(dir) => format!(
+                    "TEMPS_EXAMPLES_DIR points at `{dir}`, which is not a directory. \
+                     If this is a CI checkout, the branch may not carry `examples/starters`."
+                ),
+            }
         );
     };
 
