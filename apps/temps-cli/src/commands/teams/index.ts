@@ -32,13 +32,24 @@ import { printTable, type TableColumn } from '../../ui/table.js'
 
 const TEAM_ROLES: TeamRole[] = ['owner', 'admin', 'deployer', 'viewer']
 
-/** What each fixed role can do, shown in interactive role pickers. */
+/**
+ * What each role actually restricts today — deliberately not "read-only" /
+ * "full control". Roles narrow deployments, environments and env vars,
+ * project settings, domains, and project deletion; anything outside that
+ * set still follows the member's instance-wide role. Overstating a role
+ * changes what an operator grants, so the labels state the enforced scope.
+ */
 const ROLE_HINTS: Record<TeamRole, string> = {
-  owner: 'everything an admin can do, plus deleting the project',
-  admin: 'full control of the project, but cannot delete it',
-  deployer: 'deploy and manage env vars/pipelines; no deletes',
-  viewer: 'read-only'
+  owner: 'deploy, manage env vars/settings/domains, and delete the project',
+  admin: 'deploy, manage env vars/settings/domains; cannot delete the project',
+  deployer: 'deploy and manage env vars; cannot change settings or domains',
+  viewer: 'cannot deploy, or change env vars, settings or domains'
 }
+
+/** Printed alongside interactive role pickers. */
+const ROLE_ENFORCEMENT_NOTE =
+  'Roles restrict deployments, env vars, project settings, domains and ' +
+  "project deletion. Other actions follow the member's instance-wide role."
 
 interface JsonOption {
   json?: boolean
@@ -234,6 +245,7 @@ function parseRole(value: string): TeamRole {
 }
 
 async function promptRole(message: string): Promise<TeamRole> {
+  info(ROLE_ENFORCEMENT_NOTE)
   return (await promptSelect({
     message,
     choices: TEAM_ROLES.map((r) => ({ name: `${r} — ${ROLE_HINTS[r]}`, value: r }))

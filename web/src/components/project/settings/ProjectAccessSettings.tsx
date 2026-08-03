@@ -62,7 +62,11 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { ROLE_DESCRIPTIONS, RoleSelect } from '@/pages/TeamDetail'
+import {
+  ROLE_DESCRIPTIONS,
+  ROLE_ENFORCEMENT_NOTE,
+  RoleSelect,
+} from '@/pages/TeamDetail'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Globe, Lock, Plus, Trash2, Users } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -184,7 +188,8 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
           </CardTitle>
           <CardDescription>
             A member's permissions here are the narrower of their role in the
-            team and the role the team holds on this project.
+            team and the role the team holds on this project.{' '}
+            {ROLE_ENFORCEMENT_NOTE}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -311,6 +316,9 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
               <RoleSelect id="access-role" value={role} onChange={setRole} />
               <p className="text-xs text-muted-foreground">
                 {ROLE_DESCRIPTIONS[role]}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {ROLE_ENFORCEMENT_NOTE}
               </p>
             </div>
           </div>

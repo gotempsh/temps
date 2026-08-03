@@ -80,16 +80,36 @@ import { toast } from 'sonner'
 const TEAM_ROLES: TeamRole[] = ['owner', 'admin', 'deployer', 'viewer']
 
 /**
- * What each fixed role grants inside a project. Shown next to the role
- * pickers so an operator doesn't have to go read the docs to know whether
- * "deployer" can delete things.
+ * What each role actually restricts today.
+ *
+ * Deliberately not phrased as "read-only" / "full control". Project roles
+ * currently narrow a specific set of actions — deploying, environments and
+ * environment variables, project settings, custom domains, and deleting
+ * the project. Actions outside that set (backups, storage, sandboxes,
+ * status pages, error tracking, and so on) are not yet narrowed by the
+ * project role and still follow the member's instance-wide role.
+ *
+ * Describing a role as more restrictive than it is enforced to be is worse
+ * than describing nothing, because an operator grants on the strength of
+ * the label: "read-only" reads as a safe default for a contractor, and it
+ * is not one yet. See ROLE_ENFORCEMENT_NOTE, which is rendered wherever a
+ * role is chosen.
  */
 export const ROLE_DESCRIPTIONS: Record<TeamRole, string> = {
-  owner: 'Everything an admin can do, plus deleting the project',
-  admin: 'Full control of the project, but cannot delete it',
-  deployer: 'Deploy, and manage env vars and pipelines. No deletes',
-  viewer: 'Read-only',
+  owner: 'Deploy, manage env vars, settings and domains, and delete the project',
+  admin: 'Deploy, manage env vars, settings and domains. Cannot delete the project',
+  deployer: 'Deploy and manage env vars. Cannot change settings or domains',
+  viewer: 'Cannot deploy, or change env vars, settings or domains',
 }
+
+/**
+ * Shown next to every role picker. The honest scope of what a role gates,
+ * so nobody grants `viewer` expecting a read-only contractor account.
+ */
+export const ROLE_ENFORCEMENT_NOTE =
+  'Roles currently restrict deployments, environment variables, project ' +
+  'settings, domains and project deletion. Other actions still follow the ' +
+  "member's instance-wide role."
 
 /** Shared role picker so the wording stays identical everywhere. */
 export function RoleSelect({
@@ -211,6 +231,9 @@ function AddMemberDialog({
             <RoleSelect id="member-role" value={role} onChange={setRole} />
             <p className="text-xs text-muted-foreground">
               {ROLE_DESCRIPTIONS[role]}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {ROLE_ENFORCEMENT_NOTE}
             </p>
           </div>
         </div>
