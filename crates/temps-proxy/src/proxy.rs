@@ -4377,10 +4377,11 @@ impl ProxyHttp for LoadBalancer {
 
         if is_sse {
             ctx.is_sse = true;
-            ctx.skip_tracking = true; // Skip visitor/session tracking for SSE streams
-                                      // The upstream *confirmed* a stream (as opposed to `ctx.is_sse` set
-                                      // from the request's Accept header, which is only client intent and
-                                      // may still be answered by an ordinary short response).
+            // Skip visitor/session tracking for SSE streams
+            ctx.skip_tracking = true;
+            // The upstream *confirmed* a stream, as opposed to `ctx.is_sse` set
+            // from the request's Accept header, which is only client intent and
+            // may still be answered by an ordinary short response.
             ctx.streaming_session = true;
             debug!("SSE response detected from upstream");
         }
