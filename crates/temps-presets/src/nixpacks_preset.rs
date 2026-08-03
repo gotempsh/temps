@@ -154,6 +154,21 @@ fn autopack_provider(provider: NixpacksProvider) -> Option<&'static str> {
     }
 }
 
+/// Render a byte offset as `line L, column C`, counting from one.
+///
+/// Positions are derived rather than taken from the error's own rendering,
+/// which embeds the source text.
+fn line_and_column(source: &str, offset: usize) -> String {
+    let offset = offset.min(source.len());
+    let consumed = &source[..offset];
+    let line = consumed.matches('\n').count() + 1;
+    let column = consumed
+        .rfind('\n')
+        .map_or(offset, |newline| offset - newline - 1)
+        + 1;
+    format!("line {line}, column {column}")
+}
+
 pub struct NixpacksPreset {
     config: NixpacksConfig,
 }
@@ -186,16 +201,31 @@ impl NixpacksPreset {
     /// The check runs against autopack's compatibility reader — the same code
     /// that will read the file at build time — so validation cannot pass for
     /// something the build then refuses.
+    ///
+    /// The returned message carries the *position* of the error and nothing
+    /// else. It reaches an API response body and the logs, and a
+    /// `nixpacks_config` can hold secrets: `toml`'s own error Display renders
+    /// the offending source line, and `.message()` names the offending key on
+    /// an unknown-field error. Neither may cross that boundary, so the detail
+    /// is logged server-side instead of returned.
     pub(super) fn validate_config(
         config: &NixpacksConfig,
     ) -> Result<(), crate::PresetResolutionError> {
         if let Some(value) = config.nixpacks_config.as_deref() {
-            toml::from_str::<CompatNixpacksConfig>(value).map_err(|error| {
-                crate::PresetResolutionError::InvalidConfig {
+            if let Err(error) = toml::from_str::<CompatNixpacksConfig>(value) {
+                debug!("stored nixpacks.toml did not parse: {error}");
+                let where_ = error
+                    .span()
+                    .map(|span| format!(" at {}", line_and_column(value, span.start)))
+                    .unwrap_or_default();
+                return Err(crate::PresetResolutionError::InvalidConfig {
                     slug: "nixpacks".to_string(),
-                    reason: format!("failed to parse Nixpacks TOML: {error}"),
-                }
-            })?;
+                    reason: format!(
+                        "failed to parse Nixpacks TOML{where_}; \
+                         verify its syntax and supported fields"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -597,6 +627,34 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_validation_error_never_echoes_the_config_back() {
+        // This message reaches an API response body and the logs, and the
+        // config can hold secrets. `toml`'s own error Display renders the
+        // offending source line, so interpolating it leaks the value — which
+        // is exactly what happened here once.
+        let result = NixpacksPreset::validate_config(&NixpacksConfig {
+            nixpacks_config: Some("secret_token = [\"do-not-echo\"".to_string()),
+            ..Default::default()
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(
+            !message.contains("do-not-echo"),
+            "the error echoed the config: {message}"
+        );
+        assert!(!message.contains("secret_token"), "{message}");
+        // The position is still there, so the user can find the problem.
+        assert!(message.contains("line 1, column 30"), "{message}");
+    }
+
+    #[test]
+    fn the_reported_position_counts_lines_and_columns_from_one() {
+        assert_eq!(line_and_column("abc", 0), "line 1, column 1");
+        assert_eq!(line_and_column("abc\ndef", 5), "line 2, column 2");
+        // An offset at end-of-input is what an unterminated array produces.
+        assert_eq!(line_and_column("ab", 99), "line 1, column 3");
     }
 
     #[test]
