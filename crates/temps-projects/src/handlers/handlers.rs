@@ -203,6 +203,7 @@ pub async fn create_project(
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
         source_type: project.source_type,
+        template_slug: None,
     };
 
     let new_project = state
@@ -407,6 +408,7 @@ pub async fn update_project(
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
         source_type: project.source_type,   // Preserve source type
+        template_slug: None,                // Template provenance is immutable
     };
     let updated_project = state
         .project_service
@@ -1546,6 +1548,7 @@ pub async fn create_project_from_template(
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
+            template_slug: Some(request.template_slug.clone()),
         };
         // Surface the template's source repo as the response URL (the image ref
         // isn't a browsable URL); the message clarifies it deployed from an image.
@@ -1614,6 +1617,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(request.template_slug.clone()),
                 };
                 (req, new_repo.clone_url, "fork")
             }
@@ -1659,6 +1663,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: None,
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(request.template_slug.clone()),
                 };
                 (req, template.git.url.clone(), "public_repo")
             }

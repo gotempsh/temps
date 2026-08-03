@@ -354,6 +354,7 @@ impl ProjectService {
             deleted_at: Set(None),
             last_deployment: Set(None),
             source_type: Set(request.source_type),
+            template_slug: Set(request.template_slug),
             ..Default::default()
         };
 
@@ -3303,6 +3304,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         let result = project_service
@@ -3437,6 +3439,7 @@ mod tests {
             git_provider_connection_id: None,
             exposed_port: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         project_service
@@ -3487,6 +3490,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         }
     }
 
@@ -3538,6 +3542,35 @@ mod tests {
             .deployment_config
             .expect("default environment should seed deployment_config");
         assert_eq!(env_config.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_persists_curated_template_provenance() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Observability Starter");
+        request.template_slug = Some("observability-starter".to_string());
+
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("template project creation should succeed");
+        let persisted = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .expect("template project query should succeed")
+            .expect("template project should exist");
+
+        assert_eq!(
+            persisted.template_slug.as_deref(),
+            Some("observability-starter")
+        );
     }
 
     #[tokio::test]

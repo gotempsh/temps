@@ -83,6 +83,10 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Public slug of the curated template this project was created from.
+    /// NULL means the project was not created through the template catalog.
+    #[serde(skip_serializing)]
+    pub template_slug: Option<String>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
     /// the webhook on repo connect. NULL when not connected to a GitLab repository.
     pub gitlab_webhook_id: Option<i32>,
