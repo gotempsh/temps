@@ -158,6 +158,12 @@ pub struct ConversationService {
     /// [`ConversationService::with_write_support`] is called, or when the
     /// project toggle is off — the `temps_write` tool is simply absent.
     write_support: Option<WriteSupport>,
+    /// Reads operator-tunable chat limits. Consulted once per turn (the service
+    /// caches, so this is not a per-turn database hit) rather than at startup,
+    /// so changing the timeout in Settings takes effect on the next message
+    /// instead of requiring a restart. `None` in tests and in any wiring that
+    /// has not supplied it — the compiled default applies.
+    config: Option<Arc<temps_config::ConfigService>>,
 }
 
 impl ConversationService {
@@ -179,7 +185,17 @@ impl ConversationService {
             ai,
             providers,
             write_support: None,
+            config: None,
         }
+    }
+
+    /// Supply the settings service so operator-tuned chat limits apply.
+    ///
+    /// Optional: without it the compiled defaults are used, so a minimal wiring
+    /// (and every test) still works without standing up config.
+    pub fn with_config(mut self, config: Arc<temps_config::ConfigService>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Attach write-tool support (the `temps_write` tool + pending-action
@@ -814,10 +830,29 @@ impl ConversationService {
         // deadline adds is the guarantee those controls can't give: that an
         // unattended turn still ends, whatever the model is doing.
         //
-        // 15 minutes is generous — a full alert-suggestion turn against a slow
-        // local model runs about 10 — while capping what a single message can
-        // cost the operator, whose own provider key is paying.
-        const MAX_TURN_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        // The value is operator-tunable in Settings → AI, because the right
+        // ceiling is a property of the model: a full alert-suggestion turn runs
+        // ~10 minutes against a slow self-hosted model and seconds against a
+        // hosted one. Read per turn (the settings service caches) so a change
+        // applies to the next message rather than needing a restart.
+        let max_turn_duration = match &self.config {
+            Some(cfg) => match cfg.get_settings().await {
+                Ok(settings) => settings.ai_chat_limits.turn_timeout(),
+                Err(e) => {
+                    // Never fail a turn because settings could not be read —
+                    // fall back to the default ceiling and say why once.
+                    tracing::warn!(
+                        "Could not read AI chat limits ({e}); using the default turn timeout"
+                    );
+                    temps_core::AiChatLimitsSettings::default().turn_timeout()
+                }
+            },
+            None => temps_core::AiChatLimitsSettings::default().turn_timeout(),
+        };
+        // Phrased without the number, since the limit is now configurable and a
+        // hardcoded "15-minute" would start lying the moment anyone changes it.
+        const TURN_TIMEOUT_REASON: &str =
+            "reached the time limit for a single turn (configurable in Settings → AI)";
         // Purely an anti-spin guard, NOT a task budget. If rounds return
         // instantly (a provider erroring fast, a model emitting empty calls) the
         // deadline alone would allow an enormous number of iterations, so there
@@ -913,8 +948,8 @@ impl ConversationService {
             let turn_started = tokio::time::Instant::now();
 
             'rounds: for _ in 0..MAX_ROUNDS {
-                if turn_started.elapsed() >= MAX_TURN_DURATION {
-                    stop_reason = Some("reached its 15-minute limit for a single turn");
+                if turn_started.elapsed() >= max_turn_duration {
+                    stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
                 }
                 let req = ChatTurnRequest {
@@ -2178,6 +2213,7 @@ mod tests {
             ai,
             providers: HashMap::new(),
             write_support: None,
+            config: None,
         };
         (svc, tools)
     }
@@ -2433,7 +2469,7 @@ mod tests {
             "should stop around the 15-minute mark, stopped after {calls} rounds"
         );
         assert!(
-            joined_text(&out).contains("15-minute limit"),
+            joined_text(&out).contains("time limit for a single turn"),
             "the user must be told time ran out; got {out:?}"
         );
     }
@@ -2515,6 +2551,7 @@ mod tests {
             ai: Arc::new(ScriptedAi::new(vec![])),
             providers: HashMap::new(),
             write_support: None,
+            config: None,
         }
     }
 
@@ -2524,6 +2561,7 @@ mod tests {
             ai,
             providers: HashMap::new(),
             write_support: None,
+            config: None,
         }
     }
 

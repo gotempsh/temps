@@ -668,6 +668,31 @@ export type AiAgentTimelineRow = {
 };
 
 /**
+ * Control-plane build resource limits.
+ *
+ * Caps how many builds run concurrently AND how much CPU/memory each build
+ * is allowed to consume. A single global semaphore in the deployer crate
+ * Bounds on one AI chat turn.
+ *
+ * A turn is bounded by TIME rather than by a number of steps. A step count
+ * says nothing about cost or about how long someone has been watching a
+ * spinner, and it cuts short exactly the long, productive turns the chat
+ * exists for. The user can already see each tool call and press Stop; the
+ * deadline is what guarantees an *unattended* turn still ends.
+ *
+ * The right value is a property of the model, which is why it is configurable
+ * rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+ * against a slow local model and seconds against a hosted one.
+ */
+export type AiChatLimitsSettings = {
+    /**
+     * How long one turn may run before it is stopped and the partial answer
+     * returned, in seconds. The user is told the turn was cut short.
+     */
+    turn_timeout_secs?: number;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -966,6 +991,13 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     agent_sandbox?: AgentSandboxSettings;
+    /**
+     * Limits on a single AI chat turn. Operator-tunable because the right
+     * value depends on the model: a turn against a slow self-hosted model can
+     * legitimately take ten minutes, while a hosted one finishes in seconds
+     * and a shorter ceiling keeps costs predictable.
+     */
+    ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
      * Build-time resource limits applied on the control plane to prevent
@@ -1074,6 +1106,10 @@ export type AppSettings = {
  */
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
+    /**
+     * Per-turn limits for the AI chat. No sensitive content.
+     */
+    ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
@@ -1697,10 +1733,6 @@ export type BuildConfiguration = {
 };
 
 /**
- * Control-plane build resource limits.
- *
- * Caps how many builds run concurrently AND how much CPU/memory each build
- * is allowed to consume. A single global semaphore in the deployer crate
  * gates every `DockerRuntime::build_image` call to `max_concurrent`. When
  * the semaphore is full, additional builds queue and wait — they do not
  * fail. Per-build CPU/memory caps are forwarded to Docker via

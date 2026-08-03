@@ -14,8 +14,8 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
-    AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
+    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
+    AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
     RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
@@ -172,6 +172,9 @@ pub struct AppSettingsResponse {
     /// Build-time resource limits (control-plane only). No sensitive content,
     /// passed through as-is.
     pub build_limits: BuildLimitsSettings,
+
+    /// Per-turn limits for the AI chat. No sensitive content.
+    pub ai_chat_limits: AiChatLimitsSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -383,6 +386,7 @@ impl From<AppSettings> for AppSettingsResponse {
             require_mfa_for_admins: settings.require_mfa_for_admins,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
+            ai_chat_limits: settings.ai_chat_limits,
         }
     }
 }

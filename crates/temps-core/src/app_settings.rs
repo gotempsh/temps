@@ -61,6 +61,13 @@ pub struct AppSettings {
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
     pub ai_config: AiConfigSettings,
 
+    /// Limits on a single AI chat turn. Operator-tunable because the right
+    /// value depends on the model: a turn against a slow self-hosted model can
+    /// legitimately take ten minutes, while a hosted one finishes in seconds
+    /// and a shorter ceiling keeps costs predictable.
+    #[serde(default)]
+    pub ai_chat_limits: AiChatLimitsSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -160,6 +167,63 @@ pub struct ClusterDnsSettings {
     /// `*.temps.local` FQDNs resolve inside containers.
     #[schema(example = false)]
     pub enabled: bool,
+}
+
+/// Bounds on one AI chat turn.
+///
+/// A turn is bounded by TIME rather than by a number of steps. A step count
+/// says nothing about cost or about how long someone has been watching a
+/// spinner, and it cuts short exactly the long, productive turns the chat
+/// exists for. The user can already see each tool call and press Stop; the
+/// deadline is what guarantees an *unattended* turn still ends.
+///
+/// The right value is a property of the model, which is why it is configurable
+/// rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+/// against a slow local model and seconds against a hosted one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AiChatLimitsSettings {
+    /// How long one turn may run before it is stopped and the partial answer
+    /// returned, in seconds. The user is told the turn was cut short.
+    ///
+    /// Checked between steps, not mid-call: a model round already in flight
+    /// finishes, so a turn can overrun by up to one round. Against a slow
+    /// self-hosted model that is a minute or two. Aborting mid-stream would cut
+    /// the answer off in the middle of a sentence and throw away work already
+    /// paid for, which is worse than a late stop.
+    #[schema(minimum = 30, maximum = 3600, example = 900)]
+    pub turn_timeout_secs: u32,
+}
+
+impl Default for AiChatLimitsSettings {
+    fn default() -> Self {
+        Self {
+            // Generous against a full alert-suggestion turn on a slow local
+            // model (~10 min) while capping what a single message can cost.
+            turn_timeout_secs: 15 * 60,
+        }
+    }
+}
+
+impl AiChatLimitsSettings {
+    /// Lower bound: below this a turn cannot complete even simple tool work,
+    /// so accepting it would just look like the chat is broken.
+    pub const MIN_TURN_TIMEOUT_SECS: u32 = 30;
+    /// Upper bound: an hour of provider calls from one message is already far
+    /// past anything useful, and the value is a cost ceiling.
+    pub const MAX_TURN_TIMEOUT_SECS: u32 = 3600;
+
+    /// The configured timeout, clamped to the supported range.
+    ///
+    /// Clamped rather than trusted: the settings row is JSON that predates this
+    /// field and can be written by any admin, and a zero would otherwise mean
+    /// "every turn times out instantly".
+    pub fn turn_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.turn_timeout_secs
+                .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
+        )
+    }
 }
 
 /// Control-plane build resource limits.
@@ -833,6 +897,7 @@ impl Default for AppSettings {
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            ai_chat_limits: AiChatLimitsSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),

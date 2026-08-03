@@ -15,6 +15,7 @@ temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }

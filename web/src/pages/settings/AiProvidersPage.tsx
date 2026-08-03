@@ -38,6 +38,7 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
+import { AiChatLimitsCard } from '@/components/settings/AiChatLimitsCard'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
@@ -117,6 +118,8 @@ export function AiProvidersPage() {
           ))}
         </div>
       )}
+
+      <AiChatLimitsCard />
     </div>
   )
 }
