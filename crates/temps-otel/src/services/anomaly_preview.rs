@@ -17,6 +17,14 @@ use crate::services::metric_alert_evaluator::value_for_rule;
 use crate::services::OtelService;
 use crate::types::{MetricAggregation, MetricQuery};
 
+/// Hard cap on buckets scored in one backtest.
+///
+/// The range and bucket width are caller-supplied and every bucket becomes a
+/// point in the response, so without a ceiling an over-wide request turns into
+/// an unbounded hypertable scan and an enormous response body. 10k points is
+/// far more than any chart renders or any judgement about noisiness needs.
+pub const MAX_PREVIEW_POINTS: u64 = 10_000;
+
 /// One point in the backtest: the value, the band around it, and whether it
 /// breached.
 pub struct PreviewPoint {
@@ -64,7 +72,7 @@ pub async fn compute_anomaly_preview(
             start_time: Some(end - Duration::days(lookback_days as i64)),
             end_time: Some(end),
             bucket_interval: Some(interval.clone()),
-            limit: None,
+            limit: Some(MAX_PREVIEW_POINTS),
             aggregation,
             ..Default::default()
         })
@@ -83,7 +91,7 @@ pub async fn compute_anomaly_preview(
             start_time: Some(start),
             end_time: Some(end),
             bucket_interval: Some(interval),
-            limit: None,
+            limit: Some(MAX_PREVIEW_POINTS),
             aggregation,
             ..Default::default()
         })
@@ -164,7 +172,7 @@ pub async fn compute_static_preview(
             start_time: Some(start),
             end_time: Some(end),
             bucket_interval: Some(interval),
-            limit: None,
+            limit: Some(MAX_PREVIEW_POINTS),
             aggregation,
             ..Default::default()
         })

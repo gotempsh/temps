@@ -1610,6 +1610,88 @@ fn ai_read_allowlist() -> Vec<String> {
     .collect()
 }
 
+/// Mutating operations the AI may PROPOSE, for a human to confirm.
+///
+/// The AI never executes these — calling `temps_write` only stages a `proposed`
+/// `ai_pending_actions` row; a human confirm endpoint replays the mutation
+/// through the same router (`permission_guard!` + audit). The tool is also
+/// gated per-project behind `projects.ai_write_actions_enabled` (default OFF).
+///
+/// Conservative by design: high-value, mostly-reversible lifecycle + config
+/// operations. Adding an entry is a product + security decision — what may the
+/// AI propose for a human to run.
+///
+/// Extracted into its own function (rather than an inline literal at the call
+/// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
+/// which is the one rule holding up the read-only-POST mechanism.
+fn ai_write_allowlist() -> Vec<String> {
+    [
+        // ── Deployment lifecycle (reversible / safe) ──
+        // Redeploy the project from its configured branch —
+        // what a "redeploy main" request maps to
+        // (promote/rollback are NOT redeploys).
+        "trigger_project_pipeline",
+        "rollback_to_deployment",
+        "promote_deployment",
+        "pause_deployment",
+        "resume_deployment",
+        "cancel_deployment",
+        // ── Manual image deploy (no git build) ──
+        // Deploy a prebuilt Docker image by `image_ref` (a
+        // pullable registry ref) or a registered
+        // `external_image_id`, to a specific environment_id.
+        // Static-bundle deploys are intentionally NOT here: the
+        // AI can't perform the multipart file upload, so the
+        // whole static flow (upload + deploy) lives in the
+        // frontend.
+        "deploy_from_image",
+        // ── Container runtime control (reversible) ──
+        "restart_container",
+        "stop_container",
+        "start_container",
+        // ── Environment wake/sleep (reversible) ──
+        "wake_environment",
+        "sleep_environment",
+        // ── Environment settings (resource limits, replicas,
+        //    branch) — what "raise memory to 512 MB" /
+        //    "give it more CPU" / "scale to 2 replicas" map to.
+        //    Values are microcores (1_000_000 = 1 core) and MB.
+        //    Reversible: it's a config change, re-applicable.
+        "update_environment_settings",
+        // ── Environment variables (set / change) ──
+        "create_environment_variable",
+        "update_environment_variable",
+        "delete_environment_variable",
+        // ── Domains (attach / detach at the environment level only;
+        //    account-global domain create/delete excluded) ──
+        "add_environment_domain",
+        "delete_environment_domain",
+        // ── Managed external services (databases, caches, etc.) —
+        //    provisioning a new container and linking an existing
+        //    one to a project. Both reversible (a service can be
+        //    unlinked / left running unused; nothing is deleted).
+        "create_service",
+        "link_service_to_project",
+        // ── Metric alert rules (OTel) ──
+        // Create/update an alert rule. Reversible (a rule
+        // can be disabled or deleted) and non-destructive:
+        // creating one changes no running workload, it only
+        // starts evaluating a metric. This is what lets the
+        // assistant turn "your p95 has no alert on it" into
+        // a concrete rule the human confirms.
+        //
+        // `delete_alert` is deliberately excluded: deleting
+        // an alert silently removes monitoring, which is the
+        // kind of change that is only noticed when the
+        // incident it would have caught happens.
+        "create_alert",
+        "update_alert",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Vetted **read-only `POST`** operations for the AI read tool.
 ///
 /// HTTP method is this codebase's structural proxy for "does this mutate?", and
@@ -2722,71 +2804,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     if let Some(write_handle) =
                         service_context.get_service::<temps_ai_api_tools::WriteApiToolsHandle>()
                     {
-                        let write_allowlist: Vec<String> = [
-                            // ── Deployment lifecycle (reversible / safe) ──
-                            // Redeploy the project from its configured branch —
-                            // what a "redeploy main" request maps to
-                            // (promote/rollback are NOT redeploys).
-                            "trigger_project_pipeline",
-                            "rollback_to_deployment",
-                            "promote_deployment",
-                            "pause_deployment",
-                            "resume_deployment",
-                            "cancel_deployment",
-                            // ── Manual image deploy (no git build) ──
-                            // Deploy a prebuilt Docker image by `image_ref` (a
-                            // pullable registry ref) or a registered
-                            // `external_image_id`, to a specific environment_id.
-                            // Static-bundle deploys are intentionally NOT here: the
-                            // AI can't perform the multipart file upload, so the
-                            // whole static flow (upload + deploy) lives in the
-                            // frontend.
-                            "deploy_from_image",
-                            // ── Container runtime control (reversible) ──
-                            "restart_container",
-                            "stop_container",
-                            "start_container",
-                            // ── Environment wake/sleep (reversible) ──
-                            "wake_environment",
-                            "sleep_environment",
-                            // ── Environment settings (resource limits, replicas,
-                            //    branch) — what "raise memory to 512 MB" /
-                            //    "give it more CPU" / "scale to 2 replicas" map to.
-                            //    Values are microcores (1_000_000 = 1 core) and MB.
-                            //    Reversible: it's a config change, re-applicable.
-                            "update_environment_settings",
-                            // ── Environment variables (set / change) ──
-                            "create_environment_variable",
-                            "update_environment_variable",
-                            "delete_environment_variable",
-                            // ── Domains (attach / detach at the environment level only;
-                            //    account-global domain create/delete excluded) ──
-                            "add_environment_domain",
-                            "delete_environment_domain",
-                            // ── Managed external services (databases, caches, etc.) —
-                            //    provisioning a new container and linking an existing
-                            //    one to a project. Both reversible (a service can be
-                            //    unlinked / left running unused; nothing is deleted).
-                            "create_service",
-                            "link_service_to_project",
-                            // ── Metric alert rules (OTel) ──
-                            // Create/update an alert rule. Reversible (a rule
-                            // can be disabled or deleted) and non-destructive:
-                            // creating one changes no running workload, it only
-                            // starts evaluating a metric. This is what lets the
-                            // assistant turn "your p95 has no alert on it" into
-                            // a concrete rule the human confirms.
-                            //
-                            // `delete_alert` is deliberately excluded: deleting
-                            // an alert silently removes monitoring, which is the
-                            // kind of change that is only noticed when the
-                            // incident it would have caught happens.
-                            "create_alert",
-                            "update_alert",
-                        ]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                        let write_allowlist: Vec<String> = ai_write_allowlist();
                         let write_caller =
                             temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
                                 split.admin.clone(),
@@ -3459,6 +3477,48 @@ mod ai_tool_allowlist_tests {
             !help.contains("--end_time <array>"),
             "nullable != array: {help}"
         );
+    }
+
+    /// The read-only-POST list and the write allowlist must stay disjoint.
+    ///
+    /// This is the one rule holding up the safe-POST mechanism, and until now it
+    /// existed only as prose in a doc comment. `create_alert` and
+    /// `preview_alert` are neighbours in the same handler module under the same
+    /// OpenAPI tag, so a future `preview_and_save_alert` added by pattern-match
+    /// would execute unconfirmed writes with the chat user's auth and no confirm
+    /// card. Turn the rule into a build failure.
+    #[test]
+    fn safe_post_and_write_allowlists_are_disjoint() {
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+
+        let both: Vec<&String> = safe.intersection(&writes).collect();
+        assert!(
+            both.is_empty(),
+            "an operation cannot be both a side-effect-free read and a vetted write: {both:?}"
+        );
+    }
+
+    /// Every safe-POST entry must resolve to a real operation, or it silently
+    /// does nothing — the same failure mode the read-allowlist test guards.
+    #[test]
+    fn safe_posts_resolve_against_the_real_openapi() {
+        use temps_ai_api_tools::ReadOnlyApiIndex;
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let safe = ai_read_safe_posts();
+        let safe_refs: Vec<&str> = safe.iter().map(String::as_str).collect();
+        let index =
+            ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&openapi, &[], &safe_refs);
+
+        for op in &safe {
+            assert!(
+                index.get(op).is_some(),
+                "`{op}` is allowlisted as a read-only POST but does not resolve — \
+                 check for a typo or a renamed handler"
+            );
+        }
     }
 
     /// The AI read allowlist must never contain duplicate entries — a repeat

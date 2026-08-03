@@ -631,6 +631,37 @@ pub async fn preview_alert(
         .and_then(parse_rfc3339)
         .unwrap_or_else(|| end - chrono::Duration::days(7));
 
+    // Bound the work before dispatching it. Range and bucket width are both
+    // caller-supplied, and the query below asks for every bucket in between and
+    // materialises them all into the response — so `start_time=2000-01-01` with
+    // `window_secs=1` asks the database for hundreds of millions of rows and
+    // then tries to serialise them. Anyone holding OtelRead on one project could
+    // stall the control plane on a 4 GB box, and this endpoint is now reachable
+    // by the AI read tool rather than only from the alert form.
+    //
+    // The limits are generous against any real backtest: a rule's window is
+    // minutes to hours, and judging noisiness needs days, not decades.
+    const MIN_WINDOW_SECS: i32 = 10;
+    const MAX_WINDOW_SECS: i32 = 86_400;
+    const MAX_RANGE_DAYS: i64 = 30;
+
+    if end <= start {
+        return Err(OtelError::Validation {
+            message: "preview range is empty: end_time must be after start_time".to_string(),
+        }
+        .into());
+    }
+    if (end - start) > chrono::Duration::days(MAX_RANGE_DAYS) {
+        return Err(OtelError::Validation {
+            message: format!(
+                "preview range is {} days; the maximum is {MAX_RANGE_DAYS}. Narrow start_time/end_time.",
+                (end - start).num_days()
+            ),
+        }
+        .into());
+    }
+    let window_secs = req.window_secs.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS);
+
     // Both detector families that can actually be evaluated are backtestable.
     // Static was rejected here originally, which made "would this have fired?"
     // unanswerable for exactly the rules people create most — and left the AI
@@ -642,7 +673,7 @@ pub async fn preview_alert(
                 req.project_id,
                 &req.metric_name,
                 &req.aggregation,
-                req.window_secs,
+                window_secs,
                 params,
                 start,
                 end,
@@ -655,7 +686,7 @@ pub async fn preview_alert(
                 req.project_id,
                 &req.metric_name,
                 &req.aggregation,
-                req.window_secs,
+                window_secs,
                 params.comparator,
                 params.threshold,
                 start,

@@ -1326,6 +1326,31 @@ impl ConversationService {
 // Write-tool dispatch helper (free function so the spawned task can borrow it)
 // ---------------------------------------------------------------------------
 
+/// Did this tool result come from actually EXECUTING `operation_id` successfully?
+///
+/// Judged from the result, never from the arguments the model sent. Matching on
+/// the request is how a safety control gets satisfied without doing anything:
+/// `alerts preview_alert --help` mentions the operation, returns cheerful help
+/// text, and would otherwise count as a backtest — the model could then propose
+/// a threshold it never checked, and the human confirming would see it
+/// described as verified.
+///
+/// The read CLI's execution path returns `{"operation":…,"status":…,"data":…}`,
+/// so the operation that ran and the status it returned are both stated by the
+/// executor. Help and every error return plain prose, which parses as nothing
+/// and is correctly rejected.
+fn executed_operation_ok(result: &str, operation_id: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
+        return false;
+    };
+    if v.get("operation").and_then(serde_json::Value::as_str) != Some(operation_id) {
+        return false;
+    }
+    v.get("status")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|s| (200..300).contains(&s))
+}
+
 /// Cap what is kept for repeat-detection and the backtest check.
 ///
 /// These two uses need to know *that* a call happened and roughly what came
@@ -1480,13 +1505,9 @@ fn missing_backtest(
         .filter_map(|token| BACKTEST_REQUIRED.iter().find(|(op, _)| token == *op))
         .next()?;
 
-    let ran_backtest = seen_calls.iter().any(|(key, result)| {
-        // Key is "<tool>|<raw args>"; the read CLI carries the operation name in
-        // its command string. The result must be productive — a backtest that
-        // errored tells the model nothing, and letting it satisfy the
-        // requirement would turn one malformed call into a way past the gate.
-        key.contains(backtest_op) && tool_result_is_productive(result)
-    });
+    let ran_backtest = seen_calls
+        .values()
+        .any(|result| executed_operation_ok(result, backtest_op));
     if ran_backtest {
         return None;
     }
@@ -1858,6 +1879,47 @@ mod tests {
                 .to_string(),
         );
         assert!(missing_backtest("alerts create_alert --metric_name foo", &seen).is_some());
+
+        // ...and a non-2xx from the real operation is not a backtest either.
+        let mut seen = HashMap::new();
+        seen.insert(
+            "k".to_string(),
+            "{\"operation\":\"preview_alert\",\"status\":400,\"data\":null}".to_string(),
+        );
+        assert!(missing_backtest("alerts create_alert --metric_name foo", &seen).is_some());
+    }
+
+    /// The gate must judge what RAN, not what was asked for.
+    ///
+    /// `preview_alert --help` names the operation and returns friendly text. The
+    /// original implementation matched on the argument string, so help counted
+    /// as a backtest: the model could propose a threshold it never verified
+    /// while the human confirming saw it described as checked. Found by an
+    /// independent security audit, not by the author.
+    #[test]
+    fn help_output_does_not_satisfy_the_backtest_requirement() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "temps|{\"command\":\"alerts preview_alert --help\"}".to_string(),
+            "preview_alert — POST /otel/alerts/preview\nBacktest an anomaly detector.\nFlags:\n  \
+             --metric_name <string>"
+                .to_string(),
+        );
+        assert!(
+            missing_backtest("alerts create_alert --metric_name x", &seen).is_some(),
+            "help text must never count as having run the backtest"
+        );
+    }
+
+    /// Nor may a different operation that merely mentions it in its arguments.
+    #[test]
+    fn another_operation_mentioning_the_backtest_does_not_satisfy_it() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "temps|{\"command\":\"alerts list_alerts --name preview_alert\"}".to_string(),
+            "{\"operation\":\"list_alerts\",\"status\":200,\"data\":{\"data\":[]}}".to_string(),
+        );
+        assert!(missing_backtest("alerts create_alert --metric_name x", &seen).is_some());
     }
 
     /// Everything else stays unaffected — this gate is about thresholds, not

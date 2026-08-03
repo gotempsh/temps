@@ -102,9 +102,17 @@ pub(crate) fn resolve<'a>(
         };
     }
 
-    // Leniency: accept a bare `operation_id` (it's globally unique).
+    // Leniency: accept a bare `operation_id` (it's globally unique) — but apply
+    // the same discovery filter as the section path. Without this, naming an
+    // operation directly skipped `permit` entirely, so the "operations you
+    // cannot read are not offered" property held only for callers who browsed
+    // to them. The router's `permission_guard!` was still the real boundary, so
+    // nothing was exploitable; this just stops a request being formed that
+    // should never have been.
     if let Some(op) = index.get(first) {
-        return resolve_operation(op, &tokens[1..]);
+        if permit(op) {
+            return resolve_operation(op, &tokens[1..]);
+        }
     }
 
     CliAction::Terminal(format!(
