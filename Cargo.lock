@@ -11850,7 +11850,7 @@ dependencies = [
  "hmac 0.13.0",
  "http-body-util",
  "hyper",
- "jsonwebtoken 11.0.0",
+ "jsonwebtoken 10.4.0",
  "log",
  "mockito",
  "octocrab",
