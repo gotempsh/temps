@@ -15,6 +15,7 @@ import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
+import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
 import { GitSettings, ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
@@ -356,6 +357,10 @@ export function ProjectDetail() {
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="flags"
+                element={<ProjectFeatureFlags project={project} />}
               />
               <Route
                 path="domains"
