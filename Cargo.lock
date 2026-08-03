@@ -2919,10 +2919,10 @@ dependencies = [
  "ipnet",
  "libc",
  "log",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
  "netlink-packet-generic",
  "netlink-packet-route 0.31.0",
- "netlink-packet-utils 0.6.0",
+ "netlink-packet-utils",
  "netlink-packet-wireguard",
  "netlink-sys",
  "regex",
@@ -6056,17 +6056,6 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-core"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72724faf704479d67b388da142b186f916188505e7e0b26719019c525882eda4"
-dependencies = [
- "anyhow",
- "byteorder",
- "netlink-packet-utils 0.5.2",
-]
-
-[[package]]
-name = "netlink-packet-core"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3463cbb78394cb0141e2c926b93fc2197e473394b761986eca3b9da2c63ae0f4"
@@ -6080,7 +6069,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f891b2e0054cac5a684a06628f59568f841c93da4e551239da6e518f539e775"
 dependencies = [
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
 ]
 
 [[package]]
@@ -6092,7 +6081,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "log",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
 ]
 
 [[package]]
@@ -6104,19 +6093,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "log",
- "netlink-packet-core 0.8.1",
-]
-
-[[package]]
-name = "netlink-packet-utils"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ede8a08c71ad5a95cdd0e4e52facd37190977039a4704eb82a283f713747d34"
-dependencies = [
- "anyhow",
- "byteorder",
- "paste",
- "thiserror 1.0.69",
+ "netlink-packet-core",
 ]
 
 [[package]]
@@ -6139,7 +6116,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "log",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
  "netlink-packet-generic",
 ]
 
@@ -6152,7 +6129,7 @@ dependencies = [
  "bytes",
  "futures",
  "log",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
  "netlink-sys",
  "thiserror 2.0.19",
 ]
@@ -8726,7 +8703,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "netlink-packet-core 0.8.1",
+ "netlink-packet-core",
  "netlink-packet-route 0.30.0",
  "netlink-proto",
  "netlink-sys",
@@ -12344,7 +12321,7 @@ dependencies = [
  "ipnet",
  "libc",
  "mockall",
- "netlink-packet-core 0.7.0",
+ "netlink-packet-core",
  "netlink-packet-route 0.30.0",
  "nix 0.31.3",
  "rtnetlink",
