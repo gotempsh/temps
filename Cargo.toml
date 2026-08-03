@@ -386,18 +386,6 @@ debug = false
 #      DEFAULT feature of prometheus 0.13 -- features are additive, so it cannot be
 #      turned off from this workspace without vendoring a pingora fork.)
 #
-# 2. RUSTSEC-2023-0018 / GHSA-mc8h-8q98-g5hr: remove_dir_all 0.5.3 (LOW)
-#    - Path: nixpacks 1.41.0 → tempdir 0.3.7 → remove_dir_all 0.5.3
-#    - Fix: needs nixpacks to drop deprecated tempdir for tempfile. nixpacks 1.41.0
-#      is the crates.io latest and still uses tempdir, which hard-requires
-#      remove_dir_all ^0.5 (so `--precise 0.8.0` is impossible).
-#    - Reachability: the TOCTOU race lives in nixpacks get_output_dir()'s
-#      TempDir::new()/remove_dir_all(output.root) branch, taken only when out_dir
-#      is None. temps-presets always passes out_dir: Some(...) (nixpacks_preset.rs
-#      ~L507), so that branch never executes -> dead code here. (re-verified
-#      2026-07-25: nixpacks_preset.rs:508 is still the ONLY out_dir site in the
-#      whole workspace and still passes Some(...); nixpacks is still 1.41.0 latest.)
-#
 # 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
 #    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
 #      → opentelemetry_sdk 0.30.0
@@ -410,20 +398,6 @@ debug = false
 #      instantiated and .extract() is never called on attacker headers anywhere in
 #      the workspace -> not reachable. (re-verified 2026-07-25: no case-insensitive
 #      match for `baggage` anywhere under crates/.)
-#
-# 2c. GHSA-8wf9-4rjw-8j9r: serde_with 2.3.3 (MEDIUM, dependabot-only)
-#    - Path: nixpacks 1.41.0 → serde_with 2.3.3
-#    - The 3.x copy of serde_with (via cloudflare 0.14) WAS affected and IS fixed:
-#      bumped 3.20.0 → 3.21.0 (see "Previously resolved" below). Only the 2.x copy
-#      remains, and it has no fix: nixpacks requires serde_with ^2.1.0, 2.3.3 is the
-#      latest 2.x ever published, and the fix only landed in 3.21.0.
-#    - Reachability: the panic is in KeyValueMap's Serialize impl on an empty
-#      sequence/map entry. KeyValueMap does exist in 2.3.3 (so the version range is
-#      genuinely accurate here), but nixpacks depends on serde_with with
-#      default-features = false, features = ["macros"] and uses it ONLY for
-#      #[serde_with::skip_serializing_none] (4 sites: nix/pkg.rs, plan/phase.rs x2,
-#      plan/mod.rs). No KeyValueMap reference in nixpacks or in this workspace
-#      -> not reachable. (verified 2026-07-25)
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)
 #    - Path: testcontainers → russh → libcrux-ml-kem → libcrux-intrinsics 0.0.3
@@ -455,10 +429,16 @@ debug = false
 #     out-of-order stream reassembly): RESOLVED by cargo update quinn-proto →
 #     0.11.15. (Orphaned lock entry with no active dependents — bumped for hygiene
 #     so `cargo audit` stays clean.)
+# - remove_dir_all 0.5.3 (RUSTSEC-2023-0018 / GHSA-mc8h-8q98-g5hr) and
+#     serde_with 2.3.3 (GHSA-8wf9-4rjw-8j9r): RESOLVED by replacing the nixpacks
+#     build engine with autopack. Both reached the tree only through
+#     nixpacks 1.41.0 (→ tempdir 0.3.7, and → serde_with ^2.1.0 respectively);
+#     neither had an upstream fix available, so removing the dependency was the
+#     only way to clear them. autopack pulls neither.
 # - serde_with 3.20.0 (GHSA-8wf9-4rjw-8j9r KeyValueMap serialize panic on empty
 #     sequence/map entries): RESOLVED by cargo update serde_with@3.20.0 --precise
 #     3.21.0 (pulls serde_with_macros → 3.21.0). Reached via cloudflare 0.14 →
-#     temps-dns. The 2.x copy from nixpacks has no fix and stays — see 2c above.
+#     temps-dns. The 2.x copy came from nixpacks and left with it.
 # - rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) on rustls 0.21:
 #     RESOLVED by disabling default features on aws-sdk-s3, aws-sdk-sesv2, and
 #     aws-config so the deprecated `rustls` feature (which activates
