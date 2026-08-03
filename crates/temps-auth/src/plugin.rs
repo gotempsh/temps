@@ -62,6 +62,14 @@ impl TempsPlugin for AuthPlugin {
             let user_service = Arc::new(UserService::new(db.clone()));
             context.register_service(user_service.clone());
 
+            let step_up_service =
+                Arc::new(crate::StepUpService::new(db.clone(), user_service.clone()));
+            context.register_service(step_up_service);
+
+            let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> =
+                Arc::new(crate::DefaultSensitiveActionAuthorizer::new(db.clone()));
+            context.register_service(sensitive_action_authorizer);
+
             // Create OidcService
             let oidc_service = Arc::new(crate::oidc_service::OidcService::new(
                 db.clone(),

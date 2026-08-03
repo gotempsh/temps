@@ -211,12 +211,16 @@ async fn validate_session_cookie(
     let session_token = extract_session_from_cookies(req.headers(), crypto)?;
 
     if let Some(token) = session_token {
-        match auth_service.verify_session(&token).await {
-            Ok(user) => {
-                let user_role = determine_user_role(&user, user_service)
+        match auth_service.verify_session_details(&token).await {
+            Ok(verified) => {
+                let user_role = determine_user_role(&verified.user, user_service)
                     .await
                     .unwrap_or(Role::User);
-                return Ok(Some(AuthContext::new_session(user.clone(), user_role)));
+                return Ok(Some(AuthContext::new_persisted_session(
+                    verified.user,
+                    user_role,
+                    verified.session_id,
+                )));
             }
             Err(_) => return Ok(None),
         }

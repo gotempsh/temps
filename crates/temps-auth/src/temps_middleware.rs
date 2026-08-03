@@ -151,7 +151,12 @@ impl AuthMiddleware {
             if let Some(session_token) =
                 self.extract_user_session_from_cookies(req.headers(), &self.cookie_crypto)
             {
-                if let Ok(session_user) = self.auth_service.verify_session(&session_token).await {
+                if let Ok(verified) = self
+                    .auth_service
+                    .verify_session_details(&session_token)
+                    .await
+                {
+                    let session_user = verified.user;
                     let user_role = if self
                         .user_service
                         .is_admin(session_user.id)
@@ -164,9 +169,10 @@ impl AuthMiddleware {
                     };
                     user = Some(session_user.clone());
 
-                    Some(crate::context::AuthContext::new_session(
+                    Some(crate::context::AuthContext::new_persisted_session(
                         session_user,
                         user_role,
+                        verified.session_id,
                     ))
                 } else {
                     None

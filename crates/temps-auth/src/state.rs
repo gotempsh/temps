@@ -22,6 +22,8 @@ pub struct AuthState {
     pub api_key_service: Arc<ApiKeyService>,
     /// User service
     pub user_service: Arc<UserService>,
+    /// Session-scoped sensitive-action verification service
+    pub step_up_service: Arc<crate::StepUpService>,
     /// Cookie crypto service
     pub cookie_crypto: Arc<CookieCrypto>,
     /// Deployment token validation service
@@ -45,6 +47,7 @@ impl AuthState {
         let auth_service = Arc::new(AuthService::new(db.clone(), notification_service));
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
         let user_service = Arc::new(UserService::new(db.clone()));
+        let step_up_service = Arc::new(crate::StepUpService::new(db.clone(), user_service.clone()));
         let deployment_token_service = Arc::new(DeploymentTokenValidationService::new(db.clone()));
         let oidc_service = Arc::new(crate::oidc_service::OidcService::new(
             db.clone(),
@@ -58,6 +61,7 @@ impl AuthState {
             api_key_service,
             encryption_service,
             user_service,
+            step_up_service,
             cookie_crypto,
             deployment_token_service,
             oidc_service,

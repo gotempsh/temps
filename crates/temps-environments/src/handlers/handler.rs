@@ -1681,6 +1681,16 @@ pub async fn delete_environment(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::DeleteEnvironment {
+            project_id,
+            environment_id: env_id,
+        },
+    )
+    .await?;
+
     // Get environment details before deletion for audit log
     let environment = state
         .environment_service

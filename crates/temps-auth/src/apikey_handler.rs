@@ -35,6 +35,8 @@ pub struct ApiKeyState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Audit logger for write operations (e.g. key rotation)
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Central policy evaluator for sensitive mutations.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 /// Privilege-escalation ceiling: an API key must never grant more than the
@@ -127,6 +129,13 @@ pub async fn create_api_key(
     permission_guard!(auth, ApiKeysCreate);
 
     enforce_permission_ceiling(&auth, &request)?;
+
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::CreateApiKey,
+    )
+    .await?;
 
     // Capture audit fields before request is moved into the service call.
     let role_type = request.role_type.clone();

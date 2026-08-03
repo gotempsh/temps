@@ -37,6 +37,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 export default function ApiKeyCreate() {
   usePageTitle('Create API Key')
@@ -56,6 +57,8 @@ export default function ApiKeyCreate() {
 
   const { data: permissionsData, isLoading: isLoadingPermissions } =
     useApiKeyPermissions()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const createMutation = useMutation({
     ...createApiKeyMutation(),
@@ -67,6 +70,9 @@ export default function ApiKeyCreate() {
       setCreatedKeyId(response.id)
       setStep(4) // Show success step
       toast.success('API key created successfully')
+    },
+    onError: (error, variables) => {
+      handleSensitiveActionError(error, () => createMutation.mutate(variables))
     },
   })
 
@@ -250,6 +256,7 @@ export default function ApiKeyCreate() {
 
   return (
     <div className="container max-w-4xl mx-auto py-6 space-y-6">
+      {verificationDialog}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="icon" onClick={() => navigate('/settings/keys')}>
