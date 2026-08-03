@@ -396,9 +396,11 @@ pub async fn cli_device_lookup(
     responses(
         (status = 200, description = "Session approved; CLI can now claim the API key", body = CliDeviceApproveResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Browser session required"),
         (status = 404, description = "Unknown user_code"),
         (status = 409, description = "Already resolved"),
         (status = 410, description = "Session expired"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication",
@@ -410,6 +412,8 @@ pub async fn cli_device_approve(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CliDeviceApproveRequest>,
 ) -> Result<Json<CliDeviceApproveResponse>, Problem> {
+    require_cli_device_approval(state.sensitive_action_authorizer.as_ref(), &auth).await?;
+
     let user = auth.require_user().map_err(|msg| {
         problem_new(StatusCode::FORBIDDEN)
             .with_title("User Required")
@@ -521,6 +525,14 @@ pub async fn cli_device_approve(
         user_code: session.user_code,
         status: status::APPROVED.to_string(),
     }))
+}
+
+async fn require_cli_device_approval(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &crate::AuthContext,
+) -> Result<(), Problem> {
+    crate::require_sensitive_action(authorizer, auth, temps_core::SensitiveAction::CreateApiKey)
+        .await
 }
 
 #[utoipa::path(
@@ -788,6 +800,54 @@ fn sanitize_device_label(raw: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_entities::users;
+
+    fn test_user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 7,
+            name: "CLI Approver".to_string(),
+            email: "approver@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_cannot_approve_device_session_or_mint_cli_key() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let authorizer = crate::DefaultSensitiveActionAuthorizer::new(db);
+        let auth = crate::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "automation".to_string(),
+            9,
+        );
+
+        let error = require_cli_device_approval(&authorizer, &auth)
+            .await
+            .expect_err("machine credentials must not approve an interactive device login");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("create_api_key"))
+        );
+    }
 
     #[test]
     fn user_code_is_dashed_eight_plus_dash() {

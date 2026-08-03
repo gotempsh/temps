@@ -4,8 +4,8 @@ use chrono::Utc;
 use qrcode::QrCode;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
@@ -732,13 +732,29 @@ impl UserService {
         user_id: i32,
         code: &str,
     ) -> Result<bool, UserServiceError> {
-        // Lock the user row for the entire verification. Recovery codes are
-        // single-use credentials, so checking and consuming one must be one
-        // atomic operation; otherwise concurrent requests could reuse it.
         let transaction = self.db.begin().await?;
+        let valid = self
+            .verify_mfa_code_in_transaction(&transaction, user_id, code)
+            .await?;
+        transaction.commit().await?;
+        Ok(valid)
+    }
+
+    /// Verify MFA while keeping the user row locked in the caller's
+    /// transaction. Step-up authorization uses this to make recovery-code
+    /// consumption and session elevation one atomic state transition.
+    pub(crate) async fn verify_mfa_code_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        user_id: i32,
+        code: &str,
+    ) -> Result<bool, UserServiceError> {
+        // Recovery codes are single-use credentials, so checking and
+        // consuming one must remain under this exclusive row lock.
         let user = temps_entities::users::Entity::find_by_id(user_id)
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_exclusive()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
@@ -784,8 +800,7 @@ impl UserService {
 
                     let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
                     user_update.mfa_recovery_codes = Set(Some(serde_json::to_string(&new_codes)?));
-                    user_update.update(&transaction).await?;
-                    transaction.commit().await?;
+                    user_update.update(transaction).await?;
 
                     return Ok(true);
                 }
@@ -808,11 +823,8 @@ impl UserService {
         )
         .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
-        let valid = totp
-            .check_current(code)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))?;
-        transaction.commit().await?;
-        Ok(valid)
+        totp.check_current(code)
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))
     }
 
     pub async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {

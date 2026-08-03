@@ -11,6 +11,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { verifyStepUp, type ProblemDetails } from '@/api/client'
+import { canCloseSensitiveActionDialog } from '@/lib/sensitiveActionProblem'
 import { AlertCircle, KeyRound, Loader2 } from 'lucide-react'
 import { FormEvent, useState } from 'react'
 import { Link } from 'react-router'
@@ -33,6 +34,7 @@ export function SensitiveActionVerificationDialog({
   const [isVerifying, setIsVerifying] = useState(false)
 
   const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && !canCloseSensitiveActionDialog(isVerifying)) return
     if (!nextOpen) {
       setCode('')
       setError(null)
@@ -56,7 +58,8 @@ export function SensitiveActionVerificationDialog({
         const problem = response.error as ProblemDetails
         throw new Error(problem?.detail || 'Verification failed. Try again.')
       }
-      handleOpenChange(false)
+      setCode('')
+      setError(null)
       onVerified()
     } catch (verificationError) {
       setError(
@@ -71,7 +74,14 @@ export function SensitiveActionVerificationDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent>
+      <DialogContent
+        onEscapeKeyDown={(event) => {
+          if (isVerifying) event.preventDefault()
+        }}
+        onPointerDownOutside={(event) => {
+          if (isVerifying) event.preventDefault()
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <KeyRound className="h-5 w-5" />

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use std::sync::Arc;
 use temps_core::{
     problemdetails::Problem, SensitiveAction, SensitiveActionAuthorizationError,
@@ -126,27 +126,50 @@ impl StepUpService {
         session_id: i32,
         code: &str,
     ) -> Result<chrono::DateTime<Utc>, StepUpError> {
-        let user = temps_entities::users::Entity::find_by_id(user_id)
-            .filter(temps_entities::users::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
+        let transaction = self
+            .db
+            .begin()
             .await
             .map_err(|error| StepUpError::Database {
-                operation: "load the verification user",
+                operation: "begin atomic verification",
                 user_id,
                 session_id: Some(session_id),
                 reason: error.to_string(),
-            })?
-            .ok_or(StepUpError::UserNotFound { user_id })?;
+            })?;
 
-        if !user.mfa_enabled {
-            return Err(StepUpError::MfaNotConfigured { user_id });
+        let valid = self
+            .user_service
+            .verify_mfa_code_in_transaction(&transaction, user_id, code)
+            .await
+            .map_err(|error| match error {
+                crate::user_service::UserServiceError::MfaNotSetup(_) => {
+                    StepUpError::MfaNotConfigured { user_id }
+                }
+                crate::user_service::UserServiceError::NotFound(_) => {
+                    StepUpError::UserNotFound { user_id }
+                }
+                crate::user_service::UserServiceError::Database { reason } => {
+                    StepUpError::Database {
+                        operation: "verify MFA",
+                        user_id,
+                        session_id: Some(session_id),
+                        reason,
+                    }
+                }
+                other => StepUpError::Verification {
+                    user_id,
+                    reason: other.to_string(),
+                },
+            })?;
+        if !valid {
+            return Err(StepUpError::InvalidCode { user_id });
         }
 
         let session = temps_entities::sessions::Entity::find_by_id(session_id)
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             .filter(temps_entities::sessions::Column::MfaPending.eq(false))
-            .one(self.db.as_ref())
+            .one(&transaction)
             .await
             .map_err(|error| StepUpError::Database {
                 operation: "load the active session",
@@ -159,26 +182,23 @@ impl StepUpService {
                 session_id,
             })?;
 
-        let valid = self
-            .user_service
-            .verify_mfa_code(user_id, code)
-            .await
-            .map_err(|error| StepUpError::Verification {
-                user_id,
-                reason: error.to_string(),
-            })?;
-        if !valid {
-            return Err(StepUpError::InvalidCode { user_id });
-        }
-
         let expires_at = Utc::now() + Duration::minutes(STEP_UP_TTL_MINUTES);
         let mut session_update: temps_entities::sessions::ActiveModel = session.into();
         session_update.step_up_expires_at = Set(Some(expires_at));
         session_update
-            .update(self.db.as_ref())
+            .update(&transaction)
             .await
             .map_err(|error| StepUpError::Database {
                 operation: "persist the elevated session",
+                user_id,
+                session_id: Some(session_id),
+                reason: error.to_string(),
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| StepUpError::Database {
+                operation: "commit atomic verification",
                 user_id,
                 session_id: Some(session_id),
                 reason: error.to_string(),
@@ -448,15 +468,14 @@ mod tests {
         let test_user = user(true);
         let active_session = session(None);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![test_user.clone()]])
-            .append_query_results([vec![active_session]])
             .append_query_results([vec![test_user]])
+            .append_query_results([vec![active_session]])
             .append_query_results([vec![session(Some(
                 Utc::now() + Duration::minutes(STEP_UP_TTL_MINUTES),
             ))]])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
+        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db.clone())));
 
         let expires_at = service
             .verify_and_elevate(7, 11, &current_totp_code())
@@ -464,6 +483,23 @@ mod tests {
             .expect("valid MFA should elevate the active session");
 
         assert!(expires_at > Utc::now() + Duration::minutes(4));
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "verification and elevation must be atomic");
+        let statements = log[0].statements();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("FOR UPDATE")),
+            "the MFA user row must remain locked until elevation commits"
+        );
+        assert!(statements.iter().any(|statement| {
+            statement.sql.starts_with("UPDATE \"sessions\"")
+                && statement.sql.contains("step_up_expires_at")
+        }));
     }
 
     #[tokio::test]
@@ -485,8 +521,6 @@ mod tests {
     async fn invalid_code_does_not_elevate_the_session() {
         let test_user = user(true);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![test_user.clone()]])
-            .append_query_results([vec![session(None)]])
             .append_query_results([vec![test_user]])
             .into_connection();
         let db = Arc::new(db);
@@ -500,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_session_is_rejected_before_code_verification() {
+    async fn expired_session_is_rejected_without_committing_elevation() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![user(true)]])
             .append_query_results([Vec::<temps_entities::sessions::Model>::new()])
@@ -508,7 +542,9 @@ mod tests {
         let db = Arc::new(db);
         let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
 
-        let result = service.verify_and_elevate(7, 11, "123456").await;
+        let result = service
+            .verify_and_elevate(7, 11, &current_totp_code())
+            .await;
         assert!(matches!(
             result,
             Err(StepUpError::SessionNotFound {

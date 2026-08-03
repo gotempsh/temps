@@ -401,6 +401,7 @@ pub async fn activate_api_key(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     tag = "API Keys",
@@ -415,6 +416,13 @@ pub async fn rotate_api_key(
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
+
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::RotateApiKey { api_key_id },
+    )
+    .await?;
 
     let target = state
         .api_key_service
@@ -502,11 +510,65 @@ pub struct ApiKeyApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::{SensitiveActionAuthorizationError, SensitiveActionDecision};
     use temps_entities::users;
 
     use crate::context::AuthContext;
     use crate::permissions::Role;
+
+    struct RequireVerificationAuthorizer;
+
+    #[async_trait]
+    impl temps_core::SensitiveActionAuthorizer for RequireVerificationAuthorizer {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
+            Ok(SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            })
+        }
+    }
+
+    struct NoopAuditLogger;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn guarded_state() -> Arc<ApiKeyState> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        Arc::new(ApiKeyState {
+            api_key_service: Arc::new(ApiKeyService::new(db)),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(RequireVerificationAuthorizer),
+        })
+    }
+
+    fn request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "sensitive-action-handler-test".to_string(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
 
     fn test_user(id: i32) -> users::Model {
         let now = Utc::now();
@@ -537,6 +599,52 @@ mod tests {
 
     fn api_key_auth(role: Role) -> AuthContext {
         AuthContext::new_api_key(test_user(42), Some(role), None, "caller".to_string(), 7)
+    }
+
+    fn persisted_admin_auth() -> AuthContext {
+        AuthContext::new_persisted_session(test_user(42), Role::Admin, 99)
+    }
+
+    #[tokio::test]
+    async fn create_handler_stops_before_service_when_step_up_is_required() {
+        let result = create_api_key(
+            RequireAuth(persisted_admin_auth()),
+            State(guarded_state()),
+            Extension(request_metadata()),
+            Json(predefined_request("admin")),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("API key creation must stop before querying the service"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("create_api_key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_handler_stops_before_service_when_step_up_is_required() {
+        let result = rotate_api_key(
+            RequireAuth(persisted_admin_auth()),
+            State(guarded_state()),
+            Extension(request_metadata()),
+            Path(123),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("API key rotation must stop before querying the service"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("rotate_api_key"))
+        );
     }
 
     fn custom_request(permissions: Vec<&str>) -> CreateApiKeyRequest {

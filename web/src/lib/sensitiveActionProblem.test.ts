@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
   isStepUpRequired,
+  canCloseSensitiveActionDialog,
+  oneShotSensitiveActionRetry,
   requiresMfaSetup,
+  sensitiveActionErrorMessage,
   type SensitiveActionProblem,
 } from './sensitiveActionProblem'
 
@@ -41,5 +44,33 @@ describe('sensitive action problems', () => {
       isStepUpRequired(problem({ extensions: { error_code: 'FORBIDDEN' } }))
     ).toBe(false)
     expect(isStepUpRequired(new Error('network failure'))).toBe(false)
+  })
+
+  test('a sensitive-action retry can only run once', () => {
+    let attempts = 0
+    const retry = oneShotSensitiveActionRetry(() => attempts++)
+
+    retry()
+    retry()
+
+    expect(attempts).toBe(1)
+  })
+
+  test('the dialog cannot close while verification is in flight', () => {
+    expect(canCloseSensitiveActionDialog(false)).toBe(true)
+    expect(canCloseSensitiveActionDialog(true)).toBe(false)
+  })
+
+  test('unrelated mutation failures retain an actionable message', () => {
+    expect(
+      sensitiveActionErrorMessage(
+        { detail: 'The API key name is already in use.' },
+        'Could not create API key'
+      )
+    ).toBe('The API key name is already in use.')
+    expect(
+      sensitiveActionErrorMessage(new Error('Network unavailable'), 'Fallback')
+    ).toBe('Network unavailable')
+    expect(sensitiveActionErrorMessage({}, 'Fallback')).toBe('Fallback')
   })
 })

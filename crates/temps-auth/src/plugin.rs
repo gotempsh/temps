@@ -62,10 +62,6 @@ impl TempsPlugin for AuthPlugin {
             let user_service = Arc::new(UserService::new(db.clone()));
             context.register_service(user_service.clone());
 
-            let step_up_service =
-                Arc::new(crate::StepUpService::new(db.clone(), user_service.clone()));
-            context.register_service(step_up_service);
-
             let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> =
                 Arc::new(crate::DefaultSensitiveActionAuthorizer::new(db.clone()));
             context.register_service(sensitive_action_authorizer);
@@ -134,7 +130,13 @@ impl TempsPlugin for AuthPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the AuthState
-        let auth_state = context.require_service::<AuthState>();
+        let auth_state = Arc::new(
+            (*context.require_service::<AuthState>())
+                .clone()
+                .with_sensitive_action_authorizer(
+                    context.require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+                ),
+        );
 
         // Use the existing configure_routes function which includes all endpoints
         let auth_routes = handlers::configure_routes()

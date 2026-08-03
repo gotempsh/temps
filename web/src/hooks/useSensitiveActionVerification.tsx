@@ -1,5 +1,6 @@
 import {
   isStepUpRequired,
+  oneShotSensitiveActionRetry,
   requiresMfaSetup,
 } from '@/lib/sensitiveActionProblem'
 import { SensitiveActionVerificationDialog } from '@/components/auth/SensitiveActionVerificationDialog'
@@ -20,7 +21,10 @@ export function useSensitiveActionVerification() {
   const handleSensitiveActionError = useCallback(
     (error: unknown, retry: () => void): boolean => {
       if (!isStepUpRequired(error)) return false
-      setPending({ retry, mfaSetupRequired: requiresMfaSetup(error) })
+      setPending({
+        retry: oneShotSensitiveActionRetry(retry),
+        mfaSetupRequired: requiresMfaSetup(error),
+      })
       return true
     },
     []

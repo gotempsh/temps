@@ -13,6 +13,9 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SensitiveAction {
     CreateApiKey,
+    RotateApiKey {
+        api_key_id: i32,
+    },
     DeleteEnvironment {
         project_id: i32,
         environment_id: i32,
@@ -25,6 +28,7 @@ impl SensitiveAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateApiKey => "create_api_key",
+            Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
         }
     }
@@ -92,6 +96,10 @@ mod tests {
     #[test]
     fn action_identifiers_are_stable_and_resource_independent() {
         assert_eq!(SensitiveAction::CreateApiKey.as_str(), "create_api_key");
+        assert_eq!(
+            SensitiveAction::RotateApiKey { api_key_id: 13 }.as_str(),
+            "rotate_api_key"
+        );
         assert_eq!(
             SensitiveAction::DeleteEnvironment {
                 project_id: 7,

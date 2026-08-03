@@ -467,6 +467,7 @@ pub async fn verify_mfa_challenge(
         (status = 400, description = "Verification code is empty"),
         (status = 401, description = "Invalid code or expired session"),
         (status = 403, description = "Browser session required"),
+        (status = 429, description = "Too many verification attempts"),
         (status = 428, description = "MFA setup required"),
         (status = 500, description = "Verification infrastructure failed")
     ),
@@ -496,6 +497,21 @@ pub async fn verify_step_up(
             .build()
     })?;
     let user_id = auth.user_id();
+    let rate_limit_key = format!("user:{user_id}:session:{session_id}");
+    if auth_state
+        .step_up_rate_limiter
+        .check(&rate_limit_key)
+        .await
+        .is_err()
+    {
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Too Many Verification Attempts")
+                .detail("Wait before trying another verification code")
+                .value("error_code", "STEP_UP_RATE_LIMITED")
+                .build(),
+        );
+    }
 
     let result = auth_state
         .step_up_service

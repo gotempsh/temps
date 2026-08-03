@@ -38,6 +38,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 
 export default function ApiKeyCreate() {
   usePageTitle('Create API Key')
@@ -72,7 +73,16 @@ export default function ApiKeyCreate() {
       toast.success('API key created successfully')
     },
     onError: (error, variables) => {
-      handleSensitiveActionError(error, () => createMutation.mutate(variables))
+      if (
+        handleSensitiveActionError(error, () =>
+          createMutation.mutate(variables)
+        )
+      ) {
+        return
+      }
+      toast.error(
+        sensitiveActionErrorMessage(error, 'Failed to create API key')
+      )
     },
   })
 
@@ -246,7 +256,9 @@ export default function ApiKeyCreate() {
                   Edit Permissions
                 </Button>
               )}
-              <Button onClick={() => navigate('/settings/keys')}>Go to API Keys</Button>
+              <Button onClick={() => navigate('/settings/keys')}>
+                Go to API Keys
+              </Button>
             </div>
           </CardContent>
         </Card>
@@ -259,7 +271,11 @@ export default function ApiKeyCreate() {
       {verificationDialog}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate('/settings/keys')}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => navigate('/settings/keys')}
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
@@ -340,7 +356,8 @@ export default function ApiKeyCreate() {
                   autoFocus
                 />
                 <p className="text-sm text-muted-foreground">
-                  Choose a name that helps you remember what this key is used for
+                  Choose a name that helps you remember what this key is used
+                  for
                 </p>
               </div>
 
@@ -364,7 +381,11 @@ export default function ApiKeyCreate() {
               </div>
 
               <div className="flex justify-end gap-3">
-                <Button type="button" variant="outline" onClick={() => navigate('/settings/keys')}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => navigate('/settings/keys')}
+                >
                   Cancel
                 </Button>
                 <Button type="submit" disabled={!canProceed()}>
@@ -566,7 +587,10 @@ export default function ApiKeyCreate() {
               Back
             </Button>
             <div className="flex gap-3">
-              <Button variant="outline" onClick={() => navigate('/settings/keys')}>
+              <Button
+                variant="outline"
+                onClick={() => navigate('/settings/keys')}
+              >
                 Cancel
               </Button>
               <Button onClick={() => setStep(3)} disabled={!canProceed()}>
@@ -653,7 +677,10 @@ export default function ApiKeyCreate() {
                 Back
               </Button>
               <div className="flex gap-3">
-                <Button variant="outline" onClick={() => navigate('/settings/keys')}>
+                <Button
+                  variant="outline"
+                  onClick={() => navigate('/settings/keys')}
+                >
                   Cancel
                 </Button>
                 <Button

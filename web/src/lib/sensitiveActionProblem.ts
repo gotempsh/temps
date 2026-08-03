@@ -25,3 +25,32 @@ export function isStepUpRequired(
 export function requiresMfaSetup(problem: SensitiveActionProblem): boolean {
   return extension<boolean>(problem, 'mfa_setup_required') === true
 }
+
+/** Wrap a destructive retry so duplicate verification callbacks cannot run it twice. */
+export function oneShotSensitiveActionRetry(retry: () => void): () => void {
+  let consumed = false
+  return () => {
+    if (consumed) return
+    consumed = true
+    retry()
+  }
+}
+
+export function canCloseSensitiveActionDialog(isVerifying: boolean): boolean {
+  return !isVerifying
+}
+
+export function sensitiveActionErrorMessage(
+  error: unknown,
+  fallback: string
+): string {
+  if (!error || typeof error !== 'object') return fallback
+  const problem = error as { detail?: unknown; message?: unknown }
+  if (typeof problem.detail === 'string' && problem.detail.trim()) {
+    return problem.detail
+  }
+  if (typeof problem.message === 'string' && problem.message.trim()) {
+    return problem.message
+  }
+  return fallback
+}

@@ -21673,6 +21673,10 @@ export type RotateApiKeyErrors = {
      */
     404: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -21700,6 +21704,10 @@ export type CliDeviceApproveErrors = {
      */
     401: unknown;
     /**
+     * Browser session required
+     */
+    403: unknown;
+    /**
      * Unknown user_code
      */
     404: unknown;
@@ -21711,6 +21719,10 @@ export type CliDeviceApproveErrors = {
      * Session expired
      */
     410: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -22063,6 +22075,10 @@ export type VerifyStepUpErrors = {
      * MFA setup required
      */
     428: unknown;
+    /**
+     * Too many verification attempts
+     */
+    429: unknown;
     /**
      * Verification infrastructure failed
      */
