@@ -21,9 +21,7 @@ import {
   Activity,
   BarChart3,
   Bug,
-  Check,
   ChevronRight,
-  Circle,
   Database,
   DollarSign,
   Globe,
@@ -74,11 +72,7 @@ function getChangeDisplay(change: number | undefined, inverse = false) {
 }
 
 type OnboardingStepId =
-  | 'analytics'
-  | 'errors'
-  | 'domain'
-  | 'monitoring'
-  | 'storage'
+  'analytics' | 'errors' | 'domain' | 'monitoring' | 'storage'
 
 interface OnboardingStep {
   id: OnboardingStepId
@@ -265,161 +259,154 @@ export function ProjectOverview({
   const totalCount = steps.length
   const percent = Math.round((doneCount / totalCount) * 100)
   const allDone = doneCount === totalCount
+  const remainingSteps = steps.filter((step) => !step.done)
 
   return (
-    <>
+    <div
+      className={cn(
+        !isLoadingOnboarding &&
+          !allDone &&
+          'grid gap-4 sm:gap-6 xl:grid-cols-[17rem_minmax(0,1fr)]'
+      )}
+    >
       {!isLoadingOnboarding && !allDone && (
-        <section className="mb-4 overflow-hidden rounded-xl border bg-card sm:mb-6">
-          <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:p-5">
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-base font-semibold tracking-tight">
-                  Finish setting up {project.slug}
+        <aside aria-labelledby="project-setup-heading">
+          <section className="overflow-hidden rounded-xl border bg-card">
+            <div className="p-4">
+              <div className="flex items-center justify-between gap-3">
+                <h2
+                  id="project-setup-heading"
+                  className="text-sm font-semibold tracking-tight"
+                >
+                  Finish setup
                 </h2>
-                <Badge variant="secondary" className="tabular-nums">
-                  {doneCount} / {totalCount}
-                </Badge>
+                <span className="text-xs tabular-nums text-muted-foreground">
+                  {doneCount} of {totalCount}
+                </span>
               </div>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Wire up observability and infrastructure so Temps can start
-                capturing data and serving your app.
-              </p>
-            </div>
-            <div className="flex items-center gap-3 sm:w-64 sm:shrink-0">
-              <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+              <div
+                className="mt-3 h-1 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-label="Project setup progress"
+                aria-valuemin={0}
+                aria-valuemax={totalCount}
+                aria-valuenow={doneCount}
+              >
                 <div
-                  className="h-full bg-primary [transition-duration:400ms] transition-all"
+                  className="h-full rounded-full bg-primary transition-all [transition-duration:400ms]"
                   style={{ width: `${percent}%` }}
                 />
               </div>
-              <span className="text-sm font-medium tabular-nums text-muted-foreground">
-                {percent}%
-              </span>
             </div>
-          </div>
-          <ul role="list" className="divide-y">
-            {steps.map((step) => (
-              <li key={step.id}>
-                <Link
-                  to={step.href}
-                  className={cn(
-                    'group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50 sm:gap-4 sm:px-5 sm:py-4',
-                    step.done && 'opacity-60'
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'flex size-7 shrink-0 items-center justify-center rounded-full border',
-                      step.done
-                        ? 'border-emerald-500 bg-emerald-500 text-white'
-                        : 'border-muted-foreground/30 text-muted-foreground'
-                    )}
+
+            <ul role="list" className="border-t p-2">
+              {remainingSteps.map((step) => (
+                <li key={step.id}>
+                  <Link
+                    to={step.href}
+                    className="group flex items-center gap-3 rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    {step.done ? (
-                      <Check className="size-4" strokeWidth={3} />
-                    ) : (
-                      <Circle className="size-4" />
-                    )}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                      <p
-                        className={cn(
-                          'text-sm font-medium',
-                          step.done && 'line-through'
-                        )}
-                      >
+                    <span className="flex size-8 shrink-0 items-center justify-center rounded-lg border bg-background text-muted-foreground transition-colors group-hover:text-foreground">
+                      {step.icon}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-medium leading-tight">
                         {step.title}
-                      </p>
-                      {!step.done && (
-                        <span className="text-xs text-muted-foreground tabular-nums">
-                          · {step.estimate}
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-0.5 text-sm text-muted-foreground">
-                      {step.description}
-                    </p>
-                  </div>
-                  {!step.done && (
+                      </span>
+                      <span className="mt-0.5 block text-xs tabular-nums text-muted-foreground">
+                        {step.estimate}
+                      </span>
+                      <span className="sr-only">{step.description}</span>
+                    </span>
                     <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  )}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </section>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+
+            {doneCount > 0 && (
+              <p className="border-t px-4 py-3 text-xs text-muted-foreground">
+                {doneCount} {doneCount === 1 ? 'step' : 'steps'} completed
+              </p>
+            )}
+          </section>
+        </aside>
       )}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3 lg:gap-6">
-        {isLoadingVisitors ? (
-          <Skeleton className="h-24" />
-        ) : visitorError ? (
+      <div className="min-w-0">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3 lg:gap-6">
+          {isLoadingVisitors ? (
+            <Skeleton className="h-24" />
+          ) : visitorError ? (
+            <Link
+              to={`/projects/${project.slug}/analytics`}
+              className="h-full w-full"
+            >
+              <MetricCard
+                title="Visitors last 24 hours (Unique)"
+                icon={<Users />}
+                value="Error"
+                change=""
+                error={true}
+              />
+            </Link>
+          ) : (
+            <Link
+              to={`/projects/${project.slug}/analytics`}
+              className="h-full w-full"
+            >
+              <MetricCard
+                change=""
+                changeDisplay={getChangeDisplay(
+                  Number((visitorStats?.count || 0).toFixed(1))
+                )}
+                value={visitorStats?.count || '0'}
+                title="Visitors last 24 hours"
+                icon={<Users />}
+              />
+            </Link>
+          )}
+
+          <RevenueMetric project={project} />
+
           <Link
-            to={`/projects/${project.slug}/analytics`}
+            to={`/projects/${project.slug}/errors`}
             className="h-full w-full"
           >
             <MetricCard
-              title="Visitors last 24 hours (Unique)"
-              icon={<Users />}
-              value="Error"
-              change=""
-              error={true}
+              change={''}
+              value={errorStats?.error_groups?.toFixed(2) || '0'}
+              title="Errors"
+              icon={<Bug />}
             />
           </Link>
-        ) : (
-          <Link
-            to={`/projects/${project.slug}/analytics`}
-            className="h-full w-full"
+        </div>
+
+        <div className="mt-4 sm:mt-6">
+          {currentDeployment && (
+            <LastDeployment
+              deployment={currentDeployment}
+              projectName={project.slug}
+            />
+          )}
+        </div>
+
+        <div className="mt-4 sm:mt-6">
+          <DeploymentActivityGraph projectId={project.id} />
+        </div>
+
+        <div className="mt-4 flex justify-center sm:mt-6">
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new Event(PROJECT_TOUR_EVENT))}
+            className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
-            <MetricCard
-              change=""
-              changeDisplay={getChangeDisplay(
-                Number((visitorStats?.count || 0).toFixed(1))
-              )}
-              value={visitorStats?.count || '0'}
-              title="Visitors last 24 hours"
-              icon={<Users />}
-            />
-          </Link>
-        )}
-
-        <RevenueMetric project={project} />
-
-        <Link to={`/projects/${project.slug}/errors`} className="h-full w-full">
-          <MetricCard
-            change={''}
-            value={errorStats?.error_groups?.toFixed(2) || '0'}
-            title="Errors"
-            icon={<Bug />}
-          />
-        </Link>
+            <Sparkles className="size-3.5" />
+            Take a tour of your project
+          </button>
+        </div>
       </div>
-
-      <div className="mt-4 sm:mt-6">
-        {currentDeployment && (
-          <LastDeployment
-            deployment={currentDeployment}
-            projectName={project.slug}
-          />
-        )}
-      </div>
-
-      <div className="mt-4 sm:mt-6">
-        <DeploymentActivityGraph projectId={project.id} />
-      </div>
-
-      <div className="mt-4 flex justify-center sm:mt-6">
-        <button
-          type="button"
-          onClick={() => window.dispatchEvent(new Event(PROJECT_TOUR_EVENT))}
-          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <Sparkles className="size-3.5" />
-          Take a tour of your project
-        </button>
-      </div>
-    </>
+    </div>
   )
 }
 
