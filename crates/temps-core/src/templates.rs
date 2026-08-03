@@ -241,6 +241,27 @@ pub enum TemplateConfigError {
 /// Bundled default templates (embedded at compile time)
 const BUNDLED_TEMPLATES: &str = include_str!("../templates.yaml");
 
+/// Maximum template slug length accepted by the catalog and project schema.
+pub const MAX_TEMPLATE_SLUG_CHARS: usize = 255;
+
+/// Fixed, reviewable labels that are safe to include in anonymous telemetry.
+///
+/// Operators can load private templates with arbitrary slugs. Those slugs must
+/// never leave the instance, so telemetry callers must pass them through
+/// [`telemetry_safe_template_slug`] and treat `None` as a custom template.
+const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
+    "observability-starter",
+    "nextjs-saas-starter",
+    "nextjs-docs-template",
+];
+
+/// Return the slug only when it is a fixed label from the bundled catalog.
+pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
+    BUNDLED_TELEMETRY_TEMPLATE_SLUGS
+        .contains(&slug)
+        .then_some(slug)
+}
+
 /// Template service that manages loading and caching templates
 pub struct TemplateService {
     config: Arc<RwLock<TemplatesConfig>>,
@@ -308,6 +329,10 @@ impl TemplateService {
         // Check for empty slug
         if template.slug.is_empty() {
             errors.push("Slug cannot be empty".to_string());
+        } else if template.slug.chars().count() > MAX_TEMPLATE_SLUG_CHARS {
+            errors.push(format!(
+                "Slug cannot exceed {MAX_TEMPLATE_SLUG_CHARS} characters"
+            ));
         }
 
         // Check for empty name
@@ -759,6 +784,39 @@ templates:
             starter.services.iter().any(|s| s == "postgres"),
             "observability-starter must depend on postgres"
         );
+    }
+
+    #[test]
+    fn telemetry_slug_allowlist_exactly_matches_bundled_catalog() {
+        let config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+            .expect("bundled templates.yaml must parse");
+        let bundled: std::collections::BTreeSet<&str> = config
+            .templates
+            .iter()
+            .map(|template| template.slug.as_str())
+            .collect();
+        let allowlisted: std::collections::BTreeSet<&str> =
+            BUNDLED_TELEMETRY_TEMPLATE_SLUGS.iter().copied().collect();
+
+        assert_eq!(
+            allowlisted, bundled,
+            "every bundled slug must be explicitly reviewed for telemetry, and custom slugs must stay excluded"
+        );
+        assert_eq!(
+            telemetry_safe_template_slug("observability-starter"),
+            Some("observability-starter")
+        );
+        assert_eq!(telemetry_safe_template_slug("customer-acme-private"), None);
+    }
+
+    #[test]
+    fn template_validation_rejects_slug_longer_than_project_column() {
+        let mut config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).expect("sample config parses");
+        config.templates[0].slug = "x".repeat(MAX_TEMPLATE_SLUG_CHARS + 1);
+
+        let errors = TemplateService::validate_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].errors.iter().any(|error| error.contains("255")));
     }
 
     #[test]

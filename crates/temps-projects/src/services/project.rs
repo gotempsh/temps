@@ -270,6 +270,15 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
+        if request.template_slug.as_deref().is_some_and(|slug| {
+            slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+        }) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template slug cannot exceed {} characters",
+                temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+            )));
+        }
+
         // Verify storage service IDs exist if provided
         if !request.storage_service_ids.is_empty() {
             use temps_entities::external_services;
@@ -3571,6 +3580,30 @@ mod tests {
             persisted.template_slug.as_deref(),
             Some("observability-starter")
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+        let mut request = create_request("Custom Template");
+        request.template_slug =
+            Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+
+        let error = match project_service.create_project(request).await {
+            Ok(_) => panic!("oversized template slug must be rejected before insertion"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::InvalidInput(message) if message.contains("255")
+        ));
     }
 
     #[tokio::test]
