@@ -2182,3 +2182,108 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
 
     Ok(())
 }
+
+/// The feature-flag migration must be reversible: `down` drops the child table
+/// before the parent, and a re-`up` must rebuild the exact schema.
+///
+/// Worth a dedicated test because the two tables are linked by a foreign key,
+/// so dropping them in the wrong order fails, and because a half-applied
+/// rollback would leave an operator unable to migrate forward again.
+#[tokio::test]
+async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping feature-flag migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        2,
+        "both feature-flag tables must exist after `up`"
+    );
+
+    // Roll back exactly through the feature-flag migration, wherever it sits
+    // in the chain — a hardcoded step count breaks the moment a newer
+    // migration lands after it.
+    let target = "m20260802_000002_create_feature_flags";
+    let after = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT count(*)::int AS n FROM seaql_migrations WHERE version > '{target}'"),
+        ))
+        .await?
+        .expect("seaql_migrations count");
+    let steps_after: i32 = after.try_get("", "n")?;
+
+    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        0,
+        "`down` must drop both tables, child before parent"
+    );
+
+    // Forward again: an operator who rolled back must be able to upgrade.
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        2,
+        "re-running `up` after a rollback must rebuild both tables"
+    );
+
+    // The column that was deliberately dropped from the design must not
+    // reappear: it could only ever have been NULL, and surfacing an
+    // always-empty "last evaluated" would invite deleting a live flag.
+    let stale_column = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM information_schema.columns \
+             WHERE table_name = 'feature_flag_environments' \
+               AND column_name = 'last_evaluated_at'"
+                .to_string(),
+        ))
+        .await?
+        .expect("column count");
+    let stale: i32 = stale_column.try_get("", "n")?;
+    assert_eq!(stale, 0, "last_evaluated_at must not exist");
+
+    Ok(())
+}
+
+async fn feature_flag_table_count(db: &DatabaseConnection) -> anyhow::Result<i32> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM information_schema.tables \
+             WHERE table_schema = 'public' \
+               AND table_name IN ('feature_flags', 'feature_flag_environments')"
+                .to_string(),
+        ))
+        .await?
+        .expect("table count");
+    Ok(row.try_get("", "n")?)
+}
