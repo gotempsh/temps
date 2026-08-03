@@ -1112,6 +1112,7 @@ pub async fn update_project_settings(
         performance_metrics_enabled: None,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
+        image_retention_hours: settings.image_retention_hours,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {

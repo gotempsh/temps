@@ -1560,13 +1560,13 @@ impl ProjectService {
         }
 
         // Update preview environment settings and image retention if any are provided
-        let needs_preview_update = enable_preview_environments.is_some()
+        let needs_project_row_update = enable_preview_environments.is_some()
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
             || preview_envs_wake_timeout_seconds.is_some()
             || image_retention_hours.is_some();
 
-        if needs_preview_update {
+        if needs_project_row_update {
             // Reload project to ensure we have the latest state
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -4480,6 +4480,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial preset_config patch");
@@ -4908,6 +4909,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit empty providers");
@@ -5008,6 +5010,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5107,6 +5110,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5228,6 +5232,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update custom Dockerfile config");
@@ -5463,6 +5468,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update preset and config together");

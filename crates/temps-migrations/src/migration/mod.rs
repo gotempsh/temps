@@ -131,7 +131,6 @@ mod m20260627_000001_node_enrollment_tokens;
 mod m20260627_000002_create_ai_conversations;
 mod m20260628_000001_add_node_to_log_chunks;
 mod m20260628_000001_otel_spans_root_index;
-mod m20260629_000001_add_image_retention_hours;
 mod m20260629_000001_otel_metrics_full_fidelity;
 mod m20260629_000002_add_provider_default_model;
 mod m20260630_000001_add_ai_pending_actions_and_write_toggle;
@@ -192,6 +191,7 @@ mod m20260814_000001_create_otel_span_facets;
 mod m20260814_000002_add_ai_summary_preference;
 mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 mod m20260815_000001_default_preview_inclusion_off;
+mod m20260816_000001_add_image_retention_hours;
 
 pub struct Migrator;
 
@@ -326,7 +326,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260627_000002_create_ai_conversations::Migration),
             Box::new(m20260628_000001_add_node_to_log_chunks::Migration),
             Box::new(m20260628_000001_otel_spans_root_index::Migration),
-            Box::new(m20260629_000001_add_image_retention_hours::Migration),
             Box::new(m20260629_000001_otel_metrics_full_fidelity::Migration),
             Box::new(m20260629_000002_add_provider_default_model::Migration),
             Box::new(m20260630_000001_add_ai_pending_actions_and_write_toggle::Migration),
@@ -418,6 +417,7 @@ impl MigratorTrait for Migrator {
             // the same date and sequence stamp.
             Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
             Box::new(m20260815_000001_default_preview_inclusion_off::Migration),
+            Box::new(m20260816_000001_add_image_retention_hours::Migration),
         ]
     }
 }

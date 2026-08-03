@@ -352,7 +352,8 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
-    /// Hours to retain built Docker images before nightly cleanup. Null = system default (48 h).
+    /// Hours to retain built Docker images before nightly cleanup. Null = use the
+    /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
 }
@@ -697,8 +698,17 @@ pub struct UpdateProjectSettingsRequest {
     /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
     pub preview_envs_wake_timeout_seconds: Option<i32>,
     /// How long (hours) to retain built Docker images before nightly cleanup removes them.
-    /// Set to null to use the system default (48 hours). Valid range: 1–8760.
-    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    /// Set to null to use the system default. Valid range: 1–8760.
+    ///
+    /// Omitting the key leaves the current value unchanged; sending an explicit
+    /// `null` clears the per-project override. `skip_serializing_if` keeps the
+    /// round-trip honest — re-serializing a request that omitted the key must
+    /// not emit `"image_retention_hours": null`, which would mean "reset".
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_retention_hours: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///

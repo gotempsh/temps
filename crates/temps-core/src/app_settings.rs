@@ -94,6 +94,12 @@ pub struct AppSettings {
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
 
+    /// Retention policy for locally-built deployment images. Modeled as a
+    /// settings row (not an env var) per CLAUDE.md so an operator can change
+    /// the system-wide default at runtime without restarting the binary.
+    /// Individual projects override it via `projects.image_retention_hours`.
+    pub image_retention: ImageRetentionSettings,
+
     /// Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
     /// default — see `ClusterDnsSettings` for the incident background and
     /// trade-offs. Must be explicitly enabled by operators who need
@@ -391,6 +397,48 @@ pub struct BuildLimitsSettings {
     /// that exceed it OOM-kill.
     #[schema(minimum = 0, example = 2048)]
     pub memory_limit_mb: u32,
+}
+
+/// System-wide retention policy for locally-built deployment images.
+///
+/// The nightly cleanup removes a Temps-built image only once *every*
+/// deployment that references it is older than the owning project's retention
+/// window. Deleting an image makes rollback/promotion to that deployment
+/// impossible, so the default is deliberately generous: it is a rollback
+/// window, not a cache TTL.
+#[derive(Debug, Clone, Serialize, ToSchema, Deserialize)]
+#[serde(default)]
+pub struct ImageRetentionSettings {
+    /// Whether the nightly pass removes expired deployment images at all.
+    /// Disabling it keeps every built image forever (the pre-0.1 behaviour).
+    pub enabled: bool,
+
+    /// Default hours to keep a built deployment image when the owning project
+    /// has no `image_retention_hours` override. Valid range 1..=8760.
+    #[schema(minimum = 1, maximum = 8760, example = 336)]
+    pub default_hours: i64,
+}
+
+impl Default for ImageRetentionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 14 days. Long enough that a rollback is still possible after a
+            // quiet week; short enough to bound disk growth. A 48h default
+            // would silently destroy the rollback history of any project that
+            // did not deploy over a long weekend.
+            default_hours: 336,
+        }
+    }
+}
+
+impl ImageRetentionSettings {
+    /// Clamp `default_hours` into the range the projects API accepts, so a
+    /// hand-edited settings row can never produce a cutoff that deletes images
+    /// the moment they are built (or one that never expires by accident).
+    pub fn effective_default_hours(&self) -> i64 {
+        self.default_hours.clamp(1, 8760)
+    }
 }
 
 impl Default for BuildLimitsSettings {
@@ -1026,6 +1074,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             docker_registry: DockerRegistrySettings::default(),
+            image_retention: ImageRetentionSettings::default(),
             disk_space_alert: DiskSpaceAlertSettings::default(),
             container_logs: ContainerLogSettings::default(),
             multi_node: MultiNodeSettings::default(),

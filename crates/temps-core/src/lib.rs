@@ -105,6 +105,7 @@ pub use app_settings::{
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    ImageRetentionSettings,
 };
 pub use async_trait;
 pub use chrono;

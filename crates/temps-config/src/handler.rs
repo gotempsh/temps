@@ -19,6 +19,7 @@ use temps_core::{
     DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
     RateLimitSettings, RequestMetadata, RequestTimeoutSettings, ScreenshotSettings,
+    ImageRetentionSettings,
     SecurityHeadersSettings,
 };
 use tracing::{error, info};
@@ -228,6 +229,9 @@ pub struct AppSettingsResponse {
     /// `--disable-self-update` refuses regardless of what this says, which
     /// `GET /settings/update` reports as the authoritative answer.
     pub self_update: temps_core::SelfUpdateSettings,
+    /// Deployment-image retention policy. No sensitive content, passed through
+    /// as-is so the settings UI can show and edit the system-wide default.
+    pub image_retention: ImageRetentionSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -452,6 +456,7 @@ impl From<AppSettings> for AppSettingsResponse {
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
             self_update,
+            image_retention: settings.image_retention,
         }
     }
 }

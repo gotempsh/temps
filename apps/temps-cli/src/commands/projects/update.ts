@@ -100,10 +100,36 @@ export async function updateSettingsAction(
     slug?: string
     attackMode?: boolean
     previewEnvs?: boolean
+    imageRetentionHours?: string
+    resetImageRetention?: boolean
     json?: boolean
     yes?: boolean
   }
 ): Promise<void> {
+  // Validate arguments before authenticating or hitting the network, so a
+  // typo'd flag fails immediately instead of after a project lookup.
+  //
+  // Tri-state, matching the PATCH contract: `undefined` leaves the value
+  // unchanged, `null` clears the override back to the system default, and a
+  // number sets an explicit per-project window.
+  let imageRetentionHours: number | null | undefined
+  if (options.resetImageRetention && options.imageRetentionHours !== undefined) {
+    throw new Error(
+      'Pass either --image-retention-hours or --reset-image-retention, not both'
+    )
+  }
+  if (options.resetImageRetention) {
+    imageRetentionHours = null
+  } else if (options.imageRetentionHours !== undefined) {
+    const parsed = Number(options.imageRetentionHours)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 8760) {
+      throw new Error(
+        `--image-retention-hours must be a whole number between 1 and 8760 (got "${options.imageRetentionHours}")`
+      )
+    }
+    imageRetentionHours = parsed
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -147,7 +173,13 @@ export async function updateSettingsAction(
   let previewEnvs = options.previewEnvs
 
   // Only prompt if no flags provided AND not in automation mode
-  if (slug === undefined && attackMode === undefined && previewEnvs === undefined && !options.yes) {
+  if (
+    slug === undefined &&
+    attackMode === undefined &&
+    previewEnvs === undefined &&
+    imageRetentionHours === undefined &&
+    !options.yes
+  ) {
     newline()
     header('Update Project Settings')
     info(`Current settings for "${project.name}"`)
@@ -177,6 +209,12 @@ export async function updateSettingsAction(
         slug: slug ?? undefined,
         attack_mode: attackMode ?? undefined,
         enable_preview_environments: previewEnvs ?? undefined,
+        // Only include the key when the user actually asked to change it —
+        // sending `null` unconditionally would silently reset every project
+        // to the system default.
+        ...(imageRetentionHours !== undefined
+          ? { image_retention_hours: imageRetentionHours }
+          : {}),
       },
     })
     if (error) {
@@ -194,6 +232,23 @@ export async function updateSettingsAction(
   keyValue('Slug', slug ?? project.slug)
   keyValue('Attack Mode', attackMode ? colors.success('Enabled') : colors.muted('Disabled'))
   keyValue('Preview Environments', previewEnvs ? colors.success('Enabled') : colors.muted('Disabled'))
+
+  const effectiveRetention =
+    imageRetentionHours !== undefined
+      ? imageRetentionHours
+      : (updated?.image_retention_hours ?? null)
+  keyValue(
+    'Image Retention',
+    effectiveRetention === null
+      ? colors.muted('System default')
+      : `${effectiveRetention}h`
+  )
+  if (effectiveRetention !== null && effectiveRetention < 48) {
+    warning(
+      `Rollback is only possible while a deployment's image still exists. ` +
+        `At ${effectiveRetention}h, deployments older than that can no longer be rolled back to.`
+    )
+  }
 }
 
 export async function updateGitAction(

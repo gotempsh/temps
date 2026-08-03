@@ -66,13 +66,22 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('settings')
-    .description('Update project settings (slug, attack mode, preview environments)')
+    .description('Update project settings (slug, attack mode, preview environments, image retention)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--slug <slug>', 'Project URL slug')
     .option('--attack-mode', 'Enable attack mode (CAPTCHA protection)')
     .option('--no-attack-mode', 'Disable attack mode')
     .option('--preview-envs', 'Enable preview environments')
     .option('--no-preview-envs', 'Disable preview environments')
+    .option(
+      '--image-retention-hours <hours>',
+      'Hours to keep built images before nightly cleanup removes them (1-8760). ' +
+        'Images are needed to roll back, so this is the project rollback window'
+    )
+    .option(
+      '--reset-image-retention',
+      'Clear the per-project image retention override and use the system default'
+    )
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts (for automation)')
     .action(updateSettingsAction)

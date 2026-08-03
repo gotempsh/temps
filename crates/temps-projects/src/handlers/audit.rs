@@ -179,6 +179,10 @@ pub struct ProjectSettingsUpdatedFields {
     /// Security-relevant Compose settings changed; values are deliberately
     /// omitted because preset_config may contain credentials.
     pub compose_configuration_updated: Option<bool>,
+    /// New image-retention window, in hours. `Some(None)` records a reset back
+    /// to the system default. Audited because shortening retention permanently
+    /// destroys the project's ability to roll back to older deployments.
+    pub image_retention_hours: Option<Option<i32>>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {

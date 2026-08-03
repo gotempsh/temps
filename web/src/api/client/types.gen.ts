@@ -1377,6 +1377,13 @@ export type AppSettings = {
     edge_target?: string | null;
     external_url?: string | null;
     /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
+    /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
      * server (deployer, agent, remote service client). Strictly opt-in for
      * operators running self-signed control plane / worker certs on a trusted
@@ -1499,6 +1506,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Deployment-image retention policy. No sensitive content, passed through
+     * as-is so the settings UI can show and edit the system-wide default.
+     */
+    image_retention: ImageRetentionSettings;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
@@ -9088,6 +9100,19 @@ export type HttpChallengeDebugResponse = {
      * The ACME validation URL (internal to ACME protocol)
      */
     validation_url?: string | null;
+};
+
+export type ImageRetentionSettings = {
+    /**
+     * Default hours to keep a built deployment image when the owning project
+     * has no `image_retention_hours` override. Valid range 1..=8760.
+     */
+    default_hours?: number;
+    /**
+     * Whether the nightly pass removes expired deployment images at all.
+     * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+     */
+    enabled?: boolean;
 };
 
 /**

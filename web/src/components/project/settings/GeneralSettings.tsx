@@ -98,6 +98,21 @@ const previewEnvironmentsSchema = z
 
 type PreviewEnvironmentsFormValues = z.infer<typeof previewEnvironmentsSchema>
 
+const imageRetentionSchema = z.object({
+  // Empty string means "use the system default" and is sent as an explicit
+  // null, which clears the per-project override.
+  imageRetentionHours: z.string().refine(
+    (value) => {
+      if (value.trim() === '') return true
+      const parsed = Number(value)
+      return Number.isInteger(parsed) && parsed >= 1 && parsed <= 8760
+    },
+    { message: 'Must be a whole number of hours between 1 and 8760, or blank' }
+  ),
+})
+
+type ImageRetentionFormValues = z.infer<typeof imageRetentionSchema>
+
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
 
@@ -159,8 +174,21 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     },
   })
 
+  const imageRetentionForm = useForm<ImageRetentionFormValues>({
+    resolver: zodResolver(imageRetentionSchema),
+    defaultValues: {
+      imageRetentionHours:
+        project?.image_retention_hours != null
+          ? String(project.image_retention_hours)
+          : '',
+    },
+  })
+
   const previewEnabled = previewForm.watch('enablePreviewEnvironments')
   const onDemandEnabled = previewForm.watch('previewEnvsOnDemand')
+  const retentionInput = imageRetentionForm.watch('imageRetentionHours')
+  const retentionHours =
+    retentionInput.trim() === '' ? null : Number(retentionInput)
 
   const handleSaveProject = async (values: ProjectFormValues) => {
     if (!project?.id) return
@@ -224,6 +252,27 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         loading: 'Updating deployment configuration...',
         success: 'Deployment configuration updated successfully',
         error: 'Failed to update deployment configuration',
+      }
+    )
+    refetch()
+  }
+
+  const handleSaveImageRetention = async (values: ImageRetentionFormValues) => {
+    if (!project?.id) return
+
+    const trimmed = values.imageRetentionHours.trim()
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          // Explicit null clears the override back to the system default.
+          image_retention_hours: trimmed === '' ? null : parseInt(trimmed, 10),
+        },
+      }),
+      {
+        loading: 'Updating image retention...',
+        success: 'Image retention updated successfully',
+        error: 'Failed to update image retention',
       }
     )
     refetch()
@@ -728,6 +777,62 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <CardFooter>
               <Button type="submit" disabled={updateProjectSettings.isPending}>
                 Save Settings
+              </Button>
+            </CardFooter>
+          </Card>
+        </form>
+      </Form>
+
+      {/* Image Retention Card */}
+      <Form {...imageRetentionForm}>
+        <form
+          onSubmit={imageRetentionForm.handleSubmit(handleSaveImageRetention)}
+        >
+          <Card className="bg-background text-foreground">
+            <CardHeader>
+              <CardTitle>Built Image Retention</CardTitle>
+              <CardDescription>
+                How long this project's built Docker images are kept before the
+                nightly cleanup removes them. Rolling back or promoting a
+                deployment requires its image, so this is effectively the
+                project's rollback window.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <FormField
+                control={imageRetentionForm.control}
+                name="imageRetentionHours"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Retention (hours)</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={8760}
+                        placeholder="Use system default"
+                        className="max-w-xs"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      Leave blank to use the system-wide default configured in
+                      Settings. Min 1 hour, max 8760 (one year).
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+              {retentionHours !== null && retentionHours < 48 && (
+                <p className="mt-3 text-sm text-destructive">
+                  At {retentionHours}h, deployments older than that can no
+                  longer be rolled back to — their images will already have been
+                  deleted.
+                </p>
+              )}
+            </CardContent>
+            <CardFooter>
+              <Button type="submit" disabled={updateProjectSettings.isPending}>
+                Save Retention
               </Button>
             </CardFooter>
           </Card>
