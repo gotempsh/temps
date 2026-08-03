@@ -15,6 +15,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { cliDeviceLookupErrorKind } from '@/lib/cliDeviceProblem'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   cliDeviceApproveMutation,
@@ -147,7 +148,7 @@ export function CliLogin() {
   const requestedIp = lookup.data?.requested_ip
   const expiresAt = lookup.data?.expires_at
 
-  const lookupErrorStatus = (lookup.error as { status?: number } | null)?.status
+  const lookupErrorKind = cliDeviceLookupErrorKind(lookup.error)
 
   return (
     <div className="flex min-h-[60vh] items-center justify-center p-4">
@@ -180,12 +181,12 @@ export function CliLogin() {
               <Skeleton className="h-4 w-1/2" />
               <Skeleton className="h-4 w-2/3" />
             </div>
-          ) : lookupErrorStatus === 404 ? (
+          ) : lookupErrorKind === 'not_found' ? (
             <ErrorRow
               title="Unknown code"
               detail="This code is not recognized. Check the code shown in your terminal."
             />
-          ) : lookupErrorStatus === 410 || status === 'expired' ? (
+          ) : lookupErrorKind === 'expired' || status === 'expired' ? (
             <ErrorRow
               title="Code expired"
               detail="Run the login command again in your terminal to get a fresh code."

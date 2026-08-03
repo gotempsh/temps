@@ -38,6 +38,7 @@ use chrono::{Duration, Utc};
 use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::problemdetails::{new as problem_new, Problem};
@@ -194,13 +195,15 @@ impl From<CliDeviceFlowError> for Problem {
             CliDeviceFlowError::NotFound { .. }
             | CliDeviceFlowError::NotFoundByDeviceCode { .. } => problem_new(StatusCode::NOT_FOUND)
                 .with_title("Device Session Not Found")
-                .with_detail(err.to_string()),
+                .with_detail(err.to_string())
+                .with_value("error_code", "CLI_DEVICE_SESSION_NOT_FOUND"),
             CliDeviceFlowError::AlreadyResolved { .. } => problem_new(StatusCode::CONFLICT)
                 .with_title("Device Session Already Resolved")
                 .with_detail(err.to_string()),
             CliDeviceFlowError::Expired { .. } => problem_new(StatusCode::GONE)
                 .with_title("Device Session Expired")
-                .with_detail(err.to_string()),
+                .with_detail(err.to_string())
+                .with_value("error_code", "CLI_DEVICE_SESSION_EXPIRED"),
             CliDeviceFlowError::NoRoleAssigned { .. } => problem_new(StatusCode::FORBIDDEN)
                 .with_title("No Role Assigned")
                 .with_detail(err.to_string()),
@@ -624,7 +627,17 @@ async fn deliver_approved(
     session: temps_entities::cli_login_sessions::Model,
 ) -> Result<Json<CliDevicePollResponse>, Problem> {
     let session_id = session.id;
-    let Some(encrypted_api_key) = session.api_key_plaintext.clone() else {
+    let transaction = db.begin().await.map_err(CliDeviceFlowError::Database)?;
+    let locked_session = temps_entities::cli_login_sessions::Entity::find_by_id(session_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(CliDeviceFlowError::Database)?
+        .ok_or_else(|| CliDeviceFlowError::NotFound {
+            user_code: session.user_code.clone(),
+        })?;
+
+    let Some(encrypted_api_key) = locked_session.api_key_plaintext.clone() else {
         warn!(
             "cli device poll: session {} approved but ciphertext already consumed",
             session_id
@@ -639,7 +652,7 @@ async fn deliver_approved(
             reason: e.to_string(),
         })?;
 
-    let user_id = session
+    let user_id = locked_session
         .user_id
         .ok_or_else(|| CliDeviceFlowError::UserLoadFailed {
             user_id: 0,
@@ -649,21 +662,22 @@ async fn deliver_approved(
             ),
         })?;
 
-    // Clear plaintext immediately so a subsequent poll cannot replay it.
+    // Clear the credential while holding the row lock. The lock and update
+    // commit together, so only one concurrent poll can observe ciphertext.
     let clear = temps_entities::cli_login_sessions::ActiveModel {
         id: Set(session_id),
         api_key_plaintext: Set(None),
         ..Default::default()
     };
     clear
-        .update(db.as_ref())
+        .update(&transaction)
         .await
         .map_err(CliDeviceFlowError::Database)?;
 
     // Look up email + role for the response. We don't fail the delivery if
     // the role lookup fails — but we do need the user to exist.
     let user = temps_entities::users::Entity::find_by_id(user_id)
-        .one(db.as_ref())
+        .one(&transaction)
         .await
         .map_err(CliDeviceFlowError::Database)?
         .ok_or_else(|| CliDeviceFlowError::UserLoadFailed {
@@ -671,9 +685,9 @@ async fn deliver_approved(
             reason: "user record missing".into(),
         })?;
 
-    let api_key_row = match session.api_key_id {
+    let api_key_row = match locked_session.api_key_id {
         Some(id) => temps_entities::api_keys::Entity::find_by_id(id)
-            .one(db.as_ref())
+            .one(&transaction)
             .await
             .map_err(CliDeviceFlowError::Database)?,
         None => None,
@@ -687,6 +701,11 @@ async fn deliver_approved(
             None,
         ),
     };
+
+    transaction
+        .commit()
+        .await
+        .map_err(CliDeviceFlowError::Database)?;
 
     Ok(Json(CliDevicePollResponse::Approved {
         user_id,
@@ -912,6 +931,10 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            p.body.get("error_code"),
+            Some(&serde_json::json!("CLI_DEVICE_SESSION_NOT_FOUND"))
+        );
 
         let p: Problem = CliDeviceFlowError::AlreadyResolved {
             user_code: "ABCD-1234".into(),
@@ -926,6 +949,10 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::GONE);
+        assert_eq!(
+            p.body.get("error_code"),
+            Some(&serde_json::json!("CLI_DEVICE_SESSION_EXPIRED"))
+        );
 
         let p: Problem = CliDeviceFlowError::NoRoleAssigned { user_id: 7 }.into();
         assert_eq!(p.status_code, StatusCode::FORBIDDEN);
@@ -946,6 +973,83 @@ mod tests {
         }
         .into();
         assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn approved_credential_is_claimed_under_an_exclusive_row_lock() {
+        let now = Utc::now();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test-master-key-for-cli-device-delivery",
+        ));
+        let plaintext = "tk_abcdefghijklmnopqrstuvwxyz0123456789abcd";
+        let ciphertext = encryption_service
+            .encrypt_string(plaintext)
+            .expect("encrypt test credential");
+        let session = temps_entities::cli_login_sessions::Model {
+            id: 42,
+            device_code: "device-code".to_string(),
+            user_code: "ABCD-1234".to_string(),
+            status: status::APPROVED.to_string(),
+            user_id: Some(7),
+            api_key_id: Some(9),
+            api_key_plaintext: Some(ciphertext),
+            client_name: Some("test-client".to_string()),
+            requested_ip: Some("127.0.0.1".to_string()),
+            expires_at: now + Duration::minutes(5),
+            last_polled_at: None,
+            approved_at: Some(now),
+            denied_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let api_key = temps_entities::api_keys::Model {
+            id: 9,
+            name: "CLI login".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_abcde".to_string(),
+            user_id: 7,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: Some(now + Duration::days(90)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let mut consumed_session = session.clone();
+        consumed_session.api_key_plaintext = None;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![session.clone()]])
+                .append_query_results([vec![consumed_session]])
+                .append_query_results([vec![test_user()]])
+                .append_query_results([vec![api_key]])
+                .into_connection(),
+        );
+
+        let Json(response) = deliver_approved(&db, &encryption_service, session)
+            .await
+            .expect("deliver approved credential");
+        assert!(matches!(
+            response,
+            CliDevicePollResponse::Approved { api_key, .. } if api_key == plaintext
+        ));
+
+        let db = Arc::try_unwrap(db).expect("release mock database");
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 1, "credential claim must use one transaction");
+        let statements = log[0].statements();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("FOR UPDATE")),
+            "credential claim must lock the device session row"
+        );
+        assert!(statements.iter().any(|statement| {
+            statement.sql.starts_with("UPDATE \"cli_login_sessions\"")
+                && statement.sql.contains("api_key_plaintext")
+        }));
     }
 
     /// Regression test for the 0.1.0 hardening pass.

@@ -137,6 +137,32 @@ fn invalid_mfa_problem() -> Problem {
         .with_detail("The verification code is incorrect or has expired. Please try again with a new code from your authenticator app.")
 }
 
+async fn record_step_up_verification_audit(
+    auth_state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    session_id: i32,
+    success: bool,
+    reason: Option<&str>,
+) {
+    let audit = StepUpVerificationAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        success,
+        reason: reason.map(str::to_string),
+    };
+    if let Err(error) = auth_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id,
+            session_id, %error,
+            "Failed to record sensitive-action verification audit"
+        );
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/user/me",
@@ -504,6 +530,15 @@ pub async fn verify_step_up(
         .await
         .is_err()
     {
+        record_step_up_verification_audit(
+            &auth_state,
+            &metadata,
+            user_id,
+            session_id,
+            false,
+            Some("rate_limited"),
+        )
+        .await;
         return Err(
             temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
                 .title("Too Many Verification Attempts")
@@ -528,22 +563,8 @@ pub async fn verify_step_up(
         Err(crate::StepUpError::Verification { .. }) => (false, Some("verification_failed")),
         Err(crate::StepUpError::Database { .. }) => (false, Some("database_failed")),
     };
-    let audit = StepUpVerificationAudit {
-        context: AuditContext {
-            user_id,
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        success,
-        reason: reason.map(str::to_string),
-    };
-    if let Err(error) = auth_state.audit_service.create_audit_log(&audit).await {
-        error!(
-            user_id,
-            session_id, %error,
-            "Failed to record sensitive-action verification audit"
-        );
-    }
+    record_step_up_verification_audit(&auth_state, &metadata, user_id, session_id, success, reason)
+        .await;
 
     match result {
         Ok(expires_at) => Ok(Json(StepUpResponse {
