@@ -59,6 +59,7 @@ impl From<EmailError> for Problem {
             | EmailError::Configuration(_)
             | EmailError::AwsSes(_)
             | EmailError::Scaleway(_)
+            | EmailError::ScalewayClientBuild { .. }
             | EmailError::Smtp(_)
             | EmailError::Serialization(_)
             | EmailError::TrackingRewrite { .. } => {

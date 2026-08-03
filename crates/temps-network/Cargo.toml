@@ -32,7 +32,7 @@ chrono = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21"
 netlink-packet-route = "0.30"
-netlink-packet-core = "0.7"
+netlink-packet-core = "0.8"
 nix = { version = "0.31", features = ["net", "sched", "fs"] }
 libc = "0.2"
 

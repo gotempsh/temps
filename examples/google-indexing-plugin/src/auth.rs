@@ -206,7 +206,7 @@ mod tests {
 
     /// Generate a test service account key with an in-memory RSA private key.
     fn test_service_account_key() -> ServiceAccountKey {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
         let pem = private_key
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)

@@ -37,8 +37,8 @@ impl AuditOperation for KvServiceEnabledAudit {
         "KV_SERVICE_ENABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -60,8 +60,8 @@ impl AuditOperation for KvServiceDisabledAudit {
         "KV_SERVICE_DISABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -83,8 +83,8 @@ impl AuditOperation for KvServiceUpdatedAudit {
         "KV_SERVICE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

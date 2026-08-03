@@ -58,4 +58,4 @@ time = { version = "0.3.47", features = ["parsing", "formatting", "macros", "ser
 temps-migrations = { path = "../temps-migrations" }
 tokio-test = "0.4"
 axum-test = "18.1.0"
-serial_test = "3.2"
+serial_test = "4.0"

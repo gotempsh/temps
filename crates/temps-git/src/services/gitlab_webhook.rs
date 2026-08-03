@@ -393,12 +393,11 @@ pub fn verify_gitlab_signature(
 ///
 /// The full string (including the `whsec_` prefix) is what we store and what
 /// the verifier uses to derive the HMAC key — see `verify_gitlab_signature`.
-pub fn generate_signing_token() -> String {
+pub fn generate_signing_token() -> Result<String, rand::rngs::SysError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    format!("whsec_{}", STANDARD.encode(bytes))
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(format!("whsec_{}", STANDARD.encode(bytes)))
 }
 
 #[cfg(test)]
@@ -553,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_generate_signing_token_has_whsec_prefix() {
-        let token = generate_signing_token();
+        let token = generate_signing_token().unwrap();
         assert!(
             token.starts_with("whsec_"),
             "GitLab requires the whsec_ prefix"
@@ -569,8 +568,8 @@ mod tests {
 
     #[test]
     fn test_generate_signing_token_is_unique() {
-        let t1 = generate_signing_token();
-        let t2 = generate_signing_token();
+        let t1 = generate_signing_token().unwrap();
+        let t2 = generate_signing_token().unwrap();
         assert_ne!(t1, t2, "tokens must be unique (random)");
     }
 

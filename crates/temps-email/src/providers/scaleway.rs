@@ -32,7 +32,10 @@ impl ScalewayProvider {
 
     /// Create a new Scaleway provider with the given credentials
     pub fn new(credentials: &ScalewayCredentials, region: &str) -> Result<Self, EmailError> {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|source| EmailError::ScalewayClientBuild { source })?;
 
         Ok(Self {
             client,

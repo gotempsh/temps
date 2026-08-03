@@ -1,6 +1,6 @@
 use crate::permissions::{Permission, Role};
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
@@ -555,8 +555,8 @@ impl ApiKeyService {
         service_name: &str,
         system_user_id: i32,
     ) -> Result<String, ApiKeyServiceError> {
-        let random_part: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        let random_part: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .take(40)
             .map(char::from)
             .collect();
@@ -598,12 +598,12 @@ impl ApiKeyService {
 
     fn generate_api_key(&self) -> String {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let prefix = "tk_";
         let random_part: String = (0..40)
             .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
+                let idx = rng.random_range(0..CHARSET.len());
                 CHARSET[idx] as char
             })
             .collect();

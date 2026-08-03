@@ -32,6 +32,8 @@
   },
   "include": [
     "src",
-    "packages/console-kit/src"
+    "packages/console-kit/src",
+    "e2e",
+    "playwright.config.ts"
   ]
 }

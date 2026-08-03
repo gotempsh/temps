@@ -22,11 +22,13 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::handlers::audit::NodeArchitectureChangedAudit;
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
 use temps_core::problemdetails::{self, Problem};
+use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy};
 use temps_deployer::ContainerDeployer;
 
@@ -46,6 +48,9 @@ pub struct NodeAppState {
     /// Notification pipeline — used to alert operators when a node recovers
     /// (offline->active on heartbeat). Optional: absent if no provider is wired.
     pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Audit trail. A node's reported architecture decides where images are
+    /// placed, so a change to it is recorded like any other write.
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 /// Fixed-window rate limiter for the public node-registration endpoint
@@ -139,6 +144,10 @@ pub struct RegisterNodeApiRequest {
     pub labels: Option<serde_json::Value>,
     /// X25519 public key for ECIES certificate encryption (base64-encoded, edge nodes only)
     pub edge_public_key: Option<String>,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`). Optional: agents older than multi-arch support omit it
+    /// and the value is learned from the first heartbeat instead.
+    pub architecture: Option<String>,
     /// The node's *current* token, supplied to prove possession when
     /// re-registering (changing the identity of) a node that already exists.
     /// Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
@@ -175,6 +184,10 @@ pub struct HeartbeatApiRequest {
     /// Container inventory for reconciliation (sent on first heartbeat after agent startup).
     /// Each entry has `container_id` and `container_name` of temps-managed containers.
     pub containers: Option<Vec<ContainerInventoryItem>>,
+    /// Container platform of this node's Docker daemon (`linux/amd64`,
+    /// `linux/arm64`), read from `docker info` by the agent. Absent from
+    /// pre-multi-arch agents; the stored value is then left untouched.
+    pub architecture: Option<String>,
 }
 
 /// A container reported by the agent during heartbeat reconciliation.
@@ -203,6 +216,9 @@ pub struct NodeInfoResponse {
     pub labels: serde_json::Value,
     /// Resource capacity/usage metrics from the latest heartbeat
     pub capacity: serde_json::Value,
+    /// Container platform this node runs (`linux/amd64`, `linux/arm64`).
+    /// `None` until an agent that reports it has heartbeated.
+    pub architecture: Option<String>,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
 }
@@ -428,6 +444,50 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
 fn sha256_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     hex::encode(digest)
+}
+
+/// Maximum accepted length of an agent-reported platform string.
+///
+/// `linux/amd64` is 11 chars and the longest realistic value (`linux/arm/v7`)
+/// is 12; 64 leaves generous room while keeping an authenticated-but-buggy (or
+/// hostile) agent from writing an arbitrarily large blob into a column that is
+/// rendered in the admin UI.
+const MAX_REPORTED_PLATFORM_LEN: usize = 64;
+
+/// Validate and canonicalize the platform an agent reports.
+///
+/// This is a system boundary: the value arrives over the network from the
+/// agent, is persisted, later compared against image platforms to decide
+/// scheduling, and is displayed in the console. We accept only the shape a
+/// platform string can legitimately have (`[a-z0-9._/-]`, bounded length),
+/// canonicalize spellings (`aarch64` → `arm64`) so comparisons are plain
+/// string equality, and drop anything else rather than storing junk that would
+/// silently never match any image.
+fn normalize_reported_platform(reported: Option<&str>) -> Option<String> {
+    let raw = reported?.trim();
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.len() > MAX_REPORTED_PLATFORM_LEN {
+        warn!(
+            length = raw.len(),
+            max = MAX_REPORTED_PLATFORM_LEN,
+            "Ignoring agent-reported platform: too long"
+        );
+        return None;
+    }
+
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+    {
+        warn!("Ignoring agent-reported platform: unexpected characters");
+        return None;
+    }
+
+    Some(temps_deployer::platform::canonicalize_platform(raw))
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +923,7 @@ async fn register_node(
         role: request.role.unwrap_or_else(|| "worker".to_string()),
         labels: request.labels.unwrap_or(serde_json::json!({})),
         edge_public_key: request.edge_public_key,
+        architecture: normalize_reported_platform(request.architecture.as_deref()),
         // Hash the proof-of-possession token (if any) so the service can
         // constant-time compare it against the stored hash. (ADR-020 WS-1.2.)
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
@@ -1086,6 +1147,12 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
 async fn node_heartbeat(
     State(app_state): State<Arc<NodeAppState>>,
     headers: HeaderMap,
+    // Same source as `register_node`: the router is served with
+    // `into_make_service_with_connect_info`, so the peer address is always
+    // present in production and injected by `MockConnectInfo` in tests. Needed
+    // for the architecture-change audit — without it, an operator repointing a
+    // daemon and something impersonating the node produce identical records.
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(node_id): Path<i32>,
     Json(request): Json<HeartbeatApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1113,13 +1180,43 @@ async fn node_heartbeat(
     let heartbeat = HeartbeatRequest {
         capacity: request.capacity.unwrap_or(serde_json::json!({})),
         labels: request.labels,
+        architecture: normalize_reported_platform(request.architecture.as_deref()),
     };
 
-    app_state
+    let architecture_change = app_state
         .node_service
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
+
+    // The architecture decides where images are placed and is supplied by the
+    // node itself, so a change is an event an operator may need to explain
+    // later — a repointed daemon, or something impersonating the node. The
+    // heartbeat is unauthenticated in the user sense (a node token, not a
+    // session), hence no user context.
+    if let Some(change) = architecture_change {
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                // No user: this is a node authenticating with its own token,
+                // not a session. `0` is the codebase's convention for an
+                // actor that isn't a user (see the failed-login audit).
+                user_id: 0,
+                // The peer that sent the heartbeat. This is the field that
+                // separates "an operator repointed this node's daemon" from
+                // "something else is reporting as this node" — the reason the
+                // change is audited at all.
+                ip_address: Some(addr.ip().to_string()),
+                user_agent: format!("temps-agent/node-{}", change.node_id),
+            },
+            node_id: change.node_id,
+            node_name: change.node_name,
+            from: change.from,
+            to: change.to,
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
 
     // The node just came back: it was offline and this heartbeat flipped it to
     // active. Alert operators (recovery counterpart to the node-offline alert).
@@ -1637,7 +1734,7 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// `nodes` table; containers placed there are stored with `node_id = NULL`.
 /// Surfacing it as node `0` makes those containers visible in the node list /
 /// per-node views instead of silently invisible (ADR-020 observability).
-fn control_plane_node_response() -> NodeInfoResponse {
+fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
     // The CP self-samples its own host metrics in the 60s health loop (it isn't
     // a worker agent, so it has no heartbeat). Surface them like any node;
     // empty until the first sample lands.
@@ -1655,6 +1752,16 @@ fn control_plane_node_response() -> NodeInfoResponse {
         status: "active".to_string(),
         labels: serde_json::json!({}),
         capacity,
+        // The control plane is a scheduling target like any node, so it must
+        // advertise the platform its own Docker daemon runs — otherwise the
+        // console shows every worker's architecture but a blank for the one
+        // machine that builds the images.
+        //
+        // Only the *confirmed* platform: `get_native_platform()` falls back to
+        // this binary's architecture, which would show the wrong value to the
+        // one person debugging a mixed cluster. The UI renders `None` as
+        // "Unknown", which is the honest answer until the daemon answers.
+        architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -1694,6 +1801,7 @@ async fn admin_list_nodes(
             status: n.status,
             labels: n.labels,
             capacity: n.capacity,
+            architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
         })
@@ -1701,7 +1809,7 @@ async fn admin_list_nodes(
 
     // Always surface the control plane itself as a node so containers it runs
     // (the `Local` scheduling slot, stored with node_id = NULL) are visible.
-    node_responses.insert(0, control_plane_node_response());
+    node_responses.insert(0, control_plane_node_response(&app_state));
 
     let total = node_responses.len();
     Ok(Json(NodeListResponse {
@@ -1733,7 +1841,7 @@ async fn admin_get_node(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
     if node_id == CONTROL_PLANE_NODE_ID {
-        return Ok(Json(control_plane_node_response()));
+        return Ok(Json(control_plane_node_response(&app_state)));
     }
     let node = app_state
         .node_service
@@ -1750,6 +1858,7 @@ async fn admin_get_node(
         status: node.status,
         labels: node.labels,
         capacity: node.capacity,
+        architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
     }))
@@ -2516,6 +2625,14 @@ impl From<NodeError> for Problem {
             NodeError::Validation { ref message } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(message.clone()),
+            NodeError::NoCompatibleNode { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("No Compatible Node")
+                .with_detail(error.to_string()),
+            NodeError::InsufficientCompatibleNodes { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Insufficient Compatible Nodes")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -2537,6 +2654,7 @@ mod tests {
 
     fn sample_node() -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id: 1,
             name: "worker-1".to_string(),
             token_hash: sha256_hash("test-token"),
@@ -2600,6 +2718,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(
             server_config,
@@ -2631,6 +2750,7 @@ mod tests {
                 test_db_for_enrollment,
             )),
             notification_service: None,
+            audit_service: Arc::new(RecordingAuditLogger::default()),
         });
         // The production router is served with connect info; tests use `oneshot`
         // (no peer address), so inject a mock so the `ConnectInfo` extractor
@@ -2645,6 +2765,133 @@ mod tests {
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
         settings
+    }
+
+    // ── Agent-reported platform sanitization ────────────────────────────
+
+    /// Captures audit operations so tests can assert one was written.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    /// A node's architecture decides where images are placed and is supplied
+    /// by the node itself, so a change to it is auditable — a repointed daemon
+    /// looks identical to something impersonating the node.
+    #[test]
+    fn test_architecture_change_is_an_auditable_operation() {
+        use temps_core::audit::AuditOperation;
+
+        let audit = NodeArchitectureChangedAudit {
+            context: AuditContext {
+                user_id: 0,
+                ip_address: Some("10.100.0.7".to_string()),
+                user_agent: "temps-agent/node-7".to_string(),
+            },
+            node_id: 7,
+            node_name: "worker-arm".to_string(),
+            from: Some("linux/amd64".to_string()),
+            to: "linux/arm64".to_string(),
+        };
+
+        assert_eq!(
+            audit.operation_type(),
+            "NODE_ARCHITECTURE_CHANGED".to_string()
+        );
+        let serialized = AuditOperation::serialize(&audit).expect("serializes");
+        // Both sides of the transition have to be in the record, or it can't
+        // answer "what changed" months later.
+        assert!(serialized.contains("linux/amd64"), "got: {serialized}");
+        assert!(serialized.contains("linux/arm64"), "got: {serialized}");
+        assert!(serialized.contains("worker-arm"), "got: {serialized}");
+        // The peer address is what distinguishes an operator repointing the
+        // daemon from something else reporting as this node.
+        assert!(
+            serialized.contains("10.100.0.7"),
+            "the peer address must be recorded: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_canonicalizes_spellings() {
+        // `docker info` kernel spellings become the OCI ones, so later
+        // comparisons are plain string equality.
+        assert_eq!(
+            normalize_reported_platform(Some("linux/x86_64")).as_deref(),
+            Some("linux/amd64")
+        );
+        assert_eq!(
+            normalize_reported_platform(Some("linux/aarch64")).as_deref(),
+            Some("linux/arm64")
+        );
+        assert_eq!(
+            normalize_reported_platform(Some("  Linux/ARM64  ")).as_deref(),
+            Some("linux/arm64")
+        );
+        // Bare architecture: Linux is the only OS Temps deploys containers on.
+        assert_eq!(
+            normalize_reported_platform(Some("arm64")).as_deref(),
+            Some("linux/arm64")
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_rejects_junk() {
+        // Absent / blank means "not reported", never an empty platform.
+        assert_eq!(normalize_reported_platform(None), None);
+        assert_eq!(normalize_reported_platform(Some("")), None);
+        assert_eq!(normalize_reported_platform(Some("   ")), None);
+
+        // This is a network boundary: an authenticated-but-hostile agent must
+        // not be able to write markup, control characters, or an unbounded
+        // blob into a column the admin console renders.
+        assert_eq!(
+            normalize_reported_platform(Some("<script>alert(1)</script>")),
+            None
+        );
+        assert_eq!(normalize_reported_platform(Some("linux/amd64\n\rX")), None);
+        assert_eq!(
+            normalize_reported_platform(Some("linux/amd64; DROP TABLE")),
+            None
+        );
+        assert_eq!(
+            normalize_reported_platform(Some(&"a".repeat(MAX_REPORTED_PLATFORM_LEN + 1))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_reported_platform_passes_through_unknown_architectures() {
+        // A platform we don't know about must survive verbatim rather than be
+        // coerced to amd64 — it has to fail a comparison, not fake a match.
+        assert_eq!(
+            normalize_reported_platform(Some("linux/riscv64")).as_deref(),
+            Some("linux/riscv64")
+        );
+    }
+
+    #[test]
+    fn test_no_compatible_node_maps_to_conflict() {
+        let problem: Problem = NodeError::NoCompatibleNode {
+            image_platforms: "linux/arm64".to_string(),
+            local_platform: "linux/amd64".to_string(),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
     }
 
     #[test]

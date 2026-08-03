@@ -176,6 +176,7 @@ pub async fn get_environments(
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
@@ -246,6 +247,7 @@ pub async fn get_environment(
         protected: env.protected,
         sleeping: env.sleeping,
         attack_mode: env.attack_mode,
+        force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
@@ -1147,6 +1149,7 @@ pub async fn update_environment_settings(
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
         attack_mode: settings.attack_mode,
+        force_https: settings.force_https,
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {
@@ -1222,6 +1225,7 @@ pub async fn update_environment_settings(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1326,6 +1330,7 @@ pub async fn update_environment_subdomain(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1481,6 +1486,7 @@ pub async fn wake_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1622,6 +1628,7 @@ pub async fn sleep_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1677,10 +1684,17 @@ pub async fn delete_environment(
     // Get environment details before deletion for audit log
     let environment = state
         .environment_service
-        .get_environment(project_id, env_id)
+        .get_environment_for_deletion(project_id, env_id)
         .await?;
 
     let project = state.environment_service.get_project(project_id).await?;
+
+    // Persist the deletion fence before cancelling workflows or touching
+    // Docker. Deployment workers already reject soft-deleted environments.
+    state
+        .environment_service
+        .delete_environment(project_id, env_id)
+        .await?;
 
     // Cancel all active deployments for this environment
     match state
@@ -1696,20 +1710,38 @@ pub async fn delete_environment(
                 );
             }
         }
-        Err(e) => {
+        Err(error) => {
             error!(
-                "Failed to cancel deployments for environment {}: {:?}",
-                env_id, e
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to cancel environment deployments"
             );
-            // Continue with deletion even if cancellation fails
+            return Err(
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Deployment Cancellation Failed")
+                    .with_detail(format!(
+                        "Failed to cancel active deployments for environment {env_id}: {error}"
+                    )),
+            );
         }
     }
 
-    // Delete the environment
     state
-        .environment_service
-        .delete_environment(project_id, env_id)
-        .await?;
+        .deployment_container_cleaner
+        .cleanup_environment_containers(project_id, env_id)
+        .await
+        .map_err(|error| {
+            error!(
+                project_id,
+                environment_id = env_id,
+                %error,
+                "Failed to clean up environment containers"
+            );
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Environment Container Cleanup Failed")
+                .with_detail(error.to_string())
+        })?;
 
     // Create audit event
     let audit_context = temps_core::AuditContext {
@@ -1803,6 +1835,7 @@ pub async fn create_environment(
             protected: environment.protected,
             sleeping: environment.sleeping,
             attack_mode: environment.attack_mode,
+            force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !environment.sleeping {
                 environment

@@ -1,7 +1,8 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_core::url_validation;
-use temps_entities::project_custom_domains;
+use temps_core::AppSettings;
+use temps_entities::{project_custom_domains, settings};
 use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
@@ -31,6 +32,116 @@ pub struct CustomDomainService {
 impl CustomDomainService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    /// Rejects anything that is not a syntactically valid hostname.
+    ///
+    /// The stored value is used as a proxy route key and is rendered as a link
+    /// in the console, so a value that is not a hostname at all (a URL, a
+    /// scheme, whitespace, a path) has no legitimate use and several harmful
+    /// ones. Nothing else on this path checked it: the reserved-hostname guard
+    /// only compares against the platform's own names, and the duplicate check
+    /// only compares against other rows.
+    fn ensure_domain_is_wellformed(domain: &str) -> Result<(), CustomDomainError> {
+        let invalid = |reason: &str| {
+            Err(CustomDomainError::InvalidDomain(format!(
+                "Domain '{domain}' is not a valid hostname: {reason}"
+            )))
+        };
+
+        if domain.is_empty() {
+            return invalid("it is empty");
+        }
+        if domain.len() > 253 {
+            return invalid("it exceeds the 253-character DNS limit");
+        }
+        if domain != domain.trim() {
+            return invalid("it has leading or trailing whitespace");
+        }
+
+        // A wildcard is accepted only as a leading `*.` label.
+        let host = domain.strip_prefix("*.").unwrap_or(domain);
+        if host.contains('*') {
+            return invalid("`*` is only allowed as a leading `*.` label");
+        }
+        if host.starts_with('.') || host.ends_with('.') {
+            return invalid("it starts or ends with a dot");
+        }
+
+        let labels: Vec<&str> = host.split('.').collect();
+        if labels.len() < 2 {
+            return invalid("it needs at least two labels (e.g. example.com)");
+        }
+
+        for label in labels {
+            if label.is_empty() {
+                return invalid("it contains an empty label");
+            }
+            if label.len() > 63 {
+                return invalid("a label exceeds the 63-character DNS limit");
+            }
+            if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return invalid("a label has characters outside a-z, 0-9 and '-'");
+            }
+            if label.starts_with('-') || label.ends_with('-') {
+                return invalid("a label starts or ends with '-'");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rejects an `environment_id` that does not belong to `project_id`.
+    ///
+    /// The caller is authorized against `project_id`, but `environment_id`
+    /// arrives in the request body and was written through unchecked. Since
+    /// custom domains are read back by `environment_id` alone (with no project
+    /// filter), an unchecked value lets a caller with write access to their own
+    /// project attach a domain to *another* project's environment.
+    async fn ensure_environment_in_project(
+        &self,
+        environment_id: i32,
+        project_id: i32,
+    ) -> Result<(), CustomDomainError> {
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                CustomDomainError::InvalidDomain(format!("Environment {environment_id} not found"))
+            })?;
+
+        if environment.project_id != project_id {
+            // Deliberately does not reveal which project actually owns it.
+            return Err(CustomDomainError::InvalidDomain(format!(
+                "Environment {environment_id} does not belong to project {project_id}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Rejects domains that the platform itself serves (issue #478).
+    ///
+    /// Pointing a project at the console hostname (`external_url`) or the
+    /// preview-domain apex hijacks the proxy route for the control plane, and
+    /// the only way back in is the server's public IP — so the assignment is
+    /// refused up front instead of being made and then undone.
+    async fn ensure_domain_not_reserved(&self, domain: &str) -> Result<(), CustomDomainError> {
+        let settings = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default();
+
+        if settings.is_reserved_hostname(domain) {
+            return Err(CustomDomainError::InvalidDomain(format!(
+                "'{}' is reserved by Temps itself (console or preview domain) and cannot be assigned to a project",
+                domain
+            )));
+        }
+
+        Ok(())
     }
 
     /// Normalizes a redirect URL by adding https:// scheme if missing
@@ -204,6 +315,17 @@ impl CustomDomainService {
             domain, project_id
         );
 
+        // Must be a hostname at all before anything else looks at it.
+        Self::ensure_domain_is_wellformed(&domain)?;
+
+        // The caller is authorized against `project_id`; `environment_id` comes
+        // from the request body and must be proven to belong to it.
+        self.ensure_environment_in_project(environment_id, project_id)
+            .await?;
+
+        // Refuse hostnames the platform serves itself (console, preview apex)
+        self.ensure_domain_not_reserved(&domain).await?;
+
         // Check if domain already exists
         if let Some(_existing) = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.eq(&domain))
@@ -328,6 +450,12 @@ impl CustomDomainService {
 
         // Determine the final domain name for validation
         let final_domain = if let Some(ref new_domain) = domain {
+            // Must be a hostname at all before anything else looks at it.
+            Self::ensure_domain_is_wellformed(new_domain)?;
+
+            // Refuse hostnames the platform serves itself (console, preview apex)
+            self.ensure_domain_not_reserved(new_domain).await?;
+
             // Check if new domain already exists (for a different record)
             if let Some(existing) = project_custom_domains::Entity::find()
                 .filter(project_custom_domains::Column::Domain.eq(new_domain))
@@ -348,6 +476,10 @@ impl CustomDomainService {
         };
 
         if let Some(env_id) = environment_id {
+            // Re-scope to the row's own project: the caller was authorized
+            // against that project, so a moved domain must stay inside it.
+            self.ensure_environment_in_project(env_id, custom_domain.project_id)
+                .await?;
             active_model.environment_id = Set(env_id);
         }
         if let Some(redirect) = redirect_to {
@@ -513,6 +645,160 @@ mod tests {
         (project.id, environment.id)
     }
 
+    #[test]
+    fn wellformed_domains_are_accepted() {
+        for domain in [
+            "example.com",
+            "app.example.com",
+            "deep.sub.example.co.uk",
+            "*.example.com",
+            "my-app-1.example.com",
+            "127-0-0-1.sslip.io",
+            "xn--80ak6aa92e.com",
+        ] {
+            assert!(
+                CustomDomainService::ensure_domain_is_wellformed(domain).is_ok(),
+                "{domain} should be accepted"
+            );
+        }
+    }
+
+    /// The stored value becomes a proxy route key and is rendered as a link in
+    /// the console, so anything that is not a hostname must be refused at the
+    /// write path rather than relied on to be harmless downstream.
+    #[test]
+    fn malformed_domains_are_rejected() {
+        for domain in [
+            "",
+            " ",
+            " example.com",
+            "example.com ",
+            "localhost",             // single label
+            "example..com",          // empty label
+            "-example.com",          // label starts with '-'
+            "example-.com",          // label ends with '-'
+            ".example.com",          // leading dot
+            "example.com.",          // trailing dot
+            "http://example.com",    // a URL, not a hostname
+            "javascript:alert(1)",   // scheme
+            "//evil.com",            // protocol-relative
+            "example.com/path",      // path
+            "exa mple.com",          // whitespace
+            "*.*.example.com",       // wildcard not in leading label
+            "ex*ample.com",          // interior wildcard
+            "example.com:8080",      // port
+            "user:pass@example.com", // credentials
+        ] {
+            let result = CustomDomainService::ensure_domain_is_wellformed(domain);
+            assert!(
+                matches!(result, Err(CustomDomainError::InvalidDomain(_))),
+                "{domain:?} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_length_limits_are_enforced() {
+        let long_label = format!("{}.com", "a".repeat(64));
+        assert!(CustomDomainService::ensure_domain_is_wellformed(&long_label).is_err());
+
+        let ok_label = format!("{}.com", "a".repeat(63));
+        assert!(CustomDomainService::ensure_domain_is_wellformed(&ok_label).is_ok());
+
+        // 253 is the DNS name limit; build something comfortably past it.
+        let too_long = format!("{}.com", vec!["a".repeat(50); 6].join("."));
+        assert!(too_long.len() > 253);
+        assert!(CustomDomainService::ensure_domain_is_wellformed(&too_long).is_err());
+    }
+
+    /// The caller is authorized against `project_id`, but `environment_id`
+    /// arrives in the request body. Custom domains are read back by
+    /// `environment_id` alone, so an unchecked value would let a caller attach
+    /// a domain of their choosing to another project's environment.
+    #[tokio::test]
+    async fn create_rejects_an_environment_from_another_project() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (attacker_project_id, _) = setup_test_data(&test_db.db).await;
+
+        // A second project with its own environment stands in for the victim.
+        let victim_project = projects::ActiveModel {
+            name: Set("Victim Project".to_string()),
+            slug: Set("victim-project".to_string()),
+            repo_name: Set("victim-repo".to_string()),
+            repo_owner: Set("victim-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(PresetType::Static),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        let victim_env = environments::ActiveModel {
+            project_id: Set(victim_project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("victim-project-production".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        let result = service
+            .create_custom_domain(
+                attacker_project_id,
+                victim_env.id,
+                "attacker.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CustomDomainError::InvalidDomain(_))),
+            "a cross-project environment_id must be refused, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_malformed_domain() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let result = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "javascript:alert(1)".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CustomDomainError::InvalidDomain(_))),
+            "a non-hostname must be refused, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_custom_domain() {
         let test_db = temps_database::test_utils::TestDatabase::with_migrations()
@@ -538,6 +824,96 @@ mod tests {
         assert_eq!(domain.project_id, project_id);
         assert_eq!(domain.environment_id, env_id);
         assert_eq!(domain.status, "pending");
+    }
+
+    /// Issue #478: assigning the console hostname to a project made the
+    /// console unreachable — only the raw public IP could get the operator
+    /// back in. Create and update must both refuse it.
+    #[tokio::test]
+    async fn test_console_domain_is_rejected() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        let app_settings = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..sea_orm::ActiveModelBehavior::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        for reserved in [
+            "console.example.com",
+            "CONSOLE.example.com",
+            "apps.example.com",
+        ] {
+            let result = service
+                .create_custom_domain(
+                    project_id,
+                    env_id,
+                    reserved.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            match result {
+                Err(CustomDomainError::InvalidDomain(msg)) => assert!(
+                    msg.contains("reserved"),
+                    "expected a reserved-domain message, got: {msg}"
+                ),
+                other => panic!("expected InvalidDomain for '{reserved}', got: {other:?}"),
+            }
+        }
+
+        // A normal domain still works, and cannot be renamed onto the console.
+        let created = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "shop.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = service
+            .update_custom_domain(
+                created.id,
+                Some("console.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CustomDomainError::InvalidDomain(_))),
+            "renaming a domain onto the console hostname must be refused"
+        );
     }
 
     #[tokio::test]

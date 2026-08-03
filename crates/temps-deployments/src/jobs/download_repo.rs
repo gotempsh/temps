@@ -541,8 +541,21 @@ impl WorkflowTask for DownloadRepoJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // Download repository (logs written in real-time)
-        let repo_dir = self.download_repository(&context).await?;
+        // Download repository (logs written in real-time).
+        //
+        // The error is written into the deploy log before it propagates.
+        // Without this the job is marked failed but the log simply stops after
+        // "Cloning ...", so a private repo, bad credentials, a missing branch
+        // or an unreachable host are all indistinguishable to the operator —
+        // and self-hosted users have no other place to look. Every failure
+        // reason below already carries context; it just never reached them.
+        let repo_dir = match self.download_repository(&context).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.log(&context, format!("ERROR: {}", e)).await?;
+                return Err(e);
+            }
+        };
 
         // Set job outputs
         context.set_output(

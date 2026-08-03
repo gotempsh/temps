@@ -24,8 +24,10 @@ pub trait AuditOperation: Send + Sync {
     /// Returns the operation type (e.g., "USER_CREATED", "LOGIN_SUCCESS")
     fn operation_type(&self) -> String;
 
-    /// Returns the user ID who performed the operation
-    fn user_id(&self) -> i32;
+    /// Returns the user ID recorded as the audit actor. `None` when the actor
+    /// has no resolvable user account, such as an unknown login identity or a
+    /// deployment token.
+    fn user_id(&self) -> Option<i32>;
 
     /// Returns the IP address if available
     fn ip_address(&self) -> Option<String>;

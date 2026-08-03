@@ -349,6 +349,26 @@ impl EnvironmentService {
         )))
     }
 
+    /// Load an environment for an idempotent deletion retry, including rows
+    /// whose deletion fence (`deleted_at`) is already set.
+    pub async fn get_environment_for_deletion(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<environments::Model, EnvironmentError> {
+        environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.eq(environment_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!(
+                    "Environment {} not found in project {}",
+                    environment_id, project_id
+                ))
+            })
+    }
+
     pub async fn get_default_environment(
         &self,
         project_id_p: i32,
@@ -665,6 +685,11 @@ impl EnvironmentService {
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
         }
+        // Absent leaves the environment inheriting the project's setting; an
+        // explicit value (including `false`) pins it for this environment.
+        if let Some(cross_architecture_builds) = settings.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
         if let Some(on_demand) = settings.on_demand {
             deployment_config.on_demand = on_demand;
         }
@@ -694,6 +719,10 @@ impl EnvironmentService {
         if let Some(attack_mode) = settings.attack_mode {
             active_model.attack_mode = Set(attack_mode);
         }
+        // force_https follows the same tri-state contract as attack_mode.
+        if let Some(force_https) = settings.force_https {
+            active_model.force_https = Set(force_https);
+        }
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
@@ -701,12 +730,27 @@ impl EnvironmentService {
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
-        // When on-demand settings change, notify the proxy to reload routes so it
-        // picks up sleeping-domain registrations and on-demand configs immediately.
-        let on_demand_changed = settings.on_demand.is_some()
+        // Notify the proxy to reload routes so it picks up the change immediately.
+        //
+        // This is NOT optional for the fields below. The proxy answers requests
+        // from `CachedPeerTable`, which holds a cloned `environments::Model` and
+        // reloads *only* on PG NOTIFY — there is no periodic timer ("a quiet
+        // system stays quiet"). The `environments_route_change_trigger` covers
+        // just `current_deployment_id` and `deployment_config`, so a change to a
+        // top-level column like `force_https` or `attack_mode` reaches Postgres
+        // and then stops: the proxy keeps serving the stale model until some
+        // unrelated event (a deploy, a subdomain rename) happens to fire a
+        // NOTIFY. The setting looks silently broken, which is the worst possible
+        // outcome for a self-hosted operator with no support channel to ask.
+        //
+        // `attack_mode` is included for the same reason — it is read off the same
+        // cached model on the request path and has the same staleness window.
+        let routing_relevant_changed = settings.on_demand.is_some()
             || settings.idle_timeout_seconds.is_some()
-            || settings.wake_timeout_seconds.is_some();
-        if on_demand_changed {
+            || settings.wake_timeout_seconds.is_some()
+            || settings.force_https.is_some()
+            || settings.attack_mode.is_some();
+        if routing_relevant_changed {
             // "NOTIFY route_table_changes" is a fully hardcoded string — no
             // user-controlled data is interpolated. Statement::from_string is
             // safe here; PostgreSQL does not support parameterised NOTIFY.
@@ -721,7 +765,7 @@ impl EnvironmentService {
                 tracing::error!(
                     error = %e,
                     environment_id = env_id,
-                    "Failed to send route_table_changes NOTIFY after on-demand settings update"
+                    "Failed to send route_table_changes NOTIFY after environment settings update - the proxy will keep serving the previous settings until the next reload"
                 );
             }
         }
@@ -1009,11 +1053,10 @@ impl EnvironmentService {
         project_id: i32,
         env_id: i32,
     ) -> Result<(), EnvironmentError> {
-        // Get the environment (only non-deleted ones)
+        // Include an already-fenced row so deletion retries are idempotent.
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
@@ -1025,6 +1068,10 @@ impl EnvironmentService {
             return Err(EnvironmentError::InvalidInput(
                 "Cannot delete production environment".to_string(),
             ));
+        }
+
+        if environment.deleted_at.is_some() {
+            return Ok(());
         }
 
         // Emit EnvironmentDeleted job so subscribers can clean up
@@ -1076,6 +1123,44 @@ mod tests {
             Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
         ));
         EnvironmentService::new(Arc::new(db), config_service)
+    }
+
+    #[tokio::test]
+    async fn delete_environment_persists_idempotent_deployment_fence() {
+        let environment = environments::Model {
+            id: 7,
+            project_id: 3,
+            name: "Preview".to_string(),
+            slug: "preview".to_string(),
+            subdomain: "project-preview".to_string(),
+            branch: Some("feature".to_string()),
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: Some(11),
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: true,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        };
+        let mut fenced = environment.clone();
+        fenced.deleted_at = Some(chrono::Utc::now());
+        fenced.current_deployment_id = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![environment]])
+            .append_query_results(vec![vec![fenced.clone()]])
+            .append_query_results(vec![vec![fenced]])
+            .into_connection();
+        let service = make_service(db);
+
+        service.delete_environment(3, 7).await.unwrap();
+        service.delete_environment(3, 7).await.unwrap();
     }
 
     #[test]
@@ -1177,6 +1262,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -1220,8 +1306,10 @@ mod tests {
                     target_nodes: None,
                     target_labels: None,
                     anti_affinity: None,
+                    cross_architecture_builds: None,
                     protected: None,
                     attack_mode: None,
+                    force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
@@ -1262,6 +1350,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }

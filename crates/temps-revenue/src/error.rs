@@ -57,6 +57,9 @@ pub enum RevenueError {
     #[error("Failed to decrypt signing secret for integration {integration_id}: {reason}")]
     DecryptionFailed { integration_id: i32, reason: String },
 
+    #[error("OS randomness failed while {operation}: {reason}")]
+    RandomnessFailed { operation: String, reason: String },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }

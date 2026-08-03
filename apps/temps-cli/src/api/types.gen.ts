@@ -294,6 +294,8 @@ export type AgentConfigResponse = {
     max_turns: number;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline values are write-only and appear as
+     * `***`. Omit this field on update to preserve their stored values.
      */
     mcp_servers_config?: unknown;
     name: string;
@@ -311,7 +313,9 @@ export type AgentConfigResponse = {
     source: string;
     timeout_seconds: number;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+     * are write-only and appear as `***`. Omit this field on update to
+     * preserve their stored values.
      */
     tools_config?: unknown;
     trigger_config: unknown;
@@ -2066,8 +2070,7 @@ export type CloudflareConfig = {
     account_id: string;
     /**
      * Cloudflare API token with the Email Sending permission. Encrypted at
-     * rest; like the other notification providers, it is returned decrypted to
-     * authorized callers so the edit form can prefill (not masked).
+     * rest and masked in normal API responses.
      */
     api_token: string;
     /**
@@ -2315,6 +2318,20 @@ export type CommitListResponse = {
  */
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
+/**
+ * A port that should be exposed publicly through the proxy for a compose service.
+ */
+export type ComposePublicPort = {
+    /**
+     * Container port to expose (e.g. 8123)
+     */
+    port: number;
+    /**
+     * Compose service name (e.g. "web", "clickhouse")
+     */
+    service: string;
+};
+
 export type ConnectionListQuery = {
     direction?: string | null;
     page?: number | null;
@@ -2487,6 +2504,10 @@ export type ContainerDetailResponse = {
      */
     started_at?: string | null;
     status: string;
+};
+
+export type ContainerEnvironmentVariableValueResponse = {
+    value: string;
 };
 
 export type ContainerInfoResponse = {
@@ -4492,6 +4513,10 @@ export type DeploymentJobResponse = {
     execution_order?: number | null;
     finished_at?: number | null;
     id: number;
+    /**
+     * Internal workflow configuration is intentionally redacted. It can
+     * contain legacy plaintext secrets or encrypted secret envelopes.
+     */
     job_config?: unknown;
     job_id: string;
     job_type: string;
@@ -5270,6 +5295,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5306,7 +5349,16 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
+    variant?: null | DockerfileVariant;
 };
+
+/**
+ * Catalog variant persisted under the canonical Dockerfile preset.
+ *
+ * Existing rows predate this discriminator and therefore deserialize as
+ * [`DockerfileVariant::File`].
+ */
+export type DockerfileVariant = 'file' | 'custom';
 
 /**
  * What to do with a domain during migration
@@ -5735,6 +5787,16 @@ export type EnableKvResponse = {
 };
 
 /**
+ * Response for the enable pg_stat_statements endpoint.
+ */
+export type EnablePgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the action.
+     */
+    message: string;
+};
+
+/**
  * One DNS record on the wire. Mirrors `service_endpoints::Model` but
  * keeps the API stable across entity evolution. `target_ip` is a string
  * (v4 or v6 literal, or CNAME target hostname) parsed by the resolver.
@@ -5873,6 +5935,7 @@ export type EnvVarIntegrationInfo = {
     service_name: string;
     service_slug?: string | null;
     service_type: string;
+    service_updated_at: string;
 };
 
 /**
@@ -5971,6 +6034,14 @@ export type EnvironmentResponse = {
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
     estimated_sleep_at?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override.
+     * `null` means inherit the proxy default (redirect only when the host has
+     * an active TLS certificate); `true` always redirects plain HTTP for this
+     * environment, `false` never does. Always serialized (NOT skipped) so the
+     * UI can distinguish `null` from `false`.
+     */
+    force_https?: boolean | null;
     id: number;
     /**
      * Indicates if this is a preview environment (auto-created per branch)
@@ -6817,6 +6888,11 @@ export type ExternalServiceDetails = {
         [key: string]: string;
     } | null;
     parameter_schema?: unknown;
+    /**
+     * Parameter names whose values are masked in `current_parameters` and
+     * may be fetched only through the audited reveal endpoint.
+     */
+    sensitive_parameters: Array<string>;
     service: ExternalServiceInfo;
 };
 
@@ -7521,6 +7597,16 @@ export type GetDeploymentsParams = {
 
 export type GetEnvironmentVariablesQuery = {
     environment_id?: number | null;
+    /**
+     * Required by integration-value reveals to bind the plaintext response to
+     * the exact service displayed by the client.
+     */
+    service_id?: number | null;
+    /**
+     * Exact manual env-var row to reveal. Required by the dashboard so
+     * duplicate keys on disjoint environments cannot cross-reveal.
+     */
+    var_id?: number | null;
 };
 
 export type GetFunnelMetricsQuery = {
@@ -9884,12 +9970,28 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 
 /**
  * Configuration for Nixpacks preset
- * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
- * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ * Nixpacks provider and inline build-plan configuration.
  */
 export type NixpacksPresetConfig = {
-    [key: string]: unknown;
+    /**
+     * Optional inline nixpacks.toml contents.
+     */
+    nixpacksConfig?: string | null;
+    /**
+     * Ordered Nixpacks providers. Empty means repository config or auto-detect;
+     * include `...` to combine auto-detection with explicit providers.
+     */
+    providers?: Array<NixpacksProvider>;
 };
+
+/**
+ * A Nixpacks build provider.
+ *
+ * `Auto` serializes as the native Nixpacks `...` marker, which includes the
+ * provider detected from the project alongside any explicitly listed
+ * providers.
+ */
+export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
@@ -11463,7 +11565,7 @@ export type PostgresWalHealth = {
  * Union type for preset configurations
  * Use the appropriate configuration type based on your preset
  */
-export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+export type PresetConfigSchema = DockerfilePresetConfig | DockerComposePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
 
 /**
  * Detected preset information
@@ -14077,6 +14179,18 @@ export type SendMessageRequest = {
     page_context?: string | null;
 };
 
+export type SensitiveConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveMcpConfigValueResponse = {
+    value: string;
+};
+
+export type SensitiveValueResponse = {
+    value: string;
+};
+
 export type SentryChunkUploadResponse = {
     accept: Array<string>;
     chunkSize: number;
@@ -14903,6 +15017,66 @@ export type SlackConfig = {
 };
 
 /**
+ * Response envelope for the slow-queries list endpoint.
+ */
+export type SlowQueriesResponse = {
+    /**
+     * Current page number (1-based).
+     */
+    page: number;
+    /**
+     * Number of rows per page used for this request.
+     */
+    page_size: number;
+    /**
+     * Ordered list of query stats, slowest first by mean_exec_time_ms.
+     */
+    queries: Array<SlowQueryRow>;
+    /**
+     * Total number of qualifying rows across all pages.
+     */
+    total_count: number;
+};
+
+/**
+ * A single entry from `pg_stat_statements`, representing one normalized
+ * query fingerprint and its aggregate execution stats.
+ */
+export type SlowQueryRow = {
+    /**
+     * Shared block cache hit ratio (0.0–1.0).
+     * `None` when total block accesses are zero (e.g. function-only queries).
+     */
+    cache_hit_ratio?: number | null;
+    /**
+     * Number of times this query was executed.
+     */
+    calls: number;
+    /**
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
+     */
+    database: string;
+    /**
+     * Average wall-clock time per execution, in milliseconds.
+     */
+    mean_exec_time_ms: number;
+    /**
+     * Normalized query text (parameter literals replaced with `$N`).
+     */
+    query: string;
+    /**
+     * Total number of rows returned or affected.
+     */
+    rows: number;
+    /**
+     * Total wall-clock time spent executing this query, in milliseconds.
+     */
+    total_exec_time_ms: number;
+};
+
+/**
  * Smart filter presets for common funnel patterns
  */
 export type SmartFilter = {
@@ -15263,10 +15437,20 @@ export type SpanKind = 'UNSPECIFIED' | 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODU
  * A single trace span ready for storage.
  */
 export type SpanRecord = {
+    /**
+     * Raw key/value pairs exactly as reported by the instrumenting library.
+     * Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+     * may be seconds, milliseconds, microseconds, or nanoseconds depending on
+     * the exporter's own convention, and the unit is not labeled here.
+     */
     attributes: {
         [key: string]: string;
     };
     deployment_id?: number | null;
+    /**
+     * Span duration in milliseconds. The only field on this struct guaranteed
+     * to be in milliseconds.
+     */
     duration_ms: number;
     end_time: string;
     events: Array<SpanEvent>;
@@ -15836,6 +16020,11 @@ export type TemplateResponse = {
      */
     preset: string;
     /**
+     * URL to a wide screenshot/banner preview of the deployed template.
+     * Absent for templates that don't have one captured yet.
+     */
+    screenshot_url?: string | null;
+    /**
      * Required external services
      */
     services: Array<string>;
@@ -16130,7 +16319,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -16667,6 +16862,20 @@ export type UpdateEnvironmentSettingsRequest = {
      * 4. Default: 3000
      */
     exposed_port?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the proxy default, which
+     * redirects only when the host has an active TLS certificate)
+     * - `true` → always redirect plain HTTP to HTTPS for this environment,
+     * even when no local certificate exists (TLS terminated upstream)
+     * - `false` → never redirect this environment, even when a certificate does
+     * exist
+     *
+     * Requests under `/.well-known/acme-challenge/` are never redirected
+     * regardless of this setting, so ACME HTTP-01 validation always completes.
+     */
+    force_https?: boolean | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
@@ -17284,6 +17493,8 @@ export type UpsertAgentRequest = {
     max_turns?: number | null;
     /**
      * MCP servers config (Claude Code settings.json mcpServers format).
+     * Credential-bearing legacy inline objects are write-only: normal reads
+     * mask them, and updates must omit this field to preserve existing values.
      */
     mcp_servers_config?: unknown;
     name?: string | null;
@@ -17296,7 +17507,8 @@ export type UpsertAgentRequest = {
     slug?: string | null;
     timeout_seconds?: number | null;
     /**
-     * Tools config as JSON array.
+     * Tools config as JSON array. Custom-tool webhook URLs and headers are
+     * write-only; omit this field on update to preserve them.
      */
     tools_config?: unknown;
     /**
@@ -26885,6 +27097,50 @@ export type ExternalServiceMetricsStatusResponses = {
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
 
+export type RevealServiceParameterData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Sensitive parameter name
+         */
+        param_name: string;
+    };
+    query?: never;
+    url: '/external-services/{id}/parameters/{param_name}';
+};
+
+export type RevealServiceParameterErrors = {
+    /**
+     * Parameter is not sensitive
+     */
+    400: unknown;
+    /**
+     * Caller cannot access a project linked to this service
+     */
+    403: unknown;
+    /**
+     * Service or parameter not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceParameterResponses = {
+    /**
+     * Sensitive parameter value
+     */
+    200: SensitiveValueResponse;
+};
+
+export type RevealServiceParameterResponse = RevealServiceParameterResponses[keyof RevealServiceParameterResponses];
+
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
     path: {
@@ -27120,7 +27376,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27533,6 +27789,118 @@ export type GetPostgresWalHealthResponses = {
 };
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
+
+export type ExternalServiceEnablePgStatStatementsData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned standalone Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/enable';
+};
+
+export type ExternalServiceEnablePgStatStatementsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not standalone Postgres (cluster or wrong type)
+     */
+    422: unknown;
+    /**
+     * Restart failed
+     */
+    500: unknown;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponses = {
+    /**
+     * Container restarted; pg_stat_statements now active
+     */
+    200: EnablePgStatStatementsResponse;
+};
+
+export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
+export type GetSlowQueriesData = {
+    body?: never;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: {
+        /**
+         * Page number (1-based). Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Number of rows per page (1–100). Defaults to 20.
+         */
+        page_size?: number | null;
+        /**
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
+         */
+        sort_by?: string | null;
+        /**
+         * Sort direction: `asc` or `desc`. Defaults to `desc`.
+         */
+        sort_order?: string | null;
+    };
+    url: '/external-services/{service_id}/pg-stat-statements/slow-queries';
+};
+
+export type GetSlowQueriesErrors = {
+    /**
+     * Invalid pagination or sort parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:read)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not a Postgres service
+     */
+    422: unknown;
+    /**
+     * pg_stat_statements extension not available (container restart required)
+     */
+    503: unknown;
+};
+
+export type GetSlowQueriesResponses = {
+    /**
+     * Paginated slow queries from pg_stat_statements
+     */
+    200: SlowQueriesResponse;
+};
+
+export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
 export type ListRootContainersData = {
     body?: never;
@@ -31777,6 +32145,10 @@ export type UpdateNotificationProviderData = {
 
 export type UpdateNotificationProviderErrors = {
     /**
+     * Invalid masked provider configuration
+     */
+    400: unknown;
+    /**
      * Provider not found
      */
     404: unknown;
@@ -31794,6 +32166,50 @@ export type UpdateNotificationProviderResponses = {
 };
 
 export type UpdateNotificationProviderResponse = UpdateNotificationProviderResponses[keyof UpdateNotificationProviderResponses];
+
+export type RevealNotificationProviderConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+        /**
+         * Sensitive field, such as password or headers.Authorization
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/notification-providers/{id}/config/{field}';
+};
+
+export type RevealNotificationProviderConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * Provider or field not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealNotificationProviderConfigResponses = {
+    /**
+     * Sensitive provider configuration value
+     */
+    200: SensitiveConfigValueResponse;
+};
+
+export type RevealNotificationProviderConfigResponse = RevealNotificationProviderConfigResponses[keyof RevealNotificationProviderConfigResponses];
 
 export type TestNotificationProviderData = {
     body?: never;
@@ -33023,6 +33439,10 @@ export type QueryTraceSummariesData = {
          * Sort direction: 'asc' or 'desc' (default)
          */
         sort_order?: string;
+        /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -37531,18 +37951,34 @@ export type GetResolvedEnvironmentVariableValueData = {
     };
     query?: {
         /**
-         * Optional environment ID (manual vars only)
+         * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact manual environment-variable row ID
+         */
+        var_id?: number;
+        /**
+         * Integration service ID shown by the resolved list
+         */
+        service_id?: number;
     };
     url: '/projects/{project_id}/env-vars/resolved/{key}/value';
 };
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
      * Project, key, or integration not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -37575,15 +38011,27 @@ export type GetEnvironmentVariableValueData = {
          * Optional environment ID
          */
         environment_id?: number;
+        /**
+         * Exact environment-variable row ID
+         */
+        var_id?: number;
     };
     url: '/projects/{project_id}/env-vars/{key}/value';
 };
 
 export type GetEnvironmentVariableValueErrors = {
     /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
      * Project or variable not found
      */
     404: unknown;
+    /**
+     * Environment variable key is ambiguous
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -38403,6 +38851,54 @@ export type GetContainerDetailResponses = {
 };
 
 export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
+export type GetContainerEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+        /**
+         * Environment variable name
+         */
+        variable_name: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/environment/{variable_name}';
+};
+
+export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
+     * Container or environment variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerEnvironmentVariableResponses = {
+    /**
+     * Environment variable value
+     */
+    200: ContainerEnvironmentVariableValueResponse;
+};
+
+export type GetContainerEnvironmentVariableResponse = GetContainerEnvironmentVariableResponses[keyof GetContainerEnvironmentVariableResponses];
 
 export type GetContainerLogsByIdData = {
     body?: never;
@@ -40788,6 +41284,55 @@ export type UpdateMcpResponses = {
 
 export type UpdateMcpResponse = UpdateMcpResponses[keyof UpdateMcpResponses];
 
+export type RevealMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealMcpConfigResponse = RevealMcpConfigResponses[keyof RevealMcpConfigResponses];
+
 export type ListMonitorsData = {
     body?: never;
     path: {
@@ -42833,11 +43378,23 @@ export type GetProxyLogsData = {
          */
         visitor_id?: number | null;
         /**
-         * Start date for filtering (ISO 8601 format)
+         * Start date for filtering (ISO 8601 format).
+         *
+         * **Defaults to 1 hour before `end_date` (or before now) when omitted.**
+         * The listing is always time-bounded: an unbounded query would have to
+         * consider the entire retention window — 100M+ rows on a busy deployment —
+         * to return a single page. Pass an explicit `start_date` to widen the
+         * window, up to the configured retention horizon.
+         *
+         * The maximum span between `start_date` and `end_date` is 7 days when
+         * `project_id` is omitted, or 30 days when a single `project_id` is set —
+         * a project-scoped query is bounded by that project's own row count
+         * rather than the whole deployment's. A wider request is rejected with a
+         * 400 naming the applicable cap.
          */
         start_date?: string | null;
         /**
-         * End date for filtering (ISO 8601 format)
+         * End date for filtering (ISO 8601 format). Defaults to now.
          */
         end_date?: string | null;
         /**
@@ -44983,6 +45540,51 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type RevealGlobalMcpConfigData = {
+    body?: never;
+    path: {
+        /**
+         * MCP server slug
+         */
+        slug: string;
+        /**
+         * Sensitive field path, such as url or env.API_TOKEN
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/settings/mcp-servers/{slug}/config/{field}';
+};
+
+export type RevealGlobalMcpConfigErrors = {
+    /**
+     * Field is not revealable
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
+     * MCP server or field not found
+     */
+    404: unknown;
+    /**
+     * Configuration read or audit failed
+     */
+    500: unknown;
+};
+
+export type RevealGlobalMcpConfigResponses = {
+    200: SensitiveMcpConfigValueResponse;
+};
+
+export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
 export type RefreshRouteTableData = {
     body?: never;
@@ -47396,6 +47998,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -47424,6 +48030,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */

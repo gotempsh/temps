@@ -1,5 +1,26 @@
 name: Release
 
+# GHA cache is read-only here (`cache-from` without `cache-to`).
+#
+# GitHub scopes Actions cache *writes* to the ref that produced them, and
+# scopes *reads* to the current ref plus the default branch. This workflow
+# only ever runs on a tag ref — either the `push: tags:` trigger below, or
+# `workflow_dispatch --ref <tag>` from `nightly-release.yml`. A cache written
+# on a tag is therefore readable by exactly one thing: another run on that
+# same tag, which never happens.
+#
+# So every byte `cache-to: type=gha,mode=max` wrote here was unreadable, and
+# it was not free: the repo cache is a single 10GB LRU pool. One nightly run
+# left 206 `buildkit-blob-*` entries totalling 7.4GB behind, evicting the
+# Rust build caches that `rust-tests.yml` and the e2e job depend on. That is
+# what turned the Compose Security job's musl build from ~5 minutes into 81.
+#
+# Reads stay: `sandbox-images-beta.yml` writes the `sandbox-*` and
+# `preview-gateway` scopes from `main`, where they *are* readable from a tag.
+# If cross-nightly layer reuse becomes worth it, use a registry-backed cache
+# (`type=registry,ref=ghcr.io/...:buildcache`) — it does not touch the 10GB
+# Actions cache budget and is readable across refs.
+
 on:
   push:
     tags:
@@ -746,8 +767,10 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.title=Temps
             org.opencontainers.image.description=Open-source platform for deploying and managing applications
+          # Read-only on purpose — see the "GHA cache is read-only here" note
+          # at the top of this file. This workflow only ever runs on tag refs,
+          # whose cache scope nothing else can read.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   create-docker-manifest:
     name: Create Docker Manifest
@@ -1006,8 +1029,10 @@ jobs:
             org.opencontainers.image.version=${{ needs.prepare-sandbox-context.outputs.sandbox_image_version }}
             org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
             org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime)
+          # Read-only: `sandbox-images-beta.yml` populates this scope from
+          # `main`, where it is readable by every ref. See the "GHA cache is
+          # read-only here" note at the top of this file.
           cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
-          cache-to: type=gha,scope=sandbox-${{ matrix.runtime }},mode=max
 
   build-and-push-preview-gateway:
     name: Build preview gateway image
@@ -1073,5 +1098,5 @@ jobs:
             org.opencontainers.image.version=${{ needs.prepare-sandbox-context.outputs.gateway_version }}
             org.opencontainers.image.title=temps-preview-gateway
             org.opencontainers.image.description=Temps preview gateway — routes ws-<sid>-<port> hosts to sandbox containers
+          # Read-only, same reasoning as the sandbox images above.
           cache-from: type=gha,scope=preview-gateway
-          cache-to: type=gha,scope=preview-gateway,mode=max

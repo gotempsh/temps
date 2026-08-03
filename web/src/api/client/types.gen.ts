@@ -4275,6 +4275,27 @@ export type DeploymentConfig = {
      */
     cpuRequest?: number | null;
     /**
+     * Build one image per architecture the eligible nodes run.
+     *
+     * `None`/`false` (the default) builds exactly once, on the control
+     * plane's native platform — byte-for-byte the behaviour of a
+     * single-architecture cluster. When enabled and the nodes this
+     * deployment could land on span more than one architecture, the build
+     * job produces one image per architecture; the non-native ones go
+     * through the daemon's `platform` option, which requires QEMU binfmt
+     * handlers registered on the control plane.
+     *
+     * **Opt-in on purpose.** Cross-architecture builds are emulated and
+     * substantially slower, and deriving them from cluster topology would
+     * mean a single node joining silently changes build behaviour for every
+     * deployment in the cluster. It also keeps the decision on operator
+     * config rather than on a value each node reports about itself.
+     *
+     * `Option<bool>` so an environment inherits the project's setting
+     * (`None`) or overrides it, matching `automatic_deploy`.
+     */
+    crossArchitectureBuilds?: boolean | null;
+    /**
      * Port exposed by the container
      * If not specified, will be auto-detected from Docker image or default to 3000
      */
@@ -5295,6 +5316,24 @@ export type DnsZone = {
     status: string;
 };
 
+/**
+ * Configuration for Docker Compose deployments.
+ */
+export type DockerComposePresetConfig = {
+    /**
+     * User-provided docker-compose.override.yml content.
+     */
+    composeOverride?: string | null;
+    /**
+     * Path to the Compose file relative to the project directory.
+     */
+    composePath?: string | null;
+    /**
+     * Compose service ports that should be publicly routed.
+     */
+    publicPorts?: Array<ComposePublicPort>;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -5314,24 +5353,6 @@ export type DockerRegistrySettingsMasked = {
     registry_url?: string | null;
     tls_verify: boolean;
     username?: string | null;
-};
-
-/**
- * Configuration for Docker Compose deployments.
- */
-export type DockerComposePresetConfig = {
-    /**
-     * User-provided docker-compose.override.yml content.
-     */
-    composeOverride?: string | null;
-    /**
-     * Path to the Compose file relative to the project directory.
-     */
-    composePath?: string | null;
-    /**
-     * Compose service ports that should be publicly routed.
-     */
-    publicPorts?: Array<ComposePublicPort>;
 };
 
 /**
@@ -6034,6 +6055,14 @@ export type EnvironmentResponse = {
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
     estimated_sleep_at?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override.
+     * `null` means inherit the proxy default (redirect only when the host has
+     * an active TLS certificate); `true` always redirects plain HTTP for this
+     * environment, `false` never does. Always serialized (NOT skipped) so the
+     * UI can distinguish `null` from `false`.
+     */
+    force_https?: boolean | null;
     id: number;
     /**
      * Indicates if this is a preview environment (auto-created per branch)
@@ -7949,6 +7978,12 @@ export type HealthSummary = {
 };
 
 export type HeartbeatApiRequest = {
+    /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`), read from `docker info` by the agent. Absent from
+     * pre-multi-arch agents; the stored value is then left untouched.
+     */
+    architecture?: string | null;
     /**
      * Resource capacity/usage info as JSON (cpu_usage, memory_usage, etc.)
      */
@@ -10040,6 +10075,11 @@ export type NodeCostInfo = {
 export type NodeInfoResponse = {
     address: string;
     /**
+     * Container platform this node runs (`linux/amd64`, `linux/arm64`).
+     * `None` until an agent that reports it has heartbeated.
+     */
+    architecture?: string | null;
+    /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
     capacity: unknown;
@@ -11683,6 +11723,40 @@ export type PreviewGatewaySettingsResponse = {
     image: string;
 };
 
+/**
+ * Request body for minting a preview share link.
+ */
+export type PreviewShareLinkBody = {
+    /**
+     * Path the recipient lands on. Must be same-origin (start with a single
+     * `/`); anything else is replaced with `/` so a share link can never be
+     * turned into an open redirect.
+     */
+    path?: string | null;
+    /**
+     * Port inside the sandbox the preview serves on.
+     */
+    port: number;
+    /**
+     * How long the link stays usable, in seconds. Clamped to 24 hours.
+     * Defaults to one hour — long enough to send to a reviewer, short enough
+     * that a link pasted in a ticket does not stay live indefinitely.
+     */
+    ttl_seconds?: number | null;
+};
+
+export type PreviewShareLinkResponse = {
+    /**
+     * Unix seconds after which the link stops working.
+     */
+    expires_at: number;
+    /**
+     * The full link. Its fragment contains the grant and must be treated as a
+     * credential; URL fragments are not sent to servers or in Referer headers.
+     */
+    url: string;
+};
+
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
@@ -12366,28 +12440,6 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
- * Proxy configuration for email validation
- */
-export type ProxyRequest = {
-    /**
-     * Proxy host
-     */
-    host: string;
-    /**
-     * Optional proxy password
-     */
-    password?: string | null;
-    /**
-     * Proxy port
-     */
-    port: number;
-    /**
-     * Optional proxy username
-     */
-    username?: string | null;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
  *
  * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
@@ -12753,6 +12805,12 @@ export type RegisterNodeApiRequest = {
      */
     address: string;
     /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`). Optional: agents older than multi-arch support omit it
+     * and the value is learned from the first heartbeat instead.
+     */
+    architecture?: string | null;
+    /**
      * Node-generated certificate signing request (PEM) for multi-node mTLS
      * (ADR-020 WS-2.1). When present, the control plane signs it with the
      * cluster CA and returns the leaf + CA cert. Optional — token-only nodes
@@ -12978,6 +13036,29 @@ export type RequestRow = {
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
+};
+
+/**
+ * Explicit confirmation required for the destructive statistics reset.
+ *
+ * Requiring JSON makes the endpoint non-simple for browsers, preventing a
+ * deployed same-site application from triggering it with a plain HTML form.
+ */
+export type ResetPgStatStatementsRequest = {
+    /**
+     * Must be `true` to acknowledge the global, irreversible reset.
+     */
+    confirm: boolean;
+};
+
+/**
+ * Response for the pg_stat_statements reset endpoint.
+ */
+export type ResetPgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the destructive action.
+     */
+    message: string;
 };
 
 export type ResizeSandboxBody = {
@@ -13550,7 +13631,8 @@ export type SandboxEvent = {
     /**
      * Machine-readable operation (`created`, `stopped`, `resumed`,
      * `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
-     * `preview_password_cleared`, `source_seeded`, `destroyed`).
+     * `preview_password_cleared`, `preview_share_link_created`, `source_seeded`,
+     * `destroyed`).
      */
     event_type: string;
 };
@@ -15045,7 +15127,9 @@ export type SlowQueryRow = {
      */
     calls: number;
     /**
-     * Name of the database this query ran against. `(dropped database)` when the originating database no longer exists but `pg_stat_statements` still holds stats for it.
+     * Name of the database this query ran against. `(dropped database)`
+     * when the originating database no longer exists but
+     * `pg_stat_statements` still holds stats for it.
      */
     database: string;
     /**
@@ -16309,7 +16393,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -16749,6 +16839,13 @@ export type UpdateDeploymentConfigRequest = {
     automaticDeploy?: boolean | null;
     cpuLimit?: number | null;
     cpuRequest?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run. Off by
+     * default; environments inherit this and may override it. Cross-builds
+     * are emulated on the control plane and substantially slower, so they are
+     * opted into rather than triggered by cluster topology.
+     */
+    crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
@@ -16837,6 +16934,13 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     cpu_request?: number | null;
     /**
+     * Build one image per architecture the eligible nodes run (overrides the
+     * project-level setting). Off by default: cross-architecture builds are
+     * emulated on the control plane and substantially slower, so they are
+     * opted into per environment rather than triggered by cluster topology.
+     */
+    cross_architecture_builds?: boolean | null;
+    /**
      * Port exposed by the container (overrides project-level port for this environment)
      *
      * Priority order for port resolution:
@@ -16846,6 +16950,20 @@ export type UpdateEnvironmentSettingsRequest = {
      * 4. Default: 3000
      */
     exposed_port?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the proxy default, which
+     * redirects only when the host has an active TLS certificate)
+     * - `true` → always redirect plain HTTP to HTTPS for this environment,
+     * even when no local certificate exists (TLS terminated upstream)
+     * - `false` → never redirect this environment, even when a certificate does
+     * exist
+     *
+     * Requests under `/.well-known/acme-challenge/` are never redirected
+     * regardless of this setting, so ACME HTTP-01 validation always completes.
+     */
+    force_https?: boolean | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
@@ -17675,7 +17793,6 @@ export type ValidateEmailRequest = {
      * Email address to validate
      */
     email: string;
-    proxy?: null | ProxyRequest;
 };
 
 /**
@@ -27346,7 +27463,7 @@ export type GetServiceEnvironmentVariableData = {
 
 export type GetServiceEnvironmentVariableErrors = {
     /**
-     * Access denied for encrypted variable
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -27804,6 +27921,57 @@ export type ExternalServiceEnablePgStatStatementsResponses = {
 
 export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
 
+export type ExternalServiceResetPgStatStatementsData = {
+    /**
+     * Explicit confirmation of the global, irreversible reset
+     */
+    body: ResetPgStatStatementsRequest;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/reset';
+};
+
+export type ExternalServiceResetPgStatStatementsErrors = {
+    /**
+     * Missing or invalid reset confirmation
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not Postgres
+     */
+    422: unknown;
+    /**
+     * Target Postgres rejected or failed the reset operation
+     */
+    502: unknown;
+};
+
+export type ExternalServiceResetPgStatStatementsResponses = {
+    /**
+     * All accumulated pg_stat_statements statistics cleared
+     */
+    200: ResetPgStatStatementsResponse;
+};
+
+export type ExternalServiceResetPgStatStatementsResponse = ExternalServiceResetPgStatStatementsResponses[keyof ExternalServiceResetPgStatStatementsResponses];
+
 export type GetSlowQueriesData = {
     body?: never;
     path: {
@@ -27822,7 +27990,10 @@ export type GetSlowQueriesData = {
          */
         page_size?: number | null;
         /**
-         * Column to sort by: one of `calls`, `total_exec_time_ms`, `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to `mean_exec_time_ms`. Applied server-side so ordering stays consistent across pages.
+         * Column to sort by: one of `calls`, `total_exec_time_ms`,
+         * `mean_exec_time_ms`, `rows`, `cache_hit_ratio`. Defaults to
+         * `mean_exec_time_ms`. Applied server-side so ordering stays
+         * consistent across pages.
          */
         sort_by?: string | null;
         /**
@@ -32156,6 +32327,10 @@ export type RevealNotificationProviderConfigErrors = {
      */
     400: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * Provider or field not found
      */
     404: unknown;
@@ -33402,6 +33577,10 @@ export type QueryTraceSummariesData = {
          * Sort direction: 'asc' or 'desc' (default)
          */
         sort_order?: string;
+        /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
         /**
          * Max traces to return (default: 50, max: 100)
          */
@@ -37904,7 +38083,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -37957,7 +38136,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Secret environment variables are write-only
+     * Plaintext secret access is not permitted
      */
     403: unknown;
     /**
@@ -38813,6 +38992,10 @@ export type GetContainerEnvironmentVariableData = {
 };
 
 export type GetContainerEnvironmentVariableErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
     /**
      * Container or environment variable not found
      */
@@ -41245,6 +41428,10 @@ export type RevealMcpConfigErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
     /**
      * MCP server or field not found
      */
@@ -45495,6 +45682,10 @@ export type RevealGlobalMcpConfigErrors = {
      */
     401: unknown;
     /**
+     * Missing secrets:read permission
+     */
+    403: unknown;
+    /**
      * MCP server or field not found
      */
     404: unknown;
@@ -47050,6 +47241,43 @@ export type PauseSandboxResponses = {
 
 export type PauseSandboxResponse = PauseSandboxResponses[keyof PauseSandboxResponses];
 
+export type SandboxCreatePreviewLinkData = {
+    body: PreviewShareLinkBody;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/preview-link';
+};
+
+export type SandboxCreatePreviewLinkErrors = {
+    /**
+     * Invalid port
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox has no preview password
+     */
+    409: unknown;
+    /**
+     * Preview grant minting failed
+     */
+    500: unknown;
+};
+
+export type SandboxCreatePreviewLinkResponses = {
+    /**
+     * Shareable preview link
+     */
+    200: PreviewShareLinkResponse;
+};
+
+export type SandboxCreatePreviewLinkResponse = SandboxCreatePreviewLinkResponses[keyof SandboxCreatePreviewLinkResponses];
+
 export type ClearPreviewPasswordData = {
     body?: never;
     path: {
@@ -47897,6 +48125,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -47925,6 +48157,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */

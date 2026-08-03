@@ -37,8 +37,8 @@ impl AuditOperation for BlobServiceEnabledAudit {
         "BLOB_SERVICE_ENABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -60,8 +60,8 @@ impl AuditOperation for BlobServiceDisabledAudit {
         "BLOB_SERVICE_DISABLED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -83,8 +83,8 @@ impl AuditOperation for BlobServiceUpdatedAudit {
         "BLOB_SERVICE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

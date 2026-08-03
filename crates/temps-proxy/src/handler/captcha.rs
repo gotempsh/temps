@@ -221,9 +221,9 @@ mod tests {
     #[test]
     fn test_generate_and_solve_challenge() {
         // Generate a random challenge (same as proxy does)
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
         let challenge = hex::encode(bytes);
         let difficulty = 20; // 20 leading zero bits
 

@@ -39,6 +39,16 @@ pub struct Model {
     /// Stored as text to mirror `private_address` / `public_endpoint`; parsed
     /// to `ipnet::Ipv4Net` at the application boundary.
     pub compute_cidr: Option<String>,
+    /// Container platform this node runs, in OCI form (`linux/amd64`,
+    /// `linux/arm64`). Reported by the agent from `docker info` on every
+    /// heartbeat — it is the *daemon's* architecture, which is what decides
+    /// whether an image can run here, not the agent binary's.
+    ///
+    /// `None` means "not reported yet": an agent older than the multi-arch
+    /// support, or a node that hasn't heartbeated since the upgrade. The
+    /// scheduler treats that as compatible-but-unknown rather than excluding
+    /// the node, so a rolling upgrade doesn't drain the cluster.
+    pub architecture: Option<String>,
     /// Address other nodes use to reach this one over the underlay. Cloud
     /// private IP for same-DC clusters, public IP for cross-DC. Parsed to
     /// `std::net::IpAddr` at the application boundary.

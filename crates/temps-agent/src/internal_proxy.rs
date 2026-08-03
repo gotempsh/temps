@@ -50,7 +50,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use rand::seq::SliceRandom;
+use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
@@ -197,9 +197,9 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 /// up to the empty line, and pipes bytes bidirectionally until either
 /// side closes.
 async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
-    use rand::seq::SliceRandom;
+    use rand::prelude::IndexedRandom;
     let backend = {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         entry.backends.choose(&mut rng).cloned()
     };
     let Some(backend) = backend else {
@@ -453,7 +453,7 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     // hot-spot every request.
     let mut order: Vec<usize> = (0..entry.backends.len()).collect();
     {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         order.shuffle(&mut rng);
     }
     let attempts = if retryable {

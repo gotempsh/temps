@@ -12,7 +12,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 
 # Tokenization libraries (optional features)
-tokenizers = { version = "0.15", optional = true }
+tokenizers = { version = "0.23", optional = true }
 tiktoken-rs = { version = "0.12", optional = true }
 
 [features]

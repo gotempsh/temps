@@ -70,7 +70,31 @@ updates:
       - "dependencies"
       - "web"
     groups:
+      # react and react-dom MUST be installed at the exact same version --
+      # React throws error #527 at runtime and the console renders a blank
+      # page if they diverge (issue #504, caused by the web-minor-patch group
+      # bumping react-dom to 19.2.8 while leaving react on 19.2.7). Keep them
+      # in a dedicated group, with all update-types, so any React bump lands
+      # as a single atomic PR. The @types packages ride along so the type
+      # surface matches the runtime.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
       web-minor-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
         update-types:
           - "minor"
           - "patch"

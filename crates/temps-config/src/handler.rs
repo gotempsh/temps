@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::sync::Arc;
@@ -45,8 +45,8 @@ impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1341,8 +1341,8 @@ impl AuditOperation for JoinTokenGeneratedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_GENERATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1365,8 +1365,8 @@ impl AuditOperation for JoinTokenRevokedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_REVOKED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1405,8 +1405,8 @@ async fn generate_join_token(
 
     // Generate a random 32-byte token as hex
     let plaintext_token = {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
         hex::encode(bytes)
     };
     let token_hash = sha256_hash(&plaintext_token);

@@ -719,20 +719,31 @@ pub async fn delete_project(
     // Get project details before deletion
     let project = state.project_service.get_project(id).await?;
 
-    // Runtime resources are external to Postgres and cannot be removed by the
-    // ON DELETE CASCADE below. Clean them up first; if Docker/agent cleanup
-    // fails, preserve the project and its container records so deletion is
-    // safely retryable instead of orphaning undiscoverable containers.
+    state.project_service.begin_project_deletion(id).await?;
+
     state
-        .project_deployment_cleanup
-        .cleanup_project_deployments(id)
+        .deployment_canceller
+        .cancel_all_project_deployments(id)
         .await
-        .map_err(
-            |error| crate::services::types::ProjectError::DeploymentCleanupFailed {
-                project_id: id,
-                reason: error.to_string(),
-            },
-        )?;
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to cancel project deployments");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deployment Cancellation Failed")
+                .with_detail(format!(
+                    "Failed to cancel active deployments for project {id}: {error}"
+                ))
+        })?;
+
+    state
+        .deployment_container_cleaner
+        .cleanup_project_containers(id)
+        .await
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to clean up project containers");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Container Cleanup Failed")
+                .with_detail(error.to_string())
+        })?;
 
     state
         .project_service
@@ -1162,6 +1173,12 @@ pub async fn update_project_deployment_config(
     }
     if config.security.is_some() {
         updated_fields.insert("security".to_string(), "updated".to_string());
+    }
+    if config.cross_architecture_builds.is_some() {
+        updated_fields.insert(
+            "cross_architecture_builds".to_string(),
+            "updated".to_string(),
+        );
     }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {

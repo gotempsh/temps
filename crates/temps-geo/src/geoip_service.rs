@@ -1,5 +1,5 @@
 use maxminddb::geoip2;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::net::IpAddr;
 use thiserror::Error;
@@ -365,7 +365,7 @@ impl MockGeoIpService {
     }
 
     fn random_mock_location() -> Result<GeoLocation, GeoIpError> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mock_city = MOCK_CITIES
             .choose(&mut rng)
             .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;

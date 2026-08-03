@@ -197,12 +197,12 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 # Cryptography & Security
 # ============================================================================
 argon2 = "0.5"
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.0"
 hkdf = "0.13"
 totp-rs = "5.7.0"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
 # rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via
@@ -285,7 +285,7 @@ bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless",
 # ============================================================================
 # Scheduling & Background Jobs
 # ============================================================================
-cron = "0.15.0"
+cron = "0.17.0"
 
 # ============================================================================
 # String & URL Utilities
@@ -301,7 +301,7 @@ regex = "1.11"
 flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
-zip = "2.2"
+zip = "8.6"
 zstd = "0.13"
 
 # ============================================================================
@@ -319,7 +319,7 @@ libc = "0.2"
 # _RJEM_MALLOC_CONF is set at process start (see temps-cli/src/main.rs).
 tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-rand = "0.8"
+rand = "0.10"
 sysinfo = "0.33.1"
 tempfile = "3.12.0"
 once_cell = "1.20"

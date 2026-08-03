@@ -1,6 +1,9 @@
 use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    sea_query::{Expr, Query},
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +75,64 @@ pub struct JobProcessorService {
 }
 
 impl JobProcessorService {
+    /// Atomically admit a pending deployment only while both owners are active.
+    pub(crate) async fn try_admit_deployment(
+        db: &DbConnection,
+        deployment_id: i32,
+    ) -> Result<bool, JobProcessorError> {
+        let active_projects = Query::select()
+            .column(temps_entities::projects::Column::Id)
+            .from(temps_entities::projects::Entity)
+            .and_where(temps_entities::projects::Column::IsDeleted.eq(false))
+            .to_owned();
+        let active_environments = Query::select()
+            .column(temps_entities::environments::Column::Id)
+            .from(temps_entities::environments::Entity)
+            .and_where(temps_entities::environments::Column::DeletedAt.is_null())
+            .to_owned();
+
+        let admitted = deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("running"))
+            .col_expr(
+                deployments::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.eq("pending"))
+            .filter(deployments::Column::ProjectId.in_subquery(active_projects))
+            .filter(deployments::Column::EnvironmentId.in_subquery(active_environments))
+            .exec(db)
+            .await
+            .map(|result| result.rows_affected == 1)
+            .map_err(|error| JobProcessorError::DatabaseError(error.to_string()))?;
+
+        if !admitted {
+            // A deployment may be inserted after deletion took its cancellation
+            // snapshot. Do not leave that denied row pending forever.
+            deployments::Entity::update_many()
+                .col_expr(deployments::Column::State, Expr::value("cancelled"))
+                .col_expr(
+                    deployments::Column::CancelledReason,
+                    Expr::value("Deployment owner is being deleted"),
+                )
+                .col_expr(
+                    deployments::Column::FinishedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .col_expr(
+                    deployments::Column::UpdatedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .filter(deployments::Column::Id.eq(deployment_id))
+                .filter(deployments::Column::State.eq("pending"))
+                .exec(db)
+                .await
+                .map_err(|error| JobProcessorError::DatabaseError(error.to_string()))?;
+        }
+
+        Ok(admitted)
+    }
+
     pub fn new(
         db: Arc<DbConnection>,
         job_receiver: Box<dyn JobReceiver>,
@@ -243,6 +304,7 @@ impl JobProcessorService {
 
         // Resolve the project.
         let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
+            .filter(temps_entities::projects::Column::IsDeleted.eq(false))
             .one(db.as_ref())
             .await
         {
@@ -552,18 +614,25 @@ impl JobProcessorService {
             }
         }
 
-        if let Err(e) = JobProcessorService::update_deployment_status(
-            db,
-            deployment_id,
-            PipelineStatus::Running,
-        )
-        .await
-        {
-            error!(
-                "Failed to update deployment {} status to Running: {}",
-                deployment_id, e
-            );
-            return;
+        // This is the deployment admission boundary. Keep the pending-state
+        // and owner-fence checks in the same UPDATE so a concurrent deletion
+        // cannot resurrect a cancelled deployment after the gate returns.
+        match Self::try_admit_deployment(db.as_ref(), deployment_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "Deployment {} was not admitted because it is no longer pending or its owner is being deleted",
+                    deployment_id
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to atomically admit deployment {}: {}",
+                    deployment_id, e
+                );
+                return;
+            }
         }
         info!("Updated deployment {} status to Running", deployment_id);
 
@@ -1105,6 +1174,7 @@ async fn process_git_push_event(
     // Find the project matching this git repository
     let project = match temps_entities::projects::Entity::find()
         .filter(temps_entities::projects::Column::Id.eq(job.project_id))
+        .filter(temps_entities::projects::Column::IsDeleted.eq(false))
         .one(db.as_ref())
         .await
     {
@@ -1556,6 +1626,16 @@ mod tests {
         Arc::new(temps_error_tracking::DSNService::new(db))
     }
 
+    async fn database_integration_tests_available() -> bool {
+        std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some()
+            || tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+    }
+
     mock! {
         JobReceiver {}
 
@@ -1618,6 +1698,74 @@ mod tests {
         let deployment = deployment.insert(db).await?;
 
         Ok((deployment.id, deployment.id))
+    }
+
+    #[tokio::test]
+    async fn deployment_admission_is_atomic_with_owner_and_state_fences(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping deployment admission integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (deployment_id, _) = setup_test_data(db.as_ref()).await?;
+
+        assert!(JobProcessorService::try_admit_deployment(db.as_ref(), deployment_id).await?);
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await?
+            .expect("deployment should exist");
+        assert_eq!(deployment.state, "running");
+
+        let mut cancelled: deployments::ActiveModel = deployment.into();
+        cancelled.state = Set("cancelled".to_string());
+        let cancelled = cancelled.update(db.as_ref()).await?;
+        assert!(
+            !JobProcessorService::try_admit_deployment(db.as_ref(), cancelled.id).await?,
+            "a gate recheck must not resurrect a cancelled deployment"
+        );
+
+        let pending = deployments::ActiveModel {
+            project_id: Set(cancelled.project_id),
+            environment_id: Set(cancelled.environment_id),
+            slug: Set("owner-fenced-deployment".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let project = temps_entities::projects::Entity::find_by_id(cancelled.project_id)
+            .one(db.as_ref())
+            .await?
+            .expect("project should exist");
+        let mut deleting: temps_entities::projects::ActiveModel = project.into();
+        deleting.is_deleted = Set(true);
+        deleting.update(db.as_ref()).await?;
+
+        assert!(
+            !JobProcessorService::try_admit_deployment(db.as_ref(), pending.id).await?,
+            "a deployment owned by a deleting project must not be admitted"
+        );
+        let denied = deployments::Entity::find_by_id(pending.id)
+            .one(db.as_ref())
+            .await?
+            .expect("denied deployment should remain for history");
+        assert_eq!(denied.state, "cancelled");
+        assert_eq!(
+            denied.cancelled_reason.as_deref(),
+            Some("Deployment owner is being deleted")
+        );
+
+        Ok(())
     }
 
     async fn setup_git_push_test_data(

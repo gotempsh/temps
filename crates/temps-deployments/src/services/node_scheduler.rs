@@ -21,6 +21,11 @@ pub enum NodeAssignment {
         address: String,
         /// WireGuard or private IP
         private_address: String,
+        /// Container platform this node runs (`linux/amd64`, `linux/arm64`),
+        /// as last reported by its agent. `None` for a node that has not
+        /// reported one yet — the deploy path then validates against the
+        /// agent's health endpoint before transferring an image.
+        platform: Option<String>,
     },
 }
 
@@ -48,6 +53,82 @@ impl NodeAssignment {
             } => Some(private_address),
         }
     }
+
+    /// Container platform of the target, when known.
+    ///
+    /// `None` for `Local` (the caller knows the control plane's own platform)
+    /// and for a remote node that hasn't reported one.
+    pub fn platform(&self) -> Option<&str> {
+        match self {
+            NodeAssignment::Local => None,
+            NodeAssignment::Remote { platform, .. } => platform.as_deref(),
+        }
+    }
+}
+
+/// Why a node was dropped from the scheduling pool.
+///
+/// Carried out of the scheduler so the *deploy log* can say it — these used to
+/// be `tracing` lines only, which meant a user whose node was skipped saw
+/// nothing at all and had no way to tell a deliberate exclusion from a node
+/// that was simply never considered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExclusionReason {
+    /// The node runs an architecture no image was built for.
+    IncompatibleArchitecture {
+        node_platform: String,
+        image_platforms: Vec<String>,
+    },
+    /// The node never reported an architecture, so it was kept in the pool but
+    /// its compatibility could not be verified.
+    UnverifiedArchitecture,
+}
+
+impl std::fmt::Display for ExclusionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExclusionReason::IncompatibleArchitecture {
+                node_platform,
+                image_platforms,
+            } => write!(
+                f,
+                "runs {}, and this deployment only has images for [{}]",
+                node_platform,
+                image_platforms.join(", ")
+            ),
+            ExclusionReason::UnverifiedArchitecture => write!(
+                f,
+                "has not reported its architecture, so image compatibility could not be \
+                 verified — upgrade the node agent"
+            ),
+        }
+    }
+}
+
+/// A node the scheduler dropped (or kept but could not verify), with why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeExclusion {
+    pub node_id: i32,
+    pub node_name: String,
+    pub reason: ExclusionReason,
+    /// `false` for [`ExclusionReason::UnverifiedArchitecture`], where the node
+    /// stays schedulable and this is a warning rather than an exclusion.
+    pub excluded: bool,
+}
+
+impl std::fmt::Display for NodeExclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' {}", self.node_name, self.reason)
+    }
+}
+
+/// Result of a scheduling pass: where the replicas go, plus what was left out.
+#[derive(Debug, Clone)]
+pub struct SchedulingOutcome {
+    /// One entry per replica.
+    pub assignments: Vec<NodeAssignment>,
+    /// Nodes excluded or flagged, for the deploy log. Empty on the common path.
+    pub exclusions: Vec<NodeExclusion>,
 }
 
 /// Scheduling strategy for distributing replicas across nodes.
@@ -64,6 +145,16 @@ pub enum SchedulingStrategy {
 /// Default maximum load score (0.0–1.0). Nodes at or above this threshold
 /// are excluded from scheduling unless all nodes exceed it.
 const DEFAULT_MAX_LOAD_THRESHOLD: f64 = 0.90;
+
+/// Most platforms a single deployment will be cross-built for, including the
+/// control plane's own.
+///
+/// Each one costs a full image build — emulated, and therefore slow — on the
+/// control plane, so this bounds the work one deploy can queue no matter how
+/// many distinct architectures the fleet reports. Four covers every realistic
+/// mixed fleet (amd64 + arm64, plus room to spare); beyond that, splitting the
+/// deployment per architecture with target nodes/labels is the right answer.
+const MAX_CROSS_BUILD_PLATFORMS: usize = 4;
 
 /// Schedules replicas across available nodes using resource-aware placement.
 ///
@@ -85,6 +176,21 @@ pub struct NodeScheduler {
     /// Nodes with a load score at or above this value are excluded from the
     /// scheduling pool. Range 0.0–1.0. Defaults to 0.90 (90%).
     max_load_threshold: f64,
+    /// Container platform of the control plane itself (the `Local` slot),
+    /// pinned to a fixed value. Tests use this; production wires
+    /// `platform_source` instead so the value can't go stale.
+    /// `None` (with no source) disables platform filtering for `Local`,
+    /// preserving the old behaviour for callers that don't wire it up.
+    local_platform: Option<String>,
+    /// Live source for the control plane's platform.
+    ///
+    /// Read on every use rather than snapshotted at construction: the
+    /// `DockerRuntime` discovers the daemon's architecture asynchronously and
+    /// retries after a failure, so a value captured at startup can be the
+    /// binary's architecture forever — on a cross-architecture `DOCKER_HOST`
+    /// that is exactly the wrong answer, and it would drive both the
+    /// scheduling filter and the cross-build decision.
+    platform_source: Option<Arc<dyn temps_deployer::ImageBuilder>>,
 }
 
 impl NodeScheduler {
@@ -95,7 +201,54 @@ impl NodeScheduler {
             heartbeat_threshold_secs: 90,
             strategy: SchedulingStrategy::default(),
             max_load_threshold: DEFAULT_MAX_LOAD_THRESHOLD,
+            local_platform: None,
+            platform_source: None,
         }
+    }
+
+    /// Resolve the control plane's platform from the live image builder, so a
+    /// platform discovered (or corrected) after startup is picked up.
+    pub fn with_platform_source(
+        mut self,
+        image_builder: Arc<dyn temps_deployer::ImageBuilder>,
+    ) -> Self {
+        self.platform_source = Some(image_builder);
+        self
+    }
+
+    /// The control plane's container platform, or `None` when it isn't known.
+    ///
+    /// Reads the platform the builder **confirmed** with its daemon, never the
+    /// compiled-in fallback: with a cross-architecture `DOCKER_HOST` those
+    /// differ, and acting on the fallback would give the primary (unsuffixed)
+    /// tag to the wrong architecture — which the `Local` assignment then
+    /// deploys, since it carries no platform of its own.
+    ///
+    /// `None` disables platform filtering for `Local` and suppresses
+    /// cross-builds, which is the pre-multi-arch behaviour: degrade rather
+    /// than decide on a guess.
+    fn local_platform(&self) -> Option<String> {
+        if let Some(source) = self.platform_source.as_ref() {
+            if let Some(platform) = source.discovered_platform() {
+                let platform = platform.trim();
+                if !platform.is_empty() {
+                    return Some(temps_deployer::platform::canonicalize_platform(platform));
+                }
+            }
+            return None;
+        }
+        self.local_platform.clone()
+    }
+
+    /// Declare the control plane's own container platform so the `Local` slot
+    /// participates in architecture filtering like any worker node.
+    pub fn with_local_platform(mut self, platform: impl Into<String>) -> Self {
+        let platform = platform.into();
+        let platform = platform.trim();
+        if !platform.is_empty() {
+            self.local_platform = Some(temps_deployer::platform::canonicalize_platform(platform));
+        }
+        self
     }
 
     pub fn with_strategy(mut self, strategy: SchedulingStrategy) -> Self {
@@ -113,6 +266,128 @@ impl NodeScheduler {
     /// Get a reference to the underlying node service.
     pub fn node_service(&self) -> &NodeService {
         &self.node_service
+    }
+
+    /// Whether the control plane itself can run one of `image_platforms`.
+    ///
+    /// True when there is no constraint (empty slice) or when the control
+    /// plane's platform was never declared — in both cases we keep the
+    /// historical "Local always works" behaviour rather than inventing a
+    /// restriction the caller didn't ask for.
+    fn local_supports(&self, image_platforms: &[String]) -> bool {
+        if image_platforms.is_empty() {
+            return true;
+        }
+        match self.local_platform() {
+            Some(local) => image_platforms
+                .iter()
+                .any(|p| temps_deployer::platform::platforms_match(p, &local)),
+            None => true,
+        }
+    }
+
+    /// Container platforms a build must cover for this deployment to be
+    /// schedulable everywhere it could land.
+    ///
+    /// Returns the control plane's platform first (it always participates in
+    /// scheduling, so its architecture is always needed) followed by every
+    /// *other* architecture reported by an eligible worker node.
+    ///
+    /// Returns an **empty vec** for the common case — a cluster where every
+    /// node shares the control plane's architecture, or where the control
+    /// plane's own platform is unknown. Callers treat that as "build once,
+    /// natively", which is byte-for-byte the pre-multi-arch behaviour: no
+    /// cluster that doesn't need cross-building pays for it.
+    ///
+    /// `labels` and `target_node_ids` are the same selectors the scheduler
+    /// applies when placing replicas, so we never cross-build for an
+    /// architecture this deployment could not be placed on anyway.
+    pub async fn required_build_platforms(
+        &self,
+        labels: Option<&serde_json::Value>,
+        target_node_ids: Option<&[i32]>,
+    ) -> Result<Vec<String>, NodeError> {
+        let Some(local) = self.local_platform() else {
+            return Ok(Vec::new());
+        };
+
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+
+        let mut platforms: Vec<String> = Vec::new();
+        for node in active_nodes {
+            if let Some(target_ids) = target_node_ids {
+                if !target_ids.contains(&node.id) {
+                    continue;
+                }
+            }
+            if let Some(selector) = labels {
+                if selector.as_object().map(|m| !m.is_empty()).unwrap_or(false)
+                    && !node_matches_labels(&node.labels, selector)
+                {
+                    continue;
+                }
+            }
+            // A node that never reported its architecture can't be built for.
+            // The deploy path warns about those separately; guessing here
+            // would mean paying for an emulated build on a hunch.
+            let Some(node_platform) = node.architecture.as_deref() else {
+                continue;
+            };
+            if temps_deployer::platform::platforms_match(node_platform, &local) {
+                continue;
+            }
+            // The architecture arrives over the network from the node itself,
+            // and whatever lands here is handed to `docker build --platform`
+            // for EVERY deployment this node is eligible for. An unrecognised
+            // value would fail all of those builds, so a single buggy — or
+            // hostile — node must not be able to do that. Such a node simply
+            // never matches an image and is skipped by the placement filter,
+            // which is the safe outcome.
+            if !temps_deployer::platform::is_buildable_platform(node_platform) {
+                tracing::warn!(
+                    node_id = node.id,
+                    node_name = %node.name,
+                    reported_platform = %node_platform,
+                    "Ignoring node architecture for cross-builds: not a platform Docker can \
+                     build for. Deployments will not be scheduled onto this node."
+                );
+                continue;
+            }
+            let canonical = temps_deployer::platform::canonicalize_platform(node_platform);
+            if !platforms.contains(&canonical) {
+                platforms.push(canonical);
+            }
+        }
+
+        if platforms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Local first: it owns the unsuffixed tag, keeping image names stable
+        // for the machine that builds and stores them.
+        platforms.sort();
+        platforms.insert(0, local);
+
+        // Every extra platform is a full image build on the control plane,
+        // usually emulated. Cap the fan-out so a cluster reporting many
+        // architectures can't turn one deploy into an unbounded build queue,
+        // and say which ones were dropped rather than silently truncating.
+        if platforms.len() > MAX_CROSS_BUILD_PLATFORMS {
+            let dropped: Vec<String> = platforms.split_off(MAX_CROSS_BUILD_PLATFORMS);
+            tracing::warn!(
+                kept = ?platforms,
+                dropped = ?dropped,
+                max = MAX_CROSS_BUILD_PLATFORMS,
+                "Cluster reports more architectures than one deployment will cross-build for; \
+                 nodes running the dropped platforms will not be scheduled onto. Use target \
+                 nodes/labels to split these deployments per architecture."
+            );
+        }
+
+        Ok(platforms)
     }
 
     /// Schedule `replica_count` replicas across available nodes.
@@ -136,8 +411,16 @@ impl NodeScheduler {
         target_node_ids: Option<&[i32]>,
         anti_affinity: bool,
     ) -> Result<Vec<NodeAssignment>, NodeError> {
-        self.schedule_replicas_excluding(replica_count, labels, target_node_ids, anti_affinity, &[])
-            .await
+        self.schedule_replicas_excluding(
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity,
+            &[],
+            &[],
+        )
+        .await
+        .map(|outcome| outcome.assignments)
     }
 
     /// Like [`schedule_replicas`] but additionally accepts `exclude_node_ids` —
@@ -148,6 +431,11 @@ impl NodeScheduler {
     /// Excluded nodes are removed from the pool **only** when anti-affinity is
     /// on and there are enough remaining nodes. If excluding them would leave
     /// zero nodes, the exclusion is relaxed (best-effort).
+    /// `image_platforms` lists the container platforms an image exists for
+    /// (e.g. `["linux/amd64", "linux/arm64"]` after a multi-arch build). Nodes
+    /// that can't run any of them are dropped from the pool. An empty slice
+    /// means "unknown / unconstrained" and disables the check, which is what
+    /// callers that don't build images (or pre-multi-arch call sites) pass.
     pub async fn schedule_replicas_excluding(
         &self,
         replica_count: u32,
@@ -155,7 +443,8 @@ impl NodeScheduler {
         target_node_ids: Option<&[i32]>,
         anti_affinity: bool,
         exclude_node_ids: &[i32],
-    ) -> Result<Vec<NodeAssignment>, NodeError> {
+        image_platforms: &[String],
+    ) -> Result<SchedulingOutcome, NodeError> {
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -180,30 +469,147 @@ impl NodeScheduler {
             }
         }
 
+        // Architecture filter. A node whose Docker daemon runs a different
+        // architecture than every image we have cannot start the container —
+        // it would pull the tar, create the container, and die with
+        // `exec format error`. Drop it here so the failure is a scheduling
+        // decision with a readable message instead of a crash loop.
+        let local_compatible = self.local_supports(image_platforms);
+        // Collected rather than only logged: the caller writes these into the
+        // deploy log, which is the only place the user can see them.
+        let mut exclusions: Vec<NodeExclusion> = Vec::new();
+        if !image_platforms.is_empty() {
+            eligible_nodes.retain(|node| {
+                match node.architecture.as_deref() {
+                    Some(node_platform) => {
+                        let compatible = image_platforms
+                            .iter()
+                            .any(|p| temps_deployer::platform::platforms_match(p, node_platform));
+                        if !compatible {
+                            tracing::info!(
+                                node_id = node.id,
+                                node_name = %node.name,
+                                node_platform = %node_platform,
+                                image_platforms = ?image_platforms,
+                                "Excluding node from scheduling: no image for its architecture"
+                            );
+                            exclusions.push(NodeExclusion {
+                                node_id: node.id,
+                                node_name: node.name.clone(),
+                                reason: ExclusionReason::IncompatibleArchitecture {
+                                    node_platform: node_platform.to_string(),
+                                    image_platforms: image_platforms.to_vec(),
+                                },
+                                excluded: true,
+                            });
+                        }
+                        compatible
+                    }
+                    // Unknown architecture: a pre-multi-arch agent, or one that
+                    // hasn't heartbeated since the upgrade. Keep the historical
+                    // behaviour (schedule there) rather than draining a cluster
+                    // mid-upgrade — the deploy path validates before transfer.
+                    None => {
+                        tracing::warn!(
+                            node_id = node.id,
+                            node_name = %node.name,
+                            "Node has not reported its architecture; assuming it is compatible. \
+                             Upgrade the agent so the scheduler can verify this."
+                        );
+                        exclusions.push(NodeExclusion {
+                            node_id: node.id,
+                            node_name: node.name.clone(),
+                            reason: ExclusionReason::UnverifiedArchitecture,
+                            // Kept in the pool — this is a warning, not a drop.
+                            excluded: false,
+                        });
+                        true
+                    }
+                }
+            });
+        }
+
+        // Anti-affinity asks for one replica per node. When an architecture
+        // exclusion is what puts that out of reach, say so instead of silently
+        // stacking — reporting "3 replicas deployed" when all three share a
+        // node defeats the point of asking for the spread.
+        //
+        // This has to run BEFORE the `eligible_nodes.is_empty()` fallback
+        // below: when the filter removes *every* remote node, that fallback
+        // returns `replica_count` Local assignments and the check would never
+        // be reached — which is exactly the case a mixed cluster hits first.
+        //
+        // Deliberately gated on an exclusion having happened. A cluster that
+        // simply has fewer nodes than replicas keeps the long-standing,
+        // documented wrap-around: anti-affinity defaults to `true`, so failing
+        // there would break every multi-replica deployment on a single-node
+        // install.
+        //
+        // Counted before the load-threshold filter further down: load is
+        // transient and relaxing it is correct; an architecture mismatch is
+        // permanent.
+        let architecture_exclusions: Vec<&NodeExclusion> =
+            exclusions.iter().filter(|e| e.excluded).collect();
+        let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
+        if anti_affinity
+            && !architecture_exclusions.is_empty()
+            && (compatible_slots as u32) < replica_count
+        {
+            return Err(NodeError::InsufficientCompatibleNodes {
+                replicas: replica_count,
+                available: compatible_slots,
+                excluded: architecture_exclusions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
+
         if eligible_nodes.is_empty() {
+            if !local_compatible {
+                // Nowhere to put this: the control plane can't run the image
+                // and no worker that can is available. Failing here beats
+                // deploying a container that will never start.
+                return Err(NodeError::NoCompatibleNode {
+                    image_platforms: image_platforms.join(", "),
+                    local_platform: self
+                        .local_platform()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                });
+            }
             if target_node_ids.is_some() {
                 tracing::warn!(
                     "No active target nodes found for deployment, falling back to local deployment"
                 );
             }
-            return Ok(vec![NodeAssignment::Local; replica_count as usize]);
+            return Ok(SchedulingOutcome {
+                assignments: vec![NodeAssignment::Local; replica_count as usize],
+                exclusions,
+            });
         }
 
         // Build the scheduling pool: Local (control plane) + remote worker nodes
-        let full_pool: Vec<PoolEntry> = std::iter::once(PoolEntry {
-            assignment: NodeAssignment::Local,
-            load_score: None, // Local node has no capacity reporting
-        })
-        .chain(eligible_nodes.iter().map(|node| PoolEntry {
-            assignment: NodeAssignment::Remote {
-                node_id: node.id,
-                node_name: node.name.clone(),
-                address: node.address.clone(),
-                private_address: node.private_address.clone(),
-            },
-            load_score: compute_load_score(&node.capacity),
-        }))
-        .collect();
+        // The control plane joins the pool only when it can actually run the
+        // image — on a heterogeneous cluster it is just another node with an
+        // architecture.
+        let full_pool: Vec<PoolEntry> = local_compatible
+            .then_some(PoolEntry {
+                assignment: NodeAssignment::Local,
+                load_score: None, // Local node has no capacity reporting
+            })
+            .into_iter()
+            .chain(eligible_nodes.iter().map(|node| PoolEntry {
+                assignment: NodeAssignment::Remote {
+                    node_id: node.id,
+                    node_name: node.name.clone(),
+                    address: node.address.clone(),
+                    private_address: node.private_address.clone(),
+                    platform: node.architecture.clone(),
+                },
+                load_score: compute_load_score(&node.capacity),
+            }))
+            .collect();
 
         // Filter out nodes that exceed the max load threshold.
         // Nodes without capacity data (load_score = None) are always eligible.
@@ -225,20 +631,23 @@ impl NodeScheduler {
                     self.max_load_threshold * 100.0
                 );
                 // Re-build full pool (moved above)
-                std::iter::once(PoolEntry {
-                    assignment: NodeAssignment::Local,
-                    load_score: None,
-                })
-                .chain(eligible_nodes.iter().map(|node| PoolEntry {
-                    assignment: NodeAssignment::Remote {
-                        node_id: node.id,
-                        node_name: node.name.clone(),
-                        address: node.address.clone(),
-                        private_address: node.private_address.clone(),
-                    },
-                    load_score: compute_load_score(&node.capacity),
-                }))
-                .collect()
+                local_compatible
+                    .then_some(PoolEntry {
+                        assignment: NodeAssignment::Local,
+                        load_score: None,
+                    })
+                    .into_iter()
+                    .chain(eligible_nodes.iter().map(|node| PoolEntry {
+                        assignment: NodeAssignment::Remote {
+                            node_id: node.id,
+                            node_name: node.name.clone(),
+                            address: node.address.clone(),
+                            private_address: node.private_address.clone(),
+                            platform: node.architecture.clone(),
+                        },
+                        load_score: compute_load_score(&node.capacity),
+                    }))
+                    .collect()
             } else {
                 under_threshold
             }
@@ -268,20 +677,23 @@ impl NodeScheduler {
                     "All nodes are excluded for anti-affinity, relaxing exclusion"
                 );
                 // Re-build: we can't use pool since it was moved, rebuild from eligible_nodes
-                std::iter::once(PoolEntry {
-                    assignment: NodeAssignment::Local,
-                    load_score: None,
-                })
-                .chain(eligible_nodes.iter().map(|node| PoolEntry {
-                    assignment: NodeAssignment::Remote {
-                        node_id: node.id,
-                        node_name: node.name.clone(),
-                        address: node.address.clone(),
-                        private_address: node.private_address.clone(),
-                    },
-                    load_score: compute_load_score(&node.capacity),
-                }))
-                .collect()
+                local_compatible
+                    .then_some(PoolEntry {
+                        assignment: NodeAssignment::Local,
+                        load_score: None,
+                    })
+                    .into_iter()
+                    .chain(eligible_nodes.iter().map(|node| PoolEntry {
+                        assignment: NodeAssignment::Remote {
+                            node_id: node.id,
+                            node_name: node.name.clone(),
+                            address: node.address.clone(),
+                            private_address: node.private_address.clone(),
+                            platform: node.architecture.clone(),
+                        },
+                        load_score: compute_load_score(&node.capacity),
+                    }))
+                    .collect()
             } else {
                 filtered
             }
@@ -319,7 +731,10 @@ impl NodeScheduler {
             }
         };
 
-        Ok(assignments)
+        Ok(SchedulingOutcome {
+            assignments,
+            exclusions,
+        })
     }
 
     /// Get the assignment for a single replica (convenience wrapper).
@@ -536,6 +951,7 @@ mod tests {
 
     fn make_node(id: i32, name: &str) -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id,
             name: name.to_string(),
             token_hash: "hash".to_string(),
@@ -567,6 +983,677 @@ mod tests {
         let mut node = make_node(id, name);
         node.labels = labels;
         node
+    }
+
+    fn make_node_with_arch(id: i32, name: &str, architecture: &str) -> nodes::Model {
+        let mut node = make_node(id, name);
+        node.architecture = Some(architecture.to_string());
+        node
+    }
+
+    fn scheduler_with_nodes(nodes_list: Vec<nodes::Model>, local: &str) -> NodeScheduler {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![nodes_list])
+            .into_connection();
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db)))).with_local_platform(local)
+    }
+
+    // ── Architecture-aware scheduling ────────────────────────────────────
+
+    /// The core regression this work fixes: an arm64 worker must not receive
+    /// an amd64-only image. Before, it did — and the container died with
+    /// `exec format error`.
+    #[tokio::test]
+    async fn test_arm_node_excluded_when_image_is_amd64_only() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(3, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap()
+            .assignments;
+
+        assert_eq!(assignments.len(), 3);
+        assert!(
+            assignments.iter().all(|a| a.is_local()),
+            "every replica must stay on the amd64 control plane: {:?}",
+            assignments
+        );
+    }
+
+    /// The mirror case: an arm64-only image must not land on the amd64
+    /// control plane, even though `Local` is normally always in the pool.
+    #[tokio::test]
+    async fn test_local_excluded_when_image_is_arm64_only() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &["linux/arm64".to_string()])
+            .await
+            .unwrap()
+            .assignments;
+
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            assignments.iter().all(|a| !a.is_local()),
+            "arm64 image must go to the arm64 worker, not the amd64 CP: {:?}",
+            assignments
+        );
+        for assignment in &assignments {
+            assert_eq!(assignment.platform(), Some("linux/arm64"));
+        }
+    }
+
+    /// Nowhere to run it: fail loudly instead of silently falling back to
+    /// Local, which is what the old code path would have done.
+    #[tokio::test]
+    async fn test_no_compatible_node_is_an_error_not_a_local_fallback() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let result = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &["linux/arm64".to_string()])
+            .await;
+
+        match result {
+            Err(NodeError::NoCompatibleNode {
+                image_platforms,
+                local_platform,
+            }) => {
+                assert_eq!(image_platforms, "linux/arm64");
+                assert_eq!(local_platform, "linux/amd64");
+            }
+            other => panic!(
+                "expected NoCompatibleNode, got {:?}",
+                other.map(|o| o.assignments.len())
+            ),
+        }
+    }
+
+    // ── Replica shortfall and exclusion reporting ────────────────────────
+
+    /// Anti-affinity asks for one replica per node. When an architecture
+    /// exclusion is what makes that impossible, fail with the number to set
+    /// instead of silently stacking two replicas on one node and reporting
+    /// "3 replicas deployed" — which is the opposite of what was asked for.
+    #[tokio::test]
+    async fn test_anti_affinity_shortfall_from_exclusion_is_an_error() {
+        // Local (amd64) + worker-amd can take 2 replicas; worker-arm is
+        // dropped because the image is amd64-only. 3 were requested.
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 2, "Local + worker-amd");
+                // The message has to name the node and both platforms, or the
+                // operator can't tell why their replica count is unreachable.
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
+                assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    /// The case that escaped the first implementation and was caught on a real
+    /// mixed cluster: when the filter removes *every* remote node, the
+    /// "no eligible nodes, fall back to Local" path returned `replica_count`
+    /// Local assignments before the shortfall check was ever reached. Three
+    /// replicas silently stacked on the control plane and the deploy reported
+    /// success.
+    #[tokio::test]
+    async fn test_shortfall_errors_when_every_remote_node_is_excluded() {
+        // The only worker is arm64; the image is amd64-only. After filtering,
+        // `eligible_nodes` is empty and Local is the sole compatible slot.
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::InsufficientCompatibleNodes {
+                replicas,
+                available,
+                ref excluded,
+            } => {
+                assert_eq!(replicas, 3);
+                assert_eq!(available, 1, "only the control plane can run it");
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
+            }
+            other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+        }
+    }
+
+    /// A cluster that simply has fewer nodes than replicas keeps the
+    /// long-standing wrap-around. Anti-affinity defaults to ON, so failing
+    /// here would break every multi-replica deployment on a single-node
+    /// install — the exact regression the exclusion gate exists to avoid.
+    #[tokio::test]
+    async fn test_anti_affinity_without_exclusions_still_wraps_around() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("nothing was excluded, so this must not fail");
+
+        assert_eq!(outcome.assignments.len(), 3);
+        assert!(outcome.exclusions.is_empty());
+    }
+
+    /// Stacking stays legal with anti-affinity off, even when an exclusion
+    /// shrinks the pool — that's the documented default and what every
+    /// single-node install relies on.
+    #[tokio::test]
+    async fn test_exclusion_shortfall_without_anti_affinity_still_stacks() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(3, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("anti-affinity is off, so stacking is fine");
+
+        assert_eq!(outcome.assignments.len(), 3);
+    }
+
+    /// The caller has to be able to say a node was passed over. These were
+    /// `tracing` lines only, which the person running the deploy never sees —
+    /// their node silently went unused with nothing to explain it.
+    #[tokio::test]
+    async fn test_excluded_nodes_are_reported_to_the_caller() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-amd", "linux/amd64"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exclusions.len(), 1);
+        let excluded = &outcome.exclusions[0];
+        assert_eq!(excluded.node_name, "worker-arm");
+        assert!(excluded.excluded);
+
+        // Rendered straight into the deploy log, so it must name the node and
+        // both sides of the mismatch.
+        let rendered = excluded.to_string();
+        assert!(rendered.contains("worker-arm"), "got: {rendered}");
+        assert!(rendered.contains("linux/arm64"), "got: {rendered}");
+        assert!(rendered.contains("linux/amd64"), "got: {rendered}");
+    }
+
+    /// A node that never reported an architecture stays schedulable, but the
+    /// caller is told — otherwise "kept but unverified" is indistinguishable
+    /// from "verified compatible".
+    #[tokio::test]
+    async fn test_unverified_node_is_flagged_but_not_excluded() {
+        let scheduler = scheduler_with_nodes(vec![make_node(1, "legacy-worker")], "linux/amd64");
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exclusions.len(), 1);
+        assert!(
+            !outcome.exclusions[0].excluded,
+            "an unverified node must stay in the pool"
+        );
+        assert_eq!(
+            outcome.exclusions[0].reason,
+            ExclusionReason::UnverifiedArchitecture
+        );
+    }
+
+    /// A node upgraded from a pre-multi-arch agent reports nothing. Excluding
+    /// it would drain a cluster mid-upgrade, so it stays eligible.
+    #[tokio::test]
+    async fn test_node_with_unknown_architecture_stays_eligible() {
+        let scheduler = scheduler_with_nodes(vec![make_node(1, "legacy-worker")], "linux/amd64");
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(4, None, None, false, &[], &["linux/amd64".to_string()])
+            .await
+            .unwrap()
+            .assignments;
+
+        assert!(
+            assignments.iter().any(|a| !a.is_local()),
+            "unknown architecture must not be treated as incompatible: {:?}",
+            assignments
+        );
+    }
+
+    /// Equivalent spellings must compare equal — `docker info` says
+    /// `aarch64` where an image manifest says `arm64`.
+    #[tokio::test]
+    async fn test_architecture_matching_is_spelling_insensitive() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/aarch64")],
+            "linux/x86_64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &["linux/arm64".to_string()])
+            .await
+            .unwrap()
+            .assignments;
+
+        assert!(assignments.iter().all(|a| !a.is_local()));
+    }
+
+    /// No platform constraint (empty slice) must behave exactly as before
+    /// this feature existed.
+    #[tokio::test]
+    async fn test_empty_image_platforms_disables_filtering() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(4, None, None, false, &[], &[])
+            .await
+            .unwrap()
+            .assignments;
+
+        assert_eq!(assignments.len(), 4);
+        assert!(assignments.iter().any(|a| a.is_local()));
+        assert!(assignments.iter().any(|a| !a.is_local()));
+    }
+
+    #[tokio::test]
+    async fn test_assignment_carries_node_platform() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/arm64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas(2, None, None, true)
+            .await
+            .unwrap();
+
+        let remote = assignments
+            .iter()
+            .find(|a| !a.is_local())
+            .expect("one replica should be remote");
+        assert_eq!(remote.platform(), Some("linux/arm64"));
+    }
+
+    /// The control plane's platform must come from the daemon, read live and
+    /// only once confirmed. `get_native_platform` falls back to this process's
+    /// architecture, which differs from the daemon's on a cross-architecture
+    /// `DOCKER_HOST` — and that value decides both the `Local` filter and
+    /// which architecture owns the primary tag.
+    #[tokio::test]
+    async fn test_local_platform_uses_only_a_confirmed_daemon_platform() {
+        use std::sync::Mutex;
+
+        /// Stands in for `DockerRuntime`, whose platform starts out unknown
+        /// (falling back to the binary's) and becomes the daemon's once
+        /// discovery succeeds.
+        struct LateDiscoveryBuilder {
+            /// What `get_native_platform` answers — the compiled-in fallback
+            /// until the daemon is reached.
+            platform: Mutex<String>,
+            /// What the daemon actually confirmed, if anything.
+            discovered: Mutex<Option<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl temps_deployer::ImageBuilder for LateDiscoveryBuilder {
+            async fn build_image(
+                &self,
+                _request: temps_deployer::BuildRequest,
+            ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn build_image_with_callback(
+                &self,
+                _request: temps_deployer::BuildRequestWithCallback,
+            ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn import_image(
+                &self,
+                _image_path: std::path::PathBuf,
+                _tag: &str,
+            ) -> Result<String, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn save_image(
+                &self,
+                _image_name: &str,
+                _output_path: &std::path::Path,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn extract_from_image(
+                &self,
+                _image_name: &str,
+                _source_path: &str,
+                _destination_path: &std::path::Path,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn remove_image(
+                &self,
+                _image_name: &str,
+            ) -> Result<(), temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            async fn inspect_image(
+                &self,
+                _image_name: &str,
+            ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+                unimplemented!("not used")
+            }
+
+            fn get_native_platform(&self) -> String {
+                self.platform.lock().unwrap().clone()
+            }
+
+            fn discovered_platform(&self) -> Option<String> {
+                self.discovered.lock().unwrap().clone()
+            }
+        }
+
+        let builder = Arc::new(LateDiscoveryBuilder {
+            // The binary is amd64; the daemon (via DOCKER_HOST) hasn't
+            // answered yet.
+            platform: Mutex::new("linux/amd64".to_string()),
+            discovered: Mutex::new(None),
+        });
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+                vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            ])
+            .into_connection();
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+            .with_platform_source(builder.clone());
+
+        // Undiscovered: no cross-build decided on a guess. Acting on the
+        // binary's amd64 would hand the primary (unsuffixed) tag to the wrong
+        // architecture, and `NodeAssignment::Local` — which carries no
+        // platform — would then deploy exactly that tag.
+        assert!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unconfirmed platform must not drive cross-builds"
+        );
+
+        // The daemon answers, and it is arm64 like the worker: homogeneous
+        // cluster, nothing to cross-build.
+        *builder.discovered.lock().unwrap() = Some("linux/arm64".to_string());
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Had it confirmed amd64, the arm64 worker would need its own image.
+        *builder.discovered.lock().unwrap() = Some("linux/amd64".to_string());
+        assert_eq!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap(),
+            vec!["linux/amd64", "linux/arm64"]
+        );
+    }
+
+    // ── required_build_platforms ─────────────────────────────────────────
+
+    /// Homogeneous cluster: no cross-build, no extra image, no behaviour
+    /// change for the overwhelming majority of installs.
+    #[tokio::test]
+    async fn test_required_build_platforms_empty_for_homogeneous_cluster() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-a", "linux/amd64"),
+                make_node_with_arch(2, "worker-b", "linux/x86_64"),
+            ],
+            "linux/amd64",
+        );
+
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_required_build_platforms_lists_local_first() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-arm", "linux/arm64"),
+                make_node_with_arch(2, "worker-amd", "linux/amd64"),
+            ],
+            "linux/amd64",
+        );
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap();
+
+        // Local first: it keeps the unsuffixed tag.
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// A node's reported architecture becomes a `docker build --platform`
+    /// argument for every deployment it is eligible for. One node reporting
+    /// something Docker can't build for must not fail all of those builds.
+    #[tokio::test]
+    async fn test_required_build_platforms_ignores_unbuildable_architectures() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "weird", "linux/foo"),
+                make_node_with_arch(2, "windows", "windows/amd64"),
+            ],
+            "linux/amd64",
+        );
+
+        assert!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unbuildable platforms must not become build targets"
+        );
+    }
+
+    /// The buildable ones still get through when mixed with junk.
+    #[tokio::test]
+    async fn test_required_build_platforms_keeps_valid_platforms_alongside_junk() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "weird", "linux/foo"),
+                make_node_with_arch(2, "worker-arm", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+
+        assert_eq!(
+            scheduler
+                .required_build_platforms(None, None)
+                .await
+                .unwrap(),
+            vec!["linux/amd64", "linux/arm64"]
+        );
+    }
+
+    /// Each extra platform is a full emulated build on the control plane, so
+    /// one deployment's fan-out has to be bounded no matter how many distinct
+    /// architectures the fleet reports.
+    #[tokio::test]
+    async fn test_required_build_platforms_is_bounded() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "a", "linux/arm64"),
+                make_node_with_arch(2, "b", "linux/386"),
+                make_node_with_arch(3, "c", "linux/ppc64le"),
+                make_node_with_arch(4, "d", "linux/s390x"),
+                make_node_with_arch(5, "e", "linux/riscv64"),
+                make_node_with_arch(6, "f", "linux/arm/v7"),
+            ],
+            "linux/amd64",
+        );
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap();
+        assert!(
+            platforms.len() <= 4,
+            "cross-build fan-out must stay bounded, got {:?}",
+            platforms
+        );
+        // The control plane's own platform is never dropped: it owns the
+        // primary tag.
+        assert_eq!(platforms.first().unwrap(), "linux/amd64");
+    }
+
+    #[tokio::test]
+    async fn test_required_build_platforms_deduplicates() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "arm-a", "linux/arm64"),
+                make_node_with_arch(2, "arm-b", "linux/aarch64"),
+            ],
+            "linux/amd64",
+        );
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// Don't pay for an emulated build targeting a node this deployment is
+    /// not allowed to land on.
+    #[tokio::test]
+    async fn test_required_build_platforms_respects_target_nodes() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "worker-arm", "linux/arm64"),
+                make_node_with_arch(2, "worker-amd", "linux/amd64"),
+            ],
+            "linux/amd64",
+        );
+
+        let platforms = scheduler
+            .required_build_platforms(None, Some(&[2]))
+            .await
+            .unwrap();
+        assert!(platforms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_required_build_platforms_respects_labels() {
+        let mut arm = make_node_with_arch(1, "worker-arm", "linux/arm64");
+        arm.labels = serde_json::json!({"region": "eu"});
+        let mut amd = make_node_with_arch(2, "worker-amd", "linux/amd64");
+        amd.labels = serde_json::json!({"region": "us"});
+        let scheduler = scheduler_with_nodes(vec![arm, amd], "linux/amd64");
+
+        let selector = serde_json::json!({"region": "us"});
+        let platforms = scheduler
+            .required_build_platforms(Some(&selector), None)
+            .await
+            .unwrap();
+        assert!(platforms.is_empty());
+    }
+
+    /// A node that never reported its architecture can't be built for —
+    /// guessing would mean paying for an emulated build on a hunch.
+    #[tokio::test]
+    async fn test_required_build_platforms_ignores_unknown_architecture() {
+        let scheduler = scheduler_with_nodes(vec![make_node(1, "legacy")], "linux/amd64");
+
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Without a declared control-plane platform we have no baseline to
+    /// compare against, so we must not invent a cross-build.
+    #[tokio::test]
+    async fn test_required_build_platforms_empty_without_local_platform() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_node_with_arch(1, "arm", "linux/arm64")]])
+            .into_connection();
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))));
+
+        assert!(scheduler
+            .required_build_platforms(None, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -741,6 +1828,7 @@ mod tests {
         assert!(local.private_address().is_none());
 
         let remote = NodeAssignment::Remote {
+            platform: None,
             node_id: 5,
             node_name: "worker-5".to_string(),
             address: "https://10.100.0.5:3100".to_string(),
@@ -1409,9 +2497,10 @@ mod tests {
 
         let exclude = vec![1, 2]; // nodes with outgoing containers
         let assignments = scheduler
-            .schedule_replicas_excluding(2, None, None, true, &exclude)
+            .schedule_replicas_excluding(2, None, None, true, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 2);
 
         // Should only use Local and worker-c (node 3)
@@ -1439,9 +2528,10 @@ mod tests {
 
         let exclude = vec![1, 2]; // exclude all remote nodes
         let assignments = scheduler
-            .schedule_replicas_excluding(3, None, None, true, &exclude)
+            .schedule_replicas_excluding(3, None, None, true, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 3);
 
         // Local is never excluded, so even with all remote excluded, we still
@@ -1464,9 +2554,10 @@ mod tests {
 
         let exclude = vec![1, 2];
         let assignments = scheduler
-            .schedule_replicas_excluding(6, None, None, false, &exclude)
+            .schedule_replicas_excluding(6, None, None, false, &exclude, &[])
             .await
-            .unwrap();
+            .unwrap()
+            .assignments;
         assert_eq!(assignments.len(), 6);
 
         // With anti-affinity disabled, excluded nodes should still be used

@@ -303,8 +303,8 @@ fn default_username() -> String {
 }
 
 pub fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(16)
         .map(char::from)

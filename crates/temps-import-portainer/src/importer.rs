@@ -1091,7 +1091,11 @@ async fn execute_plan(
         git_url: None,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
-        source_type: temps_entities::source_type::SourceType::Git,
+        // Portainer workloads are pure containers/stacks with no git repo —
+        // DockerImage is the correct source_type (was incorrectly Git, which
+        // both misrepresents the project and made determine_deployment_source_type
+        // try to plan a git deploy on any future redeploy with no metadata override).
+        source_type: temps_entities::source_type::SourceType::DockerImage,
     };
 
     let project = project_service

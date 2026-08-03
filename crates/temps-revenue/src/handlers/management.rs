@@ -364,6 +364,7 @@ fn revenue_error_to_problem(err: RevenueError) -> Problem {
         }
         RevenueError::EncryptionFailed { .. }
         | RevenueError::DecryptionFailed { .. }
+        | RevenueError::RandomnessFailed { .. }
         | RevenueError::Database(_) => {
             error!("revenue internal error: {}", err);
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
