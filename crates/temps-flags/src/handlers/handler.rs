@@ -36,6 +36,7 @@ use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, Upd
         archive_flag,
         set_flag_environment,
         get_flag_snapshot,
+        record_flag_exposure,
     ),
     components(schemas(
         CreateFlagRequest,
@@ -46,6 +47,8 @@ use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, Upd
         FlagListResponse,
         FlagSnapshotResponse,
         ArchiveFlagResponse,
+        RecordExposureRequest,
+        RecordExposureResponse,
         FlagSnapshot,
         FlagValueType,
     )),
@@ -70,6 +73,7 @@ pub fn configure_routes() -> Router<Arc<FlagsAppState>> {
         // Delivery endpoint for running services. Scope comes from the
         // deployment token, not the URL.
         .route("/flags/snapshot", get(get_flag_snapshot))
+        .route("/flags/exposure", post(record_flag_exposure))
 }
 
 // =============================================================================
@@ -525,6 +529,54 @@ pub async fn set_flag_environment(
     Ok(Json(FlagEnvironmentResponse::from(model)))
 }
 
+/// Record which flags a running app actually evaluated.
+///
+/// This is what makes `last_evaluated_at` mean something. The snapshot
+/// endpoint hands the SDK every flag in the environment and evaluation then
+/// happens locally, so the control plane cannot otherwise tell a flag that is
+/// referenced by live code from one nothing has called in a year. Stamping on
+/// snapshot fetch would mark every flag as freshly used and defeat the point.
+///
+/// Scope comes from the deployment token, never the body. The endpoint writes
+/// only `last_evaluated_at` — never a flag's value — so "a deployment token
+/// cannot change what a flag serves" still holds despite this being a write.
+#[utoipa::path(
+    tag = "Feature Flags",
+    post,
+    path = "/flags/exposure",
+    request_body = RecordExposureRequest,
+    responses(
+        (status = 200, description = "Exposure recorded", body = RecordExposureResponse),
+        (status = 400, description = "Deployment token required"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn record_flag_exposure(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<FlagsAppState>>,
+    Json(request): Json<RecordExposureRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, FlagsRead);
+
+    let project_id = auth.project_id().ok_or_else(|| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Deployment Token Required")
+            .with_detail(
+                "Flag exposure is reported by deployed applications using TEMPS_API_TOKEN.",
+            )
+    })?;
+
+    let recorded = state
+        .flag_service
+        .record_exposure(project_id, &request.keys)
+        .await?;
+
+    Ok(Json(RecordExposureResponse { recorded }))
+}
+
 // =============================================================================
 // Delivery handler
 // =============================================================================
@@ -960,6 +1012,51 @@ mod tests {
         assert_eq!(
             result.err().map(|p| p.status_code),
             Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    /// Exposure is reported by deployed apps, so a session principal (which
+    /// has no project) must be turned away rather than defaulting to one.
+    #[tokio::test]
+    async fn exposure_requires_a_deployment_token() {
+        let result = record_flag_exposure(
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            State(app_state()),
+            Json(RecordExposureRequest {
+                keys: vec!["checkout.v2".to_string()],
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            result.err().map(|p| p.status_code),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    /// A read-only deployment token may report exposure: it writes a timestamp,
+    /// never a flag value, so this does not break "tokens cannot change what a
+    /// flag serves".
+    #[tokio::test]
+    async fn exposure_is_allowed_for_a_read_only_deployment_token() {
+        let result = record_flag_exposure(
+            RequireAuth(AuthContext::new_deployment_token(
+                1,
+                Some(1),
+                None,
+                1,
+                "app".to_string(),
+                vec![DeploymentTokenPermission::FlagsRead],
+            )),
+            State(app_state()),
+            Json(RecordExposureRequest { keys: vec![] }),
+        )
+        .await;
+
+        assert_ne!(
+            result.err().map(|p| p.status_code),
+            Some(StatusCode::FORBIDDEN),
+            "flags:read must be enough to report exposure"
         );
     }
 

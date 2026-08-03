@@ -7072,6 +7072,11 @@ export type FlagResponse = {
     environments: Array<FlagEnvironmentResponse>;
     id: number;
     key: string;
+    /**
+     * When an app last actually evaluated this flag. `None` means never seen,
+     * which is a real answer rather than missing data.
+     */
+    last_evaluated_at?: string | null;
     updated_at: string;
     value_type: string;
 };
@@ -12828,6 +12833,25 @@ export type RecentQueryParams = {
      * Filter by user ID
      */
     user_id?: number | null;
+};
+
+/**
+ * Keys a running app actually evaluated since its last report.
+ */
+export type RecordExposureRequest = {
+    /**
+     * Flag keys evaluated since the last report. Unknown keys are ignored.
+     */
+    keys: Array<string>;
+};
+
+export type RecordExposureResponse = {
+    /**
+     * How many of the reported keys matched a flag in this project. Lower
+     * than `keys.len()` when an app still references a flag that has since
+     * been archived or renamed.
+     */
+    recorded: number;
 };
 
 /**
@@ -28702,6 +28726,41 @@ export type GetFileResponses = {
 };
 
 export type GetFileResponse = GetFileResponses[keyof GetFileResponses];
+
+export type RecordFlagExposureData = {
+    body: RecordExposureRequest;
+    path?: never;
+    query?: never;
+    url: '/flags/exposure';
+};
+
+export type RecordFlagExposureErrors = {
+    /**
+     * Deployment token required
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RecordFlagExposureResponses = {
+    /**
+     * Exposure recorded
+     */
+    200: RecordExposureResponse;
+};
+
+export type RecordFlagExposureResponse = RecordFlagExposureResponses[keyof RecordFlagExposureResponses];
 
 export type GetFlagSnapshotData = {
     body?: never;

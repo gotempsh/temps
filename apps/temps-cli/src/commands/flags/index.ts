@@ -314,6 +314,11 @@ async function getFlagCmd(
   keyValue('Default', formatValue(flag.default_value))
   keyValue('Description', flag.description ?? '-')
   keyValue('Client visible', flag.client_visible ? 'yes' : 'no')
+  // Spelled out: this is SDK-reported evaluation, not "last touched".
+  keyValue(
+    'Last evaluated by an app',
+    flag.last_evaluated_at ?? colors.dim('never')
+  )
   if (flag.archived_at) keyValue('Archived', flag.archived_at)
 
   newline()

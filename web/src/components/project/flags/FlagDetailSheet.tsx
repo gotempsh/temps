@@ -31,6 +31,7 @@ import { useMutation } from '@tanstack/react-query'
 import { Archive, Loader2, RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 import { FlagValueField } from './FlagValueField'
 import {
   asFlagValueType,
@@ -172,6 +173,33 @@ function FlagDetailBody({
       </SheetHeader>
 
       <div className="space-y-8 py-6">
+        {/* ---------------------------------------------------------- */}
+        <section className="space-y-2">
+          <h3 className="text-base font-semibold tracking-tight">Usage</h3>
+          <div className="flex items-baseline justify-between gap-4 rounded-md border p-3">
+            <div className="min-w-0 space-y-1">
+              {/* Labelled for exactly what it measures. "Last evaluated"
+                  alone reads as "last time anything touched this flag", which
+                  would make an unused flag look alive and invite deleting a
+                  live one. */}
+              <p className="text-sm font-medium">Last evaluated by an app</p>
+              <p className="text-xs text-muted-foreground">
+                Reported by the SDK when your code actually reads this flag —
+                not when the console or a deploy fetches it.
+              </p>
+            </div>
+            <div className="shrink-0 text-sm tabular-nums">
+              {flag.last_evaluated_at ? (
+                <TimeAgo date={flag.last_evaluated_at} />
+              ) : (
+                <span className="text-muted-foreground">Never</span>
+              )}
+            </div>
+          </div>
+        </section>
+
+        <Separator />
+
         {/* ---------------------------------------------------------- */}
         <section className="space-y-4">
           <h3 className="text-base font-semibold tracking-tight">Definition</h3>

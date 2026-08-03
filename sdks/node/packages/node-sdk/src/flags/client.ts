@@ -41,11 +41,20 @@ export class FlagsClient {
   private readonly environmentId?: number;
   private readonly refreshIntervalMs: number;
   private readonly timeoutMs: number;
+  private readonly reportExposure: boolean;
   private readonly onError: (error: Error) => void;
 
   private flags = new Map<string, FlagSnapshot>();
   private etag: string | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Keys actually evaluated since the last report.
+   *
+   * Only keys present in the snapshot are recorded, which bounds this by the
+   * project's flag count — a caller doing `get('user-' + id, ...)` cannot grow
+   * it without limit.
+   */
+  private evaluated = new Set<string>();
 
   /** True once a snapshot has been successfully loaded at least once. */
   public ready = false;
@@ -62,6 +71,7 @@ export class FlagsClient {
     this.environmentId = options.environmentId;
     this.refreshIntervalMs = options.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.reportExposure = options.reportExposure ?? true;
     this.onError =
       options.onError ??
       ((error) => {
@@ -90,6 +100,7 @@ export class FlagsClient {
     if (this.timer === null && this.refreshIntervalMs > 0) {
       this.timer = setInterval(() => {
         void this.refresh();
+        void this.flushExposure();
       }, this.refreshIntervalMs);
       // On Node, don't hold the process open just to poll for flags. No-op in
       // a browser, where timer handles are plain numbers.
@@ -124,7 +135,16 @@ export class FlagsClient {
    * does not exist.
    */
   getDetails<T>(key: string, context: EvalContext = {}, fallback: T): Evaluation<T> {
-    return evaluate<T>(this.flags.get(key), context, fallback);
+    const flag = this.flags.get(key);
+
+    // Note the key in memory only — reporting happens on the refresh interval.
+    // Writing per evaluation would put a network call in the caller's hot path,
+    // which is the entire thing this client exists to avoid.
+    if (flag && this.reportExposure) {
+      this.evaluated.add(key);
+    }
+
+    return evaluate<T>(flag, context, fallback);
   }
 
   /** Every flag key currently cached. */
@@ -192,6 +212,46 @@ export class FlagsClient {
           `Flag snapshot request failed: ${reason}. Serving ${this.ready ? 'the last known' : 'fallback'} values.`,
         ),
       );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Report which flags were actually evaluated since the last flush.
+   *
+   * This is what gives `last evaluated` in the console a real meaning: the
+   * server hands out the whole flag set and evaluation happens here, so
+   * without this it could only ever know that *something* fetched the list.
+   *
+   * Best-effort. A failure drops the batch rather than retrying forever —
+   * usage telemetry must never grow unboundedly or interfere with reads.
+   */
+  async flushExposure(): Promise<void> {
+    if (!this.reportExposure || this.evaluated.size === 0) return;
+    if (!this.apiUrl || !this.apiToken) return;
+
+    // Take the batch up front so evaluations during the request aren't lost.
+    const keys = [...this.evaluated];
+    this.evaluated.clear();
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      await fetch(`${this.apiUrl}/flags/exposure`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.apiToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ keys }),
+        signal: controller.signal,
+      });
+    } catch {
+      // Deliberately silent: a dropped usage report is not worth a warning in
+      // the app's logs, and `lastError` is reserved for the failure that
+      // actually matters (flags going stale).
     } finally {
       clearTimeout(timeout);
     }

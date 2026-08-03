@@ -147,6 +147,9 @@ pub struct FlagResponse {
     pub description: Option<String>,
     pub client_visible: bool,
     pub archived_at: Option<String>,
+    /// When an app last actually evaluated this flag. `None` means never seen,
+    /// which is a real answer rather than missing data.
+    pub last_evaluated_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Per-environment overrides. Empty means the flag inherits its default
@@ -167,6 +170,7 @@ impl FlagResponse {
             description: flag.description,
             client_visible: flag.client_visible,
             archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
+            last_evaluated_at: flag.last_evaluated_at.map(|t| t.to_rfc3339()),
             created_at: flag.created_at.to_rfc3339(),
             updated_at: flag.updated_at.to_rfc3339(),
             environments: environments.into_iter().map(Into::into).collect(),
@@ -184,6 +188,22 @@ pub struct FlagListResponse {
     pub page: u64,
     pub page_size: u64,
     pub total_pages: u64,
+}
+
+/// Keys a running app actually evaluated since its last report.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RecordExposureRequest {
+    /// Flag keys evaluated since the last report. Unknown keys are ignored.
+    #[schema(example = json!(["checkout.v2", "api.rate_limit"]))]
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecordExposureResponse {
+    /// How many of the reported keys matched a flag in this project. Lower
+    /// than `keys.len()` when an app still references a flag that has since
+    /// been archived or renamed.
+    pub recorded: u64,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

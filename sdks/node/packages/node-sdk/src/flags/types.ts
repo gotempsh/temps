@@ -83,6 +83,17 @@ export interface FlagsClientOptions {
   /** Per-request timeout in milliseconds. Default 5s. */
   timeoutMs?: number;
   /**
+   * Report which flag keys were actually evaluated, on the refresh interval.
+   * Defaults to `true`.
+   *
+   * This is what makes "last evaluated" in the console meaningful — the server
+   * hands out the whole flag set and evaluation happens locally, so without it
+   * the control plane cannot tell a flag live code still reads from one nothing
+   * has called in a year. Only keys that exist in the snapshot are reported,
+   * and only on the interval, never per call.
+   */
+  reportExposure?: boolean;
+  /**
    * Called when a background refresh fails. Defaults to a `console.warn`.
    * Failures never throw and never clear the cache — the last good snapshot
    * keeps serving.

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use temps_entities::{environments, feature_flag_environments, feature_flags};
 use tracing::{debug, info};
@@ -16,6 +16,11 @@ use crate::eval::{FlagSnapshot, FlagValueType};
 /// Pagination defaults, per the project-wide convention.
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
+
+/// Upper bound on keys accepted in one exposure report. A project with more
+/// flags than this simply takes two batches; the cap exists so a client cannot
+/// hand the server an unbounded `IN` list.
+pub const MAX_EXPOSURE_KEYS: usize = 500;
 
 /// Maximum length of a flag key, matching the column width.
 const MAX_KEY_LEN: usize = 128;
@@ -435,6 +440,57 @@ impl FlagService {
     }
 
     // ---------------------------------------------------------------------
+    // Exposure
+    // ---------------------------------------------------------------------
+
+    /// Record that a running app actually evaluated these flag keys.
+    ///
+    /// One bulk `UPDATE` per batch, never per evaluation — the SDK accumulates
+    /// keys in memory and flushes on an interval, so this runs roughly once a
+    /// minute per app instance rather than once per flag check.
+    ///
+    /// Unknown keys are silently ignored rather than reported. A caller holding
+    /// a deployment token should not be able to use this endpoint to learn
+    /// which flag keys exist, and a stale key left behind after a deploy is
+    /// not an error worth surfacing.
+    ///
+    /// Writes only `last_evaluated_at`. It never touches a flag's value, which
+    /// is what keeps "a deployment token cannot change what a flag serves"
+    /// true even though this is a write path.
+    pub async fn record_exposure(
+        &self,
+        project_id: i32,
+        keys: &[String],
+    ) -> Result<u64, FlagError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        // Bound the input: a compromised or buggy client must not be able to
+        // hand us an unbounded IN list.
+        let capped: Vec<String> = keys.iter().take(MAX_EXPOSURE_KEYS).cloned().collect();
+
+        let result = feature_flags::Entity::update_many()
+            .col_expr(
+                feature_flags::Column::LastEvaluatedAt,
+                Expr::value(chrono::Utc::now()),
+            )
+            .filter(feature_flags::Column::ProjectId.eq(project_id))
+            .filter(feature_flags::Column::Key.is_in(capped))
+            .exec(self.db.as_ref())
+            .await?;
+
+        debug!(
+            project_id,
+            reported = keys.len(),
+            stamped = result.rows_affected,
+            "Recorded feature flag exposure"
+        );
+
+        Ok(result.rows_affected)
+    }
+
+    // ---------------------------------------------------------------------
     // Delivery
     // ---------------------------------------------------------------------
 
@@ -567,6 +623,7 @@ mod tests {
             salt: "a1b2c3".to_string(),
             client_visible: false,
             archived_at: None,
+            last_evaluated_at: None,
             created_at: now(),
             updated_at: now(),
         }
@@ -784,6 +841,57 @@ mod tests {
             result,
             Err(FlagError::ValueTypeMismatch { field, .. }) if field == "default_value"
         ));
+    }
+
+    // =====================================================================
+    // Exposure
+    // =====================================================================
+
+    /// An empty report must not issue a query at all — apps that evaluated
+    /// nothing this interval still call in.
+    #[tokio::test]
+    async fn empty_exposure_report_is_a_no_op() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres);
+
+        assert_eq!(service_with(db).record_exposure(1, &[]).await.unwrap(), 0);
+    }
+
+    /// Reporting a key that does not exist in this project must succeed
+    /// quietly. Surfacing "unknown key" would turn the endpoint into a
+    /// key-existence oracle, and a stale key left behind by a rollback is not
+    /// an error worth failing the report over.
+    #[tokio::test]
+    async fn unknown_keys_are_ignored_rather_than_reported() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([
+            sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            },
+        ]);
+
+        let recorded = service_with(db)
+            .record_exposure(1, &["nope.not.a.flag".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 0);
+    }
+
+    #[tokio::test]
+    async fn exposure_reports_how_many_keys_matched() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([
+            sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 2,
+            },
+        ]);
+
+        let recorded = service_with(db)
+            .record_exposure(1, &["a".to_string(), "b".to_string(), "c".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 2, "only the keys that matched are stamped");
     }
 
     // =====================================================================

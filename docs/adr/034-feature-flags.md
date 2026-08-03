@@ -121,6 +121,7 @@ OpenAPI). `temps-flags` should be a sibling and nothing more exotic.
 - **R1.6** Lifecycle metadata: `description`, `owner`, `created_at`,
   `last_evaluated_at`, `archived_at`. `last_evaluated_at` is what makes stale-flag
   cleanup possible, and stale flags are the #1 complaint about every flag product.
+  **Implemented as SDK-reported per-flag exposure** — see "R1.6, decided" below.
 - **R1.7** Storage: Postgres via Sea-ORM, new entities in `temps-entities`,
   migration in `temps-migrations`. **Not** in ClickHouse — flag *definitions* are
   small, transactional, and FK-related; flag *exposure events* are a different
@@ -262,6 +263,41 @@ to run Unleash.
 - Approval workflows on flag changes (Enterprise-tier candidate).
 - Flags-as-code / repo-declared flags (Vercel's model). Compelling, but it
   presumes a build step we do not control for every runtime.
+
+## R1.6, decided: `last_evaluated_at` is SDK-reported, per flag
+
+The obvious implementation is wrong. The snapshot endpoint hands the SDK *every*
+flag in the environment and evaluation then happens locally, so stamping on
+snapshot fetch would mark every flag as freshly used the moment any instance
+boots — including flags nothing references. The column would then actively
+mislead: someone sees a recent timestamp on a dead flag and keeps it, or trusts
+it on a live one and deletes it.
+
+So the flag set is not the signal; the *reads* are. `POST /flags/exposure` takes
+the keys an app actually evaluated, and the SDK accumulates them in memory and
+flushes on the refresh interval — never per call, which would put a network
+round trip back into the hot path this client exists to remove.
+
+Three properties that make it safe:
+
+- **Bounded.** The SDK only records keys present in the snapshot, so
+  `get('user-' + id, …)` cannot grow the set; the server caps a batch at
+  `MAX_EXPOSURE_KEYS` regardless.
+- **Not an oracle.** Unknown keys are ignored silently and counted out of
+  `recorded`, so the endpoint cannot be used to discover which flag keys exist.
+- **Still read-only in the sense that matters.** It writes `last_evaluated_at`
+  and nothing else, so "a deployment token cannot change what a flag serves"
+  remains true even though this is a write path.
+
+It lives on `feature_flags` rather than `feature_flag_environments`: the row
+always exists (a flag with no override anywhere has no environment row to
+stamp), and the question it answers — "is it safe to delete this flag?" — is
+answered across all environments at once. Per-environment resolution arrives
+with full exposure events, which carry the environment on the event itself.
+
+The UI labels it **"Last evaluated by an app"**, not "Last evaluated", and
+renders `Never` distinctly — the whole risk here is someone reading the field as
+"last time anything touched this flag".
 
 ## R4.5, decided: per-environment gating is credential scoping, not resource elevation
 

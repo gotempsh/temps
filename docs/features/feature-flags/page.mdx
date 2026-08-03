@@ -178,6 +178,28 @@ const batchSize = flags.get('worker.batch_size', {}, 50)
 
 ---
 
+## Knowing what's still in use
+
+Every flag shows **Last evaluated by an app** in its detail panel. This is
+reported by the SDK when your code actually reads the flag — it is deliberately
+*not* stamped when the console opens or when a deploy fetches the flag set,
+because that would make every flag look freshly used and defeat the purpose.
+
+`Never` means exactly that: no running app has read this flag since the feature
+shipped. That is the signal that a flag is safe to archive.
+
+Reporting is on by default, batched on the refresh interval, and only ever
+includes keys that exist in your project. Turn it off if you'd rather not send
+it:
+
+```js
+await flags.init()   // reporting on by default
+
+const client = new FlagsClient({ reportExposure: false })
+```
+
+---
+
 ## Archiving
 
 Archiving stops a flag being served. Apps fall back to the default compiled into their own code, so check that fallback is what you want in production before archiving.
@@ -223,3 +245,4 @@ Phase 1 covers per-environment values and kill switches. Not yet available:
 - Percentage rollouts
 - Reading flags directly from a browser
 - Flag-change correlation with analytics and error tracking
+- Per-environment usage (today "last evaluated" is per flag, across all environments)

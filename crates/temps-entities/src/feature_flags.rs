@@ -50,6 +50,14 @@ pub struct Model {
     /// Soft delete. Archived flags evaluate as `FLAG_NOT_FOUND` so callers
     /// fall back to their own default rather than silently changing behaviour.
     pub archived_at: Option<DBDateTime>,
+    /// When an app last actually evaluated this flag, reported in batches by
+    /// the SDK. `None` means never seen — which is a real answer, not missing
+    /// data: a flag created and never referenced by any running code.
+    ///
+    /// Deliberately *not* stamped when a snapshot is fetched: the snapshot
+    /// carries every flag in the environment, so stamping on fetch would make
+    /// unreferenced flags look freshly used and defeat the whole point.
+    pub last_evaluated_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
