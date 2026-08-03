@@ -456,11 +456,12 @@ impl PgStatStatementsService {
 
         // The schema name comes from pg_catalog, never user input. It is still
         // quoted as an identifier so unusual extension schemas remain valid
-        // and cannot alter the statement. Qualifying the function avoids
-        // executing an attacker-controlled same-named function earlier in the
-        // target role's search_path.
+        // and cannot alter the statement. Qualifying the function and calling
+        // its exact, non-defaulted signature avoids both search-path and
+        // default-argument overload shadowing.
         let quoted_schema = format!("\"{}\"", schema_name.replace('"', "\"\""));
-        let reset_sql = format!("SELECT {quoted_schema}.pg_stat_statements_reset()");
+        let reset_sql =
+            format!("SELECT {quoted_schema}.pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)");
 
         db.execute(Statement::from_string(DatabaseBackend::Postgres, reset_sql))
             .await
@@ -772,7 +773,9 @@ mod tests {
         assert!(statements
             .iter()
             .any(|sql| sql.contains("pg_catalog.pg_extension")));
-        assert!(statements.contains(&"SELECT \"extensions\".pg_stat_statements_reset()"));
+        assert!(statements.contains(
+            &"SELECT \"extensions\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
+        ));
     }
 
     #[tokio::test]
@@ -797,7 +800,7 @@ mod tests {
             .expect("reset statement should be recorded");
         assert_eq!(
             reset_statement.sql,
-            "SELECT \"odd\"\"schema\".pg_stat_statements_reset()"
+            "SELECT \"odd\"\"schema\".pg_stat_statements_reset(0::oid, 0::oid, 0::bigint)"
         );
     }
 
