@@ -30,6 +30,7 @@ import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
+import { registerFlagsCommands } from './commands/flags/index.js'
 import { registerBlobCommands } from './commands/blob/index.js'
 import { registerDsnCommands } from './commands/dsn/index.js'
 import { registerScansCommands } from './commands/scans/index.js'
@@ -168,6 +169,7 @@ export function createProgram(): Command {
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerKvCommands(program)
+registerFlagsCommands(program)
   registerBlobCommands(program)
   registerDsnCommands(program)
   registerScansCommands(program)
