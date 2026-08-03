@@ -8,6 +8,7 @@ import {
   getFlag,
   updateFlag,
   archiveFlag,
+  restoreFlag,
   setFlagEnvironment,
   getProjectBySlug,
   getEnvironments,
@@ -110,6 +111,12 @@ export function registerFlagsCommands(program: Command): void {
     .action((key: string, options: { project?: string; environment: string }) =>
       toggleFlagCmd(key, options, true),
     )
+
+  flags
+    .command('restore <key>')
+    .description('Restore an archived flag')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .action(restoreFlagCmd)
 
   flags
     .command('archive <key>')
@@ -558,5 +565,22 @@ async function archiveFlagCmd(key: string, options: { project?: string }): Promi
   newline()
   success(`Archived ${colors.bold(key)}`)
   info('Callers now fall back to the default they compiled in.')
+  newline()
+}
+
+async function restoreFlagCmd(key: string, options: { project?: string }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const project = await resolveProject(options.project)
+
+  await withSpinner(`Restoring ${key}...`, async () => {
+    const { error } = await restoreFlag({ client, path: { project_id: project.id, key } })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+
+  newline()
+  success(`Restored ${colors.bold(key)}`)
+  info('Apps will receive it again on their next refresh.')
   newline()
 }

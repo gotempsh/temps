@@ -2255,21 +2255,35 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
         "re-running `up` after a rollback must rebuild both tables"
     );
 
-    // The column that was deliberately dropped from the design must not
-    // reappear: it could only ever have been NULL, and surfacing an
-    // always-empty "last evaluated" would invite deleting a live flag.
-    let stale_column = db
+    // `last_evaluated_at` belongs on `feature_flags` (the row always exists and
+    // the question is per-flag), NOT on `feature_flag_environments`. Assert
+    // both directions: a positive check so the follow-up migration cannot be
+    // silently dropped from `mod.rs` and still pass, and a negative one so it
+    // does not drift back onto the environments table.
+    let placement = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*)::int AS n FROM information_schema.columns \
-             WHERE table_name = 'feature_flag_environments' \
-               AND column_name = 'last_evaluated_at'"
+            "SELECT \
+                (SELECT count(*)::int FROM information_schema.columns \
+                  WHERE table_name = 'feature_flags' \
+                    AND column_name = 'last_evaluated_at') AS on_flags, \
+                (SELECT count(*)::int FROM information_schema.columns \
+                  WHERE table_name = 'feature_flag_environments' \
+                    AND column_name = 'last_evaluated_at') AS on_environments"
                 .to_string(),
         ))
         .await?
-        .expect("column count");
-    let stale: i32 = stale_column.try_get("", "n")?;
-    assert_eq!(stale, 0, "last_evaluated_at must not exist");
+        .expect("column placement");
+    let on_flags: i32 = placement.try_get("", "on_flags")?;
+    let on_environments: i32 = placement.try_get("", "on_environments")?;
+    assert_eq!(
+        on_flags, 1,
+        "feature_flags.last_evaluated_at must exist — is m20260803_000001 registered?"
+    );
+    assert_eq!(
+        on_environments, 0,
+        "last_evaluated_at must not be on feature_flag_environments"
+    );
 
     Ok(())
 }

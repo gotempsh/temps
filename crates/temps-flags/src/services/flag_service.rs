@@ -22,6 +22,11 @@ const MAX_PAGE_SIZE: u64 = 100;
 /// hand the server an unbounded `IN` list.
 pub const MAX_EXPOSURE_KEYS: usize = 500;
 
+/// How stale `last_evaluated_at` must be before an exposure report rewrites
+/// it. The column answers "is this flag still read at all", so hour-level
+/// resolution is ample and second-level would be pure write amplification.
+const EXPOSURE_STALENESS_SECS: i64 = 3600;
+
 /// Maximum length of a flag key, matching the column width.
 const MAX_KEY_LEN: usize = 128;
 /// Maximum length of a flag description, matching the column width.
@@ -169,7 +174,11 @@ impl FlagService {
     // Reads
     // ---------------------------------------------------------------------
 
-    /// List flags for a project, newest-key-first, paginated.
+    /// List flags for a project, alphabetically by key, paginated.
+    ///
+    /// Key order rather than CLAUDE.md's usual `created_at` DESC: a flag list
+    /// is scanned by name to find a specific key, not read as a timeline. Noted
+    /// here because it is a deliberate deviation from the house default.
     ///
     /// Returns `(page_of_flags, total_matching_flags)`.
     ///
@@ -308,6 +317,18 @@ impl FlagService {
     ) -> Result<feature_flags::Model, FlagError> {
         let existing = self.get(project_id, key).await?.flag;
 
+        self.apply_update(key, existing, request).await
+    }
+
+    /// The update itself, given a flag the caller has already fetched.
+    async fn apply_update(
+        &self,
+        key: &str,
+        existing: feature_flags::Model,
+        request: UpdateFlag,
+    ) -> Result<feature_flags::Model, FlagError> {
+        let project_id = existing.project_id;
+
         let value_type = FlagValueType::parse(&existing.value_type).ok_or_else(|| {
             FlagError::InvalidValueType {
                 key: key.to_string(),
@@ -339,6 +360,10 @@ impl FlagService {
     /// Archive a flag. Deliberately a soft delete: an archived flag evaluates
     /// as `FLAG_NOT_FOUND`, so callers fall back to the default they compiled
     /// in rather than silently flipping behaviour.
+    ///
+    /// Idempotent. Re-archiving used to overwrite `archived_at` with `now()`,
+    /// destroying the record of when the flag was actually retired — which is
+    /// the one thing the timestamp is for.
     pub async fn archive(
         &self,
         project_id: i32,
@@ -346,12 +371,42 @@ impl FlagService {
     ) -> Result<feature_flags::Model, FlagError> {
         let existing = self.get(project_id, key).await?.flag;
 
+        if existing.archived_at.is_some() {
+            return Ok(existing);
+        }
+
         let mut active: feature_flags::ActiveModel = existing.into();
         active.archived_at = Set(Some(chrono::Utc::now()));
 
         let model = active.update(self.db.as_ref()).await?;
 
         info!(project_id, flag_key = %key, "Archived feature flag");
+
+        Ok(model)
+    }
+
+    /// Bring an archived flag back.
+    ///
+    /// Archiving is otherwise a one-way door with no route back through the
+    /// API — an accidental `flags archive` would be unrecoverable, and the key
+    /// stays reserved so it cannot even be re-created.
+    pub async fn restore(
+        &self,
+        project_id: i32,
+        key: &str,
+    ) -> Result<feature_flags::Model, FlagError> {
+        let existing = self.get(project_id, key).await?.flag;
+
+        if existing.archived_at.is_none() {
+            return Ok(existing);
+        }
+
+        let mut active: feature_flags::ActiveModel = existing.into();
+        active.archived_at = Set(None);
+
+        let model = active.update(self.db.as_ref()).await?;
+
+        info!(project_id, flag_key = %key, "Restored feature flag");
 
         Ok(model)
     }
@@ -445,14 +500,10 @@ impl FlagService {
 
     /// Record that a running app actually evaluated these flag keys.
     ///
-    /// One bulk `UPDATE` per batch, never per evaluation — the SDK accumulates
-    /// keys in memory and flushes on an interval, so this runs roughly once a
-    /// minute per app instance rather than once per flag check.
-    ///
-    /// Unknown keys are silently ignored rather than reported. A caller holding
-    /// a deployment token should not be able to use this endpoint to learn
-    /// which flag keys exist, and a stale key left behind after a deploy is
-    /// not an error worth surfacing.
+    /// Returns how many keys were *accepted*, which is deliberately not the
+    /// number of rows updated: reporting `rows_affected` would let a caller
+    /// probe `{"keys":["candidate"]}` and read the result as "this flag
+    /// exists". Accepted-count says nothing about what is stored.
     ///
     /// Writes only `last_evaluated_at`. It never touches a flag's value, which
     /// is what keeps "a deployment token cannot change what a flag serves"
@@ -466,9 +517,32 @@ impl FlagService {
             return Ok(0);
         }
 
-        // Bound the input: a compromised or buggy client must not be able to
-        // hand us an unbounded IN list.
-        let capped: Vec<String> = keys.iter().take(MAX_EXPOSURE_KEYS).cloned().collect();
+        // Reject rather than truncate. Silently dropping the tail would leave
+        // flags that ARE being evaluated stamped `NULL` forever, and the whole
+        // point of the column is answering "is it safe to delete this?".
+        if keys.len() > MAX_EXPOSURE_KEYS {
+            return Err(FlagError::Validation {
+                key: "<exposure>".to_string(),
+                message: format!(
+                    "reported {} keys, maximum is {MAX_EXPOSURE_KEYS} per batch — send several batches",
+                    keys.len()
+                ),
+            });
+        }
+
+        // A key longer than the column can hold cannot match anything, so
+        // filter rather than round-trip it into the query.
+        let candidates: Vec<&String> = keys.iter().filter(|k| k.len() <= MAX_KEY_LEN).collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Only stamp rows whose timestamp is actually stale. Without this,
+        // every instance rewrites up to MAX_EXPOSURE_KEYS rows on every flush,
+        // forever — WAL churn, index bloat and autovacuum pressure on a table
+        // shared by every tenant, to store a timestamp nobody reads at second
+        // granularity. In steady state this collapses to zero writes.
+        let stale_before = chrono::Utc::now() - chrono::Duration::seconds(EXPOSURE_STALENESS_SECS);
 
         let result = feature_flags::Entity::update_many()
             .col_expr(
@@ -476,18 +550,23 @@ impl FlagService {
                 Expr::value(chrono::Utc::now()),
             )
             .filter(feature_flags::Column::ProjectId.eq(project_id))
-            .filter(feature_flags::Column::Key.is_in(capped))
+            .filter(feature_flags::Column::Key.is_in(candidates.iter().map(|k| k.as_str())))
+            .filter(
+                feature_flags::Column::LastEvaluatedAt
+                    .is_null()
+                    .or(feature_flags::Column::LastEvaluatedAt.lt(stale_before)),
+            )
             .exec(self.db.as_ref())
             .await?;
 
         debug!(
             project_id,
-            reported = keys.len(),
+            accepted = candidates.len(),
             stamped = result.rows_affected,
             "Recorded feature flag exposure"
         );
 
-        Ok(result.rows_affected)
+        Ok(candidates.len() as u64)
     }
 
     // ---------------------------------------------------------------------
@@ -524,9 +603,17 @@ impl FlagService {
             query = query.filter(feature_flags::Column::ClientVisible.eq(true));
         }
 
-        // One JOIN, not one query per flag.
+        // One JOIN, not one query per flag — and filtered to the requested
+        // environment inside the join. Without the extra condition this pulls
+        // every environment's override and then discards all but one, on the
+        // endpoint every running container polls.
         let rows = query
             .find_with_related(feature_flag_environments::Entity)
+            .filter(
+                feature_flag_environments::Column::EnvironmentId
+                    .eq(environment_id)
+                    .or(feature_flag_environments::Column::Id.is_null()),
+            )
             .order_by_asc(feature_flags::Column::Key)
             .all(self.db.as_ref())
             .await?;
@@ -856,12 +943,11 @@ mod tests {
         assert_eq!(service_with(db).record_exposure(1, &[]).await.unwrap(), 0);
     }
 
-    /// Reporting a key that does not exist in this project must succeed
-    /// quietly. Surfacing "unknown key" would turn the endpoint into a
-    /// key-existence oracle, and a stale key left behind by a rollback is not
-    /// an error worth failing the report over.
+    /// Reporting a key that does not exist must succeed quietly AND must not
+    /// reveal that it was unknown — `recorded` is the accepted count, so it
+    /// cannot be used to probe which keys exist.
     #[tokio::test]
-    async fn unknown_keys_are_ignored_rather_than_reported() {
+    async fn unknown_keys_are_accepted_without_revealing_they_are_unknown() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([
             sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -874,11 +960,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(recorded, 0);
+        assert_eq!(
+            recorded, 1,
+            "accepted count, not rows_affected — otherwise this is an oracle"
+        );
     }
 
     #[tokio::test]
-    async fn exposure_reports_how_many_keys_matched() {
+    async fn exposure_returns_the_accepted_count() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([
             sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -891,7 +980,36 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(recorded, 2, "only the keys that matched are stamped");
+        assert_eq!(recorded, 3, "all three were accepted regardless of matches");
+    }
+
+    /// Over-cap batches are rejected, not truncated. Silent truncation would
+    /// leave flags that ARE evaluated stamped NULL forever.
+    #[tokio::test]
+    async fn oversized_exposure_batch_is_rejected_not_truncated() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres);
+        let keys: Vec<String> = (0..MAX_EXPOSURE_KEYS + 1)
+            .map(|i| format!("k{i}"))
+            .collect();
+
+        assert!(matches!(
+            service_with(db).record_exposure(1, &keys).await,
+            Err(FlagError::Validation { .. })
+        ));
+    }
+
+    /// A key longer than the column cannot match anything, so it is dropped
+    /// before it reaches the query rather than bloating the IN list.
+    #[tokio::test]
+    async fn over_long_keys_never_reach_the_query() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres);
+
+        let recorded = service_with(db)
+            .record_exposure(1, &["x".repeat(MAX_KEY_LEN + 1)])
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 0, "no query issued, nothing accepted");
     }
 
     // =====================================================================

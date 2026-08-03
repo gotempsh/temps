@@ -208,7 +208,11 @@ Archiving stops a flag being served. Apps fall back to the default compiled into
 bunx @temps-sdk/cli flags archive checkout.v2
 ```
 
-Archived flags keep their key reserved. Use `--include-archived` on `flags list` to see them.
+Archived flags keep their key reserved. Use `--include-archived` on `flags list` to see them, and restore one if you archived it by mistake:
+
+```bash
+bunx @temps-sdk/cli flags restore checkout.v2
+```
 
 ---
 

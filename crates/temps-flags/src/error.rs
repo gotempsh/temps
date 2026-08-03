@@ -42,8 +42,78 @@ pub enum FlagError {
     TokenNotEnvironmentScoped { project_id: i32 },
 
     #[error("Database error: {0}")]
-    Database(#[from] sea_orm::DbErr),
+    Database(sea_orm::DbErr),
 
     #[error("Failed to serialize flag value for flag '{key}': {reason}")]
     Serialization { key: String, reason: String },
+}
+
+/// Semantic mapping from Sea-ORM errors, per CLAUDE.md.
+///
+/// The one that matters is the unique-index violation on
+/// `idx_feature_flags_project_key`. `create()` probes for a duplicate before
+/// inserting, but the probe and the insert are not atomic — two concurrent
+/// creates of the same key both pass the probe and the index rejects the
+/// loser. Without this mapping that surfaces as a 500, while a request that
+/// loses the race by a millisecond earlier gets a clean 409. Same conflict,
+/// two different answers.
+impl From<sea_orm::DbErr> for FlagError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        if is_unique_violation(&error) {
+            return FlagError::DuplicateKey {
+                // The IDs are not recoverable from the driver error; the
+                // handler's 409 is what the caller acts on.
+                project_id: 0,
+                key: "<already exists>".to_string(),
+            };
+        }
+        FlagError::Database(error)
+    }
+}
+
+/// Detect a Postgres unique-constraint violation (SQLSTATE 23505).
+///
+/// Sea-ORM does not surface SQLSTATE as a typed field, so this inspects the
+/// rendered driver error — the same approach the rest of the codebase takes.
+fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
+    match error {
+        sea_orm::DbErr::RecordNotInserted => true,
+        other => {
+            let rendered = other.to_string();
+            rendered.contains("23505")
+                || rendered.contains("duplicate key value violates unique constraint")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_not_inserted_maps_to_duplicate_key() {
+        let mapped: FlagError = sea_orm::DbErr::RecordNotInserted.into();
+        assert!(matches!(mapped, FlagError::DuplicateKey { .. }));
+    }
+
+    /// The concurrent-create race: the unique index rejects the loser, and the
+    /// caller must see the same 409 it would have got from the pre-check.
+    #[test]
+    fn postgres_unique_violation_maps_to_duplicate_key() {
+        let raw = sea_orm::DbErr::Custom(
+            "error returned from database: (23505) duplicate key value violates unique \
+             constraint \"idx_feature_flags_project_key\""
+                .to_string(),
+        );
+        assert!(matches!(
+            FlagError::from(raw),
+            FlagError::DuplicateKey { .. }
+        ));
+    }
+
+    #[test]
+    fn unrelated_database_errors_stay_database_errors() {
+        let raw = sea_orm::DbErr::Custom("connection reset by peer".to_string());
+        assert!(matches!(FlagError::from(raw), FlagError::Database(_)));
+    }
 }

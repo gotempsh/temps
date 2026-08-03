@@ -82,7 +82,16 @@ pub struct FeatureFlagEnvironmentValueSetAudit {
     pub new_value: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FeatureFlagRestoredAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub flag_id: i32,
+    pub key: String,
+}
+
 impl_audit_operation!(FeatureFlagCreatedAudit, "FEATURE_FLAG_CREATED");
+impl_audit_operation!(FeatureFlagRestoredAudit, "FEATURE_FLAG_RESTORED");
 impl_audit_operation!(FeatureFlagUpdatedAudit, "FEATURE_FLAG_UPDATED");
 impl_audit_operation!(FeatureFlagArchivedAudit, "FEATURE_FLAG_ARCHIVED");
 impl_audit_operation!(

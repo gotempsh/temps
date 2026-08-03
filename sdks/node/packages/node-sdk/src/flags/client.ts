@@ -21,6 +21,12 @@ import type {
 
 const DEFAULT_REFRESH_INTERVAL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 5_000;
+/**
+ * Matches `MAX_EXPOSURE_KEYS` on the server, which now rejects (rather than
+ * truncates) an over-sized batch. A project with more flags than this must be
+ * chunked, or its overflow keys would never be stamped.
+ */
+const MAX_EXPOSURE_KEYS = 500;
 
 /**
  * Read an environment variable without depending on Node type definitions.
@@ -114,6 +120,9 @@ export class FlagsClient {
       clearInterval(this.timer);
       this.timer = null;
     }
+    // Best-effort final report so a graceful shutdown doesn't discard the
+    // last interval's worth of usage.
+    void this.flushExposure();
   }
 
   /**
@@ -232,28 +241,41 @@ export class FlagsClient {
     if (!this.apiUrl || !this.apiToken) return;
 
     // Take the batch up front so evaluations during the request aren't lost.
-    const keys = [...this.evaluated];
+    const pending = [...this.evaluated];
     this.evaluated.clear();
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    // Chunk to the server's cap. It rejects over-sized batches outright, so a
+    // project with >500 flags would otherwise have its whole report refused
+    // and those flags would read as "never evaluated" forever.
+    for (let i = 0; i < pending.length; i += MAX_EXPOSURE_KEYS) {
+      const keys = pending.slice(i, i + MAX_EXPOSURE_KEYS);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
-    try {
-      await fetch(`${this.apiUrl}/flags/exposure`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ keys }),
-        signal: controller.signal,
-      });
-    } catch {
-      // Deliberately silent: a dropped usage report is not worth a warning in
-      // the app's logs, and `lastError` is reserved for the failure that
-      // actually matters (flags going stale).
-    } finally {
-      clearTimeout(timeout);
+      try {
+        const response = await fetch(`${this.apiUrl}/flags/exposure`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ keys }),
+          signal: controller.signal,
+        });
+
+        // Put a rejected batch back so the next flush retries it. Bounded by
+        // the flag count, so this cannot grow without limit.
+        if (!response.ok) {
+          for (const key of keys) this.evaluated.add(key);
+        }
+      } catch {
+        // Deliberately silent: a dropped usage report is not worth a warning
+        // in the app's logs, and `lastError` is reserved for the failure that
+        // actually matters (flags going stale).
+        for (const key of keys) this.evaluated.add(key);
+      } finally {
+        clearTimeout(timeout);
+      }
     }
   }
 

@@ -11,10 +11,6 @@ temps-core = { path = "../temps-core" }
 temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 
-# Async runtime
-tokio.workspace = true
-async-trait.workspace = true
-
 # Web framework
 axum.workspace = true
 
@@ -43,3 +39,4 @@ hex.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+async-trait.workspace = true

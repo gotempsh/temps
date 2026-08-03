@@ -11,7 +11,9 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
 use tracing::error;
@@ -19,7 +21,7 @@ use utoipa::{IntoParams, OpenApi};
 
 use super::audit::{
     AuditContext, FeatureFlagArchivedAudit, FeatureFlagCreatedAudit,
-    FeatureFlagEnvironmentValueSetAudit, FeatureFlagUpdatedAudit,
+    FeatureFlagEnvironmentValueSetAudit, FeatureFlagRestoredAudit, FeatureFlagUpdatedAudit,
 };
 use super::types::*;
 use crate::error::FlagError;
@@ -34,6 +36,7 @@ use crate::services::{normalize_pagination, CreateFlag, SetEnvironmentValue, Upd
         get_flag,
         update_flag,
         archive_flag,
+        restore_flag,
         set_flag_environment,
         get_flag_snapshot,
         record_flag_exposure,
@@ -66,6 +69,10 @@ pub fn configure_routes() -> Router<Arc<FlagsAppState>> {
         .route("/projects/{project_id}/flags/{key}", get(get_flag))
         .route("/projects/{project_id}/flags/{key}", patch(update_flag))
         .route("/projects/{project_id}/flags/{key}", delete(archive_flag))
+        .route(
+            "/projects/{project_id}/flags/{key}/restore",
+            post(restore_flag),
+        )
         .route(
             "/projects/{project_id}/flags/{key}/environments/{environment_id}",
             put(set_flag_environment),
@@ -193,6 +200,27 @@ fn snapshot_etag(flags: &[FlagSnapshot]) -> Result<String, FlagError> {
     Ok(format!("\"{}\"", hex::encode(&digest[..16])))
 }
 
+/// Does an `If-None-Match` header match our tag?
+///
+/// Handles the two things exact-byte comparison gets wrong: a weak validator
+/// (`W/"abc"`), which any conformant intermediary is allowed to introduce, and
+/// a comma-separated list of candidates. Both would otherwise silently defeat
+/// the 304 and make every poll transfer the whole snapshot.
+fn if_none_match_matches(requested: &HeaderValue, etag: &str) -> bool {
+    let Ok(raw) = requested.to_str() else {
+        return false;
+    };
+
+    if raw.trim() == "*" {
+        return true;
+    }
+
+    raw.split(',')
+        .map(|candidate| candidate.trim())
+        .map(|candidate| candidate.strip_prefix("W/").unwrap_or(candidate))
+        .any(|candidate| candidate == etag)
+}
+
 // =============================================================================
 // Management handlers
 // =============================================================================
@@ -217,6 +245,11 @@ pub async fn list_flags(
     Query(query): Query<ListFlagsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, FlagsRead);
+    // A deployment token is pinned to one environment, but this endpoint
+    // returns every environment's override. `/flags/snapshot` is the machine
+    // surface and honours that pinning; without this guard a preview container
+    // could read production flag values for its project.
+    deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, &state.project_access_checker);
 
@@ -335,6 +368,9 @@ pub async fn get_flag(
     Path((project_id, key)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, FlagsRead);
+    // Same reasoning as `list_flags`: the response carries every environment's
+    // override, which is more than a token's own environment.
+    deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, &state.project_access_checker);
 
@@ -373,7 +409,11 @@ pub async fn update_flag(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, &state.project_access_checker);
 
-    let before = state.flag_service.get(project_id, &key).await?.flag;
+    // One read for the before-image; `update()` reuses it rather than
+    // fetching the flag a second time, and the environments come back with it
+    // instead of costing a third round trip.
+    let before = state.flag_service.get(project_id, &key).await?;
+    let before_flag = before.flag.clone();
 
     let flag = state
         .flag_service
@@ -393,18 +433,16 @@ pub async fn update_flag(
         project_id,
         flag_id: flag.id,
         key: flag.key.clone(),
-        old_default_value: before.default_value,
+        old_default_value: before_flag.default_value,
         new_default_value: flag.default_value.clone(),
-        old_client_visible: before.client_visible,
+        old_client_visible: before_flag.client_visible,
         new_client_visible: flag.client_visible,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log for feature flag update: {}", e);
     }
 
-    let environments = state.flag_service.get(project_id, &key).await?.environments;
-
-    Ok(Json(FlagResponse::new(flag, environments)))
+    Ok(Json(FlagResponse::new(flag, before.environments)))
 }
 
 #[utoipa::path(
@@ -450,6 +488,53 @@ pub async fn archive_flag(
         key: flag.key,
         archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
     }))
+}
+
+/// Bring an archived flag back.
+///
+/// Archiving is otherwise one-way: the key stays reserved so the flag cannot
+/// even be re-created under the same name, which makes an accidental archive
+/// unrecoverable through the API.
+#[utoipa::path(
+    tag = "Feature Flags",
+    post,
+    path = "/projects/{project_id}/flags/{key}/restore",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("key" = String, Path, description = "Flag key")
+    ),
+    responses(
+        (status = 200, description = "Flag restored", body = FlagResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Flag not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn restore_flag(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<FlagsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, key)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, FlagsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, &state.project_access_checker);
+
+    let flag = state.flag_service.restore(project_id, &key).await?;
+
+    let audit = FeatureFlagRestoredAudit {
+        context: audit_context(&auth, &metadata),
+        project_id,
+        flag_id: flag.id,
+        key: flag.key.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for feature flag restore: {}", e);
+    }
+
+    Ok(Json(FlagResponse::new(flag, Vec::new())))
 }
 
 /// Set a flag's value in one environment, and/or flip its kill switch.
@@ -617,7 +702,8 @@ pub async fn get_flag_snapshot(
     let token_info = auth.deployment_token_info();
 
     // A deployment token pins the project. Anything else (session, API key)
-    // must name the project it wants and pass the access guard.
+    // has no project to pin, so it is turned away — the management endpoints
+    // are the route for those principals.
     let project_id = match auth.project_id() {
         Some(project_id) => project_id,
         None => {
@@ -663,7 +749,7 @@ pub async fn get_flag_snapshot(
     let etag = snapshot_etag(&flags)?;
 
     if let Some(requested) = headers.get(header::IF_NONE_MATCH) {
-        if requested.as_bytes() == etag.as_bytes() {
+        if if_none_match_matches(requested, &etag) {
             return Ok(StatusCode::NOT_MODIFIED.into_response());
         }
     }
@@ -922,10 +1008,62 @@ mod tests {
         assert_eq!(rejection, Some(StatusCode::FORBIDDEN));
     }
 
-    /// The token's own project must still work, or the guard is too strict.
+    /// A deployment token must not reach the management reads AT ALL — not even
+    /// for its own project.
+    ///
+    /// This endpoint returns every environment's override, but a token is
+    /// pinned to one environment. Allowing it would let a preview container
+    /// read production flag values. `/flags/snapshot` is the machine surface
+    /// and honours the pinning; this one is for humans and API keys.
     #[tokio::test]
-    async fn deployment_token_can_read_its_own_project() {
-        let rejection = list_flags(
+    async fn deployment_token_cannot_read_management_endpoints_even_for_its_own_project() {
+        let token = || {
+            AuthContext::new_deployment_token(
+                1,
+                Some(1),
+                None,
+                1,
+                "app".to_string(),
+                vec![DeploymentTokenPermission::FlagsRead],
+            )
+        };
+
+        assert_eq!(
+            list_rejection(token()).await,
+            Some(StatusCode::FORBIDDEN),
+            "a token must not list flags: the response spans every environment"
+        );
+
+        let get_rejection = get_flag(
+            RequireAuth(token()),
+            State(app_state()),
+            Path((1, "checkout.v2".to_string())),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code);
+        assert_eq!(
+            get_rejection,
+            Some(StatusCode::FORBIDDEN),
+            "a token must not read a single flag either"
+        );
+    }
+
+    /// ...but a human session must still reach it, or the guard is too strict.
+    #[tokio::test]
+    async fn session_can_still_reach_the_management_reads() {
+        assert_ne!(
+            list_rejection(AuthContext::new_session(test_user(), Role::Reader)).await,
+            Some(StatusCode::FORBIDDEN),
+            "Reader holds flags:read and is not a deployment token"
+        );
+    }
+
+    /// The snapshot endpoint is the token's supported path and must keep
+    /// working — this guard must not have closed the legitimate route.
+    #[tokio::test]
+    async fn deployment_token_can_still_reach_the_snapshot() {
+        let result = get_flag_snapshot(
             RequireAuth(AuthContext::new_deployment_token(
                 1,
                 Some(1),
@@ -935,14 +1073,18 @@ mod tests {
                 vec![DeploymentTokenPermission::FlagsRead],
             )),
             State(app_state()),
-            Path(1),
-            Query(list_query()),
+            HeaderMap::new(),
+            Query(SnapshotQuery {
+                environment_id: None,
+            }),
         )
-        .await
-        .err()
-        .map(|p| p.status_code);
+        .await;
 
-        assert_ne!(rejection, Some(StatusCode::FORBIDDEN));
+        assert_ne!(
+            result.err().map(|p| p.status_code),
+            Some(StatusCode::FORBIDDEN),
+            "the snapshot is the documented machine surface"
+        );
     }
 
     /// A container's baked-in `TEMPS_API_TOKEN` must never be able to change a
@@ -1012,6 +1154,167 @@ mod tests {
         assert_eq!(
             result.err().map(|p| p.status_code),
             Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Write handlers
+    //
+    // These were the gap: removing a guard from `set_flag_environment` — the
+    // endpoint that flips a flag in production — used to break nothing in CI.
+    // -------------------------------------------------------------------
+
+    async fn create_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        create_flag(
+            RequireAuth(auth),
+            State(app_state()),
+            Extension(test_metadata()),
+            Path(project_id),
+            Json(CreateFlagRequest {
+                key: "checkout.v2".to_string(),
+                value_type: FlagValueType::Bool,
+                default_value: serde_json::json!(false),
+                description: None,
+                client_visible: false,
+            }),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    async fn update_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        update_flag(
+            RequireAuth(auth),
+            State(app_state()),
+            Extension(test_metadata()),
+            Path((project_id, "checkout.v2".to_string())),
+            Json(UpdateFlagRequest {
+                default_value: None,
+                description: None,
+                client_visible: Some(true),
+            }),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    async fn set_environment_rejection(auth: AuthContext, project_id: i32) -> Option<StatusCode> {
+        set_flag_environment(
+            RequireAuth(auth),
+            State(app_state()),
+            Extension(test_metadata()),
+            Path((project_id, "checkout.v2".to_string(), 1)),
+            Json(SetFlagEnvironmentRequest {
+                value: Some(Some(serde_json::json!(true))),
+                enabled: None,
+            }),
+        )
+        .await
+        .err()
+        .map(|p| p.status_code)
+    }
+
+    #[tokio::test]
+    async fn write_handlers_reject_a_read_only_role() {
+        let reader = || AuthContext::new_session(test_user(), Role::Reader);
+
+        assert_eq!(
+            create_rejection(reader(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            update_rejection(reader(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            set_environment_rejection(reader(), 1).await,
+            Some(StatusCode::FORBIDDEN),
+            "Reader must not be able to flip a flag in an environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_handlers_reject_a_read_only_api_key() {
+        let read_only = || {
+            AuthContext::new_api_key(
+                test_user(),
+                None,
+                Some(vec![Permission::FlagsRead]),
+                "flags-read-key".to_string(),
+                1,
+            )
+        };
+
+        assert_eq!(
+            create_rejection(read_only(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            update_rejection(read_only(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            set_environment_rejection(read_only(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    /// Deployment tokens cannot reach the write handlers at all.
+    ///
+    /// Note *why*: `permission_guard!(FlagsWrite)` rejects them before
+    /// `project_scope_guard!` is ever consulted, because the token bridge only
+    /// ever grants `FlagsRead`. So the scope guard on the write handlers is
+    /// unreachable defence-in-depth, not the thing doing the work here — a
+    /// sentinel run confirms removing it does not fail this test. It stays
+    /// because "every project-scoped handler carries both guards" is a rule
+    /// worth keeping mechanical rather than case-by-case.
+    #[tokio::test]
+    async fn write_handlers_reject_deployment_tokens_outright() {
+        let token = || {
+            AuthContext::new_deployment_token(
+                1,
+                Some(1),
+                None,
+                1,
+                "app".to_string(),
+                vec![DeploymentTokenPermission::FullAccess],
+            )
+        };
+
+        for (name, status) in [
+            ("create", create_rejection(token(), 2).await),
+            ("update", update_rejection(token(), 2).await),
+            (
+                "set_environment",
+                set_environment_rejection(token(), 2).await,
+            ),
+        ] {
+            assert_eq!(
+                status,
+                Some(StatusCode::FORBIDDEN),
+                "{name} must reject a deployment token"
+            );
+        }
+    }
+
+    /// A writer must still get through, or the guards are too strict.
+    #[tokio::test]
+    async fn write_handlers_admit_a_writer() {
+        let admin = || AuthContext::new_session(test_user(), Role::Admin);
+
+        assert_ne!(
+            create_rejection(admin(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_ne!(
+            update_rejection(admin(), 1).await,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_ne!(
+            set_environment_rejection(admin(), 1).await,
+            Some(StatusCode::FORBIDDEN)
         );
     }
 
@@ -1099,6 +1402,29 @@ mod tests {
         ];
 
         assert_ne!(snapshot_etag(&a).unwrap(), snapshot_etag(&b).unwrap());
+    }
+
+    #[test]
+    fn if_none_match_handles_weak_validators_and_lists() {
+        let etag = "\"abc123\"";
+
+        assert!(if_none_match_matches(
+            &HeaderValue::from_static("\"abc123\""),
+            etag
+        ));
+        assert!(
+            if_none_match_matches(&HeaderValue::from_static("W/\"abc123\""), etag),
+            "a weak validator must still match — intermediaries may add W/"
+        );
+        assert!(
+            if_none_match_matches(&HeaderValue::from_static("\"other\", W/\"abc123\""), etag),
+            "a comma-separated candidate list must be searched"
+        );
+        assert!(if_none_match_matches(&HeaderValue::from_static("*"), etag));
+        assert!(!if_none_match_matches(
+            &HeaderValue::from_static("\"nope\""),
+            etag
+        ));
     }
 
     #[test]

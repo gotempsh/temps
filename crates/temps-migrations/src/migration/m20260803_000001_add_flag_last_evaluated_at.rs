@@ -29,7 +29,7 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(FeatureFlags::Table)
-                    .add_column(
+                    .add_column_if_not_exists(
                         ColumnDef::new(FeatureFlags::LastEvaluatedAt)
                             .timestamp_with_time_zone()
                             .null(),

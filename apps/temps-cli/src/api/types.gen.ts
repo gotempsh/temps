@@ -12859,9 +12859,11 @@ export type RecordExposureRequest = {
 
 export type RecordExposureResponse = {
     /**
-     * How many of the reported keys matched a flag in this project. Lower
-     * than `keys.len()` when an app still references a flag that has since
-     * been archived or renamed.
+     * How many keys were accepted for processing.
+     *
+     * Deliberately not the number of rows updated: echoing that back would
+     * let a caller post a single candidate key and read the result as "this
+     * flag exists", turning the endpoint into an existence oracle.
      */
     recorded: number;
 };
@@ -41039,6 +41041,50 @@ export type SetFlagEnvironmentResponses = {
 };
 
 export type SetFlagEnvironmentResponse = SetFlagEnvironmentResponses[keyof SetFlagEnvironmentResponses];
+
+export type RestoreFlagData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/restore';
+};
+
+export type RestoreFlagErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RestoreFlagResponses = {
+    /**
+     * Flag restored
+     */
+    200: FlagResponse;
+};
+
+export type RestoreFlagResponse = RestoreFlagResponses[keyof RestoreFlagResponses];
 
 export type ListFunnelsData = {
     body?: never;

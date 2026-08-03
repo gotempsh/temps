@@ -2496,6 +2496,7 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `clear` - Clear a flag override so the environment inherits the default
 - `disable` - Kill switch: serve the default in this environment, ignoring any override
 - `enable` - Re-enable a flag in this environment after a kill switch
+- `restore` - Restore an archived flag
 - `archive` - Archive a flag (callers fall back to their own default)
 
 ### `flags list` (alias: `ls`)
@@ -2598,6 +2599,16 @@ Re-enable a flag in this environment after a kill switch
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | Yes |
 | `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags restore`
+
+Restore an archived flag
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 
 ### `flags archive`
 

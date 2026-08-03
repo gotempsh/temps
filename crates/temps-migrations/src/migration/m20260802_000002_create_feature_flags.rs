@@ -99,6 +99,7 @@ impl MigrationTrait for Migration {
                     .col(FeatureFlags::ProjectId)
                     .col(FeatureFlags::Key)
                     .unique()
+                    .if_not_exists()
                     .to_owned(),
             )
             .await?;
@@ -195,6 +196,7 @@ impl MigrationTrait for Migration {
                     .col(FeatureFlagEnvironments::FlagId)
                     .col(FeatureFlagEnvironments::EnvironmentId)
                     .unique()
+                    .if_not_exists()
                     .to_owned(),
             )
             .await?;
@@ -206,6 +208,7 @@ impl MigrationTrait for Migration {
                     .name("idx_feature_flag_environments_environment")
                     .table(FeatureFlagEnvironments::Table)
                     .col(FeatureFlagEnvironments::EnvironmentId)
+                    .if_not_exists()
                     .to_owned(),
             )
             .await?;
@@ -218,12 +221,18 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(FeatureFlagEnvironments::Table)
+                    .if_exists()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(FeatureFlags::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(FeatureFlags::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
 
         Ok(())

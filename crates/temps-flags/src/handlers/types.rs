@@ -96,12 +96,12 @@ pub struct CreateFlagRequest {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateFlagRequest {
     /// Must match the flag's existing `value_type`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub default_value: Option<serde_json::Value>,
     /// Tri-state: absent leaves it, `null` clears it, a string sets it.
     #[serde(default, deserialize_with = "deserialize_optional_optional_string")]
     pub description: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub client_visible: Option<bool>,
 }
 
@@ -113,7 +113,7 @@ pub struct SetFlagEnvironmentRequest {
     pub value: Option<Option<serde_json::Value>>,
     /// The kill switch. `false` makes the flag serve its default regardless of
     /// any override — and, once targeting exists, regardless of any rule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub enabled: Option<bool>,
 }
 
@@ -200,9 +200,11 @@ pub struct RecordExposureRequest {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RecordExposureResponse {
-    /// How many of the reported keys matched a flag in this project. Lower
-    /// than `keys.len()` when an app still references a flag that has since
-    /// been archived or renamed.
+    /// How many keys were accepted for processing.
+    ///
+    /// Deliberately not the number of rows updated: echoing that back would
+    /// let a caller post a single candidate key and read the result as "this
+    /// flag exists", turning the endpoint into an existence oracle.
     pub recorded: u64,
 }
 
@@ -218,4 +220,71 @@ pub struct FlagSnapshotResponse {
 pub struct ArchiveFlagResponse {
     pub key: String,
     pub archived_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The tri-state distinction (absent vs explicit null vs value) is the
+    // mechanism that has silently regressed in this codebase before: serde's
+    // plain Option<Option<T>> collapses a present `null` into `None`, making
+    // "clear this field" indistinguishable from "leave it alone".
+
+    #[test]
+    fn absent_description_means_leave_unchanged() {
+        let parsed: UpdateFlagRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.description, None);
+    }
+
+    #[test]
+    fn null_description_means_clear_it() {
+        let parsed: UpdateFlagRequest = serde_json::from_str(r#"{"description":null}"#).unwrap();
+        assert_eq!(
+            parsed.description,
+            Some(None),
+            "an explicit null must survive as the clear signal"
+        );
+    }
+
+    #[test]
+    fn present_description_means_set_it() {
+        let parsed: UpdateFlagRequest = serde_json::from_str(r#"{"description":"hi"}"#).unwrap();
+        assert_eq!(parsed.description, Some(Some("hi".to_string())));
+    }
+
+    #[test]
+    fn absent_environment_value_means_leave_the_override() {
+        let parsed: SetFlagEnvironmentRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.value, None);
+        assert_eq!(parsed.enabled, None);
+    }
+
+    #[test]
+    fn null_environment_value_means_inherit_the_default() {
+        let parsed: SetFlagEnvironmentRequest = serde_json::from_str(r#"{"value":null}"#).unwrap();
+        assert_eq!(
+            parsed.value,
+            Some(None),
+            "null clears the override so the flag inherits its default"
+        );
+    }
+
+    #[test]
+    fn false_is_a_value_not_a_clear() {
+        let parsed: SetFlagEnvironmentRequest = serde_json::from_str(r#"{"value":false}"#).unwrap();
+        assert_eq!(
+            parsed.value,
+            Some(Some(serde_json::json!(false))),
+            "false must not be confused with null — it is a legitimate flag value"
+        );
+    }
+
+    #[test]
+    fn kill_switch_and_value_are_independent() {
+        let parsed: SetFlagEnvironmentRequest =
+            serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert_eq!(parsed.enabled, Some(false));
+        assert_eq!(parsed.value, None, "disabling must not clear the override");
+    }
 }
