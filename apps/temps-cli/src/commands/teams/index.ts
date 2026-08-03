@@ -268,7 +268,7 @@ async function listTeamsAction(options: JsonOption): Promise<void> {
 
   if (teams.length === 0) {
     info('No teams yet')
-    info('Run: temps teams create --name "Platform" --slug platform')
+    info('Run: bunx @temps-sdk/cli teams create --name "Platform" --slug platform')
     newline()
     return
   }
@@ -314,7 +314,9 @@ async function createTeamAction(options: {
 
   newline()
   success(`Created team '${team.name}' (id ${team.id})`)
-  info(`Grant it a project: temps access grant ${team.slug} --project <project> --role deployer`)
+  info(
+    `Grant it a project: bunx @temps-sdk/cli access grant ${team.slug} --project <project> --role deployer`
+  )
   newline()
 }
 
@@ -475,7 +477,9 @@ async function listMembersAction(teamRef: string, options: JsonOption): Promise<
   header(`${icons.info} Members of '${teamRef}' (${members.length})`)
   if (members.length === 0) {
     info('No members')
-    info(`Run: temps teams members add ${teamRef} --user someone@example.com --role viewer`)
+    info(
+      `Run: bunx @temps-sdk/cli teams members add ${teamRef} --user someone@example.com --role viewer`
+    )
     newline()
     return
   }
@@ -677,7 +681,9 @@ async function grantAccessAction(
 
   newline()
   success(`Granted '${teamRef}' ${role} access to project ${grant.project_id}`)
-  info('This project is now restricted to the teams listed in: temps access list')
+  info(
+    'This project is now restricted to the teams listed in: bunx @temps-sdk/cli access list'
+  )
   newline()
 }
 
