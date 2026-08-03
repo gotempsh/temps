@@ -197,7 +197,7 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 # Cryptography & Security
 # ============================================================================
 argon2 = "0.5"
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.0"
 hkdf = "0.13"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
