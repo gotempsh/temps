@@ -945,7 +945,22 @@ fn schema_type_to_string(st: &utoipa::openapi::schema::SchemaType) -> String {
         SchemaType::Type(Type::Array) => "array",
         SchemaType::Type(Type::Object) => "object",
         SchemaType::Type(Type::Null) => "null",
-        SchemaType::Array(_) => "array",
+        // NOT an array — this is a *type union*, which utoipa emits as
+        // `type: ["string", "null"]` for an `Option<String>`. Reporting it as
+        // "array" told the model that every optional field wanted a list, so
+        // `--start_time <array>` for what is an RFC 3339 string. Report the one
+        // real type instead and ignore the null.
+        SchemaType::Array(types) => {
+            let mut concrete = types.iter().filter(|t| !matches!(t, Type::Null));
+            return match (concrete.next(), concrete.next()) {
+                // The overwhelmingly common case: `T | null`.
+                (Some(single), None) => schema_type_to_string(&SchemaType::Type(single.clone())),
+                // Genuinely polymorphic, or null-only — neither is a type the
+                // caller can act on, so don't pretend otherwise.
+                (Some(_), Some(_)) => "any".to_string(),
+                (None, _) => "null".to_string(),
+            };
+        }
         SchemaType::AnyValue => "any",
     }
     .to_string()
@@ -1753,6 +1768,39 @@ mod tests {
             shape.describe().contains("\"kind\": \"static\""),
             "{}",
             shape.describe()
+        );
+    }
+
+    /// `Option<T>` must report `T`, not "array".
+    ///
+    /// utoipa encodes a nullable field as `type: ["string", "null"]`, which is
+    /// a type UNION. Mapping that to "array" told the model every optional
+    /// field wanted a list — `--start_time <array>` for an RFC 3339 string.
+    #[test]
+    fn nullable_type_union_reports_the_concrete_type() {
+        use utoipa::openapi::schema::{SchemaType, Type};
+
+        let nullable_string = SchemaType::Array(vec![Type::String, Type::Null]);
+        assert_eq!(schema_type_to_string(&nullable_string), "string");
+
+        let nullable_number = SchemaType::Array(vec![Type::Null, Type::Number]);
+        assert_eq!(schema_type_to_string(&nullable_number), "number");
+
+        // A real array is still an array.
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Type(Type::Array)),
+            "array"
+        );
+
+        // Genuinely polymorphic, or null-only: neither is actionable, so don't
+        // claim a type the caller could act on.
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Array(vec![Type::String, Type::Number])),
+            "any"
+        );
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Array(vec![Type::Null])),
+            "null"
         );
     }
 

@@ -3404,6 +3404,63 @@ mod ai_tool_allowlist_tests {
         );
     }
 
+    /// `preview_alert` must be reachable from the read CLI, and its help must
+    /// describe a backtest the model can actually run.
+    ///
+    /// Allowlisted is not the same as usable. It was discoverable all along —
+    /// the reason it was never called is that it rejected every detector kind
+    /// except `anomaly`, while every rule the model proposes is a static
+    /// threshold. It also advertised its optional RFC 3339 timestamps as
+    /// `<array>`, because a nullable type union was being read as an array.
+    #[tokio::test]
+    async fn preview_alert_is_usable_from_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let caller = InternalApiCaller::new_allowlisted_with_safe_posts(
+            axum::Router::new(),
+            &openapi,
+            ai_read_allowlist(),
+            ai_read_safe_posts(),
+        );
+        let auth = admin_auth();
+        let scope = ApiCallScope {
+            auth: auth.clone(),
+            project_ids: vec![1],
+        };
+
+        // Discoverable by browsing, which is how the model finds anything.
+        let section = caller.run_cli("alerts --help", &scope).await;
+        assert!(
+            section.contains("preview_alert"),
+            "must be listed in its section: {section}"
+        );
+
+        let help = caller.run_cli("alerts preview_alert --help", &scope).await;
+
+        // The static variant has to be offered, or the backtest is impossible
+        // for the rules this flow actually proposes.
+        assert!(
+            help.contains("\"kind\": \"static\""),
+            "static detectors must be backtestable: {help}"
+        );
+        assert!(
+            help.contains("comparator") && help.contains("gt|gte|lt|lte"),
+            "the static variant's fields must be spelled out: {help}"
+        );
+
+        // Optional timestamps are strings, not lists.
+        assert!(
+            help.contains("--start_time <string>"),
+            "an Option<String> must not advertise itself as an array: {help}"
+        );
+        assert!(
+            !help.contains("--end_time <array>"),
+            "nullable != array: {help}"
+        );
+    }
+
     /// The AI read allowlist must never contain duplicate entries — a repeat
     /// is dead weight in the model's tool catalogue and a signal something
     /// was pasted twice while merging.
