@@ -803,32 +803,35 @@ impl ConversationService {
         tools: Vec<ChatTool>,
         auth: &AuthContext,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
-        // The turn runs until the model answers, the user presses Stop, or one
-        // of the bounds below trips. It deliberately is NOT capped at a small
-        // number of steps: the user can see every tool call as it happens and
-        // stop it, and closing the panel drops the SSE stream which cancels the
-        // upstream request — so a preset step limit mostly just cuts short
-        // tasks that were working.
+        // A turn is bounded by TIME, not by a number of steps.
         //
-        // What actually needs bounding is different:
+        // A step count is the wrong governor: it says nothing about cost or
+        // about how long someone has been watching a spinner, and it cuts short
+        // exactly the long, productive tasks people want the chat for. The user
+        // can already see every tool call as it happens and press Stop, and
+        // closing the panel drops the SSE stream, which cancels the upstream
+        // request — so the interactive controls are the real ones. What a
+        // deadline adds is the guarantee those controls can't give: that an
+        // unattended turn still ends, whatever the model is doing.
         //
-        // - `MAX_ROUNDS` is a runaway backstop for a loop nobody is watching,
-        //   not a task budget. No legitimate task should come near it.
-        // - `MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS` stops a stuck turn fast. A
-        //   model correcting a flag is fine; one that has produced nothing but
-        //   rejections for several rounds is not going to recover, and no user
-        //   should have to sit and watch it try.
-        // - `MAX_CARRIED_TOOL_BYTES` is the real ceiling on turn length, since
-        //   every tool result is replayed on every later round. Without it a
-        //   long turn blows the context window instead of finishing.
-        const MAX_ROUNDS: usize = 40;
-        // A turn also has to end in bounded *time*, not just bounded steps. The
-        // step count says nothing about cost or about how long someone has been
-        // watching a spinner: 40 rounds against a slow local model is over an
-        // hour. This is the ceiling that actually protects the operator's
-        // provider bill, since it holds however fast or slow each round is.
+        // 15 minutes is generous — a full alert-suggestion turn against a slow
+        // local model runs about 10 — while capping what a single message can
+        // cost the operator, whose own provider key is paying.
         const MAX_TURN_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        // Purely an anti-spin guard, NOT a task budget. If rounds return
+        // instantly (a provider erroring fast, a model emitting empty calls) the
+        // deadline alone would allow an enormous number of iterations, so there
+        // is a ceiling — set far beyond anything a real task approaches, so it
+        // is never what ends a turn in practice.
+        const MAX_ROUNDS: usize = 500;
+        // Independent of both: a turn where every call was rejected several
+        // rounds running is stuck, and stopping it in seconds beats letting it
+        // grind for the rest of the deadline. This never shortens a turn that
+        // is getting real results.
         const MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS: usize = 3;
+        // Every tool result is replayed on each later round, so without a cap on
+        // the carried transcript a long turn runs out of context rather than
+        // finishing. Not a limit on the task — a limit on what it re-sends.
         const MAX_CARRIED_TOOL_BYTES: usize = 192 * 1024;
         // Directive appended before the final, tool-free answer so the model
         // writes real prose from the evidence instead of narrating another tool
@@ -911,7 +914,7 @@ impl ConversationService {
 
             'rounds: for _ in 0..MAX_ROUNDS {
                 if turn_started.elapsed() >= MAX_TURN_DURATION {
-                    stop_reason = Some("stopped after running for too long");
+                    stop_reason = Some("reached its 15-minute limit for a single turn");
                     break 'rounds;
                 }
                 let req = ChatTurnRequest {
@@ -1146,7 +1149,7 @@ impl ConversationService {
             // Fell out of the loop by exhausting the backstop rather than by
             // answering — worth saying, since it means the task was cut short.
             if !answered && stop_reason.is_none() && !client_gone && !tools_meta.is_empty() {
-                stop_reason = Some("stopped at the maximum number of steps for one turn");
+                stop_reason = Some("stopped after an unusually long run of steps");
             }
 
             // Close any trailing open text part.
@@ -1989,6 +1992,9 @@ mod tests {
         /// round-cap assertions).
         chat_calls: Arc<std::sync::atomic::AtomicUsize>,
         available: bool,
+        /// Advance the paused test clock by this much on every model call, so a
+        /// deadline can be exercised without a test that actually waits.
+        advance_per_round: Option<std::time::Duration>,
     }
 
     impl ScriptedAi {
@@ -1997,9 +2003,17 @@ mod tests {
                 rounds: Mutex::new(rounds.into_iter().collect()),
                 chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 available: true,
+                advance_per_round: None,
             }
         }
 
+        /// Advance the paused clock by `d` on each model call.
+        fn advancing(mut self, d: std::time::Duration) -> Self {
+            self.advance_per_round = Some(d);
+            self
+        }
+
+        #[allow(dead_code)]
         fn unavailable() -> Self {
             Self {
                 available: false,
@@ -2025,6 +2039,9 @@ mod tests {
         ) -> Result<ChatTurnStream, AiError> {
             self.chat_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(d) = self.advance_per_round {
+                tokio::time::advance(d).await;
+            }
             // When the script is exhausted, keep requesting the same tool call so a
             // misbehaving loop would run forever — letting MAX_ROUNDS assert.
             let round = self
@@ -2337,12 +2354,16 @@ mod tests {
         );
     }
 
-    /// The backstop still exists for a model that keeps making *different*
-    /// calls forever — progress that never converges.
+    /// A model making genuine progress is NOT cut off by a step count.
+    ///
+    /// This is the property the product wants: ask the chat something and it
+    /// works the problem, rather than stopping every N turns. The old 10-step
+    /// cap ended real alert-suggestion turns with nothing proposed; steps no
+    /// longer govern at all.
     #[tokio::test]
-    async fn test_tool_loop_backstop_bounds_an_endlessly_productive_model() {
-        // Each round asks for a DIFFERENT tool call, so the repeat guard never
-        // fires and every round looks productive — only the backstop ends it.
+    async fn test_tool_loop_does_not_cut_off_a_productive_model() {
+        // 60 rounds, each a DIFFERENT call, so the repeat guard never fires and
+        // every round counts as progress. Comfortably past any old step cap.
         let rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>> = (0..60)
             .map(|i| {
                 Ok(vec![ChatStreamDelta::ToolCall(ToolCall {
@@ -2364,20 +2385,56 @@ mod tests {
         let stream = svc
             .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
             .await;
+        drain(stream).await;
+
+        let calls = chat_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls >= 60,
+            "a productive model must run its course, was stopped after {calls} rounds"
+        );
+    }
+
+    /// Time is the limit. An unattended turn ends on the deadline however many
+    /// steps it has taken, and says so.
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_loop_ends_on_the_deadline() {
+        // Never-ending script; each call advances the paused clock by a minute,
+        // so the 15-minute deadline trips without the test waiting.
+        let ai = Arc::new(
+            ScriptedAi::new(
+                (0..1000)
+                    .map(|i| {
+                        Ok(vec![ChatStreamDelta::ToolCall(ToolCall {
+                            id: format!("c{i}"),
+                            name: "echo".to_string(),
+                            arguments: format!("{{\"n\":{i}}}"),
+                        })])
+                    })
+                    .collect(),
+            )
+            .advancing(std::time::Duration::from_secs(60)),
+        );
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let chat_count = ai.chat_calls.clone();
+        let (svc, tools) = service_with(ai);
+
+        let conv = test_conversation();
+        let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
+        let stream = svc
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .await;
         let out = drain(stream).await;
 
         let calls = chat_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            calls <= 41,
-            "must not exceed MAX_ROUNDS (40) + 1 salvage call, took {calls}"
+            (14..=18).contains(&calls),
+            "should stop around the 15-minute mark, stopped after {calls} rounds"
         );
         assert!(
-            calls > 6,
-            "a model making genuine progress must not be cut off early, took {calls}"
-        );
-        assert!(
-            joined_text(&out).contains("maximum number of steps"),
-            "the user must be told the turn was cut short; got {out:?}"
+            joined_text(&out).contains("15-minute limit"),
+            "the user must be told time ran out; got {out:?}"
         );
     }
 

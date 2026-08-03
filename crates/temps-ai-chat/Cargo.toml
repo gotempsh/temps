@@ -37,4 +37,6 @@ base64 = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` gives the paused clock used to exercise the turn deadline without
+# a test that actually waits fifteen minutes. Dev-only — not in the binary.
+tokio = { workspace = true, features = ["test-util"] }
