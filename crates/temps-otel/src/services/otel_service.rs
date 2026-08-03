@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 use crate::error::OtelError;
@@ -33,8 +34,15 @@ pub struct OtelService {
     /// over the OTel hypertables on every ingest request. See
     /// [`crate::ingest::quota_cache`].
     quota_cache: Arc<QuotaCache>,
+    ingest_semaphore: Arc<Semaphore>,
     stats: PipelineStatsAtomic,
 }
+
+/// Process-wide limit for OTLP requests that may authenticate, decompress,
+/// decode, and write concurrently. The permit is acquired before Axum buffers
+/// the request body, bounding both task and payload memory during exporter
+/// retry storms.
+pub const MAX_CONCURRENT_INGEST_REQUESTS: usize = 64;
 
 /// Max `si_` ingest requests per service per window. ~10 req/s — far above a
 /// healthy exporter's cadence, low enough to stop a tight-loop flood from
@@ -91,8 +99,19 @@ impl OtelService {
                 SERVICE_INGEST_WINDOW,
             )),
             quota_cache: Arc::new(QuotaCache::new(QUOTA_CACHE_TTL)),
+            ingest_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_INGEST_REQUESTS)),
             stats: PipelineStatsAtomic::default(),
         }
+    }
+
+    /// Acquire an ingest slot without queueing more work in memory.
+    pub fn try_acquire_ingest_permit(&self) -> Result<OwnedSemaphorePermit, OtelError> {
+        self.ingest_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OtelError::IngestSaturated {
+                limit: MAX_CONCURRENT_INGEST_REQUESTS,
+            })
     }
 
     /// Authenticate a token (API key `tk_` or deployment token `dt_`).
@@ -1130,5 +1149,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OtelError::Validation { .. }));
+    }
+
+    #[test]
+    fn ingest_concurrency_is_bounded_and_permits_are_released() {
+        let (service, _storage) = make_service(MockOtelStorage::new());
+        let permits: Vec<_> = (0..MAX_CONCURRENT_INGEST_REQUESTS)
+            .map(|_| service.try_acquire_ingest_permit().unwrap())
+            .collect();
+
+        assert!(matches!(
+            service.try_acquire_ingest_permit(),
+            Err(OtelError::IngestSaturated {
+                limit: MAX_CONCURRENT_INGEST_REQUESTS
+            })
+        ));
+
+        drop(permits);
+        assert!(service.try_acquire_ingest_permit().is_ok());
     }
 }

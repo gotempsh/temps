@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **email:** Pin validated SMTP probe addresses and remove request-controlled proxy routing ([#305](https://github.com/gotempsh/temps/pull/305))
 ### Fixed
 
+- **OTel ingest memory backpressure:** Bound concurrent OTLP request processing before body buffering, single-flight repeated token authentication, coalesce token usage writes, remove duplicate metrics authentication, and enforce the decompressed-size limit while streaming zstd payloads.
 - **command palette:** Show a left icon for every search result and rank matching projects ahead of common navigation pages.
 - **Cloud metadata egress isolation:** Block IPv4 and IPv6 metadata endpoints for routed app and Compose bridge traffic with an atomic, startup-reconciled nftables policy; reject Compose network drivers that bypass host filtering ([#431](https://github.com/gotempsh/temps/pull/431))
 - **Clone-error credential redaction:** Reject Git URLs with embedded userinfo and redact both usernames and passwords from libgit2 clone errors before deployment failures are persisted to project logs.
