@@ -3,6 +3,7 @@
 //! Handles remote deployments from pre-built Docker images and static file bundles.
 //! These endpoints enable external CI/CD systems to deploy to Temps without Git integration.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::audit::{
@@ -19,7 +20,9 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
@@ -28,6 +31,7 @@ use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects, source_bundles};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -67,12 +71,99 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
 )]
 pub struct RemoteDeploymentsApiDoc;
 
+#[derive(ToSchema)]
+pub struct SourceArchiveUpload {
+    #[schema(value_type = String, format = Binary)]
+    pub file: String,
+}
+
+static ARCHIVE_UPLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct ArchiveUploadPermit;
+
+impl ArchiveUploadPermit {
+    fn acquire() -> Result<Self, Problem> {
+        ARCHIVE_UPLOADS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < 4).then_some(current + 1)
+            })
+            .map_err(|_| {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Many Archive Uploads")
+                    .with_detail(
+                        "At most four source or static archives may be uploaded concurrently",
+                    )
+            })?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ArchiveUploadPermit {
+    fn drop(&mut self) {
+        ARCHIVE_UPLOADS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn read_bounded_multipart_text(
+    mut field: axum::extract::multipart::Field<'_>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<String, Problem> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Multipart Field Error")
+            .with_detail(format!("Failed to read {label}: {error}"))
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                .with_title("Multipart Field Too Large")
+                .with_detail(format!("{label} exceeds {max_bytes} bytes")));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Multipart Text")
+            .with_detail(format!("{label} is not valid UTF-8: {error}"))
+    })
+}
+
+async fn rollback_uploaded_source(
+    state: &AppState,
+    deployment_id: Option<i32>,
+    bundle_id: Option<i32>,
+    archive_path: &std::path::Path,
+) {
+    if let Some(deployment_id) = deployment_id {
+        if let Err(error) = deployments::Entity::delete_by_id(deployment_id)
+            .exec(state.db.as_ref())
+            .await
+        {
+            error!(deployment_id, %error, "Failed to roll back uploaded-source deployment");
+        }
+    }
+    if let Some(bundle_id) = bundle_id {
+        if let Err(error) = source_bundles::Entity::delete_by_id(bundle_id)
+            .exec(state.db.as_ref())
+            .await
+        {
+            error!(bundle_id, %error, "Failed to roll back source-bundle row");
+        }
+    }
+    if let Err(error) = tokio::fs::remove_file(archive_path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            error!(path = %archive_path.display(), %error, "Failed to roll back source archive");
+        }
+    }
+}
+
 /// Upload source code and immediately start a preset-based deployment.
 #[utoipa::path(
     post,
     tag = "Deployments",
     path = "/projects/{project_id}/environments/{environment_id}/deploy/source",
-    request_body(content = String, content_type = "multipart/form-data"),
+    request_body(content = SourceArchiveUpload, content_type = "multipart/form-data"),
     responses(
         (status = 202, description = "Source deployment started", body = RemoteDeploymentResponse),
         (status = 400, description = "Invalid source archive"),
@@ -93,8 +184,10 @@ pub async fn deploy_from_uploaded_source(
         project_id,
         state.project_access_checker
     );
+    let upload_permit = ArchiveUploadPermit::acquire()?;
 
     let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
         .one(state.db.as_ref())
         .await
         .map_err(|error| {
@@ -128,43 +221,7 @@ pub async fn deploy_from_uploaded_source(
                 .with_detail("Environment does not belong to the project")
         })?;
 
-    const MAX_SOURCE_BYTES: usize = 500 * 1024 * 1024;
-    let mut bytes = None;
-    let mut original_filename = None;
-    while let Some(field) = multipart.next_field().await.map_err(|error| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Multipart Error")
-            .with_detail(error.to_string())
-    })? {
-        if field.name() == Some("file") {
-            original_filename = field.file_name().map(ToString::to_string);
-            let uploaded = field.bytes().await.map_err(|error| {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("File Read Error")
-                    .with_detail(error.to_string())
-            })?;
-            if uploaded.len() > MAX_SOURCE_BYTES {
-                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
-                    .with_title("Source Archive Too Large")
-                    .with_detail("Source archive exceeds 500 MiB"));
-            }
-            bytes = Some(uploaded);
-            break;
-        }
-    }
-    let bytes = bytes.ok_or_else(|| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Missing Source Archive")
-            .with_detail("Expected a ZIP archive in multipart field 'file'")
-    })?;
-    zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).map_err(|error| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid ZIP Archive")
-            .with_detail(error.to_string())
-    })?;
-
-    use sha2::{Digest, Sha256};
-    let checksum = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+    const MAX_SOURCE_BYTES: u64 = 500 * 1024 * 1024;
     let relative_path = format!("source-bundles/{}.zip", uuid::Uuid::new_v4());
     let absolute_path = state.data_dir.join(&relative_path);
     if let Some(parent) = absolute_path.parent() {
@@ -174,21 +231,109 @@ pub async fn deploy_from_uploaded_source(
                 .with_detail(error.to_string())
         })?;
     }
-    tokio::fs::write(&absolute_path, &bytes)
-        .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Source Storage Failed")
-                .with_detail(error.to_string())
-        })?;
+    let staging_directory = absolute_path.parent().ok_or_else(|| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Storage Failed")
+            .with_detail("Source archive path has no storage directory")
+    })?;
+    let staged_archive = tempfile::NamedTempFile::new_in(staging_directory).map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Storage Failed")
+            .with_detail(error.to_string())
+    })?;
 
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut archive_received = false;
+    let mut original_filename = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Multipart Error")
+            .with_detail(error.to_string())
+    })? {
+        if field.name() == Some("file") {
+            original_filename = field.file_name().map(ToString::to_string);
+            let staging_file = staged_archive.reopen().map_err(|error| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Source Storage Failed")
+                    .with_detail(error.to_string())
+            })?;
+            let mut output = tokio::fs::File::from_std(staging_file);
+            let mut field = field;
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("File Read Error")
+                    .with_detail(error.to_string())
+            })? {
+                size_bytes = size_bytes.saturating_add(chunk.len() as u64);
+                if size_bytes > MAX_SOURCE_BYTES {
+                    return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                        .with_title("Source Archive Too Large")
+                        .with_detail("Source archive exceeds 500 MiB"));
+                }
+                hasher.update(&chunk);
+                output.write_all(&chunk).await.map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Source Storage Failed")
+                        .with_detail(error.to_string())
+                })?;
+            }
+            output.flush().await.map_err(|error| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Source Storage Failed")
+                    .with_detail(error.to_string())
+            })?;
+            archive_received = true;
+            break;
+        }
+    }
+    if !archive_received {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Source Archive")
+            .with_detail("Expected a ZIP archive in multipart field 'file'"));
+    }
+    let validation_path = staged_archive.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _upload_permit = upload_permit;
+        let mut file = std::fs::File::open(&validation_path)?;
+        temps_core::archive_security::validate_zip_metadata(&mut file)?;
+        zip::ZipArchive::new(file)
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    })
+    .await
+    .map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("ZIP Validation Failed")
+            .with_detail(error.to_string())
+    })?
+    .map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(error.to_string())
+    })?;
+
+    staged_archive.persist(&absolute_path).map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Storage Failed")
+            .with_detail(error.error.to_string())
+    })?;
+
+    let checksum = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+    let transaction = state.db.begin().await.map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Registration Failed")
+            .with_detail(error.to_string())
+    })?;
     let now = Utc::now();
-    let bundle = source_bundles::ActiveModel {
+    let bundle = match (source_bundles::ActiveModel {
         project_id: Set(project_id),
         archive_path: Set(relative_path.clone()),
         original_filename: Set(original_filename),
         content_type: Set("application/zip".to_string()),
-        size_bytes: Set(bytes.len() as i64),
+        size_bytes: Set(size_bytes as i64),
         checksum: Set(checksum),
         directory: Set(project.directory.clone()),
         preset: Set(project.preset.as_str().to_string()),
@@ -196,29 +341,27 @@ pub async fn deploy_from_uploaded_source(
         uploaded_at: Set(now),
         created_at: Set(now),
         ..Default::default()
-    }
-    .insert(state.db.as_ref())
+    })
+    .insert(&transaction)
     .await
-    .map_err(|error| {
-        let path = absolute_path.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(path).await;
-        });
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Source Registration Failed")
-            .with_detail(error.to_string())
-    })?;
+    {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            rollback_uploaded_source(&state, None, None, &absolute_path).await;
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Source Registration Failed")
+                .with_detail(error.to_string()));
+        }
+    };
 
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-    let deployment = deployments::ActiveModel {
+    let deployment = match (deployments::ActiveModel {
         project_id: Set(project_id),
         environment_id: Set(environment_id),
-        slug: Set(format!("{}-{deployment_number}", project.slug)),
+        slug: Set(format!(
+            "{}-{}",
+            project.slug,
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )),
         state: Set("pending".to_string()),
         metadata: Set(Some(DeploymentMetadata {
             source_bundle_id: Some(bundle.id),
@@ -233,16 +376,40 @@ pub async fn deploy_from_uploaded_source(
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
-    }
-    .insert(state.db.as_ref())
+    })
+    .insert(&transaction)
     .await
-    .map_err(|error| {
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Deployment Creation Failed")
-            .with_detail(error.to_string())
-    })?;
+    {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            rollback_uploaded_source(&state, None, None, &absolute_path).await;
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Deployment Creation Failed")
+                .with_detail(error.to_string()));
+        }
+    };
 
-    state
+    if let Err(error) = transaction.commit().await {
+        rollback_uploaded_source(&state, None, None, &absolute_path).await;
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Source Registration Failed")
+            .with_detail(format!("Failed to commit source deployment: {error}")));
+    }
+
+    if let Err(error) = state
+        .workflow_planner
+        .create_deployment_jobs(deployment.id)
+        .await
+    {
+        rollback_uploaded_source(&state, Some(deployment.id), Some(bundle.id), &absolute_path)
+            .await;
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Job Creation Failed")
+            .with_detail(error.to_string()));
+    }
+
+    if let Err(error) = state
         .queue_service
         .send(Job::DeploymentCreated(DeploymentCreatedJob {
             deployment_id: deployment.id,
@@ -253,21 +420,13 @@ pub async fn deploy_from_uploaded_source(
             commit_sha: None,
         }))
         .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Deployment Queue Failed")
-                .with_detail(error.to_string())
-        })?;
-
-    state
-        .workflow_planner
-        .create_deployment_jobs(deployment.id)
-        .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Job Creation Failed")
-                .with_detail(error.to_string())
-        })?;
+    {
+        rollback_uploaded_source(&state, Some(deployment.id), Some(bundle.id), &absolute_path)
+            .await;
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Queue Failed")
+            .with_detail(error.to_string()));
+    }
     let workflow_executor = state.workflow_executor.clone();
     let deployment_gate = state.deployment_gate.clone();
     let db = state.db.clone();
@@ -1628,6 +1787,7 @@ pub async fn upload_static_bundle(
         project_id,
         state.project_access_checker
     );
+    let _static_upload_permit = ArchiveUploadPermit::acquire()?;
 
     debug!("Uploading static bundle for project {}", project_id);
 
@@ -1661,15 +1821,31 @@ pub async fn upload_static_bundle(
             )));
     }
 
-    // 2. Read the uploaded file from multipart
-    let mut file_data: Option<bytes::Bytes> = None;
+    // 2. Stream the uploaded file into the static-bundle storage directory.
+    let staging_directory = state.data_dir.join("static-bundles");
+    tokio::fs::create_dir_all(&staging_directory)
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Upload Failed")
+                .with_detail(format!("Failed to create storage directory: {error}"))
+        })?;
+    let staged_bundle = tempfile::NamedTempFile::new_in(&staging_directory).map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Upload Failed")
+            .with_detail(format!("Failed to create upload staging file: {error}"))
+    })?;
+    let mut file_received = false;
+    let mut size_bytes = 0u64;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
     let mut original_filename: Option<String> = None;
     let mut content_type: Option<String> = None;
     let mut explicit_content_type: Option<String> = None; // From form field
     let mut metadata: Option<serde_json::Value> = None;
 
     // Maximum file size: 500MB
-    const MAX_FILE_SIZE: usize = 500 * 1024 * 1024;
+    const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         error!("Multipart error: {}", e);
@@ -1681,46 +1857,54 @@ pub async fn upload_static_bundle(
 
         match name.as_str() {
             "file" => {
+                if file_received {
+                    return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Duplicate File")
+                        .with_detail("Only one static bundle may be uploaded per request"));
+                }
                 original_filename = field.file_name().map(|s| s.to_string());
                 content_type = field.content_type().map(|s| s.to_string());
 
-                let data = field.bytes().await.map_err(|e| {
-                    error!("Failed to read file data: {}", e);
+                let staging_file = staged_bundle.reopen().map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Failed")
+                        .with_detail(format!("Failed to open upload staging file: {error}"))
+                })?;
+                let mut output = tokio::fs::File::from_std(staging_file);
+                let mut field = field;
+                while let Some(chunk) = field.chunk().await.map_err(|error| {
                     problemdetails::new(StatusCode::BAD_REQUEST)
                         .with_title("File Read Error")
-                        .with_detail(e.to_string())
-                })?;
-
-                if data.len() > MAX_FILE_SIZE {
-                    return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
-                        .with_title("File Too Large")
-                        .with_detail(format!(
-                            "File size {} exceeds maximum allowed size of {}",
-                            data.len(),
-                            MAX_FILE_SIZE
-                        )));
+                        .with_detail(error.to_string())
+                })? {
+                    size_bytes = size_bytes.saturating_add(chunk.len() as u64);
+                    if size_bytes > MAX_FILE_SIZE {
+                        return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                            .with_title("File Too Large")
+                            .with_detail("Static bundle exceeds 500 MiB"));
+                    }
+                    hasher.update(&chunk);
+                    output.write_all(&chunk).await.map_err(|error| {
+                        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Upload Failed")
+                            .with_detail(format!("Failed to stage static bundle: {error}"))
+                    })?;
                 }
-
-                file_data = Some(data);
+                output.flush().await.map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Failed")
+                        .with_detail(format!("Failed to flush static bundle: {error}"))
+                })?;
+                file_received = true;
             }
             "metadata" => {
-                let data = field.text().await.map_err(|e| {
-                    error!("Failed to read metadata: {}", e);
-                    problemdetails::new(StatusCode::BAD_REQUEST)
-                        .with_title("Metadata Error")
-                        .with_detail(e.to_string())
-                })?;
+                let data = read_bounded_multipart_text(field, "metadata", 64 * 1024).await?;
 
                 metadata = serde_json::from_str(&data).ok();
             }
             "content_type" => {
                 // Explicit content_type field from CLI (more reliable than multipart header)
-                let data = field.text().await.map_err(|e| {
-                    error!("Failed to read content_type field: {}", e);
-                    problemdetails::new(StatusCode::BAD_REQUEST)
-                        .with_title("Content Type Error")
-                        .with_detail(e.to_string())
-                })?;
+                let data = read_bounded_multipart_text(field, "content_type", 256).await?;
                 explicit_content_type = Some(data);
             }
             _ => {
@@ -1735,13 +1919,11 @@ pub async fn upload_static_bundle(
     }
 
     // Ensure file was provided
-    let file_bytes = file_data.ok_or_else(|| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
+    if !file_received {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Missing File")
-            .with_detail("No file was provided in the multipart request")
-    })?;
-
-    let size_bytes = file_bytes.len() as i64;
+            .with_detail("No file was provided in the multipart request"));
+    }
 
     // 3. Validate content type (tar.gz or zip)
     // Detect from filename if content type is missing or generic (application/octet-stream)
@@ -1838,34 +2020,24 @@ pub async fn upload_static_bundle(
         }
     }
 
-    // Calculate checksum
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&file_bytes);
+    // Calculate checksum accumulated while streaming the upload.
     let checksum = format!("sha256:{}", hex::encode(hasher.finalize()));
 
     // Store static bundle in local data directory
     let local_path = state.data_dir.join(&blob_path);
 
-    // Ensure parent directory exists
-    if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            error!("Failed to create directory for static bundle: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Upload Failed")
-                .with_detail(format!("Failed to create storage directory: {}", e))
-        })?;
-    }
-
-    // Write file to local filesystem
-    tokio::fs::write(&local_path, &file_bytes)
-        .await
-        .map_err(|e| {
-            error!("Failed to write static bundle to local storage: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Upload Failed")
-                .with_detail(format!("Failed to write file to local storage: {}", e))
-        })?;
+    staged_bundle.persist(&local_path).map_err(|error| {
+        error!(
+            "Failed to persist static bundle to local storage: {}",
+            error.error
+        );
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Upload Failed")
+            .with_detail(format!(
+                "Failed to persist file to local storage: {}",
+                error.error
+            ))
+    })?;
 
     info!(
         "Uploaded static bundle to local storage: {} ({} bytes)",
@@ -1885,7 +2057,7 @@ pub async fn upload_static_bundle(
         .register_static_bundle(
             project_id,
             blob_path,
-            size_bytes,
+            size_bytes as i64,
             upload_request,
             Some(checksum),
         )
@@ -2327,7 +2499,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/source",
-            post(deploy_from_uploaded_source).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+            post(deploy_from_uploaded_source).layer(DefaultBodyLimit::max(501 * 1024 * 1024)),
         )
         // Upload endpoints with increased body limit
         .route(

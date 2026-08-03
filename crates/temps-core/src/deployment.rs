@@ -90,20 +90,17 @@ pub trait DeploymentCanceller: Send + Sync {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Removes every runtime container owned by a project before the project's
-/// database rows are deleted.
+/// Removes source/static archives owned by a project before its database rows
+/// are deleted.
 ///
 /// The trait lives in `temps-core` so the projects crate can require cleanup
 /// without depending on the deployments crate. Implementations must be
 /// idempotent: retrying after a partial cleanup must safely continue.
 #[async_trait]
-pub trait ProjectDeploymentCleanup: Send + Sync {
-    /// Remove all containers known to belong to `project_id`.
-    ///
-    /// Returns the number of container records reconciled. A failure must leave
-    /// the project row intact so callers can retry instead of orphaning runtime
-    /// resources that can no longer be discovered from the database.
-    async fn cleanup_project_deployments(
+pub trait ProjectArchiveCleaner: Send + Sync {
+    /// Remove all persisted upload archives known to belong to `project_id`.
+    /// A failure must leave the project row intact so callers can retry.
+    async fn cleanup_project_archives(
         &self,
         project_id: i32,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;

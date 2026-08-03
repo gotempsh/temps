@@ -183,6 +183,35 @@ fn validate_preset_config(
     Ok(config)
 }
 
+fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(".".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':');
+    if has_windows_drive_prefix
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project directory '{directory}' must be a relative path inside the source root"
+        )));
+    }
+    Ok(normalized.trim_start_matches("./").to_string())
+}
+
 /// Resolve an explicit catalog selection for create/update.
 ///
 /// Existing config is retained when it belongs to the same canonical preset.
@@ -289,20 +318,7 @@ impl ProjectService {
             }
         }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
         let resolved = resolve_preset_selection(
@@ -826,20 +842,7 @@ impl ProjectService {
                 project_id
             )))?;
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
@@ -4646,5 +4649,26 @@ mod tests {
             !matches!(result, Err(ProjectError::NotFound(_))),
             "caller_user_id with no connection_id must not be rejected by the ownership guard"
         );
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

@@ -15413,6 +15413,7 @@ export type SourceMapResponse = {
  * - `Git`: Source code from a Git repository (traditional flow)
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
+ * - `UploadedSource`: Source archive uploaded without a Git repository
  * - `Manual`: Flexible type that accepts any deployment method
  */
 export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
@@ -18411,6 +18412,28 @@ export type WriteFilesResponse = {
  */
 export type ZoneListResponse = {
     zones: Array<DnsZone>;
+};
+
+export type DropArchiveUpload = {
+    file: Blob | File;
+};
+
+export type SourceArchiveUpload = {
+    file: Blob | File;
+};
+
+export type DropInspectionResponse = {
+    candidates: Array<DropPresetCandidate>;
+    suggestedName: string;
+};
+
+export type DropPresetCandidate = {
+    confidence: string;
+    directory: string;
+    isStatic: boolean;
+    label: string;
+    preset: string;
+    reason: string;
 };
 
 /**
@@ -48052,3 +48075,56 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+export type InspectDropArchiveData = {
+    body: DropArchiveUpload;
+    path?: never;
+    query?: never;
+    url: '/drop/inspect';
+};
+
+export type InspectDropArchiveErrors = {
+    /**
+     * Invalid or unsupported archive
+     */
+    400: unknown;
+};
+
+export type InspectDropArchiveResponses = {
+    /**
+     * Detected deployable project roots
+     */
+    200: DropInspectionResponse;
+};
+
+export type InspectDropArchiveResponse = InspectDropArchiveResponses[keyof InspectDropArchiveResponses];
+
+export type DeployFromUploadedSourceData = {
+    body: SourceArchiveUpload;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/source';
+};
+
+export type DeployFromUploadedSourceErrors = {
+    /**
+     * Invalid source archive
+     */
+    400: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type DeployFromUploadedSourceResponses = {
+    /**
+     * Source deployment started
+     */
+    202: RemoteDeploymentResponse;
+};
+
+export type DeployFromUploadedSourceResponse = DeployFromUploadedSourceResponses[keyof DeployFromUploadedSourceResponses];

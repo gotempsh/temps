@@ -628,6 +628,10 @@ impl WorkflowTask for DownloadRepoJob {
         }
         Ok(())
     }
+
+    fn cleanup_after_workflow(&self) -> bool {
+        true
+    }
 }
 
 /// Builder for DownloadRepoJob

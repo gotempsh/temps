@@ -9,9 +9,16 @@ export interface PreparedDrop {
   rootPage: string | null
 }
 
-const ARCHIVE_PATTERN = /\.(zip|tar|tar\.gz|tgz)$/i
-const IGNORED_PATH_PARTS = new Set(['.DS_Store', 'Thumbs.db', '__MACOSX'])
+const ARCHIVE_PATTERN = /\.zip$/i
+const IGNORED_PATH_PARTS = new Set([
+  '.DS_Store',
+  'Thumbs.db',
+  '__MACOSX',
+  '.git',
+  'node_modules',
+])
 const textEncoder = new TextEncoder()
+const MAX_BROWSER_PACKAGE_BYTES = 100 * 1024 * 1024
 
 export function isDropArchive(filename: string): boolean {
   return ARCHIVE_PATTERN.test(filename)
@@ -38,7 +45,17 @@ function cleanPath(path: string): string {
 }
 
 function shouldIgnore(path: string): boolean {
-  return path.split('/').some((part) => IGNORED_PATH_PARTS.has(part))
+  return path
+    .split('/')
+    .some(
+      (part) =>
+        IGNORED_PATH_PARTS.has(part) ||
+        part === '.env' ||
+        part.startsWith('.env.') ||
+        part.endsWith('.pem') ||
+        part.endsWith('.key') ||
+        part === 'credentials.json'
+    )
 }
 
 export function normalizeDropFiles(files: DropFile[]): DropFile[] {
@@ -190,6 +207,9 @@ export async function prepareDrop(
   selectedRootPage?: string
 ): Promise<PreparedDrop> {
   if (rawFiles.length === 1 && isDropArchive(rawFiles[0].file.name)) {
+    if (rawFiles[0].file.size > 500 * 1024 * 1024) {
+      throw new Error('Drop exceeds the 500 MB upload limit')
+    }
     return { file: rawFiles[0].file, fileCount: 1, rootPage: null }
   }
 
@@ -197,8 +217,10 @@ export async function prepareDrop(
   if (files.length === 0) throw new Error('The selected folder is empty')
 
   const totalBytes = files.reduce((sum, { file }) => sum + file.size, 0)
-  if (totalBytes > 500 * 1024 * 1024) {
-    throw new Error('Drop exceeds the 500 MB upload limit')
+  if (totalBytes > MAX_BROWSER_PACKAGE_BYTES) {
+    throw new Error(
+      'Folders larger than 100 MB must be zipped before upload to limit browser memory use'
+    )
   }
 
   const paths = new Set(files.map(({ path }) => path.toLowerCase()))

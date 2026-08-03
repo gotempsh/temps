@@ -12,6 +12,7 @@ import {
   Play,
   ScrollText,
   Terminal,
+  UploadCloud,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -49,7 +50,8 @@ const SHOWCASE: ReadonlyArray<{
   {
     icon: BarChart3,
     name: 'Analytics',
-    blurb: 'Visitors, pages, funnels, and a live globe — no third-party scripts.',
+    blurb:
+      'Visitors, pages, funnels, and a live globe — no third-party scripts.',
     href: 'https://temps.sh/docs/analytics',
   },
   {
@@ -156,7 +158,7 @@ export function FirstProjectOnboarding({
         </div>
       </div>
 
-      {/* Deploy your own — Git / CLI. */}
+      {/* Deploy your own — Git, CLI, or browser upload. */}
       <section
         id="deploy-your-own"
         className="rounded-2xl border bg-card p-5 sm:p-6"
@@ -176,10 +178,10 @@ export function FirstProjectOnboarding({
           </a>
         </div>
 
-        {/* Two peer paths — Git and CLI. Migrating from another platform has
+        {/* Three peer paths. Migrating from another platform has
             its own entry point in the page header above, so it isn't repeated
             here as a third card. */}
-        <div className="grid gap-5 sm:grid-cols-2">
+        <div className="grid gap-5 lg:grid-cols-3">
           {/* Path A — Deploy from Git */}
           <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
             <div className="flex items-center gap-2.5">
@@ -223,6 +225,27 @@ export function FirstProjectOnboarding({
                 <Step key={step} index={i + 1} label={step} />
               ))}
             </ol>
+          </div>
+
+          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted">
+                <UploadCloud className="h-4 w-4 text-muted-foreground" />
+              </div>
+              <div className="min-w-0">
+                <h4 className="text-sm font-semibold">Drop project files</h4>
+                <p className="text-xs text-muted-foreground">
+                  Upload a folder or ZIP; Temps detects and builds it
+                </p>
+              </div>
+            </div>
+            <p className="mt-3 flex-1 text-sm leading-6 text-muted-foreground">
+              Create and deploy a project directly from your browser without a
+              repository or local CLI setup.
+            </p>
+            <Button asChild variant="outline" className="mt-4">
+              <Link to="/drop">Open Drop</Link>
+            </Button>
           </div>
         </div>
       </section>

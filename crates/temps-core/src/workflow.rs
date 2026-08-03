@@ -418,6 +418,12 @@ pub trait WorkflowTask: Send + Sync + std::fmt::Debug {
     async fn cleanup(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
         Ok(())
     }
+
+    /// Whether cleanup must also run after the entire workflow reaches a
+    /// terminal state. This is for temporary inputs used by downstream jobs.
+    fn cleanup_after_workflow(&self) -> bool {
+        false
+    }
 }
 
 /// Configuration for a job in a workflow

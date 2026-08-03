@@ -123,6 +123,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['new', 'create', 'add', 'project', 'app'],
   },
   {
+    title: 'Drop Project Files',
+    url: '/drop',
+    icon: Upload,
+    keywords: ['drop', 'upload', 'zip', 'folder', 'deploy', 'no git'],
+  },
+  {
     title: 'Import Project',
     url: '/projects/import-wizard',
     icon: Upload,

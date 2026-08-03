@@ -1850,11 +1850,26 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
+
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
-        // Job 1: Download repository (only if git-backed)
-        if has_git_info {
+        // Job 1: prepare either the uploaded archive or the Git checkout.
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: "prepare_source_bundle".to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             let branch_or_commit = deployment
                 .branch_ref
                 .as_ref()
@@ -1896,7 +1911,14 @@ impl WorkflowPlanner {
             .unwrap_or_else(|| "docker-compose.yml".to_string());
 
         // Job 2: Deploy Compose Stack (no build step)
-        let deploy_dependencies = if has_git_info {
+        let deploy_dependencies = if deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.as_ref())
+            .is_some()
+        {
+            vec!["prepare_source_bundle".to_string()]
+        } else if has_git_info {
             vec!["download_repo".to_string()]
         } else {
             vec![]
@@ -2234,6 +2256,7 @@ impl WorkflowPlanner {
                 "project_slug": project.slug,
                 "environment_slug": environment.slug,
                 "deployment_slug": deployment.slug,
+                "source_directory": project.directory,
             })),
             required_for_completion: true,
         });
@@ -3026,6 +3049,73 @@ mod tests {
         assert!(!runtime_env
             .values()
             .any(|value| value == &expected_namespace));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_compose_uses_prepared_archive_as_its_repository(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping uploaded Compose planner test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let prepare = jobs
+            .iter()
+            .find(|job| job.job_id == "prepare_source_bundle")
+            .expect("uploaded Compose must prepare its source archive");
+        assert_eq!(
+            prepare
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("archive_path"))
+                .and_then(serde_json::Value::as_str),
+            Some("source-bundles/fixture.zip")
+        );
+        let compose = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("uploaded Compose must deploy the stack");
+        assert_eq!(
+            compose.dependencies,
+            Some(serde_json::json!(["prepare_source_bundle"]))
+        );
 
         Ok(())
     }

@@ -33,7 +33,9 @@ pub use build_system::MonorepoTool;
 use docker::DockerfilePreset;
 use docker_custom::DockerCustomPreset;
 use docusaurus::Docusaurus;
-pub use framework_detector::{detect_node_framework, NodeFramework};
+pub use framework_detector::{
+    detect_node_framework, detect_node_framework_from_package_json, NodeFramework,
+};
 pub use go_preset::GoPreset;
 pub use java_preset::JavaPreset;
 pub use nextjs::NextJs;
@@ -609,7 +611,8 @@ pub fn detect_project_candidates(
                 | "pom.xml"
                 | "build.gradle"
                 | "index.html"
-        ) || name.starts_with("next.config.")
+        ) || name.ends_with(".csproj")
+            || name.starts_with("next.config.")
             || name.starts_with("vite.config.")
             || name.starts_with("astro.config.")
         {
@@ -631,6 +634,15 @@ pub fn detect_project_candidates(
             }
         };
         let has = |name: &str| files.contains_key(&at_root(name));
+        let has_extension = |extension: &str| {
+            files.keys().any(|path| {
+                let in_root = path
+                    .rsplit_once('/')
+                    .map(|(directory, _)| directory == root)
+                    .unwrap_or(root == ".");
+                in_root && path.rsplit('/').next().is_some_and(|name| name.ends_with(extension))
+            })
+        };
 
         let detected = if has("docker-compose.yml")
             || has("docker-compose.yaml")
@@ -665,6 +677,12 @@ pub fn detect_project_candidates(
                 PresetType::Java,
                 "high",
                 "Java build manifest found".to_string(),
+            ))
+        } else if has_extension(".csproj") {
+            Some((
+                PresetType::Nixpacks,
+                "high",
+                ".NET project file found".to_string(),
             ))
         } else if has("index.html") {
             Some((PresetType::Static, "medium", "index.html found".to_string()))
@@ -914,6 +932,21 @@ mod uploaded_source_detection_tests {
         let candidates = detect_project_candidates(&files);
 
         assert_eq!(candidates[0].preset, PresetType::Dockerfile);
+    }
+
+    #[test]
+    fn detects_dotnet_project_in_nested_directory() {
+        let files = BTreeMap::from([(
+            "services/api/Api.csproj".to_string(),
+            r#"<Project Sdk="Microsoft.NET.Sdk.Web" />"#.to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "services/api");
+        assert_eq!(candidates[0].preset, PresetType::Nixpacks);
+        assert!(candidates[0].reason.contains(".NET"));
     }
 
     #[test]

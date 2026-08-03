@@ -1,9 +1,15 @@
 import { existsSync, statSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { basename, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
-import { createProject, deleteProject, getEnvironments } from '../../api/sdk.gen.js'
+import {
+  createProject,
+  deleteProject,
+  deployFromUploadedSource,
+  getEnvironments,
+  inspectDropArchive,
+} from '../../api/sdk.gen.js'
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { client, normalizeApiUrl, setupClient } from '../../lib/api-client.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
@@ -32,7 +38,7 @@ interface Inspection {
   candidates: Candidate[]
 }
 
-function slugName(value: string): string {
+export function slugName(value: string): string {
   const slug = value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -41,11 +47,30 @@ function slugName(value: string): string {
   return slug || `drop-${Math.random().toString(36).slice(2, 10)}`
 }
 
-async function zipDirectory(directory: string): Promise<{ data: Buffer; cleanup: () => Promise<void> }> {
+export async function zipDirectory(directory: string): Promise<{ data: Buffer; cleanup: () => Promise<void> }> {
+  async function rejectSymlinks(current: string): Promise<void> {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const path = join(current, entry.name)
+      const metadata = await lstat(path)
+      if (metadata.isSymbolicLink()) {
+        throw new Error(`Drop does not follow symbolic links: ${path}`)
+      }
+      if (metadata.isDirectory() && !['.git', 'node_modules'].includes(entry.name)) {
+        await rejectSymlinks(path)
+      }
+    }
+  }
+
+  await rejectSymlinks(directory)
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'temps-drop-'))
   const archivePath = join(temporaryDirectory, 'source.zip')
   await new Promise<void>((resolvePromise, reject) => {
-    const child = spawn('zip', ['-q', '-r', archivePath, '.'], { cwd: directory, stdio: 'ignore' })
+    const child = spawn('zip', [
+      '-q', '-r', '-y', archivePath, '.',
+      '-x', '.git/*', '*/.git/*', 'node_modules/*', '*/node_modules/*',
+      '.env', '.env.*', '*/.env', '*/.env.*', '*.pem', '*.key',
+      'credentials.json', '*/credentials.json', '.DS_Store', '*/.DS_Store',
+    ], { cwd: directory, stdio: 'ignore' })
     child.once('error', reject)
     child.once('exit', (code) => {
       if (code === 0) resolvePromise()
@@ -89,13 +114,20 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
   try {
     succeedSpinner(`Prepared ${(data.length / 1024 / 1024).toFixed(2)} MiB ZIP`)
     startSpinner('Detecting project preset...')
-    const inspectForm = new FormData()
-    inspectForm.append('file', archive, `${basename(sourcePath)}.zip`)
-    const inspectResponse = await fetch(`${apiUrl}/drop/inspect`, {
-      method: 'POST', headers, body: inspectForm,
+    const inspected = await inspectDropArchive({
+      client,
+      body: {
+        file: new File(
+          [archive],
+          isDirectory ? `${basename(sourcePath)}.zip` : basename(sourcePath),
+          { type: 'application/zip' },
+        ),
+      },
     })
-    if (!inspectResponse.ok) throw new Error(await inspectResponse.text())
-    const inspection = (await inspectResponse.json()) as Inspection
+    if (inspected.error || !inspected.data) {
+      throw new Error(JSON.stringify(inspected.error || 'Preset inspection returned no data'))
+    }
+    const inspection = inspected.data as Inspection
     const candidate = inspection.candidates.find((item) =>
       (!options.preset || item.preset === options.preset) &&
       (!options.directory || item.directory === options.directory)
@@ -129,14 +161,14 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
     startSpinner(candidate.isStatic ? 'Uploading static site...' : 'Uploading source and starting deployment...')
     const deployForm = new FormData()
     deployForm.append('file', archive, 'source.zip')
-    let response: Response
+    let deployment: { id: number; slug: string }
     if (candidate.isStatic) {
       const upload = await fetch(`${apiUrl}/projects/${projectId}/upload/static`, {
         method: 'POST', headers, body: deployForm,
       })
       if (!upload.ok) throw new Error(await upload.text())
       const bundle = (await upload.json()) as { id: number }
-      response = await fetch(
+      const response = await fetch(
         `${apiUrl}/projects/${projectId}/environments/${environment.id}/deploy/static`,
         {
           method: 'POST',
@@ -144,14 +176,19 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
           body: JSON.stringify({ static_bundle_id: bundle.id }),
         },
       )
+      if (!response.ok) throw new Error(await response.text())
+      deployment = (await response.json()) as { id: number; slug: string }
     } else {
-      response = await fetch(
-        `${apiUrl}/projects/${projectId}/environments/${environment.id}/deploy/source`,
-        { method: 'POST', headers, body: deployForm },
-      )
+      const sourceDeployment = await deployFromUploadedSource({
+        client,
+        path: { project_id: projectId, environment_id: environment.id },
+        body: { file: new File([archive], 'source.zip', { type: 'application/zip' }) },
+      })
+      if (sourceDeployment.error || !sourceDeployment.data) {
+        throw new Error(JSON.stringify(sourceDeployment.error || 'Deployment returned no data'))
+      }
+      deployment = sourceDeployment.data
     }
-    if (!response.ok) throw new Error(await response.text())
-    const deployment = (await response.json()) as { id: number; slug: string }
     succeedSpinner(`Deployment started: ${deployment.slug}`)
     info(`Dashboard: ${config.get('apiUrl').replace(/\/api\/?$/, '')}/projects/${created.data.slug}/deployments/${deployment.id}`)
     if (options.wait !== false) {

@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_auth::RequireAuth;
 use temps_auth::{
@@ -34,6 +35,7 @@ use std::io::Read;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_entities::source_type::SourceType;
+use tokio::io::AsyncWriteExt;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     use axum::extract::DefaultBodyLimit;
@@ -50,7 +52,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects", get(get_projects))
         .route(
             "/drop/inspect",
-            post(inspect_drop_archive).layer(DefaultBodyLimit::max(500 * 1024 * 1024)),
+            post(inspect_drop_archive).layer(DefaultBodyLimit::max(501 * 1024 * 1024)),
         )
         .route("/projects/statistics", get(get_project_statistics))
         // Create project from template
@@ -162,6 +164,31 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 )]
 pub struct ApiDoc;
 
+static DROP_INSPECTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DropInspectionPermit;
+
+impl DropInspectionPermit {
+    fn acquire() -> Result<Self, Problem> {
+        DROP_INSPECTIONS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < 4).then_some(current + 1)
+            })
+            .map_err(|_| {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Many Drop Inspections")
+                    .with_detail("At most four Drop archives may be inspected concurrently")
+            })?;
+        Ok(Self)
+    }
+}
+
+impl Drop for DropInspectionPermit {
+    fn drop(&mut self) {
+        DROP_INSPECTIONS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DropPresetCandidate {
@@ -180,12 +207,18 @@ pub struct DropInspectionResponse {
     pub candidates: Vec<DropPresetCandidate>,
 }
 
+#[derive(utoipa::ToSchema)]
+pub struct DropArchiveUpload {
+    #[schema(value_type = String, format = Binary)]
+    pub file: String,
+}
+
 /// Inspect a source ZIP without creating a project or retaining the upload.
 #[utoipa::path(
     post,
     path = "/drop/inspect",
     tag = "Projects",
-    request_body(content = String, content_type = "multipart/form-data"),
+    request_body(content = DropArchiveUpload, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Detected deployable project roots", body = DropInspectionResponse),
         (status = 400, description = "Invalid or unsupported archive")
@@ -197,8 +230,16 @@ pub async fn inspect_drop_archive(
     mut multipart: Multipart,
 ) -> Result<Json<DropInspectionResponse>, Problem> {
     permission_guard!(auth, ProjectsCreate);
+    let inspection_permit = DropInspectionPermit::acquire()?;
 
-    let mut archive_bytes = None;
+    const MAX_ARCHIVE_BYTES: u64 = 500 * 1024 * 1024;
+    let temporary = tempfile::tempdir().map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Upload Staging Failed")
+            .with_detail(error.to_string())
+    })?;
+    let archive_path = temporary.path().join("drop-inspect.zip");
+    let mut archive_received = false;
     let mut filename = None;
     while let Some(field) = multipart.next_field().await.map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -207,21 +248,57 @@ pub async fn inspect_drop_archive(
     })? {
         if field.name() == Some("file") {
             filename = field.file_name().map(ToString::to_string);
-            archive_bytes = Some(field.bytes().await.map_err(|error| {
+            let mut output = tokio::fs::File::create(&archive_path)
+                .await
+                .map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Staging Failed")
+                        .with_detail(error.to_string())
+                })?;
+            let mut field = field;
+            let mut size = 0u64;
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Upload")
                     .with_detail(format!("Failed to read uploaded archive: {error}"))
-            })?);
+            })? {
+                size = size.saturating_add(chunk.len() as u64);
+                if size > MAX_ARCHIVE_BYTES {
+                    return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                        .with_title("Archive Too Large")
+                        .with_detail("Drop archive exceeds 500 MiB"));
+                }
+                output.write_all(&chunk).await.map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Staging Failed")
+                        .with_detail(error.to_string())
+                })?;
+            }
+            output.flush().await.map_err(|error| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Upload Staging Failed")
+                    .with_detail(error.to_string())
+            })?;
+            archive_received = true;
             break;
         }
     }
 
-    let archive_bytes = archive_bytes.ok_or_else(|| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
+    if !archive_received {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Missing Archive")
-            .with_detail("Expected a ZIP archive in multipart field 'file'")
-    })?;
-    let manifests = inspect_zip_manifests(&archive_bytes)?;
+            .with_detail("Expected a ZIP archive in multipart field 'file'"));
+    }
+    let manifests = tokio::task::spawn_blocking(move || {
+        let _inspection_permit = inspection_permit;
+        inspect_zip_manifests(&archive_path)
+    })
+    .await
+    .map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Archive Inspection Failed")
+            .with_detail(error.to_string())
+    })??;
     let candidates = temps_presets::detect_project_candidates(&manifests)
         .into_iter()
         .map(|candidate| {
@@ -258,12 +335,21 @@ pub async fn inspect_drop_archive(
     }))
 }
 
-fn inspect_zip_manifests(bytes: &[u8]) -> Result<BTreeMap<String, String>, Problem> {
+fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
     const MAX_FILES: usize = 20_000;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|error| {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(format!("Could not read ZIP archive: {error}"))
+    })?;
+    temps_core::archive_security::validate_zip_metadata(&mut file).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(error.to_string())
+    })?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid ZIP Archive")
             .with_detail(format!("Could not open ZIP archive: {error}"))
@@ -292,6 +378,26 @@ fn inspect_zip_manifests(bytes: &[u8]) -> Result<BTreeMap<String, String>, Probl
                     entry.name()
                 ))
         })?;
+        if path.components().any(|component| {
+            let std::path::Component::Normal(value) = component else {
+                return false;
+            };
+            let name = value.to_string_lossy();
+            name == ".git"
+                || name == "node_modules"
+                || name == ".env"
+                || name.starts_with(".env.")
+                || name.ends_with(".pem")
+                || name.ends_with(".key")
+                || name == "credentials.json"
+        }) {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Sensitive ZIP Entry")
+                .with_detail(format!(
+                    "Archive entry '{}' must be excluded from Drop uploads",
+                    entry.name()
+                )));
+        }
         if entry
             .unix_mode()
             .is_some_and(|mode| mode & 0o170000 == 0o120000)
@@ -311,7 +417,7 @@ fn inspect_zip_manifests(bytes: &[u8]) -> Result<BTreeMap<String, String>, Probl
                 | "go.mod"
                 | "pom.xml"
                 | "build.gradle"
-        );
+        ) || basename.ends_with(".csproj");
         let mut contents = String::new();
         if should_read {
             if entry.size() > MAX_MANIFEST_BYTES {
@@ -743,6 +849,19 @@ pub async fn delete_project(
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Project Container Cleanup Failed")
                 .with_detail(error.to_string())
+        })?;
+
+    state
+        .project_archive_cleaner
+        .cleanup_project_archives(id)
+        .await
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to clean up project archives");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Archive Cleanup Failed")
+                .with_detail(format!(
+                    "Failed to remove uploaded archives for project {id}: {error}"
+                ))
         })?;
 
     state

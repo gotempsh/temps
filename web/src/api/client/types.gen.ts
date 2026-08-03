@@ -48179,3 +48179,36 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+export type DropArchiveUpload = { file: Blob | File };
+export type SourceArchiveUpload = { file: Blob | File };
+export type DropInspectionResponse = {
+    candidates: Array<DropPresetCandidate>;
+    suggestedName: string;
+};
+export type DropPresetCandidate = {
+    confidence: string;
+    directory: string;
+    isStatic: boolean;
+    label: string;
+    preset: string;
+    reason: string;
+};
+export type InspectDropArchiveData = {
+    body: DropArchiveUpload;
+    path?: never;
+    query?: never;
+    url: '/drop/inspect';
+};
+export type InspectDropArchiveErrors = { 400: unknown };
+export type InspectDropArchiveResponses = { 200: DropInspectionResponse };
+export type InspectDropArchiveResponse = InspectDropArchiveResponses[keyof InspectDropArchiveResponses];
+export type DeployFromUploadedSourceData = {
+    body: SourceArchiveUpload;
+    path: { project_id: number; environment_id: number };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/source';
+};
+export type DeployFromUploadedSourceErrors = { 400: unknown; 404: unknown };
+export type DeployFromUploadedSourceResponses = { 202: RemoteDeploymentResponse };
+export type DeployFromUploadedSourceResponse = DeployFromUploadedSourceResponses[keyof DeployFromUploadedSourceResponses];

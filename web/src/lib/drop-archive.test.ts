@@ -42,6 +42,19 @@ describe('drop archive preparation', () => {
     expect(files.map(({ path }) => path)).toEqual(['index.html'])
   })
 
+  test('excludes secrets, git metadata, and dependency trees', () => {
+    const files = normalizeDropFiles([
+      dropped('site/index.html'),
+      dropped('site/.env', 'TOKEN=secret'),
+      dropped('site/.env.local', 'TOKEN=secret'),
+      dropped('site/server.pem', 'secret'),
+      dropped('site/.git/config'),
+      dropped('site/node_modules/pkg/index.js'),
+    ])
+
+    expect(files.map(({ path }) => path)).toEqual(['index.html'])
+  })
+
   test('finds root page choices when index.html is absent', () => {
     expect(
       htmlRootCandidates([

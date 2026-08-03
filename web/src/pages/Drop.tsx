@@ -1,8 +1,11 @@
 import {
   createProject,
   deleteProject,
+  deployFromUploadedSource,
   deployFromStatic,
   getEnvironments,
+  inspectDropArchive,
+  type DropInspectionResponse,
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
@@ -51,20 +54,6 @@ type DropStage =
   | 'uploading'
   | 'deploying'
   | 'done'
-
-interface DropPresetCandidate {
-  directory: string
-  preset: string
-  label: string
-  confidence: string
-  reason: string
-  isStatic: boolean
-}
-
-interface DropInspection {
-  suggestedName: string
-  candidates: DropPresetCandidate[]
-}
 
 interface LegacyFileSystemEntry {
   isFile: boolean
@@ -177,7 +166,7 @@ function stageLabel(stage: DropStage): string {
     case 'detecting':
       return 'Detecting preset'
     case 'uploading':
-      return 'Uploading static bundle'
+      return 'Uploading project'
     case 'deploying':
       return 'Starting deployment'
     case 'done':
@@ -203,7 +192,9 @@ export function Drop() {
     null
   )
   const [preparedArchive, setPreparedArchive] = useState<File | null>(null)
-  const [inspection, setInspection] = useState<DropInspection | null>(null)
+  const [inspection, setInspection] = useState<DropInspectionResponse | null>(
+    null
+  )
   const [selectedCandidateIndex, setSelectedCandidateIndex] = useState('0')
 
   usePageTitle('Drop')
@@ -287,23 +278,12 @@ export function Drop() {
         setPreparedArchive(archive)
 
         setStage('detecting')
-        const inspectBody = new FormData()
-        inspectBody.append('file', archive)
-        const inspectResponse = await fetch('/api/drop/inspect', {
-          method: 'POST',
-          credentials: 'include',
-          body: inspectBody,
+        const inspectResponse = await inspectDropArchive({
+          throwOnError: true,
+          body: { file: archive },
         })
-        if (!inspectResponse.ok) {
-          const problem = (await inspectResponse.json().catch(() => null)) as {
-            detail?: string
-          } | null
-          throw new Error(
-            problem?.detail ||
-              `Preset detection failed (${inspectResponse.status})`
-          )
-        }
-        detected = (await inspectResponse.json()) as DropInspection
+        detected = inspectResponse.data
+        if (!detected) throw new Error('Preset detection returned no result')
         setInspection(detected)
         setSelectedCandidateIndex('0')
         if (!nameWasEdited) {
@@ -352,20 +332,17 @@ export function Drop() {
       const body = new FormData()
       body.append('file', archive)
       if (!candidate.isStatic) {
-        const sourceResponse = await fetch(
-          `/api/projects/${createdProject.id}/environments/${targetEnvironment.id}/deploy/source`,
-          { method: 'POST', credentials: 'include', body }
-        )
-        if (!sourceResponse.ok) {
-          const problem = (await sourceResponse.json().catch(() => null)) as {
-            detail?: string
-          } | null
-          throw new Error(
-            problem?.detail ||
-              `Source deployment failed (${sourceResponse.status})`
-          )
-        }
-        const sourceDeployment = (await sourceResponse.json()) as { id: number }
+        const sourceResponse = await deployFromUploadedSource({
+          throwOnError: true,
+          path: {
+            project_id: createdProject.id,
+            environment_id: targetEnvironment.id,
+          },
+          body: { file: archive },
+        })
+        const sourceDeployment = sourceResponse.data
+        if (!sourceDeployment)
+          throw new Error('Source deployment returned no result')
         deploymentAccepted = true
         navigate(
           `/projects/${createdProject.slug}/deployments/${sourceDeployment.id}`
@@ -436,8 +413,8 @@ export function Drop() {
               {project.name} is on its way live.
             </h1>
             <p className="mt-5 max-w-2xl text-lg leading-8 text-muted-foreground">
-              Temps is extracting the bundle and starting its static container.
-              The project page has the live build log and final status.
+              Temps accepted the bundle and started the deployment. The project
+              page has the live build log and final status.
             </p>
             <div className="mt-9 flex flex-wrap gap-3">
               <Button asChild size="lg">
@@ -471,9 +448,9 @@ export function Drop() {
             Drop files. Get a deployment.
           </h1>
           <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground">
-            Ship a static site without Git or a CLI. Temps creates a project,
-            packages folders in your browser, and starts the deployment in one
-            pass.
+            Ship a static site or application without Git or a CLI. Temps
+            detects the preset, creates a project, and starts the right build
+            pipeline in one pass.
           </p>
         </div>
         <div className="flex gap-6 font-mono text-xs uppercase tracking-wider text-muted-foreground">
@@ -523,11 +500,11 @@ export function Drop() {
                   />
                 </div>
                 <h2 className="text-2xl font-semibold tracking-tight">
-                  Drag your site here
+                  Drag your project here
                 </h2>
                 <p className="mt-3 max-w-md text-sm leading-6 text-muted-foreground">
-                  A folder, one HTML file, or a .zip, .tar, .tar.gz, or .tgz
-                  archive. Files are packaged locally before upload.
+                  A project folder, one HTML file, or a .zip archive. Folders
+                  are packaged locally before upload.
                 </p>
                 <div className="mt-7 flex flex-wrap justify-center gap-3">
                   <Button onClick={() => folderInputRef.current?.click()}>
@@ -688,7 +665,7 @@ export function Drop() {
               </div>
               <div className="mt-3 flex items-center justify-between gap-3">
                 <span className="text-muted-foreground">Upload limit</span>
-                <span className="font-medium">500 MB</span>
+                <span className="font-medium">500 MB ZIP / 100 MB folder</span>
               </div>
             </div>
 
@@ -729,7 +706,7 @@ export function Drop() {
         id="drop-file-input"
         type="file"
         className="hidden"
-        accept=".html,.htm,.zip,.tar,.tar.gz,.tgz,application/zip,application/gzip"
+        accept=".html,.htm,.zip,application/zip"
         onChange={(event) => handleInput(event.target.files)}
       />
       <input

@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{
+    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
+};
 use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor};
 use temps_logs::LogService;
 use tracing::debug;
@@ -369,7 +371,12 @@ impl WorkflowTask for DeployComposeJob {
         }
         if let Err(e) = self
             .compose_executor
-            .teardown_for_redeploy(&project_name)
+            .teardown_at(
+                &project_name,
+                repo_path.as_deref(),
+                Some(compose_file_name),
+                &self.environment_vars,
+            )
             .await
         {
             debug!(
@@ -388,7 +395,7 @@ impl WorkflowTask for DeployComposeJob {
             environment_vars: self.environment_vars.clone(),
             build_args: self.build_args.clone(),
             labels,
-            repo_dir: repo_path,
+            repo_dir: repo_path.clone(),
             compose_override: self.compose_override.clone(),
         };
 
@@ -396,6 +403,16 @@ impl WorkflowTask for DeployComposeJob {
         let services = match self.compose_executor.deploy(request).await {
             Ok(s) => s,
             Err(e) => {
+                let cleanup_error = self
+                    .compose_executor
+                    .teardown_at(
+                        &project_name,
+                        repo_path.as_deref(),
+                        Some(compose_file_name),
+                        &self.environment_vars,
+                    )
+                    .await
+                    .err();
                 let error_msg = format!("Compose deploy failed: {}", e);
                 tracing::error!(error = %error_msg, "Docker Compose deployment failed");
                 if let Some(ref log_id) = self.log_id {
@@ -403,11 +420,23 @@ impl WorkflowTask for DeployComposeJob {
                         tracing::error!("Failed to write error to log stream: {}", log_err);
                     }
                 }
+                if let Some(cleanup_error) = cleanup_error {
+                    tracing::error!(project = %project_name, error = %cleanup_error, "Compose compensation cleanup failed");
+                }
                 return Err(WorkflowError::JobExecutionFailed(error_msg));
             }
         };
 
         if services.is_empty() {
+            let _ = self
+                .compose_executor
+                .teardown_at(
+                    &project_name,
+                    repo_path.as_deref(),
+                    Some(compose_file_name),
+                    &self.environment_vars,
+                )
+                .await;
             let error_msg = "No containers found after docker compose up".to_string();
             tracing::error!(error = %error_msg, "Docker Compose deployment produced no containers");
             if let Some(ref log_id) = self.log_id {
@@ -513,6 +542,61 @@ impl WorkflowTask for DeployComposeJob {
         }
 
         Ok(JobResult::success(context))
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        context: WorkflowContext,
+        cancellation_provider: &dyn WorkflowCancellationProvider,
+    ) -> Result<JobResult, WorkflowError> {
+        let workflow_run_id = context.workflow_run_id.clone();
+        let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
+        validate_relative_path(compose_file_name, "compose_path")?;
+        validate_relative_path(&self.directory, "directory")?;
+        let cleanup_repo_path = if self.compose_content.is_none() {
+            let repo_dir: Option<String> = context
+                .get_output(&self.download_job_id, "repo_dir")
+                .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?;
+            repo_dir
+                .map(|repo_dir| {
+                    canonicalize_confined_repo_path(
+                        Path::new(&repo_dir),
+                        Path::new(&self.directory),
+                        "directory",
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let cancellation_check = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match cancellation_provider.is_cancelled(&workflow_run_id).await {
+                    Ok(false) => continue,
+                    Ok(true) | Err(_) => return,
+                }
+            }
+        };
+
+        tokio::select! {
+            result = self.execute(context) => result,
+            _ = cancellation_check => {
+                self.compose_executor
+                    .teardown_at(
+                        &project_name,
+                        cleanup_repo_path.as_deref(),
+                        Some(compose_file_name),
+                        &self.environment_vars,
+                    )
+                    .await
+                    .map_err(|error| WorkflowError::JobExecutionFailed(format!(
+                        "Compose deployment was cancelled, but stack cleanup failed for {project_name}: {error}"
+                    )))?;
+                Err(WorkflowError::WorkflowCancelled)
+            }
+        }
     }
 }
 

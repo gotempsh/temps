@@ -61,6 +61,8 @@ zip = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }
 urlencoding = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # mTLS for the terminal WebSocket proxy (ADR-020 WS-2.1): build a rustls
@@ -74,7 +76,6 @@ tokio-test = "0.4"
 mockall = "0.15"
 tower = { workspace = true }
 env_logger = "0.11"
-tempfile = "3.8"
 
 [features]
 default = []

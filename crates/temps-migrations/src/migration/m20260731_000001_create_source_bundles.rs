@@ -85,6 +85,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_source_bundles_project_uploaded")
+                    .if_not_exists()
                     .table(SourceBundles::Table)
                     .col(SourceBundles::ProjectId)
                     .col(SourceBundles::UploadedAt)
@@ -95,7 +96,12 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_table(Table::drop().table(SourceBundles::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(SourceBundles::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await
     }
 }

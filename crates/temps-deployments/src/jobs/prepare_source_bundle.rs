@@ -11,6 +11,7 @@ pub struct PrepareSourceBundleJob {
     job_id: String,
     archive_path: PathBuf,
     project_slug: String,
+    extraction_id: uuid::Uuid,
 }
 
 impl PrepareSourceBundleJob {
@@ -19,7 +20,16 @@ impl PrepareSourceBundleJob {
             job_id,
             archive_path,
             project_slug,
+            extraction_id: uuid::Uuid::new_v4(),
         }
+    }
+
+    fn target_path(&self, context: &WorkflowContext) -> PathBuf {
+        let work_root = context.work_dir.clone().unwrap_or_else(std::env::temp_dir);
+        work_root.join(format!(
+            "uploaded-source-{}-{}",
+            self.project_slug, self.extraction_id
+        ))
     }
 
     fn validate_path(path: &Path) -> Result<(), WorkflowError> {
@@ -36,25 +46,54 @@ impl PrepareSourceBundleJob {
                 reason: "entry path escapes the source root".to_string(),
             });
         }
+        if path.components().any(|component| {
+            let Component::Normal(value) = component else {
+                return false;
+            };
+            let name = value.to_string_lossy();
+            name == ".git"
+                || name == "node_modules"
+                || name == ".env"
+                || name.starts_with(".env.")
+                || name.ends_with(".pem")
+                || name.ends_with(".key")
+                || name == "credentials.json"
+        }) {
+            return Err(WorkflowError::InvalidArchiveEntry {
+                path: path.display().to_string(),
+                reason: "sensitive or generated paths are not accepted in Drop uploads".to_string(),
+            });
+        }
         Ok(())
     }
 
-    fn extract(&self, target: &Path) -> Result<u32, WorkflowError> {
-        const MAX_FILES: u32 = 20_000;
+    fn extract_archive(archive_path: &Path, target: &Path) -> Result<u32, WorkflowError> {
+        const MAX_ENTRIES: u32 = 20_000;
         const MAX_ENTRY_BYTES: u64 = 500 * 1024 * 1024;
         const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-        let file = fs::File::open(&self.archive_path).map_err(WorkflowError::IoError)?;
+        let mut file = fs::File::open(archive_path).map_err(WorkflowError::IoError)?;
+        temps_core::archive_security::validate_zip_metadata(&mut file).map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!("Unsafe source ZIP metadata: {error}"))
+        })?;
         let mut archive = zip::ZipArchive::new(file).map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
                 "Failed to open source archive '{}': {error}",
-                self.archive_path.display()
+                archive_path.display()
             ))
         })?;
-        let mut count = 0u32;
+        let mut entry_count = 0u32;
+        let mut file_count = 0u32;
         let mut total = 0u64;
+        let mut written_total = 0u64;
         for index in 0..archive.len() {
-            let entry = archive.by_index(index).map_err(|error| {
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > MAX_ENTRIES {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Source archive exceeds the 20,000 entry extraction limit".to_string(),
+                ));
+            }
+            let mut entry = archive.by_index(index).map_err(|error| {
                 WorkflowError::JobExecutionFailed(format!(
                     "Failed to read ZIP entry {index}: {error}"
                 ))
@@ -80,9 +119,9 @@ impl PrepareSourceBundleJob {
                 fs::create_dir_all(target.join(&enclosed)).map_err(WorkflowError::IoError)?;
                 continue;
             }
-            count = count.saturating_add(1);
+            file_count = file_count.saturating_add(1);
             total = total.saturating_add(entry.size());
-            if count > MAX_FILES || entry.size() > MAX_ENTRY_BYTES || total > MAX_TOTAL_BYTES {
+            if entry.size() > MAX_ENTRY_BYTES || total > MAX_TOTAL_BYTES {
                 return Err(WorkflowError::JobExecutionFailed(
                     "Source archive exceeds extraction safety limits".to_string(),
                 ));
@@ -92,10 +131,22 @@ impl PrepareSourceBundleJob {
                 fs::create_dir_all(parent).map_err(WorkflowError::IoError)?;
             }
             let mut output = fs::File::create(&destination).map_err(WorkflowError::IoError)?;
-            io::copy(&mut entry.take(MAX_ENTRY_BYTES + 1), &mut output)
+            let written = io::copy(&mut entry.by_ref().take(MAX_ENTRY_BYTES + 1), &mut output)
                 .map_err(WorkflowError::IoError)?;
+            if written > MAX_ENTRY_BYTES {
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "ZIP entry '{}' exceeds the 500 MiB extraction limit",
+                    enclosed.display()
+                )));
+            }
+            written_total = written_total.saturating_add(written);
+            if written_total > MAX_TOTAL_BYTES {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Source archive exceeds the 2 GiB extraction limit".to_string(),
+                ));
+            }
         }
-        Ok(count)
+        Ok(file_count)
     }
 }
 
@@ -112,14 +163,19 @@ impl WorkflowTask for PrepareSourceBundleJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        let work_root = context.work_dir.clone().unwrap_or_else(std::env::temp_dir);
-        let target = work_root.join(format!(
-            "uploaded-source-{}-{}",
-            self.project_slug,
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&target).map_err(WorkflowError::IoError)?;
-        let file_count = self.extract(&target)?;
+        let target = self.target_path(&context);
+        let archive_path = self.archive_path.clone();
+        let extraction_target = target.clone();
+        let extraction_permit = super::acquire_archive_extraction_permit().await?;
+        let file_count = tokio::task::spawn_blocking(move || {
+            let _extraction_permit = extraction_permit;
+            fs::create_dir_all(&extraction_target).map_err(WorkflowError::IoError)?;
+            Self::extract_archive(&archive_path, &extraction_target)
+        })
+        .await
+        .map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!("Source extraction task failed: {error}"))
+        })??;
         if file_count == 0 {
             return Err(WorkflowError::JobExecutionFailed(
                 "Uploaded source archive is empty".to_string(),
@@ -135,7 +191,6 @@ impl WorkflowTask for PrepareSourceBundleJob {
         context.set_output(&self.job_id, "repo_owner", "drop")?;
         context.set_output(&self.job_id, "repo_name", &self.project_slug)?;
         context.set_artifact(&self.job_id, "source_code", target.clone());
-        context.work_dir = target.parent().map(Path::to_path_buf);
         Ok(JobResult::success(context))
     }
 
@@ -153,21 +208,24 @@ impl WorkflowTask for PrepareSourceBundleJob {
     }
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        if let Some(work_dir) = &context.work_dir {
-            if work_dir
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("uploaded-source-"))
-            {
-                fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
-            }
+        let target = self.target_path(context);
+        match tokio::fs::remove_dir_all(&target).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkflowError::IoError(error)),
         }
         Ok(())
+    }
+
+    fn cleanup_after_workflow(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn rejects_parent_directory_entries() {
@@ -176,5 +234,43 @@ mod tests {
             error,
             Err(WorkflowError::InvalidArchiveEntry { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_sensitive_entries() {
+        for path in [".env", "app/.env.local", ".git/config", "server.key"] {
+            assert!(matches!(
+                PrepareSourceBundleJob::validate_path(Path::new(path)),
+                Err(WorkflowError::InvalidArchiveEntry { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn extracts_regular_files_and_rejects_directory_only_archives_as_empty() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let archive_path = temporary.path().join("source.zip");
+        let file = fs::File::create(&archive_path).expect("archive file");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        archive
+            .add_directory("empty/", options)
+            .expect("directory entry");
+        archive
+            .start_file("src/main.rs", options)
+            .expect("file entry");
+        archive.write_all(b"fn main() {}").expect("file content");
+        archive.finish().expect("complete archive");
+
+        let target = temporary.path().join("extracted");
+        fs::create_dir_all(&target).expect("target");
+        let count = PrepareSourceBundleJob::extract_archive(&archive_path, &target)
+            .expect("archive should extract");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            fs::read_to_string(target.join("src/main.rs")).expect("extracted file"),
+            "fn main() {}"
+        );
     }
 }

@@ -88,6 +88,20 @@ impl WorkflowExecutor {
         )
     }
 
+    async fn cleanup_terminal_resources(&self, jobs: &[JobConfig], context: &WorkflowContext) {
+        for config in jobs {
+            if config.job.cleanup_after_workflow() {
+                if let Err(error) = config.job.cleanup(context).await {
+                    error!(
+                        job_id = config.job.job_id(),
+                        %error,
+                        "Failed to clean up workflow-scoped resources"
+                    );
+                }
+            }
+        }
+    }
+
     /// Execute a workflow with proper dependency resolution and parallel execution
     pub async fn execute_workflow(
         &self,
@@ -124,10 +138,23 @@ impl WorkflowExecutor {
         // Execute jobs in dependency order
         for batch in execution_order {
             // Check for cancellation
-            if cancellation_provider
+            let cancelled = match cancellation_provider
                 .is_cancelled(&config.workflow_run_id)
-                .await?
+                .await
             {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    self.cancel_remaining_pending(
+                        &config.workflow_run_id,
+                        format!("Cancellation status check failed: {error}"),
+                    )
+                    .await;
+                    self.cleanup_terminal_resources(&config.jobs, &context)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if cancelled {
                 warn!("🚫 Workflow {} was cancelled", config.workflow_run_id);
 
                 self.cancel_remaining_pending(
@@ -135,6 +162,9 @@ impl WorkflowExecutor {
                     "Workflow cancelled by user".to_string(),
                 )
                 .await;
+
+                self.cleanup_terminal_resources(&config.jobs, &context)
+                    .await;
 
                 return Err(WorkflowError::WorkflowCancelled);
             }
@@ -162,6 +192,8 @@ impl WorkflowExecutor {
                         format!("Workflow aborted: {}", e),
                     )
                     .await;
+                    self.cleanup_terminal_resources(&config.jobs, &context)
+                        .await;
                     return Err(e);
                 }
             };
@@ -190,6 +222,9 @@ impl WorkflowExecutor {
                     }
                     for (key, value) in result.context.vars {
                         context.vars.insert(key, value);
+                    }
+                    if result.context.work_dir.is_some() {
+                        context.work_dir = result.context.work_dir;
                     }
 
                     // Update job tracker with completion status
@@ -281,6 +316,9 @@ impl WorkflowExecutor {
                                 }
                             }
 
+                            self.cleanup_terminal_resources(&config.jobs, &context)
+                                .await;
+
                             return Err(WorkflowError::JobExecutionFailed(format!(
                                 "Required job '{}' failed: {:?}",
                                 job_id, result.message
@@ -297,6 +335,8 @@ impl WorkflowExecutor {
             "🎉 Workflow {} completed successfully",
             config.workflow_run_id
         );
+        self.cleanup_terminal_resources(&config.jobs, &context)
+            .await;
         Ok(context)
     }
 
@@ -804,6 +844,11 @@ mod tests {
         cancelled: bool,
     }
 
+    struct FailingCancellationProvider {
+        calls: AtomicUsize,
+        fail_on: usize,
+    }
+
     #[test]
     fn test_cancellation_errors_are_not_failures() {
         assert!(WorkflowExecutor::is_cancellation_error(
@@ -820,6 +865,20 @@ mod tests {
     impl WorkflowCancellationProvider for TestCancellationProvider {
         async fn is_cancelled(&self, _workflow_run_id: &str) -> Result<bool, WorkflowError> {
             Ok(self.cancelled)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowCancellationProvider for FailingCancellationProvider {
+        async fn is_cancelled(&self, _workflow_run_id: &str) -> Result<bool, WorkflowError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on {
+                Err(WorkflowError::JobExecutionFailed(
+                    "cancellation backend unavailable".to_string(),
+                ))
+            } else {
+                Ok(false)
+            }
         }
     }
 
@@ -1301,5 +1360,111 @@ mod tests {
              job's reason — it must not fabricate one, got: {:?}",
             message
         );
+    }
+
+    #[derive(Debug)]
+    struct TerminalCleanupJob {
+        cleaned: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct AfterTemporarySourceJob;
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for AfterTemporarySourceJob {
+        fn job_id(&self) -> &str {
+            "after_temporary_source"
+        }
+        fn name(&self) -> &str {
+            "After temporary source"
+        }
+        fn description(&self) -> &str {
+            "Creates a second workflow batch"
+        }
+        fn depends_on(&self) -> Vec<String> {
+            vec!["temporary_source".to_string()]
+        }
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Ok(JobResult::success(context))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for TerminalCleanupJob {
+        fn job_id(&self) -> &str {
+            "temporary_source"
+        }
+
+        fn name(&self) -> &str {
+            "Temporary source"
+        }
+
+        fn description(&self) -> &str {
+            "Creates a workflow-scoped temporary input"
+        }
+
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Ok(JobResult::success(context))
+        }
+
+        async fn cleanup(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+            self.cleaned.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn cleanup_after_workflow(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_scoped_resources_are_cleaned_after_success() {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("cleanup-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job(Arc::new(TerminalCleanupJob {
+                cleaned: cleaned.clone(),
+            }))
+            .build()
+            .expect("workflow config should build");
+
+        WorkflowExecutor::new(None)
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await
+            .expect("workflow should succeed");
+
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_provider_error_still_runs_terminal_cleanup() {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("cleanup-provider-error".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job(Arc::new(TerminalCleanupJob {
+                cleaned: cleaned.clone(),
+            }))
+            .with_job(Arc::new(AfterTemporarySourceJob))
+            .build()
+            .expect("workflow config should build");
+
+        let result = WorkflowExecutor::new(None)
+            .execute_workflow(
+                config,
+                Arc::new(FailingCancellationProvider {
+                    calls: AtomicUsize::new(0),
+                    fail_on: 1,
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
     }
 }

@@ -2,6 +2,52 @@
 //!
 //! This module provides ready-to-use job implementations for common deployment tasks.
 
+use std::sync::{Arc, LazyLock};
+use temps_core::WorkflowError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+static ARCHIVE_EXTRACTION_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(2)));
+
+pub(crate) async fn acquire_archive_extraction_permit(
+) -> Result<OwnedSemaphorePermit, WorkflowError> {
+    ARCHIVE_EXTRACTION_SEMAPHORE
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            WorkflowError::JobExecutionFailed(
+                "Archive extraction concurrency limiter was closed".to_string(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod extraction_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extraction_limit_holds_at_two_until_work_releases_a_permit() {
+        let first = acquire_archive_extraction_permit().await.unwrap();
+        let second = acquire_archive_extraction_permit().await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            acquire_archive_extraction_permit()
+        )
+        .await
+        .is_err());
+        drop(first);
+        let third = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_archive_extraction_permit(),
+        )
+        .await
+        .expect("released extraction slot")
+        .unwrap();
+        drop((second, third));
+    }
+}
+
 pub mod build_image;
 pub mod capture_source_files;
 pub mod capture_source_maps;
