@@ -122,35 +122,31 @@ impl TempsPlugin for KvPlugin {
                             KV_REDIS_SERVICE_NAME, service_model.id, service_model.status
                         );
 
+                        // Same contract as the blob plugin: go through the
+                        // manager so inferred parameters land back on the
+                        // row instead of being dropped, keeping the stored
+                        // config (which `health_probe` reads) in step with
+                        // the running container.
                         match external_service_manager
-                            .get_service_config(service_model.id)
+                            .initialize_plugin_service(service_model.id, redis_service.as_ref())
                             .await
                         {
-                            Ok(service_config) => match redis_service.init(service_config).await {
-                                Ok(_) => {
-                                    info!(
-                                        "KV Redis service '{}' initialized successfully from database config",
-                                        KV_REDIS_SERVICE_NAME
-                                    );
-                                    if let Err(e) = redis_service.start().await {
-                                        warn!(
-                                            "Failed to start KV Redis container (may already be running): {}",
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
+                            Ok(()) => {
+                                info!(
+                                    "KV Redis service '{}' initialized successfully from database config",
+                                    KV_REDIS_SERVICE_NAME
+                                );
+                                if let Err(e) = redis_service.start().await {
                                     warn!(
-                                        "Failed to initialize KV Redis service from database config: {}. \
-                                         The service will need to be created via the API.",
+                                        "Failed to start KV Redis container (may already be running): {}",
                                         e
                                     );
                                 }
-                            },
+                            }
                             Err(e) => {
                                 warn!(
-                                    "Failed to get KV service config from database: {}. \
-                                     The service may need to be recreated.",
+                                    "Failed to initialize KV Redis service from database config: {}. \
+                                     The service will need to be created via the API.",
                                     e
                                 );
                             }

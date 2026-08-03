@@ -6034,6 +6034,14 @@ export type EnvironmentResponse = {
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
     estimated_sleep_at?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override.
+     * `null` means inherit the proxy default (redirect only when the host has
+     * an active TLS certificate); `true` always redirects plain HTTP for this
+     * environment, `false` never does. Always serialized (NOT skipped) so the
+     * UI can distinguish `null` from `false`.
+     */
+    force_https?: boolean | null;
     id: number;
     /**
      * Indicates if this is a preview environment (auto-created per branch)
@@ -16854,6 +16862,20 @@ export type UpdateEnvironmentSettingsRequest = {
      * 4. Default: 3000
      */
     exposed_port?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the proxy default, which
+     * redirects only when the host has an active TLS certificate)
+     * - `true` → always redirect plain HTTP to HTTPS for this environment,
+     * even when no local certificate exists (TLS terminated upstream)
+     * - `false` → never redirect this environment, even when a certificate does
+     * exist
+     *
+     * Requests under `/.well-known/acme-challenge/` are never redirected
+     * regardless of this setting, so ACME HTTP-01 validation always completes.
+     */
+    force_https?: boolean | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */

@@ -29,6 +29,7 @@ import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { formatMicrocores } from '@/lib/cpu-format'
+import { normalizeUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -73,18 +74,6 @@ function statusBadgeVariant(status: string): BadgeVariant {
   }
 }
 
-// The environment's URLs come through `environment.domains` (domains[0] is the
-// stable env URL). A deployment also has its own deployment-specific `url`.
-// The current deployment is served at the environment's stable domain, so we
-// surface that; older deployments fall back to their deployment-specific URL.
-function resolvePrimaryUrl(deployment: DeploymentResponse): string | null {
-  const normalize = (u: string) => (u.startsWith('http') ? u : `https://${u}`)
-  const envUrl = deployment.environment.domains?.[0]
-  if (deployment.is_current && envUrl) return normalize(envUrl)
-  if (deployment.url) return normalize(deployment.url)
-  return envUrl ? normalize(envUrl) : null
-}
-
 function formatDurationMs(ms?: number | null): string | null {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return null
   const totalSeconds = Math.round(ms / 1000)
@@ -117,8 +106,12 @@ function buildUrlEntries(
     seen.add(primaryUrl)
   }
   deployment.environment.domains?.forEach((domain) => {
-    const url = domain.startsWith('http') ? domain : `https://${domain}`
-    if (seen.has(url)) return
+    // Same scheme validation as the primary URL. These entries are rendered as
+    // links too, and custom domains reach this array as raw user-supplied
+    // strings, so the weaker `startsWith('http')` test used to let
+    // `httpfoo://` and `//evil.com` through to an href.
+    const url = normalizeUrl(domain)
+    if (!url || seen.has(url)) return
     seen.add(url)
     entries.push({ url, display: domain, kind: 'preview' })
   })

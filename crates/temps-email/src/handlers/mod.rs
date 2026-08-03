@@ -105,7 +105,6 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             // Validation types
             validation::ValidateEmailRequest,
             validation::ValidateEmailResponse,
-            validation::ProxyRequest,
             validation::ReachabilityStatus,
             validation::SyntaxResult,
             validation::MxResult,

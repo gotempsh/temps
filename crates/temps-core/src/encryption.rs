@@ -1,11 +1,6 @@
-// Note: Deprecation warnings from generic-array 0.14.x are expected
-// These will be resolved when aes-gcm upgrades to 0.11.0 (currently in RC)
-// which uses generic-array 1.x
-#![allow(deprecated)]
-
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    AeadCore, Aes256Gcm, Nonce,
+    Aes256Gcm, Key, Nonce,
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -65,8 +60,12 @@ impl EncryptionService {
     /// Encrypts data using AES-256-GCM
     /// Returns base64 encoded string containing nonce + ciphertext
     pub fn encrypt(&self, data: &[u8]) -> Result<String> {
-        let cipher = Aes256Gcm::new(self.master_key.as_slice().into());
-        let nonce = Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+        let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
+        let cipher = Aes256Gcm::new(&key);
+        let mut nonce_bytes = [0u8; NONCE_LENGTH];
+        crate::ecies::fill_secure_random_bytes("generating an encryption nonce", &mut nonce_bytes)
+            .map_err(|error| anyhow!(error))?;
+        let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
             .encrypt(&nonce, data)
@@ -88,10 +87,13 @@ impl EncryptionService {
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_LENGTH);
-        let cipher = Aes256Gcm::new(self.master_key.as_slice().into());
+        let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
+        let cipher = Aes256Gcm::new(&key);
+        let nonce = Nonce::try_from(nonce_bytes)
+            .map_err(|error| anyhow!("Invalid encryption nonce: {error}"))?;
 
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         Ok(plaintext)
@@ -202,6 +204,18 @@ mod tests {
         let decrypted = service.decrypt(&encrypted).unwrap();
 
         assert_eq!(original.to_vec(), decrypted);
+    }
+
+    #[test]
+    fn test_decrypts_pre_upgrade_aes_gcm_payload() {
+        // AES-256-GCM vector encoded in Temps' existing nonce || ciphertext || tag format.
+        // Keeping this stable ensures values written by aes-gcm 0.10 remain readable.
+        let service = EncryptionService::new(&"00".repeat(32)).unwrap();
+        let encoded = "AAAAAAAAAAAAAAAAzqdAPU1ga24HTsXTuvOdGNDRyKeZmWvwJluYtdSKuRk=";
+
+        let decrypted = service.decrypt(encoded).unwrap();
+
+        assert_eq!(decrypted, vec![0u8; 16]);
     }
 
     #[test]

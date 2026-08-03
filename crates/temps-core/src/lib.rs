@@ -36,6 +36,7 @@ mod cookie_crypto;
 #[allow(deprecated)] // generic-array 0.14.x deprecation in aes-gcm 0.10
 pub mod ecies;
 mod encryption;
+pub mod preview_grant;
 pub mod repo_config;
 mod request_metadata;
 pub mod route_table;
@@ -90,6 +91,11 @@ pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
 pub use encryption::EncryptionService;
+pub use preview_grant::{
+    encode_preview_session_grant, sanitize_preview_next, validate_preview_session_grant_envelope,
+    verify_preview_session_grant, PreviewGrantError, PREVIEW_SESSION_GRANT_MAX_TTL,
+    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+};
 pub use repo_config::*;
 pub use request_metadata::{
     build_from_request as build_request_metadata, host_without_port, request_metadata_middleware,

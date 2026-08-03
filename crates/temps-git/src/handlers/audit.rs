@@ -27,8 +27,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         "PIPELINE_TRIGGERED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

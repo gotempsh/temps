@@ -728,6 +728,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }

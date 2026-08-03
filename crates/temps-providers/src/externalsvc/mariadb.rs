@@ -1,5 +1,6 @@
 use crate::utils::ensure_network_exists;
 
+use super::port_util::{find_available_port, find_available_port_async};
 use super::{
     ExternalService, HealthProbeResult, LogicalResource, NewServiceRestoreResult, RecoveryTarget,
     RuntimeEnvVar, ServiceConfig, ServiceResourceLimits, ServiceType,
@@ -13,7 +14,6 @@ use futures::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -407,14 +407,6 @@ fn example_root_password() -> &'static str {
 
 fn example_docker_image() -> &'static str {
     DEFAULT_MARIADB_IMAGE
-}
-
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
 }
 
 fn generate_password() -> String {
@@ -2516,9 +2508,12 @@ impl MariaDbService {
         let mut config = self.get_mariadb_config(source_config.clone())?;
 
         // Fresh port (the source's is taken). A restored new service is its own
-        // container, not an imported one.
+        // container, not an imported one. Docker-aware here because we have a
+        // client: it also skips ports published by other containers, not just
+        // ones the OS reports as bound.
         config.container_name = None;
-        let new_port = find_available_port(3306)
+        let new_port = find_available_port_async(&self.docker, 3306)
+            .await
             .ok_or_else(|| anyhow::anyhow!("No available ports for new MariaDB service"))?
             .to_string();
         config.port = new_port;

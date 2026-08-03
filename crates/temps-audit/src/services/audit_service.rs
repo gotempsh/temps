@@ -47,7 +47,7 @@ impl AuditService {
         let data_json = operation.serialize()?;
 
         let new_audit_log = audit_logs::ActiveModel {
-            user_id: Set(Some(operation.user_id())),
+            user_id: Set(operation.user_id()),
             operation_type: Set(operation.operation_type()),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
@@ -210,7 +210,7 @@ impl AuditLogger for AuditService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use temps_geo::geoip_service::{GeoIpService, MockGeoIpService};
 
     fn service_with(db: sea_orm::DatabaseConnection) -> AuditService {
@@ -232,6 +232,88 @@ mod tests {
             created_at: now,
             data: "{}".to_string(),
         }
+    }
+
+    #[derive(Serialize)]
+    struct TestAuditOperation {
+        user_id: Option<i32>,
+    }
+
+    impl AuditOperation for TestAuditOperation {
+        fn operation_type(&self) -> String {
+            "TEST_OPERATION".to_string()
+        }
+
+        fn user_id(&self) -> Option<i32> {
+            self.user_id
+        }
+
+        fn ip_address(&self) -> Option<String> {
+            None
+        }
+
+        fn user_agent(&self) -> &str {
+            "test-agent"
+        }
+
+        fn serialize(&self) -> anyhow::Result<String> {
+            serde_json::to_string(self)
+                .map_err(|error| anyhow::anyhow!("Failed to serialize test audit: {}", error))
+        }
+    }
+
+    async fn persisted_actor_value<T: AuditOperation>(
+        operation: &T,
+        user_id: Option<i32>,
+    ) -> Value {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![log_row(user_id)]])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+
+        service
+            .create_audit_log_typed(operation)
+            .await
+            .expect("test audit should be inserted");
+
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release the database connection")
+            .into_transaction_log();
+        let statement = &transactions
+            .first()
+            .expect("audit insert should execute one statement")
+            .statements()[0];
+        statement
+            .values
+            .as_ref()
+            .expect("audit insert should bind values")
+            .0
+            .first()
+            .expect("user_id should be the first bound audit value")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn test_create_audit_log_persists_null_actor() {
+        let operation = TestAuditOperation { user_id: None };
+        assert_eq!(
+            persisted_actor_value(&operation, operation.user_id()).await,
+            Value::Int(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_audit_log_persists_known_actor() {
+        let operation = TestAuditOperation { user_id: Some(42) };
+        assert_eq!(
+            persisted_actor_value(&operation, operation.user_id()).await,
+            Value::Int(Some(42))
+        );
     }
 
     #[tokio::test]

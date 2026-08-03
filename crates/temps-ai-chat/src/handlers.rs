@@ -1140,6 +1140,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             slug: "p".to_string(),
+            template_slug: None,
             is_deleted: false,
             deleted_at: None,
             last_deployment: None,

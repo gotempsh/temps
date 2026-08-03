@@ -76,7 +76,7 @@ impl TempsPlugin for EmailPlugin {
             ));
             context.register_service(email_service.clone());
 
-            // Create ValidationService with default config
+            // API callers cannot choose a control-plane network path.
             let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
             context.register_service(validation_service.clone());
 

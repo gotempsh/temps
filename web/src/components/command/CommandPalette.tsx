@@ -55,6 +55,7 @@ import {
   Shield,
   Sparkles,
   SquareTerminal,
+  SunMoon,
   Upload,
   Users,
   Wand2,
@@ -70,6 +71,24 @@ interface NavigationItem {
   icon: LucideIcon
   keywords?: string[]
 }
+
+interface CommandAction {
+  id: string
+  title: string
+  icon: LucideIcon
+  keywords: string[]
+  run: () => void
+}
+
+const commandActions: CommandAction[] = [
+  {
+    id: 'toggle-theme',
+    title: 'Toggle Theme',
+    icon: SunMoon,
+    keywords: ['toggle', 'theme', 'dark', 'light', 'mode'],
+    run: () => document.body.classList.toggle('dark'),
+  },
+]
 
 const mainNavItems: NavigationItem[] = [
   {
@@ -285,7 +304,16 @@ const settingsNavItems: NavigationItem[] = [
     title: 'Add Git Provider',
     url: '/git-providers/add',
     icon: GitBranch,
-    keywords: ['new', 'create', 'add', 'connect', 'github', 'gitlab', 'bitbucket', 'gitea'],
+    keywords: [
+      'new',
+      'create',
+      'add',
+      'connect',
+      'github',
+      'gitlab',
+      'bitbucket',
+      'gitea',
+    ],
   },
   {
     title: 'DNS Providers',
@@ -746,14 +774,20 @@ export function CommandPalette() {
     enabled: open,
     staleTime: 60_000,
   })
-  const globalSkills = globalSkillsData?.items ?? []
+  const globalSkills = useMemo(
+    () => globalSkillsData?.items ?? [],
+    [globalSkillsData]
+  )
 
   const { data: globalMcpServersData, refetch: refetchMcp } = useQuery({
     ...listGlobalMcpsOptions(),
     enabled: open,
     staleTime: 60_000,
   })
-  const globalMcpServers = globalMcpServersData?.items ?? []
+  const globalMcpServers = useMemo(
+    () => globalMcpServersData?.items ?? [],
+    [globalMcpServersData]
+  )
 
   // Detect if user is on a project page and extract slug
   const currentProjectSlug = useMemo(() => {
@@ -936,7 +970,7 @@ export function CommandPalette() {
         projects: projects,
         skills: globalSkills,
         mcpServers: globalMcpServers,
-        actions: ['toggle-theme'],
+        actions: commandActions,
       }
     }
 
@@ -1011,13 +1045,12 @@ export function CommandPalette() {
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.item)
 
-    // Search actions (simple fuzzy match for now)
-    const actions: string[] = []
-    const themeKeywords = ['toggle', 'theme', 'dark', 'light', 'mode']
-    const themeFuse = new Fuse(themeKeywords, { threshold: 0.4 })
-    if (themeFuse.search(search).length > 0) {
-      actions.push('toggle-theme')
-    }
+    const actions = commandActions.filter((action) => {
+      const actionFuse = new Fuse([action.title, ...action.keywords], {
+        threshold: 0.4,
+      })
+      return actionFuse.search(search).length > 0
+    })
 
     return {
       navigation: sortByScore(groupedNavResults.navigation),
@@ -1115,12 +1148,17 @@ export function CommandPalette() {
           icon: <Server className="h-4 w-4" />,
           run: () => navigate(`/mcp-servers/${mcp.slug}`),
         })
-      } else if (key === 'action:toggle-theme') {
+      } else if (key.startsWith('action:')) {
+        const action = commandActions.find(
+          ({ id }) => id === key.slice('action:'.length)
+        )
+        if (!action) continue
+        const Icon = action.icon
         out.push({
           key,
-          title: 'Toggle Theme',
-          icon: <Settings className="h-4 w-4" />,
-          run: () => document.body.classList.toggle('dark'),
+          title: action.title,
+          icon: <Icon className="h-4 w-4" />,
+          run: action.run,
         })
       } else {
         // Treat as nav URL
@@ -1148,6 +1186,31 @@ export function CommandPalette() {
     globalMcpServers,
     navigate,
   ])
+
+  const projectResultsGroup = searchResults.projects.length > 0 && (
+    <>
+      <CommandGroup heading="Projects">
+        {searchResults.projects.map((project) => (
+          <CommandItem
+            key={project.id}
+            onSelect={() =>
+              runWithFrecency(`project:${project.id}`, () =>
+                navigate(`/projects/${project.slug}`)
+              )
+            }
+            className="flex items-center gap-2"
+          >
+            <Avatar className="size-6">
+              <AvatarImage src={`/api/projects/${project.id}/favicon`} />
+              <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
+            </Avatar>
+            <span>{project.slug}</span>
+          </CommandItem>
+        ))}
+      </CommandGroup>
+      <CommandSeparator />
+    </>
+  )
 
   return (
     <CommandDialog
@@ -1214,6 +1277,9 @@ export function CommandPalette() {
               <CommandSeparator />
             </>
           )}
+
+          {/* Matching projects take priority over common navigation pages. */}
+          {search && projectResultsGroup}
 
           {/* Main Navigation */}
           {searchResults.navigation.length > 0 && (
@@ -1377,46 +1443,24 @@ export function CommandPalette() {
             </>
           )}
 
-          {/* Projects */}
-          {searchResults.projects.length > 0 && (
-            <>
-              <CommandGroup heading="Projects">
-                {searchResults.projects.map((project) => (
-                  <CommandItem
-                    key={project.id}
-                    onSelect={() =>
-                      runWithFrecency(`project:${project.id}`, () =>
-                        navigate(`/projects/${project.slug}`)
-                      )
-                    }
-                    className="flex items-center gap-2"
-                  >
-                    <Avatar className="size-6">
-                      <AvatarImage
-                        src={`/api/projects/${project.id}/favicon`}
-                      />
-                      <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
-                    </Avatar>
-                    <span>{project.slug}</span>
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-              <CommandSeparator />
-            </>
-          )}
+          {/* Preserve the browse order when the palette opens without a query. */}
+          {!search && projectResultsGroup}
 
           {/* Actions */}
-          {searchResults.actions.includes('toggle-theme') && (
+          {searchResults.actions.length > 0 && (
             <CommandGroup heading="Actions">
-              <CommandItem
-                onSelect={() =>
-                  runWithFrecency('action:toggle-theme', () =>
-                    document.body.classList.toggle('dark')
-                  )
-                }
-              >
-                <span>Toggle Theme</span>
-              </CommandItem>
+              {searchResults.actions.map((action) => (
+                <CommandItem
+                  key={action.id}
+                  onSelect={() =>
+                    runWithFrecency(`action:${action.id}`, action.run)
+                  }
+                  className="flex items-center gap-2"
+                >
+                  <action.icon className="h-4 w-4" />
+                  <span>{action.title}</span>
+                </CommandItem>
+              ))}
             </CommandGroup>
           )}
         </CommandList>

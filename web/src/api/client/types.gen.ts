@@ -6055,6 +6055,14 @@ export type EnvironmentResponse = {
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
     estimated_sleep_at?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override.
+     * `null` means inherit the proxy default (redirect only when the host has
+     * an active TLS certificate); `true` always redirects plain HTTP for this
+     * environment, `false` never does. Always serialized (NOT skipped) so the
+     * UI can distinguish `null` from `false`.
+     */
+    force_https?: boolean | null;
     id: number;
     /**
      * Indicates if this is a preview environment (auto-created per branch)
@@ -11715,6 +11723,40 @@ export type PreviewGatewaySettingsResponse = {
     image: string;
 };
 
+/**
+ * Request body for minting a preview share link.
+ */
+export type PreviewShareLinkBody = {
+    /**
+     * Path the recipient lands on. Must be same-origin (start with a single
+     * `/`); anything else is replaced with `/` so a share link can never be
+     * turned into an open redirect.
+     */
+    path?: string | null;
+    /**
+     * Port inside the sandbox the preview serves on.
+     */
+    port: number;
+    /**
+     * How long the link stays usable, in seconds. Clamped to 24 hours.
+     * Defaults to one hour — long enough to send to a reviewer, short enough
+     * that a link pasted in a ticket does not stay live indefinitely.
+     */
+    ttl_seconds?: number | null;
+};
+
+export type PreviewShareLinkResponse = {
+    /**
+     * Unix seconds after which the link stops working.
+     */
+    expires_at: number;
+    /**
+     * The full link. Its fragment contains the grant and must be treated as a
+     * credential; URL fragments are not sent to servers or in Referer headers.
+     */
+    url: string;
+};
+
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
@@ -12398,28 +12440,6 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
- * Proxy configuration for email validation
- */
-export type ProxyRequest = {
-    /**
-     * Proxy host
-     */
-    host: string;
-    /**
-     * Optional proxy password
-     */
-    password?: string | null;
-    /**
-     * Proxy port
-     */
-    port: number;
-    /**
-     * Optional proxy username
-     */
-    username?: string | null;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
  *
  * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
@@ -13018,6 +13038,29 @@ export type ResetPasswordRequest = {
     token: string;
 };
 
+/**
+ * Explicit confirmation required for the destructive statistics reset.
+ *
+ * Requiring JSON makes the endpoint non-simple for browsers, preventing a
+ * deployed same-site application from triggering it with a plain HTML form.
+ */
+export type ResetPgStatStatementsRequest = {
+    /**
+     * Must be `true` to acknowledge the global, irreversible reset.
+     */
+    confirm: boolean;
+};
+
+/**
+ * Response for the pg_stat_statements reset endpoint.
+ */
+export type ResetPgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the destructive action.
+     */
+    message: string;
+};
+
 export type ResizeSandboxBody = {
     /**
      * New root disk size in MB. Grow-only; must exceed the current size.
@@ -13588,7 +13631,8 @@ export type SandboxEvent = {
     /**
      * Machine-readable operation (`created`, `stopped`, `resumed`,
      * `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
-     * `preview_password_cleared`, `source_seeded`, `destroyed`).
+     * `preview_password_cleared`, `preview_share_link_created`, `source_seeded`,
+     * `destroyed`).
      */
     event_type: string;
 };
@@ -16907,6 +16951,20 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     exposed_port?: number | null;
     /**
+     * Per-environment HTTP→HTTPS redirect override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the proxy default, which
+     * redirects only when the host has an active TLS certificate)
+     * - `true` → always redirect plain HTTP to HTTPS for this environment,
+     * even when no local certificate exists (TLS terminated upstream)
+     * - `false` → never redirect this environment, even when a certificate does
+     * exist
+     *
+     * Requests under `/.well-known/acme-challenge/` are never redirected
+     * regardless of this setting, so ACME HTTP-01 validation always completes.
+     */
+    force_https?: boolean | null;
+    /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
@@ -17735,7 +17793,6 @@ export type ValidateEmailRequest = {
      * Email address to validate
      */
     email: string;
-    proxy?: null | ProxyRequest;
 };
 
 /**
@@ -27863,6 +27920,57 @@ export type ExternalServiceEnablePgStatStatementsResponses = {
 };
 
 export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
+export type ExternalServiceResetPgStatStatementsData = {
+    /**
+     * Explicit confirmation of the global, irreversible reset
+     */
+    body: ResetPgStatStatementsRequest;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/reset';
+};
+
+export type ExternalServiceResetPgStatStatementsErrors = {
+    /**
+     * Missing or invalid reset confirmation
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not Postgres
+     */
+    422: unknown;
+    /**
+     * Target Postgres rejected or failed the reset operation
+     */
+    502: unknown;
+};
+
+export type ExternalServiceResetPgStatStatementsResponses = {
+    /**
+     * All accumulated pg_stat_statements statistics cleared
+     */
+    200: ResetPgStatStatementsResponse;
+};
+
+export type ExternalServiceResetPgStatStatementsResponse = ExternalServiceResetPgStatStatementsResponses[keyof ExternalServiceResetPgStatStatementsResponses];
 
 export type GetSlowQueriesData = {
     body?: never;
@@ -47132,6 +47240,43 @@ export type PauseSandboxResponses = {
 };
 
 export type PauseSandboxResponse = PauseSandboxResponses[keyof PauseSandboxResponses];
+
+export type SandboxCreatePreviewLinkData = {
+    body: PreviewShareLinkBody;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/preview-link';
+};
+
+export type SandboxCreatePreviewLinkErrors = {
+    /**
+     * Invalid port
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox has no preview password
+     */
+    409: unknown;
+    /**
+     * Preview grant minting failed
+     */
+    500: unknown;
+};
+
+export type SandboxCreatePreviewLinkResponses = {
+    /**
+     * Shareable preview link
+     */
+    200: PreviewShareLinkResponse;
+};
+
+export type SandboxCreatePreviewLinkResponse = SandboxCreatePreviewLinkResponses[keyof SandboxCreatePreviewLinkResponses];
 
 export type ClearPreviewPasswordData = {
     body?: never;

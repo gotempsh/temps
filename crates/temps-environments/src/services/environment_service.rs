@@ -719,6 +719,10 @@ impl EnvironmentService {
         if let Some(attack_mode) = settings.attack_mode {
             active_model.attack_mode = Set(attack_mode);
         }
+        // force_https follows the same tri-state contract as attack_mode.
+        if let Some(force_https) = settings.force_https {
+            active_model.force_https = Set(force_https);
+        }
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
@@ -726,12 +730,27 @@ impl EnvironmentService {
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
-        // When on-demand settings change, notify the proxy to reload routes so it
-        // picks up sleeping-domain registrations and on-demand configs immediately.
-        let on_demand_changed = settings.on_demand.is_some()
+        // Notify the proxy to reload routes so it picks up the change immediately.
+        //
+        // This is NOT optional for the fields below. The proxy answers requests
+        // from `CachedPeerTable`, which holds a cloned `environments::Model` and
+        // reloads *only* on PG NOTIFY — there is no periodic timer ("a quiet
+        // system stays quiet"). The `environments_route_change_trigger` covers
+        // just `current_deployment_id` and `deployment_config`, so a change to a
+        // top-level column like `force_https` or `attack_mode` reaches Postgres
+        // and then stops: the proxy keeps serving the stale model until some
+        // unrelated event (a deploy, a subdomain rename) happens to fire a
+        // NOTIFY. The setting looks silently broken, which is the worst possible
+        // outcome for a self-hosted operator with no support channel to ask.
+        //
+        // `attack_mode` is included for the same reason — it is read off the same
+        // cached model on the request path and has the same staleness window.
+        let routing_relevant_changed = settings.on_demand.is_some()
             || settings.idle_timeout_seconds.is_some()
-            || settings.wake_timeout_seconds.is_some();
-        if on_demand_changed {
+            || settings.wake_timeout_seconds.is_some()
+            || settings.force_https.is_some()
+            || settings.attack_mode.is_some();
+        if routing_relevant_changed {
             // "NOTIFY route_table_changes" is a fully hardcoded string — no
             // user-controlled data is interpolated. Statement::from_string is
             // safe here; PostgreSQL does not support parameterised NOTIFY.
@@ -746,7 +765,7 @@ impl EnvironmentService {
                 tracing::error!(
                     error = %e,
                     environment_id = env_id,
-                    "Failed to send route_table_changes NOTIFY after on-demand settings update"
+                    "Failed to send route_table_changes NOTIFY after environment settings update - the proxy will keep serving the previous settings until the next reload"
                 );
             }
         }
@@ -1127,6 +1146,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
         let mut fenced = environment.clone();
@@ -1242,6 +1262,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -1288,6 +1309,7 @@ mod tests {
                     cross_architecture_builds: None,
                     protected: None,
                     attack_mode: None,
+                    force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
@@ -1328,6 +1350,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }

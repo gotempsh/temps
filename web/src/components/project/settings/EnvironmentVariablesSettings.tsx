@@ -111,7 +111,13 @@ function EnvironmentVariableRow({
 
   const revealValue = async (): Promise<string | undefined> => {
     if (isSecret) return undefined
-    const request = revealGuard.current.begin('value')
+    // Capture the guard instance once: revealGuard.current gets swapped to a
+    // fresh guard (new, empty request map) whenever revealScope changes, which
+    // happens as soon as this row's own edit is saved and the list refetches.
+    // Re-reading revealGuard.current after the await would compare against
+    // that new, unrelated guard and always report the request as stale.
+    const guard = revealGuard.current
+    const request = guard.begin('value')
     setIsRevealing(true)
     try {
       const value = await getEnvVarValue(
@@ -119,16 +125,16 @@ function EnvironmentVariableRow({
         variable.key,
         variable.id
       )
-      if (!revealGuard.current.isCurrent('value', request)) return undefined
+      if (!guard.isCurrent('value', request)) return undefined
       setRevealedValue({ value, scope: revealScope })
       return value
     } catch {
-      if (revealGuard.current.isCurrent('value', request)) {
+      if (guard.isCurrent('value', request)) {
         toast.error(`Failed to reveal ${variable.key}`)
       }
       return undefined
     } finally {
-      if (revealGuard.current.finish('value', request)) {
+      if (guard.finish('value', request)) {
         setIsRevealing(false)
       }
     }

@@ -45,8 +45,8 @@ impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1341,8 +1341,8 @@ impl AuditOperation for JoinTokenGeneratedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_GENERATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -1365,8 +1365,8 @@ impl AuditOperation for JoinTokenRevokedAudit {
     fn operation_type(&self) -> String {
         "JOIN_TOKEN_REVOKED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

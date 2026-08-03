@@ -571,25 +571,20 @@ pub async fn blob_enable(
             existing.status
         );
 
-        // Get the service config from the database and initialize the plugin's RustfsService
-        let service_config = state
-            .external_service_manager
-            .get_service_config(existing.id)
-            .await
-            .map_err(|e| {
-                error!("Failed to get Blob service config: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable Blob Service")
-                    .with_detail(format!("Could not get Blob service config: {}", e))
-            })?;
-
         info!(
-            "Retrieved Blob service config (service_id: {}), initializing RustfsService...",
+            "Initializing RustfsService from stored config (service_id: {})...",
             existing.id
         );
 
-        // Initialize the plugin's RustfsService with the config from database
-        if let Err(e) = state.rustfs_service.init(service_config).await {
+        // Initialize the plugin's RustfsService from the stored config, and
+        // write the engine's inferred parameters back to the row. Calling
+        // `init()` directly here dropped them, letting the stored port drift
+        // from the container's real one — which `health_probe` then reads.
+        if let Err(e) = state
+            .external_service_manager
+            .initialize_plugin_service(existing.id, state.rustfs_service.as_ref())
+            .await
+        {
             error!("Failed to initialize RustfsService: {}", e);
             return Err(
                 temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -674,21 +669,10 @@ pub async fn blob_enable(
         // upload, list and head goes through — is still unconfigured. Without
         // this the branch above returns "enabled successfully" and then every
         // blob request fails until the server is restarted and the plugin
-        // initializes itself on boot. Load the config it just persisted.
-        let service_config = state
-            .external_service_manager
-            .get_service_config(created.id)
-            .await
-            .map_err(|e| {
-                error!("Failed to get config for newly created Blob service: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable Blob Service")
-                    .with_detail(format!("Could not read back Blob service config: {}", e))
-            })?;
-
+        // initializes itself on boot.
         state
-            .rustfs_service
-            .init(service_config)
+            .external_service_manager
+            .initialize_plugin_service(created.id, state.rustfs_service.as_ref())
             .await
             .map_err(|e| {
                 error!("Failed to initialize RustfsService after create: {}", e);

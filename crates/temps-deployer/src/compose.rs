@@ -603,6 +603,7 @@ impl ComposeExecutor {
         // Block host files exposed through top-level configs/secrets `file:` paths.
         self.validate_top_level_files(&root, "configs")?;
         self.validate_top_level_files(&root, "secrets")?;
+        self.validate_top_level_networks(&root)?;
 
         let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
             return Ok(());
@@ -765,6 +766,64 @@ impl ComposeExecutor {
             self.reject_deploy_devices(service, service_name)?;
             self.validate_build_options(service, service_name)?;
             self.validate_service_volumes(service, service_name, &forbidden_named_volumes)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_top_level_networks(&self, root: &YamlValue) -> Result<(), ComposeError> {
+        let Some(networks) = root.get("networks") else {
+            return Ok(());
+        };
+        let Some(networks) = networks.as_mapping() else {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: "<top-level>".to_string(),
+                field: "networks".to_string(),
+                reason: "top-level networks must be a mapping".to_string(),
+            });
+        };
+
+        for (network_name, network) in networks {
+            let name = network_name.as_str().unwrap_or("<non-string>");
+            if network.is_null() {
+                continue;
+            }
+            let Some(options) = network.as_mapping() else {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<top-level>".to_string(),
+                    field: format!("networks.{name}"),
+                    reason: "network configuration must be a mapping".to_string(),
+                });
+            };
+
+            if options.contains_key(YamlValue::String("external".to_string())) {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<top-level>".to_string(),
+                    field: format!("networks.{name}.external"),
+                    reason: "external Compose networks bypass Temps-managed network policy"
+                        .to_string(),
+                });
+            }
+
+            if let Some(driver) = options.get(YamlValue::String("driver".to_string())) {
+                let Some(driver) = driver.as_str() else {
+                    return Err(ComposeError::SecurityPolicyViolation {
+                        service: "<top-level>".to_string(),
+                        field: format!("networks.{name}.driver"),
+                        reason: "network driver must be the literal value 'bridge'".to_string(),
+                    });
+                };
+                if driver != "bridge" {
+                    return Err(ComposeError::SecurityPolicyViolation {
+                        service: "<top-level>".to_string(),
+                        field: format!("networks.{name}.driver"),
+                        reason: format!(
+                            "network driver '{driver}' can bypass routed host filtering; \
+                             only the bridge driver is allowed"
+                        ),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -2979,6 +3038,48 @@ services:
             error,
             ComposeError::SecurityPolicyViolation { field, .. } if field == "volumes"
         ));
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_rejects_network_filter_bypasses() {
+        let docker = Docker::connect_with_defaults().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), PathBuf::from("/tmp/test"));
+
+        for (field, network) in [
+            ("networks.direct.driver", "driver: macvlan"),
+            ("networks.direct.driver", "driver: ipvlan"),
+            ("networks.direct.external", "external: true"),
+        ] {
+            let compose = format!(
+                "services:\n  web:\n    image: alpine\n    networks: [direct]\nnetworks:\n  direct:\n    {network}\n"
+            );
+            let error = executor
+                .validate_compose_security_policy("compose file", &compose)
+                .expect_err("L2 and external networks must not bypass metadata filtering");
+            assert!(matches!(
+                error,
+                ComposeError::SecurityPolicyViolation { field: actual, .. } if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_allows_managed_bridge_network() {
+        let docker = Docker::connect_with_defaults().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), PathBuf::from("/tmp/test"));
+        let compose = r#"
+services:
+  web:
+    image: alpine
+    networks: [app]
+networks:
+  app:
+    driver: bridge
+"#;
+
+        executor
+            .validate_compose_security_policy("compose file", compose)
+            .expect("managed bridge networks remain supported");
     }
 
     #[test]
