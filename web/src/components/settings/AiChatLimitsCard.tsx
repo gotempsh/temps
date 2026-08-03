@@ -101,7 +101,15 @@ export function AiChatLimitsCard() {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+        {/* `noValidate` hands validation to react-hook-form. Without it the
+            browser's own constraint check fires first and blocks submit with a
+            native tooltip — safe, but styled by the browser and phrased by it,
+            and it means the messages below could never appear. */}
+        <form
+          noValidate
+          onSubmit={handleSubmit(onSubmit)}
+          className="space-y-4"
+        >
           <div className="space-y-2">
             <Label htmlFor="turn_timeout_secs">Timeout (seconds)</Label>
             <div className="flex items-center gap-3">
