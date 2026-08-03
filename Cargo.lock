@@ -12328,7 +12328,7 @@ dependencies = [
  "libc",
  "mockall",
  "netlink-packet-core",
- "netlink-packet-route 0.30.0",
+ "netlink-packet-route 0.31.0",
  "nix 0.31.3",
  "rtnetlink",
  "sea-orm",
