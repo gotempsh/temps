@@ -1392,7 +1392,6 @@ pub async fn get_project_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
-
     Ok(Json(super::templates::TemplateResponse::from(template)))
 }
 
@@ -1515,6 +1514,7 @@ pub async fn create_project_from_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
+    let template_provenance = temps_core::templates::template_provenance(&template).to_string();
 
     // 2. Build the environment variables from the request (shared by both modes).
     let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
@@ -1570,7 +1570,7 @@ pub async fn create_project_from_template(
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
-            template_slug: Some(request.template_slug.clone()),
+            template_slug: Some(template_provenance.clone()),
         };
         // Surface the template's source repo as the response URL (the image ref
         // isn't a browsable URL); the message clarifies it deployed from an image.
@@ -1639,7 +1639,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
                     source_type: SourceType::Git,
-                    template_slug: Some(request.template_slug.clone()),
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, new_repo.clone_url, "fork")
             }
@@ -1685,7 +1685,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: None,
                     exposed_port: None,
                     source_type: SourceType::Git,
-                    template_slug: Some(request.template_slug.clone()),
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, template.git.url.clone(), "public_repo")
             }
@@ -1762,7 +1762,7 @@ pub async fn create_project_from_template(
     state
         .telemetry
         .report(project_created_from_template_telemetry_event(
-            &request.template_slug,
+            &template_provenance,
             deploy_mode,
             request.storage_service_ids.len(),
         ));

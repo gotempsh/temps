@@ -2910,6 +2910,13 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
 
+    async fn docker_available() -> bool {
+        match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     #[test]
     fn failure_classifier_maps_specific_errors_to_allowlisted_stage_and_code() {
         let cases = [
@@ -3663,6 +3670,10 @@ mod tests {
     #[tokio::test]
     async fn test_execute_deployment_workflow_with_jobs() -> Result<(), Box<dyn std::error::Error>>
     {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -3763,6 +3774,10 @@ mod tests {
     #[tokio::test]
     async fn failed_status_path_sanitizes_operator_template_and_raw_reason(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let (project, _environment, deployment) = create_test_data(&db).await?;

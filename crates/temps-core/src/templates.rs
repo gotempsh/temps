@@ -255,11 +255,37 @@ const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
     "nextjs-docs-template",
 ];
 
+/// Stored provenance marker for projects created from an operator-defined
+/// template. The operator's actual slug stays local to the template catalog.
+pub const CUSTOM_TEMPLATE_PROVENANCE: &str = "custom";
+
 /// Return the slug only when it is a fixed label from the bundled catalog.
 pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
     BUNDLED_TELEMETRY_TEMPLATE_SLUGS
         .contains(&slug)
         .then_some(slug)
+}
+
+/// Return the public bundled slug only when the selected template exactly
+/// matches its embedded catalog definition.
+///
+/// External template files can replace the bundled catalog and may reuse one
+/// of its slugs. Comparing the complete definition prevents such an override
+/// from being attributed to the bundled template merely because its name
+/// matches a public label.
+pub fn bundled_telemetry_template_slug(template: &ProjectTemplate) -> Option<&str> {
+    telemetry_safe_template_slug(&template.slug)?;
+    let bundled = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES).ok()?;
+    bundled
+        .templates
+        .iter()
+        .any(|candidate| candidate == template)
+        .then_some(template.slug.as_str())
+}
+
+/// Produce the bounded value persisted on a template-created project.
+pub fn template_provenance(template: &ProjectTemplate) -> &str {
+    bundled_telemetry_template_slug(template).unwrap_or(CUSTOM_TEMPLATE_PROVENANCE)
 }
 
 /// Template service that manages loading and caching templates
@@ -807,6 +833,25 @@ templates:
             Some("observability-starter")
         );
         assert_eq!(telemetry_safe_template_slug("customer-acme-private"), None);
+    }
+
+    #[test]
+    fn external_override_reusing_bundled_slug_is_custom_provenance() {
+        let mut config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+            .expect("bundled templates.yaml must parse");
+        let template = config
+            .templates
+            .iter_mut()
+            .find(|template| template.slug == "observability-starter")
+            .expect("observability template must be bundled");
+        template.git.url = "https://example.com/operator/observability.git".to_string();
+
+        assert_eq!(bundled_telemetry_template_slug(template), None);
+        assert_eq!(template_provenance(template), CUSTOM_TEMPLATE_PROVENANCE);
+        assert_eq!(
+            telemetry_safe_template_slug(template_provenance(template)),
+            None
+        );
     }
 
     #[test]
