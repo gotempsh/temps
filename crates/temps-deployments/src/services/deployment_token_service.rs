@@ -1314,6 +1314,7 @@ mod tests {
             DeploymentTokenPermission::AnalyticsRead,
             DeploymentTokenPermission::EventsWrite,
             DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::FlagsRead,
             DeploymentTokenPermission::FullAccess,
         ];
 
@@ -1330,16 +1331,21 @@ mod tests {
     }
 
     /// Test DeploymentTokenPermission::all() returns all variants
+    ///
+    /// The length assertion is deliberate: adding a variant without listing it
+    /// here means it silently misses `all()`, and `all()` is what the UI offers
+    /// when scoping a token. Update both when adding a permission.
     #[test]
     fn test_permission_all() {
         let all = DeploymentTokenPermission::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert!(all.contains(&DeploymentTokenPermission::VisitorsEnrich));
         assert!(all.contains(&DeploymentTokenPermission::EmailsSend));
         assert!(all.contains(&DeploymentTokenPermission::AnalyticsRead));
         assert!(all.contains(&DeploymentTokenPermission::EventsWrite));
         assert!(all.contains(&DeploymentTokenPermission::ErrorsRead));
         assert!(all.contains(&DeploymentTokenPermission::AiGatewayExecute));
+        assert!(all.contains(&DeploymentTokenPermission::FlagsRead));
         assert!(all.contains(&DeploymentTokenPermission::FullAccess));
     }
 
