@@ -803,12 +803,27 @@ impl ConversationService {
         tools: Vec<ChatTool>,
         auth: &AuthContext,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
-        // Round cap for the agentic loop. Each round is one model call that may
-        // issue tool calls; a multi-step task (search → describe → call, possibly
-        // a couple of endpoints) legitimately needs several rounds, so this is
-        // generous. The anti-repeat guard below stops a model from burning the
-        // whole budget re-issuing the same search.
-        const MAX_ROUNDS: usize = 10;
+        // The turn runs until the model answers, the user presses Stop, or one
+        // of the bounds below trips. It deliberately is NOT capped at a small
+        // number of steps: the user can see every tool call as it happens and
+        // stop it, and closing the panel drops the SSE stream which cancels the
+        // upstream request — so a preset step limit mostly just cuts short
+        // tasks that were working.
+        //
+        // What actually needs bounding is different:
+        //
+        // - `MAX_ROUNDS` is a runaway backstop for a loop nobody is watching,
+        //   not a task budget. No legitimate task should come near it.
+        // - `MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS` stops a stuck turn fast. A
+        //   model correcting a flag is fine; one that has produced nothing but
+        //   rejections for several rounds is not going to recover, and no user
+        //   should have to sit and watch it try.
+        // - `MAX_CARRIED_TOOL_BYTES` is the real ceiling on turn length, since
+        //   every tool result is replayed on every later round. Without it a
+        //   long turn blows the context window instead of finishing.
+        const MAX_ROUNDS: usize = 40;
+        const MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS: usize = 3;
+        const MAX_CARRIED_TOOL_BYTES: usize = 192 * 1024;
         // Directive appended before the final, tool-free answer so the model
         // writes real prose from the evidence instead of narrating another tool
         // call it would like to make.
@@ -880,6 +895,12 @@ impl ConversationService {
             // so that a turn which ends up with nothing to show can explain WHY
             // instead of just stopping — see the empty-turn check after salvage.
             let mut last_provider_error: Option<String> = None;
+            // Why generation stopped, when it was a bound rather than the model
+            // finishing. Reported to the user — a turn that halts for a reason
+            // nobody states looks identical to one that simply gave up.
+            let mut stop_reason: Option<&'static str> = None;
+            // Consecutive rounds in which every tool call was rejected.
+            let mut unproductive_streak = 0usize;
 
             'rounds: for _ in 0..MAX_ROUNDS {
                 let req = ChatTurnRequest {
@@ -902,6 +923,8 @@ impl ConversationService {
                 };
                 let mut round_text = String::new();
                 let mut round_calls: Vec<ToolCall> = Vec::new();
+                // Did anything this round return usable data (vs. only rejections)?
+                let mut round_produced_something = false;
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(ChatStreamDelta::Text(t)) => {
@@ -1002,6 +1025,7 @@ impl ConversationService {
                                 write_handle_opt.as_deref(),
                                 pending_svc_opt.as_deref(),
                                 &mut proposed_action_ids,
+                                &seen_calls,
                             )
                             .await
                         } else if tc.name == "temps" {
@@ -1068,6 +1092,9 @@ impl ConversationService {
                     });
                     tools_meta.push(tool_part.clone());
                     parts.push(serde_json::json!({ "type": "tool", "tool": tool_part }));
+                    if tool_result_is_productive(&result) {
+                        round_produced_something = true;
+                    }
                     messages.push(ChatMessage::tool(tc.id.clone(), result));
                 }
 
@@ -1076,6 +1103,31 @@ impl ConversationService {
                 if client_gone {
                     break 'rounds;
                 }
+
+                // A round where every call was rejected is not progress. Allow a
+                // couple — correcting a flag name is normal and the error
+                // messages are written to be self-correcting — then stop, rather
+                // than letting the model grind against the same mistake.
+                if round_produced_something {
+                    unproductive_streak = 0;
+                } else {
+                    unproductive_streak += 1;
+                    if unproductive_streak >= MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS {
+                        stop_reason =
+                            Some("stopped after several attempts in a row produced only errors");
+                        break 'rounds;
+                    }
+                }
+
+                // Bound what gets replayed next round. This, not the round
+                // count, is what keeps a long turn from running out of context.
+                trim_carried_tool_results(&mut messages, MAX_CARRIED_TOOL_BYTES);
+            }
+
+            // Fell out of the loop by exhausting the backstop rather than by
+            // answering — worth saying, since it means the task was cut short.
+            if !answered && stop_reason.is_none() && !client_gone && !tools_meta.is_empty() {
+                stop_reason = Some("stopped at the maximum number of steps for one turn");
             }
 
             // Close any trailing open text part.
@@ -1086,8 +1138,26 @@ impl ConversationService {
                 }));
             }
 
+            // Say that the turn was cut short, before the salvage answer.
+            //
+            // Without this the user gets a confident-looking summary with no
+            // indication it was written under duress — which reads as a complete
+            // answer and is the same class of dishonesty as claiming a backtest
+            // that never ran. They can then decide to ask it to continue.
+            if let Some(reason) = stop_reason {
+                let note = format!(
+                    "\n\n_The assistant {reason}. What follows is based only on \
+                     what it gathered so far — ask it to continue if that looks incomplete._\n\n"
+                );
+                content.push_str(&note);
+                parts.push(serde_json::json!({ "type": "text", "text": note.clone() }));
+                if tx.send(Ok(ChatStreamEvent::Token(note))).is_err() {
+                    client_gone = true;
+                }
+            }
+
             // Salvage: the loop used tools but never settled on a prose answer (it
-            // hit the round cap still calling tools). Make one tool-free streaming
+            // hit a bound while still calling tools). Make one tool-free streaming
             // call so the model answers from the evidence it gathered. Skip it if
             // the client is already gone — no one is listening.
             if !answered && !tools_meta.is_empty() && !client_gone {
@@ -1237,11 +1307,152 @@ impl ConversationService {
 // Write-tool dispatch helper (free function so the spawned task can borrow it)
 // ---------------------------------------------------------------------------
 
+/// Did a tool call produce something the model can reason from, or only a
+/// rejection?
+///
+/// This is the difference between a turn that is making progress and one that
+/// is stuck, and the two need opposite treatment: a long productive task should
+/// be allowed to continue, a loop of validation errors should be stopped
+/// quickly. A single round counter cannot tell them apart, so it ends up too
+/// tight for the first and far too loose for the second.
+///
+/// The read CLI has a defined success shape — `{"operation":…,"status":N,…}` —
+/// so classifying it is parsing a contract, not guessing. Anything else is
+/// assumed productive: a tool this function does not understand must not be
+/// mistaken for a failure and used to cut a working turn short.
+fn tool_result_is_productive(result: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(result) {
+        Ok(v) => match v.get("status").and_then(serde_json::Value::as_u64) {
+            Some(status) => (200..300).contains(&status),
+            // Valid JSON without a status: the write tool's proposal receipt,
+            // which is very much progress.
+            None => true,
+        },
+        // Not JSON — every failure path returns a plain sentence, but so could a
+        // future tool, hence the explicit allow-list of known rejections rather
+        // than treating all prose as failure.
+        Err(_) => {
+            const REJECTIONS: &[&str] = &[
+                "Unknown parameter(s)",
+                "Missing required parameters",
+                "has the wrong shape",
+                "Required parameter",
+                "Unknown operation",
+                "Unknown command",
+                "is not available",
+                "You already ran",
+                "Not staged",
+                "Invalid `temps_write` arguments",
+            ];
+            !REJECTIONS.iter().any(|r| result.contains(r)) && !result.contains("` failed:")
+        }
+    }
+}
+
+/// Replace the oldest tool results with a stub once the carried-forward
+/// transcript grows past `budget` bytes.
+///
+/// Every tool result is replayed to the model on every subsequent round, so a
+/// long task re-sends everything it has ever read — the transcript, not the
+/// round count, is what actually bounds how long a turn can run. Without this,
+/// raising the round cap just moves the failure from "stopped early" to "blew
+/// the context window", which is worse because it is not explained.
+///
+/// The messages are kept in place with their `tool_call_id` intact — providers
+/// reject a tool_calls block whose answers have gone missing — and only the
+/// content is replaced, so the model still sees that the call happened and what
+/// it was.
+fn trim_carried_tool_results(messages: &mut [ChatMessage], budget: usize) {
+    let total: usize = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.len())
+        .sum();
+    if total <= budget {
+        return;
+    }
+
+    // Drop oldest-first: recent results are what the model is reasoning about
+    // right now, and the older ones have usually been summarised into its own
+    // prose already.
+    let mut over = total - budget;
+    for m in messages.iter_mut().filter(|m| m.role == "tool") {
+        if over == 0 {
+            break;
+        }
+        const STUB: &str = "[earlier tool result dropped to stay within the context budget —                             re-run the command if you still need it]";
+        if m.content.len() <= STUB.len() {
+            continue;
+        }
+        over = over.saturating_sub(m.content.len() - STUB.len());
+        m.content = STUB.to_string();
+    }
+}
+
+/// Operations that must not be proposed without first backtesting them, mapped
+/// to the read-tool operation that does the backtesting.
+///
+/// A threshold is a number someone invented; the only thing that turns it into
+/// a judgement is knowing how often it would have fired. The system prompt asks
+/// for that and a model will still skip it — and worse, claim it did — so this
+/// is enforced rather than requested. `preview_alert` is read-only and saves
+/// nothing, so requiring it costs one extra round and no risk.
+const BACKTEST_REQUIRED: &[(&str, &str)] = &[
+    ("create_alert", "preview_alert"),
+    ("update_alert", "preview_alert"),
+];
+
+/// If `command` proposes an operation that requires a backtest, and no matching
+/// backtest was run this turn, return the message to send back instead.
+///
+/// Matching is by operation name only, not by exact arguments: the model
+/// legitimately tunes a threshold between backtest and proposal, and demanding
+/// byte-identical config would just make the requirement impossible to satisfy.
+/// The goal is that the model has *looked*, not that it never adjusted after.
+fn missing_backtest(
+    command: &str,
+    seen_calls: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let (op, backtest_op) = BACKTEST_REQUIRED
+        .iter()
+        .find(|(op, _)| command.split_whitespace().any(|t| t == *op))?;
+
+    let ran_backtest = seen_calls.iter().any(|(key, result)| {
+        // Key is "<tool>|<raw args>"; the read CLI carries the operation name in
+        // its command string. The result must be productive — a backtest that
+        // errored tells the model nothing, and letting it satisfy the
+        // requirement would turn one malformed call into a way past the gate.
+        key.contains(backtest_op) && tool_result_is_productive(result)
+    });
+    if ran_backtest {
+        return None;
+    }
+
+    // Spell the command out rather than describing it. The model reliably
+    // rediscovers these flags by trial and error otherwise, and every wrong
+    // guess costs a round out of the loop's budget — enough of them and the
+    // turn ends with nothing proposed, which is a worse outcome than the
+    // un-backtested proposal this gate exists to prevent.
+    Some(format!(
+        "Not staged: `{op}` requires a backtest first, and none succeeded this turn.\n\n\
+         Run this with the `temps` tool, substituting the values you intend to propose:\n\n\
+         alerts {backtest_op} --metric_name <metric> --aggregation <avg|max|p95|…> \
+         --window_secs <secs> \
+         --detection_config '{{\"kind\":\"static\",\"comparator\":\"gt\",\"threshold\":<number>}}'\n\n\
+         It is read-only and saves nothing. It returns `breach_count` out of the points it \
+         scored — how often this exact rule WOULD have fired. Judge the threshold by it (firing \
+         on nearly every bucket is noise; never firing may be pointless), then propose the \
+         configuration you settled on.\n\n\
+         Do not describe a rule as backtested unless you have run this and read the result."
+    ))
+}
+
 /// Dispatch a `temps_write` tool call: parse the command, validate (no
 /// execution), create a pending-action row, return a JSON proposal receipt.
 ///
 /// Returns a readable string result that goes back to the model as the tool
 /// result — always, even on internal errors (never panics).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_write_tool(
     arguments: &str,
     project_id: i32,
@@ -1250,6 +1461,7 @@ async fn dispatch_write_tool(
     write_handle: Option<&temps_ai_api_tools::InternalApiCaller>,
     pending_svc: Option<&PendingActionService>,
     proposed_action_ids: &mut Vec<i64>,
+    seen_calls: &std::collections::HashMap<String, String>,
 ) -> String {
     let caller = match write_handle {
         Some(c) => c,
@@ -1300,6 +1512,16 @@ async fn dispatch_write_tool(
                 discover operations."
             .to_string();
     };
+
+    // Refuse to stage anything that should have been backtested and wasn't.
+    // Checked before `prepare_write_cli` so the model gets the one instruction
+    // that matters rather than a validation error it would fix and re-submit,
+    // still un-backtested.
+    for cmd in &commands {
+        if let Some(msg) = missing_backtest(cmd, seen_calls) {
+            return msg;
+        }
+    }
 
     // Prepare (validate, NO execution) every step first. If any step is a help
     // request or fails to validate, surface that and stage NOTHING — a plan is
@@ -1399,6 +1621,155 @@ async fn dispatch_write_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::HashMap;
+
+    #[test]
+    fn productive_results_are_distinguished_from_rejections() {
+        // The read CLI's success shape — a contract, not a guess.
+        assert!(tool_result_is_productive(
+            r#"{"operation":"query_metrics","status":200,"data":{"data":[]}}"#
+        ));
+        // A non-2xx replayed through the CLI is not progress.
+        assert!(!tool_result_is_productive(
+            r#"{"operation":"get_alert","status":404,"data":null}"#
+        ));
+        // The write tool's proposal receipt has no status and is very much progress.
+        assert!(tool_result_is_productive(
+            r#"{"status":"proposed","action_id":"abc","operation":"create_alert"}"#
+        ));
+
+        for rejection in [
+            "Unknown parameter(s) for operation 'query_metrics': 'metric'.",
+            "Missing required parameters for operation 'create_alert': name.",
+            "Parameter 'detection_config' has the wrong shape for operation 'create_alert'.",
+            "`query_metrics` failed: something went wrong",
+            "You already ran `echo` with these exact arguments earlier this turn.",
+            "Not staged: `create_alert` requires a backtest first.",
+        ] {
+            assert!(
+                !tool_result_is_productive(rejection),
+                "should count as unproductive: {rejection}"
+            );
+        }
+
+        // An unrecognised tool's prose must NOT be mistaken for a failure —
+        // misclassifying it would cut a working turn short.
+        assert!(tool_result_is_productive(
+            "The deployment finished at 12:04 and the container is healthy."
+        ));
+    }
+
+    #[test]
+    fn carried_tool_results_are_trimmed_oldest_first() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            ChatMessage::system("seed"),
+            ChatMessage::tool("a".to_string(), big.clone()),
+            ChatMessage::tool("b".to_string(), big.clone()),
+            ChatMessage::tool("c".to_string(), big.clone()),
+        ];
+
+        trim_carried_tool_results(&mut messages, 1500);
+
+        // Structure is preserved — a provider rejects a tool_calls block whose
+        // answers have vanished, so messages are stubbed in place, never removed.
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("a"));
+
+        // Oldest went first; the newest result — what the model is actually
+        // reasoning about — survives intact.
+        assert!(messages[1].content.contains("dropped"));
+        assert_eq!(messages[3].content, big);
+
+        let carried: usize = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.len())
+            .sum();
+        assert!(carried <= 1500, "still over budget: {carried}");
+    }
+
+    #[test]
+    fn trimming_leaves_a_transcript_under_budget_alone() {
+        let mut messages = vec![
+            ChatMessage::tool("a".to_string(), "small".to_string()),
+            ChatMessage::tool("b".to_string(), "also small".to_string()),
+        ];
+        let before = messages.clone();
+        trim_carried_tool_results(&mut messages, 192 * 1024);
+        assert_eq!(messages[0].content, before[0].content);
+        assert_eq!(messages[1].content, before[1].content);
+    }
+
+    /// A `create_alert` proposal with no prior backtest must be refused.
+    ///
+    /// The system prompt asks for a backtest in the strongest terms available
+    /// and a live model still skipped it — then wrote "backtested via
+    /// preview_alert" in its answer without having called it. A threshold
+    /// nobody checked is a guess, so this is enforced rather than requested.
+    #[test]
+    fn create_alert_without_a_backtest_is_refused() {
+        let seen = HashMap::new();
+        let msg = missing_backtest(
+            "alerts create_alert --metric_name http.server.duration --severity critical",
+            &seen,
+        )
+        .expect("must refuse an un-backtested proposal");
+
+        assert!(msg.contains("preview_alert"), "must name the tool: {msg}");
+        assert!(
+            msg.contains("Not staged"),
+            "must be clear nothing was proposed: {msg}"
+        );
+    }
+
+    /// A successful backtest earlier in the turn satisfies the requirement.
+    #[test]
+    fn create_alert_after_a_backtest_is_allowed() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "temps|{\"command\":\"alerts preview_alert --metric_name http.server.duration\"}"
+                .to_string(),
+            "{\"operation\":\"preview_alert\",\"status\":200,\"data\":{\"breach_count\":22}}"
+                .to_string(),
+        );
+        assert!(missing_backtest(
+            "alerts create_alert --metric_name http.server.duration",
+            &seen
+        )
+        .is_none());
+    }
+
+    /// A backtest that errored proves nothing, so it must not unlock the
+    /// proposal — otherwise a single malformed call becomes a way past the gate.
+    #[test]
+    fn a_failed_backtest_does_not_satisfy_the_requirement() {
+        let mut seen = HashMap::new();
+        seen.insert(
+            "temps|{\"command\":\"alerts preview_alert --metric foo\"}".to_string(),
+            "`preview_alert` failed: Unknown parameter(s) for operation 'preview_alert': 'metric'"
+                .to_string(),
+        );
+        assert!(missing_backtest("alerts create_alert --metric_name foo", &seen).is_some());
+    }
+
+    /// Everything else stays unaffected — this gate is about thresholds, not
+    /// write actions in general.
+    #[test]
+    fn other_write_operations_need_no_backtest() {
+        let seen = HashMap::new();
+        for cmd in [
+            "deployments trigger_project_pipeline --environment_id 8",
+            "containers restart_container --id abc",
+            "environments update_environment_settings --replicas 2",
+        ] {
+            assert!(
+                missing_backtest(cmd, &seen).is_none(),
+                "{cmd} must not require a backtest"
+            );
+        }
+    }
 
     #[test]
     fn clean_title_strips_quotes_and_punctuation() {
@@ -1760,14 +2131,13 @@ mod tests {
         );
     }
 
-    // (c) MAX_ROUNDS enforced: a model that always asks for a tool must never
-    // exceed MAX_ROUNDS + 1 calls (the rounds plus one tool-free salvage call),
-    // and never produces a final answer token.
+    // (c) A model stuck repeating itself is stopped by the unproductive-round
+    // detector, long before the runaway backstop — and the user is told why.
     #[tokio::test]
-    async fn test_tool_loop_enforces_max_rounds() {
-        // Empty script: the exhausted fallback always streams a tool call, so the
-        // loop would spin forever without the round cap. The salvage call also gets
-        // a tool call (no prose), so no answer token is ever produced.
+    async fn test_tool_loop_stops_a_stuck_model_quickly() {
+        // Empty script: the exhausted fallback always re-issues the SAME tool
+        // call, so every round after the first is answered by the repeat guard
+        // and produces nothing usable. That is the definition of stuck.
         let ai = Arc::new(ScriptedAi::new(vec![]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1782,13 +2152,64 @@ mod tests {
             .await;
         let out = drain(stream).await;
 
+        // Stopped in a handful of rounds, NOT at the 40-round backstop. The
+        // backstop exists for a loop nobody is watching; a user staring at a
+        // model repeating itself should not wait that long.
+        let calls = chat_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            joined_text(&out).is_empty(),
-            "no final prose should ever materialise; got {out:?}"
+            calls <= 6,
+            "a stuck model must be stopped quickly, took {calls} rounds"
+        );
+
+        // And it must say so. A turn that halts without explanation is
+        // indistinguishable from one that simply gave up.
+        assert!(
+            joined_text(&out).contains("produced only errors"),
+            "the user must be told why it stopped; got {out:?}"
+        );
+    }
+
+    /// The backstop still exists for a model that keeps making *different*
+    /// calls forever — progress that never converges.
+    #[tokio::test]
+    async fn test_tool_loop_backstop_bounds_an_endlessly_productive_model() {
+        // Each round asks for a DIFFERENT tool call, so the repeat guard never
+        // fires and every round looks productive — only the backstop ends it.
+        let rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>> = (0..60)
+            .map(|i| {
+                Ok(vec![ChatStreamDelta::ToolCall(ToolCall {
+                    id: format!("c{i}"),
+                    name: "echo".to_string(),
+                    arguments: format!("{{\"n\":{i}}}"),
+                })])
+            })
+            .collect();
+        let ai = Arc::new(ScriptedAi::new(rounds));
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let chat_count = ai.chat_calls.clone();
+        let (svc, tools) = service_with(ai);
+
+        let conv = test_conversation();
+        let provider_dyn: Arc<dyn ConversationContextProvider> = provider;
+        let stream = svc
+            .try_tool_loop(&conv, vec![], Some(provider_dyn), tools, &test_auth())
+            .await;
+        let out = drain(stream).await;
+
+        let calls = chat_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls <= 41,
+            "must not exceed MAX_ROUNDS (40) + 1 salvage call, took {calls}"
         );
         assert!(
-            chat_count.load(std::sync::atomic::Ordering::SeqCst) <= 11,
-            "calls must not exceed MAX_ROUNDS (10) + 1 salvage call"
+            calls > 6,
+            "a model making genuine progress must not be cut off early, took {calls}"
+        );
+        assert!(
+            joined_text(&out).contains("maximum number of steps"),
+            "the user must be told the turn was cut short; got {out:?}"
         );
     }
 

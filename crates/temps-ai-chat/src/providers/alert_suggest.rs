@@ -9,10 +9,10 @@
 //!
 //! 1. **Look.** Enumerate what the project actually emits (`list_metric_names`)
 //!    and what is already alerted on (`list_alerts`).
-//! 2. **Check.** For each candidate, query real values (`query_metrics`) and,
-//!    for anomaly detectors, backtest with `preview_alert` — so a proposed
+//! 2. **Check.** For each candidate, query real values (`query_metrics`) and
+//!    backtest the exact detector with `preview_alert` — so a proposed
 //!    threshold is grounded in the project's own history rather than a generic
-//!    SRE rule of thumb.
+//!    SRE rule of thumb, and its noisiness is known before anyone is paged.
 //! 3. **Propose.** Stage each rule as a separate `temps_write create_alert`
 //!    action so the human confirms them one at a time.
 //!
@@ -36,15 +36,20 @@ but badly tuned, say so and propose an update instead of a second rule.
 a rule on a metric that is never reported will never fire and is worse than no rule at all.
 3. FOR EACH candidate, ground the threshold in real data. Query the metric's recent values \
 (`temps telemetry query_metrics`) to see its normal range, and check EVERY metric you intend to mention — never \
-claim a metric has no data without having queried it. For an anomaly detector, backtest it by calling \
-`temps alerts preview_alert`, which is read-only and reports how often the rule WOULD have fired over the last \
-week; eyeballing the query output is not a backtest. A rule that would have fired constantly is noise; a rule that \
-would never have fired may be pointless.
-4. FINALLY, propose — by CALLING the `temps_write` tool, once per rule, so the human can accept some and reject \
+claim a metric has no data without having queried it.
+4. THEN BACKTEST IT — every rule, static thresholds included. Call `temps alerts preview_alert` with the exact \
+`detection_config`, `aggregation` and `window_secs` you are about to propose. It is read-only, saves nothing, and \
+returns `breach_count` out of the points it scored: how often this rule WOULD have fired. Eyeballing the query \
+output is NOT a backtest and you must not describe it as one. Never claim a rule was backtested unless you called \
+this tool and read its result. Use what it tells you: a rule that fires on nearly every bucket is noise and the \
+threshold is too tight; one that never fires may be pointless, or the threshold is too loose to ever catch \
+anything. Adjust and re-run until the count is defensible, then propose that configuration.
+5. FINALLY, propose — by CALLING the `temps_write` tool, once per rule, so the human can accept some and reject \
 others. This is a real tool call, not something you write out: printing a `temps_write …` command inside a code \
 block does NOTHING — no rule is proposed, and the user sees a wall of text with no button to accept. If you \
 described a rule in your answer, you must also have called the tool for it. Do NOT propose a rule you could not \
-ground in step 3.
+ground in step 3 and backtest in step 4. For every rule, state the backtest result — how many times it \
+would have fired over the scored window — and if you did not backtest it, say that instead of implying you did.
 
 ## What makes a good proposal
 
@@ -125,5 +130,28 @@ mod tests {
         assert!(seed.system.contains("temps alerts list_alerts"));
         assert!(seed.system.contains("every page"));
         assert_eq!(seed.metadata.unwrap()["project_id"], 7);
+    }
+
+    /// The backtest step must be unconditional.
+    ///
+    /// It used to read "for an anomaly detector, backtest it" — and since every
+    /// rule the model actually proposes is a static threshold, that let it skip
+    /// the step entirely while still writing "backtested" in its answer.
+    /// `preview_alert` now accepts static detectors, so there is no rule it
+    /// cannot check.
+    #[tokio::test]
+    async fn seed_requires_backtesting_every_rule_including_static() {
+        let provider = AlertSuggestChatProvider::new();
+        let seed = provider.seed(7, "7").await.expect("seeds");
+
+        assert!(seed.system.contains("preview_alert"));
+        assert!(
+            seed.system.contains("static thresholds included"),
+            "the instruction must not be scoped to anomaly detectors"
+        );
+        assert!(
+            seed.system.contains("Never claim a rule was backtested"),
+            "a model that skipped the call must not be able to imply it didn't"
+        );
     }
 }
