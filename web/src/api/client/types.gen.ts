@@ -11723,6 +11723,40 @@ export type PreviewGatewaySettingsResponse = {
     image: string;
 };
 
+/**
+ * Request body for minting a preview share link.
+ */
+export type PreviewShareLinkBody = {
+    /**
+     * Path the recipient lands on. Must be same-origin (start with a single
+     * `/`); anything else is replaced with `/` so a share link can never be
+     * turned into an open redirect.
+     */
+    path?: string | null;
+    /**
+     * Port inside the sandbox the preview serves on.
+     */
+    port: number;
+    /**
+     * How long the link stays usable, in seconds. Clamped to 24 hours.
+     * Defaults to one hour — long enough to send to a reviewer, short enough
+     * that a link pasted in a ticket does not stay live indefinitely.
+     */
+    ttl_seconds?: number | null;
+};
+
+export type PreviewShareLinkResponse = {
+    /**
+     * Unix seconds after which the link stops working.
+     */
+    expires_at: number;
+    /**
+     * The full link. Its fragment contains the grant and must be treated as a
+     * credential; URL fragments are not sent to servers or in Referer headers.
+     */
+    url: string;
+};
+
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
@@ -12403,28 +12437,6 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
-};
-
-/**
- * Proxy configuration for email validation
- */
-export type ProxyRequest = {
-    /**
-     * Proxy host
-     */
-    host: string;
-    /**
-     * Optional proxy password
-     */
-    password?: string | null;
-    /**
-     * Proxy port
-     */
-    port: number;
-    /**
-     * Optional proxy username
-     */
-    username?: string | null;
 };
 
 /**
@@ -13596,7 +13608,8 @@ export type SandboxEvent = {
     /**
      * Machine-readable operation (`created`, `stopped`, `resumed`,
      * `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
-     * `preview_password_cleared`, `source_seeded`, `destroyed`).
+     * `preview_password_cleared`, `preview_share_link_created`, `source_seeded`,
+     * `destroyed`).
      */
     event_type: string;
 };
@@ -47153,6 +47166,43 @@ export type PauseSandboxResponses = {
 };
 
 export type PauseSandboxResponse = PauseSandboxResponses[keyof PauseSandboxResponses];
+
+export type SandboxCreatePreviewLinkData = {
+    body: PreviewShareLinkBody;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/preview-link';
+};
+
+export type SandboxCreatePreviewLinkErrors = {
+    /**
+     * Invalid port
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox has no preview password
+     */
+    409: unknown;
+    /**
+     * Preview grant minting failed
+     */
+    500: unknown;
+};
+
+export type SandboxCreatePreviewLinkResponses = {
+    /**
+     * Shareable preview link
+     */
+    200: PreviewShareLinkResponse;
+};
+
+export type SandboxCreatePreviewLinkResponse = SandboxCreatePreviewLinkResponses[keyof SandboxCreatePreviewLinkResponses];
 
 export type ClearPreviewPasswordData = {
     body?: never;

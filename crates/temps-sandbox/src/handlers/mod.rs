@@ -17,10 +17,6 @@ use crate::services::sandbox_service::SandboxService;
 /// the service itself.
 pub struct SandboxAppState {
     pub sandbox_service: Arc<SandboxService>,
-    /// Shared with the proxy, and the reason a minted preview grant verifies
-    /// there. `None` on a deployment that registered no cookie crypto, in
-    /// which case `preview-link` reports 503 rather than pretending.
-    pub cookie_crypto: Option<Arc<temps_core::CookieCrypto>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -187,5 +183,17 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn preview_link_openapi_contract_is_domain_prefixed_and_documents_conflict() {
+        let api = serde_json::to_value(SandboxApiDoc::openapi()).expect("serialize OpenAPI");
+        let operation = &api["paths"]["/v1/sandboxes/{id}/preview-link"]["post"];
+        assert_eq!(
+            operation["operationId"],
+            serde_json::json!("sandbox_create_preview_link")
+        );
+        assert!(operation["responses"].get("409").is_some());
+        assert!(operation["responses"].get("500").is_some());
     }
 }

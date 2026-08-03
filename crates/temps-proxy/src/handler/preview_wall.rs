@@ -60,23 +60,27 @@ pub fn generate_preview_form_html_labeled(
 
 /// Render the auto-submit bridge that exchanges a share link for a cookie.
 ///
-/// A minted `session_grant` arrives as a query parameter on a GET, because a
-/// share link has to be clickable. The grant is only *accepted* on the POST
-/// branch, which is where argon2 verification, the rate limiter and cookie
-/// minting already live — duplicating that on the GET path would mean a second
-/// copy of the security-critical code. So the GET renders this: a form that
-/// carries the grant in a hidden field and submits itself.
+/// A minted `session_grant` arrives in the URL fragment, which browsers never
+/// send in the HTTP request target or Referer. This bridge reads it locally,
+/// removes it from browser history, and submits it to the existing POST branch
+/// where verification, rate limiting, and cookie minting already live.
 ///
 /// The grant is deliberately not placed anywhere the sandbox can read it. It
-/// never leaves this form, and the POST exchanges it for the ordinary preview
-/// cookie.
-pub fn generate_preview_bridge_html(label: &str, next: &str, session_grant: &str) -> String {
+/// never appears in generated markup, and the POST exchanges it for the
+/// ordinary preview cookie.
+pub fn generate_preview_bridge_html(label: &str, next: &str) -> String {
+    let fallback = format!(
+        "{}?next={}",
+        PREVIEW_LOGIN_PATH,
+        url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
+    );
     format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
 <title>Opening preview…</title>
 <style>
   body {{ font: 15px/1.5 system-ui, -apple-system, sans-serif; margin: 0;
@@ -91,20 +95,35 @@ pub fn generate_preview_bridge_html(label: &str, next: &str, session_grant: &str
 <div class="card">
   <p>Opening the preview for {label}…</p>
   <form id="bridge" method="POST" action="{action}">
-    <input type="hidden" name="session_grant" value="{grant}">
+    <input id="session-grant" type="hidden" name="session_grant" value="">
     <input type="hidden" name="next" value="{next}">
-    <noscript><button type="submit">Continue to preview</button></noscript>
   </form>
   <p class="muted">This link signs you in to the preview. It expires.</p>
+  <noscript><p><a href="{fallback}">Use the preview password instead</a></p></noscript>
 </div>
-<script>document.getElementById('bridge').submit();</script>
+<script>
+(() => {{
+  const current = new URL(window.location.href);
+  const grant = new URLSearchParams(current.hash.slice(1)).get('session_grant');
+  current.hash = '';
+  current.searchParams.delete('grant');
+  const cleanUrl = current.pathname + current.search;
+  if (!grant) {{
+    window.location.replace(cleanUrl);
+    return;
+  }}
+  window.history.replaceState(null, '', cleanUrl);
+  document.getElementById('session-grant').value = grant;
+  document.getElementById('bridge').submit();
+}})();
+</script>
 </body>
 </html>
 "#,
         label = html_escape(label),
         action = PREVIEW_LOGIN_PATH,
-        grant = html_escape(session_grant),
         next = html_escape(next),
+        fallback = html_escape(&fallback),
     )
 }
 
@@ -144,11 +163,7 @@ pub fn build_logout_cookie_sandbox(
 /// allow paths that start with `/` and don't start with `//` (which browsers
 /// interpret as a scheme-relative URL to another host).
 pub fn sanitize_next(next: &str) -> String {
-    if next.starts_with('/') && !next.starts_with("//") {
-        next.to_string()
-    } else {
-        "/".to_string()
-    }
+    temps_core::sanitize_preview_next(next)
 }
 
 fn html_escape(s: &str) -> String {
@@ -199,6 +214,12 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_next_rejects_backslash_redirects_and_control_characters() {
+        assert_eq!(sanitize_next("/\\evil.example.com"), "/");
+        assert_eq!(sanitize_next("/safe\r\nLocation: //evil.example.com"), "/");
+    }
+
+    #[test]
     fn sanitize_next_rejects_absolute_url() {
         assert_eq!(sanitize_next("https://evil.example.com"), "/");
         assert_eq!(sanitize_next("javascript:alert(1)"), "/");
@@ -208,6 +229,25 @@ mod tests {
     fn sanitize_next_rejects_relative() {
         assert_eq!(sanitize_next("foo"), "/");
         assert_eq!(sanitize_next(""), "/");
+    }
+
+    #[test]
+    fn bridge_reads_fragment_without_embedding_the_grant() {
+        let html = generate_preview_bridge_html("sandbox sbx_abc", "/pricing");
+        assert!(html.contains("current.hash.slice(1)"));
+        assert!(html.contains("history.replaceState"));
+        assert!(html.contains("name=\"referrer\" content=\"no-referrer\""));
+        assert!(html.contains("name=\"session_grant\" value=\"\""));
+        assert!(html.contains("name=\"next\" value=\"/pricing\""));
+        assert!(!html.contains("session_grant=secret"));
+    }
+
+    #[test]
+    fn bridge_escapes_dynamic_html() {
+        let html = generate_preview_bridge_html("<script>alert(1)</script>", "/?q=\"");
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("value=\"/?q=&quot;\""));
     }
 
     #[test]

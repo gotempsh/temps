@@ -87,6 +87,15 @@ pub enum SandboxError {
     #[error("Failed to hash preview password for sandbox {sandbox_id}: {reason}")]
     PasswordHashFailed { sandbox_id: String, reason: String },
 
+    /// Minting the encrypted preview credential failed. This is an internal
+    /// crypto/clock failure, never a client validation error.
+    #[error("Failed to mint preview grant for sandbox {sandbox_id}: {source}")]
+    PreviewGrantFailed {
+        sandbox_id: String,
+        #[source]
+        source: temps_core::PreviewGrantError,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 

@@ -136,6 +136,11 @@ impl From<SandboxError> for Problem {
                     .with_title("Password Hashing Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::PreviewGrantFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Preview Grant Minting Failed")
+                    .with_detail(error.to_string())
+            }
             SandboxError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(error.to_string()),
@@ -924,7 +929,8 @@ pub async fn list_sandboxes(
 pub struct SandboxEvent {
     /// Machine-readable operation (`created`, `stopped`, `resumed`,
     /// `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
-    /// `preview_password_cleared`, `source_seeded`, `destroyed`).
+    /// `preview_password_cleared`, `preview_share_link_created`, `source_seeded`,
+    /// `destroyed`).
     pub event_type: String,
     /// Optional structured context (shape depends on `event_type`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2331,7 +2337,8 @@ pub struct PreviewShareLinkBody {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PreviewShareLinkResponse {
-    /// The full link, including the grant. Treat it as a credential.
+    /// The full link. Its fragment contains the grant and must be treated as a
+    /// credential; URL fragments are not sent to servers or in Referer headers.
     pub url: String,
     /// Unix seconds after which the link stops working.
     pub expires_at: u64,
@@ -2353,6 +2360,7 @@ pub struct PreviewShareLinkResponse {
 /// there is no per-link revocation short of rotating the preview password.
 #[utoipa::path(
     tag = "Sandboxes",
+    operation_id = "sandbox_create_preview_link",
     post,
     path = "/v1/sandboxes/{id}/preview-link",
     request_body = PreviewShareLinkBody,
@@ -2360,7 +2368,8 @@ pub struct PreviewShareLinkResponse {
         (status = 200, description = "Shareable preview link", body = PreviewShareLinkResponse),
         (status = 400, description = "Invalid port"),
         (status = 404, description = "Sandbox not found"),
-        (status = 400, description = "Preview links are not configured on this server")
+        (status = 409, description = "Sandbox has no preview password"),
+        (status = 500, description = "Preview grant minting failed")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2375,14 +2384,6 @@ pub async fn create_preview_link(
     // gate on `preview-password`.
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
 
-    let Some(crypto) = state.cookie_crypto.as_ref() else {
-        return Err(Problem::from(SandboxError::Validation {
-            message: "preview links are unavailable: this server registered no cookie crypto, \
-                      so a grant cannot be minted"
-                .into(),
-        }));
-    };
-
     let ttl = std::time::Duration::from_secs(body.ttl_seconds.unwrap_or(60 * 60));
     let (url, expires_at) = state
         .sandbox_service
@@ -2392,7 +2393,6 @@ pub async fn create_preview_link(
             body.port,
             body.path.as_deref().unwrap_or("/"),
             ttl,
-            crypto,
         )
         .await?;
 
