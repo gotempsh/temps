@@ -62,6 +62,7 @@ jobs:
           - python/fastapi
           - python/flask
           - ruby/rails
+          - rust/actix
           - sveltekit
           - swift/vapor
           - vite/react
@@ -102,19 +103,17 @@ jobs:
           cargo test -p temps-presets --test starters -- --ignored --nocapture
 
   known-failing:
-    # These two do not pass yet. They run anyway, and always report success, so
-    # the failure stays visible in the log without blocking a merge — a red
-    # required check that everyone learns to ignore is worse than no check.
+    # java/spring-boot does not pass yet. It runs anyway and always reports
+    # success, so the failure stays visible in the log without blocking a merge
+    # — a red required check that everyone learns to ignore is worse than no
+    # check at all.
     #
-    #   java/spring-boot  Spring deduces a REACTIVE application type from a
-    #                     classpath that only has spring-boot-starter-web, then
-    #                     fails for want of a ReactiveWebServerFactory. The boot
-    #                     jar is selected correctly and the app does start.
-    #   rust/actix        Ignores SIGTERM: `docker stop` waits the full grace
-    #                     period and SIGKILLs. Actix's default graceful-shutdown
-    #                     timeout outlives the stop timeout.
+    # Spring deduces a REACTIVE application type from a classpath that only has
+    # spring-boot-starter-web, then fails for want of a ReactiveWebServerFactory.
+    # The boot jar is selected correctly (the `-plain.jar` exclusion works) and
+    # the application does start, so this is not jar selection. Not root-caused.
     #
-    # Tracked in the autopack repository; remove an entry here when it is fixed.
+    # Tracked in the autopack repository; remove this job when it is fixed.
     name: known-failing (report only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -145,7 +144,7 @@ jobs:
         continue-on-error: true
         env:
           TEMPS_EXAMPLES_DIR: ${{ github.workspace }}/temps-examples/examples/starters
-          TEMPS_STARTERS_ONLY: java/spring-boot,rust/actix
+          TEMPS_STARTERS_ONLY: java/spring-boot
           DOCKER_BUILDKIT: '1'
         run: |
           cargo test -p temps-presets --test starters -- --ignored --nocapture
