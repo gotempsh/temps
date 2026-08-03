@@ -249,7 +249,10 @@ impl TempsPlugin for SandboxPlugin {
         // warn! in `register_services` is the operator-facing signal.
         let sandbox_service = context.get_service::<SandboxService>()?;
 
-        let app_state = Arc::new(SandboxAppState { sandbox_service });
+        let app_state = Arc::new(SandboxAppState {
+            sandbox_service,
+            cookie_crypto: context.get_service::<temps_core::CookieCrypto>(),
+        });
         let router = configure_routes().with_state(app_state);
         Some(PluginRoutes::new(router))
     }

@@ -2310,6 +2310,95 @@ pub async fn clear_preview_password(
 
 // ── Routing ─────────────────────────────────────────────────────────────────
 
+// ── Shareable preview link ──────────────────────────────────────────────────
+
+/// Request body for minting a preview share link.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PreviewShareLinkBody {
+    /// Port inside the sandbox the preview serves on.
+    pub port: u16,
+    /// Path the recipient lands on. Must be same-origin (start with a single
+    /// `/`); anything else is replaced with `/` so a share link can never be
+    /// turned into an open redirect.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// How long the link stays usable, in seconds. Clamped to 24 hours.
+    /// Defaults to one hour — long enough to send to a reviewer, short enough
+    /// that a link pasted in a ticket does not stay live indefinitely.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PreviewShareLinkResponse {
+    /// The full link, including the grant. Treat it as a credential.
+    pub url: String,
+    /// Unix seconds after which the link stops working.
+    pub expires_at: u64,
+}
+
+/// Mint a shareable link to a sandbox preview.
+///
+/// `GET /domain` returns the bare preview URL, which is useless to anyone who
+/// does not already hold the sandbox's preview password — so sharing a
+/// protected preview meant sharing that password, which is the same secret for
+/// every recipient and can only be withdrawn by rotating it for all of them.
+///
+/// This returns the same URL carrying a short-lived, sandbox-scoped grant. The
+/// recipient's browser exchanges it for the ordinary preview cookie and lands
+/// on `path`. The grant never reaches the sandbox, so preview application code
+/// cannot read it and re-share it.
+///
+/// Anyone holding the returned URL can view the preview until it expires;
+/// there is no per-link revocation short of rotating the preview password.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/v1/sandboxes/{id}/preview-link",
+    request_body = PreviewShareLinkBody,
+    responses(
+        (status = 200, description = "Shareable preview link", body = PreviewShareLinkResponse),
+        (status = 400, description = "Invalid port"),
+        (status = 404, description = "Sandbox not found"),
+        (status = 400, description = "Preview links are not configured on this server")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_preview_link(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PreviewShareLinkBody>,
+) -> Result<impl IntoResponse, Problem> {
+    // Write, not read: this mints a credential that grants someone else access,
+    // which is a stronger act than reading the sandbox yourself. Matches the
+    // gate on `preview-password`.
+    sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+
+    let Some(crypto) = state.cookie_crypto.as_ref() else {
+        return Err(Problem::from(SandboxError::Validation {
+            message: "preview links are unavailable: this server registered no cookie crypto, \
+                      so a grant cannot be minted"
+                .into(),
+        }));
+    };
+
+    let ttl = std::time::Duration::from_secs(body.ttl_seconds.unwrap_or(60 * 60));
+    let (url, expires_at) = state
+        .sandbox_service
+        .preview_share_link(
+            &id,
+            auth.user_id(),
+            body.port,
+            body.path.as_deref().unwrap_or("/"),
+            ttl,
+            crypto,
+        )
+        .await?;
+
+    Ok(Json(PreviewShareLinkResponse { url, expires_at }))
+}
+
 pub fn routes() -> Router<Arc<SandboxAppState>> {
     Router::new()
         .route("/v1/sandboxes", post(create_sandbox).get(list_sandboxes))
@@ -2362,6 +2451,7 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             "/v1/sandboxes/{id}/preview-password",
             put(set_preview_password).delete(clear_preview_password),
         )
+        .route("/v1/sandboxes/{id}/preview-link", post(create_preview_link))
 }
 
 #[cfg(test)]

@@ -58,6 +58,56 @@ pub fn generate_preview_form_html_labeled(
         )
 }
 
+/// Render the auto-submit bridge that exchanges a share link for a cookie.
+///
+/// A minted `session_grant` arrives as a query parameter on a GET, because a
+/// share link has to be clickable. The grant is only *accepted* on the POST
+/// branch, which is where argon2 verification, the rate limiter and cookie
+/// minting already live — duplicating that on the GET path would mean a second
+/// copy of the security-critical code. So the GET renders this: a form that
+/// carries the grant in a hidden field and submits itself.
+///
+/// The grant is deliberately not placed anywhere the sandbox can read it. It
+/// never leaves this form, and the POST exchanges it for the ordinary preview
+/// cookie.
+pub fn generate_preview_bridge_html(label: &str, next: &str, session_grant: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<title>Opening preview…</title>
+<style>
+  body {{ font: 15px/1.5 system-ui, -apple-system, sans-serif; margin: 0;
+         min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; color: #1f2328; background: #f6f8fa; }}
+  .card {{ text-align: center; padding: 2rem 2.5rem; }}
+  p {{ margin: 0 0 1rem; }}
+  .muted {{ color: #656d76; font-size: 13px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <p>Opening the preview for {label}…</p>
+  <form id="bridge" method="POST" action="{action}">
+    <input type="hidden" name="session_grant" value="{grant}">
+    <input type="hidden" name="next" value="{next}">
+    <noscript><button type="submit">Continue to preview</button></noscript>
+  </form>
+  <p class="muted">This link signs you in to the preview. It expires.</p>
+</div>
+<script>document.getElementById('bridge').submit();</script>
+</body>
+</html>
+"#,
+        label = html_escape(label),
+        action = PREVIEW_LOGIN_PATH,
+        grant = html_escape(session_grant),
+        next = html_escape(next),
+    )
+}
+
 /// Build an expired Set-Cookie header for a standalone sandbox logout.
 /// Matches the scope of the live cookie so the browser actually drops it.
 /// `secure` must match the scheme used when the live cookie was set.

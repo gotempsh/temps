@@ -17,6 +17,10 @@ use crate::services::sandbox_service::SandboxService;
 /// the service itself.
 pub struct SandboxAppState {
     pub sandbox_service: Arc<SandboxService>,
+    /// Shared with the proxy, and the reason a minted preview grant verifies
+    /// there. `None` on a deployment that registered no cookie crypto, in
+    /// which case `preview-link` reports 503 rather than pretending.
+    pub cookie_crypto: Option<Arc<temps_core::CookieCrypto>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -58,6 +62,7 @@ pub struct SandboxAppState {
         sandboxes::mkdir,
         sandboxes::domain,
         sandboxes::set_preview_password,
+        sandboxes::create_preview_link,
         sandboxes::clear_preview_password,
         sandboxes::resize_sandbox,
         sandboxes::list_events,
@@ -89,6 +94,8 @@ pub struct SandboxAppState {
         sandboxes::StatResponse,
         sandboxes::SandboxDomainResponse,
         sandboxes::SetPreviewPasswordBody,
+        sandboxes::PreviewShareLinkBody,
+        sandboxes::PreviewShareLinkResponse,
         sandboxes::SetPreviewPasswordResponse,
         sandboxes::ResizeSandboxBody,
         sandboxes::SandboxEvent,
@@ -150,6 +157,7 @@ mod tests {
             "/v1/sandboxes/{id}/fs/mkdir",
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
+            "/v1/sandboxes/{id}/preview-link",
             "/v1/sandboxes/{id}/events",
             "/v1/sandboxes/{id}/resize",
             "/v1/sandboxes/rootfs",

@@ -43,13 +43,14 @@ pub const PREVIEW_COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Owner unlock bridges remain idempotent outside this window.
 pub const PREVIEW_COOKIE_REFRESH_WINDOW: Duration = Duration::from_secs(60 * 60);
 
-/// Lifetime of a scoped handoff minted by an authenticated control-plane
-/// route. This is only long enough to cross an auto-submit bridge; it
-/// is never forwarded to the sandbox and is exchanged for the normal preview
-/// cookie immediately.
-pub const PREVIEW_SESSION_GRANT_TTL: Duration = Duration::from_secs(60);
-
-const PREVIEW_SESSION_GRANT_VERSION: &str = "preview-session-v1";
+/// Preview session grants are defined in `temps-core` so the sandbox API can
+/// mint what this module verifies without either crate depending on the other.
+/// Re-exported here because callers have always reached for them via
+/// `preview_auth`.
+pub use temps_core::{
+    encode_preview_session_grant, verify_preview_session_grant, PREVIEW_SESSION_GRANT_MAX_TTL,
+    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+};
 
 /// The local TCP address where the preview gateway listens. Pingora forwards
 /// authenticated preview requests to this peer.
@@ -218,37 +219,6 @@ pub fn preview_cookie_remaining_ttl(
         return None;
     };
     exp.checked_sub(now_secs.as_secs()).map(Duration::from_secs)
-}
-
-/// Validate a short-lived platform-session handoff for one sandbox.
-///
-/// The API and proxy share `CookieCrypto`, so an authenticated API route can
-/// mint an AES-GCM authenticated payload without making the host-only Temps
-/// session cookie available to preview application code. The version prefix
-/// keeps grants domain-separated from every other encrypted cookie payload.
-pub fn verify_preview_session_grant(
-    crypto: &CookieCrypto,
-    grant: &str,
-    subject: &str,
-    now: SystemTime,
-) -> bool {
-    let Ok(plain) = crypto.decrypt(grant) else {
-        return false;
-    };
-    let mut parts = plain.split('|');
-    if parts.next() != Some(PREVIEW_SESSION_GRANT_VERSION) || parts.next() != Some(subject) {
-        return false;
-    }
-    let Some(exp) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    let Ok(now_secs) = now.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    now_secs.as_secs() <= exp
 }
 
 /// Combine every HTTP Cookie header field into the equivalent cookie-pair

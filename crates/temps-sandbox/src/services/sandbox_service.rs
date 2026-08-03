@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use sea_orm::{
@@ -1538,6 +1538,66 @@ TEMPS_ASKPASS_EOF\n\
         let _ = self.resolve_id(public_id_value, user_id).await?;
         let parts = self.preview_parts().await;
         Ok(parts.url_for(public_id_value, port))
+    }
+
+    /// Build a shareable preview link that carries its own authorization.
+    ///
+    /// `domain()` returns the bare preview URL, which is useless to anyone who
+    /// does not already hold the preview password — so sharing a protected
+    /// preview meant sharing the password itself, which then cannot be revoked
+    /// for one recipient. This returns that URL plus a minted `session_grant`
+    /// aimed at the login bridge: the recipient's browser exchanges it for the
+    /// ordinary preview cookie and lands on `path`.
+    ///
+    /// The grant is scoped to this one sandbox, expires, and is never
+    /// forwarded to the sandbox itself.
+    pub async fn preview_share_link(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        port: u16,
+        path: &str,
+        ttl: Duration,
+        crypto: &temps_core::CookieCrypto,
+    ) -> Result<(String, u64), SandboxError> {
+        if port == 0 {
+            return Err(SandboxError::Validation {
+                message: "port must be between 1 and 65535".into(),
+            });
+        }
+        let _ = self.resolve_id(public_id_value, user_id).await?;
+
+        let now = SystemTime::now();
+        let grant = temps_core::encode_preview_session_grant(crypto, public_id_value, ttl, now)
+            .ok_or_else(|| SandboxError::Validation {
+                message: "could not mint a preview grant for this sandbox".into(),
+            })?;
+        let granted_ttl = ttl.min(temps_core::PREVIEW_SESSION_GRANT_MAX_TTL);
+
+        // Same-origin paths only. The bridge feeds `next` into a redirect, so
+        // anything else would turn a share link into an open redirect.
+        let next = if path.starts_with('/') && !path.starts_with("//") {
+            path
+        } else {
+            "/"
+        };
+
+        let base = self.preview_parts().await.url_for(public_id_value, port);
+        let url = format!(
+            "{}/__temps/preview/login?session_grant={}&next={}",
+            base.trim_end_matches('/'),
+            // `url` is already a dependency; the grant is AES-GCM ciphertext in
+            // base64, which contains `+` and `/` and must not reach the proxy
+            // re-decoded as a space or a path separator.
+            url::form_urlencoded::byte_serialize(grant.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>(),
+        );
+        let expires_at = now
+            .checked_add(granted_ttl)
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        Ok((url, expires_at))
     }
 }
 

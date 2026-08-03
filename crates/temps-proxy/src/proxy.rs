@@ -19,7 +19,8 @@
 
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
-    generate_preview_form_html_labeled, sanitize_next, PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
+    generate_preview_bridge_html, generate_preview_form_html_labeled, sanitize_next,
+    PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
@@ -3164,8 +3165,29 @@ impl ProxyHttp for LoadBalancer {
                         .unwrap_or_else(|| "/".to_string());
                     let next = sanitize_next(&next_raw);
                     let label = format!("sandbox sbx_{}", hex);
-                    let html =
-                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false);
+
+                    // A share link carries a minted `session_grant`. Only the
+                    // POST branch accepts one — that is where verification,
+                    // the rate limiter and cookie minting already live — so
+                    // hand the visitor a form that submits itself rather than
+                    // asking for a password they were never given. Nothing is
+                    // trusted here: an invalid or expired grant simply fails
+                    // that POST and falls back to the password wall.
+                    let session_grant = ctx
+                        .query_string
+                        .as_deref()
+                        .and_then(|qs| {
+                            url::form_urlencoded::parse(qs.as_bytes())
+                                .find(|(k, _)| k == "session_grant")
+                                .map(|(_, v)| v.into_owned())
+                        })
+                        .unwrap_or_default();
+
+                    let html = if session_grant.is_empty() {
+                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false)
+                    } else {
+                        generate_preview_bridge_html(&label, &next, &session_grant)
+                    };
                     let html_bytes = Bytes::from(html);
                     let mut response = ResponseHeader::build(StatusCode::OK, None)?;
                     response.insert_header("Content-Type", "text/html; charset=utf-8")?;
