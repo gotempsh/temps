@@ -30,8 +30,13 @@ export function AiChat() {
     close()
   }, [close])
 
+  // Fill the content area exactly. The shell already bounds this page (a
+  // `dvh`-tall column whose content slot is whatever is left under the header
+  // and any banners), so `h-full` tracks that remaining height. Guessing it with
+  // viewport math instead overflowed by the banner and container-padding heights
+  // and pushed the composer below the fold.
   return (
-    <div className="flex-1 min-h-0 h-[calc(100dvh-var(--header-height,3.5rem))]">
+    <div className="h-full min-h-0">
       {/* `initialContext` is set when the user expands a dock conversation to
           full screen, so this lands on that same thread; it is undefined on a
           direct visit, which opens on the chat list. */}

@@ -105,7 +105,7 @@ docker run -d \
 ### Run the Server
 
 ```bash
-cargo run -- serve --database-url "postgresql://temps:temps@localhost:5432/temps"
+cargo run --bin temps -- serve --database-url "postgresql://temps:temps@localhost:5432/temps"
 ```
 
 ### Pre-commit Hooks

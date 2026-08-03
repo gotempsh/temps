@@ -56,17 +56,17 @@ pub struct UpsertAgentRequest {
 
 /// Generate a short non-secret webhook ID (8 bytes = 16 hex chars) for the URL path.
 fn generate_webhook_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
 /// Generate a cryptographically random webhook token (32 bytes = 64 hex chars) for header auth.
 fn generate_webhook_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 

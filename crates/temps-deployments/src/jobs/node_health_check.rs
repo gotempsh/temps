@@ -527,6 +527,7 @@ mod tests {
 
     fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id,
             name: name.to_string(),
             token_hash: "hash".to_string(),

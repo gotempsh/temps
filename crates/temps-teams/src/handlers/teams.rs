@@ -38,8 +38,8 @@ impl AuditOperation for TeamCreatedAudit {
     fn operation_type(&self) -> String {
         "TEAM_CREATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -64,8 +64,8 @@ impl AuditOperation for TeamUpdatedAudit {
     fn operation_type(&self) -> String {
         "TEAM_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -90,8 +90,8 @@ impl AuditOperation for TeamDeletedAudit {
     fn operation_type(&self) -> String {
         "TEAM_DELETED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -118,8 +118,8 @@ impl AuditOperation for TeamMemberAddedAudit {
     fn operation_type(&self) -> String {
         "TEAM_MEMBER_ADDED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -145,8 +145,8 @@ impl AuditOperation for TeamMemberRemovedAudit {
     fn operation_type(&self) -> String {
         "TEAM_MEMBER_REMOVED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -173,8 +173,8 @@ impl AuditOperation for TeamMemberRoleUpdatedAudit {
     fn operation_type(&self) -> String {
         "TEAM_MEMBER_ROLE_UPDATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()

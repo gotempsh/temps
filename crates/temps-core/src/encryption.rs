@@ -9,7 +9,6 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -129,17 +128,19 @@ impl EncryptionService {
     }
 
     /// Generates a random encryption key as base64 string
-    pub fn generate_key() -> String {
+    pub fn generate_key() -> Result<String> {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-        BASE64.encode(key)
+        crate::ecies::fill_secure_random_bytes("generating a base64 encryption key", &mut key)
+            .map_err(|error| anyhow!(error))?;
+        Ok(BASE64.encode(key))
     }
 
     /// Generates a random 32-byte key as hex string (for direct use with new())
-    pub fn generate_raw_key() -> String {
+    pub fn generate_raw_key() -> Result<String> {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-        bytes_to_hex(&key)
+        crate::ecies::fill_secure_random_bytes("generating a hexadecimal encryption key", &mut key)
+            .map_err(|error| anyhow!(error))?;
+        Ok(bytes_to_hex(&key))
     }
 }
 
@@ -320,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_generate_key_is_valid_base64() {
-        let key_str = EncryptionService::generate_key();
+        let key_str = EncryptionService::generate_key().unwrap();
         let decoded = BASE64.decode(&key_str);
         assert!(decoded.is_ok());
         assert_eq!(decoded.unwrap().len(), 32);
@@ -328,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_generate_raw_key_is_64_chars() {
-        let key_str = EncryptionService::generate_raw_key();
+        let key_str = EncryptionService::generate_raw_key().unwrap();
         assert_eq!(key_str.len(), 64); // 32 bytes * 2 hex chars each
 
         // Should be able to create service with generated key
@@ -338,12 +339,12 @@ mod tests {
 
     #[test]
     fn test_generated_keys_are_different() {
-        let key1 = EncryptionService::generate_key();
-        let key2 = EncryptionService::generate_key();
+        let key1 = EncryptionService::generate_key().unwrap();
+        let key2 = EncryptionService::generate_key().unwrap();
         assert_ne!(key1, key2);
 
-        let raw_key1 = EncryptionService::generate_raw_key();
-        let raw_key2 = EncryptionService::generate_raw_key();
+        let raw_key1 = EncryptionService::generate_raw_key().unwrap();
+        let raw_key2 = EncryptionService::generate_raw_key().unwrap();
         assert_ne!(raw_key1, raw_key2);
         assert_eq!(raw_key1.len(), 64); // Verify hex encoding produces 64 chars
         assert_eq!(raw_key2.len(), 64);

@@ -68,6 +68,15 @@ delete table inet {table}
 add table inet {table}
 
 add chain inet {table} forward {{ type filter hook forward priority -100; policy accept; }}
+# Cloud-metadata endpoints hand out instance credentials to any local
+# caller; containers must never reach them. These sit BEFORE the bridge
+# accept rules (this chain runs at priority -100, ahead of Docker's own
+# chains, so a later iptables rule could not catch this traffic).
+# 169.254/16 = AWS/GCP/Azure/Hetzner/DO/Tencent; 100.100.100.200 = Alibaba.
+add rule inet {table} forward ip daddr 169.254.0.0/16 counter reject
+add rule inet {table} forward ip daddr 100.100.100.200 counter reject
+add rule inet {table} forward ip6 daddr fd00:ec2::254 counter reject
+add rule inet {table} forward ip6 daddr fd20:ce::254 counter reject
 add rule inet {table} forward iifname \"{bridge}\" accept
 add rule inet {table} forward oifname \"{bridge}\" accept
 
@@ -134,5 +143,40 @@ mod tests {
         assert!(s.contains("172.20.5.0/24"));
         assert!(s.contains("masquerade"));
         assert!(s.contains("delete table inet temps_network"));
+    }
+
+    #[test]
+    fn baseline_script_blocks_metadata_before_bridge_accept() {
+        let cfg = NetworkConfig::default();
+        let alloc = NodeAlloc {
+            node_id: Uuid::nil(),
+            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
+            bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
+            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        };
+        let s = render_baseline(&cfg, &alloc);
+        let aws_block = s
+            .find("ip daddr 169.254.0.0/16 counter reject")
+            .expect("link-local cloud metadata reject rule present");
+        let alibaba_block = s
+            .find("ip daddr 100.100.100.200 counter reject")
+            .expect("Alibaba metadata reject rule present");
+        let aws_ipv6_block = s
+            .find("ip6 daddr fd00:ec2::254 counter reject")
+            .expect("AWS IPv6 metadata reject rule present");
+        let google_ipv6_block = s
+            .find("ip6 daddr fd20:ce::254 counter reject")
+            .expect("Google IPv6 metadata reject rule present");
+        let bridge_accept = s
+            .find("forward iifname \"br-temps0\" accept")
+            .expect("bridge accept rule present");
+        assert!(
+            aws_block < bridge_accept
+                && alibaba_block < bridge_accept
+                && aws_ipv6_block < bridge_accept
+                && google_ipv6_block < bridge_accept,
+            "metadata rejects must precede the bridge accept rule, \
+             or accepted traffic would never reach them"
+        );
     }
 }

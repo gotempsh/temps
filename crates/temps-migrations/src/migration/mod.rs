@@ -164,7 +164,9 @@ mod m20260723_000001_add_error_source_root_to_projects;
 mod m20260724_000001_add_run_config_to_agent_runs;
 mod m20260725_000001_sandboxes_agent_run_link;
 mod m20260728_000001_add_environment_id_to_metric_alert_rules;
+mod m20260730_000001_add_architecture_to_nodes;
 mod m20260730_000001_create_teams_rbac;
+mod m20260802_000001_add_environment_force_https;
 
 pub struct Migrator;
 
@@ -336,7 +338,9 @@ impl MigratorTrait for Migrator {
             Box::new(
                 m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
             ),
+            Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
             Box::new(m20260730_000001_create_teams_rbac::Migration),
+            Box::new(m20260802_000001_add_environment_force_https::Migration),
         ]
     }
 }

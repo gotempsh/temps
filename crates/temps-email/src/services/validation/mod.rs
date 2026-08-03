@@ -24,7 +24,7 @@ use tracing::{debug, info};
 use crate::errors::EmailError;
 
 /// SOCKS5 proxy configuration for routing SMTP probes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub host: String,
     pub port: u16,
@@ -32,10 +32,22 @@ pub struct ProxyConfig {
     pub password: Option<String>,
 }
 
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
 /// Configuration for the validation service.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationConfig {
-    /// SOCKS5 proxy applied to every probe (per-request proxy overrides it).
+    /// Operator-configured SOCKS5 proxy applied to every probe.
     pub proxy: Option<ProxyConfig>,
     /// Envelope sender used in `MAIL FROM` during SMTP probing.
     pub from_email: Option<String>,
@@ -47,8 +59,6 @@ pub struct ValidationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidateEmailRequest {
     pub email: String,
-    /// Optional per-request SOCKS5 proxy (overrides the service default).
-    pub proxy: Option<ProxyConfig>,
 }
 
 /// Overall deliverability verdict.
@@ -220,7 +230,6 @@ impl ValidationService {
         }
 
         // ── Stage 4: SMTP probe ─────────────────────────────────────────
-        let proxy = request.proxy.as_ref().or(self.config.proxy.as_ref());
         let from_email = self
             .config
             .from_email
@@ -234,7 +243,8 @@ impl ValidationService {
             from_email,
             hello_name,
             timeout: Duration::from_secs(10),
-            proxy,
+            deadline: Duration::from_secs(30),
+            proxy: self.config.proxy.as_ref(),
         })
         .await;
 
@@ -270,10 +280,7 @@ impl ValidationService {
     ) -> Result<Vec<ValidateEmailResponse>, EmailError> {
         let mut results = Vec::with_capacity(emails.len());
         for email in emails {
-            results.push(
-                self.validate(ValidateEmailRequest { email, proxy: None })
-                    .await?,
-            );
+            results.push(self.validate(ValidateEmailRequest { email }).await?);
         }
         Ok(results)
     }
@@ -401,7 +408,6 @@ mod tests {
         let resp = service
             .validate(ValidateEmailRequest {
                 email: "not-an-email".to_string(),
-                proxy: None,
             })
             .await
             .unwrap();
@@ -420,7 +426,6 @@ mod tests {
         let resp = service
             .validate(ValidateEmailRequest {
                 email: "alice@nonexistent-temps-test.invalid".to_string(),
-                proxy: None,
             })
             .await
             .unwrap();
@@ -436,5 +441,19 @@ mod tests {
     fn test_config_default() {
         let c = ValidationConfig::default();
         assert!(c.proxy.is_none() && c.from_email.is_none() && c.hello_name.is_none());
+    }
+
+    #[test]
+    fn test_proxy_config_debug_redacts_password() {
+        let proxy = ProxyConfig {
+            host: "proxy.example.com".to_string(),
+            port: 1080,
+            username: Some("smtp-user".to_string()),
+            password: Some("super-secret-password".to_string()),
+        };
+
+        let debug = format!("{proxy:?}");
+        assert!(!debug.contains("super-secret-password"));
+        assert!(debug.contains("***"));
     }
 }

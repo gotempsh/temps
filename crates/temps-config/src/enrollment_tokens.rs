@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
     DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Statement,
@@ -90,8 +90,8 @@ impl EnrollmentTokenService {
         // `!Send` `ThreadRng` is dropped before any `.await` — otherwise the
         // returned future is not `Send` and can't be used in an axum handler.
         let plaintext = {
-            let mut rng = rand::thread_rng();
-            let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+            let mut rng = rand::rng();
+            let bytes: Vec<u8> = (0..32).map(|_| rng.random::<u8>()).collect();
             hex::encode(&bytes)
         };
         let token_hash = Self::hash(&plaintext);

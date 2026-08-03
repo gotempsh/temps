@@ -12,7 +12,7 @@ use aws_sdk_s3::Client;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -237,11 +237,11 @@ fn default_host() -> String {
 
 fn default_access_key() -> String {
     // AWS Access Key format: AKIA + 16 uppercase alphanumeric characters = 20 chars total
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let random_part: String = (0..16)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect();
     format!("AKIA{}", random_part)
@@ -249,11 +249,11 @@ fn default_access_key() -> String {
 
 fn default_secret_key() -> String {
     // AWS Secret Key format: 40 characters of base64-like characters (alphanumeric + / +)
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..40)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect()
 }
@@ -305,6 +305,51 @@ pub struct RustfsService {
     encryption_service: Arc<EncryptionService>,
 }
 
+/// Host ports to adopt from an already-running container, if any.
+///
+/// Split out of [`RustfsService::running_container_ports`] so the decision can
+/// be tested without a Docker daemon. Returns `Some((api, console))` only when
+/// the container is running the exact image we're about to ask for — anything
+/// else means `create_container` recreates it and the caller's freshly probed
+/// ports are the right ones.
+fn adopted_ports_from_inspect(
+    info: &bollard::models::ContainerInspectResponse,
+    docker_image: &str,
+) -> Option<(String, String)> {
+    let running = info
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .is_some_and(|status| status == bollard::models::ContainerStateStatusEnum::RUNNING);
+    if !running {
+        return None;
+    }
+
+    // Same image check as `create_container` — a mismatch means the container
+    // is about to be replaced, ports and all.
+    let image_matches = info
+        .config
+        .as_ref()
+        .and_then(|config| config.image.as_deref())
+        .is_some_and(|image| image == docker_image);
+    if !image_matches {
+        return None;
+    }
+
+    let ports = info.network_settings.as_ref()?.ports.as_ref()?;
+    let host_port = |internal: &str| -> Option<String> {
+        ports
+            .get(internal)?
+            .as_ref()?
+            .first()?
+            .host_port
+            .clone()
+            .filter(|port| !port.is_empty())
+    };
+
+    Some((host_port("9000/tcp")?, host_port("9001/tcp")?))
+}
+
 impl RustfsService {
     /// MinIO Client (mc) utility image - used for backup/restore operations via mc mirror
     const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
@@ -324,8 +369,39 @@ impl RustfsService {
         }
     }
 
-    fn get_container_name(&self) -> String {
+    /// The Docker container this instance owns.
+    ///
+    /// Public so callers that need to reason about the container — the blob
+    /// plugin checking for a duplicate left by the pre-#495 naming split, for
+    /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
+    pub fn get_container_name(&self) -> String {
         format!("rustfs-{}", self.name)
+    }
+
+    /// Host ports this service's container already publishes, when it is
+    /// running the image we're about to ask for.
+    ///
+    /// `RustfsConfig::from_input_async` probes each configured port and
+    /// relocates off anything already bound. On the second and every later
+    /// `init()` — re-enabling a running service, or the blob plugin loading
+    /// its config on boot — the process holding those ports *is this
+    /// service's own container*, so the probe hands back a free port nothing
+    /// is listening on. `create_container` then sees a healthy container on
+    /// the right image and returns early without applying the new ports, and
+    /// the S3 client below gets built against a dead endpoint: every blob
+    /// request fails with a dispatch error while the container sits there
+    /// healthy.
+    ///
+    /// Returns `None` when the container is absent, stopped, or on a
+    /// different image — all cases where `create_container` recreates it and
+    /// the freshly probed ports are the correct ones to use.
+    async fn running_container_ports(&self, docker_image: &str) -> Option<(String, String)> {
+        let info = self
+            .docker
+            .inspect_container(&self.get_container_name(), None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        adopted_ports_from_inspect(&info, docker_image)
     }
 
     /// Pull the MinIO Client (mc) image used for backup/restore operations
@@ -903,7 +979,30 @@ impl ExternalService for RustfsService {
             .context("Failed to parse RustFS configuration")?;
 
         // Convert to runtime config using async Docker-aware port finding
-        let runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
+        let mut runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
+
+        // If our container is already up on this image, it owns its ports and
+        // `create_container` below will leave it alone — so the freshly probed
+        // ports above are fiction. Adopt what the container actually
+        // publishes. See `running_container_ports`.
+        if let Some((api_port, console_port)) = self
+            .running_container_ports(&runtime_config.docker_image)
+            .await
+        {
+            if api_port != runtime_config.port || console_port != runtime_config.console_port {
+                info!(
+                    "Adopting ports {}/{} already published by running container {} \
+                     (probe suggested {}/{})",
+                    api_port,
+                    console_port,
+                    self.get_container_name(),
+                    runtime_config.port,
+                    runtime_config.console_port
+                );
+            }
+            runtime_config.port = api_port;
+            runtime_config.console_port = console_port;
+        }
 
         // Create container
         self.create_container(&self.docker, &runtime_config, &resource_limits)
@@ -2054,6 +2153,113 @@ fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+
+    fn inspect_response(
+        status: bollard::models::ContainerStateStatusEnum,
+        image: &str,
+        ports: Vec<(&str, Option<&str>)>,
+    ) -> bollard::models::ContainerInspectResponse {
+        let port_map = ports
+            .into_iter()
+            .map(|(internal, host_port)| {
+                let bindings = host_port.map(|port| {
+                    vec![bollard::models::PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: Some(port.to_string()),
+                    }]
+                });
+                (internal.to_string(), bindings)
+            })
+            .collect();
+
+        bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                status: Some(status),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                image: Some(image.to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(port_map),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn running_on(ports: Vec<(&str, Option<&str>)>) -> bollard::models::ContainerInspectResponse {
+        inspect_response(
+            bollard::models::ContainerStateStatusEnum::RUNNING,
+            TEST_IMAGE,
+            ports,
+        )
+    }
+
+    /// The regression behind the "dispatch failure" on every blob request.
+    ///
+    /// On any `init()` after the first, `from_input_async` probes the
+    /// persisted port, finds it bound — by this service's *own* container —
+    /// and relocates. `create_container` then sees a healthy container on the
+    /// right image and returns without applying the move, so the S3 client
+    /// ends up pointed at a port nothing serves. Adopting the ports the
+    /// container actually publishes is what keeps the two in agreement.
+    #[test]
+    fn adopts_ports_published_by_the_running_container() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, TEST_IMAGE),
+            Some(("9000".to_string(), "9002".to_string())),
+            "must return the container's real published ports, not a re-probed guess"
+        );
+    }
+
+    /// A stopped container is about to be removed and recreated by
+    /// `create_container`, so its old bindings must not be adopted.
+    #[test]
+    fn ignores_a_stopped_container() {
+        let info = inspect_response(
+            bollard::models::ContainerStateStatusEnum::EXITED,
+            TEST_IMAGE,
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))],
+        );
+
+        assert_eq!(adopted_ports_from_inspect(&info, TEST_IMAGE), None);
+    }
+
+    /// An image change also forces a recreate, which re-binds the ports —
+    /// adopting the outgoing container's would pin the new one to stale values.
+    #[test]
+    fn ignores_a_container_running_a_different_image() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, "rustfs/rustfs:1.0.0-alpha.99"),
+            None
+        );
+    }
+
+    /// Partially-published containers must not yield a half-adopted config:
+    /// a missing console binding with an adopted API port would silently keep
+    /// the probed console port, which is exactly the mismatch being fixed.
+    #[test]
+    fn ignores_a_container_missing_a_published_port() {
+        for ports in [
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", None)],
+            vec![("9000/tcp", None), ("9001/tcp", Some("9002"))],
+            vec![("9000/tcp", Some("9000"))],
+        ] {
+            assert_eq!(
+                adopted_ports_from_inspect(&running_on(ports), TEST_IMAGE),
+                None,
+                "an incomplete port map must fall back to the probed config wholesale"
+            );
+        }
+    }
 
     #[test]
     fn test_rustfs_config_defaults() {

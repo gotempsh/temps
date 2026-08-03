@@ -2,7 +2,7 @@ use crate::avatar::generate_avatar_data_url;
 use base64::Engine;
 use chrono::Utc;
 use qrcode::QrCode;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
 };
@@ -599,14 +599,14 @@ impl UserService {
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
         // Generate random secret with explicit type
-        let secret: Vec<u8> = (0..20).map(|_| rand::thread_rng().gen::<u8>()).collect();
+        let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
         let secret_b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
 
         // Generate recovery codes
         let recovery_codes: Vec<String> = (0..8)
             .map(|_| {
                 let code: String = (0..6)
-                    .map(|_| rand::thread_rng().gen_range(0..10).to_string())
+                    .map(|_| rand::rng().random_range(0..10).to_string())
                     .collect();
                 code
             })

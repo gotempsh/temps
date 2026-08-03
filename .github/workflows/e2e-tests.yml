@@ -1,11 +1,21 @@
 name: E2E Tests
 
+# Called by `rust-tests.yml`, not triggered directly.
+#
+# This job used to build its own `--release` binary — a second full compile of
+# the same workspace that `rust-tests.yml` was already building for Compose
+# Security, plus a second web-UI and WASM build in front of it. It now takes
+# the musl `fast` binary from the `build-binary` job as an artifact, which is
+# both faster and a better test: that is the binary that ships in the Docker
+# image, where `--release` glibc never was.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      binary-artifact:
+        description: "Name of the artifact holding the prebuilt `temps` binary"
+        required: false
+        default: temps-binary-musl-fast
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +25,6 @@ jobs:
   e2e-test:
     name: E2E Deployment Tests
     runs-on: ubuntu-latest
-    needs: []
     timeout-minutes: 60
 
     services:
@@ -46,6 +55,7 @@ jobs:
       # with phantom "tried N deploys, never shipped" instances. (Opt-out values:
       # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
       TEMPS_TELEMETRY: "0"
+      TEMPS_BIN: ./ci-prebuilt/temps
 
     steps:
       - name: Free up disk space
@@ -55,64 +65,51 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
 
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # No Rust toolchain, no wasm-pack, no rsbuild production build — the
+      # binary arrives prebuilt with the web UI already embedded. Bun stays,
+      # but only to install web/node_modules for the Playwright console tests
+      # below; it no longer builds the UI.
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ci-prebuilt
+
+      - name: Verify prebuilt binary runs
+        run: |
+          chmod +x "$TEMPS_BIN"
+          file "$TEMPS_BIN"
+          "$TEMPS_BIN" --version
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - name: Rust cache (release build)
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: e2e-release
-          # Save from every ref, not just main — PRs used to depend entirely
-          # on main's copy surviving GitHub's cache eviction, which it
-          # routinely didn't (repo-wide cache churn from per-PR debug-build
-          # caches kept evicting this one). Now every PR keeps its own copy
-          # warm too.
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
+      # Restore always, save only from `main` — see the cache-scoping note in
+      # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
+      # node_modules copy in each open PR's scope (5 copies, ~805MB) for a
+      # `bun install` that takes seconds to redo.
+      - name: Restore Bun dependencies
+        id: bun-cache
+        uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
-      - name: Cache wasm-pack binary
-        id: wasm-pack-cache
-        uses: actions/cache@v6
+      - name: Install web dependencies (Playwright tests)
+        run: cd web && bun install
+
+      - name: Save Bun dependencies
+        if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
         with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install wasm-pack and build WASM
-        run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun install
-          bun run build
-
-      - name: Build Web UI
-        run: |
-          cd web
-          bun install
-          RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
-
-      - name: Build release binary
-        run: cargo build --release --bin temps
-        env:
-          FORCE_WEB_BUILD: 1
-          CARGO_INCREMENTAL: 0
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       - name: Generate self-signed localho.st certificate
         run: |
@@ -139,7 +136,7 @@ jobs:
 
       - name: Run temps setup
         run: |
-          ./target/release/temps setup --non-interactive \
+          "$TEMPS_BIN" setup --non-interactive \
             --database-url "$DATABASE_URL" \
             --data-dir "$TEMPS_DATA_DIR" \
             --admin-email "$ADMIN_EMAIL" \
@@ -161,7 +158,7 @@ jobs:
 
       - name: Start temps serve
         run: |
-          ./target/release/temps serve \
+          "$TEMPS_BIN" serve \
             --database-url "$DATABASE_URL" \
             --data-dir "$TEMPS_DATA_DIR" \
             --address 0.0.0.0:3000 \
@@ -185,13 +182,41 @@ jobs:
           echo "Waiting for Temps to become healthy..."
           timeout 120 bash -c 'until curl -sf http://localhost:8081/ > /dev/null 2>&1; do sleep 2; done'
           echo "Platform is healthy"
+          # NOTE: this only proves the shell is served. A console whose JS dies
+          # on boot still answers 200 here -- that is exactly how #504 shipped.
+          # The console UI tests below are what actually verify it works.
           curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
           echo ""
+
+      # Drives the real console in a real browser against the instance started
+      # above. Runs before the API-level deploys so a broken UI is reported as a
+      # UI failure rather than being buried behind a 20-minute deploy matrix.
+      - name: Install Playwright browser
+        run: cd web && bunx playwright install --with-deps chromium
+
+      - name: Console UI end-to-end tests
+        env:
+          E2E_BASE_URL: http://localhost:8081
+          E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
+          E2E_PASSWORD: ${{ env.ADMIN_PASSWORD }}
+          E2E_REPO_URL: https://github.com/${{ github.repository }}.git
+        run: cd web && bun run e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Create API key via CLI
         id: auth
         run: |
-          API_OUTPUT=$(./target/release/temps api-key \
+          API_OUTPUT=$("$TEMPS_BIN" api-key \
             --database-url "$DATABASE_URL" \
             --name "e2e-test" \
             --role admin \

@@ -9,7 +9,7 @@ use chrono;
 use colored::Colorize;
 use futures::FutureExt;
 use include_dir::{include_dir, Dir};
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -390,10 +390,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
 fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -2525,6 +2525,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         notification_service: service_context
             .get_service::<dyn temps_core::notifications::NotificationService>(),
+        audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);

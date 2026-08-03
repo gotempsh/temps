@@ -432,6 +432,7 @@ mod tests {
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,
+            docker_extra_networks: Vec::new(),
             data_dir: std::path::PathBuf::from("/tmp/temps-test"),
             auth_secret: "test-secret".to_string(),
             encryption_key: "test-key".to_string(),

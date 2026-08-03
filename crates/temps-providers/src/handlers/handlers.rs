@@ -753,38 +753,15 @@ async fn require_service_parameter_project_access(
         .map(|link| link.project.id)
         .collect::<Vec<_>>();
     if let Some(checker) = app_state.project_access_checker.as_ref() {
-        require_access_to_any_linked_project(auth.user_id(), &project_ids, checker.as_ref()).await
+        super::metrics_handlers::require_access_to_any_linked_project(
+            auth.user_id(),
+            &project_ids,
+            checker.as_ref(),
+        )
+        .await
     } else {
         Ok(())
     }
-}
-
-async fn require_access_to_any_linked_project(
-    user_id: i32,
-    project_ids: &[i32],
-    checker: &dyn temps_core::ProjectAccessChecker,
-) -> Result<(), Problem> {
-    let mut infrastructure_error = None;
-    for project_id in project_ids {
-        match checker.user_can_access_project(user_id, *project_id).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(error) => infrastructure_error = Some(error),
-        }
-    }
-
-    if let Some(error) = infrastructure_error {
-        error!(user_id, error = %error, "Project access check failed during credential reveal");
-        return Err(internal_server_error()
-            .title("Project Access Check Failed")
-            .detail("Could not verify project access; please try again")
-            .build());
-    }
-
-    Err(forbidden()
-        .title("Project Access Denied")
-        .detail("Your team membership does not include access to this service")
-        .build())
 }
 
 fn require_reveal_audit(
@@ -2627,6 +2604,7 @@ pub struct ExternalServiceApiDoc;
 
 #[cfg(test)]
 mod tests {
+    use super::super::metrics_handlers::require_access_to_any_linked_project;
     use super::*;
     use axum::response::IntoResponse;
     use sea_orm::MockDatabase;
@@ -2845,7 +2823,14 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                .append_query_results([vec![model.clone()], vec![model]])
+                // 1: assert_service_owned_by_caller's existence check
+                .append_query_results([vec![model.clone()]])
+                // 2: assert_service_owned_by_caller's linked-projects lookup
+                // (empty — irrelevant here since project_access_checker is
+                // None, which fails open regardless of the project list)
+                .append_query_results([Vec::<temps_entities::project_services::Model>::new()])
+                // 3: get_sensitive_parameter_value's own fetch
+                .append_query_results([vec![model]])
                 .into_connection(),
         );
         let docker = Arc::new(

@@ -1,6 +1,73 @@
 //! Deployment-related traits and types
 
 use async_trait::async_trait;
+use thiserror::Error;
+
+/// Failure while removing application containers before their owning database
+/// records are deleted.
+#[derive(Debug, Error)]
+pub enum ContainerCleanupError {
+    #[error(
+        "Failed to list containers for project {project_id}, environment {environment_id:?}: {reason}"
+    )]
+    Discovery {
+        project_id: i32,
+        environment_id: Option<i32>,
+        reason: String,
+    },
+
+    #[error(
+        "Failed to prepare container '{container_id}' on node {node_id:?} for deletion from project {project_id}, environment {environment_id}: {reason}"
+    )]
+    Prepare {
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+        node_id: Option<i32>,
+        reason: String,
+    },
+
+    #[error(
+        "Failed to remove container '{container_id}' on node {node_id:?} from project {project_id}, environment {environment_id}: {reason}"
+    )]
+    Removal {
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+        node_id: Option<i32>,
+        reason: String,
+    },
+
+    #[error(
+        "Removed container '{container_id}' on node {node_id:?}, but failed to finalize its database record for project {project_id}, environment {environment_id}: {reason}"
+    )]
+    Finalize {
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+        node_id: Option<i32>,
+        reason: String,
+    },
+}
+
+/// Removes application containers before project/environment records are
+/// deleted. Implemented by `temps-deployments` and consumed through the
+/// service registry to avoid crate dependency cycles.
+#[async_trait]
+pub trait DeploymentContainerCleaner: Send + Sync {
+    /// Remove every active application container owned by a project.
+    async fn cleanup_project_containers(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, ContainerCleanupError>;
+
+    /// Remove every active application container owned by an environment.
+    async fn cleanup_environment_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<u64, ContainerCleanupError>;
+}
 
 /// Trait for cancelling deployments for an environment
 ///
@@ -9,6 +76,12 @@ use async_trait::async_trait;
 /// implements this trait.
 #[async_trait]
 pub trait DeploymentCanceller: Send + Sync {
+    /// Cancel all active deployments for a project.
+    async fn cancel_all_project_deployments(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+
     /// Cancel all active deployments for an environment
     /// Returns the number of deployments cancelled
     async fn cancel_all_environment_deployments(

@@ -225,6 +225,7 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
             | UrlValidationError::MulticastIp
             | UrlValidationError::BroadcastIp
             | UrlValidationError::DocumentationIp
+            | UrlValidationError::ReservedIp
             | UrlValidationError::UnspecifiedIp
             | UrlValidationError::DomainResolvesToBlockedIp => {
                 "host points to a private, loopback, or metadata address".to_string()
@@ -2367,6 +2368,43 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use temps_auth::context::AuthContext;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    fn test_user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 1,
+            name: "Platform Admin".to_string(),
+            email: "platform-admin@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn platform_admin_cannot_pass_create_sandbox_permission_guard() {
+        let auth = AuthContext::new_session(test_user(), Role::PlatformAdmin);
+
+        let problem =
+            sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)
+                .expect_err("PlatformAdmin must not be allowed to create a sandbox");
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
 
     // ── Tar extraction (SDK fs/write path) ─────────────────────────────────
 

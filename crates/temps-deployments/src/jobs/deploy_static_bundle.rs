@@ -136,6 +136,28 @@ fn validate_archive_entry_path(path: &Path) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+/// Reject absolute ZIP entry names before the zip crate normalizes them.
+///
+/// zip 8 accepts a root or Windows drive prefix at the start of an entry and
+/// returns the remaining relative path from `enclosed_name()`. That behavior
+/// is useful for permissive extractors, but deployment bundles must reject
+/// absolute names rather than silently changing their meaning.
+fn validate_zip_entry_name(name: &str) -> Result<(), WorkflowError> {
+    let bytes = name.as_bytes();
+    let has_root = matches!(bytes.first(), Some(b'/') | Some(b'\\'));
+    let has_windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+
+    if has_root || has_windows_drive_prefix {
+        return Err(WorkflowError::InvalidArchiveEntry {
+            path: name.to_string(),
+            reason: "absolute path entries not allowed".into(),
+        });
+    }
+
+    Ok(())
+}
+
 impl DeployStaticBundleJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -350,9 +372,13 @@ impl DeployStaticBundleJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to read zip entry {}: {}", i, e))
             })?;
 
-            // Fix #18: `enclosed_name()` strips leading `/` and `..` segments,
-            // but the returned path still needs component-walk validation since
-            // the zip crate's stripping may not cover all cases.
+            // Validate the raw name first because zip 8 normalizes absolute
+            // roots and prefixes into relative paths in `enclosed_name()`.
+            validate_zip_entry_name(file.name())?;
+
+            // Fix #18: `enclosed_name()` resolves safe internal `..` segments
+            // and rejects traversal beyond the archive root. The returned path
+            // still gets the platform-native component validation below.
             let entry_path = match file.enclosed_name() {
                 Some(path) => path.to_path_buf(),
                 None => continue, // zip crate already rejected this as unsafe
@@ -887,11 +913,30 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let job = make_job_for_extract();
         let data = build_zip_with_path("/etc/passwd", b"pwned");
-        let result = job.extract_zip(&data, temp_dir.path());
-        match result {
-            Ok(n) => assert_eq!(n, 0, "absolute zip entry must be skipped"),
-            Err(WorkflowError::InvalidArchiveEntry { .. }) => {}
-            Err(e) => panic!("unexpected error: {:?}", e),
+        let err = job.extract_zip(&data, temp_dir.path()).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::InvalidArchiveEntry { .. }),
+            "expected InvalidArchiveEntry for absolute path, got {err:?}"
+        );
+        assert!(!temp_dir.path().join("etc/passwd").exists());
+    }
+
+    #[test]
+    fn test_zip_rejects_windows_absolute_paths() {
+        for entry_path in [
+            r"C:\Windows\system32\drivers\etc\hosts",
+            r"\Windows\system32\drivers\etc\hosts",
+            r"\\server\share\payload.txt",
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let job = make_job_for_extract();
+            let data = build_zip_with_path(entry_path, b"pwned");
+            let err = job.extract_zip(&data, temp_dir.path()).unwrap_err();
+
+            assert!(
+                matches!(err, WorkflowError::InvalidArchiveEntry { .. }),
+                "expected InvalidArchiveEntry for {entry_path:?}, got {err:?}"
+            );
         }
     }
 

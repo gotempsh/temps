@@ -61,8 +61,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         "PIPELINE_TRIGGERED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -111,8 +111,8 @@ impl AuditOperation for ProjectCreatedAudit {
         "PROJECT_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -134,8 +134,8 @@ impl AuditOperation for ProjectUpdatedAudit {
         "PROJECT_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -157,8 +157,8 @@ impl AuditOperation for ProjectDeletedAudit {
         "PROJECT_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -180,8 +180,8 @@ impl AuditOperation for ProjectSettingsUpdatedAudit {
         "PROJECT_SETTINGS_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -212,8 +212,8 @@ impl AuditOperation for DeploymentConfigUpdatedAudit {
         "DEPLOYMENT_CONFIG_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

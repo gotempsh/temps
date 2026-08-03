@@ -4291,6 +4291,27 @@ export type DeploymentConfig = {
      */
     cpuRequest?: number | null;
     /**
+     * Build one image per architecture the eligible nodes run.
+     *
+     * `None`/`false` (the default) builds exactly once, on the control
+     * plane's native platform — byte-for-byte the behaviour of a
+     * single-architecture cluster. When enabled and the nodes this
+     * deployment could land on span more than one architecture, the build
+     * job produces one image per architecture; the non-native ones go
+     * through the daemon's `platform` option, which requires QEMU binfmt
+     * handlers registered on the control plane.
+     *
+     * **Opt-in on purpose.** Cross-architecture builds are emulated and
+     * substantially slower, and deriving them from cluster topology would
+     * mean a single node joining silently changes build behaviour for every
+     * deployment in the cluster. It also keeps the decision on operator
+     * config rather than on a value each node reports about itself.
+     *
+     * `Option<bool>` so an environment inherits the project's setting
+     * (`None`) or overrides it, matching `automatic_deploy`.
+     */
+    crossArchitectureBuilds?: boolean | null;
+    /**
      * Port exposed by the container
      * If not specified, will be auto-detected from Docker image or default to 3000
      */
@@ -6050,6 +6071,14 @@ export type EnvironmentResponse = {
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
     estimated_sleep_at?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override.
+     * `null` means inherit the proxy default (redirect only when the host has
+     * an active TLS certificate); `true` always redirects plain HTTP for this
+     * environment, `false` never does. Always serialized (NOT skipped) so the
+     * UI can distinguish `null` from `false`.
+     */
+    force_https?: boolean | null;
     id: number;
     /**
      * Indicates if this is a preview environment (auto-created per branch)
@@ -7965,6 +7994,12 @@ export type HealthSummary = {
 };
 
 export type HeartbeatApiRequest = {
+    /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`), read from `docker info` by the agent. Absent from
+     * pre-multi-arch agents; the stored value is then left untouched.
+     */
+    architecture?: string | null;
     /**
      * Resource capacity/usage info as JSON (cpu_usage, memory_usage, etc.)
      */
@@ -10055,6 +10090,11 @@ export type NodeCostInfo = {
 
 export type NodeInfoResponse = {
     address: string;
+    /**
+     * Container platform this node runs (`linux/amd64`, `linux/arm64`).
+     * `None` until an agent that reports it has heartbeated.
+     */
+    architecture?: string | null;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -12392,28 +12432,6 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
- * Proxy configuration for email validation
- */
-export type ProxyRequest = {
-    /**
-     * Proxy host
-     */
-    host: string;
-    /**
-     * Optional proxy password
-     */
-    password?: string | null;
-    /**
-     * Proxy port
-     */
-    port: number;
-    /**
-     * Optional proxy username
-     */
-    username?: string | null;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
  *
  * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
@@ -12778,6 +12796,12 @@ export type RegisterNodeApiRequest = {
      * Node's reachable address (e.g., "10.100.0.2" or "192.168.1.50")
      */
     address: string;
+    /**
+     * Container platform of this node's Docker daemon (`linux/amd64`,
+     * `linux/arm64`). Optional: agents older than multi-arch support omit it
+     * and the value is learned from the first heartbeat instead.
+     */
+    architecture?: string | null;
     /**
      * Node-generated certificate signing request (PEM) for multi-node mTLS
      * (ADR-020 WS-2.1). When present, the control plane signs it with the
@@ -16394,7 +16418,13 @@ export type TraceProjectRef = {
 
 export type TraceSummariesResponse = {
     data: Array<TraceSummary>;
-    total: number;
+    /**
+     * Total traces matching the filters, ignoring pagination. Omitted when
+     * the request passed `include_total=false`, in which case the caller
+     * asked not to pay for the count — treat its absence as "unknown", not
+     * as zero.
+     */
+    total?: number | null;
 };
 
 /**
@@ -16834,6 +16864,13 @@ export type UpdateDeploymentConfigRequest = {
     automaticDeploy?: boolean | null;
     cpuLimit?: number | null;
     cpuRequest?: number | null;
+    /**
+     * Build one image per architecture the eligible nodes run. Off by
+     * default; environments inherit this and may override it. Cross-builds
+     * are emulated on the control plane and substantially slower, so they are
+     * opted into rather than triggered by cluster topology.
+     */
+    crossArchitectureBuilds?: boolean | null;
     exposedPort?: number | null;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
@@ -16922,6 +16959,13 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     cpu_request?: number | null;
     /**
+     * Build one image per architecture the eligible nodes run (overrides the
+     * project-level setting). Off by default: cross-architecture builds are
+     * emulated on the control plane and substantially slower, so they are
+     * opted into per environment rather than triggered by cluster topology.
+     */
+    cross_architecture_builds?: boolean | null;
+    /**
      * Port exposed by the container (overrides project-level port for this environment)
      *
      * Priority order for port resolution:
@@ -16931,6 +16975,20 @@ export type UpdateEnvironmentSettingsRequest = {
      * 4. Default: 3000
      */
     exposed_port?: number | null;
+    /**
+     * Per-environment HTTP→HTTPS redirect override (tri-state):
+     * - absent → leave the current override unchanged
+     * - JSON `null` → clear the override (inherit the proxy default, which
+     * redirects only when the host has an active TLS certificate)
+     * - `true` → always redirect plain HTTP to HTTPS for this environment,
+     * even when no local certificate exists (TLS terminated upstream)
+     * - `false` → never redirect this environment, even when a certificate does
+     * exist
+     *
+     * Requests under `/.well-known/acme-challenge/` are never redirected
+     * regardless of this setting, so ACME HTTP-01 validation always completes.
+     */
+    force_https?: boolean | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
@@ -17772,7 +17830,6 @@ export type ValidateEmailRequest = {
      * Email address to validate
      */
     email: string;
-    proxy?: null | ProxyRequest;
 };
 
 /**
@@ -33507,6 +33564,10 @@ export type QueryTraceSummariesData = {
          */
         sort_order?: string;
         /**
+         * Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed
+         */
+        include_total?: boolean;
+        /**
          * Max traces to return (default: 50, max: 100)
          */
         limit?: number;
@@ -48463,6 +48524,10 @@ export type ListAuditLogsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -48491,6 +48556,10 @@ export type GetAuditLogErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Audit log not found
      */

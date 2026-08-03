@@ -1,6 +1,26 @@
 const KEY = 'temps:returnTo'
 
-const AUTH_PATHS = new Set(['/mfa-verify'])
+/**
+ * Paths that must never be captured as a post-login destination.
+ *
+ * `/login` matters most and is the least obvious: it is not a registered route
+ * at all. It falls through to `/*` -> ProtectedLayout, which renders the login
+ * form in place (the URL stays `/login`) and calls `captureReturnTo()`. Without
+ * this entry, signing in at `/login` stored `/login` as the return target and
+ * then navigated back to it -- now authenticated, where `AuthenticatedRoutes`
+ * has no such route, so the user landed on "404 - Page Not Found" immediately
+ * after a successful login. Bookmarking the login page is entirely normal, so
+ * this was easy to hit and impossible to self-diagnose.
+ *
+ * The password-reset paths are here for the same reason: they are public routes
+ * that make no sense to return to once a session exists.
+ */
+const AUTH_PATHS = new Set([
+  '/mfa-verify',
+  '/login',
+  '/forgot-password',
+  '/auth/reset-password',
+])
 
 function isAuthPath(path: string): boolean {
   const pathname = path.split('?')[0]?.split('#')[0] ?? path

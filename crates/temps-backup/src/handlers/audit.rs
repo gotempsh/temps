@@ -117,8 +117,8 @@ impl AuditOperation for S3SourceCreatedAudit {
         "S3_SOURCE_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -140,8 +140,8 @@ impl AuditOperation for S3SourceUpdatedAudit {
         "S3_SOURCE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -163,8 +163,8 @@ impl AuditOperation for S3SourceDeletedAudit {
         "S3_SOURCE_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -187,8 +187,8 @@ impl AuditOperation for BackupScheduleUpdatedAudit {
         "BACKUP_SCHEDULE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -210,8 +210,8 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
         "BACKUP_SCHEDULE_STATUS_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -233,8 +233,8 @@ impl AuditOperation for BackupRunAudit {
         "BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -256,8 +256,8 @@ impl AuditOperation for BackupDeletedAudit {
         "BACKUP_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -279,8 +279,8 @@ impl AuditOperation for BackupRetentionCleanupAudit {
         "BACKUP_RETENTION_CLEANUP".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -302,8 +302,8 @@ impl AuditOperation for ExternalServiceBackupRunAudit {
         "EXTERNAL_SERVICE_BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -337,8 +337,8 @@ impl AuditOperation for ScheduleServicesAttachedAudit {
         "BACKUP_SCHEDULE_SERVICES_ATTACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -371,8 +371,8 @@ impl AuditOperation for ScheduleServiceDetachedAudit {
         "BACKUP_SCHEDULE_SERVICE_DETACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -409,8 +409,8 @@ impl AuditOperation for ScheduleRunNowAudit {
         "BACKUP_SCHEDULE_RUN_NOW".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -432,8 +432,8 @@ impl AuditOperation for RestoreRunAudit {
         "EXTERNAL_SERVICE_RESTORE_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

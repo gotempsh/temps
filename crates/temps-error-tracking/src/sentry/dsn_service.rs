@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_entities::{project_dsns, projects};
@@ -399,8 +399,8 @@ impl DSNService {
 
     /// Generate a random key
     fn generate_key(&self, length: usize) -> String {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..length).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..length).map(|_| rng.random()).collect();
         hex::encode(bytes)
     }
 }

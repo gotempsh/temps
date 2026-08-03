@@ -38,8 +38,8 @@ impl AuditOperation for ProjectAccessGrantedAudit {
     fn operation_type(&self) -> String {
         "PROJECT_ACCESS_GRANTED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -65,8 +65,8 @@ impl AuditOperation for ProjectAccessRevokedAudit {
     fn operation_type(&self) -> String {
         "PROJECT_ACCESS_REVOKED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
