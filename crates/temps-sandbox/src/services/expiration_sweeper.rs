@@ -199,6 +199,14 @@ impl SandboxExpirationSweeper {
     ///
     /// Only `sbx_<16 hex>` directory names are considered, so anything an
     /// operator put in the data dir is out of scope by construction.
+    ///
+    /// Ordering is load-bearing and depends on `create_sandbox` inserting
+    /// the row *before* it creates the directory: we list directories
+    /// first, then query. A directory can therefore only exist if its row
+    /// was already committed, so the query below is guaranteed to see it
+    /// and an in-flight create can never be reaped. Creating the directory
+    /// before the row would reintroduce that race silently — if that order
+    /// ever changes, this sweep has to change with it.
     async fn reap_orphaned_work_dirs(&self) -> Result<usize, std::io::Error> {
         let mut dir = match tokio::fs::read_dir(&self.data_root).await {
             Ok(d) => d,
