@@ -1664,6 +1664,7 @@ pub async fn sleep_environment(
         (status = 204, description = "Environment permanently deleted"),
         (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     params(

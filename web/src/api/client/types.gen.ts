@@ -21394,6 +21394,10 @@ export type CreateApiKeyErrors = {
      */
     409: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -38385,6 +38389,10 @@ export type DeleteEnvironmentErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
     /**
      * Internal server error
      */

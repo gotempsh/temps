@@ -114,7 +114,6 @@ export function SensitiveActionVerificationDialog({
                 value={code}
                 onChange={(event) => setCode(event.target.value)}
                 autoComplete="one-time-code"
-                inputMode="numeric"
                 autoFocus
                 disabled={isVerifying}
               />

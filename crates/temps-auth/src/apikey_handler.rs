@@ -112,6 +112,7 @@ fn permission_ceiling_exceeded(perm_str: &str) -> Problem {
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 409, description = "Conflict - API key name already exists"),
         (status = 500, description = "Internal server error")
     ),

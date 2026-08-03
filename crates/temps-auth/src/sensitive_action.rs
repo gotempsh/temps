@@ -251,6 +251,19 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
+    struct FixedDecisionAuthorizer(SensitiveActionDecision);
+
+    #[async_trait]
+    impl SensitiveActionAuthorizer for FixedDecisionAuthorizer {
+        async fn authorize(
+            &self,
+            _action: &SensitiveAction,
+            _principal: &SensitiveActionPrincipal,
+        ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn authorizer_with_sessions(
         sessions: Vec<temps_entities::sessions::Model>,
     ) -> DefaultSensitiveActionAuthorizer {
@@ -383,6 +396,51 @@ mod tests {
                 reason: "interactive_verification_required".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn verification_decision_maps_to_actionable_428_problem() {
+        let auth = AuthContext::new_persisted_session(user(true), crate::Role::Admin, 11);
+        let error = require_sensitive_action(
+            &FixedDecisionAuthorizer(SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            }),
+            &auth,
+            SensitiveAction::CreateApiKey,
+        )
+        .await
+        .expect_err("verification must interrupt the mutation");
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("STEP_UP_REQUIRED"))
+        );
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("create_api_key"))
+        );
+        assert_eq!(
+            error.body.get("mfa_setup_required"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denial_does_not_disclose_implementation_reason() {
+        let auth = AuthContext::new_persisted_session(user(true), crate::Role::Admin, 11);
+        let error = require_sensitive_action(
+            &FixedDecisionAuthorizer(SensitiveActionDecision::Deny {
+                reason: "private policy detail".to_string(),
+            }),
+            &auth,
+            SensitiveAction::CreateApiKey,
+        )
+        .await
+        .expect_err("denied policy must interrupt the mutation");
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(!format!("{:?}", error.body).contains("private policy detail"));
     }
 
     #[tokio::test]
