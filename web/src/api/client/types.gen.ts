@@ -12406,28 +12406,6 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
- * Proxy configuration for email validation
- */
-export type ProxyRequest = {
-    /**
-     * Proxy host
-     */
-    host: string;
-    /**
-     * Optional proxy password
-     */
-    password?: string | null;
-    /**
-     * Proxy port
-     */
-    port: number;
-    /**
-     * Optional proxy username
-     */
-    username?: string | null;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
  *
  * The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
@@ -13024,6 +13002,29 @@ export type RequestRow = {
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
+};
+
+/**
+ * Explicit confirmation required for the destructive statistics reset.
+ *
+ * Requiring JSON makes the endpoint non-simple for browsers, preventing a
+ * deployed same-site application from triggering it with a plain HTML form.
+ */
+export type ResetPgStatStatementsRequest = {
+    /**
+     * Must be `true` to acknowledge the global, irreversible reset.
+     */
+    confirm: boolean;
+};
+
+/**
+ * Response for the pg_stat_statements reset endpoint.
+ */
+export type ResetPgStatStatementsResponse = {
+    /**
+     * Human-readable message confirming the destructive action.
+     */
+    message: string;
 };
 
 export type ResizeSandboxBody = {
@@ -27884,6 +27885,57 @@ export type ExternalServiceEnablePgStatStatementsResponses = {
 };
 
 export type ExternalServiceEnablePgStatStatementsResponse = ExternalServiceEnablePgStatStatementsResponses[keyof ExternalServiceEnablePgStatStatementsResponses];
+
+export type ExternalServiceResetPgStatStatementsData = {
+    /**
+     * Explicit confirmation of the global, irreversible reset
+     */
+    body: ResetPgStatStatementsRequest;
+    path: {
+        /**
+         * ID of the provisioned Postgres service
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/pg-stat-statements/reset';
+};
+
+export type ExternalServiceResetPgStatStatementsErrors = {
+    /**
+     * Missing or invalid reset confirmation
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires external_services:write)
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Service is not Postgres
+     */
+    422: unknown;
+    /**
+     * Target Postgres rejected or failed the reset operation
+     */
+    502: unknown;
+};
+
+export type ExternalServiceResetPgStatStatementsResponses = {
+    /**
+     * All accumulated pg_stat_statements statistics cleared
+     */
+    200: ResetPgStatStatementsResponse;
+};
+
+export type ExternalServiceResetPgStatStatementsResponse = ExternalServiceResetPgStatStatementsResponses[keyof ExternalServiceResetPgStatStatementsResponses];
 
 export type GetSlowQueriesData = {
     body?: never;

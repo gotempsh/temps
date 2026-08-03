@@ -11,6 +11,7 @@
  */
 
 import {
+  externalServiceResetPgStatStatementsMutation,
   getServiceOptions,
   getSlowQueriesOptions,
   getSlowQueriesQueryKey,
@@ -63,6 +64,7 @@ import {
   ChevronRight,
   Loader2,
   RefreshCw,
+  Trash2,
   Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -136,18 +138,16 @@ function ExtensionNotAvailable({
             <p className="text-sm font-medium">pg_stat_statements not loaded</p>
             <p className="text-xs text-muted-foreground">
               The extension requires{' '}
-              <code className="font-mono">shared_preload_libraries=pg_stat_statements</code>{' '}
+              <code className="font-mono">
+                shared_preload_libraries=pg_stat_statements
+              </code>{' '}
               to be set before Postgres starts.
             </p>
           </div>
 
           {isStandalone ? (
             <div className="flex flex-col items-center gap-2">
-              <Button
-                size="sm"
-                onClick={onEnable}
-                disabled={isEnabling}
-              >
+              <Button size="sm" onClick={onEnable} disabled={isEnabling}>
                 {isEnabling ? (
                   <>
                     <Loader2 className="mr-2 size-3.5 animate-spin" />
@@ -163,12 +163,16 @@ function ExtensionNotAvailable({
             </div>
           ) : (
             <div className="max-w-sm space-y-1 text-left rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
-              <p className="font-medium text-foreground">Manual rolling restart required</p>
+              <p className="font-medium text-foreground">
+                Manual rolling restart required
+              </p>
               <p>
                 This is a clustered (HA) service. To avoid data loss, restart
                 each node one at a time using your cluster management tooling.
                 Ensure{' '}
-                <code className="font-mono">shared_preload_libraries=pg_stat_statements</code>{' '}
+                <code className="font-mono">
+                  shared_preload_libraries=pg_stat_statements
+                </code>{' '}
                 is set on every node before restarting.
               </p>
             </div>
@@ -212,11 +216,12 @@ function SlowQueriesContent({
   // Default matches the backend default (mean_exec_time_ms desc) so the
   // header arrow reflects the order actually applied on first load.
   const [sortKey, setSortKey] = useState<SlowQuerySortKey | null>(
-    'mean_exec_time_ms',
+    'mean_exec_time_ms'
   )
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
   const [selectedRow, setSelectedRow] = useState<SlowQueryRow | null>(null)
-  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [enableConfirmOpen, setEnableConfirmOpen] = useState(false)
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false)
 
   // Reset to page 1 when page size changes
   const handlePageSizeChange = (val: string) => {
@@ -274,13 +279,11 @@ function SlowQueriesContent({
     mutationFn: async () => {
       const response = await fetch(
         `/api/external-services/${serviceId}/pg-stat-statements/enable`,
-        { method: 'POST', credentials: 'include' },
+        { method: 'POST', credentials: 'include' }
       )
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
-        throw new Error(
-          body.detail ?? 'Failed to enable pg_stat_statements',
-        )
+        throw new Error(body.detail ?? 'Failed to enable pg_stat_statements')
       }
       return response.json() as Promise<{ message: string }>
     },
@@ -298,10 +301,29 @@ function SlowQueriesContent({
     },
   })
 
+  const resetMutation = useMutation({
+    ...externalServiceResetPgStatStatementsMutation(),
+    onSuccess: (data) => {
+      setPage(1)
+      queryClient.invalidateQueries({
+        queryKey: [{ _id: 'getSlowQueries' }],
+      })
+      toast.success('Query statistics reset', {
+        description:
+          data.message ??
+          'All accumulated pg_stat_statements statistics were cleared.',
+      })
+    },
+    onError: (err) => {
+      toast.error('Reset failed', { description: metricsErrorText(err) })
+    },
+  })
+
   const queries = data?.queries ?? []
 
   const totalCount = data?.total_count ?? 0
-  const totalPages = pageSize > 0 ? Math.max(1, Math.ceil(totalCount / pageSize)) : 1
+  const totalPages =
+    pageSize > 0 ? Math.max(1, Math.ceil(totalCount / pageSize)) : 1
   const startRow = totalCount === 0 ? 0 : (page - 1) * pageSize + 1
   const endRow = Math.min(page * pageSize, totalCount)
 
@@ -336,18 +358,34 @@ function SlowQueriesContent({
             time. Click a row to see the full query text and all stats.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="gap-1.5 shrink-0"
-          onClick={handleRefresh}
-          disabled={isFetching}
-        >
-          <RefreshCw
-            className={cn('size-3.5', isFetching && 'animate-spin')}
-          />
-          <span className="hidden sm:inline">Refresh</span>
-        </Button>
+        <div className="flex shrink-0 gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5 text-destructive hover:text-destructive"
+            onClick={() => setResetConfirmOpen(true)}
+            disabled={isLoading || error != null || resetMutation.isPending}
+          >
+            {resetMutation.isPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Trash2 className="size-3.5" />
+            )}
+            <span className="hidden sm:inline">Reset statistics</span>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={handleRefresh}
+            disabled={isFetching}
+          >
+            <RefreshCw
+              className={cn('size-3.5', isFetching && 'animate-spin')}
+            />
+            <span className="hidden sm:inline">Refresh</span>
+          </Button>
+        </div>
       </div>
 
       {/* Content */}
@@ -366,7 +404,7 @@ function SlowQueriesContent({
         <ExtensionNotAvailable
           error={error}
           serviceTopology={serviceTopology}
-          onEnable={() => setConfirmOpen(true)}
+          onEnable={() => setEnableConfirmOpen(true)}
           isEnabling={enableMutation.isPending}
         />
       ) : queries.length === 0 ? (
@@ -517,23 +555,22 @@ function SlowQueriesContent({
       />
 
       {/* Enable & Restart confirmation dialog */}
-      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+      <AlertDialog open={enableConfirmOpen} onOpenChange={setEnableConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Enable pg_stat_statements?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will restart the{' '}
-              <strong>{serviceName}</strong> database container to load{' '}
-              <code>pg_stat_statements</code>. Active connections will be
-              briefly dropped and in-flight transactions rolled back. The
-              database will come back online in a few seconds.
+              This will restart the <strong>{serviceName}</strong> database
+              container to load <code>pg_stat_statements</code>. Active
+              connections will be briefly dropped and in-flight transactions
+              rolled back. The database will come back online in a few seconds.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                setConfirmOpen(false)
+                setEnableConfirmOpen(false)
                 enableMutation.mutate()
               }}
             >
@@ -544,6 +581,46 @@ function SlowQueriesContent({
                 </>
               ) : (
                 'Enable & Restart'
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Reset statistics confirmation dialog */}
+      <AlertDialog open={resetConfirmOpen} onOpenChange={setResetConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reset all query statistics?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This clears every statistic accumulated by{' '}
+              <code>pg_stat_statements</code> on <strong>{serviceName}</strong>,
+              across all users, databases, and queries. This cannot be undone;
+              new statistics will accumulate as queries run.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={resetMutation.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={resetMutation.isPending}
+              onClick={() => {
+                setResetConfirmOpen(false)
+                resetMutation.mutate({
+                  path: { service_id: serviceId },
+                  body: { confirm: true },
+                })
+              }}
+            >
+              {resetMutation.isPending ? (
+                <>
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                  Resetting…
+                </>
+              ) : (
+                'Reset all statistics'
               )}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -595,10 +672,7 @@ function QueryDetailSheet({
                 Statistics
               </p>
               <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-                <StatCell
-                  label="Calls"
-                  value={row.calls.toLocaleString()}
-                />
+                <StatCell label="Calls" value={row.calls.toLocaleString()} />
                 <StatCell
                   label="Total Time"
                   value={`${row.total_exec_time_ms.toFixed(3)} ms`}
@@ -607,16 +681,11 @@ function QueryDetailSheet({
                   label="Mean Time"
                   value={`${row.mean_exec_time_ms.toFixed(3)} ms`}
                 />
-                <StatCell
-                  label="Rows"
-                  value={row.rows.toLocaleString()}
-                />
+                <StatCell label="Rows" value={row.rows.toLocaleString()} />
                 <StatCell
                   label="Rows / Call"
                   value={
-                    row.calls > 0
-                      ? (row.rows / row.calls).toFixed(1)
-                      : '—'
+                    row.calls > 0 ? (row.rows / row.calls).toFixed(1) : '—'
                   }
                 />
                 <StatCell
@@ -721,7 +790,7 @@ export function ServiceQueryPerformance() {
   usePageTitle(
     serviceData?.service?.name
       ? `${serviceData.service.name} · Query Performance`
-      : 'Query Performance',
+      : 'Query Performance'
   )
 
   return (
@@ -760,7 +829,7 @@ export function ServiceQueryPerformance() {
                     'w-full rounded-md px-3 py-2 text-left text-sm transition-colors',
                     activeSection === section.id
                       ? 'bg-accent font-medium text-accent-foreground'
-                      : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
+                      : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
                   )}
                 >
                   {section.label}

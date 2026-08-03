@@ -18,7 +18,7 @@ use std::sync::Arc;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DbErr, Statement};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use utoipa::ToSchema;
 
 use crate::externalsvc::postgres::PostgresInputConfig;
@@ -76,6 +76,12 @@ pub enum PgStatStatementsError {
 
     #[error("Failed to restart service {service_id} to enable pg_stat_statements: {reason}")]
     RestartFailed { service_id: i32, reason: String },
+
+    #[error(
+        "Failed to reset pg_stat_statements statistics on service {service_id}. \
+         Verify that the database role can execute the extension reset function."
+    )]
+    ResetFailed { service_id: i32 },
 
     #[error("Validation error: {message}")]
     Validation { message: String },
@@ -395,6 +401,82 @@ impl PgStatStatementsService {
         Ok(())
     }
 
+    /// Clear all aggregate query statistics collected by
+    /// `pg_stat_statements` for the target Postgres instance.
+    ///
+    /// PostgreSQL applies this reset across every user, database, and query
+    /// visible to the extension. The service account must have permission to
+    /// execute `pg_stat_statements_reset()`; managed providers may require an
+    /// elevated provider-specific role.
+    ///
+    /// Note: the caller (handler) must perform the ownership check
+    /// (`assert_service_owned_by_caller`) before invoking this method.
+    pub async fn reset_pg_stat_statements(
+        &self,
+        service_id: i32,
+    ) -> Result<(), PgStatStatementsError> {
+        let (db, service_id) = self.connect_to_service(service_id).await?;
+        Self::reset_on_connection(&db, service_id).await
+    }
+
+    async fn reset_on_connection<C>(db: &C, service_id: i32) -> Result<(), PgStatStatementsError>
+    where
+        C: ConnectionTrait,
+    {
+        let schema_row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                r#"
+                SELECT n.nspname AS schema_name
+                FROM pg_catalog.pg_extension e
+                JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+                WHERE e.extname = 'pg_stat_statements'
+                "#
+                .to_owned(),
+            ))
+            .await
+            .map_err(|db_error| {
+                error!(
+                    service_id,
+                    error = %db_error,
+                    "Failed to resolve pg_stat_statements extension schema"
+                );
+                PgStatStatementsError::ResetFailed { service_id }
+            })?
+            .ok_or(PgStatStatementsError::ExtensionNotAvailable { service_id })?;
+
+        let schema_name: String = schema_row.try_get("", "schema_name").map_err(|db_error| {
+            error!(
+                service_id,
+                error = %db_error,
+                "Failed to read pg_stat_statements extension schema"
+            );
+            PgStatStatementsError::ResetFailed { service_id }
+        })?;
+
+        // The schema name comes from pg_catalog, never user input. It is still
+        // quoted as an identifier so unusual extension schemas remain valid
+        // and cannot alter the statement. Qualifying the function avoids
+        // executing an attacker-controlled same-named function earlier in the
+        // target role's search_path.
+        let quoted_schema = format!("\"{}\"", schema_name.replace('"', "\"\""));
+        let reset_sql = format!("SELECT {quoted_schema}.pg_stat_statements_reset()");
+
+        db.execute(Statement::from_string(DatabaseBackend::Postgres, reset_sql))
+            .await
+            .map_err(|db_error| {
+                error!(
+                    service_id,
+                    extension_schema = schema_name,
+                    error = %db_error,
+                    "Target Postgres rejected pg_stat_statements reset"
+                );
+                PgStatStatementsError::ResetFailed { service_id }
+            })?;
+
+        Ok(())
+    }
+
     /// Return a paginated, sorted slice of queries for the given
     /// user-provisioned Postgres service. Sorting is applied server-side,
     /// before the `LIMIT`/`OFFSET`, so the ordering is consistent across
@@ -588,6 +670,17 @@ impl PgStatStatementsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{MockDatabase, MockExecResult, Value};
+    use std::collections::BTreeMap;
+
+    fn extension_schema_row(schema_name: &str) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert(
+            "schema_name".to_owned(),
+            Value::String(Some(Box::new(schema_name.to_owned()))),
+        );
+        row
+    }
 
     #[test]
     fn test_default_page_size_is_within_max() {
@@ -654,6 +747,93 @@ mod tests {
         assert_eq!(SortOrder::parse("asc"), Ok(SortOrder::Asc));
         assert_eq!(SortOrder::parse("desc"), Ok(SortOrder::Desc));
         assert!(SortOrder::parse("sideways").is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_on_connection_executes_global_reset() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![extension_schema_row("extensions")]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        PgStatStatementsService::reset_on_connection(&db, 42)
+            .await
+            .expect("reset should succeed");
+
+        let log = db.into_transaction_log();
+        let statements = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>();
+        assert!(statements
+            .iter()
+            .any(|sql| sql.contains("pg_catalog.pg_extension")));
+        assert!(statements.contains(&"SELECT \"extensions\".pg_stat_statements_reset()"));
+    }
+
+    #[tokio::test]
+    async fn reset_on_connection_quotes_extension_schema_identifier() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![extension_schema_row("odd\"schema")]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+
+        PgStatStatementsService::reset_on_connection(&db, 42)
+            .await
+            .expect("quoted extension schema should be safe");
+
+        let log = db.into_transaction_log();
+        let reset_statement = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .find(|statement| statement.sql.contains("pg_stat_statements_reset"))
+            .expect("reset statement should be recorded");
+        assert_eq!(
+            reset_statement.sql,
+            "SELECT \"odd\"\"schema\".pg_stat_statements_reset()"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_on_connection_preserves_service_context_on_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![extension_schema_row("public")]])
+            .append_exec_errors([DbErr::Custom("permission denied for function".to_owned())])
+            .into_connection();
+
+        let error = PgStatStatementsService::reset_on_connection(&db, 73)
+            .await
+            .expect_err("permission failure must be returned");
+
+        assert!(matches!(
+            &error,
+            PgStatStatementsError::ResetFailed { service_id }
+                if *service_id == 73
+        ));
+        assert!(!error.to_string().contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn reset_on_connection_reports_missing_extension() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+            .into_connection();
+
+        let error = PgStatStatementsService::reset_on_connection(&db, 91)
+            .await
+            .expect_err("missing extension must be reported");
+
+        assert!(matches!(
+            error,
+            PgStatStatementsError::ExtensionNotAvailable { service_id: 91 }
+        ));
     }
 
     /// Validate the page_size bounds (logic extracted from top_slow_queries).
