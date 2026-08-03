@@ -26,6 +26,22 @@ pub enum TeamError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    /// Adding the first grant to a project, or revoking its last one,
+    /// changes whether the project is gated at all — an administrative act.
+    #[error(
+        "Restricting a project to teams, or removing its last grant and re-opening it, \
+         requires an instance administrator"
+    )]
+    GatingRequiresAdmin,
+
+    #[error(
+        "Changing who can reach project {project_id} requires the {required} permission on it"
+    )]
+    ProjectPermissionDenied { project_id: i32, required: String },
+
+    #[error("Cannot apply the '{role}' role: it carries '{permission}', which you do not hold on this project")]
+    RoleCeilingExceeded { role: String, permission: String },
+
     #[error("Invalid role: {0}")]
     InvalidRole(#[from] TeamRoleParseError),
 
@@ -47,6 +63,12 @@ impl From<TeamError> for Problem {
                     .with_title("Validation Error")
                     .with_detail(error.to_string())
             }
+
+            TeamError::GatingRequiresAdmin
+            | TeamError::ProjectPermissionDenied { .. }
+            | TeamError::RoleCeilingExceeded { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Access Change Denied")
+                .with_detail(error.to_string()),
 
             TeamError::SlugConflict { .. }
             | TeamError::DuplicateMember { .. }

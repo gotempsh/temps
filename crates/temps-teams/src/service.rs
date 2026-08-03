@@ -3,10 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set,
+    sea_query::{LockType, OnConflict},
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use temps_auth::permissions::Permission;
 use temps_entities::{project_team_access, projects, team_members, teams, users, TeamRole};
 use utoipa::ToSchema;
 
@@ -65,6 +67,58 @@ pub struct UpdateMemberRoleRequest {
     pub role: TeamRole,
 }
 
+/// Authorization inputs for a grant mutation, resolved by the caller before
+/// the service takes its lock.
+///
+/// The *inputs* are gathered in the handler (it owns the `AuthContext` and
+/// the checker); the *decision* is made inside the service's transaction,
+/// against grant rows locked `FOR UPDATE`. Evaluating the rules in the
+/// handler against an unlocked read is what allowed two concurrent revokes
+/// to each believe they were not removing the last grant, and between them
+/// silently re-open the project to everyone.
+#[derive(Debug, Clone)]
+pub struct GrantAuthz {
+    /// Instance admins bypass every rule below, as they do everywhere else.
+    pub is_instance_admin: bool,
+    /// The caller's effective permissions on this project, resolved
+    /// **uncached** — a cached allow would let a just-revoked admin restore
+    /// their own access inside the staleness window.
+    pub held: std::collections::HashSet<String>,
+}
+
+impl GrantAuthz {
+    /// Unrestricted, for internal callers with no user context.
+    pub fn instance_admin() -> Self {
+        Self {
+            is_instance_admin: true,
+            held: std::collections::HashSet::new(),
+        }
+    }
+
+    fn holds(&self, permission: &Permission) -> bool {
+        self.held.contains(&permission.to_string())
+    }
+
+    /// The role a caller may not exceed when writing or removing a grant.
+    ///
+    /// Checked against the role being *written* and the role being
+    /// *overwritten*: without the latter, a project-admin could demote or
+    /// delete an `owner` grant and become the highest authority on the
+    /// project, having removed everyone above them.
+    fn check_role_ceiling(&self, role: TeamRole) -> Result<(), TeamError> {
+        if let Some(excess) = crate::role_permissions::fixed_role_permissions(role)
+            .into_iter()
+            .find(|p| !self.holds(p))
+        {
+            return Err(TeamError::RoleCeilingExceeded {
+                role: role.to_string(),
+                permission: excess.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait surface
 // ---------------------------------------------------------------------------
@@ -117,6 +171,7 @@ pub trait TeamService: Send + Sync {
         actor_user_id: i32,
         project_id: i32,
         req: CreateProjectAccessRequest,
+        authz: &GrantAuthz,
     ) -> Result<project_team_access::Model, TeamError>;
 
     async fn list_project_access(
@@ -131,7 +186,12 @@ pub trait TeamService: Send + Sync {
         team_id: i32,
     ) -> Result<Vec<project_team_access::Model>, TeamError>;
 
-    async fn revoke_project_access(&self, project_id: i32, team_id: i32) -> Result<(), TeamError>;
+    async fn revoke_project_access(
+        &self,
+        project_id: i32,
+        team_id: i32,
+        authz: &GrantAuthz,
+    ) -> Result<(), TeamError>;
 
     /// Team ids `user_id` belongs to. Used to scope the project list to
     /// what the caller can actually reach.
@@ -341,7 +401,15 @@ impl TeamService for DefaultTeamService {
         // `fk_team_members_user` and the catch-all below reports it as
         // "already a member" — an error that actively misdirects whoever is
         // debugging it.
+        //
+        // Deleting a user is a *soft* delete, so the row survives and the FK
+        // is satisfied — the checker excludes soft-deleted users from every
+        // resolution path, so adding one here would create a membership that
+        // grants nothing and shows up in the UI as a live member. Reject it
+        // at the door and report it as not existing, which is what a deleted
+        // user is from the caller's point of view.
         if users::Entity::find_by_id(req.user_id)
+            .filter(users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .is_none()
@@ -481,12 +549,65 @@ impl TeamService for DefaultTeamService {
         actor_user_id: i32,
         project_id: i32,
         req: CreateProjectAccessRequest,
+        authz: &GrantAuthz,
     ) -> Result<project_team_access::Model, TeamError> {
-        self.get_team(req.team_id).await?;
+        let txn = self.db.begin().await?;
+
+        // Lock this project's grants for the duration. Every rule below is
+        // evaluated against the locked set, so a concurrent mutation can't
+        // change the answer between the check and the write.
+        let grants = project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.eq(project_id))
+            .lock(LockType::Update)
+            .all(&txn)
+            .await?;
+
+        if !authz.is_instance_admin {
+            // Adding the first grant gates a previously-open project and
+            // locks out everyone who isn't in the named team.
+            if grants.is_empty() {
+                return Err(TeamError::GatingRequiresAdmin);
+            }
+            if !authz.holds(&Permission::ProjectsWrite) {
+                return Err(TeamError::ProjectPermissionDenied {
+                    project_id,
+                    required: Permission::ProjectsWrite.to_string(),
+                });
+            }
+            // The role being written...
+            authz.check_role_ceiling(req.role)?;
+            // ...and the role being overwritten, if this replaces a grant.
+            // Without this a project-admin could demote an `owner` team to
+            // `viewer` and become the highest authority on the project.
+            if let Some(existing) = grants.iter().find(|g| g.team_id == req.team_id) {
+                authz.check_role_ceiling(existing.role.parse()?)?;
+            }
+        }
+
+        // Team existence: for a non-admin this must not distinguish "no such
+        // team" from "not allowed", or the endpoint becomes an oracle for
+        // enumerating the instance's teams — the same leak `list_team_projects`
+        // was moved to `UsersRead` to close.
+        if teams::Entity::find_by_id(req.team_id)
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            return Err(if authz.is_instance_admin {
+                TeamError::NotFound {
+                    team_id: req.team_id,
+                }
+            } else {
+                TeamError::ProjectPermissionDenied {
+                    project_id,
+                    required: Permission::ProjectsWrite.to_string(),
+                }
+            });
+        }
         // A non-existent project_id violates `fk_project_team_access_project`
         // and would otherwise surface as an opaque 500.
         if projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?
             .is_none()
         {
@@ -522,8 +643,10 @@ impl TeamService for DefaultTeamService {
                 ])
                 .to_owned(),
             )
-            .exec_with_returning(self.db.as_ref())
+            .exec_with_returning(&txn)
             .await?;
+
+        txn.commit().await?;
 
         // Granting access changes which users may reach this project.
         if let Some(ref checker) = self.checker {
@@ -558,11 +681,51 @@ impl TeamService for DefaultTeamService {
             .await?)
     }
 
-    async fn revoke_project_access(&self, project_id: i32, team_id: i32) -> Result<(), TeamError> {
+    async fn revoke_project_access(
+        &self,
+        project_id: i32,
+        team_id: i32,
+        authz: &GrantAuthz,
+    ) -> Result<(), TeamError> {
+        let txn = self.db.begin().await?;
+
+        // Lock the project's grants before counting them. Two concurrent
+        // revokes against a two-grant project would otherwise each read
+        // "two grants, not the last one", both authorize, and between them
+        // remove every grant — silently re-opening the project to every
+        // user, which is exactly the transition this rule exists to gate.
+        let grants = project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.eq(project_id))
+            .lock(LockType::Update)
+            .all(&txn)
+            .await?;
+
+        let Some(target) = grants.iter().find(|g| g.team_id == team_id) else {
+            return Err(TeamError::ProjectAccessNotFound {
+                project_id,
+                team_id,
+            });
+        };
+
+        if !authz.is_instance_admin {
+            // Removing the last grant re-opens the project to everyone.
+            if grants.len() == 1 {
+                return Err(TeamError::GatingRequiresAdmin);
+            }
+            if !authz.holds(&Permission::ProjectsWrite) {
+                return Err(TeamError::ProjectPermissionDenied {
+                    project_id,
+                    required: Permission::ProjectsWrite.to_string(),
+                });
+            }
+            // You may not remove a grant you could not have created.
+            authz.check_role_ceiling(target.role.parse()?)?;
+        }
+
         let result = project_team_access::Entity::delete_many()
             .filter(project_team_access::Column::ProjectId.eq(project_id))
             .filter(project_team_access::Column::TeamId.eq(team_id))
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
         if result.rows_affected == 0 {
             return Err(TeamError::ProjectAccessNotFound {
@@ -570,6 +733,8 @@ impl TeamService for DefaultTeamService {
                 team_id,
             });
         }
+
+        txn.commit().await?;
         // All users who were allowed via `team_id` must now be denied.
         if let Some(ref checker) = self.checker {
             checker.invalidate_project(project_id).await;
@@ -816,5 +981,275 @@ mod tests {
                 user_id: 5
             }
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Grant/revoke authorization
+    //
+    // These rules used to live in the handler, deciding against an
+    // unlocked snapshot of the grants and a *cached* permission lookup.
+    // Each test below pins one of the escalations that made possible.
+    // -----------------------------------------------------------------
+
+    fn grant_row(id: i32, team_id: i32, role: TeamRole) -> project_team_access::Model {
+        let now = Utc::now();
+        project_team_access::Model {
+            id,
+            project_id: 42,
+            team_id,
+            role: role.to_string(),
+            granted_by: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A caller whose project-scoped permissions are exactly those of `role`.
+    fn authz_for(role: TeamRole) -> GrantAuthz {
+        GrantAuthz {
+            is_instance_admin: false,
+            held: crate::role_permissions::fixed_role_permissions(role)
+                .into_iter()
+                .map(|p| p.to_string())
+                .collect(),
+        }
+    }
+
+    fn grant_req(team_id: i32, role: TeamRole) -> CreateProjectAccessRequest {
+        CreateProjectAccessRequest { team_id, role }
+    }
+
+    #[test]
+    fn ceiling_admits_the_callers_own_role_and_everything_below() {
+        let authz = authz_for(TeamRole::Admin);
+        for role in [TeamRole::Viewer, TeamRole::Deployer, TeamRole::Admin] {
+            assert!(
+                authz.check_role_ceiling(role).is_ok(),
+                "an admin must be able to hand out {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_rejects_a_role_the_caller_does_not_hold() {
+        let err = authz_for(TeamRole::Admin)
+            .check_role_ceiling(TeamRole::Owner)
+            .unwrap_err();
+        // `owner` is `admin` + ProjectsDelete, so that is the excess.
+        assert!(matches!(
+            err,
+            TeamError::RoleCeilingExceeded { ref role, ref permission }
+                if role == "owner" && permission == &Permission::ProjectsDelete.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_will_not_gate_an_open_project_without_instance_admin() {
+        // No grants yet: adding the first one locks out every user who is
+        // not in the named team, which is an instance-admin decision.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_team_access::Model>::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                grant_req(7, TeamRole::Viewer),
+                &authz_for(TeamRole::Owner),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::GatingRequiresAdmin));
+    }
+
+    #[tokio::test]
+    async fn grant_requires_project_scoped_write_not_just_instance_write() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                grant_req(9, TeamRole::Viewer),
+                &authz_for(TeamRole::Viewer),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_cannot_write_a_role_above_the_callers_ceiling() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                grant_req(9, TeamRole::Owner),
+                &authz_for(TeamRole::Admin),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::RoleCeilingExceeded { ref role, .. } if role == "owner"
+        ));
+    }
+
+    /// The escalation the ceiling check missed while it only inspected the
+    /// role being written: a project-admin demoting the `owner` team to
+    /// `viewer`, leaving themselves the highest authority on the project.
+    #[tokio::test]
+    async fn grant_cannot_overwrite_a_grant_above_the_callers_ceiling() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                grant_row(1, 7, TeamRole::Owner),
+                grant_row(2, 9, TeamRole::Admin),
+            ]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                // The *incoming* role is below the caller's ceiling; only the
+                // role being replaced is above it.
+                grant_req(7, TeamRole::Viewer),
+                &authz_for(TeamRole::Admin),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::RoleCeilingExceeded { ref role, .. } if role == "owner"
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_does_not_tell_non_admins_which_teams_exist() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .append_query_results(vec![Vec::<teams::Model>::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                grant_req(9999, TeamRole::Viewer),
+                &authz_for(TeamRole::Owner),
+            )
+            .await
+            .unwrap_err();
+        // Not `NotFound`: distinguishing the two turns this endpoint into an
+        // oracle for enumerating every team on the instance.
+        assert!(matches!(
+            err,
+            TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_does_report_unknown_teams_to_instance_admins() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .append_query_results(vec![Vec::<teams::Model>::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                1,
+                42,
+                grant_req(9999, TeamRole::Viewer),
+                &GrantAuthz::instance_admin(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::NotFound { team_id: 9999 }));
+    }
+
+    #[tokio::test]
+    async fn revoke_reports_a_team_with_no_grant_as_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .revoke_project_access(42, 9, &GrantAuthz::instance_admin())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::ProjectAccessNotFound {
+                project_id: 42,
+                team_id: 9
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoke_will_not_ungate_a_project_without_instance_admin() {
+        // Removing the last grant re-opens the project to every user.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .revoke_project_access(42, 7, &authz_for(TeamRole::Owner))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::GatingRequiresAdmin));
+    }
+
+    #[tokio::test]
+    async fn revoke_cannot_remove_a_grant_above_the_callers_ceiling() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                grant_row(1, 7, TeamRole::Owner),
+                grant_row(2, 9, TeamRole::Admin),
+            ]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .revoke_project_access(42, 7, &authz_for(TeamRole::Admin))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::RoleCeilingExceeded { ref role, .. } if role == "owner"
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_member_rejects_a_soft_deleted_user() {
+        // The row still satisfies `fk_team_members_user`, but the checker
+        // excludes soft-deleted users from every resolution path, so the
+        // membership would grant nothing while showing as live in the UI.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_team(3)]])
+            .append_query_results(vec![Vec::<users::Model>::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .add_member(
+                1,
+                3,
+                CreateTeamMemberRequest {
+                    user_id: 77,
+                    role: TeamRole::Viewer,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TeamError::Validation { .. }));
     }
 }

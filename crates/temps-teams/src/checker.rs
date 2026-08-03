@@ -231,6 +231,27 @@ impl TeamProjectAccessChecker {
         }
     }
 
+    /// Resolves a caller's project permissions **without** consulting the
+    /// cache.
+    ///
+    /// [`effective_project_permissions`](ProjectAccessChecker::effective_project_permissions)
+    /// is cached, and its invalidation is explicitly best-effort (see the
+    /// module docs). That trade-off is fine for a read gate — the worst
+    /// case is a revoked user reading for another few seconds. It is not
+    /// fine as the gate on a privilege-*granting* write: a just-revoked
+    /// project admin could re-grant themselves from a stale entry and make
+    /// their own revocation non-durable. Callers that authorize a mutation
+    /// must use this instead.
+    pub async fn effective_project_permissions_uncached(
+        &self,
+        user_id: i32,
+        project_id: i32,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.check_permissions_uncached(user_id, project_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     /// Full cache flush, for writes affecting an unbounded set of
     /// `(user_id, project_id)` pairs — deleting a team cascades away its
     /// memberships and grants at once, and editing a custom role changes
