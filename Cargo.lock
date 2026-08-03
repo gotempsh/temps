@@ -12984,7 +12984,7 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.18",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "utoipa",
