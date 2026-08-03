@@ -198,12 +198,12 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 # Cryptography & Security
 # ============================================================================
 argon2 = "0.5"
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.0"
 hkdf = "0.13"
 totp-rs = "5.7.0"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4.3"
 # openidconnect 4.x — bumped from 3.x to clear three transitive
 # rustls-webpki CVEs (RUSTSEC-2026-0098/0099/0104) that came in via
@@ -286,7 +286,7 @@ bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless",
 # ============================================================================
 # Scheduling & Background Jobs
 # ============================================================================
-cron = "0.15.0"
+cron = "0.17.0"
 
 # ============================================================================
 # String & URL Utilities

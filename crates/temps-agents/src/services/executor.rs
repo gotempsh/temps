@@ -4131,6 +4131,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             slug: "test-app".into(),
+            template_slug: None,
             is_deleted: false,
             deleted_at: None,
             last_deployment: None,

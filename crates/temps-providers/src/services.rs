@@ -7,7 +7,7 @@ use crate::externalsvc::{
     redis::RedisService,
     rustfs::RustfsService,
     s3::S3Service,
-    AvailableContainer, ClusterMemberSpec, ExternalService, HealthProbeStatus,
+    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
     ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
@@ -430,6 +430,153 @@ impl ServiceMemberInfo {
 fn role_from_str(s: &str) -> Option<crate::ClusterRole> {
     use std::str::FromStr;
     crate::ClusterRole::from_str(s).ok()
+}
+
+/// pg_auto_failover node states, grouped by what they mean for an application.
+///
+/// These are `reportedstate` values from `pgautofailover.node` on the monitor,
+/// not our own roles — `service_members.role` is static config, while the FSM
+/// state is the runtime truth about whether anyone can serve a write.
+pub(crate) mod cluster_states {
+    /// States in which a node accepts writes.
+    ///
+    /// `wait_primary` and `single` belong here even though neither is named
+    /// "primary": pg_auto_failover clears `synchronous_standby_names` in those
+    /// states precisely so writes keep flowing while there is no standby. A
+    /// cluster sitting in `wait_primary` is unprotected, not down, and warning
+    /// that writes will fail there would be wrong.
+    pub const WRITABLE: &[&str] = &["primary", "wait_primary", "single", "apply_settings"];
+
+    /// States a node passes through during a failover.
+    ///
+    /// While any node reports one of these, an election is underway and the
+    /// absence of a writer is expected for a few seconds — so it is reported as
+    /// a failover in progress rather than a stuck cluster.
+    pub const TRANSITIONAL: &[&str] = &[
+        "prepare_promotion",
+        "stop_replication",
+        "demoted",
+        "demote_timeout",
+        "draining",
+        "prepare_maintenance",
+        "wait_maintenance",
+    ];
+}
+
+/// One data node as the monitor sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterNodeState {
+    pub name: String,
+    /// `reportedstate` — what the node last told the monitor it was doing.
+    pub state: String,
+    /// Monitor's own health check: -1 not yet checked, 0 failing, 1 responding.
+    pub health: i32,
+}
+
+impl ClusterNodeState {
+    /// Whether this node can serve a write *right now*.
+    ///
+    /// Requires both a writable FSM state and a health check that isn't
+    /// actively failing. `health == 0` alone disqualifies it: when every node
+    /// dies at once the monitor cannot promote anything, so it leaves the old
+    /// `reportedstate` in place and a dead primary keeps reporting `primary`.
+    /// `-1` (not yet checked) is not treated as failure — that would false-
+    /// alarm on a freshly registered node.
+    fn is_writable(&self) -> bool {
+        cluster_states::WRITABLE.contains(&self.state.as_str()) && self.health != 0
+    }
+
+    fn label(&self) -> String {
+        if self.health == 0 {
+            format!("{}={} (unreachable)", self.name, self.state)
+        } else {
+            format!("{}={}", self.name, self.state)
+        }
+    }
+}
+
+/// Turn the monitor's per-node states into a health verdict.
+///
+/// Split out from `probe_cluster` so the classification is testable without a
+/// live monitor — it is the part that decides what an operator is told.
+pub(crate) fn classify_cluster_states(
+    service_id: i32,
+    states: &[ClusterNodeState],
+) -> (HealthProbeStatus, Option<String>) {
+    const HEALTHY: &[&str] = &["primary", "single", "secondary"];
+
+    let listed =
+        |sel: &[ClusterNodeState]| sel.iter().map(|n| n.label()).collect::<Vec<_>>().join(", ");
+
+    let unhealthy: Vec<String> = states
+        .iter()
+        .filter(|n| !HEALTHY.contains(&n.state.as_str()) || n.health == 0)
+        .map(|n| n.label())
+        .collect();
+
+    let has_writer = states.iter().any(|n| n.is_writable());
+
+    // No node is accepting writes. This is what actually breaks an
+    // application, and it is NOT the same as "no node reports `primary`":
+    // `wait_primary` and `single` are writable, so treating those as
+    // leaderless would cry wolf on a cluster that is merely unprotected.
+    if !has_writer {
+        let failing_over = states
+            .iter()
+            .any(|n| cluster_states::TRANSITIONAL.contains(&n.state.as_str()));
+
+        // A failover in flight passes through `prepare_promotion` /
+        // `stop_replication` / `demoted` for a few seconds. Saying "no leader,
+        // go fix it" there would flap on every normal failover.
+        let message = if failing_over {
+            format!(
+                "Failover in progress — no node is accepting writes right now. \
+                 Node states: {}. This normally clears within seconds; if it \
+                 persists, promote a member explicitly.",
+                listed(states)
+            )
+        } else {
+            format!(
+                "Cluster has no leader — writes will fail. No node is in a writable state \
+                 ({}), so the monitor has not elected a primary. Node states: {}. \
+                 Recover by promoting a running member \
+                 (POST /external-services/{}/members/{{member_id}}/promote). If no member \
+                 is running, start or retry the members first — promotion needs a running \
+                 container.",
+                cluster_states::WRITABLE.join("/"),
+                listed(states),
+                service_id
+            )
+        };
+        return (HealthProbeStatus::Degraded, Some(message));
+    }
+
+    if unhealthy.is_empty() {
+        return (HealthProbeStatus::Operational, None);
+    }
+
+    // Writable, but something is off. Call out the case where writes work yet
+    // there is no standby at all: the next failure is not survivable, which is
+    // a materially different warning from "a replica is catching up".
+    let unprotected = !states
+        .iter()
+        .any(|n| n.state == "secondary" && n.health != 0);
+    let detail = format!(
+        "{}/{} data node(s) not in a healthy state: {}",
+        unhealthy.len(),
+        states.len(),
+        unhealthy.join(", ")
+    );
+    let message = if unprotected {
+        format!(
+            "Writes are being accepted, but the cluster has no healthy standby — a failure \
+             now would take it down with no node to fail over to. {detail}"
+        )
+    } else {
+        detail
+    };
+
+    (HealthProbeStatus::Degraded, Some(message))
 }
 
 fn is_role_monitor(s: &str) -> bool {
@@ -2662,7 +2809,12 @@ impl ExternalServiceManager {
         let rows_result = tokio::time::timeout(
             PROBE_TIMEOUT,
             client.query(
-                "SELECT nodename::text, nodehost::text, reportedstate::text \
+                // `health` matters as much as `reportedstate`: when every node
+                // dies at once the monitor has nothing to promote, so the FSM
+                // leaves the last reported states in place and a dead cluster
+                // still reads as `primary`/`secondary`. Only `health` reveals
+                // it. (-1 = not yet checked, 0 = failing, 1 = responding.)
+                "SELECT nodename::text, nodehost::text, reportedstate::text, health \
                  FROM pgautofailover.node",
                 &[],
             ),
@@ -2693,16 +2845,6 @@ impl ExternalServiceManager {
         let elapsed_ms = start.elapsed().as_millis();
         let response_time_ms = i32::try_from(elapsed_ms).ok();
 
-        let healthy_states = ["primary", "single", "secondary"];
-        let mut unhealthy: Vec<String> = Vec::new();
-        for row in &rows {
-            let nodename: &str = row.get(0);
-            let state: &str = row.get(2);
-            if !healthy_states.contains(&state) {
-                unhealthy.push(format!("{nodename}={state}"));
-            }
-        }
-
         if rows.is_empty() {
             // Monitor reachable but no data nodes registered — cluster is
             // half-built. Treat as Down so it's visibly broken.
@@ -2711,23 +2853,20 @@ impl ExternalServiceManager {
             ));
         }
 
-        if unhealthy.is_empty() {
-            ClusterProbeResult {
-                status: HealthProbeStatus::Operational,
-                response_time_ms,
-                error_message: None,
-            }
-        } else {
-            ClusterProbeResult {
-                status: HealthProbeStatus::Degraded,
-                response_time_ms,
-                error_message: Some(format!(
-                    "{}/{} data node(s) not in a healthy state: {}",
-                    unhealthy.len(),
-                    rows.len(),
-                    unhealthy.join(", ")
-                )),
-            }
+        let states: Vec<ClusterNodeState> = rows
+            .iter()
+            .map(|row| ClusterNodeState {
+                name: row.get::<_, &str>(0).to_string(),
+                state: row.get::<_, &str>(2).to_string(),
+                health: row.get::<_, i32>(3),
+            })
+            .collect();
+
+        let (status, error_message) = classify_cluster_states(service.id, &states);
+        ClusterProbeResult {
+            status,
+            response_time_ms,
+            error_message,
         }
     }
 
@@ -4528,6 +4667,78 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Node id the API uses for the control plane in the node list.
+    ///
+    /// It is synthetic — there is no `nodes` row for the control plane, and
+    /// containers it runs are stored with `node_id = NULL`. Mirrors
+    /// `CONTROL_PLANE_NODE_ID` in `temps-deployments`.
+    const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+    /// Normalize and validate the node placement of every requested member.
+    ///
+    /// Returns the requests with the control-plane pseudo-node collapsed to
+    /// `None` (which is how local placement is represented everywhere else),
+    /// and fails with a validation error naming the offending member if any
+    /// remaining id has no `nodes` row.
+    ///
+    /// Runs before any container is created so an unknown node is a rejected
+    /// request rather than a half-built cluster.
+    async fn resolve_member_placement(
+        db: &DatabaseConnection,
+        service_id: i32,
+        member_requests: &[ClusterMemberRequest],
+    ) -> Result<Vec<ClusterMemberRequest>, ExternalServiceError> {
+        let normalized: Vec<ClusterMemberRequest> = member_requests
+            .iter()
+            .map(|m| ClusterMemberRequest {
+                role: m.role.clone(),
+                node_id: match m.node_id {
+                    Some(Self::CONTROL_PLANE_NODE_ID) | None => None,
+                    Some(id) => Some(id),
+                },
+            })
+            .collect();
+
+        // One query for every distinct remote id rather than a lookup per
+        // member.
+        let mut wanted: Vec<i32> = normalized.iter().filter_map(|m| m.node_id).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        if wanted.is_empty() {
+            return Ok(normalized);
+        }
+
+        let found: Vec<i32> = nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(wanted.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Unknown node id(s) [{}] requested for cluster members. Use an id from \
+                     the node list, or omit it (or use {}) to place the member on the \
+                     control plane.",
+                    missing.join(", "),
+                    Self::CONTROL_PLANE_NODE_ID
+                ),
+            });
+        }
+
+        Ok(normalized)
+    }
+
     /// Initialize a cluster service: create member containers across nodes,
     /// then record them in the service_members table.
     async fn initialize_cluster(
@@ -4571,6 +4782,22 @@ echo "[restore] Pre-seed complete"
                 });
             }
         }
+
+        // Resolve placement before anything is created.
+        //
+        // Two things go wrong without this. The node list API surfaces the
+        // control plane as a synthetic node with id 0 — it has no `nodes` row,
+        // because containers it runs are stored with `node_id = NULL` — so a
+        // member placed on it used to reach the node lookup below and fail
+        // with `Internal error: Node 0 not found`. And an id that simply
+        // doesn't exist failed the same way, mid-creation, after other members
+        // had already been built.
+        //
+        // Node 0 is normalized to `None` (the local/control-plane placement it
+        // actually denotes), and every other id is checked up front so a bad
+        // request is a validation error before any container exists.
+        let member_requests =
+            &Self::resolve_member_placement(self.db.as_ref(), service_id, member_requests).await?;
 
         // Parameter decryption only after validation has passed; otherwise
         // operators creating a cluster with an unsupported type or invalid
@@ -4643,6 +4870,24 @@ echo "[restore] Pre-seed complete"
                 id: service_id,
                 reason: format!("Cluster init_cluster failed: {}", e),
             })?;
+
+        // Record the intended membership before building anything.
+        //
+        // These rows used to be inserted one at a time inside the creation
+        // loop below, which meant a failure before the first container — a bad
+        // config, an unreachable node, a parse error — left the service
+        // `failed` with zero `service_members`. Retry reconstructs its member
+        // list from exactly those rows, so it had nothing to work from and
+        // dead-ended on "no previous member records found", telling the
+        // operator to supply a members array the console has no way to send.
+        // Delete-and-recreate was the only way out.
+        //
+        // Writing them up front makes the requested topology durable from the
+        // start, so every later failure is retryable. Rows are `pending` until
+        // their container exists.
+        let pre_created =
+            precreate_cluster_members(self.db.as_ref(), service_id, &member_results, &member_specs)
+                .await?;
 
         // Get the Postgres cluster service for building member params
         let pg_cluster = match service_type {
@@ -4720,27 +4965,23 @@ echo "[restore] Pre-seed complete"
                 // catching up was the bug behind the "two primaries"
                 // display. Treating roles as static config eliminates the
                 // class.
-                let stored_role = if is_role_monitor(&result.role) {
-                    "monitor".to_string()
-                } else {
-                    "replica".to_string()
+                // The row already exists — it was written before any container
+                // work started so a failure here is still retryable. Move it
+                // from `pending` to `creating`.
+                let member_model = {
+                    let existing = pre_created.get(&result.ordinal).cloned().ok_or(
+                        ExternalServiceError::InternalError {
+                            reason: format!(
+                                "No pre-created member record for ordinal {} of service {}",
+                                result.ordinal, service_id
+                            ),
+                        },
+                    )?;
+                    let mut active: service_members::ActiveModel = existing.into();
+                    active.status = Set("creating".to_string());
+                    active.updated_at = Set(Utc::now());
+                    active.update(self.db.as_ref()).await?
                 };
-                let member_record = service_members::ActiveModel {
-                    service_id: Set(service_id),
-                    node_id: Set(spec.node_id),
-                    role: Set(stored_role),
-                    container_id: Set(None),
-                    container_name: Set(result.container_name.clone()),
-                    hostname: Set(spec.hostname.clone()),
-                    port: Set(None),
-                    status: Set("creating".to_string()),
-                    ordinal: Set(result.ordinal),
-                    config: Set(None),
-                    created_at: Set(Utc::now()),
-                    updated_at: Set(Utc::now()),
-                    ..Default::default()
-                };
-                let member_model = member_record.insert(self.db.as_ref()).await?;
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
                 let member_port = if is_role_monitor(&spec.role) {
@@ -9893,6 +10134,47 @@ fn compute_stats_sample(
     }
 }
 
+/// Persist the complete intended topology as one transaction so a database
+/// failure cannot leave a retry with only a prefix of the requested members.
+async fn precreate_cluster_members(
+    db: &DatabaseConnection,
+    service_id: i32,
+    member_results: &[ClusterMemberResult],
+    member_specs: &[ClusterMemberSpec],
+) -> Result<HashMap<i32, service_members::Model>, ExternalServiceError> {
+    let transaction = db.begin().await?;
+    let mut pre_created = HashMap::new();
+
+    for (result, spec) in member_results.iter().zip(member_specs.iter()) {
+        let stored_role = if is_role_monitor(&result.role) {
+            "monitor".to_string()
+        } else {
+            "replica".to_string()
+        };
+        let now = Utc::now();
+        let record = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(spec.node_id),
+            role: Set(stored_role),
+            container_id: Set(None),
+            container_name: Set(result.container_name.clone()),
+            hostname: Set(spec.hostname.clone()),
+            port: Set(None),
+            status: Set("pending".to_string()),
+            ordinal: Set(result.ordinal),
+            config: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let model = record.insert(&transaction).await?;
+        pre_created.insert(result.ordinal, model);
+    }
+
+    transaction.commit().await?;
+    Ok(pre_created)
+}
+
 /// Rewrites env var values for cross-node deployments.
 ///
 /// Replaces container names and localhost references with the service node's
@@ -9929,6 +10211,349 @@ fn rewrite_env_vars_for_cross_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cluster write availability ──────────────────────────────────────
+
+    /// Healthy-by-default node states (health = 1, i.e. responding).
+    fn st(pairs: &[(&str, &str)]) -> Vec<ClusterNodeState> {
+        pairs
+            .iter()
+            .map(|(n, s)| ClusterNodeState {
+                name: n.to_string(),
+                state: s.to_string(),
+                health: 1,
+            })
+            .collect()
+    }
+
+    /// Node states with an explicit monitor health value.
+    fn st_h(triples: &[(&str, &str, i32)]) -> Vec<ClusterNodeState> {
+        triples
+            .iter()
+            .map(|(n, s, h)| ClusterNodeState {
+                name: n.to_string(),
+                state: s.to_string(),
+                health: *h,
+            })
+            .collect()
+    }
+
+    /// The total-outage case, and the reason `health` is read at all: when
+    /// every node dies at once the monitor has nothing to promote, so it never
+    /// demotes anyone and `reportedstate` still says primary/secondary. Judging
+    /// on state alone reported a dead cluster as Operational.
+    #[test]
+    fn test_all_nodes_unreachable_is_leaderless_despite_stale_primary_state() {
+        let (status, msg) = classify_cluster_states(
+            2,
+            &st_h(&[("node-1", "primary", 0), ("node-2", "secondary", 0)]),
+        );
+        let msg = msg.expect("a dead cluster must not be silent");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(msg.contains("no leader"), "got: {msg}");
+        assert!(msg.contains("writes will fail"), "got: {msg}");
+        // The operator needs to see it is a reachability problem, not an
+        // election problem — the state still reads "primary".
+        assert!(msg.contains("node-1=primary (unreachable)"), "got: {msg}");
+    }
+
+    /// A primary the monitor has not yet health-checked (-1) must not be
+    /// treated as dead, or every freshly registered cluster would alarm.
+    #[test]
+    fn test_unchecked_health_is_not_treated_as_failure() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st_h(&[("node-1", "primary", -1), ("node-2", "secondary", -1)]),
+        );
+        assert_eq!(status, HealthProbeStatus::Operational, "got: {msg:?}");
+    }
+
+    /// A live primary with a dead standby still serves writes — that is the
+    /// unprotected warning, not the leaderless one.
+    #[test]
+    fn test_dead_standby_leaves_a_working_primary() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st_h(&[("node-1", "primary", 1), ("node-2", "secondary", 0)]),
+        );
+        let msg = msg.expect("degraded");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+        assert!(msg.contains("no healthy standby"), "got: {msg}");
+        assert!(msg.contains("node-2=secondary (unreachable)"), "got: {msg}");
+    }
+
+    /// The condition that actually breaks an application: nothing can accept a
+    /// write. The operator has to be told that plainly, and told how to get out
+    /// of it — the promote endpoint is the only self-service recovery.
+    #[test]
+    fn test_no_writable_node_warns_about_writes_and_names_the_recovery() {
+        let (status, msg) = classify_cluster_states(
+            7,
+            &st(&[("node-1", "catchingup"), ("node-2", "wait_standby")]),
+        );
+        let msg = msg.expect("must explain itself");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(msg.contains("no leader"), "got: {msg}");
+        assert!(msg.contains("writes will fail"), "got: {msg}");
+        // Actionable: names the endpoint and the service it applies to.
+        assert!(msg.contains("/external-services/7/members/"), "got: {msg}");
+        assert!(msg.contains("promote"), "got: {msg}");
+        // And still lists the states, so the operator can see why.
+        assert!(msg.contains("node-1=catchingup"), "got: {msg}");
+    }
+
+    /// `wait_primary` accepts writes — pg_auto_failover clears
+    /// `synchronous_standby_names` there so the cluster keeps serving without a
+    /// standby. Warning "writes will fail" would be flatly wrong, and this is
+    /// the exact state a half-built cluster sits in.
+    #[test]
+    fn test_wait_primary_is_not_reported_as_leaderless() {
+        let (status, msg) = classify_cluster_states(
+            1,
+            &st(&[("node-1", "wait_primary"), ("node-2", "wait_standby")]),
+        );
+        let msg = msg.expect("still degraded — no standby");
+
+        assert_eq!(status, HealthProbeStatus::Degraded);
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+        assert!(!msg.contains("no leader"), "got: {msg}");
+        // It gets the milder, accurate warning instead.
+        assert!(msg.contains("Writes are being accepted"), "got: {msg}");
+        assert!(msg.contains("no healthy standby"), "got: {msg}");
+    }
+
+    /// `single` is a one-node cluster: writable, and legitimately has no
+    /// standby.
+    #[test]
+    fn test_single_node_is_writable() {
+        let (status, msg) = classify_cluster_states(1, &st(&[("node-1", "single")]));
+        assert_eq!(status, HealthProbeStatus::Operational);
+        assert!(msg.is_none(), "got: {msg:?}");
+    }
+
+    /// A failover passes through these states for a few seconds. Reporting a
+    /// stuck cluster there would flap on every normal promotion.
+    #[test]
+    fn test_failover_in_flight_is_not_reported_as_stuck() {
+        for transient in ["prepare_promotion", "stop_replication", "demoted"] {
+            let (status, msg) =
+                classify_cluster_states(1, &st(&[("node-1", transient), ("node-2", "catchingup")]));
+            let msg = msg.expect("should say something");
+
+            assert_eq!(status, HealthProbeStatus::Degraded);
+            assert!(
+                msg.contains("Failover in progress"),
+                "{transient} should read as a failover, got: {msg}"
+            );
+            assert!(
+                !msg.contains("writes will fail"),
+                "{transient} must not be reported as permanently broken, got: {msg}"
+            );
+        }
+    }
+
+    /// A healthy pair stays quiet — no warning fatigue.
+    #[test]
+    fn test_primary_plus_secondary_is_operational() {
+        let (status, msg) =
+            classify_cluster_states(1, &st(&[("node-1", "primary"), ("node-2", "secondary")]));
+        assert_eq!(status, HealthProbeStatus::Operational);
+        assert!(msg.is_none());
+    }
+
+    /// A primary with a replica still catching up is degraded, but it has a
+    /// standby — so it must NOT get the "no standby" wording.
+    #[test]
+    fn test_catching_up_replica_is_degraded_but_not_unprotected() {
+        let (_, msg) =
+            classify_cluster_states(1, &st(&[("node-1", "primary"), ("node-2", "catchingup")]));
+        let msg = msg.expect("degraded");
+        assert!(msg.contains("node-2=catchingup"), "got: {msg}");
+        assert!(!msg.contains("writes will fail"), "got: {msg}");
+    }
+
+    // ── Cluster member placement ────────────────────────────────────────
+
+    fn member(role: &str, node_id: Option<i32>) -> ClusterMemberRequest {
+        ClusterMemberRequest {
+            role: role.to_string(),
+            node_id,
+        }
+    }
+
+    fn nodes_test_model(id: i32) -> nodes::Model {
+        nodes::Model {
+            id,
+            name: format!("worker-{id}"),
+            token_hash: "hash".to_string(),
+            token_encrypted: None,
+            address: "http://10.0.0.2:3100".to_string(),
+            private_address: "10.0.0.2".to_string(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            labels: serde_json::json!({}),
+            capacity: serde_json::json!({}),
+            last_heartbeat: None,
+            edge_public_key: None,
+            compute_cidr: None,
+            architecture: None,
+            underlay_address: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn db_with_nodes(rows: Vec<nodes::Model>) -> DatabaseConnection {
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![rows])
+            .into_connection()
+    }
+
+    /// The node list surfaces the control plane as id 0, but it has no `nodes`
+    /// row — local placement is `None` everywhere else. Without collapsing it,
+    /// creating a cluster member there failed with
+    /// `Internal error: Node 0 not found`.
+    #[tokio::test]
+    async fn test_control_plane_node_id_resolves_to_local() {
+        let db = db_with_nodes(vec![]);
+        let resolved = ExternalServiceManager::resolve_member_placement(
+            &db,
+            1,
+            &[member("monitor", Some(0)), member("replica", None)],
+        )
+        .await
+        .expect("node 0 is the control plane, not an unknown node");
+
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().all(|m| m.node_id.is_none()),
+            "both members should be local: {:?}",
+            resolved.iter().map(|m| m.node_id).collect::<Vec<_>>()
+        );
+        // Roles must survive normalization untouched.
+        assert_eq!(resolved[0].role, "monitor");
+        assert_eq!(resolved[1].role, "replica");
+    }
+
+    /// An id that has no row must be rejected as a validation error *before*
+    /// any container is created — it used to surface as an internal error
+    /// partway through building the cluster.
+    #[tokio::test]
+    async fn test_unknown_node_id_is_a_validation_error() {
+        let db = db_with_nodes(vec![]);
+        let err = ExternalServiceManager::resolve_member_placement(
+            &db,
+            7,
+            &[member("replica", Some(42))],
+        )
+        .await
+        .expect_err("node 42 does not exist");
+
+        match err {
+            ExternalServiceError::ParameterValidationFailed { service_id, reason } => {
+                assert_eq!(service_id, 7);
+                assert!(reason.contains("42"), "must name the bad id: {reason}");
+            }
+            other => panic!("expected ParameterValidationFailed, got {other:?}"),
+        }
+    }
+
+    /// A real worker id passes through so remote placement still works.
+    #[tokio::test]
+    async fn test_known_node_id_is_preserved() {
+        let db = db_with_nodes(vec![nodes_test_model(3)]);
+
+        let resolved =
+            ExternalServiceManager::resolve_member_placement(&db, 1, &[member("replica", Some(3))])
+                .await
+                .expect("node 3 exists");
+
+        assert_eq!(resolved[0].node_id, Some(3));
+    }
+
+    fn cluster_member_result(ordinal: i32, role: &str) -> ClusterMemberResult {
+        ClusterMemberResult {
+            ordinal,
+            role: role.to_string(),
+            container_id: String::new(),
+            container_name: format!("cluster-member-{ordinal}"),
+            port: None,
+            status: "pending".to_string(),
+        }
+    }
+
+    fn service_member_model(id: i32, ordinal: i32, role: &str) -> service_members::Model {
+        service_members::Model {
+            id,
+            service_id: 7,
+            node_id: None,
+            role: role.to_string(),
+            container_id: None,
+            container_name: format!("cluster-member-{ordinal}"),
+            hostname: None,
+            port: None,
+            compute_ip: None,
+            status: "pending".to_string(),
+            ordinal,
+            config: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_precreated_cluster_topology_is_one_transaction() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![service_member_model(1, 0, "monitor")],
+                vec![service_member_model(2, 1, "replica")],
+            ])
+            .into_connection();
+        let results = [
+            cluster_member_result(0, "monitor"),
+            cluster_member_result(1, "replica"),
+        ];
+        let specs = [
+            ClusterMemberSpec {
+                role: "monitor".to_string(),
+                node_id: None,
+                ordinal: 0,
+                hostname: None,
+            },
+            ClusterMemberSpec {
+                role: "replica".to_string(),
+                node_id: None,
+                ordinal: 1,
+                hostname: None,
+            },
+        ];
+
+        let created = precreate_cluster_members(&db, 7, &results, &specs)
+            .await
+            .expect("the full topology should commit");
+        assert_eq!(created.len(), 2);
+
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "all member inserts must commit as one transaction"
+        );
+        let insert_count = log[0]
+            .statements()
+            .iter()
+            .filter(|statement| statement.sql.starts_with("INSERT INTO \"service_members\""))
+            .count();
+        assert_eq!(insert_count, 2);
+    }
 
     fn test_s3_credentials() -> crate::S3Credentials {
         crate::S3Credentials {

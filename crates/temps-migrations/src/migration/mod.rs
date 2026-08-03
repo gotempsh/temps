@@ -168,6 +168,7 @@ mod m20260730_000001_add_architecture_to_nodes;
 mod m20260802_000001_add_environment_force_https;
 mod m20260802_000002_create_feature_flags;
 mod m20260803_000001_add_flag_last_evaluated_at;
+mod m20260803_000001_add_template_slug_to_projects;
 
 pub struct Migrator;
 
@@ -343,6 +344,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260802_000001_add_environment_force_https::Migration),
             Box::new(m20260802_000002_create_feature_flags::Migration),
             Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
+            Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
         ]
     }
 }

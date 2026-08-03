@@ -60,6 +60,25 @@ interface ProjectCardProps {
   health?: ProjectMonitorHealth
 }
 
+/**
+ * How to describe the timestamp on the project card.
+ *
+ * Only a completed deployment gets to be called "Deployed" — anything else is
+ * an attempt, and labelling a failed run as a deployment is how a red project
+ * ended up claiming it had deployed.
+ */
+export function deploymentLabel(status?: string | null): string {
+  switch (status) {
+    case 'completed':
+      return 'Deployed'
+    case 'running':
+    case 'pending':
+      return 'Deploying, started'
+    default:
+      return 'Last attempt'
+  }
+}
+
 function HealthStatusDot({ status }: { status: string }) {
   const colors: Record<string, string> = {
     operational: 'bg-emerald-500',
@@ -143,7 +162,15 @@ export function ProjectCard({
                 </div>
                 {project.last_deployment && (
                   <p className="text-xs text-muted-foreground">
-                    Deployed <TimeAgo date={project.last_deployment} />
+                    {/*
+                      `last_deployment` is stamped when a deployment is
+                      *attempted*, not when one succeeds. A project whose only
+                      run failed at the first job still has it set, so saying
+                      "Deployed" there claims something that never happened —
+                      and it sat next to a red status dot, contradicting it.
+                    */}
+                    {deploymentLabel(lastDeployment?.status)}{' '}
+                    <TimeAgo date={project.last_deployment} />
                   </p>
                 )}
               </div>

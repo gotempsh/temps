@@ -27,7 +27,7 @@ axum = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 tower-http = { workspace = true }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = { workspace = true }
 hkdf = { workspace = true }
 rand = { workspace = true }
