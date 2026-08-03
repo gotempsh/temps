@@ -37,7 +37,7 @@ serde_derive = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
-cron = "0.15.0"
+cron = "0.17.0"
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
