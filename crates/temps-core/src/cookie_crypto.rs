@@ -1,10 +1,5 @@
-// Note: Deprecation warnings from generic-array 0.14.x are expected
-// These will be resolved when aes-gcm upgrades to 0.11.0 (currently in RC)
-// which uses generic-array 1.x
-#![allow(deprecated)]
-
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
 use axum::http::StatusCode;
@@ -67,20 +62,24 @@ impl CookieCrypto {
             ));
         }
 
-        // Use the new API that doesn't allocate - just use the reference
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|error| CryptoError::InvalidKey(error.to_string()))?;
         Ok(Self { cipher })
     }
 
     /// Creates a new CookieCrypto from a raw 32-byte array (for backward compatibility)
     pub fn from_bytes(secret_key: &[u8; 32]) -> Self {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(secret_key));
+        let key = Key::<Aes256Gcm>::from(*secret_key);
+        let cipher = Aes256Gcm::new(&key);
         Self { cipher }
     }
 
     /// Encrypt a string value for use in cookies
     pub fn encrypt(&self, plaintext: &str) -> Result<String, CryptoError> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut nonce_bytes = [0u8; 12];
+        crate::ecies::fill_secure_random_bytes("generating a cookie nonce", &mut nonce_bytes)
+            .map_err(|error| CryptoError::EncryptionError(error.to_string()))?;
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext.as_bytes())
@@ -106,10 +105,11 @@ impl CookieCrypto {
 
         // Split nonce and ciphertext
         let (nonce_bytes, ciphertext) = combined.split_at(12);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError::InvalidFormat)?;
 
         let plaintext = self
             .cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|e| CryptoError::DecryptionError(e.to_string()))?;
 
         String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidFormat)
