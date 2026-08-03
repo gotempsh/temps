@@ -822,6 +822,12 @@ impl ConversationService {
         //   every tool result is replayed on every later round. Without it a
         //   long turn blows the context window instead of finishing.
         const MAX_ROUNDS: usize = 40;
+        // A turn also has to end in bounded *time*, not just bounded steps. The
+        // step count says nothing about cost or about how long someone has been
+        // watching a spinner: 40 rounds against a slow local model is over an
+        // hour. This is the ceiling that actually protects the operator's
+        // provider bill, since it holds however fast or slow each round is.
+        const MAX_TURN_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         const MAX_CONSECUTIVE_UNPRODUCTIVE_ROUNDS: usize = 3;
         const MAX_CARRIED_TOOL_BYTES: usize = 192 * 1024;
         // Directive appended before the final, tool-free answer so the model
@@ -901,8 +907,13 @@ impl ConversationService {
             let mut stop_reason: Option<&'static str> = None;
             // Consecutive rounds in which every tool call was rejected.
             let mut unproductive_streak = 0usize;
+            let turn_started = tokio::time::Instant::now();
 
             'rounds: for _ in 0..MAX_ROUNDS {
+                if turn_started.elapsed() >= MAX_TURN_DURATION {
+                    stop_reason = Some("stopped after running for too long");
+                    break 'rounds;
+                }
                 let req = ChatTurnRequest {
                     purpose: format!("chat.{context_type}.tools"),
                     project_id: Some(project_id),
@@ -1070,7 +1081,15 @@ impl ConversationService {
                         } else {
                             format!("Tool '{}' is not available in this context.", tc.name)
                         };
-                        seen_calls.insert(call_key, r.clone());
+                        // Retain only a capped copy. `seen_calls` exists to detect
+                        // repeats and to record that a backtest ran — neither
+                        // needs the whole payload, and keeping it would hold
+                        // every result of the turn at full size in memory while
+                        // `trim_carried_tool_results` was busy bounding the very
+                        // same data in the transcript. It also means the
+                        // repeat-guard cannot resurrect a trimmed result at its
+                        // original size.
+                        seen_calls.insert(call_key, summarize_for_recall(&r));
                         r
                     };
                     // Surface the result right after — live.
@@ -1307,6 +1326,30 @@ impl ConversationService {
 // Write-tool dispatch helper (free function so the spawned task can borrow it)
 // ---------------------------------------------------------------------------
 
+/// Cap what is kept for repeat-detection and the backtest check.
+///
+/// These two uses need to know *that* a call happened and roughly what came
+/// back, not the whole payload — and a tool result can be 128 KiB. Retaining
+/// every one at full size for the length of a turn would hold megabytes per
+/// concurrent chat, and would quietly undo [`trim_carried_tool_results`], since
+/// the repeat guard feeds this copy back into the transcript.
+fn summarize_for_recall(result: &str) -> String {
+    const MAX: usize = 4 * 1024;
+    if result.len() <= MAX {
+        return result.to_string();
+    }
+    // Cut on a char boundary — `result` is arbitrary tool output, so slicing
+    // blind would panic on any multi-byte character straddling the limit.
+    let mut end = MAX;
+    while end > 0 && !result.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[… truncated for recall; re-run the command if you need the rest]",
+        &result[..end]
+    )
+}
+
 /// Did a tool call produce something the model can reason from, or only a
 /// rejection?
 ///
@@ -1332,6 +1375,10 @@ fn tool_result_is_productive(result: &str) -> bool {
         // future tool, hence the explicit allow-list of known rejections rather
         // than treating all prose as failure.
         Err(_) => {
+            // Kept next to the messages they mirror. If a rejection is reworded
+            // without updating this, the effect is that a stuck turn runs longer
+            // (bounded by MAX_ROUNDS and the deadline) rather than a working turn
+            // being cut short — the safe direction, but still worth keeping true.
             const REJECTIONS: &[&str] = &[
                 "Unknown parameter(s)",
                 "Missing required parameters",
@@ -1409,13 +1456,29 @@ const BACKTEST_REQUIRED: &[(&str, &str)] = &[
 /// legitimately tunes a threshold between backtest and proposal, and demanding
 /// byte-identical config would just make the requirement impossible to satisfy.
 /// The goal is that the model has *looked*, not that it never adjusted after.
+///
+/// The check is deliberately scoped to the CURRENT turn. A follow-up like "now
+/// create that alert" therefore backtests again, which reads like friction but
+/// is the correct behaviour: it is a new proposal, the metric has moved since,
+/// and a backtest from an earlier turn says nothing about the threshold being
+/// proposed now. Honouring an older one would keep the requirement satisfiable
+/// while quietly voiding what it guarantees — and the re-run is read-only and
+/// costs a single round.
 fn missing_backtest(
     command: &str,
     seen_calls: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let (op, backtest_op) = BACKTEST_REQUIRED
-        .iter()
-        .find(|(op, _)| command.split_whitespace().any(|t| t == *op))?;
+    // Match the operation in COMMAND POSITION only. The CLI form is
+    // `[section] <operation> --flags…`, so scanning every token would also fire
+    // on an operation name that merely appears inside an argument (a rule named
+    // "create_alert", say) and demand a backtest for an unrelated call.
+    let position = command
+        .split_whitespace()
+        .take_while(|t| !t.starts_with("--"))
+        .take(2);
+    let (op, backtest_op) = position
+        .filter_map(|token| BACKTEST_REQUIRED.iter().find(|(op, _)| token == *op))
+        .next()?;
 
     let ran_backtest = seen_calls.iter().any(|(key, result)| {
         // Key is "<tool>|<raw args>"; the read CLI carries the operation name in
@@ -1658,6 +1721,49 @@ mod tests {
         assert!(tool_result_is_productive(
             "The deployment finished at 12:04 and the container is healthy."
         ));
+    }
+
+    /// What is retained for recall must be bounded, or a turn holds every tool
+    /// result at full size in memory while the transcript trimming is busy
+    /// bounding the very same data.
+    #[test]
+    fn recall_copies_are_capped() {
+        let small = "a short result";
+        assert_eq!(summarize_for_recall(small), small);
+
+        let huge = "x".repeat(200_000);
+        let kept = summarize_for_recall(&huge);
+        assert!(kept.len() < 5 * 1024, "not capped: {} bytes", kept.len());
+        assert!(kept.contains("truncated for recall"));
+    }
+
+    /// Tool output is arbitrary text, so the cap has to land on a character
+    /// boundary — slicing blind panics on a multi-byte character across it.
+    #[test]
+    fn recall_cap_does_not_split_a_multibyte_character() {
+        // 'é' is two bytes; a run of them guarantees a boundary at the cut.
+        let multibyte = "é".repeat(100_000);
+        let kept = summarize_for_recall(&multibyte);
+        assert!(kept.contains("truncated for recall"));
+    }
+
+    /// The gate must read the operation in command position, not anywhere in
+    /// the string — an alert *named* `create_alert` must not make an unrelated
+    /// call demand a backtest.
+    #[test]
+    fn backtest_gate_ignores_operation_names_inside_arguments() {
+        let seen = HashMap::new();
+        assert!(
+            missing_backtest(
+                "deployments trigger_project_pipeline --name create_alert",
+                &seen
+            )
+            .is_none(),
+            "an operation name in an argument must not trip the gate"
+        );
+        // ...while the real thing still does, with or without a section prefix.
+        assert!(missing_backtest("alerts create_alert --metric_name x", &seen).is_some());
+        assert!(missing_backtest("create_alert --metric_name x", &seen).is_some());
     }
 
     #[test]
