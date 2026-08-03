@@ -1704,4 +1704,51 @@ mod tests {
             "error message must include project_id, got: {msg}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Authorization lookups (added with the project-scoping fix)
+    //
+    // These resolve the project that owns a session/visitor so the
+    // handlers can run `project_access_guard!`. If they ever stop
+    // returning the owning project, the guard silently checks the wrong
+    // project — so pin the behaviour.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_returns_owning_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_session_model(7, "sess-x", 42)]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(svc.project_id_for_session_pk(7).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_errors_when_missing() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<session_replay_sessions::Model>::new()])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert!(svc.project_id_for_session_pk(999).await.is_err());
+    }
+
+    /// Deliberately does NOT filter on `is_active`: an authorization
+    /// decision has to be made for the row that exists, or an ended
+    /// session falls out of scoping entirely and becomes readable by
+    /// anyone.
+    #[tokio::test]
+    async fn project_id_for_session_replay_id_resolves_inactive_sessions() {
+        let mut inactive = make_session_model(7, "sess-x", 42);
+        inactive.is_active = false;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![inactive]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(
+            svc.project_id_for_session_replay_id("sess-x")
+                .await
+                .unwrap(),
+            42
+        );
+    }
 }

@@ -270,8 +270,19 @@ async fn resolve_hidden_projects(
     let Some(checker) = state.project_access_checker.as_ref() else {
         return Ok(Vec::new());
     };
+    // Fail closed, matching `project_permission_guard!`. Unreachable today
+    // (deployment tokens are the only user-less auth source and are handled
+    // above), but "hide nothing" on an unresolvable identity means "show
+    // every project", so a future auth source must not land here silently.
     let Some(user_id) = auth.user_id_opt() else {
-        return Ok(Vec::new());
+        tracing::error!("project list filtering: authenticated caller has no user id");
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/project-access-denied")
+                .title("Project Access Denied")
+                .detail("Could not resolve caller identity")
+                .build(),
+        );
     };
     match checker.hidden_project_ids(user_id).await {
         Ok(hidden) => Ok(hidden.unwrap_or_default()),

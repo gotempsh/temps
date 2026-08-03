@@ -595,7 +595,13 @@ pub async fn list_team_projects(
     State(state): State<Arc<TeamsAppState>>,
     Path(team_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsRead);
+    // `UsersRead`, not `ProjectsRead`, to match the rest of this crate.
+    // `ProjectsRead` is held by `Role::User` and `Role::Reader`, and team
+    // ids are small sequential integers — guarding on it would let any
+    // low-privilege account walk the whole access-control matrix (which
+    // project is gated, to which team, at what role), defeating the
+    // project-list filtering this feature exists to provide.
+    permission_guard!(auth, UsersRead);
     let grants = state.team_service.list_team_projects(team_id).await?;
     let responses: Result<Vec<_>, _> = grants
         .into_iter()

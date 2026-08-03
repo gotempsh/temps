@@ -730,6 +730,9 @@ pub async fn add_events(
         .get_project_id_for_session(&session_id)
         .await
         .map_err(Problem::from)?;
+    // Sixth handler on this route group keyed by session id rather than
+    // project id — same scoping gap as the five reads, and this one writes.
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     match state
         .session_replay_service

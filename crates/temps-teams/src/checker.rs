@@ -58,7 +58,12 @@
 //! `moka::future::Cache<(user_id, project_id), bool>`, 60 s TTL,
 //! 10 000-entry capacity, for the binary check. A second cache of the same
 //! shape holds `Option<Vec<String>>` for the permission resolution.
-//! Explicit invalidation (not just TTL) is required after writes:
+//! Explicit invalidation (not just TTL) is required after writes. It is
+//! best-effort rather than a hard guarantee: a check that read the DB
+//! before a revocation but inserts into the cache after the eviction sweep
+//! can still serve a stale allow until the TTL expires, and invalidation is
+//! process-local, so on a multi-node control plane other nodes converge on
+//! the TTL. Both windows are bounded by `CACHE_TTL`.
 //!
 //! - [`invalidate_project`](TeamProjectAccessChecker::invalidate_project) —
 //!   `grant_project_access` / `revoke_project_access`
@@ -74,10 +79,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_auth::permissions::Permission;
 use temps_core::{MembershipPermissionResolver, ProjectAccessChecker};
-use temps_entities::{project_team_access, team_members};
+use temps_entities::{project_team_access, team_members, users};
 
 use crate::role_permissions::fixed_role_permissions;
 
@@ -262,6 +267,12 @@ impl TeamProjectAccessChecker {
         let any_membership = team_members::Entity::find()
             .filter(team_members::Column::UserId.eq(user_id))
             .filter(team_members::Column::TeamId.is_in(granted_team_ids))
+            // A soft-deleted user keeps their membership rows (deletion sets
+            // `deleted_at`, it does not remove the row, so the FK cascade
+            // never fires). Offboarding must revoke project access here even
+            // if a credential outlives the account.
+            .inner_join(users::Entity)
+            .filter(users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await
             .map_err(|source| CheckerError::MembershipQuery {
@@ -281,14 +292,41 @@ impl TeamProjectAccessChecker {
     /// was revoked — the exact leak the filter exists to prevent. Two
     /// index-covered queries on small tables is the right trade.
     async fn hidden_project_ids_uncached(&self, user_id: i32) -> Result<Vec<i32>, CheckerError> {
-        // Every gated project and the teams granted on it. A project with
-        // no row here is unrestricted and never hidden.
-        let grants = project_team_access::Entity::find()
+        // The user's teams first — bounded by how many teams one person is
+        // in, which is small.
+        let memberships = team_members::Entity::find()
+            .filter(team_members::Column::UserId.eq(user_id))
+            .inner_join(users::Entity)
+            .filter(users::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(|source| CheckerError::MembershipQuery {
+                user_id,
+                // Not scoped to one project — 0 reads as "all projects" in
+                // the error message context.
+                project_id: 0,
+                source,
+            })?;
+        let user_team_ids: Vec<i32> = memberships.into_iter().map(|m| m.team_id).collect();
+
+        // Only the two columns needed, and only for gated projects. Loading
+        // whole grant rows for the entire instance on every project-list
+        // request would be an unbounded read on the control plane's hot
+        // dashboard path (CLAUDE.md: never load an unbounded set into a Vec).
+        #[derive(sea_orm::FromQueryResult)]
+        struct GrantKey {
+            project_id: i32,
+            team_id: i32,
+        }
+
+        let grants: Vec<GrantKey> = project_team_access::Entity::find()
+            .select_only()
+            .column(project_team_access::Column::ProjectId)
+            .column(project_team_access::Column::TeamId)
+            .into_model::<GrantKey>()
             .all(self.db.as_ref())
             .await
             .map_err(|source| CheckerError::AccessGrantQuery {
-                // Not scoped to one project — 0 reads as "all projects" in
-                // the error message context.
                 project_id: 0,
                 source,
             })?;
@@ -297,21 +335,9 @@ impl TeamProjectAccessChecker {
             return Ok(Vec::new());
         }
 
-        let memberships = team_members::Entity::find()
-            .filter(team_members::Column::UserId.eq(user_id))
-            .all(self.db.as_ref())
-            .await
-            .map_err(|source| CheckerError::MembershipQuery {
-                user_id,
-                project_id: 0,
-                source,
-            })?;
-
-        let user_team_ids: std::collections::HashSet<i32> =
-            memberships.into_iter().map(|m| m.team_id).collect();
-
-        // Group by project: a project is hidden only if the user is in
-        // NONE of the teams granted on it.
+        // A project is hidden only if the user is in NONE of the teams
+        // granted on it, so gather both sets before differencing.
+        let user_team_ids: std::collections::HashSet<i32> = user_team_ids.into_iter().collect();
         let mut allowed: std::collections::HashSet<i32> = std::collections::HashSet::new();
         let mut gated: std::collections::HashSet<i32> = std::collections::HashSet::new();
         for grant in grants {
@@ -387,6 +413,8 @@ impl TeamProjectAccessChecker {
         let memberships = team_members::Entity::find()
             .filter(team_members::Column::UserId.eq(user_id))
             .filter(team_members::Column::TeamId.is_in(granted_team_ids))
+            .inner_join(users::Entity)
+            .filter(users::Column::DeletedAt.is_null())
             .all(self.db.as_ref())
             .await
             .map_err(|source| CheckerError::MembershipQuery {
@@ -800,6 +828,8 @@ mod tests {
     #[tokio::test]
     async fn hidden_project_ids_empty_when_no_grants_exist() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // memberships first, then grants
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
             .append_query_results(vec![Vec::<project_team_access::Model>::new()])
             .into_connection();
         let checker = new_checker(db);
@@ -815,11 +845,11 @@ mod tests {
     #[tokio::test]
     async fn hidden_project_ids_hides_only_ungranted_gated_projects() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_member(10, 1)]])
             .append_query_results(vec![vec![
                 sample_grant(42, 10), // user is in team 10 → visible
                 sample_grant(99, 20), // user is not in team 20 → hidden
             ]])
-            .append_query_results(vec![vec![sample_member(10, 1)]])
             .into_connection();
         let checker = new_checker(db);
 
@@ -832,8 +862,8 @@ mod tests {
     #[tokio::test]
     async fn hidden_project_ids_unions_grants_on_the_same_project() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_grant(42, 10), sample_grant(42, 20)]])
             .append_query_results(vec![vec![sample_member(20, 1)]])
+            .append_query_results(vec![vec![sample_grant(42, 10), sample_grant(42, 20)]])
             .into_connection();
         let checker = new_checker(db);
 
@@ -848,8 +878,8 @@ mod tests {
     #[tokio::test]
     async fn hidden_project_ids_hides_all_gated_projects_from_teamless_user() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![sample_grant(42, 10)]])
             .append_query_results(vec![Vec::<team_members::Model>::new()])
+            .append_query_results(vec![vec![sample_grant(42, 10)]])
             .into_connection();
         let checker = new_checker(db);
 
@@ -1120,6 +1150,48 @@ mod tests {
         assert_eq!(
             checker.effective_project_permissions(1, 42).await.unwrap(),
             None
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Soft-deleted users
+    // -------------------------------------------------------------------
+
+    /// Deleting a user sets `deleted_at`; it does not remove the row, so
+    /// the FK cascade never fires and their `team_members` rows survive.
+    /// Authorization must not treat them as a member — otherwise a
+    /// credential that outlives the account keeps its project access.
+    /// The membership query joins `users` and filters `deleted_at IS NULL`,
+    /// so the DB returns no membership row for a deleted user.
+    #[tokio::test]
+    async fn soft_deleted_user_is_denied_even_with_a_surviving_membership_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_grant(42, 10)]])
+            // The join filters the deleted user out, so the membership
+            // lookup comes back empty.
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
+            .into_connection();
+        let checker = new_checker(db);
+
+        assert!(
+            !checker.user_can_access_project(1, 42).await.unwrap(),
+            "a soft-deleted user must not retain team-derived project access"
+        );
+    }
+
+    /// Same for the finer-grained resolution: no membership → holds
+    /// nothing here, not "unrestricted".
+    #[tokio::test]
+    async fn soft_deleted_user_resolves_to_no_permissions() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_with_role(42, 10, "admin")]])
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
+            .into_connection();
+        let checker = new_checker(db);
+
+        assert_eq!(
+            checker.effective_project_permissions(1, 42).await.unwrap(),
+            Some(Vec::new())
         );
     }
 }

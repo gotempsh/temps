@@ -7,7 +7,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
-use temps_entities::{project_team_access, team_members, teams, users, TeamRole};
+use temps_entities::{project_team_access, projects, team_members, teams, users, TeamRole};
 use utoipa::ToSchema;
 
 use crate::checker::TeamProjectAccessChecker;
@@ -337,6 +337,19 @@ impl TeamService for DefaultTeamService {
         // Make sure the team exists; surface NotFound rather than letting
         // the FK violate-and-rollback path produce a Database error.
         self.get_team(team_id).await?;
+        // Same for the user. Without this, a non-existent user_id violates
+        // `fk_team_members_user` and the catch-all below reports it as
+        // "already a member" — an error that actively misdirects whoever is
+        // debugging it.
+        if users::Entity::find_by_id(req.user_id)
+            .one(self.db.as_ref())
+            .await?
+            .is_none()
+        {
+            return Err(TeamError::Validation {
+                message: format!("User {} does not exist", req.user_id),
+            });
+        }
 
         let now = Utc::now();
         let model = team_members::ActiveModel {
@@ -470,6 +483,17 @@ impl TeamService for DefaultTeamService {
         req: CreateProjectAccessRequest,
     ) -> Result<project_team_access::Model, TeamError> {
         self.get_team(req.team_id).await?;
+        // A non-existent project_id violates `fk_project_team_access_project`
+        // and would otherwise surface as an opaque 500.
+        if projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .is_none()
+        {
+            return Err(TeamError::Validation {
+                message: format!("Project {project_id} does not exist"),
+            });
+        }
 
         let now = Utc::now();
         let model = project_team_access::ActiveModel {
