@@ -41,6 +41,7 @@ use temps_email::EmailPlugin;
 use temps_entities::users;
 use temps_environments::EnvironmentsPlugin;
 use temps_error_tracking::ErrorTrackingPlugin;
+use temps_flags::FlagsPlugin;
 use temps_geo::GeoPlugin;
 use temps_git::GitPlugin;
 use temps_import::ImportPlugin;
@@ -1880,6 +1881,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering BlobPlugin");
     let blob_plugin = Box::new(BlobPlugin::new());
     plugin_manager.register_plugin(blob_plugin);
+
+    // 5.3. FlagsPlugin - provides feature flags (depends on database only:
+    // flags are control-plane rows, no container and no background task)
+    debug!("Registering FlagsPlugin");
+    let flags_plugin = Box::new(FlagsPlugin::new());
+    plugin_manager.register_plugin(flags_plugin);
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");

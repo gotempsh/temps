@@ -64,6 +64,7 @@ members = [
     "crates/temps-dns-resolver",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
+    "crates/temps-flags",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-otel",
