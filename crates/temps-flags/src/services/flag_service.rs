@@ -603,24 +603,43 @@ impl FlagService {
             query = query.filter(feature_flags::Column::ClientVisible.eq(true));
         }
 
-        // One JOIN, not one query per flag — and filtered to the requested
-        // environment inside the join. Without the extra condition this pulls
-        // every environment's override and then discards all but one, on the
-        // endpoint every running container polls.
-        let rows = query
-            .find_with_related(feature_flag_environments::Entity)
-            .filter(
-                feature_flag_environments::Column::EnvironmentId
-                    .eq(environment_id)
-                    .or(feature_flag_environments::Column::Id.is_null()),
-            )
+        // Two queries, not one JOIN — the same shape `list()` uses, and for a
+        // related reason.
+        //
+        // `find_with_related` emits a LEFT JOIN, and a `.filter()` on it lands
+        // in the WHERE clause, evaluated *after* the join. A flag whose only
+        // override belongs to a different environment then produces a joined
+        // row satisfying neither `environment_id = $env` nor `id IS NULL`, so
+        // the flag is dropped from the result entirely — it disappears from
+        // this environment's snapshot instead of appearing with its default.
+        // The SDK reads that as FLAG_NOT_FOUND and serves the caller's own
+        // fallback, which for a kill switch is exactly the wrong value.
+        // Fetching the overrides separately makes that failure impossible.
+        let flags = query
             .order_by_asc(feature_flags::Column::Key)
             .all(self.db.as_ref())
             .await?;
 
-        let snapshots = rows
+        if flags.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let flag_ids: Vec<i32> = flags.iter().map(|flag| flag.id).collect();
+        let overrides = feature_flag_environments::Entity::find()
+            .filter(feature_flag_environments::Column::FlagId.is_in(flag_ids))
+            .filter(feature_flag_environments::Column::EnvironmentId.eq(environment_id))
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut by_flag: HashMap<i32, Vec<feature_flag_environments::Model>> = HashMap::new();
+        for row in overrides {
+            by_flag.entry(row.flag_id).or_default().push(row);
+        }
+
+        let snapshots = flags
             .into_iter()
-            .filter_map(|(flag, overrides)| {
+            .filter_map(|flag| {
+                let overrides = by_flag.remove(&flag.id).unwrap_or_default();
                 collapse_to_environment(flag, overrides, environment_id)
             })
             .collect();
