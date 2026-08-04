@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::permission_guard;
+use temps_auth::permissions::Role;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
@@ -16,8 +17,8 @@ use temps_entities::teams;
 use utoipa::ToSchema;
 
 use crate::service::{
-    CreateTeamMemberRequest, CreateTeamRequest, ProjectAccessResponse, TeamMemberResponse,
-    UpdateMemberRoleRequest, UpdateTeamRequest,
+    CreateTeamMemberRequest, CreateTeamRequest, GrantAuthz, ProjectAccessResponse,
+    TeamMemberResponse, UpdateMemberRoleRequest, UpdateTeamRequest,
 };
 
 use super::TeamsAppState;
@@ -408,7 +409,15 @@ pub async fn delete_team(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersDelete);
-    state.team_service.delete_team(team_id).await?;
+    // Deleting a team cascades away its project grants. The service refuses
+    // when that would strip a project's last grant and silently re-open it,
+    // unless the caller is an instance admin — the same bar `revoke` sets.
+    let authz = if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        GrantAuthz::instance_admin()
+    } else {
+        GrantAuthz::project_scoped()
+    };
+    let cascaded = state.team_service.delete_team(team_id, &authz).await?;
     let audit = TeamDeletedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -419,6 +428,27 @@ pub async fn delete_team(
     };
     if let Err(e) = state.audit.create_audit_log(&audit).await {
         tracing::error!(error = %e, "teams: failed to write team delete audit log");
+    }
+    // Without these, the trail shows only TEAM_DELETED and never says which
+    // projects stopped being reachable through it.
+    for grant in cascaded {
+        let revoked = crate::handlers::project_access::ProjectAccessRevokedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id: grant.project_id,
+            team_id: grant.team_id,
+        };
+        if let Err(e) = state.audit.create_audit_log(&revoked).await {
+            tracing::error!(
+                error = %e,
+                project_id = grant.project_id,
+                team_id = grant.team_id,
+                "teams: failed to audit a grant removed by team deletion"
+            );
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

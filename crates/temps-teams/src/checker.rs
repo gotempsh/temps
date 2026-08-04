@@ -320,21 +320,27 @@ impl TeamProjectAccessChecker {
             })?;
         let user_team_ids: Vec<i32> = memberships.into_iter().map(|m| m.team_id).collect();
 
-        // Only the two columns needed, and only for gated projects. Loading
-        // whole grant rows for the entire instance on every project-list
-        // request would be an unbounded read on the control plane's hot
-        // dashboard path (CLAUDE.md: never load an unbounded set into a Vec).
+        // Two narrow queries instead of one wide one. The previous shape
+        // read every (project_id, team_id) pair on the instance — the whole
+        // grants table — and differenced them in memory, on a path that runs
+        // for `GET /projects` *and* `GET /projects/statistics`, i.e. twice
+        // per dashboard load. That is exactly the unbounded read CLAUDE.md
+        // forbids, and the comment here used to claim it was bounded.
+        //
+        // Now: one DISTINCT column of gated project ids (one row per gated
+        // project, not per grant), and one DISTINCT column of the projects
+        // this user can reach. The result set is inherently O(gated
+        // projects) — it is the answer — but nothing larger is transferred.
         #[derive(sea_orm::FromQueryResult)]
-        struct GrantKey {
+        struct ProjectId {
             project_id: i32,
-            team_id: i32,
         }
 
-        let grants: Vec<GrantKey> = project_team_access::Entity::find()
+        let gated: Vec<ProjectId> = project_team_access::Entity::find()
             .select_only()
             .column(project_team_access::Column::ProjectId)
-            .column(project_team_access::Column::TeamId)
-            .into_model::<GrantKey>()
+            .distinct()
+            .into_model::<ProjectId>()
             .all(self.db.as_ref())
             .await
             .map_err(|source| CheckerError::AccessGrantQuery {
@@ -342,23 +348,37 @@ impl TeamProjectAccessChecker {
                 source,
             })?;
 
-        if grants.is_empty() {
+        if gated.is_empty() {
             return Ok(Vec::new());
         }
 
         // A project is hidden only if the user is in NONE of the teams
-        // granted on it, so gather both sets before differencing.
-        let user_team_ids: std::collections::HashSet<i32> = user_team_ids.into_iter().collect();
-        let mut allowed: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        let mut gated: std::collections::HashSet<i32> = std::collections::HashSet::new();
-        for grant in grants {
-            gated.insert(grant.project_id);
-            if user_team_ids.contains(&grant.team_id) {
-                allowed.insert(grant.project_id);
-            }
-        }
+        // granted on it, so an empty team list hides every gated project.
+        let allowed: std::collections::HashSet<i32> = if user_team_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            project_team_access::Entity::find()
+                .select_only()
+                .column(project_team_access::Column::ProjectId)
+                .filter(project_team_access::Column::TeamId.is_in(user_team_ids))
+                .distinct()
+                .into_model::<ProjectId>()
+                .all(self.db.as_ref())
+                .await
+                .map_err(|source| CheckerError::AccessGrantQuery {
+                    project_id: 0,
+                    source,
+                })?
+                .into_iter()
+                .map(|p| p.project_id)
+                .collect()
+        };
 
-        Ok(gated.difference(&allowed).copied().collect())
+        Ok(gated
+            .into_iter()
+            .map(|p| p.project_id)
+            .filter(|id| !allowed.contains(id))
+            .collect())
     }
 
     /// Resolves the permission strings `user_id` holds within `project_id`
@@ -891,12 +911,16 @@ mod tests {
     /// one of their teams holds is not.
     #[tokio::test]
     async fn hidden_project_ids_hides_only_ungranted_gated_projects() {
+        // Three queries now: the user's memberships, the DISTINCT gated
+        // project ids, then the DISTINCT ids the user can reach.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_member(10, 1)]])
             .append_query_results(vec![vec![
-                sample_grant(42, 10), // user is in team 10 → visible
-                sample_grant(99, 20), // user is not in team 20 → hidden
+                sample_grant(42, 10), // gated
+                sample_grant(99, 20), // gated
             ]])
+            // user is in team 10 → reaches 42; not in team 20 → 99 hidden
+            .append_query_results(vec![vec![sample_grant(42, 10)]])
             .into_connection();
         let checker = new_checker(db);
 
@@ -906,11 +930,30 @@ mod tests {
     /// A project granted to two teams is visible if the user is in either
     /// — the per-project answer is a union across its grants, not a
     /// per-row decision.
+    /// A user in no teams reaches nothing gated. The second query is
+    /// skipped entirely (an empty `IN ()` has no meaning), so only two
+    /// results are queued — if it ran, MockDatabase would panic.
+    #[tokio::test]
+    async fn hidden_project_ids_hides_everything_gated_from_a_user_with_no_teams() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
+            .append_query_results(vec![vec![sample_grant(42, 10), sample_grant(99, 20)]])
+            .into_connection();
+        let checker = new_checker(db);
+
+        assert_eq!(
+            checker.hidden_project_ids(1).await.unwrap(),
+            Some(vec![42, 99])
+        );
+    }
+
     #[tokio::test]
     async fn hidden_project_ids_unions_grants_on_the_same_project() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_member(20, 1)]])
             .append_query_results(vec![vec![sample_grant(42, 10), sample_grant(42, 20)]])
+            // Reached via team 20, even though team 10 also holds project 42.
+            .append_query_results(vec![vec![sample_grant(42, 20)]])
             .into_connection();
         let checker = new_checker(db);
 

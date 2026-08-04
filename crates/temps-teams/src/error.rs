@@ -57,6 +57,16 @@ pub enum TeamError {
         role: String,
     },
 
+    /// Deleting a team would cascade away the last access grant on one or
+    /// more projects, re-opening them to every user — the same transition
+    /// [`Self::GatingRequiresAdmin`] gates on the revoke path.
+    #[error(
+        "Deleting team {team_id} would remove the last access grant on project(s) {projects}, \
+         re-opening them to every user on this instance. An instance administrator must do \
+         this, or grant another team access to those projects first."
+    )]
+    TeamDeletionWouldUngate { team_id: i32, projects: String },
+
     /// The caller's permissions on the project could not be resolved, so
     /// the mutation is refused rather than authorized on a guess.
     #[error(
@@ -88,6 +98,7 @@ impl From<TeamError> for Problem {
 
             TeamError::GatingRequiresAdmin
             | TeamError::ProjectPermissionDenied { .. }
+            | TeamError::TeamDeletionWouldUngate { .. }
             | TeamError::RoleCeilingExceeded { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Project Access Change Denied")
                 .with_detail(error.to_string()),
@@ -101,9 +112,27 @@ impl From<TeamError> for Problem {
             // `CorruptStoredRole` and `PermissionResolution` are server-side
             // faults, not caller mistakes — a 4xx here would have an operator
             // debugging a request that was perfectly well-formed.
-            TeamError::Database(_)
-            | TeamError::CorruptStoredRole { .. }
-            | TeamError::PermissionResolution { .. } => {
+            // The full reason (including the underlying DB error) is logged
+            // here rather than returned: this is an *authorization* failure,
+            // the one place a verbose body is least justified, and the
+            // caller can do nothing with a SQL fragment anyway.
+            TeamError::PermissionResolution {
+                user_id,
+                project_id,
+                ref reason,
+            } => {
+                tracing::error!(
+                    user_id,
+                    project_id,
+                    reason = %reason,
+                    "teams: could not resolve permissions while authorizing an access change"
+                );
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("Could not verify project access; please try again")
+            }
+
+            TeamError::Database(_) | TeamError::CorruptStoredRole { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())

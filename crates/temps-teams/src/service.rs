@@ -173,6 +173,19 @@ impl ResolvedAuthz {
     }
 }
 
+/// True only for a Postgres unique-constraint violation (SQLSTATE 23505).
+///
+/// `DbErr::Exec`/`Query`/`RecordNotInserted` also cover connection resets,
+/// statement timeouts and permission-denied-on-table. Mapping that whole
+/// class to "already exists" tells an operator debugging an outage to go
+/// look for a duplicate row that does not exist.
+fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    matches!(err, sea_orm::DbErr::RecordNotInserted)
+        || err
+            .sql_err()
+            .is_some_and(|e| matches!(e, sea_orm::SqlErr::UniqueConstraintViolation(_)))
+}
+
 /// Parses a `role` column, reporting corruption with the row it came from.
 ///
 /// Stored roles are never caller input — the API takes roles as a typed
@@ -212,7 +225,13 @@ pub trait TeamService: Send + Sync {
         req: UpdateTeamRequest,
     ) -> Result<teams::Model, TeamError>;
 
-    async fn delete_team(&self, team_id: i32) -> Result<(), TeamError>;
+    /// Deletes a team, returning the access grants the cascade removed so
+    /// the caller can audit them.
+    async fn delete_team(
+        &self,
+        team_id: i32,
+        authz: &GrantAuthz,
+    ) -> Result<Vec<project_team_access::Model>, TeamError>;
 
     async fn add_member(
         &self,
@@ -384,11 +403,7 @@ impl TeamService for DefaultTeamService {
 
         match model.insert(self.db.as_ref()).await {
             Ok(team) => Ok(team),
-            Err(
-                sea_orm::DbErr::Exec(_)
-                | sea_orm::DbErr::Query(_)
-                | sea_orm::DbErr::RecordNotInserted,
-            ) => Err(TeamError::SlugConflict { slug: req.slug }),
+            Err(e) if is_unique_violation(&e) => Err(TeamError::SlugConflict { slug: req.slug }),
             Err(other) => Err(TeamError::Database(other)),
         }
     }
@@ -437,13 +452,71 @@ impl TeamService for DefaultTeamService {
         Ok(active.update(self.db.as_ref()).await?)
     }
 
-    async fn delete_team(&self, team_id: i32) -> Result<(), TeamError> {
-        let result = teams::Entity::delete_by_id(team_id)
-            .exec(self.db.as_ref())
+    async fn delete_team(
+        &self,
+        team_id: i32,
+        authz: &GrantAuthz,
+    ) -> Result<Vec<project_team_access::Model>, TeamError> {
+        let txn = self.db.begin().await?;
+
+        // `fk_project_team_access_team` is ON DELETE CASCADE, so deleting a
+        // team silently removes every grant it held. Where that was a
+        // project's *last* grant, the project becomes ungated — reachable
+        // by every user on the instance. That is the same transition
+        // `revoke_project_access` refuses without an instance admin, so it
+        // cannot be left as an unguarded side effect of a team delete.
+        let cascaded = project_team_access::Entity::find()
+            .filter(project_team_access::Column::TeamId.eq(team_id))
+            .lock(LockType::Update)
+            .all(&txn)
             .await?;
+
+        if !cascaded.is_empty() && !authz.is_instance_admin {
+            let affected: Vec<i32> = {
+                let mut ids: Vec<i32> = cascaded.iter().map(|g| g.project_id).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+
+            // Every grant on the affected projects, locked, so a concurrent
+            // revoke cannot remove the grant we are counting on to keep a
+            // project gated.
+            let siblings = project_team_access::Entity::find()
+                .filter(project_team_access::Column::ProjectId.is_in(affected.clone()))
+                .lock(LockType::Update)
+                .all(&txn)
+                .await?;
+
+            let mut would_ungate: Vec<i32> = affected
+                .into_iter()
+                .filter(|pid| {
+                    !siblings
+                        .iter()
+                        .any(|g| g.project_id == *pid && g.team_id != team_id)
+                })
+                .collect();
+            would_ungate.sort_unstable();
+
+            if !would_ungate.is_empty() {
+                return Err(TeamError::TeamDeletionWouldUngate {
+                    team_id,
+                    projects: would_ungate
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+
+        let result = teams::Entity::delete_by_id(team_id).exec(&txn).await?;
         if result.rows_affected == 0 {
             return Err(TeamError::NotFound { team_id });
         }
+
+        txn.commit().await?;
+
         // DB-level CASCADE removes every `team_members` and
         // `project_team_access` row for this team in the same delete, but
         // that can touch an unbounded set of users and projects at once —
@@ -453,7 +526,11 @@ impl TeamService for DefaultTeamService {
         if let Some(ref checker) = self.checker {
             checker.invalidate_all();
         }
-        Ok(())
+
+        // Returned so the handler can audit each cascaded revocation:
+        // otherwise the trail shows only TEAM_DELETED and never says which
+        // projects stopped being reachable through it.
+        Ok(cascaded)
     }
 
     async fn add_member(
@@ -500,11 +577,7 @@ impl TeamService for DefaultTeamService {
 
         let member = match model.insert(self.db.as_ref()).await {
             Ok(member) => member,
-            Err(
-                sea_orm::DbErr::Exec(_)
-                | sea_orm::DbErr::Query(_)
-                | sea_orm::DbErr::RecordNotInserted,
-            ) => {
+            Err(e) if is_unique_violation(&e) => {
                 return Err(TeamError::DuplicateMember {
                     team_id,
                     user_id: req.user_id,
@@ -792,13 +865,6 @@ impl TeamService for DefaultTeamService {
             .all(&txn)
             .await?;
 
-        let Some(target) = grants.iter().find(|g| g.team_id == team_id) else {
-            return Err(TeamError::ProjectAccessNotFound {
-                project_id,
-                team_id,
-            });
-        };
-
         // Resolved on `txn`, from the rows just locked above.
         let authz = ResolvedAuthz::resolve(
             &txn,
@@ -810,16 +876,28 @@ impl TeamService for DefaultTeamService {
         )
         .await?;
 
+        // Authorize *before* revealing whether the target grant exists, so
+        // this endpoint does not distinguish "no such grant" (404) from
+        // "grant you may not touch" (403) for a caller who cannot manage
+        // the project at all. The grant path orders itself the same way.
+        if !authz.is_instance_admin && !authz.holds(&Permission::ProjectsWrite) {
+            return Err(TeamError::ProjectPermissionDenied {
+                project_id,
+                required: Permission::ProjectsWrite.to_string(),
+            });
+        }
+
+        let Some(target) = grants.iter().find(|g| g.team_id == team_id) else {
+            return Err(TeamError::ProjectAccessNotFound {
+                project_id,
+                team_id,
+            });
+        };
+
         if !authz.is_instance_admin {
             // Removing the last grant re-opens the project to everyone.
             if grants.len() == 1 {
                 return Err(TeamError::GatingRequiresAdmin);
-            }
-            if !authz.holds(&Permission::ProjectsWrite) {
-                return Err(TeamError::ProjectPermissionDenied {
-                    project_id,
-                    required: Permission::ProjectsWrite.to_string(),
-                });
             }
             // You may not remove a grant you could not have created.
             authz.check_role_ceiling(parse_stored_role(
@@ -1002,14 +1080,88 @@ mod tests {
     #[tokio::test]
     async fn delete_team_returns_not_found_when_zero_rows() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The team's cascaded grants are read first; this team holds none.
+            .append_query_results(vec![Vec::<project_team_access::Model>::new()])
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
             }])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
-        let err = svc.delete_team(42).await.unwrap_err();
+        let err = svc
+            .delete_team(42, &GrantAuthz::instance_admin())
+            .await
+            .unwrap_err();
         assert!(matches!(err, TeamError::NotFound { team_id: 42 }));
+    }
+
+    /// `fk_project_team_access_team` is ON DELETE CASCADE, so deleting a
+    /// team drops every grant it held. Where that was a project's last
+    /// grant the project silently becomes reachable by everyone — the
+    /// transition `revoke_project_access` refuses. Deleting a team must not
+    /// be a way around that rule.
+    #[tokio::test]
+    async fn delete_team_will_not_ungate_a_project_without_instance_admin() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Team 7 holds a grant on project 42...
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            // ...and it is the only grant there.
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .delete_team(7, &GrantAuthz::project_scoped())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::TeamDeletionWouldUngate { team_id: 7, ref projects } if projects == "42"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_team_is_allowed_when_another_team_still_holds_the_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            // Team 9 also holds project 42, so it stays gated.
+            .append_query_results(vec![vec![
+                grant_row(1, 7, TeamRole::Admin),
+                grant_row(2, 9, TeamRole::Owner),
+            ]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let cascaded = svc
+            .delete_team(7, &GrantAuthz::project_scoped())
+            .await
+            .expect("deletion leaves project 42 gated by team 9");
+        // Returned so the handler can audit each removed grant.
+        assert_eq!(cascaded.len(), 1);
+        assert_eq!(cascaded[0].project_id, 42);
+    }
+
+    /// Revoke must not distinguish "no such grant" (404) from "a grant you
+    /// may not touch" (403) for a caller who cannot manage the project.
+    #[tokio::test]
+    async fn revoke_denies_a_caller_without_project_write_before_revealing_the_target() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Viewer)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        // Target team 9999 has no grant here; the caller must still be told
+        // only that they lack permission.
+        let err = svc
+            .revoke_project_access(ACTOR, 42, 9999, &GrantAuthz::project_scoped())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
     }
 
     #[tokio::test]

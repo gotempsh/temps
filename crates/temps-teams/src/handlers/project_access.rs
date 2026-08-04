@@ -50,11 +50,11 @@ impl AuditOperation for ProjectAccessGrantedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProjectAccessRevokedAudit {
+pub(crate) struct ProjectAccessRevokedAudit {
     #[serde(flatten)]
-    context: AuditContext,
-    project_id: i32,
-    team_id: i32,
+    pub(crate) context: AuditContext,
+    pub(crate) project_id: i32,
+    pub(crate) team_id: i32,
 }
 
 impl AuditOperation for ProjectAccessRevokedAudit {
