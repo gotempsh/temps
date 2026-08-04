@@ -241,6 +241,53 @@ pub enum TemplateConfigError {
 /// Bundled default templates (embedded at compile time)
 const BUNDLED_TEMPLATES: &str = include_str!("../templates.yaml");
 
+/// Maximum template slug length accepted by the catalog and project schema.
+pub const MAX_TEMPLATE_SLUG_CHARS: usize = 255;
+
+/// Fixed, reviewable labels that are safe to include in anonymous telemetry.
+///
+/// Operators can load private templates with arbitrary slugs. Those slugs must
+/// never leave the instance, so telemetry callers must pass them through
+/// [`telemetry_safe_template_slug`] and treat `None` as a custom template.
+const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
+    "observability-starter",
+    "nextjs-saas-starter",
+    "nextjs-docs-template",
+];
+
+/// Stored provenance marker for projects created from an operator-defined
+/// template. The operator's actual slug stays local to the template catalog.
+pub const CUSTOM_TEMPLATE_PROVENANCE: &str = "custom";
+
+/// Return the slug only when it is a fixed label from the bundled catalog.
+pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
+    BUNDLED_TELEMETRY_TEMPLATE_SLUGS
+        .contains(&slug)
+        .then_some(slug)
+}
+
+/// Return the public bundled slug only when the selected template exactly
+/// matches its embedded catalog definition.
+///
+/// External template files can replace the bundled catalog and may reuse one
+/// of its slugs. Comparing the complete definition prevents such an override
+/// from being attributed to the bundled template merely because its name
+/// matches a public label.
+pub fn bundled_telemetry_template_slug(template: &ProjectTemplate) -> Option<&str> {
+    telemetry_safe_template_slug(&template.slug)?;
+    let bundled = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES).ok()?;
+    bundled
+        .templates
+        .iter()
+        .any(|candidate| candidate == template)
+        .then_some(template.slug.as_str())
+}
+
+/// Produce the bounded value persisted on a template-created project.
+pub fn template_provenance(template: &ProjectTemplate) -> &str {
+    bundled_telemetry_template_slug(template).unwrap_or(CUSTOM_TEMPLATE_PROVENANCE)
+}
+
 /// Template service that manages loading and caching templates
 pub struct TemplateService {
     config: Arc<RwLock<TemplatesConfig>>,
@@ -308,6 +355,10 @@ impl TemplateService {
         // Check for empty slug
         if template.slug.is_empty() {
             errors.push("Slug cannot be empty".to_string());
+        } else if template.slug.chars().count() > MAX_TEMPLATE_SLUG_CHARS {
+            errors.push(format!(
+                "Slug cannot exceed {MAX_TEMPLATE_SLUG_CHARS} characters"
+            ));
         }
 
         // Check for empty name
@@ -759,6 +810,58 @@ templates:
             starter.services.iter().any(|s| s == "postgres"),
             "observability-starter must depend on postgres"
         );
+    }
+
+    #[test]
+    fn telemetry_slug_allowlist_exactly_matches_bundled_catalog() {
+        let config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+            .expect("bundled templates.yaml must parse");
+        let bundled: std::collections::BTreeSet<&str> = config
+            .templates
+            .iter()
+            .map(|template| template.slug.as_str())
+            .collect();
+        let allowlisted: std::collections::BTreeSet<&str> =
+            BUNDLED_TELEMETRY_TEMPLATE_SLUGS.iter().copied().collect();
+
+        assert_eq!(
+            allowlisted, bundled,
+            "every bundled slug must be explicitly reviewed for telemetry, and custom slugs must stay excluded"
+        );
+        assert_eq!(
+            telemetry_safe_template_slug("observability-starter"),
+            Some("observability-starter")
+        );
+        assert_eq!(telemetry_safe_template_slug("customer-acme-private"), None);
+    }
+
+    #[test]
+    fn external_override_reusing_bundled_slug_is_custom_provenance() {
+        let mut config = TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+            .expect("bundled templates.yaml must parse");
+        let template = config
+            .templates
+            .iter_mut()
+            .find(|template| template.slug == "observability-starter")
+            .expect("observability template must be bundled");
+        template.git.url = "https://example.com/operator/observability.git".to_string();
+
+        assert_eq!(bundled_telemetry_template_slug(template), None);
+        assert_eq!(template_provenance(template), CUSTOM_TEMPLATE_PROVENANCE);
+        assert_eq!(
+            telemetry_safe_template_slug(template_provenance(template)),
+            None
+        );
+    }
+
+    #[test]
+    fn template_validation_rejects_slug_longer_than_project_column() {
+        let mut config = TemplatesConfig::from_yaml(SAMPLE_CONFIG).expect("sample config parses");
+        config.templates[0].slug = "x".repeat(MAX_TEMPLATE_SLUG_CHARS + 1);
+
+        let errors = TemplateService::validate_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].errors.iter().any(|error| error.contains("255")));
     }
 
     #[test]

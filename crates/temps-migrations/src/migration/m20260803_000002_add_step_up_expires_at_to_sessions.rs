@@ -45,7 +45,7 @@ mod tests {
     fn migration_name_is_stable() {
         assert_eq!(
             Migration.name(),
-            "m20260803_000001_add_step_up_expires_at_to_sessions"
+            "m20260803_000002_add_step_up_expires_at_to_sessions"
         );
     }
 }

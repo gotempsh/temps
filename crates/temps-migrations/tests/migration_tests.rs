@@ -66,7 +66,7 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     let db = connect_with_retries(&db_url).await?;
 
-    let target = "m20260803_000001_add_step_up_expires_at_to_sessions";
+    let target = "m20260803_000002_add_step_up_expires_at_to_sessions";
     let pre_target_count = Migrator::migrations()
         .iter()
         .position(|migration| migration.name() == target)

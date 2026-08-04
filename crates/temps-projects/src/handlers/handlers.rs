@@ -203,6 +203,7 @@ pub async fn create_project(
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
         source_type: project.source_type,
+        template_slug: None,
     };
 
     let new_project = state
@@ -407,6 +408,7 @@ pub async fn update_project(
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
         source_type: project.source_type,   // Preserve source type
+        template_slug: None,                // Template provenance is immutable
     };
     let updated_project = state
         .project_service
@@ -1390,7 +1392,6 @@ pub async fn get_project_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
-
     Ok(Json(super::templates::TemplateResponse::from(template)))
 }
 
@@ -1453,6 +1454,28 @@ fn parse_owner_repo_from_git_url(git_url: &str) -> (String, String) {
     }
 }
 
+fn project_created_from_template_telemetry_event(
+    template_slug: &str,
+    deploy_mode: &'static str,
+    service_count: usize,
+) -> temps_core::telemetry::TelemetryEvent {
+    let safe_slug = temps_core::templates::telemetry_safe_template_slug(template_slug);
+    temps_core::telemetry::TelemetryEvent::new(
+        temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
+    )
+    .with(
+        "template_source",
+        if safe_slug.is_some() {
+            "bundled"
+        } else {
+            "custom"
+        },
+    )
+    .with_opt("template_slug", safe_slug.map(str::to_string))
+    .with("deploy_mode", deploy_mode)
+    .with("service_count", service_count as i64)
+}
+
 /// Create a new project from a template
 ///
 /// Creates a new repository from a template and sets up the project with the
@@ -1491,6 +1514,7 @@ pub async fn create_project_from_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
+    let template_provenance = temps_core::templates::template_provenance(&template).to_string();
 
     // 2. Build the environment variables from the request (shared by both modes).
     let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
@@ -1546,6 +1570,7 @@ pub async fn create_project_from_template(
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
+            template_slug: Some(template_provenance.clone()),
         };
         // Surface the template's source repo as the response URL (the image ref
         // isn't a browsable URL); the message clarifies it deployed from an image.
@@ -1614,6 +1639,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, new_repo.clone_url, "fork")
             }
@@ -1659,6 +1685,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: None,
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, template.git.url.clone(), "public_repo")
             }
@@ -1732,14 +1759,13 @@ pub async fn create_project_from_template(
         .with("source_type", project.source_type.to_string())
         .with_opt("preset", project.preset.clone()),
     );
-    state.telemetry.report(
-        temps_core::telemetry::TelemetryEvent::new(
-            temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
-        )
-        .with("template_slug", request.template_slug.clone())
-        .with("deploy_mode", deploy_mode)
-        .with("service_count", request.storage_service_ids.len() as i64),
-    );
+    state
+        .telemetry
+        .report(project_created_from_template_telemetry_event(
+            &template_provenance,
+            deploy_mode,
+            request.storage_service_ids.len(),
+        ));
 
     // 7. Return the response with the source/repository URL.
     let deploy_note = match deploy_mode {
@@ -1764,7 +1790,29 @@ pub async fn create_project_from_template(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_owner_repo_from_git_url;
+    use super::{parse_owner_repo_from_git_url, project_created_from_template_telemetry_event};
+
+    #[test]
+    fn template_creation_telemetry_omits_operator_defined_slug() {
+        let private_slug = "customer-acme-private-ghp_secret123";
+        let event = project_created_from_template_telemetry_event(private_slug, "image", 2);
+        let serialized = serde_json::to_string(&event).expect("telemetry event serializes");
+
+        assert_eq!(event.properties["template_source"], "custom");
+        assert!(!event.properties.contains_key("template_slug"));
+        assert!(!serialized.contains(private_slug));
+        assert_eq!(event.properties["deploy_mode"], "image");
+        assert_eq!(event.properties["service_count"], 2);
+    }
+
+    #[test]
+    fn template_creation_telemetry_keeps_bundled_observability_slug() {
+        let event =
+            project_created_from_template_telemetry_event("observability-starter", "image", 1);
+
+        assert_eq!(event.properties["template_source"], "bundled");
+        assert_eq!(event.properties["template_slug"], "observability-starter");
+    }
 
     /// Regression test for ADR-028 finding #2: `get_project_by_slug` guard bypass.
     ///
