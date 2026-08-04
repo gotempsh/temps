@@ -1,35 +1,32 @@
-//! Nixpacks preset - generates Dockerfile for any supported language
+//! The legacy `nixpacks*` preset slugs, now built by autopack.
 //!
-//! This preset uses nixpacks to auto-detect the project language/framework
-//! and generate an optimized Dockerfile. It acts as a fallback when no
-//! framework-specific preset (Next.js, Vite, etc.) or user-provided Dockerfile exists.
+//! The Nixpacks library is gone; these slugs remain. Projects created before
+//! the switch have `preset = 'nixpacks'` and a [`NixpacksConfig`] persisted in
+//! the database, and a deployment of one of them must keep working without the
+//! user touching anything — so the slugs, labels, icons and stored config shape
+//! are all preserved, and only the engine underneath changed.
 //!
-//! Supported languages: Node.js, Python, Rust, Go, Java, PHP, Ruby, Elixir, .NET, Dart, etc.
+//! New projects should use the `autopack` slug ([`crate::AutopackPreset`]).
+//! This module is the compatibility surface, not the entry point.
 //!
-//! Provider-specific variants allow explicit selection for monorepos and multi-language projects.
+//! Two behaviours are deliberately kept rather than "cleaned up":
+//!
+//! * a persisted `nixpacks_config` TOML is still honoured — autopack reads the
+//!   Nixpacks schema in compatibility mode, and reports anything it could not
+//!   translate instead of dropping it silently;
+//! * the provider stored against a project still forces that language, so a
+//!   polyglot repository pinned to `python` does not silently start building
+//!   as `node` because detection order differs.
 
+use super::autopack_preset::render_or_explain;
 use crate::{DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
 use async_trait::async_trait;
-use nixpacks::nixpacks::{
-    app::App,
-    builder::{
-        docker::{docker_image_builder::DockerImageBuilder, DockerBuilderOptions},
-        ImageBuilder,
-    },
-    environment::Environment,
-    logger::Logger,
-    plan::{
-        generator::{GeneratePlanOptions, NixpacksBuildPlanGenerator},
-        BuildPlan,
-        PlanGenerator,
-    },
-};
-use std::collections::HashMap;
+use autopack_core::compat::nixpacks::NixpacksConfig as CompatNixpacksConfig;
+use autopack_core::{App, Environment};
 use std::path::Path;
-pub use temps_entities::preset::NixpacksProvider;
 use temps_entities::preset::NixpacksConfig;
-use tokio::fs;
-use tracing::{debug, info, warn};
+pub use temps_entities::preset::NixpacksProvider;
+use tracing::{debug, warn};
 
 fn provider_name(provider: NixpacksProvider) -> &'static str {
     match provider {
@@ -62,7 +59,7 @@ fn provider_name(provider: NixpacksProvider) -> &'static str {
 
 fn provider_icon_url(provider: NixpacksProvider) -> &'static str {
     match provider {
-        NixpacksProvider::Auto => "/presets/nixpacks.svg",
+        NixpacksProvider::Auto => "/presets/autopack.svg",
         NixpacksProvider::Node => "/presets/nodejs.svg",
         NixpacksProvider::Python => "/presets/python.svg",
         NixpacksProvider::Rust => "/presets/rust.svg",
@@ -93,16 +90,12 @@ fn provider_description(provider: NixpacksProvider) -> &'static str {
     match provider {
         NixpacksProvider::Auto => "Auto-detects your language and framework from the repository",
         NixpacksProvider::Node => {
-            "Node.js apps — Nuxt, Vue, SvelteKit, Astro, Remix, Express, and more"
+            "Node.js apps — Next, Nuxt, Vue, SvelteKit, Astro, Remix, Express, and more"
         }
-        NixpacksProvider::Python => {
-            "Python web applications (Django, Flask, FastAPI, etc.)"
-        }
+        NixpacksProvider::Python => "Python web applications (Django, Flask, FastAPI, etc.)",
         NixpacksProvider::Rust => "Rust web applications and services",
         NixpacksProvider::Go => "Go web applications and services",
-        NixpacksProvider::Java => {
-            "Java web applications (Spring Boot, Micronaut, Quarkus, etc.)"
-        }
+        NixpacksProvider::Java => "Java web applications (Spring Boot, Micronaut, Quarkus, etc.)",
         NixpacksProvider::Php => "PHP applications — Laravel, Symfony, and more",
         NixpacksProvider::Ruby => "Ruby applications — Ruby on Rails and more",
         NixpacksProvider::Deno => "Deno applications and services",
@@ -122,6 +115,58 @@ fn provider_description(provider: NixpacksProvider) -> &'static str {
         NixpacksProvider::Scheme => "Scheme applications and services",
         NixpacksProvider::Static => "Pre-built static files, no build step",
     }
+}
+
+/// The autopack provider that builds what this Nixpacks provider used to.
+///
+/// `None` means "let autopack detect", which is right for `Auto` — and is also
+/// the only honest answer for a provider autopack does not implement. Forcing
+/// an id autopack does not know would fail the build outright; falling back to
+/// detection at least gives the app a chance, and the caller logs the gap.
+fn autopack_provider(provider: NixpacksProvider) -> Option<&'static str> {
+    match provider {
+        NixpacksProvider::Auto => None,
+        NixpacksProvider::Node => Some("node"),
+        NixpacksProvider::Python => Some("python"),
+        NixpacksProvider::Rust => Some("rust"),
+        NixpacksProvider::Go => Some("go"),
+        NixpacksProvider::Java => Some("java"),
+        NixpacksProvider::Php => Some("php"),
+        NixpacksProvider::Ruby => Some("ruby"),
+        NixpacksProvider::Deno => Some("deno"),
+        NixpacksProvider::Elixir => Some("elixir"),
+        // Nixpacks split .NET by language; autopack has one provider for both.
+        NixpacksProvider::CSharp | NixpacksProvider::FSharp => Some("dotnet"),
+        NixpacksProvider::Dart => Some("dart"),
+        NixpacksProvider::Swift => Some("swift"),
+        NixpacksProvider::Zig => Some("zig"),
+        NixpacksProvider::Scala => Some("scala"),
+        NixpacksProvider::Haskell => Some("haskell"),
+        NixpacksProvider::Clojure => Some("clojure"),
+        NixpacksProvider::Crystal => Some("crystal"),
+        NixpacksProvider::Cobol => Some("cobol"),
+        NixpacksProvider::Gleam => Some("gleam"),
+        NixpacksProvider::Lunatic => Some("lunatic"),
+        // Nixpacks' Scheme support was its Haunt static-site generator; autopack
+        // has no equivalent, so detection decides (usually `static` or `shell`).
+        NixpacksProvider::Scheme => None,
+        NixpacksProvider::Static => Some("static"),
+    }
+}
+
+/// Render a byte offset as `line L, column C`, counting from one.
+///
+/// Positions are derived rather than taken from the error's own rendering,
+/// which embeds the source text.
+fn line_and_column(source: &str, offset: usize) -> String {
+    let offset = offset.min(source.len());
+    let consumed = &source[..offset];
+    let line = consumed.matches('\n').count() + 1;
+    let column = consumed
+        .rfind('\n')
+        .map_or(offset, |newline| offset - newline - 1)
+        + 1;
+    format!("line {line}, column {column}")
 }
 
 pub struct NixpacksPreset {
@@ -151,17 +196,36 @@ impl NixpacksPreset {
         Self { config }
     }
 
+    /// Reject a stored `nixpacks_config` that no longer parses.
+    ///
+    /// The check runs against autopack's compatibility reader — the same code
+    /// that will read the file at build time — so validation cannot pass for
+    /// something the build then refuses.
+    ///
+    /// The returned message carries the *position* of the error and nothing
+    /// else. It reaches an API response body and the logs, and a
+    /// `nixpacks_config` can hold secrets: `toml`'s own error Display renders
+    /// the offending source line, and `.message()` names the offending key on
+    /// an unknown-field error. Neither may cross that boundary, so the detail
+    /// is logged server-side instead of returned.
     pub(super) fn validate_config(
         config: &NixpacksConfig,
     ) -> Result<(), crate::PresetResolutionError> {
         if let Some(value) = config.nixpacks_config.as_deref() {
-            BuildPlan::from_toml(value).map_err(|_| {
-                crate::PresetResolutionError::InvalidConfig {
+            if let Err(error) = toml::from_str::<CompatNixpacksConfig>(value) {
+                debug!("stored nixpacks.toml did not parse: {error}");
+                let where_ = error
+                    .span()
+                    .map(|span| format!(" at {}", line_and_column(value, span.start)))
+                    .unwrap_or_default();
+                return Err(crate::PresetResolutionError::InvalidConfig {
                     slug: "nixpacks".to_string(),
-                    reason: "failed to parse Nixpacks TOML; verify its syntax and supported fields"
-                        .to_string(),
-                }
-            })?;
+                    reason: format!(
+                        "failed to parse Nixpacks TOML{where_}; \
+                         verify its syntax and supported fields"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -173,388 +237,120 @@ impl NixpacksPreset {
         }
     }
 
-    fn generate_plan_options(&self) -> Result<GeneratePlanOptions, String> {
-        let mut plan = match self.config.nixpacks_config.as_deref() {
-            Some(config) => BuildPlan::from_toml(config).map_err(|_| {
-                "Failed to parse custom Nixpacks config; verify its syntax and supported fields"
-                    .to_string()
-            })?,
-            None => BuildPlan::default(),
-        };
-
-        if !self.config.providers.is_empty() {
-            plan.providers = Some(
-                self.config
-                    .providers
-                    .iter()
-                    .map(|provider| provider.nixpacks_name().to_string())
-                    .collect(),
+    /// The autopack provider id to force for this preset, if any.
+    fn forced_provider(&self) -> Option<&'static str> {
+        let provider = self.display_provider();
+        let mapped = autopack_provider(provider);
+        if mapped.is_none() && provider != NixpacksProvider::Auto {
+            warn!(
+                provider = provider_name(provider),
+                "autopack has no provider for this language; falling back to auto-detection"
             );
         }
-
-        Ok(GeneratePlanOptions {
-            plan: Some(plan),
-            ..Default::default()
-        })
+        mapped
     }
 
-    fn generate_build_plan(
-        &self,
-        app: &App,
-        environment: &Environment,
-    ) -> Result<BuildPlan, String> {
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
-        ];
-
-        let options = self.generate_plan_options()?;
-        let mut generator = NixpacksBuildPlanGenerator::new(providers, options);
-        generator
-            .generate_plan(app, environment)
-            .map(|(plan, _)| plan)
-            .map_err(|error| format!("Failed to generate build plan: {}", error))
+    /// Whether autopack can plan a build for this project at all.
+    pub fn can_detect(path: &Path) -> bool {
+        Self::detect_provider_id(path).is_some()
     }
 
-    /// Detect which providers are available for a given path
-    /// Returns a list of providers that can handle the project
-    pub fn detect_available_providers(path: &Path) -> Vec<NixpacksProvider> {
-        let mut available = Vec::new();
-
-        // Check if a Nixpacks config file exists to pass as an option if present
-        // Supported: nixpacks.toml or .nixpacks.toml
-        let nixpacks_toml = path.join("nixpacks.toml");
-        let dot_nixpacks_toml = path.join(".nixpacks.toml");
-        let config_file = if nixpacks_toml.exists() {
-            Some(nixpacks_toml)
-        } else if dot_nixpacks_toml.exists() {
-            Some(dot_nixpacks_toml)
-        } else {
-            None
-        };
-
-        // Check each provider (except Auto and Static)
-        let providers_to_check: Vec<(NixpacksProvider, &dyn nixpacks::providers::Provider)> = vec![
-            (
-                NixpacksProvider::Node,
-                &nixpacks::providers::node::NodeProvider {},
-            ),
-            (
-                NixpacksProvider::Python,
-                &nixpacks::providers::python::PythonProvider {},
-            ),
-            (
-                NixpacksProvider::Rust,
-                &nixpacks::providers::rust::RustProvider {},
-            ),
-            (
-                NixpacksProvider::Go,
-                &nixpacks::providers::go::GolangProvider {},
-            ),
-            (
-                NixpacksProvider::Java,
-                &nixpacks::providers::java::JavaProvider {},
-            ),
-            (
-                NixpacksProvider::Php,
-                &nixpacks::providers::php::PhpProvider {},
-            ),
-            (
-                NixpacksProvider::Ruby,
-                &nixpacks::providers::ruby::RubyProvider {},
-            ),
-            (
-                NixpacksProvider::Deno,
-                &nixpacks::providers::deno::DenoProvider {},
-            ),
-            (
-                NixpacksProvider::Elixir,
-                &nixpacks::providers::elixir::ElixirProvider {},
-            ),
-            (
-                NixpacksProvider::CSharp,
-                &nixpacks::providers::csharp::CSharpProvider {},
-            ),
-            (
-                NixpacksProvider::FSharp,
-                &nixpacks::providers::fsharp::FSharpProvider {},
-            ),
-            (
-                NixpacksProvider::Dart,
-                &nixpacks::providers::dart::DartProvider {},
-            ),
-            (
-                NixpacksProvider::Swift,
-                &nixpacks::providers::swift::SwiftProvider {},
-            ),
-            (
-                NixpacksProvider::Zig,
-                &nixpacks::providers::zig::ZigProvider {},
-            ),
-            (
-                NixpacksProvider::Scala,
-                &nixpacks::providers::scala::ScalaProvider {},
-            ),
-            (
-                NixpacksProvider::Haskell,
-                &nixpacks::providers::haskell::HaskellStackProvider {},
-            ),
-            (
-                NixpacksProvider::Clojure,
-                &nixpacks::providers::clojure::ClojureProvider {},
-            ),
-            (
-                NixpacksProvider::Crystal,
-                &nixpacks::providers::crystal::CrystalProvider {},
-            ),
-            (
-                NixpacksProvider::Cobol,
-                &nixpacks::providers::cobol::CobolProvider {},
-            ),
-            (
-                NixpacksProvider::Gleam,
-                &nixpacks::providers::gleam::GleamProvider {},
-            ),
-            (
-                NixpacksProvider::Lunatic,
-                &nixpacks::providers::lunatic::LunaticProvider {},
-            ),
-            (
-                NixpacksProvider::Scheme,
-                &nixpacks::providers::scheme::HauntProvider {},
-            ),
-        ];
-
-        let path_str = match path.to_str() {
-            Some(s) => s,
-            None => return available,
-        };
-
-        let app = match App::new(path_str) {
+    /// The autopack provider that claims this project, if any.
+    fn detect_provider_id(path: &Path) -> Option<String> {
+        let app = match App::new(path) {
             Ok(app) => app,
-            Err(_) => return available,
-        };
-
-        let environment = match Environment::from_envs(vec![]) {
-            Ok(env) => env,
-            Err(_) => return available,
-        };
-
-        // Check each provider individually, passing config if present
-        for (provider_type, provider) in providers_to_check {
-            let providers_slice = vec![provider];
-
-            // Build options, include the config path if file exists
-            let mut options = GeneratePlanOptions::default();
-            if let Some(config_path) = &config_file {
-                // Only pass the config if the file exists
-                options.config_file = Some(config_path.to_string_lossy().to_string());
+            Err(error) => {
+                debug!("autopack: could not read {path:?}: {error}");
+                return None;
             }
-
-            let mut generator = NixpacksBuildPlanGenerator::new(&providers_slice, options);
-
-            if let Ok((plan, _)) = generator.generate_plan(&app, &environment) {
-                let phase_count = plan.phases.clone().map_or(0, |phases| phases.len());
-                if phase_count > 0 && plan.start_phase.is_some() {
-                    available.push(provider_type);
-                }
+        };
+        let env = Environment::new();
+        match autopack_providers::registry().detect(&app, &env) {
+            Ok(Some(provider)) => Some(provider.id().to_string()),
+            Ok(None) => None,
+            Err(error) => {
+                debug!("autopack: detection failed for {path:?}: {error}");
+                None
             }
         }
+    }
 
-        available
+    /// Which of the selectable providers can build this project.
+    ///
+    /// Autopack resolves exactly one provider per project rather than ranking
+    /// candidates, so this reports that one — the UI uses it to preselect a
+    /// language, and offering several would imply a choice that does not exist.
+    pub fn detect_available_providers(path: &Path) -> Vec<NixpacksProvider> {
+        let Some(detected) = Self::detect_provider_id(path) else {
+            return Vec::new();
+        };
+        [
+            NixpacksProvider::Node,
+            NixpacksProvider::Python,
+            NixpacksProvider::Rust,
+            NixpacksProvider::Go,
+            NixpacksProvider::Java,
+            NixpacksProvider::Php,
+            NixpacksProvider::Ruby,
+            NixpacksProvider::Deno,
+            NixpacksProvider::Elixir,
+            NixpacksProvider::CSharp,
+            NixpacksProvider::Dart,
+            NixpacksProvider::Swift,
+            NixpacksProvider::Zig,
+            NixpacksProvider::Scala,
+            NixpacksProvider::Haskell,
+            NixpacksProvider::Clojure,
+            NixpacksProvider::Crystal,
+            NixpacksProvider::Cobol,
+            NixpacksProvider::Gleam,
+            NixpacksProvider::Lunatic,
+            NixpacksProvider::Static,
+        ]
+        .into_iter()
+        .filter(|provider| autopack_provider(*provider) == Some(detected.as_str()))
+        .collect()
+    }
+
+    /// Apply the persisted Nixpacks TOML, if there is one, as an overlay file
+    /// autopack will read in compatibility mode.
+    ///
+    /// The config lives in the database, not the repository, so it has to be
+    /// materialised somewhere autopack can see it. Writing it into the build
+    /// context is what the previous implementation did with `.nixpacks/`, and
+    /// keeps the semantics identical.
+    fn stage_config(&self, local_path: &Path) -> Option<StagedConfig> {
+        let contents = self.config.nixpacks_config.as_deref()?;
+        // A repository that ships its own file already says what its author
+        // wanted; the stored config is the platform's copy of the same thing,
+        // and overwriting the file would lose the user's edits.
+        let path = local_path.join("nixpacks.toml");
+        if path.exists() {
+            debug!("nixpacks.toml already present in the repository; leaving it alone");
+            return None;
+        }
+        match std::fs::write(&path, contents) {
+            Ok(()) => Some(StagedConfig { path }),
+            Err(error) => {
+                warn!("could not stage the stored nixpacks.toml: {error}");
+                None
+            }
+        }
     }
 }
 
-impl NixpacksPreset {
-    /// Check if nixpacks can detect and handle this project
-    pub fn can_detect(path: &Path) -> bool {
-        // Try to generate a plan - if successful, nixpacks can handle it
-        let path_str = match path.to_str() {
-            Some(s) => s,
-            None => {
-                warn!("Invalid path encoding for nixpacks detection");
-                return false;
-            }
-        };
+/// Removes a staged `nixpacks.toml` when the build plan has been generated.
+///
+/// The build context is a checkout the platform owns, but leaving the file
+/// behind would make a later `autopack.json` look like it lost to a stale
+/// compatibility file.
+struct StagedConfig {
+    path: std::path::PathBuf,
+}
 
-        let app = match App::new(path_str) {
-            Ok(app) => app,
-            Err(e) => {
-                debug!("Nixpacks: Failed to create app: {}", e);
-                return false;
-            }
-        };
-
-        let environment = match Environment::from_envs(vec![]) {
-            Ok(env) => env,
-            Err(e) => {
-                debug!("Nixpacks: Failed to create environment: {}", e);
-                return false;
-            }
-        };
-
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
-        ];
-
-        let mut generator =
-            NixpacksBuildPlanGenerator::new(providers, GeneratePlanOptions::default());
-
-        match generator.generate_plan(&app, &environment) {
-            Ok((plan, _)) => {
-                // Check if we have a valid plan with phases and start command
-                let phase_count = plan.phases.clone().map_or(0, |phases| phases.len());
-                if phase_count > 0 {
-                    let start = plan.start_phase.clone().unwrap_or_default();
-                    if start.cmd.is_some() {
-                        debug!("Nixpacks: Successfully detected project at {:?}", path);
-                        return true;
-                    }
-                }
-                debug!("Nixpacks: Plan generated but missing start command");
-                false
-            }
-            Err(e) => {
-                debug!("Nixpacks: Failed to generate plan: {}", e);
-                false
-            }
-        }
-    }
-
-    /// Generate actual Dockerfile using nixpacks' DockerImageBuilder
-    ///
-    /// This function uses the nixpacks library to:
-    /// 1. Detect the project language/framework
-    /// 2. Generate an optimized build plan
-    /// 3. Use DockerImageBuilder to generate the actual Dockerfile
-    /// 4. Extract build args from the plan's variables
-    /// 5. Read the generated Dockerfile from .nixpacks/Dockerfile
-    ///
-    /// Returns both the Dockerfile content and the build args that should be passed to docker build.
-    async fn generate_dockerfile_content(
-        &self,
-        path: &Path,
-        build_vars: Option<&Vec<String>>,
-    ) -> Result<DockerfileWithArgs, String> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| "Invalid path encoding".to_string())?;
-
-        info!("Generating Dockerfile for: {:?}", path);
-
-        // Create nixpacks App
-        let app =
-            App::new(path_str).map_err(|e| format!("Failed to create nixpacks app: {}", e))?;
-
-        // Create environment from build variables
-        let env_vars: Vec<&str> = build_vars
-            .map(|vars| vars.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_default();
-
-        let environment = Environment::from_envs(env_vars)
-            .map_err(|e| format!("Failed to create environment: {}", e))?;
-
-        // Generate the build plan with the persisted provider selection and
-        // optional user-supplied Nixpacks plan.
-        let plan = self.generate_build_plan(&app, &environment)?;
-
-        // Validate plan
-        let phase_count = plan.phases.clone().map_or(0, |phases| phases.len());
-        if phase_count == 0 {
-            return Err("Unable to generate a build plan for this app. \
-                 Please check https://nixpacks.com for supported languages."
-                .to_string());
-        }
-
-        // let start = plan.start_phase.clone().unwrap_or_default();
-        // if start.cmd.is_none() {
-        //     return Err("No start command could be found in the build plan".to_string());
-        // }
-
-        // Use DockerImageBuilder to generate the actual Dockerfile
-        let builder = DockerImageBuilder::new(
-            Logger::new(),
-            DockerBuilderOptions {
-                out_dir: Some(path.to_string_lossy().to_string()),
-                ..Default::default()
-            },
-        );
-
-        // Generate Dockerfile at .nixpacks/Dockerfile
-        builder
-            .create_image(path_str, &plan, &environment)
-            .await
-            .map_err(|e| format!("Failed to create nixpacks image: {}", e))?;
-
-        // Read the generated Dockerfile
-        let nixpacks_dockerfile = path.join(".nixpacks").join("Dockerfile");
-        let dockerfile = fs::read_to_string(&nixpacks_dockerfile)
-            .await
-            .map_err(|e| format!("Failed to read generated Dockerfile: {}", e))?;
-
-        // Extract build args from the plan's variables
-        // These are the environment variables that nixpacks has set as defaults
-        let mut build_args = HashMap::new();
-        if let Some(variables) = plan.variables {
-            for (key, value) in variables.iter() {
-                build_args.insert(key.clone(), value.clone());
-            }
-        }
-
-        debug!(
-            dockerfile_bytes = dockerfile.len(),
-            build_arg_count = build_args.len(),
-            "Generated Nixpacks Dockerfile"
-        );
-        info!(
-            "Successfully generated Dockerfile using nixpacks with {} build args",
-            build_args.len()
-        );
-
-        Ok(DockerfileWithArgs::with_args(dockerfile, build_args))
+impl Drop for StagedConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -573,9 +369,9 @@ impl Preset for NixpacksPreset {
                 .map(|provider| provider_name(*provider))
                 .collect::<Vec<_>>()
                 .join(" + ");
-            format!("Nixpacks ({})", providers)
+            format!("Autopack ({providers})")
         } else {
-            format!("Nixpacks ({})", provider_name(self.display_provider()))
+            format!("Autopack ({})", provider_name(self.display_provider()))
         }
     }
 
@@ -619,56 +415,27 @@ impl Preset for NixpacksPreset {
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
-        match self
-            .generate_dockerfile_content(config.local_path, config.build_vars)
-            .await
-        {
-            Ok(dockerfile_with_args) => dockerfile_with_args,
-            Err(e) => {
-                warn!("Failed to generate nixpacks Dockerfile: {}", e);
-                // Return a minimal fallback Dockerfile
-                DockerfileWithArgs::new(format!(
-                    r#"FROM alpine:latest
-WORKDIR /app
-COPY . .
-# Nixpacks failed to generate Dockerfile: {}
-# Please provide a custom Dockerfile or check your project structure
-"#,
-                    e
-                ))
-            }
-        }
+        let _staged = self.stage_config(config.local_path);
+        render_or_explain(&config, self.forced_provider())
     }
 
     async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
-        match self.generate_dockerfile_content(local_path, None).await {
-            Ok(dockerfile_with_args) => dockerfile_with_args,
-            Err(e) => {
-                warn!("Failed to generate nixpacks Dockerfile: {}", e);
-                DockerfileWithArgs::new(format!(
-                    r#"FROM alpine:latest
-WORKDIR /app
-COPY . .
-# Nixpacks failed: {}
-"#,
-                    e
-                ))
-            }
-        }
+        let _staged = self.stage_config(local_path);
+        let mut config = DockerfileConfig::new(local_path, local_path, "app");
+        config.use_buildkit = true;
+        render_or_explain(&config, self.forced_provider())
     }
 
     fn install_command(&self, _local_path: &Path) -> String {
-        // Nixpacks handles installation automatically in the Dockerfile
-        "# Handled by nixpacks".to_string()
+        "# Handled by autopack".to_string()
     }
 
     fn build_command(&self, _local_path: &Path) -> String {
-        // Nixpacks handles build automatically in the Dockerfile
-        "# Handled by nixpacks".to_string()
+        "# Handled by autopack".to_string()
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        // Nixpacks needs the entire project directory
+        // The whole project directory: autopack decides what it needs.
         vec![".".to_string()]
     }
 
@@ -692,871 +459,281 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Helper to get the detected language/provider from build plan
-    fn get_detected_language(path: &Path) -> Option<String> {
-        let path_str = path.to_str()?;
-        let app = App::new(path_str).ok()?;
-        let environment = Environment::from_envs(vec![]).ok()?;
-
-        let providers: &[&dyn nixpacks::providers::Provider] = &[
-            &nixpacks::providers::node::NodeProvider {},
-            &nixpacks::providers::python::PythonProvider {},
-            &nixpacks::providers::rust::RustProvider {},
-            &nixpacks::providers::go::GolangProvider {},
-            &nixpacks::providers::java::JavaProvider {},
-            &nixpacks::providers::php::PhpProvider {},
-            &nixpacks::providers::ruby::RubyProvider {},
-            &nixpacks::providers::deno::DenoProvider {},
-            &nixpacks::providers::elixir::ElixirProvider {},
-            &nixpacks::providers::csharp::CSharpProvider {},
-            &nixpacks::providers::fsharp::FSharpProvider {},
-            &nixpacks::providers::dart::DartProvider {},
-            &nixpacks::providers::swift::SwiftProvider {},
-            &nixpacks::providers::zig::ZigProvider {},
-            &nixpacks::providers::scala::ScalaProvider {},
-            &nixpacks::providers::haskell::HaskellStackProvider {},
-            &nixpacks::providers::clojure::ClojureProvider {},
-            &nixpacks::providers::crystal::CrystalProvider {},
-            &nixpacks::providers::cobol::CobolProvider {},
-            &nixpacks::providers::gleam::GleamProvider {},
-            &nixpacks::providers::lunatic::LunaticProvider {},
-            &nixpacks::providers::scheme::HauntProvider {},
-            &nixpacks::providers::staticfile::StaticfileProvider {},
-        ];
-
-        let mut generator =
-            NixpacksBuildPlanGenerator::new(providers, GeneratePlanOptions::default());
-
-        let (plan, _) = generator.generate_plan(&app, &environment).ok()?;
-
-        // Get the build plan string which contains the detected info
-        let build_string = plan.get_build_string().ok()?;
-
-        Some(build_string)
+    fn project(files: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (path, contents) in files {
+            let full = dir.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+        dir
     }
 
-    fn create_nodejs_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let package_json = r#"{
-  "name": "test-app",
-  "version": "1.0.0",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "express": "^4.18.0"
-  }
-}"#;
-        fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
-        fs::write(
-            temp_dir.path().join("index.js"),
-            "console.log('Hello World')",
-        )
-        .unwrap();
-        temp_dir
+    fn nodejs_project() -> TempDir {
+        project(&[
+            (
+                "package.json",
+                r#"{"name":"test-app","scripts":{"start":"node index.js"},"dependencies":{"express":"^4.18.0"}}"#,
+            ),
+            ("index.js", "console.log('Hello World')"),
+        ])
     }
 
-    fn create_python_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        fs::write(temp_dir.path().join("requirements.txt"), "flask==2.0.0").unwrap();
-        fs::write(
-            temp_dir.path().join("main.py"),
-            r#"from flask import Flask
-app = Flask(__name__)
+    fn python_project() -> TempDir {
+        project(&[
+            ("requirements.txt", "flask==2.0.0"),
+            ("main.py", "print('hello')"),
+        ])
+    }
 
-@app.route('/')
-def hello():
-    return 'Hello World!'
-
-if __name__ == '__main__':
-    app.run()
-"#,
-        )
-        .unwrap();
-        temp_dir
+    async fn dockerfile_for(preset: &NixpacksPreset, dir: &Path) -> String {
+        let mut config = DockerfileConfig::new(dir, dir, "test-project");
+        config.use_buildkit = true;
+        preset.dockerfile(config).await.content
     }
 
     #[test]
-    fn test_nixpacks_detects_nodejs() {
-        let temp_dir = create_nodejs_project();
-
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Should detect Node.js project"
-        );
-
-        // Verify it detected Node.js specifically
-        let detected = get_detected_language(temp_dir.path()).expect("Should detect language");
-        assert!(
-            detected.to_lowercase().contains("node") || detected.contains("npm"),
-            "Build plan should indicate Node.js was detected, got: {}",
-            &detected[..detected.len().min(200)]
-        );
+    fn detects_the_common_languages() {
+        for (label, dir) in [
+            ("node", nodejs_project()),
+            ("python", python_project()),
+            (
+                "go",
+                project(&[("go.mod", "module x\n\ngo 1.22\n"), ("main.go", "package main\nfunc main() {}\n")]),
+            ),
+            (
+                "rust",
+                project(&[
+                    ("Cargo.toml", "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                    ("src/main.rs", "fn main() {}"),
+                ]),
+            ),
+            ("dart", project(&[("pubspec.yaml", "name: x\n")])),
+        ] {
+            assert!(
+                NixpacksPreset::can_detect(dir.path()),
+                "should detect the {label} project"
+            );
+        }
     }
 
     #[test]
-    fn test_nixpacks_detects_python() {
-        let temp_dir = create_python_project();
-
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Should detect Python project"
-        );
-
-        // Verify it detected Python specifically
-        let detected = get_detected_language(temp_dir.path()).expect("Should detect language");
-        assert!(
-            detected.to_lowercase().contains("python") || detected.contains("pip"),
-            "Build plan should indicate Python was detected, got: {}",
-            &detected[..detected.len().min(200)]
-        );
+    fn a_directory_with_nothing_to_build_is_not_detected() {
+        let dir = project(&[("README.md", "# nothing here")]);
+        assert!(!NixpacksPreset::can_detect(dir.path()));
     }
 
     #[test]
-    fn test_nixpacks_fails_empty_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        assert!(!NixpacksPreset::can_detect(temp_dir.path()));
-    }
-
-    #[test]
-    fn test_nixpacks_preset_properties() {
-        let preset = NixpacksPreset::auto();
-        assert_eq!(preset.slug(), "nixpacks");
-        assert_eq!(preset.label(), "Nixpacks (Auto-detect)");
-        assert!(matches!(preset.project_type(), ProjectType::Server));
-    }
-
-    #[test]
-    fn test_nixpacks_provider_selection_reaches_plan_options() {
-        let preset = NixpacksPreset::from_config(NixpacksConfig {
-            nixpacks_config: None,
-            providers: vec![NixpacksProvider::Node],
-        });
-        let options = preset.generate_plan_options().unwrap();
-
+    fn detection_reports_the_matching_provider() {
+        let dir = python_project();
         assert_eq!(
-            options.plan.and_then(|plan| plan.providers),
-            Some(vec!["node".to_string()])
+            NixpacksPreset::detect_available_providers(dir.path()),
+            vec![NixpacksProvider::Python]
         );
     }
 
-    #[test]
-    fn test_nixpacks_multiple_providers_preserve_order_and_auto_marker() {
-        let preset = NixpacksPreset::from_config(NixpacksConfig {
-            nixpacks_config: None,
-            providers: vec![NixpacksProvider::Auto, NixpacksProvider::Python],
-        });
-        let options = preset.generate_plan_options().unwrap();
+    #[tokio::test]
+    async fn generates_a_dockerfile_for_an_auto_detected_project() {
+        let dir = python_project();
+        let content = dockerfile_for(&NixpacksPreset::auto(), dir.path()).await;
 
+        assert!(content.starts_with("# syntax="), "{content}");
+        assert!(!content.contains("autopack could not plan"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_provider_forces_that_language() {
+        // A repository can look like more than one thing. If the project was
+        // pinned to a language, detection order must not override it.
+        let dir = project(&[
+            ("package.json", r#"{"scripts":{"start":"node index.js"}}"#),
+            ("index.js", ""),
+            ("requirements.txt", "flask==2.0.0"),
+            ("main.py", "print('hi')"),
+        ]);
+
+        let content = dockerfile_for(&NixpacksPreset::new(NixpacksProvider::Python), dir.path()).await;
+        assert!(content.contains("pip"), "{content}");
+    }
+
+    #[test]
+    fn slugs_and_stored_preset_are_unchanged() {
+        // These are persisted. Changing either orphans existing projects.
+        assert_eq!(NixpacksPreset::auto().slug(), "nixpacks");
         assert_eq!(
-            options.plan.and_then(|plan| plan.providers),
-            Some(vec!["...".to_string(), "python".to_string()])
+            NixpacksPreset::new(NixpacksProvider::Node).slug(),
+            NixpacksProvider::Node.variant_slug()
         );
-        assert_eq!(preset.slug(), "nixpacks");
+        assert_eq!(
+            NixpacksPreset::auto().stored_preset(),
+            Some(temps_entities::preset::Preset::Nixpacks)
+        );
     }
 
-    #[test]
-    fn test_nixpacks_invalid_custom_config_is_contextual() {
+    #[tokio::test]
+    async fn a_persisted_nixpacks_toml_reaches_the_build() {
+        // The config lives in the database, so it has to be materialised for
+        // autopack's compatibility reader to see it.
+        let dir = nodejs_project();
         let preset = NixpacksPreset::from_config(NixpacksConfig {
-            nixpacks_config: Some("invalid = [".to_string()),
-            providers: Vec::new(),
+            nixpacks_config: Some("[start]\ncmd = \"node custom-entry.js\"\n".to_string()),
+            ..Default::default()
         });
 
-        let error = preset.generate_plan_options().unwrap_err();
-        assert!(error.contains("Failed to parse custom Nixpacks config"));
+        let content = dockerfile_for(&preset, dir.path()).await;
+        assert!(content.contains("node custom-entry.js"), "{content}");
     }
 
-    fn create_rust_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let cargo_toml = r#"[package]
-name = "test-rust-app"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-"#;
-        fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
-
-        let src_dir = temp_dir.path().join("src");
-        fs::create_dir(&src_dir).unwrap();
-        fs::write(
-            src_dir.join("main.rs"),
-            r#"fn main() { println!("Hello, world!"); }"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_go_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let go_mod = r#"module example.com/hello
-
-go 1.21
-"#;
-        fs::write(temp_dir.path().join("go.mod"), go_mod).unwrap();
-        fs::write(
-            temp_dir.path().join("main.go"),
-            r#"package main
-
-import "fmt"
-
-func main() {
-    fmt.Println("Hello, World!")
-}
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_nextjs_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let package_json = r#"{
-  "name": "nextjs-app",
-  "version": "1.0.0",
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
-  },
-  "dependencies": {
-    "next": "14.0.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
-  }
-}"#;
-        fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
-
-        let pages_dir = temp_dir.path().join("pages");
-        fs::create_dir(&pages_dir).unwrap();
-        fs::write(
-            pages_dir.join("index.js"),
-            "export default function Home() { return <div>Hello</div> }",
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_php_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let composer_json = r#"{
-  "name": "test/php-app",
-  "require": {
-    "php": "^8.0"
-  }
-}"#;
-        fs::write(temp_dir.path().join("composer.json"), composer_json).unwrap();
-        fs::write(
-            temp_dir.path().join("index.php"),
-            "<?php\necho 'Hello, World!';\n",
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_ruby_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let gemfile = r#"source 'https://rubygems.org'
-
-gem 'sinatra'
-gem 'thin'
-"#;
-        fs::write(temp_dir.path().join("Gemfile"), gemfile).unwrap();
-
-        // Create Gemfile.lock for detection
-        let gemfile_lock = r#"GEM
-  remote: https://rubygems.org/
-  specs:
-    sinatra (3.0.0)
-
-PLATFORMS
-  ruby
-
-DEPENDENCIES
-  sinatra
-
-BUNDLED WITH
-   2.4.0
-"#;
-        fs::write(temp_dir.path().join("Gemfile.lock"), gemfile_lock).unwrap();
-
-        // Create config.ru for Rack application
-        fs::write(
-            temp_dir.path().join("config.ru"),
-            r#"require './app'
-run Sinatra::Application
-"#,
-        )
-        .unwrap();
-
-        fs::write(
-            temp_dir.path().join("app.rb"),
-            r#"require 'sinatra'
-
-get '/' do
-  'Hello, World!'
-end
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_java_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let pom_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0">
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>demo</artifactId>
-  <version>0.0.1-SNAPSHOT</version>
-  <name>demo</name>
-</project>
-"#;
-        fs::write(temp_dir.path().join("pom.xml"), pom_xml).unwrap();
-
-        let src_dir = temp_dir.path().join("src/main/java/com/example/demo");
-        fs::create_dir_all(&src_dir).unwrap();
-        fs::write(
-            src_dir.join("DemoApplication.java"),
-            r#"package com.example.demo;
-
-public class DemoApplication {
-    public static void main(String[] args) {
-        System.out.println("Hello, World!");
-    }
-}
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_deno_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        fs::write(
-            temp_dir.path().join("main.ts"),
-            r#"import { serve } from "https://deno.land/std@0.140.0/http/server.ts";
-
-serve(() => new Response("Hello, World!"));
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_elixir_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let mix_exs = r#"defmodule MyApp.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :my_app,
-      version: "0.1.0",
-      elixir: "~> 1.14"
-    ]
-  end
-end
-"#;
-        fs::write(temp_dir.path().join("mix.exs"), mix_exs).unwrap();
-
-        let lib_dir = temp_dir.path().join("lib");
-        fs::create_dir(&lib_dir).unwrap();
-        fs::write(
-            lib_dir.join("my_app.ex"),
-            r#"defmodule MyApp do
-  def hello do
-    "Hello, World!"
-  end
-end
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_csharp_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let csproj = r#"<Project Sdk="Microsoft.NET.Sdk.Web">
-  <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
-  </PropertyGroup>
-</Project>
-"#;
-        fs::write(temp_dir.path().join("MyApp.csproj"), csproj).unwrap();
-        fs::write(
-            temp_dir.path().join("Program.cs"),
-            r#"var builder = WebApplication.CreateBuilder(args);
-var app = builder.Build();
-
-app.MapGet("/", () => "Hello World!");
-
-app.Run();
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    fn create_dart_project() -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        let pubspec = r#"name: my_app
-version: 1.0.0
-environment:
-  sdk: '>=2.17.0 <3.0.0'
-"#;
-        fs::write(temp_dir.path().join("pubspec.yaml"), pubspec).unwrap();
-
-        let bin_dir = temp_dir.path().join("bin");
-        fs::create_dir(&bin_dir).unwrap();
-        fs::write(
-            bin_dir.join("main.dart"),
-            r#"void main() {
-  print('Hello, World!');
-}
-"#,
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    // Detection tests for all supported languages
-    #[test]
-    fn test_nixpacks_detects_rust() {
-        let temp_dir = create_rust_project();
-
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Rust project with Cargo.toml"
-        );
-
-        let detected = get_detected_language(temp_dir.path()).expect("Should detect language");
-        assert!(
-            detected.to_lowercase().contains("rust") || detected.contains("cargo"),
-            "Build plan should indicate Rust was detected, got: {}",
-            &detected[..detected.len().min(200)]
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_go() {
-        let temp_dir = create_go_project();
-
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Go project with go.mod"
-        );
-
-        let detected = get_detected_language(temp_dir.path()).expect("Should detect language");
-        assert!(
-            detected.to_lowercase().contains("go") || detected.contains("golang"),
-            "Build plan should indicate Go was detected, got: {}",
-            &detected[..detected.len().min(200)]
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_nextjs() {
-        let temp_dir = create_nextjs_project();
-
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Next.js project"
-        );
-
-        let detected = get_detected_language(temp_dir.path()).expect("Should detect language");
-        assert!(
-            detected.to_lowercase().contains("node")
-                || detected.contains("next")
-                || detected.contains("npm"),
-            "Build plan should indicate Node.js/Next.js was detected, got: {}",
-            &detected[..detected.len().min(200)]
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_php() {
-        let temp_dir = create_php_project();
-
-        // Verify it can detect
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect PHP project with composer.json"
-        );
-
-        // Verify it detected PHP specifically, not another language
-        let detected = get_detected_language(temp_dir.path());
-        assert!(detected.is_some(), "Should return detection info");
-
-        let plan = detected.unwrap();
-        assert!(
-            plan.to_lowercase().contains("php") || plan.contains("composer"),
-            "Build plan should indicate PHP was detected. Got: {:?}",
-            &plan[..plan.len().min(300)]
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_ruby() {
-        let temp_dir = create_ruby_project();
-        // Ruby detection is currently not working in this nixpacks version
-        // Document the actual behavior
-        let can_detect = NixpacksPreset::can_detect(temp_dir.path());
-        println!("Ruby project detection result: {}", can_detect);
-        // TODO: Investigate Ruby provider requirements in nixpacks
-    }
-
-    #[test]
-    fn test_nixpacks_detects_java() {
-        let temp_dir = create_java_project();
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Java project with pom.xml"
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_deno() {
-        let temp_dir = create_deno_project();
-        // Deno detection might be tricky - it could detect as Node.js or Deno
-        // Document actual behavior
-        let can_detect = NixpacksPreset::can_detect(temp_dir.path());
-        println!("Deno project detection result: {}", can_detect);
-        // This test documents behavior rather than asserting
-    }
-
-    #[test]
-    fn test_nixpacks_detects_elixir() {
-        let temp_dir = create_elixir_project();
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Elixir project with mix.exs"
-        );
-    }
-
-    #[test]
-    fn test_nixpacks_detects_csharp() {
-        let temp_dir = create_csharp_project();
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect C# project with .csproj"
-        );
-    }
-
-    #[test]
-    fn test_explicit_csharp_provider_uses_native_nixpacks_name() {
-        let temp_dir = create_csharp_project();
-        let app = App::new(temp_dir.path().to_string_lossy().as_ref()).unwrap();
-        let environment = Environment::from_envs(vec![]).unwrap();
+    #[tokio::test]
+    async fn staging_the_stored_config_leaves_no_file_behind() {
+        // A leftover nixpacks.toml would beat a later autopack.json.
+        let dir = nodejs_project();
         let preset = NixpacksPreset::from_config(NixpacksConfig {
-            nixpacks_config: None,
-            providers: vec![NixpacksProvider::CSharp],
+            nixpacks_config: Some("[start]\ncmd = \"node index.js\"\n".to_string()),
+            ..Default::default()
         });
 
-        let plan = preset
-            .generate_build_plan(&app, &environment)
-            .expect("explicit C# provider should resolve in Nixpacks");
-
-        assert!(!plan.phases.unwrap_or_default().is_empty());
-    }
-
-    #[test]
-    fn test_nixpacks_detects_dart() {
-        let temp_dir = create_dart_project();
-        assert!(
-            NixpacksPreset::can_detect(temp_dir.path()),
-            "Nixpacks should detect Dart project with pubspec.yaml"
-        );
-    }
-
-    // Dockerfile generation tests
-    #[tokio::test]
-    async fn test_dockerfile_generation_returns_content() {
-        let temp_dir = create_python_project();
-        let preset = NixpacksPreset::auto();
-
-        let config = DockerfileConfig {
-            use_buildkit: true,
-            root_local_path: temp_dir.path(),
-            local_path: temp_dir.path(),
-            install_command: None,
-            build_command: None,
-            output_dir: None,
-            build_vars: None,
-            project_slug: "test-project",
-        };
-
-        let dockerfile = preset.dockerfile(config).await;
-
-        println!("Generated content:\n{}", dockerfile.content);
-        println!("Content length: {}", dockerfile.content.len());
-        let build_args = dockerfile.build_args;
-        println!("Build args: {:?}", build_args);
-        assert!(
-            !dockerfile.content.is_empty(),
-            "Dockerfile should not be empty"
-        );
-        // Nixpacks returns a build plan summary, not a traditional Dockerfile
-        assert!(
-            dockerfile.content.contains("Nixpacks")
-                || dockerfile.content.contains("setup")
-                || dockerfile.content.contains("install"),
-            "Content should contain nixpacks build plan information"
-        );
+        dockerfile_for(&preset, dir.path()).await;
+        assert!(!dir.path().join("nixpacks.toml").exists());
     }
 
     #[tokio::test]
-    async fn test_stored_python_provider_controls_ambiguous_project_build() {
-        let temp_dir = create_python_project();
+    async fn a_repository_nixpacks_toml_wins_over_the_stored_one() {
+        // The file in the repository is the one the author is editing.
+        let dir = nodejs_project();
         fs::write(
-            temp_dir.path().join("package.json"),
-            r#"{
-  "name": "ambiguous-app",
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "express": "^4.18.0" }
-}"#,
+            dir.path().join("nixpacks.toml"),
+            "[start]\ncmd = \"node from-repo.js\"\n",
         )
         .unwrap();
-        fs::write(temp_dir.path().join("index.js"), "console.log('node')").unwrap();
 
-        let stored_config =
-            temps_entities::preset::PresetConfig::Nixpacks(NixpacksConfig {
-                nixpacks_config: None,
-                providers: vec![NixpacksProvider::Python],
-            });
-        let preset = crate::get_preset_for_storage(
-            temps_entities::preset::Preset::Nixpacks,
-            Some(&stored_config),
-        )
-        .expect("stored Nixpacks config should be valid")
-        .expect("stored Nixpacks preset should resolve");
-        let dockerfile = preset
-            .dockerfile(DockerfileConfig {
-                use_buildkit: true,
-                root_local_path: temp_dir.path(),
-                local_path: temp_dir.path(),
-                install_command: None,
-                build_command: None,
-                output_dir: None,
-                build_vars: None,
-                project_slug: "ambiguous-project",
-            })
-            .await;
+        let preset = NixpacksPreset::from_config(NixpacksConfig {
+            nixpacks_config: Some("[start]\ncmd = \"node from-database.js\"\n".to_string()),
+            ..Default::default()
+        });
 
+        let content = dockerfile_for(&preset, dir.path()).await;
+        assert!(content.contains("node from-repo.js"), "{content}");
         assert!(
-            !dockerfile.content.contains("Nixpacks failed"),
-            "{}",
-            dockerfile.content
+            dir.path().join("nixpacks.toml").exists(),
+            "the repository's own file must survive"
         );
+    }
+
+    #[test]
+    fn invalid_stored_toml_is_rejected_before_the_build() {
+        let result = NixpacksPreset::validate_config(&NixpacksConfig {
+            nixpacks_config: Some("this is not = valid = toml".to_string()),
+            ..Default::default()
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_validation_error_never_echoes_the_config_back() {
+        // This message reaches an API response body and the logs, and the
+        // config can hold secrets. `toml`'s own error Display renders the
+        // offending source line, so interpolating it leaks the value — which
+        // is exactly what happened here once.
+        let result = NixpacksPreset::validate_config(&NixpacksConfig {
+            nixpacks_config: Some("secret_token = [\"do-not-echo\"".to_string()),
+            ..Default::default()
+        });
+        let message = result.unwrap_err().to_string();
         assert!(
-            dockerfile.content.to_lowercase().contains("python"),
-            "expected Python build plan, got:\n{}",
-            dockerfile.content
+            !message.contains("do-not-echo"),
+            "the error echoed the config: {message}"
         );
+        assert!(!message.contains("secret_token"), "{message}");
+        // The position is still there, so the user can find the problem.
+        assert!(message.contains("line 1, column 30"), "{message}");
+    }
+
+    #[test]
+    fn the_reported_position_counts_lines_and_columns_from_one() {
+        assert_eq!(line_and_column("abc", 0), "line 1, column 1");
+        assert_eq!(line_and_column("abc\ndef", 5), "line 2, column 2");
+        // An offset at end-of-input is what an unterminated array produces.
+        assert_eq!(line_and_column("ab", 99), "line 1, column 3");
+    }
+
+    #[test]
+    fn valid_stored_toml_passes_validation() {
+        let result = NixpacksPreset::validate_config(&NixpacksConfig {
+            nixpacks_config: Some("[start]\ncmd = \"./server\"\n".to_string()),
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn dotnet_providers_share_one_autopack_provider() {
+        assert_eq!(autopack_provider(NixpacksProvider::CSharp), Some("dotnet"));
+        assert_eq!(autopack_provider(NixpacksProvider::FSharp), Some("dotnet"));
+    }
+
+    #[test]
+    fn a_language_autopack_lacks_falls_back_to_detection() {
+        // Forcing an id autopack does not know would fail the build outright.
+        assert_eq!(autopack_provider(NixpacksProvider::Scheme), None);
+        assert_eq!(
+            NixpacksPreset::new(NixpacksProvider::Scheme).forced_provider(),
+            None
+        );
+    }
+
+    #[test]
+    fn every_selectable_provider_maps_to_a_real_autopack_provider() {
+        // A typo here is a build that fails with "unknown provider" for one
+        // language only, which is exactly the kind of thing nobody notices.
+        let registry = autopack_providers::registry();
+        for provider in [
+            NixpacksProvider::Node,
+            NixpacksProvider::Python,
+            NixpacksProvider::Rust,
+            NixpacksProvider::Go,
+            NixpacksProvider::Java,
+            NixpacksProvider::Php,
+            NixpacksProvider::Ruby,
+            NixpacksProvider::Deno,
+            NixpacksProvider::Elixir,
+            NixpacksProvider::CSharp,
+            NixpacksProvider::FSharp,
+            NixpacksProvider::Dart,
+            NixpacksProvider::Swift,
+            NixpacksProvider::Zig,
+            NixpacksProvider::Scala,
+            NixpacksProvider::Haskell,
+            NixpacksProvider::Clojure,
+            NixpacksProvider::Crystal,
+            NixpacksProvider::Cobol,
+            NixpacksProvider::Gleam,
+            NixpacksProvider::Lunatic,
+            NixpacksProvider::Static,
+        ] {
+            let id = autopack_provider(provider)
+                .unwrap_or_else(|| panic!("{provider:?} should map to a provider"));
+            assert!(
+                registry.get(id).is_some(),
+                "{provider:?} maps to `{id}`, which autopack does not register"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_dockerfile_contains_build_plan() {
-        let temp_dir = create_nodejs_project();
-        let preset = NixpacksPreset::auto();
-
-        let config = DockerfileConfig {
-            use_buildkit: true,
-            root_local_path: temp_dir.path(),
-            local_path: temp_dir.path(),
-            install_command: None,
-            build_command: None,
-            output_dir: None,
-            build_vars: None,
-            project_slug: "test-project",
-        };
-
-        let dockerfile = preset.dockerfile(config).await;
-        println!("Generated dockerfile: {}", dockerfile.content);
-        // Nixpacks returns a build plan summary with setup/install/start phases
-        assert!(
-            dockerfile.content.contains("install") || dockerfile.content.contains("start"),
-            "Build plan should contain phase information"
-        );
+    async fn a_build_without_buildkit_is_refused_by_name() {
+        let dir = nodejs_project();
+        let config = DockerfileConfig::new(dir.path(), dir.path(), "test");
+        let content = NixpacksPreset::auto().dockerfile(config).await.content;
+        assert!(content.contains("BuildKit"), "{content}");
     }
 
     #[tokio::test]
-    async fn test_dockerfile_with_build_dir() {
-        let temp_dir = create_rust_project();
-        let preset = NixpacksPreset::auto();
-
-        let dockerfile = preset.dockerfile_with_build_dir(temp_dir.path()).await;
-
-        assert!(!dockerfile.content.is_empty());
-        // Nixpacks returns a build plan, not a traditional Dockerfile
-        assert!(
-            dockerfile.content.contains("Nixpacks")
-                || dockerfile.content.contains("setup")
-                || dockerfile.content.contains("install"),
-            "Build plan should contain nixpacks information"
-        );
-    }
-
-    // Install and build command tests
-    #[test]
-    fn test_install_command_handled_by_nixpacks() {
-        let temp_dir = create_python_project();
-        let preset = NixpacksPreset::auto();
-
-        let install_cmd = preset.install_command(temp_dir.path());
-
-        assert!(
-            install_cmd.contains("nixpacks") || install_cmd.contains("Handled"),
-            "Install command should indicate nixpacks handles it"
-        );
-    }
-
-    #[test]
-    fn test_build_command_handled_by_nixpacks() {
-        let temp_dir = create_nodejs_project();
-        let preset = NixpacksPreset::auto();
-
-        let build_cmd = preset.build_command(temp_dir.path());
-
-        assert!(
-            build_cmd.contains("nixpacks") || build_cmd.contains("Handled"),
-            "Build command should indicate nixpacks handles it"
-        );
-    }
-
-    // Dirs to upload tests
-    #[test]
-    fn test_dirs_to_upload_includes_root() {
-        let preset = NixpacksPreset::auto();
-        let dirs = preset.dirs_to_upload();
-
-        assert!(!dirs.is_empty(), "Should return directories to upload");
-        assert!(
-            dirs.contains(&".".to_string()),
-            "Should include root directory"
-        );
-    }
-
-    // Display trait test
-    #[test]
-    fn test_display_trait() {
-        let preset = NixpacksPreset::auto();
-        assert_eq!(format!("{}", preset), "Nixpacks (Auto-detect)");
-    }
-
-    // Icon URL test
-    #[test]
-    fn test_icon_url() {
-        let preset = NixpacksPreset::auto();
-        let icon_url = preset.icon_url();
-
-        assert!(
-            icon_url.contains("nixpacks"),
-            "Icon URL should reference nixpacks"
-        );
-        assert!(icon_url.ends_with(".svg"), "Icon should be SVG format");
-    }
-
-    // Edge case: project with no start command
-    #[test]
-    fn test_nixpacks_fails_on_project_without_entry_point() {
-        let temp_dir = TempDir::new().unwrap();
-        // Create a package.json without start script
-        let package_json = r#"{
-  "name": "incomplete-app",
-  "version": "1.0.0"
-}"#;
-        fs::write(temp_dir.path().join("package.json"), package_json).unwrap();
-
-        // Nixpacks might still detect it but fail validation
-        // This depends on nixpacks behavior - it might still work with default start
-        let can_detect = NixpacksPreset::can_detect(temp_dir.path());
-
-        // Document the behavior - this might be true or false depending on nixpacks version
-        println!(
-            "Project without explicit entry point detection result: {}",
-            can_detect
-        );
-    }
-
-    // Test with fixture directories (if they exist)
-    #[test]
-    fn test_detect_python_flask_fixture() {
-        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("temps-deployments/tests/fixtures/simple-python");
-
-        if fixture_path.exists() {
-            assert!(
-                NixpacksPreset::can_detect(&fixture_path),
-                "Should detect Python Flask fixture"
-            );
-        } else {
-            println!(
-                "Python fixture not found at {:?}, skipping test",
-                fixture_path
-            );
-        }
-    }
-
-    #[test]
-    fn test_detect_nextjs_fixture() {
-        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("temps-deployments/tests/fixtures/simple-nextjs");
-
-        if fixture_path.exists() {
-            assert!(
-                NixpacksPreset::can_detect(&fixture_path),
-                "Should detect Next.js fixture"
-            );
-        } else {
-            println!(
-                "Next.js fixture not found at {:?}, skipping test",
-                fixture_path
-            );
-        }
-    }
-
-    #[test]
-    fn test_detect_rust_fixture() {
-        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("temps-deployments/tests/fixtures/simple-rust");
-
-        if fixture_path.exists() {
-            assert!(
-                NixpacksPreset::can_detect(&fixture_path),
-                "Should detect Rust fixture"
-            );
-        } else {
-            println!(
-                "Rust fixture not found at {:?}, skipping test",
-                fixture_path
-            );
-        }
-    }
-
-    #[test]
-    fn test_detect_go_fixture() {
-        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("temps-deployments/tests/fixtures/simple-go");
-
-        if fixture_path.exists() {
-            assert!(
-                NixpacksPreset::can_detect(&fixture_path),
-                "Should detect Go fixture"
-            );
-        } else {
-            println!("Go fixture not found at {:?}, skipping test", fixture_path);
-        }
+    async fn an_unbuildable_project_fails_loudly_rather_than_producing_a_running_image() {
+        // The previous implementation emitted `FROM alpine` + `COPY . .` with no
+        // CMD, which builds, deploys, and then exits immediately.
+        let dir = project(&[("README.md", "# nothing here")]);
+        let content = dockerfile_for(&NixpacksPreset::auto(), dir.path()).await;
+        assert!(content.contains("exit 1"), "{content}");
     }
 }

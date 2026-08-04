@@ -2283,6 +2283,7 @@ pub(crate) fn public_sentry_dsn_var(
         | Preset::Dockerfile
         | Preset::DockerCompose
         | Preset::Nixpacks
+        | Preset::Autopack
         | Preset::Static => None,
     }
 }

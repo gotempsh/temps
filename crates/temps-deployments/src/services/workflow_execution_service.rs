@@ -25,41 +25,533 @@ use crate::jobs::{
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
-/// Map a deployment's free-form failure reason to a coarse, NON-identifying
-/// category for telemetry. The raw reason can contain build logs, file paths,
-/// or repo names, so it is never sent verbatim — only one of these stable
-/// labels (or `unknown`). Matching is on lowercased substrings.
-fn categorize_failure_reason(reason: Option<&str>) -> &'static str {
+/// Version of the allowlisted failure taxonomy emitted in deployment telemetry.
+/// Increment this when matching semantics or wire labels change.
+const FAILURE_CLASSIFIER_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentFailureStage {
+    Source,
+    Configuration,
+    DependencyInstall,
+    Build,
+    Image,
+    Deploy,
+    Runtime,
+    HealthCheck,
+    Resource,
+    Platform,
+    Unknown,
+}
+
+impl DeploymentFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Configuration => "configuration",
+            Self::DependencyInstall => "dependency_install",
+            Self::Build => "build",
+            Self::Image => "image",
+            Self::Deploy => "deploy",
+            Self::Runtime => "runtime",
+            Self::HealthCheck => "health_check",
+            Self::Resource => "resource",
+            Self::Platform => "platform",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentFailureCode {
+    OutOfMemory,
+    DiskExhausted,
+    Timeout,
+    HealthCheckFailed,
+    RepositoryAuthentication,
+    RepositoryNotFound,
+    RepositoryClone,
+    DnsResolution,
+    NetworkConnection,
+    DependencyLockfileOutOfSync,
+    DependencyResolution,
+    DependencyDownload,
+    RuntimeVersionUnsupported,
+    MissingBuildScript,
+    CompileError,
+    DockerfileInvalid,
+    BaseImagePull,
+    ImageMissing,
+    StaticOutputMissing,
+    PortUnavailable,
+    PermissionDenied,
+    InvalidConfiguration,
+    ContainerStart,
+    BuildError,
+    PlatformInternal,
+    Cancelled,
+    Unknown,
+}
+
+impl DeploymentFailureCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfMemory => "out_of_memory",
+            Self::DiskExhausted => "disk_exhausted",
+            Self::Timeout => "timeout",
+            Self::HealthCheckFailed => "health_check_failed",
+            Self::RepositoryAuthentication => "repository_authentication",
+            Self::RepositoryNotFound => "repository_not_found",
+            Self::RepositoryClone => "repository_clone",
+            Self::DnsResolution => "dns_resolution",
+            Self::NetworkConnection => "network_connection",
+            Self::DependencyLockfileOutOfSync => "dependency_lockfile_out_of_sync",
+            Self::DependencyResolution => "dependency_resolution",
+            Self::DependencyDownload => "dependency_download",
+            Self::RuntimeVersionUnsupported => "runtime_version_unsupported",
+            Self::MissingBuildScript => "missing_build_script",
+            Self::CompileError => "compile_error",
+            Self::DockerfileInvalid => "dockerfile_invalid",
+            Self::BaseImagePull => "base_image_pull",
+            Self::ImageMissing => "image_missing",
+            Self::StaticOutputMissing => "static_output_missing",
+            Self::PortUnavailable => "port_unavailable",
+            Self::PermissionDenied => "permission_denied",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::ContainerStart => "container_start",
+            Self::BuildError => "build_error",
+            Self::PlatformInternal => "platform_internal",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeploymentFailureClassification {
+    stage: DeploymentFailureStage,
+    code: DeploymentFailureCode,
+    /// Coarse pre-taxonomy value retained for telemetry consumers that already
+    /// group by `reason`.
+    legacy_reason: &'static str,
+}
+
+impl DeploymentFailureClassification {
+    const fn new(
+        stage: DeploymentFailureStage,
+        code: DeploymentFailureCode,
+        legacy_reason: &'static str,
+    ) -> Self {
+        Self {
+            stage,
+            code,
+            legacy_reason,
+        }
+    }
+}
+
+fn contains_any(reason: &str, signals: &[&str]) -> bool {
+    signals.iter().any(|signal| reason.contains(signal))
+}
+
+/// Add bounded template context without allowing operator-defined template
+/// slugs to become identifying or high-cardinality outbound telemetry.
+fn with_template_telemetry(
+    event: temps_core::telemetry::TelemetryEvent,
+    template_slug: Option<&str>,
+) -> temps_core::telemetry::TelemetryEvent {
+    let safe_slug = template_slug.and_then(temps_core::templates::telemetry_safe_template_slug);
+    let template_source = match (template_slug, safe_slug) {
+        (None, _) => "none",
+        (Some(_), Some(_)) => "bundled",
+        (Some(_), None) => "custom",
+    };
+
+    event
+        .with("is_template", template_slug.is_some())
+        .with("template_source", template_source)
+        .with_opt("template_slug", safe_slug.map(str::to_string))
+}
+
+/// Preserve the pre-taxonomy `reason` wire value exactly for existing
+/// telemetry consumers. New stage/code matching may be more specific, but it
+/// must not silently change this compatibility dimension.
+fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let r = reason.to_lowercase();
+    let reason = reason.to_lowercase();
 
-    // Order matters: check the most specific signals first.
-    if r.contains("out of memory") || r.contains("oom") || r.contains("exit code 137") {
+    if reason.contains("out of memory")
+        || reason.contains("oom")
+        || reason.contains("exit code 137")
+    {
         "oom"
-    } else if r.contains("timeout") || r.contains("timed out") || r.contains("deadline") {
+    } else if reason.contains("timeout")
+        || reason.contains("timed out")
+        || reason.contains("deadline")
+    {
         "timeout"
-    } else if r.contains("health check") || r.contains("healthcheck") || r.contains("unhealthy") {
+    } else if reason.contains("health check")
+        || reason.contains("healthcheck")
+        || reason.contains("unhealthy")
+    {
         "health_check"
-    } else if r.contains("build") || r.contains("compile") || r.contains("nixpacks") {
+    } else if reason.contains("build") || reason.contains("compile") || reason.contains("nixpacks")
+    {
         "build_error"
-    } else if r.contains("clone")
-        || r.contains("network")
-        || r.contains("connection")
-        || r.contains("download")
-        || r.contains("dns")
+    } else if reason.contains("clone")
+        || reason.contains("network")
+        || reason.contains("connection")
+        || reason.contains("download")
+        || reason.contains("dns")
     {
         "network"
-    } else if r.contains("image")
-        && (r.contains("not found") || r.contains("missing") || r.contains("no such"))
+    } else if reason.contains("image")
+        && (reason.contains("not found")
+            || reason.contains("missing")
+            || reason.contains("no such"))
     {
         "image_missing"
-    } else if r.contains("cancel") {
+    } else if reason.contains("cancel") {
         "cancelled"
     } else {
         "unknown"
     }
+}
+
+/// Classify a deployment's free-form failure reason locally into fixed,
+/// NON-identifying labels. The raw reason can contain secrets, source code,
+/// paths, repository names, and dependency names, so it must never leave the
+/// instance. Matching order is deliberately most-specific-first.
+fn classify_failure_reason(reason: Option<&str>) -> DeploymentFailureClassification {
+    let Some(reason) = reason else {
+        return DeploymentFailureClassification::new(
+            DeploymentFailureStage::Unknown,
+            DeploymentFailureCode::Unknown,
+            "unknown",
+        );
+    };
+    let r = reason.to_lowercase();
+
+    let classification =
+        if contains_any(&r, &["out of memory", "oom", "oomkilled", "exit code 137"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+                "oom",
+            )
+        } else if contains_any(
+            &r,
+            &["no space left on device", "disk quota exceeded", "enospc"],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::DiskExhausted,
+                "unknown",
+            )
+        } else if contains_any(&r, &["health check", "healthcheck", "unhealthy"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::HealthCheck,
+                DeploymentFailureCode::HealthCheckFailed,
+                "health_check",
+            )
+        } else if contains_any(&r, &["timeout", "timed out", "deadline"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Timeout,
+                "timeout",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "authentication failed",
+                "could not read username",
+                "permission denied (publickey)",
+                "invalid credentials",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryAuthentication,
+                "network",
+            )
+        } else if contains_any(&r, &["repository not found", "remote ref does not exist"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryNotFound,
+                "network",
+            )
+        } else if contains_any(&r, &["failed to clone", "git clone", "clone task failed"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryClone,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "could not resolve host",
+                "name or service not known",
+                "dns lookup failed",
+                "dns resolution",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::DnsResolution,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "err_pnpm_outdated_lockfile",
+                "frozen lockfile",
+                "lockfile is out of date",
+                "package-lock.json is not in sync",
+                "yarn.lock needs to be updated",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyLockfileOutOfSync,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "eresolve",
+                "could not resolve dependency",
+                "unable to resolve dependency tree",
+                "version solving failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyResolution,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to download",
+                "error fetching packages",
+                "package download failed",
+                "registry request failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyDownload,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "ebadengine",
+                "unsupported engine",
+                "unsupported runtime",
+                "runtime version not found",
+                "no matching version found",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::RuntimeVersionUnsupported,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "missing script: build",
+                "command \"build\" not found",
+                "couldn't find a script named \"build\"",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::MissingBuildScript,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "compilation failed",
+                "failed to compile",
+                "syntax error",
+                "type error",
+                "typescript error",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::CompileError,
+                "build_error",
+            )
+        } else if r.contains("dockerfile")
+            && contains_any(
+                &r,
+                &["parse error", "invalid", "failed to read", "not found"],
+            )
+        {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::DockerfileInvalid,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to pull image",
+                "pull access denied",
+                "manifest unknown",
+                "failed to resolve source metadata",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::BaseImagePull,
+                "network",
+            )
+        } else if r.contains("image")
+            && contains_any(&r, &["not found", "missing", "no such image"])
+        {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::ImageMissing,
+                "image_missing",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "static output directory not found",
+                "index.html not found",
+                "build output not found",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::StaticOutputMissing,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "address already in use",
+                "failed to find available port",
+                "no available port",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Deploy,
+                DeploymentFailureCode::PortUnavailable,
+                "unknown",
+            )
+        } else if contains_any(&r, &["permission denied", "operation not permitted"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PermissionDenied,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to parse .temps.yaml",
+                "invalid configuration",
+                "configuration validation failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::InvalidConfiguration,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to start container",
+                "container failed to start",
+                "container exited before",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Runtime,
+                DeploymentFailureCode::ContainerStart,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &["connection refused", "connection reset", "network error"],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+                "network",
+            )
+        } else if contains_any(&r, &["build", "compile", "nixpacks"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::BuildError,
+                "build_error",
+            )
+        } else if contains_any(&r, &["clone", "network", "connection", "download", "dns"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+                "network",
+            )
+        } else if r.contains("cancel") {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Cancelled,
+                "cancelled",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "workflow execution failed",
+                "internal error",
+                "job validation failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PlatformInternal,
+                "unknown",
+            )
+        } else {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Unknown,
+                DeploymentFailureCode::Unknown,
+                "unknown",
+            )
+        };
+
+    DeploymentFailureClassification {
+        legacy_reason: legacy_failure_reason(Some(reason)),
+        ..classification
+    }
+}
+
+fn deploy_failed_telemetry_event(
+    reason: Option<&str>,
+    source_type: Option<String>,
+    preset: Option<String>,
+    template_slug: Option<String>,
+) -> temps_core::telemetry::TelemetryEvent {
+    let failure = classify_failure_reason(reason);
+    with_template_telemetry(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::DeployFailed,
+        )
+        .with("reason", failure.legacy_reason)
+        .with("failure_stage", failure.stage.as_str())
+        .with("failure_code", failure.code.as_str())
+        .with("classifier_version", FAILURE_CLASSIFIER_VERSION)
+        .with_opt("source_type", source_type)
+        .with_opt("preset", preset),
+        template_slug.as_deref(),
+    )
 }
 
 /// Service for executing deployment workflows
@@ -183,7 +675,7 @@ impl WorkflowExecutionService {
         // Anonymous telemetry: a deploy is now being attempted. This runs once
         // per deployment workflow. Properties are non-identifying enum labels
         // (source type, build preset) plus whether this is a preview env.
-        self.telemetry().report(
+        self.telemetry().report(with_template_telemetry(
             temps_core::telemetry::TelemetryEvent::new(
                 temps_core::telemetry::TelemetryEventKind::DeployAttempted,
             )
@@ -193,7 +685,8 @@ impl WorkflowExecutionService {
                 temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
             )
             .with("is_preview", environment.is_preview),
-        );
+            project.template_slug.as_deref(),
+        ));
 
         // Load all jobs for this deployment
         let db_jobs = self.get_deployment_jobs(deployment_id).await?;
@@ -313,7 +806,7 @@ impl WorkflowExecutionService {
                 // path (finalization bypasses it), so success must be emitted
                 // here to pair with the deploy_attempted event above.
                 let telemetry = self.telemetry();
-                telemetry.report(
+                telemetry.report(with_template_telemetry(
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
                     )
@@ -323,17 +816,24 @@ impl WorkflowExecutionService {
                         temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
                     )
                     .with("is_preview", environment.is_preview),
-                );
+                    project.template_slug.as_deref(),
+                ));
                 // Once-per-instance: "this instance shipped its first deploy".
                 telemetry.report_once(
                     "first_deploy_succeeded",
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
-                    )
-                    .with("source_type", project.source_type.to_string())
-                    .with(
-                        "preset",
-                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    with_template_telemetry(
+                        temps_core::telemetry::TelemetryEvent::new(
+                            temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
+                        )
+                        .with("source_type", project.source_type.to_string())
+                        .with(
+                            "preset",
+                            temps_presets::runtime_slug(
+                                project.preset,
+                                project.preset_config.as_ref(),
+                            ),
+                        ),
+                        project.template_slug.as_deref(),
                     ),
                 );
 
@@ -1904,26 +2404,6 @@ impl WorkflowExecutionService {
                 ))
             })?;
 
-        // Non-identifying deploy labels for the failure telemetry below —
-        // best-effort lookup so deploy_failed can report which preset / source
-        // type the deploy used. That's what lets us see *which* presets fail
-        // most, not just the overall failure rate. (Success telemetry is
-        // emitted in execute_deployment_workflow, not here.)
-        let (telemetry_source_type, telemetry_preset) =
-            match projects::Entity::find_by_id(updated_deployment.project_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(p)) => (
-                    Some(p.source_type.to_string()),
-                    Some(temps_presets::runtime_slug(
-                        p.preset,
-                        p.preset_config.as_ref(),
-                    )),
-                ),
-                _ => (None, None),
-            };
-
         match status {
             temps_entities::types::PipelineStatus::Completed => {
                 // Get deployment URL from environment: prefer custom host, fall back to preview domain
@@ -1983,6 +2463,25 @@ impl WorkflowExecutionService {
                 // gains a caller.
             }
             temps_entities::types::PipelineStatus::Failed => {
+                // Best-effort labels used only for failure telemetry. Keep the
+                // lookup inside this arm so other status transitions do not pay
+                // for an unrelated project query.
+                let (telemetry_source_type, telemetry_preset, telemetry_template_slug) =
+                    match projects::Entity::find_by_id(updated_deployment.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        Ok(Some(project)) => (
+                            Some(project.source_type.to_string()),
+                            Some(temps_presets::runtime_slug(
+                                project.preset,
+                                project.preset_config.as_ref(),
+                            )),
+                            project.template_slug,
+                        ),
+                        _ => (None, None, None),
+                    };
+
                 let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
                     deployment_id: updated_deployment.id,
                     project_id: updated_deployment.project_id,
@@ -2001,20 +2500,15 @@ impl WorkflowExecutionService {
 
                 // Anonymous telemetry: terminal failure point. The raw
                 // `cancelled_reason` may contain build logs / paths / repo
-                // names, so it is NEVER sent — only a coarse category label.
-                // preset/source_type are included so we can see which build
-                // types fail most (e.g. "nixpacks deploys OOM 3x more often").
-                self.telemetry().report(
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::DeployFailed,
-                    )
-                    .with(
-                        "reason",
-                        categorize_failure_reason(cancelled_reason.as_deref()),
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
+                // names, so it is NEVER sent — only fixed allowlisted stage,
+                // code, and legacy category labels. preset/source_type are
+                // included so we can compare failure rates by build type.
+                self.telemetry().report(deploy_failed_telemetry_event(
+                    cancelled_reason.as_deref(),
+                    telemetry_source_type.clone(),
+                    telemetry_preset.clone(),
+                    telemetry_template_slug.clone(),
+                ));
             }
             temps_entities::types::PipelineStatus::Cancelled => {
                 let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
@@ -2416,6 +2910,246 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
 
+    async fn docker_available() -> bool {
+        match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn failure_classifier_maps_specific_errors_to_allowlisted_stage_and_code() {
+        let cases = [
+            (
+                "process was OOMKilled (exit code 137)",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+            ),
+            (
+                "write failed: no space left on device",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::DiskExhausted,
+            ),
+            (
+                "workflow deadline exceeded",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Timeout,
+            ),
+            (
+                "application health check timed out",
+                DeploymentFailureStage::HealthCheck,
+                DeploymentFailureCode::HealthCheckFailed,
+            ),
+            (
+                "authentication failed while fetching repository",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryAuthentication,
+            ),
+            (
+                "repository not found",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryNotFound,
+            ),
+            (
+                "Git clone task failed",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryClone,
+            ),
+            (
+                "could not resolve host: example.invalid",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::DnsResolution,
+            ),
+            (
+                "connection refused by build service",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+            ),
+            (
+                "ERR_PNPM_OUTDATED_LOCKFILE Cannot install with frozen lockfile",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyLockfileOutOfSync,
+            ),
+            (
+                "npm ERR! ERESOLVE unable to resolve dependency tree",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyResolution,
+            ),
+            (
+                "registry request failed while fetching packages",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyDownload,
+            ),
+            (
+                "npm ERR! code EBADENGINE Unsupported engine",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::RuntimeVersionUnsupported,
+            ),
+            (
+                "npm error Missing script: build",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::MissingBuildScript,
+            ),
+            (
+                "TypeScript error: failed to compile",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::CompileError,
+            ),
+            (
+                "Dockerfile parse error on line 4",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::DockerfileInvalid,
+            ),
+            (
+                "pull access denied for private/base-image",
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::BaseImagePull,
+            ),
+            (
+                "built image not found",
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::ImageMissing,
+            ),
+            (
+                "static output directory not found",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::StaticOutputMissing,
+            ),
+            (
+                "failed to find available port",
+                DeploymentFailureStage::Deploy,
+                DeploymentFailureCode::PortUnavailable,
+            ),
+            (
+                "operation not permitted while creating build directory",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PermissionDenied,
+            ),
+            (
+                "failed to parse .temps.yaml: invalid field",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::InvalidConfiguration,
+            ),
+            (
+                "failed to start container",
+                DeploymentFailureStage::Runtime,
+                DeploymentFailureCode::ContainerStart,
+            ),
+            (
+                "Nixpacks build failed",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::BuildError,
+            ),
+            (
+                "workflow execution failed before scheduling",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PlatformInternal,
+            ),
+            (
+                "deployment cancelled by workflow",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Cancelled,
+            ),
+        ];
+
+        for (message, expected_stage, expected_code) in cases {
+            let classification = classify_failure_reason(Some(message));
+            assert_eq!(classification.stage, expected_stage, "message: {message}");
+            assert_eq!(classification.code, expected_code, "message: {message}");
+        }
+    }
+
+    #[test]
+    fn deploy_failed_telemetry_never_copies_sensitive_failure_input() {
+        let sensitive = "Build failed in /srv/repos/acme-secret with token ghp_private123";
+        let event = deploy_failed_telemetry_event(
+            Some(sensitive),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            Some("observability-starter".to_string()),
+        );
+        let serialized = serde_json::to_string(&event).expect("telemetry event serializes");
+
+        assert_eq!(event.event_type, "deploy_failed");
+        assert_eq!(event.properties["failure_stage"], "build");
+        assert_eq!(event.properties["failure_code"], "build_error");
+        assert_eq!(event.properties["classifier_version"], 1);
+        assert_eq!(event.properties["is_template"], true);
+        assert_eq!(event.properties["template_source"], "bundled");
+        assert_eq!(event.properties["template_slug"], "observability-starter");
+        assert!(!serialized.contains("acme-secret"));
+        assert!(!serialized.contains("ghp_private123"));
+        assert!(!serialized.contains("/srv/repos"));
+
+        let regular_project_event = deploy_failed_telemetry_event(
+            Some("build failed"),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            None,
+        );
+        assert_eq!(regular_project_event.properties["is_template"], false);
+        assert_eq!(regular_project_event.properties["template_source"], "none");
+        assert!(!regular_project_event
+            .properties
+            .contains_key("template_slug"));
+
+        let private_slug = "customer-acme-private-ghp_secret456";
+        let custom_template_event = deploy_failed_telemetry_event(
+            Some("build failed"),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            Some(private_slug.to_string()),
+        );
+        let serialized =
+            serde_json::to_string(&custom_template_event).expect("telemetry event serializes");
+        assert_eq!(custom_template_event.properties["is_template"], true);
+        assert_eq!(
+            custom_template_event.properties["template_source"],
+            "custom"
+        );
+        assert!(!custom_template_event
+            .properties
+            .contains_key("template_slug"));
+        assert!(!serialized.contains(private_slug));
+    }
+
+    #[test]
+    fn failure_classifier_preserves_legacy_reason_wire_values() {
+        let cases = [
+            ("OOM", "oom"),
+            ("deadline reached", "timeout"),
+            ("health check timed out", "timeout"),
+            ("healthcheck failed", "health_check"),
+            ("build command exited", "build_error"),
+            ("DNS error", "network"),
+            ("image not found", "image_missing"),
+            ("deployment cancelled", "cancelled"),
+            ("novel error", "unknown"),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(legacy_failure_reason(Some(message)), expected);
+            assert_eq!(
+                classify_failure_reason(Some(message)).legacy_reason,
+                expected,
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_classifier_handles_missing_and_unrecognized_reasons() {
+        for reason in [
+            None,
+            Some("an entirely novel failure containing customer-data"),
+        ] {
+            let classification = classify_failure_reason(reason);
+            assert_eq!(classification.stage, DeploymentFailureStage::Unknown);
+            assert_eq!(classification.code, DeploymentFailureCode::Unknown);
+            assert_eq!(classification.legacy_reason, "unknown");
+        }
+    }
+
     // Mock services for testing
     struct MockGitProvider;
 
@@ -2433,9 +3167,15 @@ mod tests {
             _connection_id: i32,
             _repo_owner: &str,
             _repo_name: &str,
-            _target_dir: &std::path::Path,
+            target_dir: &std::path::Path,
             _branch_or_ref: Option<&str>,
         ) -> Result<(), temps_git::GitProviderManagerError> {
+            tokio::fs::create_dir_all(target_dir)
+                .await
+                .map_err(|error| temps_git::GitProviderManagerError::Other(error.to_string()))?;
+            tokio::fs::write(target_dir.join("package.json"), b"{}")
+                .await
+                .map_err(|error| temps_git::GitProviderManagerError::Other(error.to_string()))?;
             Ok(())
         }
 
@@ -2777,6 +3517,7 @@ mod tests {
             repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
             preset: Set(Preset::NextJs),
+            template_slug: Set(Some("observability-starter".to_string())),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -2929,6 +3670,10 @@ mod tests {
     #[tokio::test]
     async fn test_execute_deployment_workflow_with_jobs() -> Result<(), Box<dyn std::error::Error>>
     {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -2953,41 +3698,6 @@ mod tests {
             ..Default::default()
         };
         download_job.insert(db.as_ref()).await?;
-
-        let build_job = deployment_jobs::ActiveModel {
-            deployment_id: Set(deployment.id),
-            job_id: Set("build_image".to_string()),
-            job_type: Set("BuildImageJob".to_string()),
-            name: Set("Build Image".to_string()),
-            description: Set(Some("Build Docker image".to_string())),
-            status: Set(JobStatus::Pending),
-            log_id: Set(format!("deployment-{}-job-build_image", deployment.id)),
-            job_config: Set(Some(serde_json::json!({
-                "dockerfile_path": "Dockerfile"
-            }))),
-            dependencies: Set(Some(serde_json::json!(["download_repo"]))),
-            execution_order: Set(Some(1)),
-            ..Default::default()
-        };
-        build_job.insert(db.as_ref()).await?;
-
-        let deploy_job = deployment_jobs::ActiveModel {
-            deployment_id: Set(deployment.id),
-            job_id: Set("deploy_container".to_string()),
-            job_type: Set("DeployContainerJob".to_string()),
-            name: Set("Deploy Container".to_string()),
-            description: Set(Some("Deploy container".to_string())),
-            status: Set(JobStatus::Pending),
-            log_id: Set(format!("deployment-{}-job-deploy_container", deployment.id)),
-            job_config: Set(Some(serde_json::json!({
-                "port": 3000,
-                "replicas": 1
-            }))),
-            dependencies: Set(Some(serde_json::json!(["build_image"]))),
-            execution_order: Set(Some(2)),
-            ..Default::default()
-        };
-        deploy_job.insert(db.as_ref()).await?;
 
         let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
@@ -3027,51 +3737,111 @@ mod tests {
         let telemetry = Arc::new(CapturingTelemetryReporter::default());
         service.set_telemetry(telemetry.clone());
 
-        // Execute workflow - this will use mock services so should succeed
-        let result = service.execute_deployment_workflow(deployment.id).await;
+        // Execute workflow. This test is the terminal-success proof, so an
+        // unexpected mock failure must fail the test rather than being accepted.
+        service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect("mock deployment workflow must complete successfully");
 
         // deploy_attempted fires unconditionally once jobs are loaded.
         assert!(
             telemetry.has_event("deploy_attempted"),
             "deploy_attempted telemetry must fire for every workflow execution"
         );
+        let attempted = telemetry
+            .event("deploy_attempted")
+            .expect("deploy_attempted event must be captured");
+        assert_eq!(attempted.properties["is_template"], true);
+        assert_eq!(attempted.properties["template_source"], "bundled");
+        assert_eq!(
+            attempted.properties["template_slug"],
+            "observability-starter"
+        );
 
-        // Note: This might fail due to the mock implementations not being complete enough
-        // But the structure should be correct
-        match result {
-            Ok(_) => {
-                // Success - verify deployment was updated
-                let updated_deployment = deployments::Entity::find_by_id(deployment.id)
-                    .one(db.as_ref())
-                    .await?
-                    .unwrap();
-
-                assert_eq!(updated_deployment.state, "deployed");
-                // Note: container_id field removed after workflow refactoring
-
-                // The success funnel events must fire on the Ok path — this is
-                // the only place they are emitted (MarkDeploymentCompleteJob
-                // bypasses update_deployment_status_with_reason on success).
-                assert!(
-                    telemetry.has_event("deploy_succeeded"),
-                    "deploy_succeeded telemetry must fire when the workflow completes"
-                );
-                assert!(
-                    telemetry.has_event("first_deploy_succeeded"),
-                    "first_deploy_succeeded telemetry must fire on the first successful deploy"
-                );
-            }
-            Err(e) => {
-                // Log error for debugging
-                eprintln!("Workflow execution error (expected in unit test): {}", e);
-                // In unit tests with mocks, some failures are expected — but a
-                // failed workflow must never report success.
-                assert!(
-                    !telemetry.has_event("deploy_succeeded"),
-                    "deploy_succeeded telemetry must not fire when the workflow fails"
-                );
-            }
+        for event_type in ["deploy_succeeded", "first_deploy_succeeded"] {
+            let event = telemetry
+                .event(event_type)
+                .unwrap_or_else(|| panic!("{event_type} event must be captured"));
+            assert_eq!(event.properties["is_template"], true);
+            assert_eq!(event.properties["template_source"], "bundled");
+            assert_eq!(event.properties["template_slug"], "observability-starter");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_status_path_sanitizes_operator_template_and_raw_reason(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment) = create_test_data(&db).await?;
+
+        let private_slug = "customer-acme-private-ghp_secret789";
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.template_slug = Set(Some(private_slug.to_string()));
+        active_project.update(db.as_ref()).await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+        );
+        let telemetry = Arc::new(CapturingTelemetryReporter::default());
+        service.set_telemetry(telemetry.clone());
+
+        let sensitive_reason =
+            "Build failed in /srv/repos/acme-secret with token ghp_private_failure123";
+        service
+            .update_deployment_status_with_reason(
+                deployment.id,
+                temps_entities::types::PipelineStatus::Failed,
+                Some(sensitive_reason.to_string()),
+            )
+            .await?;
+
+        let event = telemetry
+            .event("deploy_failed")
+            .expect("real failed status path must report deploy_failed");
+        let serialized = serde_json::to_string(&event)?;
+        assert_eq!(event.properties["failure_stage"], "build");
+        assert_eq!(event.properties["failure_code"], "build_error");
+        assert_eq!(event.properties["is_template"], true);
+        assert_eq!(event.properties["template_source"], "custom");
+        assert!(!event.properties.contains_key("template_slug"));
+        for sensitive in [
+            private_slug,
+            "/srv/repos/acme-secret",
+            "ghp_private_failure123",
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+
+        let failed_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("deployment row must exist");
+        assert_eq!(failed_deployment.state, "failed");
 
         Ok(())
     }
@@ -3090,6 +3860,15 @@ mod tests {
                 .expect("telemetry capture lock poisoned")
                 .iter()
                 .any(|e| e.event_type == event_type)
+        }
+
+        fn event(&self, event_type: &str) -> Option<temps_core::telemetry::TelemetryEvent> {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .cloned()
         }
     }
 

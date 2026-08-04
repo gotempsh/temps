@@ -1,13 +1,13 @@
-//! Rust preset implementation using Nixpacks
+//! Rust preset implementation using autopack
 //!
-//! This preset detects Rust projects (Cargo.toml) and uses Nixpacks for building.
+//! This preset detects Rust projects (Cargo.toml) and uses autopack for building.
 
 use crate::{DockerfileConfig, DockerfileWithArgs, NixpacksPreset, NixpacksProvider, Preset, ProjectType};
 use async_trait::async_trait;
 use std::fmt;
 use std::path::Path;
 
-/// Rust preset - delegates to Nixpacks with Rust provider
+/// Rust preset - delegates to autopack with the Rust provider
 #[derive(Debug, Clone, Copy)]
 pub struct RustPreset;
 
@@ -43,15 +43,15 @@ impl Preset for RustPreset {
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Rust provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Rust);
-        nixpacks.dockerfile(config).await
+        // Delegate to autopack with the Rust provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Rust);
+        builder.dockerfile(config).await
     }
 
     async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Rust provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Rust);
-        nixpacks.dockerfile_with_build_dir(local_path).await
+        // Delegate to autopack with the Rust provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Rust);
+        builder.dockerfile_with_build_dir(local_path).await
     }
 
     fn install_command(&self, _local_path: &Path) -> String {

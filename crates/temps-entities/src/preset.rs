@@ -112,6 +112,10 @@ pub enum Preset {
     #[sea_orm(string_value = "nixpacks")]
     Nixpacks,
 
+    /// Auto-detecting builder backed by the autopack crates.
+    #[sea_orm(string_value = "autopack")]
+    Autopack,
+
     #[sea_orm(string_value = "static")]
     Static,
 
@@ -154,6 +158,7 @@ impl Preset {
             Preset::Dockerfile => "dockerfile",
             Preset::DockerCompose => "docker-compose",
             Preset::Nixpacks => "nixpacks",
+            Preset::Autopack => "autopack",
             Preset::Static => "static",
             Preset::NodeJs => "nodejs",
         }
@@ -186,6 +191,7 @@ impl Preset {
             Preset::Dockerfile => "Dockerfile",
             Preset::DockerCompose => "Docker Compose",
             Preset::Nixpacks => "Nixpacks",
+            Preset::Autopack => "Autopack",
             Preset::Static => "Static Site",
             Preset::NodeJs => "Node.js",
         }
@@ -213,9 +219,11 @@ impl Preset {
             Preset::Rust => "rust",
             Preset::Java => "java",
             Preset::Laravel => "php",
-            Preset::Dockerfile | Preset::DockerCompose | Preset::Nixpacks | Preset::Static => {
-                "generic"
-            }
+            Preset::Dockerfile
+            | Preset::DockerCompose
+            | Preset::Nixpacks
+            | Preset::Autopack
+            | Preset::Static => "generic",
         }
     }
 
@@ -288,6 +296,7 @@ impl Preset {
             Preset::Dockerfile => None,    // User-defined
             Preset::DockerCompose => None, // Multiple services, user-configured
             Preset::Nixpacks => None,      // Auto-detected
+            Preset::Autopack => None,      // Auto-detected
             Preset::Static => None,        // No server
         }
     }
@@ -335,6 +344,7 @@ impl Preset {
             Preset::Dockerfile => Some("https://cdn.simpleicons.org/docker/2496ED"),
             Preset::DockerCompose => Some("https://cdn.simpleicons.org/docker/2496ED"),
             Preset::Nixpacks => None, // No specific icon
+            Preset::Autopack => None, // No specific icon
             Preset::Static => Some("https://cdn.simpleicons.org/html5/E34F26"),
         }
     }
@@ -362,7 +372,9 @@ impl Preset {
             Preset::Python | Preset::Go | Preset::Rust | Preset::Java | Preset::NodeJs => "runtime",
 
             // Generic presets
-            Preset::Dockerfile | Preset::DockerCompose | Preset::Nixpacks => "container",
+            Preset::Dockerfile | Preset::DockerCompose | Preset::Nixpacks | Preset::Autopack => {
+                "container"
+            }
             Preset::Static => "static",
         }
     }
@@ -435,6 +447,7 @@ impl std::str::FromStr for Preset {
             "dockerfile" => Ok(Preset::Dockerfile),
             "docker-compose" | "dockercompose" | "compose" => Ok(Preset::DockerCompose),
             "nixpacks" => Ok(Preset::Nixpacks),
+            "autopack" => Ok(Preset::Autopack),
             "static" => Ok(Preset::Static),
             "nodejs" | "node" => Ok(Preset::NodeJs),
             _ => Err(format!("Unknown preset: {}", s)),
@@ -1092,6 +1105,7 @@ impl PresetConfig {
             Preset::Dockerfile => PresetConfig::Dockerfile(DockerfileConfig::default()),
             Preset::DockerCompose => PresetConfig::DockerCompose(DockerComposeConfig::default()),
             Preset::Nixpacks => PresetConfig::Nixpacks(NixpacksConfig::default()),
+            Preset::Autopack => PresetConfig::Nixpacks(NixpacksConfig::default()),
             Preset::Static => PresetConfig::Static(StaticConfig::default()),
             Preset::NodeJs => PresetConfig::NodeJs(NodeJsConfig::default()),
         }

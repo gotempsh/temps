@@ -64,7 +64,7 @@ hickory-resolver = "0.26"
 
 # Email validation (native): SMTP probing over SOCKS5 + Gravatar hashing
 tokio-socks = "0.5"
-md5 = "0.7"
+md5 = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
