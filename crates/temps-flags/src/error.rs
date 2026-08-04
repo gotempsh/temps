@@ -80,8 +80,12 @@ fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
         sea_orm::DbErr::RecordNotInserted => true,
         other => {
             let rendered = other.to_string();
-            rendered.contains("23505")
-                || rendered.contains("duplicate key value violates unique constraint")
+            // Require the SQLSTATE to sit alongside the word "unique" rather
+            // than matching "23505" on its own. Flag keys permit digits, so a
+            // flag named `23505` could otherwise make an unrelated query error
+            // report itself as a duplicate — a 409 hiding a real 500.
+            rendered.contains("duplicate key value violates unique constraint")
+                || (rendered.contains("23505") && rendered.contains("unique"))
         }
     }
 }
@@ -115,5 +119,18 @@ mod tests {
     fn unrelated_database_errors_stay_database_errors() {
         let raw = sea_orm::DbErr::Custom("connection reset by peer".to_string());
         assert!(matches!(FlagError::from(raw), FlagError::Database(_)));
+    }
+
+    /// Flag keys permit digits, so a flag named `23505` must not turn an
+    /// unrelated failure into a 409 that hides a real 500.
+    #[test]
+    fn a_flag_key_that_looks_like_a_sqlstate_does_not_fake_a_conflict() {
+        let raw = sea_orm::DbErr::Custom(
+            "query failed for flag '23505': connection reset by peer".to_string(),
+        );
+        assert!(
+            matches!(FlagError::from(raw), FlagError::Database(_)),
+            "the bare SQLSTATE digits must not be enough on their own"
+        );
     }
 }
