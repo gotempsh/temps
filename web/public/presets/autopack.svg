@@ -1,0 +1,12 @@
+<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" role="img" fill="#14B8A6">
+  <title>autopack</title>
+  <!-- An isometric box with its lid lifted clear: the container image autopack
+       produces, caught mid-assembly. The lift is what makes it autopack's mark
+       rather than the generic package cube every registry uses.
+       Deliberately not a triangle — that is Vercel's, and temps competes with
+       them — and not a letter "A", which is Astro's and sits in the same
+       picker. The gaps carry the shape, so it survives at 16px. -->
+  <path d="M12 1.6 19.72 6.06 12 10.52 4.28 6.06Z"/>
+  <path d="M3.99 8.3 11.71 12.77V21.7L3.99 17.23Z"/>
+  <path d="M20.01 8.3 12.29 12.77V21.7L20.01 17.23Z"/>
+</svg>
