@@ -14,8 +14,8 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
-    AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
+    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
+    AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
     RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
@@ -172,6 +172,9 @@ pub struct AppSettingsResponse {
     /// Build-time resource limits (control-plane only). No sensitive content,
     /// passed through as-is.
     pub build_limits: BuildLimitsSettings,
+
+    /// Per-turn limits for the AI chat. No sensitive content.
+    pub ai_chat_limits: AiChatLimitsSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -383,6 +386,7 @@ impl From<AppSettings> for AppSettingsResponse {
             require_mfa_for_admins: settings.require_mfa_for_admins,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
+            ai_chat_limits: settings.ai_chat_limits,
         }
     }
 }
@@ -993,6 +997,29 @@ fn validate_observability_compression(
     Ok(())
 }
 
+/// Reject a chat turn timeout outside the supported range.
+///
+/// The runtime clamps on read, so an out-of-range value could never break the
+/// chat — but storing one means the settings API echoes back a number that is
+/// not what is in effect, and the form then shows the operator a limit that
+/// isn't real. Rejecting keeps the stored value and the effective value the
+/// same thing, which is the only way the page can be trusted.
+fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem> {
+    let min = AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS;
+    let max = AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS;
+    if !(min..=max).contains(&limits.turn_timeout_secs) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "ai_chat_limits.turn_timeout_secs must be between {min} and {max} seconds \
+                 (got {})",
+                limits.turn_timeout_secs
+            ))
+            .build());
+    }
+    Ok(())
+}
+
 fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
     if monitoring.scrape_interval_secs < 15 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -1242,6 +1269,7 @@ async fn update_settings(
     }
 
     validate_monitoring_settings(&settings.monitoring)?;
+    validate_ai_chat_limits(&settings.ai_chat_limits)?;
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
@@ -1594,7 +1622,61 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::{AgentSandboxSettings, AppSettings, ProviderConfig};
+    use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
+
+    /// The stored value and the effective value must be the same number.
+    ///
+    /// The runtime clamps on read, so an out-of-range value could never break
+    /// the chat — but it would be echoed back by the API and shown in the form,
+    /// telling the operator a limit is in force that isn't. Found by testing
+    /// the endpoint rather than trusting the clamp.
+    #[test]
+    fn ai_chat_turn_timeout_outside_the_supported_range_is_rejected() {
+        for bad in [0, 5, 29, 3601, 99_999] {
+            let limits = AiChatLimitsSettings {
+                turn_timeout_secs: bad,
+            };
+            assert!(
+                validate_ai_chat_limits(&limits).is_err(),
+                "{bad}s should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ai_chat_turn_timeout_within_range_is_accepted() {
+        for ok in [30, 120, 900, 3600] {
+            let limits = AiChatLimitsSettings {
+                turn_timeout_secs: ok,
+            };
+            assert!(
+                validate_ai_chat_limits(&limits).is_ok(),
+                "{ok}s should be accepted"
+            );
+        }
+    }
+
+    /// The bounds the form advertises must be the bounds the server enforces,
+    /// or the UI silently sends values that 400.
+    #[test]
+    fn advertised_bounds_match_the_runtime_clamp() {
+        let min = AiChatLimitsSettings {
+            turn_timeout_secs: AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS,
+        };
+        let max = AiChatLimitsSettings {
+            turn_timeout_secs: AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS,
+        };
+        assert_eq!(
+            min.turn_timeout().as_secs(),
+            u64::from(AiChatLimitsSettings::MIN_TURN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            max.turn_timeout().as_secs(),
+            u64::from(AiChatLimitsSettings::MAX_TURN_TIMEOUT_SECS)
+        );
+        assert!(validate_ai_chat_limits(&min).is_ok());
+        assert!(validate_ai_chat_limits(&max).is_ok());
+    }
 
     // Regression: a client round-tripping a never-configured external_url
     // sends `Some("")` (the form's empty-string default), which previously

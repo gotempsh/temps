@@ -15,6 +15,7 @@ temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
@@ -37,4 +38,6 @@ base64 = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` gives the paused clock used to exercise the turn deadline without
+# a test that actually waits fifteen minutes. Dev-only — not in the binary.
+tokio = { workspace = true, features = ["test-util"] }

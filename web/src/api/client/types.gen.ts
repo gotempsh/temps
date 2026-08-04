@@ -668,6 +668,33 @@ export type AiAgentTimelineRow = {
 };
 
 /**
+ * Bounds on one AI chat turn.
+ *
+ * A turn is bounded by TIME rather than by a number of steps. A step count
+ * says nothing about cost or about how long someone has been watching a
+ * spinner, and it cuts short exactly the long, productive turns the chat
+ * exists for. The user can already see each tool call and press Stop; the
+ * deadline is what guarantees an *unattended* turn still ends.
+ *
+ * The right value is a property of the model, which is why it is configurable
+ * rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+ * against a slow local model and seconds against a hosted one.
+ */
+export type AiChatLimitsSettings = {
+    /**
+     * How long one turn may run before it is stopped and the partial answer
+     * returned, in seconds. The user is told the turn was cut short.
+     *
+     * Checked between steps, not mid-call: a model round already in flight
+     * finishes, so a turn can overrun by up to one round. Against a slow
+     * self-hosted model that is a minute or two. Aborting mid-stream would cut
+     * the answer off in the middle of a sentence and throw away work already
+     * paid for, which is worse than a late stop.
+     */
+    turn_timeout_secs?: number;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -910,7 +937,8 @@ export type AnomalyPreviewRequest = {
      */
     aggregation: string;
     /**
-     * Must be an `anomaly` detector — the band to backtest.
+     * The detector to backtest. `static` and `anomaly` are supported — the
+     * kinds the evaluator actually runs.
      */
     detection_config: DetectionConfig;
     /**
@@ -965,6 +993,13 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     agent_sandbox?: AgentSandboxSettings;
+    /**
+     * Limits on a single AI chat turn. Operator-tunable because the right
+     * value depends on the model: a turn against a slow self-hosted model can
+     * legitimately take ten minutes, while a hosted one finishes in seconds
+     * and a shorter ceiling keeps costs predictable.
+     */
+    ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
      * Build-time resource limits applied on the control plane to prevent
@@ -1073,6 +1108,10 @@ export type AppSettings = {
  */
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
+    /**
+     * Per-turn limits for the AI chat. No sensitive content.
+     */
+    ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
@@ -1893,6 +1932,32 @@ export type ChatMessage = {
     role: string;
     tool_call_id?: string | null;
     tool_calls?: Array<unknown> | null;
+};
+
+/**
+ * What still has to be true before an AI chat can run a turn in this project.
+ *
+ * The three gates are independent and fail for different reasons with different
+ * fixes, so they are reported separately rather than collapsed into one boolean:
+ * an instance admin configures a provider (instance-wide), while the two toggles
+ * are per-project. Collapsing them would leave the user with "AI unavailable"
+ * and no idea which of three places to go.
+ */
+export type ChatReadinessResponse = {
+    /**
+     * An AI provider is configured on this instance. Fixed in
+     * Settings → AI Providers; instance-wide, not per project.
+     */
+    ai_configured: boolean;
+    /**
+     * The per-project read-only chat toggle is on (the default).
+     */
+    chat_enabled: boolean;
+    /**
+     * The per-project write-actions opt-in is on. Required for any flow where
+     * the assistant *proposes* changes; irrelevant for read-only questions.
+     */
+    write_actions_enabled: boolean;
 };
 
 /**
@@ -36545,6 +36610,39 @@ export type RejectPendingActionResponses = {
 };
 
 export type RejectPendingActionResponse = RejectPendingActionResponses[keyof RejectPendingActionResponses];
+
+export type GetChatReadinessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/readiness';
+};
+
+export type GetChatReadinessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetChatReadinessResponses = {
+    /**
+     * Which AI prerequisites are met
+     */
+    200: ChatReadinessResponse;
+};
+
+export type GetChatReadinessResponse = GetChatReadinessResponses[keyof GetChatReadinessResponses];
 
 export type ListProjectAlarmsData = {
     body?: never;

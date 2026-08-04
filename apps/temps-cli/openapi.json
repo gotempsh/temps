@@ -28145,6 +28145,53 @@
         ]
       }
     },
+    "/projects/{project_id}/ai/readiness": {
+      "get": {
+        "tags": [
+          "AI Chat"
+        ],
+        "summary": "Report which AI prerequisites this project satisfies.",
+        "description": "Read-only and cheap, so the UI can decide up front whether to show a working\nentry point, an onboarding path, or nothing \u2014 instead of letting the user\nclick something that fails with a 409 they can't act on.",
+        "operationId": "get_chat_readiness",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Which AI prerequisites are met",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatReadinessResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/projects/{project_id}/alarms": {
       "get": {
         "tags": [
@@ -49786,6 +49833,21 @@
           }
         }
       },
+      "AiChatLimitsSettings": {
+        "type": "object",
+        "description": "Bounds on one AI chat turn.\n\nA turn is bounded by TIME rather than by a number of steps. A step count\nsays nothing about cost or about how long someone has been watching a\nspinner, and it cuts short exactly the long, productive turns the chat\nexists for. The user can already see each tool call and press Stop; the\ndeadline is what guarantees an *unattended* turn still ends.\n\nThe right value is a property of the model, which is why it is configurable\nrather than compiled in: a full alert-suggestion turn takes ~10 minutes\nagainst a slow local model and seconds against a hosted one.",
+        "properties": {
+          "turn_timeout_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How long one turn may run before it is stopped and the partial answer\nreturned, in seconds. The user is told the turn was cut short.\n\nChecked between steps, not mid-call: a model round already in flight\nfinishes, so a turn can overrun by up to one round. Against a slow\nself-hosted model that is a minute or two. Aborting mid-stream would cut\nthe answer off in the middle of a sentence and throw away work already\npaid for, which is worse than a late stop.",
+            "default": 900,
+            "example": 900,
+            "maximum": 3600,
+            "minimum": 30
+          }
+        }
+      },
       "AiConfigSettings": {
         "type": "object",
         "description": "Global AI configuration settings. Controls the default config repo\ncontaining `.claude/` directory (skills, MCP servers, plugins) that\ngets overlaid into every agent sandbox.",
@@ -50318,7 +50380,7 @@
           },
           "detection_config": {
             "$ref": "#/components/schemas/DetectionConfig",
-            "description": "Must be an `anomaly` detector \u2014 the band to backtest."
+            "description": "The detector to backtest. `static` and `anomaly` are supported \u2014 the\nkinds the evaluator actually runs."
           },
           "end_time": {
             "type": [
@@ -50481,6 +50543,17 @@
               "memory_limit_mb": 8192,
               "network_mode": "full",
               "sandbox_backend": null
+            }
+          },
+          "ai_chat_limits": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AiChatLimitsSettings",
+                "description": "Limits on a single AI chat turn. Operator-tunable because the right\nvalue depends on the model: a turn against a slow self-hosted model can\nlegitimately take ten minutes, while a hosted one finishes in seconds\nand a shorter ceiling keeps costs predictable."
+              }
+            ],
+            "default": {
+              "turn_timeout_secs": 900
             }
           },
           "ai_config": {
@@ -50790,11 +50863,16 @@
           "setup_complete",
           "require_mfa_for_admins",
           "cluster_dns",
-          "build_limits"
+          "build_limits",
+          "ai_chat_limits"
         ],
         "properties": {
           "agent_sandbox": {
             "$ref": "#/components/schemas/AgentSandboxSettingsMasked"
+          },
+          "ai_chat_limits": {
+            "$ref": "#/components/schemas/AiChatLimitsSettings",
+            "description": "Per-turn limits for the AI chat. No sensitive content."
           },
           "ai_config": {
             "$ref": "#/components/schemas/AiConfigSettings"
@@ -52514,6 +52592,29 @@
               "null"
             ],
             "items": {}
+          }
+        }
+      },
+      "ChatReadinessResponse": {
+        "type": "object",
+        "description": "What still has to be true before an AI chat can run a turn in this project.\n\nThe three gates are independent and fail for different reasons with different\nfixes, so they are reported separately rather than collapsed into one boolean:\nan instance admin configures a provider (instance-wide), while the two toggles\nare per-project. Collapsing them would leave the user with \"AI unavailable\"\nand no idea which of three places to go.",
+        "required": [
+          "ai_configured",
+          "chat_enabled",
+          "write_actions_enabled"
+        ],
+        "properties": {
+          "ai_configured": {
+            "type": "boolean",
+            "description": "An AI provider is configured on this instance. Fixed in\nSettings \u2192 AI Providers; instance-wide, not per project."
+          },
+          "chat_enabled": {
+            "type": "boolean",
+            "description": "The per-project read-only chat toggle is on (the default)."
+          },
+          "write_actions_enabled": {
+            "type": "boolean",
+            "description": "The per-project write-actions opt-in is on. Required for any flow where\nthe assistant *proposes* changes; irrelevant for read-only questions."
           }
         }
       },

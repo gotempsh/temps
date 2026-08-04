@@ -20,6 +20,7 @@ use crate::handlers::{self, AiChatApiDoc, AppState};
 use crate::pending_actions::PendingActionService;
 use crate::provider::ConversationContextProvider;
 use crate::providers::alert::AlertChatProvider;
+use crate::providers::alert_suggest::AlertSuggestChatProvider;
 use crate::providers::api_tools::ApiToolsProvider;
 use crate::providers::deployment::DeploymentChatProvider;
 use crate::providers::project::ProjectChatProvider;
@@ -93,6 +94,7 @@ impl TempsPlugin for AiChatPlugin {
             let providers: Vec<Arc<dyn ConversationContextProvider>> = vec![
                 Arc::new(DeploymentChatProvider::new(db.clone(), log_service)),
                 Arc::new(AlertChatProvider::new(db.clone())),
+                Arc::new(AlertSuggestChatProvider::new()),
                 Arc::new(ProjectChatProvider::new(db.clone())),
                 // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
                 // Uses the sentinel context_type "__api_tools__" — never selected as a
@@ -106,10 +108,15 @@ impl TempsPlugin for AiChatPlugin {
                 Arc::new(RepoToolsProvider::new(db.clone(), git)),
             ];
 
-            let service = Arc::new(
-                ConversationService::new(db.clone(), ai, providers)
-                    .with_write_support(write_handle, pending_actions.clone()),
-            );
+            // Optional: operator-tuned chat limits (turn timeout). Absent in
+            // minimal wirings, where the compiled defaults apply.
+            let config_service = context.get_service::<temps_config::ConfigService>();
+            let mut service = ConversationService::new(db.clone(), ai, providers)
+                .with_write_support(write_handle, pending_actions.clone());
+            if let Some(cfg) = config_service {
+                service = service.with_config(cfg);
+            }
+            let service = Arc::new(service);
             context.register_service(service.clone());
 
             let app_state = Arc::new(AppState {

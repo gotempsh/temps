@@ -1,19 +1,29 @@
-//! Backtest / band preview for anomaly alert rules.
+//! Backtest / band preview for alert rules.
 //!
-//! Replays a metric over a time range against the SAME [`BandModel`] the
-//! evaluator uses, so a "would this have fired?" preview in the UI can never
-//! diverge from what production would actually do. The band is built from the
-//! lookback ending at the range end and applied to each displayed bucket, mapped
-//! through the same `value_for_rule` (so counter rates / histogram percentiles
-//! compare like-for-like).
+//! Replays a metric over a time range against the SAME detector logic the
+//! evaluator uses, so a "would this have fired?" preview can never diverge from
+//! what production would actually do — the band comes from [`BandModel`] and
+//! static thresholds go through [`Comparator::breaches`], the same call the
+//! evaluator makes. Values are mapped through the same `value_for_rule` so
+//! counter rates / histogram percentiles compare like-for-like.
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::detectors::{AnomalyParams, BandModel, DEFAULT_LOOKBACK_DAYS, MIN_BASELINE_SAMPLES};
+use crate::detectors::{
+    AnomalyParams, BandModel, Comparator, DEFAULT_LOOKBACK_DAYS, MIN_BASELINE_SAMPLES,
+};
 use crate::error::OtelError;
 use crate::services::metric_alert_evaluator::value_for_rule;
 use crate::services::OtelService;
 use crate::types::{MetricAggregation, MetricQuery};
+
+/// Hard cap on buckets scored in one backtest.
+///
+/// The range and bucket width are caller-supplied and every bucket becomes a
+/// point in the response, so without a ceiling an over-wide request turns into
+/// an unbounded hypertable scan and an enormous response body. 10k points is
+/// far more than any chart renders or any judgement about noisiness needs.
+pub const MAX_PREVIEW_POINTS: u64 = 10_000;
 
 /// One point in the backtest: the value, the band around it, and whether it
 /// breached.
@@ -62,7 +72,7 @@ pub async fn compute_anomaly_preview(
             start_time: Some(end - Duration::days(lookback_days as i64)),
             end_time: Some(end),
             bucket_interval: Some(interval.clone()),
-            limit: None,
+            limit: Some(MAX_PREVIEW_POINTS),
             aggregation,
             ..Default::default()
         })
@@ -81,7 +91,7 @@ pub async fn compute_anomaly_preview(
             start_time: Some(start),
             end_time: Some(end),
             bucket_interval: Some(interval),
-            limit: None,
+            limit: Some(MAX_PREVIEW_POINTS),
             aggregation,
             ..Default::default()
         })
@@ -122,5 +132,77 @@ pub async fn compute_anomaly_preview(
         breach_count,
         baseline_samples: band.samples as i64,
         sufficient: band.samples >= MIN_BASELINE_SAMPLES,
+    })
+}
+
+/// Backtest a **static threshold** over `[start, end]`.
+///
+/// "Would this have fired?" matters at least as much for a static rule as for
+/// an anomaly band — arguably more, because the threshold is a number a person
+/// (or a model) picked, with nothing but judgement behind it. Answering it
+/// before the rule is created is what separates a grounded threshold from a
+/// guess, and it is the only way to notice that a proposed rule would have
+/// fired on every single bucket, or never once.
+///
+/// Breaches go through [`Comparator::breaches`] — the same call the evaluator
+/// makes — so the preview cannot drift from production behaviour.
+///
+/// `lower`/`upper` are both the threshold: a static rule has no band, and
+/// repeating the constant keeps one response shape for both detector families
+/// (a flat line is also exactly what a chart wants to draw).
+#[allow(clippy::too_many_arguments)]
+pub async fn compute_static_preview(
+    otel: &OtelService,
+    project_id: i32,
+    metric_name: &str,
+    aggregation_str: &str,
+    window_secs: i32,
+    comparator: Comparator,
+    threshold: f64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<AnomalyPreview, OtelError> {
+    let aggregation = MetricAggregation::parse(aggregation_str);
+    let interval = format!("{}s", window_secs.max(1));
+
+    let display = otel
+        .query_metrics(MetricQuery {
+            project_id,
+            metric_name: Some(metric_name.to_string()),
+            start_time: Some(start),
+            end_time: Some(end),
+            bucket_interval: Some(interval),
+            limit: Some(MAX_PREVIEW_POINTS),
+            aggregation,
+            ..Default::default()
+        })
+        .await?;
+
+    let mut points = Vec::with_capacity(display.len());
+    let mut breach_count = 0i64;
+    for b in &display {
+        let value = value_for_rule(b, aggregation);
+        let breaching = comparator.breaches(value, threshold);
+        if breaching {
+            breach_count += 1;
+        }
+        points.push(PreviewPoint {
+            bucket: b.bucket,
+            value,
+            lower: threshold,
+            upper: threshold,
+            breaching,
+        });
+    }
+
+    // A static threshold needs no baseline, so there is nothing that could be
+    // "insufficient" — but an empty range still cannot answer the question, and
+    // reporting that as a confident "would never have fired" would be a lie.
+    let sample_count = points.len() as i64;
+    Ok(AnomalyPreview {
+        points,
+        breach_count,
+        baseline_samples: sample_count,
+        sufficient: sample_count > 0,
     })
 }

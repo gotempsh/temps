@@ -29,12 +29,20 @@ pub use service::{ChatStreamEvent, ConversationService};
 pub enum ChatError {
     #[error("conversation '{0}' not found")]
     NotFound(String),
+    #[error("project {0} not found")]
+    ProjectNotFound(i32),
     #[error("no AI context provider registered for type '{0}'")]
     NoProvider(String),
     #[error("AI is not configured for this project")]
     AiUnavailable,
     #[error("context not found or not accessible")]
     ContextUnavailable,
+    #[error("failed to load project {project_id} for AI chat readiness: {source}")]
+    ProjectLookup {
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
     #[error("database error: {0}")]
     Db(#[from] sea_orm::DbErr),
     #[error("AI provider error: {0}")]

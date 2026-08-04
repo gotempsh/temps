@@ -65,6 +65,7 @@ import { registerInitCommand } from './commands/init/index.js'
 import { registerLinkCommand } from './commands/link/index.js'
 import { registerUpCommand } from './commands/up/index.js'
 import { registerStatusCommand } from './commands/status/index.js'
+import { registerAiCommands } from './commands/ai/index.js'
 import { registerInstancesCommands } from './commands/instances/index.js'
 import { registerEnvSyncCommands } from './commands/env-sync/index.js'
 import { registerRollbackCommand } from './commands/rollback/index.js'
@@ -205,6 +206,7 @@ registerFlagsCommands(program)
   registerLinkCommand(program)
   registerUpCommand(program)
   registerStatusCommand(program)
+  registerAiCommands(program)
   registerInstancesCommands(program)
   registerEnvSyncCommands(program)
   registerRollbackCommand(program)

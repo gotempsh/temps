@@ -10212,6 +10212,7 @@ dependencies = [
  "temps-ai",
  "temps-ai-api-tools",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-entities",
  "temps-git",
