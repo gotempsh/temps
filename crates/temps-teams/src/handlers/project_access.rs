@@ -92,66 +92,21 @@ pub(crate) fn router() -> Router<Arc<TeamsAppState>> {
 // Authorization inputs for mutating a project's grants
 // ---------------------------------------------------------------------------
 
-/// Gathers what the service needs to authorize a grant change.
+/// Classifies the caller for the service's authorization rules.
 ///
-/// The rules themselves live in the service, evaluated inside a transaction
-/// against grant rows locked `FOR UPDATE` — see [`GrantAuthz`]. They were
-/// originally evaluated here, which had three defects, all from deciding
-/// against an unlocked, cached snapshot:
-///
-/// - two concurrent revokes each read "not the last grant", both
-///   authorized, and between them removed every grant, silently re-opening
-///   the project to everyone;
-/// - the permission lookup came from the 60 s cache, so a just-revoked
-///   project admin could re-grant themselves and make the revocation
-///   non-durable;
-/// - only the incoming role was ceiling-checked, so a project-admin could
-///   demote or delete an `owner` grant and become the top authority.
-///
-/// This function therefore resolves the caller's permissions **uncached**
-/// and hands them over; it deliberately makes no decision itself.
-async fn grant_authz(
-    auth: &temps_auth::context::AuthContext,
-    state: &TeamsAppState,
-    project_id: i32,
-) -> Result<GrantAuthz, Problem> {
+/// This is the *whole* of the handler's involvement in that decision. It
+/// deliberately does not resolve the caller's project permissions: those
+/// are read by the service inside its transaction, from the grant rows it
+/// holds locked. Resolving them here would put the decision back on a
+/// snapshot taken before the lock — which is what let two concurrent
+/// revokes each believe they were not removing the last grant, and let a
+/// just-revoked project admin re-grant themselves from a stale read.
+fn grant_authz(auth: &temps_auth::context::AuthContext) -> GrantAuthz {
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
-        return Ok(GrantAuthz::instance_admin());
+        GrantAuthz::instance_admin()
+    } else {
+        GrantAuthz::project_scoped()
     }
-
-    let held = match state
-        .checker
-        .effective_project_permissions_uncached(auth.user_id(), project_id)
-        .await
-    {
-        // `None` means the project has no grants at all. That is reachable
-        // here (a revoke against an ungated project, or a concurrent revoke
-        // of the last grant between this call and the service's lock), and
-        // it maps to "holds nothing", not "unrestricted" — the empty set
-        // denies, which is the intended answer. Do not "simplify" this into
-        // treating `None` as an allow.
-        Ok(opt) => opt.unwrap_or_default().into_iter().collect(),
-        Err(e) => {
-            tracing::error!(
-                project_id,
-                user_id = auth.user_id(),
-                error = %e,
-                "teams: could not resolve caller permissions while authorizing a grant change"
-            );
-            return Err(temps_core::error_builder::ErrorBuilder::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-            .type_("https://temps.sh/probs/project-access-check-failed")
-            .title("Project Access Check Failed")
-            .detail("Could not verify project access; please try again")
-            .build());
-        }
-    };
-
-    Ok(GrantAuthz {
-        is_instance_admin: false,
-        held,
-    })
 }
 
 #[utoipa::path(
@@ -209,9 +164,9 @@ pub async fn grant_project_access(
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
     project_access_guard!(auth, project_id, checker);
     // ...and the coarse guard above is not sufficient on its own: it passes
-    // for a `viewer`, who could then rewrite this very grant. See
-    // `authorize_grant_mutation`.
-    let authz = grant_authz(&auth, &state, project_id).await?;
+    // for a `viewer`, who could then rewrite this very grant. The rule that
+    // stops them lives in the service, under the row lock.
+    let authz = grant_authz(&auth);
     // Capture audit fields before req is moved into the service call.
     let team_id = req.team_id;
     let role = req.role.to_string();
@@ -257,10 +212,10 @@ pub async fn revoke_project_access(
     permission_guard!(auth, ProjectsWrite);
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
     project_access_guard!(auth, project_id, checker);
-    let authz = grant_authz(&auth, &state, project_id).await?;
+    let authz = grant_authz(&auth);
     state
         .team_service
-        .revoke_project_access(project_id, team_id, &authz)
+        .revoke_project_access(auth.user_id(), project_id, team_id, &authz)
         .await?;
     let audit = ProjectAccessRevokedAudit {
         context: AuditContext {
@@ -275,4 +230,51 @@ pub async fn revoke_project_access(
         tracing::error!(error = %e, "teams: failed to write project access revoke audit log");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_auth::context::AuthContext;
+    use temps_entities::users;
+
+    fn user(id: i32) -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id,
+            name: "test".into(),
+            email: "test@example.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn instance_admins_bypass_the_project_scoped_rules() {
+        for role in [Role::Admin, Role::PlatformAdmin] {
+            let auth = AuthContext::new_session(user(1), role.clone());
+            assert!(
+                grant_authz(&auth).is_instance_admin,
+                "{role:?} is an instance administrator"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_users_are_subject_to_the_project_scoped_rules() {
+        let auth = AuthContext::new_session(user(2), Role::User);
+        assert!(!grant_authz(&auth).is_instance_admin);
+    }
 }

@@ -67,23 +67,20 @@ pub struct UpdateMemberRoleRequest {
     pub role: TeamRole,
 }
 
-/// Authorization inputs for a grant mutation, resolved by the caller before
-/// the service takes its lock.
+/// Who is asking for a grant mutation.
 ///
-/// The *inputs* are gathered in the handler (it owns the `AuthContext` and
-/// the checker); the *decision* is made inside the service's transaction,
-/// against grant rows locked `FOR UPDATE`. Evaluating the rules in the
-/// handler against an unlocked read is what allowed two concurrent revokes
-/// to each believe they were not removing the last grant, and between them
-/// silently re-open the project to everyone.
-#[derive(Debug, Clone)]
+/// Deliberately *only* the instance-admin flag. The caller's project-scoped
+/// permissions are **not** passed in: they are resolved by the service
+/// inside its own transaction, from the same grant rows it holds locked
+/// (see [`ResolvedAuthz::resolve`]). Handing them in from the handler would
+/// reintroduce the defect this design exists to prevent — a decision made
+/// against a snapshot taken before the lock, which a concurrent revoke can
+/// invalidate between the read and the write.
+#[derive(Debug, Clone, Copy)]
 pub struct GrantAuthz {
-    /// Instance admins bypass every rule below, as they do everywhere else.
+    /// Instance admins bypass every project-scoped rule, as they do
+    /// everywhere else in the platform.
     pub is_instance_admin: bool,
-    /// The caller's effective permissions on this project, resolved
-    /// **uncached** — a cached allow would let a just-revoked admin restore
-    /// their own access inside the staleness window.
-    pub held: std::collections::HashSet<String>,
 }
 
 impl GrantAuthz {
@@ -91,8 +88,65 @@ impl GrantAuthz {
     pub fn instance_admin() -> Self {
         Self {
             is_instance_admin: true,
-            held: std::collections::HashSet::new(),
         }
+    }
+
+    /// A caller subject to the project-scoped rules.
+    pub fn project_scoped() -> Self {
+        Self {
+            is_instance_admin: false,
+        }
+    }
+}
+
+/// [`GrantAuthz`] plus the permissions the caller actually holds on the
+/// project, resolved under the transaction's row lock.
+struct ResolvedAuthz {
+    is_instance_admin: bool,
+    held: std::collections::HashSet<String>,
+}
+
+impl ResolvedAuthz {
+    /// Resolves the caller's project permissions **on `txn`**, against
+    /// `grants` — the rows the caller has already locked `FOR UPDATE`.
+    ///
+    /// Both halves matter. Running on the transaction means the read sees
+    /// the same snapshot as the write. Passing the locked `grants` rather
+    /// than re-reading them means no concurrent mutation can change the
+    /// grant set out from under the answer.
+    async fn resolve(
+        txn: &sea_orm::DatabaseTransaction,
+        checker: Option<&TeamProjectAccessChecker>,
+        authz: &GrantAuthz,
+        user_id: i32,
+        project_id: i32,
+        grants: &[project_team_access::Model],
+    ) -> Result<Self, TeamError> {
+        if authz.is_instance_admin {
+            return Ok(Self {
+                is_instance_admin: true,
+                held: std::collections::HashSet::new(),
+            });
+        }
+
+        let held = crate::checker::permissions_from_grants(
+            txn,
+            checker.and_then(|c| c.membership_resolver()),
+            user_id,
+            project_id,
+            grants,
+        )
+        .await
+        .map_err(|e| TeamError::PermissionResolution {
+            user_id,
+            project_id,
+            reason: e.to_string(),
+        })?;
+
+        Ok(Self {
+            is_instance_admin: false,
+            held: held.into_iter().collect(),
+        })
     }
 
     fn holds(&self, permission: &Permission) -> bool {
@@ -117,6 +171,19 @@ impl GrantAuthz {
         }
         Ok(())
     }
+}
+
+/// Parses a `role` column, reporting corruption with the row it came from.
+///
+/// Stored roles are never caller input — the API takes roles as a typed
+/// enum — so a parse failure here is a data-integrity fault, and the error
+/// says which row to go look at.
+fn parse_stored_role(entity: &'static str, id: i32, role: &str) -> Result<TeamRole, TeamError> {
+    role.parse().map_err(|_| TeamError::CorruptStoredRole {
+        entity,
+        id,
+        role: role.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +255,7 @@ pub trait TeamService: Send + Sync {
 
     async fn revoke_project_access(
         &self,
+        actor_user_id: i32,
         project_id: i32,
         team_id: i32,
         authz: &GrantAuthz,
@@ -562,6 +630,19 @@ impl TeamService for DefaultTeamService {
             .all(&txn)
             .await?;
 
+        // Resolved on `txn`, from the rows just locked above — so the
+        // permissions this decision rests on and the rows it is about to
+        // write are the same snapshot.
+        let authz = ResolvedAuthz::resolve(
+            &txn,
+            self.checker.as_deref(),
+            authz,
+            actor_user_id,
+            project_id,
+            &grants,
+        )
+        .await?;
+
         if !authz.is_instance_admin {
             // Adding the first grant gates a previously-open project and
             // locks out everyone who isn't in the named team.
@@ -580,7 +661,11 @@ impl TeamService for DefaultTeamService {
             // Without this a project-admin could demote an `owner` team to
             // `viewer` and become the highest authority on the project.
             if let Some(existing) = grants.iter().find(|g| g.team_id == req.team_id) {
-                authz.check_role_ceiling(existing.role.parse()?)?;
+                authz.check_role_ceiling(parse_stored_role(
+                    "project_team_access",
+                    existing.id,
+                    &existing.role,
+                )?)?;
             }
         }
 
@@ -647,6 +732,14 @@ impl TeamService for DefaultTeamService {
         txn.commit().await?;
 
         // Granting access changes which users may reach this project.
+        //
+        // Deliberately after the commit and outside the transaction: the
+        // cache is not a source of truth, so it must never be invalidated
+        // for a write that then rolls back. The cost is that a crash in
+        // this window leaves the read caches stale until the 60 s TTL
+        // expires. That is bounded and read-only — and the *write* gate
+        // does not consult the cache at all (see `ResolvedAuthz::resolve`),
+        // so a stale entry cannot be escalated into a privilege change.
         if let Some(ref checker) = self.checker {
             checker.invalidate_project(project_id).await;
         }
@@ -681,6 +774,7 @@ impl TeamService for DefaultTeamService {
 
     async fn revoke_project_access(
         &self,
+        actor_user_id: i32,
         project_id: i32,
         team_id: i32,
         authz: &GrantAuthz,
@@ -705,6 +799,17 @@ impl TeamService for DefaultTeamService {
             });
         };
 
+        // Resolved on `txn`, from the rows just locked above.
+        let authz = ResolvedAuthz::resolve(
+            &txn,
+            self.checker.as_deref(),
+            authz,
+            actor_user_id,
+            project_id,
+            &grants,
+        )
+        .await?;
+
         if !authz.is_instance_admin {
             // Removing the last grant re-opens the project to everyone.
             if grants.len() == 1 {
@@ -717,7 +822,11 @@ impl TeamService for DefaultTeamService {
                 });
             }
             // You may not remove a grant you could not have created.
-            authz.check_role_ceiling(target.role.parse()?)?;
+            authz.check_role_ceiling(parse_stored_role(
+                "project_team_access",
+                target.id,
+                &target.role,
+            )?)?;
         }
 
         let result = project_team_access::Entity::delete_many()
@@ -734,6 +843,8 @@ impl TeamService for DefaultTeamService {
 
         txn.commit().await?;
         // All users who were allowed via `team_id` must now be denied.
+        // Post-commit and non-transactional for the reasons in
+        // `grant_project_access`.
         if let Some(ref checker) = self.checker {
             checker.invalidate_project(project_id).await;
         }
@@ -781,7 +892,7 @@ impl TeamMemberResponse {
             user_name,
             user_email,
         } = tm;
-        let role: TeamRole = member.role.parse()?;
+        let role: TeamRole = parse_stored_role("team_members", member.id, &member.role)?;
         Ok(Self {
             id: member.id,
             team_id: member.team_id,
@@ -811,7 +922,7 @@ pub struct ProjectAccessResponse {
 
 impl ProjectAccessResponse {
     pub fn from_model(m: project_team_access::Model) -> Result<Self, TeamError> {
-        let role: TeamRole = m.role.parse()?;
+        let role: TeamRole = parse_stored_role("team_members", m.id, &m.role)?;
         Ok(Self {
             id: m.id,
             project_id: m.project_id,
@@ -985,9 +1096,17 @@ mod tests {
     // Grant/revoke authorization
     //
     // These rules used to live in the handler, deciding against an
-    // unlocked snapshot of the grants and a *cached* permission lookup.
-    // Each test below pins one of the escalations that made possible.
+    // unlocked snapshot and a *cached* permission lookup. Each test below
+    // pins one of the escalations that made possible.
+    //
+    // The caller's permissions are no longer injected: the service
+    // resolves them from the membership rows, on the transaction, against
+    // the locked grants. So every test appends the grants first and the
+    // actor's memberships second — the order the service reads them.
     // -----------------------------------------------------------------
+
+    /// The actor in every test below.
+    const ACTOR: i32 = 1;
 
     fn grant_row(id: i32, team_id: i32, role: TeamRole) -> project_team_access::Model {
         let now = Utc::now();
@@ -1002,9 +1121,26 @@ mod tests {
         }
     }
 
-    /// A caller whose project-scoped permissions are exactly those of `role`.
-    fn authz_for(role: TeamRole) -> GrantAuthz {
-        GrantAuthz {
+    /// A membership giving [`ACTOR`] `role` within `team_id`. Their
+    /// effective permissions on the project are this role intersected with
+    /// that team's grant role, so the two together decide the ceiling.
+    fn member_row(id: i32, team_id: i32, role: TeamRole) -> team_members::Model {
+        let now = Utc::now();
+        team_members::Model {
+            id,
+            team_id,
+            user_id: ACTOR,
+            role: role.to_string(),
+            added_by: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A caller whose resolved permissions are exactly those of `role` —
+    /// for the pure ceiling tests, which don't go through the service.
+    fn resolved_for(role: TeamRole) -> ResolvedAuthz {
+        ResolvedAuthz {
             is_instance_admin: false,
             held: crate::role_permissions::fixed_role_permissions(role)
                 .into_iter()
@@ -1019,7 +1155,7 @@ mod tests {
 
     #[test]
     fn ceiling_admits_the_callers_own_role_and_everything_below() {
-        let authz = authz_for(TeamRole::Admin);
+        let authz = resolved_for(TeamRole::Admin);
         for role in [TeamRole::Viewer, TeamRole::Deployer, TeamRole::Admin] {
             assert!(
                 authz.check_role_ceiling(role).is_ok(),
@@ -1030,7 +1166,7 @@ mod tests {
 
     #[test]
     fn ceiling_rejects_a_role_the_caller_does_not_hold() {
-        let err = authz_for(TeamRole::Admin)
+        let err = resolved_for(TeamRole::Admin)
             .check_role_ceiling(TeamRole::Owner)
             .unwrap_err();
         // `owner` is `admin` + ProjectsDelete, so that is the excess.
@@ -1045,16 +1181,18 @@ mod tests {
     async fn grant_will_not_gate_an_open_project_without_instance_admin() {
         // No grants yet: adding the first one locks out every user who is
         // not in the named team, which is an instance-admin decision.
+        // Resolution short-circuits on the empty grant set, so no
+        // membership query is issued.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<project_team_access::Model>::new()])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
                 grant_req(7, TeamRole::Viewer),
-                &authz_for(TeamRole::Owner),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
@@ -1063,16 +1201,19 @@ mod tests {
 
     #[tokio::test]
     async fn grant_requires_project_scoped_write_not_just_instance_write() {
+        // Instance-level ProjectsWrite got them into the handler; within
+        // the project they are only a viewer.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Viewer)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
                 grant_req(9, TeamRole::Viewer),
-                &authz_for(TeamRole::Viewer),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
@@ -1086,14 +1227,15 @@ mod tests {
     async fn grant_cannot_write_a_role_above_the_callers_ceiling() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Admin)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
                 grant_req(9, TeamRole::Owner),
-                &authz_for(TeamRole::Admin),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
@@ -1113,16 +1255,17 @@ mod tests {
                 grant_row(1, 7, TeamRole::Owner),
                 grant_row(2, 9, TeamRole::Admin),
             ]])
+            .append_query_results(vec![vec![member_row(1, 9, TeamRole::Admin)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
-                // The *incoming* role is below the caller's ceiling; only the
-                // role being replaced is above it.
+                // The *incoming* role is below the caller's ceiling; only
+                // the role being replaced is above it.
                 grant_req(7, TeamRole::Viewer),
-                &authz_for(TeamRole::Admin),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
@@ -1140,15 +1283,16 @@ mod tests {
     async fn grant_reports_an_unknown_team_only_after_every_denial() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Owner)]])
             .append_query_results(vec![Vec::<teams::Model>::new()])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
                 grant_req(9999, TeamRole::Viewer),
-                &authz_for(TeamRole::Owner),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
@@ -1157,24 +1301,51 @@ mod tests {
 
     #[tokio::test]
     async fn grant_denies_a_caller_without_project_write_before_looking_up_the_team() {
-        // Only one query result is queued — the grants. If the team lookup
+        // Only the grants and the membership are queued. If the team lookup
         // ran before the permission check this would panic on the missing
-        // second result instead of denying, which is the property being
+        // third result instead of denying — which is the property being
         // pinned: a caller who cannot manage the project never learns
         // whether the team exists.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Admin)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Viewer)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
             .grant_project_access(
-                1,
+                ACTOR,
                 42,
                 grant_req(9999, TeamRole::Viewer),
-                &authz_for(TeamRole::Viewer),
+                &GrantAuthz::project_scoped(),
             )
             .await
             .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::ProjectPermissionDenied { project_id: 42, .. }
+        ));
+    }
+
+    /// The grant role caps the member role: `owner` within the team is
+    /// still only `viewer` on a project the team holds `viewer` on.
+    #[tokio::test]
+    async fn grant_role_caps_the_member_role() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Viewer)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Owner)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .grant_project_access(
+                ACTOR,
+                42,
+                grant_req(9, TeamRole::Viewer),
+                &GrantAuthz::project_scoped(),
+            )
+            .await
+            .unwrap_err();
+        // Team owner, but the team only holds `viewer` here — so not even
+        // `projects:write`, let alone the ceiling for handing out a role.
         assert!(matches!(
             err,
             TeamError::ProjectPermissionDenied { project_id: 42, .. }
@@ -1188,7 +1359,7 @@ mod tests {
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
-            .revoke_project_access(42, 9, &GrantAuthz::instance_admin())
+            .revoke_project_access(ACTOR, 42, 9, &GrantAuthz::instance_admin())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1205,10 +1376,11 @@ mod tests {
         // Removing the last grant re-opens the project to every user.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![grant_row(1, 7, TeamRole::Owner)]])
+            .append_query_results(vec![vec![member_row(1, 7, TeamRole::Owner)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
-            .revoke_project_access(42, 7, &authz_for(TeamRole::Owner))
+            .revoke_project_access(ACTOR, 42, 7, &GrantAuthz::project_scoped())
             .await
             .unwrap_err();
         assert!(matches!(err, TeamError::GatingRequiresAdmin));
@@ -1221,16 +1393,48 @@ mod tests {
                 grant_row(1, 7, TeamRole::Owner),
                 grant_row(2, 9, TeamRole::Admin),
             ]])
+            .append_query_results(vec![vec![member_row(1, 9, TeamRole::Admin)]])
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc
-            .revoke_project_access(42, 7, &authz_for(TeamRole::Admin))
+            .revoke_project_access(ACTOR, 42, 7, &GrantAuthz::project_scoped())
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             TeamError::RoleCeilingExceeded { ref role, .. } if role == "owner"
         ));
+    }
+
+    /// A `role` column the binary cannot parse is a data-integrity fault,
+    /// not a bad request — and it must deny, never fall through.
+    #[tokio::test]
+    async fn corrupt_stored_role_denies_and_is_not_a_client_error() {
+        let mut corrupt = grant_row(1, 7, TeamRole::Owner);
+        corrupt.role = "sorcerer".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![corrupt, grant_row(2, 9, TeamRole::Admin)]])
+            .append_query_results(vec![vec![member_row(1, 9, TeamRole::Admin)]])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let err = svc
+            .revoke_project_access(ACTOR, 42, 7, &GrantAuthz::project_scoped())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::CorruptStoredRole {
+                entity: "project_team_access",
+                id: 1,
+                ref role
+            } if role == "sorcerer"
+        ));
+        let problem: temps_core::problemdetails::Problem = err.into();
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupt stored role is a server fault, not a client error"
+        );
     }
 
     #[tokio::test]

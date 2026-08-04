@@ -79,7 +79,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
+};
 use temps_auth::permissions::Permission;
 use temps_core::{MembershipPermissionResolver, ProjectAccessChecker};
 use temps_entities::{project_team_access, team_members, users};
@@ -231,25 +233,13 @@ impl TeamProjectAccessChecker {
         }
     }
 
-    /// Resolves a caller's project permissions **without** consulting the
-    /// cache.
+    /// The registered [`MembershipPermissionResolver`], if any.
     ///
-    /// [`effective_project_permissions`](ProjectAccessChecker::effective_project_permissions)
-    /// is cached, and its invalidation is explicitly best-effort (see the
-    /// module docs). That trade-off is fine for a read gate — the worst
-    /// case is a revoked user reading for another few seconds. It is not
-    /// fine as the gate on a privilege-*granting* write: a just-revoked
-    /// project admin could re-grant themselves from a stale entry and make
-    /// their own revocation non-durable. Callers that authorize a mutation
-    /// must use this instead.
-    pub async fn effective_project_permissions_uncached(
-        &self,
-        user_id: i32,
-        project_id: i32,
-    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
-        self.check_permissions_uncached(user_id, project_id)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    /// Exposed so the service can run [`permissions_from_grants`] against
+    /// its own transaction — resolving a caller's permissions from the very
+    /// rows it holds locked, instead of from a second, unlocked read.
+    pub(crate) fn membership_resolver(&self) -> Option<&Arc<dyn MembershipPermissionResolver>> {
+        self.membership_resolver.get().and_then(|r| r.as_ref())
     }
 
     /// Full cache flush, for writes affecting an unbounded set of
@@ -371,41 +361,6 @@ impl TeamProjectAccessChecker {
         Ok(gated.difference(&allowed).copied().collect())
     }
 
-    /// Asks a registered [`MembershipPermissionResolver`], if any, what
-    /// this membership's own role should resolve to. `Ok(None)` means
-    /// "use the fixed role" — which is also the answer on a binary with
-    /// no resolver registered.
-    async fn resolve_member_side(
-        &self,
-        membership: &team_members::Model,
-    ) -> Result<Option<Vec<Permission>>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(resolver) = self.membership_resolver.get().and_then(|r| r.as_ref()) else {
-            return Ok(None);
-        };
-        let Some(strings) = resolver.membership_permissions(membership.id).await? else {
-            return Ok(None);
-        };
-        // Unrecognised strings are dropped, not errored: narrowing is the
-        // safe direction if a resolver is ahead of this binary's
-        // `Permission` enum.
-        Ok(Some(
-            strings
-                .into_iter()
-                .filter_map(|p| {
-                    let parsed = Permission::from_str(&p);
-                    if parsed.is_none() {
-                        tracing::warn!(
-                            team_member_id = membership.id,
-                            permission = %p,
-                            "teams: resolver returned an unrecognized permission — dropping it"
-                        );
-                    }
-                    parsed
-                })
-                .collect(),
-        ))
-    }
-
     /// Resolves the permission strings `user_id` holds within `project_id`
     /// — runs only on a permissions-cache miss.
     async fn check_permissions_uncached(
@@ -425,75 +380,146 @@ impl TeamProjectAccessChecker {
             return Ok(None);
         }
 
-        let granted_team_ids: Vec<i32> = grants.iter().map(|g| g.team_id).collect();
-
-        // Step 2: the user's membership rows on those granted teams.
-        // Unlike the binary check we need the full rows (for the role),
-        // and there can be more than one — a user may belong to several
-        // teams granted access to the same project.
-        let memberships = team_members::Entity::find()
-            .filter(team_members::Column::UserId.eq(user_id))
-            .filter(team_members::Column::TeamId.is_in(granted_team_ids))
-            .inner_join(users::Entity)
-            .filter(users::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await
-            .map_err(|source| CheckerError::MembershipQuery {
-                user_id,
-                project_id,
-                source,
-            })?;
-
-        if memberships.is_empty() {
-            // Not a member of any granted team → holds nothing here. This
-            // is the finer-grained expression of the binary check's false.
-            return Ok(Some(Vec::new()));
-        }
-
-        let mut effective: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for membership in &memberships {
-            // Every membership.team_id came from granted_team_ids, which
-            // was built from these exact grants, so a missing match is
-            // impossible — but resolve it without panicking anyway.
-            let Some(grant) = grants.iter().find(|g| g.team_id == membership.team_id) else {
-                continue;
-            };
-
-            // What the member's own role contributes. A registered
-            // resolver may replace this half; the grant half below still
-            // applies either way.
-            let member_side: Vec<Permission> = match self.resolve_member_side(membership).await {
-                Ok(Some(perms)) => perms,
-                Ok(None) => fixed_role_permissions_or_empty(&membership.role),
-                Err(source) => {
-                    return Err(CheckerError::MembershipResolution {
-                        team_member_id: membership.id,
-                        user_id,
-                        project_id,
-                        source,
-                    })
-                }
-            };
-
-            // The team's grant on this project is a hard ceiling: whatever
-            // the member's side says, they cannot exceed what their team
-            // was actually granted here.
-            let grant_side: std::collections::HashSet<Permission> =
-                fixed_role_permissions_or_empty(&grant.role)
-                    .into_iter()
-                    .collect();
-
-            effective.extend(
-                member_side
-                    .into_iter()
-                    .filter(|p| grant_side.contains(p))
-                    .map(|p| p.to_string()),
-            );
-        }
-
-        Ok(Some(effective.into_iter().collect()))
+        permissions_from_grants(
+            self.db.as_ref(),
+            self.membership_resolver(),
+            user_id,
+            project_id,
+            &grants,
+        )
+        .await
+        .map(Some)
     }
+}
+
+/// Resolves what `user_id` may do on `project_id`, given that project's
+/// access grants.
+///
+/// Generic over the connection so it can run either on the checker's own
+/// pool (the cached read path) or **inside a caller's transaction** — the
+/// service authorizes grant mutations by calling this with the same
+/// transaction that holds those grant rows locked `FOR UPDATE`, so the
+/// permissions it checks and the rows it is about to write cannot disagree.
+///
+/// `grants` must be this project's full grant set; passing a subset would
+/// silently narrow the answer. The caller supplies it rather than this
+/// function re-reading it, precisely so the locked rows are the ones used.
+pub(crate) async fn permissions_from_grants<C: ConnectionTrait>(
+    conn: &C,
+    resolver: Option<&Arc<dyn MembershipPermissionResolver>>,
+    user_id: i32,
+    project_id: i32,
+    grants: &[project_team_access::Model],
+) -> Result<Vec<String>, CheckerError> {
+    // No grants at all → the project is ungated and nobody holds
+    // project-scoped permissions on it. Returning early also avoids
+    // building an `IN ()` predicate from an empty id list.
+    if grants.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let granted_team_ids: Vec<i32> = grants.iter().map(|g| g.team_id).collect();
+
+    // The user's membership rows on those granted teams. Unlike the binary
+    // check we need the full rows (for the role), and there can be more
+    // than one — a user may belong to several teams granted the same
+    // project. Soft-deleted users are excluded: deletion does not remove
+    // the membership row, so without this join a deleted account would
+    // keep resolving to live permissions.
+    let memberships = team_members::Entity::find()
+        .filter(team_members::Column::UserId.eq(user_id))
+        .filter(team_members::Column::TeamId.is_in(granted_team_ids))
+        .inner_join(users::Entity)
+        .filter(users::Column::DeletedAt.is_null())
+        .all(conn)
+        .await
+        .map_err(|source| CheckerError::MembershipQuery {
+            user_id,
+            project_id,
+            source,
+        })?;
+
+    // Not a member of any granted team → holds nothing here. This is the
+    // finer-grained expression of the binary check's `false`.
+    if memberships.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut effective: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for membership in &memberships {
+        // Every membership.team_id came from granted_team_ids, which was
+        // built from these exact grants, so a missing match is impossible
+        // — but resolve it without panicking anyway.
+        let Some(grant) = grants.iter().find(|g| g.team_id == membership.team_id) else {
+            continue;
+        };
+
+        // What the member's own role contributes. A registered resolver
+        // may replace this half; the grant half below still applies.
+        let member_side: Vec<Permission> = match resolve_member_side(resolver, membership).await {
+            Ok(Some(perms)) => perms,
+            Ok(None) => fixed_role_permissions_or_empty(&membership.role),
+            Err(source) => {
+                return Err(CheckerError::MembershipResolution {
+                    team_member_id: membership.id,
+                    user_id,
+                    project_id,
+                    source,
+                })
+            }
+        };
+
+        // The team's grant on this project is a hard ceiling: whatever the
+        // member's side says, they cannot exceed what their team was
+        // actually granted here.
+        let grant_side: std::collections::HashSet<Permission> =
+            fixed_role_permissions_or_empty(&grant.role)
+                .into_iter()
+                .collect();
+
+        effective.extend(
+            member_side
+                .into_iter()
+                .filter(|p| grant_side.contains(p))
+                .map(|p| p.to_string()),
+        );
+    }
+
+    Ok(effective.into_iter().collect())
+}
+
+/// Asks a registered [`MembershipPermissionResolver`], if any, what this
+/// membership's own role should resolve to. `Ok(None)` means "use the
+/// fixed role" — also the answer on a binary with no resolver registered.
+async fn resolve_member_side(
+    resolver: Option<&Arc<dyn MembershipPermissionResolver>>,
+    membership: &team_members::Model,
+) -> Result<Option<Vec<Permission>>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(resolver) = resolver else {
+        return Ok(None);
+    };
+    let Some(strings) = resolver.membership_permissions(membership.id).await? else {
+        return Ok(None);
+    };
+    // Unrecognised strings are dropped, not errored: narrowing is the safe
+    // direction if a resolver is ahead of this binary's `Permission` enum.
+    Ok(Some(
+        strings
+            .into_iter()
+            .filter_map(|p| {
+                let parsed = Permission::from_str(&p);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        team_member_id = membership.id,
+                        permission = %p,
+                        "teams: resolver returned an unrecognized permission — dropping it"
+                    );
+                }
+                parsed
+            })
+            .collect(),
+    ))
 }
 
 /// Fixed-role permission set for a stored role string.

@@ -1,6 +1,5 @@
 use axum::http::StatusCode;
 use temps_core::problemdetails::{self, Problem};
-use temps_entities::TeamRoleParseError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -42,8 +41,33 @@ pub enum TeamError {
     #[error("Cannot apply the '{role}' role: it carries '{permission}', which you do not hold on this project")]
     RoleCeilingExceeded { role: String, permission: String },
 
-    #[error("Invalid role: {0}")]
-    InvalidRole(#[from] TeamRoleParseError),
+    /// A `role` column holds a string this build cannot interpret.
+    ///
+    /// Always a data-integrity problem, never a bad request: the API takes
+    /// roles as a typed enum, so an invalid value from a caller is rejected
+    /// by deserialization long before it reaches a service. Reporting it as
+    /// 400 would send an operator looking for a fault in their own request.
+    #[error(
+        "Stored role '{role}' on {entity} {id} is not one of owner/admin/deployer/viewer — \
+         the teams tables hold a value this build cannot interpret"
+    )]
+    CorruptStoredRole {
+        entity: &'static str,
+        id: i32,
+        role: String,
+    },
+
+    /// The caller's permissions on the project could not be resolved, so
+    /// the mutation is refused rather than authorized on a guess.
+    #[error(
+        "Could not resolve user {user_id}'s permissions on project {project_id} while \
+         authorizing an access change: {reason}"
+    )]
+    PermissionResolution {
+        user_id: i32,
+        project_id: i32,
+        reason: String,
+    },
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
@@ -58,11 +82,9 @@ impl From<TeamError> for Problem {
                 .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
 
-            TeamError::Validation { .. } | TeamError::InvalidRole(_) => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Validation Error")
-                    .with_detail(error.to_string())
-            }
+            TeamError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Validation Error")
+                .with_detail(error.to_string()),
 
             TeamError::GatingRequiresAdmin
             | TeamError::ProjectPermissionDenied { .. }
@@ -76,9 +98,16 @@ impl From<TeamError> for Problem {
                 .with_title("Resource Conflict")
                 .with_detail(error.to_string()),
 
-            TeamError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail(error.to_string()),
+            // `CorruptStoredRole` and `PermissionResolution` are server-side
+            // faults, not caller mistakes — a 4xx here would have an operator
+            // debugging a request that was perfectly well-formed.
+            TeamError::Database(_)
+            | TeamError::CorruptStoredRole { .. }
+            | TeamError::PermissionResolution { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
