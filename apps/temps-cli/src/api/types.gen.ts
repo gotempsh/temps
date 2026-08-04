@@ -668,10 +668,6 @@ export type AiAgentTimelineRow = {
 };
 
 /**
- * Control-plane build resource limits.
- *
- * Caps how many builds run concurrently AND how much CPU/memory each build
- * is allowed to consume. A single global semaphore in the deployer crate
  * Bounds on one AI chat turn.
  *
  * A turn is bounded by TIME rather than by a number of steps. A step count
@@ -688,6 +684,12 @@ export type AiChatLimitsSettings = {
     /**
      * How long one turn may run before it is stopped and the partial answer
      * returned, in seconds. The user is told the turn was cut short.
+     *
+     * Checked between steps, not mid-call: a model round already in flight
+     * finishes, so a turn can overrun by up to one round. Against a slow
+     * self-hosted model that is a minute or two. Aborting mid-stream would cut
+     * the answer off in the middle of a sentence and throw away work already
+     * paid for, which is worse than a late stop.
      */
     turn_timeout_secs?: number;
 };
@@ -1733,6 +1735,10 @@ export type BuildConfiguration = {
 };
 
 /**
+ * Control-plane build resource limits.
+ *
+ * Caps how many builds run concurrently AND how much CPU/memory each build
+ * is allowed to consume. A single global semaphore in the deployer crate
  * gates every `DockerRuntime::build_image` call to `max_concurrent`. When
  * the semaphore is full, additional builds queue and wait — they do not
  * fail. Per-build CPU/memory caps are forwarded to Docker via
