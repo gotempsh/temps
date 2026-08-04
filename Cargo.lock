@@ -10650,6 +10650,7 @@ dependencies = [
  "temps-environments",
  "temps-error-tracking",
  "temps-external-plugins",
+ "temps-flags",
  "temps-geo",
  "temps-git",
  "temps-import",
@@ -11288,6 +11289,29 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "temps-flags"
+version = "0.1.0-beta.55"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "hex",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "temps-auth",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "utoipa",
  "uuid",
 ]
 
