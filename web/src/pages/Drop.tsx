@@ -9,6 +9,7 @@ import {
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
+import { DropZone } from '@/components/drop/DropZone'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -29,21 +30,11 @@ import {
   prepareDrop,
   type DropFile,
 } from '@/lib/drop-archive'
+import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
-import {
-  ArrowRight,
-  Check,
-  FileArchive,
-  FileCode2,
-  FolderOpen,
-  Loader2,
-  PackageOpen,
-  RotateCcw,
-  UploadCloud,
-  X,
-} from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowRight, Check, Loader2, RotateCcw, UploadCloud } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 
 type DropStage =
@@ -54,108 +45,6 @@ type DropStage =
   | 'uploading'
   | 'deploying'
   | 'done'
-
-interface LegacyFileSystemEntry {
-  isFile: boolean
-  isDirectory: boolean
-  name: string
-}
-
-interface LegacyFileEntry extends LegacyFileSystemEntry {
-  file(
-    success: (file: File) => void,
-    error: (error: DOMException) => void
-  ): void
-}
-
-interface LegacyDirectoryReader {
-  readEntries(
-    success: (entries: LegacyFileSystemEntry[]) => void,
-    error: (error: DOMException) => void
-  ): void
-}
-
-interface LegacyDirectoryEntry extends LegacyFileSystemEntry {
-  createReader(): LegacyDirectoryReader
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  if (error && typeof error === 'object') {
-    const problem = error as { detail?: string; message?: string }
-    return problem.detail || problem.message || 'The drop could not be deployed'
-  }
-  return 'The drop could not be deployed'
-}
-
-function inferredProjectName(files: DropFile[]): string {
-  const firstPath = files[0]?.path.replace(/\\/g, '/') || ''
-  const parts = firstPath.split('/').filter(Boolean)
-  const source = parts.length > 1 ? parts[0] : parts[0] || ''
-  return source
-    .replace(/\.(tar\.gz|tgz|zip|tar|html?)$/i, '')
-    .replace(/[_-]+/g, ' ')
-    .trim()
-}
-
-async function readDirectoryEntries(
-  directory: LegacyDirectoryEntry
-): Promise<LegacyFileSystemEntry[]> {
-  const reader = directory.createReader()
-  const entries: LegacyFileSystemEntry[] = []
-  while (true) {
-    const batch = await new Promise<LegacyFileSystemEntry[]>(
-      (resolve, reject) => reader.readEntries(resolve, reject)
-    )
-    if (batch.length === 0) return entries
-    entries.push(...batch)
-  }
-}
-
-async function readEntry(
-  entry: LegacyFileSystemEntry,
-  prefix = ''
-): Promise<DropFile[]> {
-  const path = prefix ? `${prefix}/${entry.name}` : entry.name
-  if (entry.isFile) {
-    const file = await new Promise<File>((resolve, reject) =>
-      (entry as LegacyFileEntry).file(resolve, reject)
-    )
-    return [{ file, path }]
-  }
-  if (!entry.isDirectory) return []
-
-  const children = await readDirectoryEntries(entry as LegacyDirectoryEntry)
-  const nested = await Promise.all(
-    children.map((child) => readEntry(child, path))
-  )
-  return nested.flat()
-}
-
-async function filesFromDrop(event: React.DragEvent): Promise<DropFile[]> {
-  const items = Array.from(event.dataTransfer.items)
-  const entryItems = items
-    .map((item) => {
-      const getEntry = (
-        item as DataTransferItem & {
-          webkitGetAsEntry?: () => LegacyFileSystemEntry | null
-        }
-      ).webkitGetAsEntry
-      return getEntry?.call(item) ?? null
-    })
-    .filter((entry): entry is LegacyFileSystemEntry => entry !== null)
-
-  if (entryItems.length > 0) {
-    return (
-      await Promise.all(entryItems.map((entry) => readEntry(entry)))
-    ).flat()
-  }
-
-  return Array.from(event.dataTransfer.files).map((file) => ({
-    file,
-    path: file.webkitRelativePath || file.name,
-  }))
-}
 
 function stageLabel(stage: DropStage): string {
   switch (stage) {
@@ -179,12 +68,10 @@ function stageLabel(stage: DropStage): string {
 export function Drop() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const folderInputRef = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
   const [nameWasEdited, setNameWasEdited] = useState(false)
   const [rootPage, setRootPage] = useState('')
-  const [isDragging, setIsDragging] = useState(false)
   const [stage, setStage] = useState<DropStage>('idle')
   const [error, setError] = useState<string | null>(null)
   const [project, setProject] = useState<ProjectResponse | null>(null)
@@ -205,16 +92,11 @@ export function Drop() {
     ])
   }, [setBreadcrumbs])
 
-  useEffect(() => {
-    folderInputRef.current?.setAttribute('webkitdirectory', '')
-  }, [])
-
   const normalizedCandidates = useMemo(() => htmlRootCandidates(files), [files])
   const hasRootIndex = normalizedCandidates.some(
     (path) => path.toLowerCase() === 'index.html'
   )
   const isArchive = files.length === 1 && isDropArchive(files[0].file.name)
-  const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0)
   const isBusy = !['idle', 'done'].includes(stage)
 
   const setSelection = (nextFiles: DropFile[]) => {
@@ -234,16 +116,6 @@ export function Drop() {
     if (!nameWasEdited) {
       setProjectName(ensureDropProjectName(inferredProjectName(nextFiles)))
     }
-  }
-
-  const handleInput = (selected: FileList | null) => {
-    if (!selected) return
-    setSelection(
-      Array.from(selected).map((file) => ({
-        file,
-        path: file.webkitRelativePath || file.name,
-      }))
-    )
   }
 
   const reset = () => {
@@ -377,7 +249,7 @@ export function Drop() {
       setEnvironment(targetEnvironment)
       setStage('done')
     } catch (caught) {
-      let message = errorMessage(caught)
+      let message = dropErrorMessage(caught)
       if (createdProject && !deploymentAccepted) {
         try {
           await deleteProject({
@@ -386,7 +258,7 @@ export function Drop() {
           })
           message += ' The incomplete project was removed.'
         } catch (cleanupError) {
-          message += ` Cleanup also failed: ${errorMessage(cleanupError)}`
+          message += ` Cleanup also failed: ${dropErrorMessage(cleanupError)}`
         }
       }
       setError(message)
@@ -461,99 +333,12 @@ export function Drop() {
       </header>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1.6fr)_minmax(20rem,0.8fr)]">
-        <section
-          className={cn(
-            'group relative min-h-[28rem] overflow-hidden rounded-[2rem] border-2 border-dashed transition-all duration-300',
-            'bg-[linear-gradient(135deg,hsl(var(--muted)/0.35)_25%,transparent_25%,transparent_50%,hsl(var(--muted)/0.35)_50%,hsl(var(--muted)/0.35)_75%,transparent_75%,transparent)] bg-[length:28px_28px]',
-            isDragging
-              ? 'scale-[1.01] border-primary bg-primary/5 shadow-2xl shadow-primary/10'
-              : 'border-border hover:border-muted-foreground/60'
-          )}
-          onDragEnter={(event) => {
-            event.preventDefault()
-            setIsDragging(true)
-          }}
-          onDragOver={(event) => event.preventDefault()}
-          onDragLeave={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget as Node)) {
-              setIsDragging(false)
-            }
-          }}
-          onDrop={async (event) => {
-            event.preventDefault()
-            setIsDragging(false)
-            try {
-              setSelection(await filesFromDrop(event))
-            } catch (caught) {
-              setError(errorMessage(caught))
-            }
-          }}
-        >
-          <div className="absolute inset-0 bg-gradient-to-b from-background/20 to-background/80" />
-          <div className="relative flex min-h-[28rem] flex-col items-center justify-center px-6 text-center">
-            {files.length === 0 ? (
-              <>
-                <div className="mb-7 flex size-24 items-center justify-center rounded-[2rem] border bg-background shadow-xl transition-transform duration-300 group-hover:-translate-y-1">
-                  <UploadCloud
-                    className="size-10 text-primary"
-                    strokeWidth={1.5}
-                  />
-                </div>
-                <h2 className="text-2xl font-semibold tracking-tight">
-                  Drag your project here
-                </h2>
-                <p className="mt-3 max-w-md text-sm leading-6 text-muted-foreground">
-                  A project folder, one HTML file, or a .zip archive. Folders
-                  are packaged locally before upload.
-                </p>
-                <div className="mt-7 flex flex-wrap justify-center gap-3">
-                  <Button onClick={() => folderInputRef.current?.click()}>
-                    <FolderOpen className="mr-2 size-4" /> Choose folder
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() =>
-                      document.getElementById('drop-file-input')?.click()
-                    }
-                  >
-                    <FileArchive className="mr-2 size-4" /> Choose file
-                  </Button>
-                </div>
-              </>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  className="absolute right-5 top-5 rounded-full border bg-background p-2 text-muted-foreground transition-colors hover:text-foreground"
-                  onClick={reset}
-                  aria-label="Clear selected files"
-                >
-                  <X className="size-4" />
-                </button>
-                <div className="mb-7 flex size-24 items-center justify-center rounded-[2rem] bg-foreground text-background shadow-xl">
-                  {isArchive ? (
-                    <PackageOpen className="size-10" strokeWidth={1.5} />
-                  ) : (
-                    <FileCode2 className="size-10" strokeWidth={1.5} />
-                  )}
-                </div>
-                <h2 className="max-w-xl truncate text-2xl font-semibold tracking-tight">
-                  {files.length === 1
-                    ? files[0].file.name
-                    : `${files.length} files ready`}
-                </h2>
-                <p className="mt-3 font-mono text-xs uppercase tracking-wider text-muted-foreground">
-                  {(totalBytes / 1024).toLocaleString(undefined, {
-                    maximumFractionDigits: 1,
-                  })}{' '}
-                  KB
-                  {!isArchive &&
-                    ` · ${normalizedCandidates.length} HTML page${normalizedCandidates.length === 1 ? '' : 's'}`}
-                </p>
-              </>
-            )}
-          </div>
-        </section>
+        <DropZone
+          files={files}
+          onSelect={setSelection}
+          onError={setError}
+          disabled={isBusy}
+        />
 
         <aside className="flex flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7">
           <div className="flex items-center justify-between border-b pb-5">
@@ -702,20 +487,6 @@ export function Drop() {
         </aside>
       </div>
 
-      <input
-        id="drop-file-input"
-        type="file"
-        className="hidden"
-        accept=".html,.htm,.zip,application/zip"
-        onChange={(event) => handleInput(event.target.files)}
-      />
-      <input
-        ref={folderInputRef}
-        type="file"
-        className="hidden"
-        multiple
-        onChange={(event) => handleInput(event.target.files)}
-      />
     </PageContainer>
   )
 }

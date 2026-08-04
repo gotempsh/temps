@@ -4,6 +4,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
+import { DropButton } from '@/components/dashboard/DropButton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useQuery } from '@tanstack/react-query'
@@ -222,7 +223,9 @@ export function Header() {
           {/* The "+" quick-actions menu and the theme toggle used to live here.
               Every entry it held is now in the command palette (⌘K), and
               appearance moved into the account menu — so the header keeps only
-              what you reach for mid-task: the assistant and alerts. */}
+              what you reach for mid-task: dropping files, the assistant, and
+              alerts. */}
+          <DropButton />
           <AiAssistantButton />
           <BackupAlertsButton />
         </div>

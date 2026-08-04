@@ -1,8 +1,4 @@
-import {
-  deployFromUploadedSource,
-  EnvironmentResponse,
-  ProjectResponse,
-} from '@/api/client'
+import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
@@ -41,7 +37,7 @@ import {
 } from '@/utils/errorHandling'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -54,6 +50,7 @@ import {
   PlusIcon,
   RefreshCw,
   Upload,
+  UploadCloud,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 
@@ -73,10 +70,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [staticEnv, setStaticEnv] = useState<string>('')
   const [staticFile, setStaticFile] = useState<File | null>(null)
   const [staticUploading, setStaticUploading] = useState(false)
-  const [sourceDialogOpen, setSourceDialogOpen] = useState(false)
-  const [sourceEnv, setSourceEnv] = useState<string>('')
-  const [sourceFile, setSourceFile] = useState<File | null>(null)
-  const [sourceUploading, setSourceUploading] = useState(false)
   // Docker-image deploy: deploy a specific (possibly new) image ref.
   const [imageDialogOpen, setImageDialogOpen] = useState(false)
   const [imageEnv, setImageEnv] = useState<string>('')
@@ -85,7 +78,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
-  const navigate = useNavigate()
 
   // Handle opening new deployment modal
   const handleOpenNewDeployment = useCallback(() => {
@@ -451,34 +443,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     }
   }
 
-  const handleDeploySource = async () => {
-    if (!sourceFile || !sourceEnv) return
-    setSourceUploading(true)
-    try {
-      const response = await deployFromUploadedSource({
-        throwOnError: true,
-        path: {
-          project_id: project.id,
-          environment_id: Number(sourceEnv),
-        },
-        body: { file: sourceFile },
-      })
-      const deployment = response.data
-      if (!deployment) throw new Error('Source deployment returned no result')
-      toast.success('Source deployment started')
-      setSourceDialogOpen(false)
-      setSourceFile(null)
-      setSourceEnv('')
-      navigate(`/projects/${project.slug}/deployments/${deployment.id}`)
-    } catch (e) {
-      toast.error(
-        (e as { message?: string })?.message || 'Failed to deploy source'
-      )
-    } finally {
-      setSourceUploading(false)
-    }
-  }
-
   // Get environments that are different from the deployment's environment
   const getPromoteTargetEnvironments = (deploymentId: number) => {
     const deployment = deploymentsData?.deployments.find(
@@ -654,81 +618,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     </Dialog>
   )
 
-  const sourceDeployDialog = (
-    <Dialog
-      open={sourceDialogOpen}
-      onOpenChange={(open) => {
-        if (!open && !sourceUploading) {
-          setSourceDialogOpen(false)
-          setSourceFile(null)
-          setSourceEnv('')
-        }
-      }}
-    >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Upload className="h-5 w-5" />
-            Deploy source archive
-          </DialogTitle>
-          <DialogDescription>
-            Upload a ZIP of this project. Temps uses the project&apos;s detected
-            preset and directory for the new build.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-4 py-4">
-          <div className="space-y-2">
-            <Label htmlFor="source-bundle">Source ZIP</Label>
-            <Input
-              id="source-bundle"
-              type="file"
-              accept=".zip,application/zip"
-              disabled={sourceUploading}
-              onChange={(event) =>
-                setSourceFile(event.target.files?.[0] ?? null)
-              }
-            />
-          </div>
-          <div className="space-y-2">
-            <Label>Environment</Label>
-            <Select value={sourceEnv} onValueChange={setSourceEnv}>
-              <SelectTrigger>
-                <SelectValue placeholder="Select environment..." />
-              </SelectTrigger>
-              <SelectContent>
-                {(
-                  environmentsQuery.data as EnvironmentResponse[] | undefined
-                )?.map((env) => (
-                  <SelectItem key={env.id} value={String(env.id)}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-        <DialogFooter>
-          <Button
-            variant="outline"
-            disabled={sourceUploading}
-            onClick={() => setSourceDialogOpen(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={handleDeploySource}
-            disabled={!sourceFile || !sourceEnv || sourceUploading}
-          >
-            {sourceUploading && (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            )}
-            {sourceUploading ? 'Deploying...' : 'Upload & deploy'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-
   if (error) {
     return (
       <ErrorAlert
@@ -784,9 +673,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 Deploy static files
               </Button>
             ) : project.source_type === 'uploaded_source' ? (
-              <Button onClick={() => setSourceDialogOpen(true)}>
-                <Upload className="h-4 w-4 mr-2" />
-                Upload new source
+              <Button asChild>
+                <Link to={`/projects/${project.slug}/drop`}>
+                  <UploadCloud className="h-4 w-4 mr-2" />
+                  Upload new source
+                </Link>
               </Button>
             ) : project.source_type === 'docker_image' ? (
               <Button
@@ -811,7 +702,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           }
         />
         {staticDeployDialog}
-        {sourceDeployDialog}
         {imageDeployDialog}
         <RedeploymentModal
           project={project}
@@ -886,12 +776,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             Deploy static files
           </Button>
         ) : project.source_type === 'uploaded_source' ? (
-          <Button
-            onClick={() => setSourceDialogOpen(true)}
-            className="w-full sm:w-auto"
-          >
-            <Upload className="h-4 w-4 mr-2" />
-            Upload new source
+          <Button asChild className="w-full sm:w-auto">
+            <Link to={`/projects/${project.slug}/drop`}>
+              <UploadCloud className="h-4 w-4 mr-2" />
+              Upload new source
+            </Link>
           </Button>
         ) : project.source_type === 'docker_image' ? (
           <Button
@@ -1086,7 +975,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
       {/* Manual deploy dialogs */}
       {staticDeployDialog}
-      {sourceDeployDialog}
       {imageDeployDialog}
     </>
   )

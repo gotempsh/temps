@@ -8,6 +8,7 @@ import {
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
+import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
@@ -354,6 +355,7 @@ export function ProjectDetail() {
                 path="deployments/:deploymentId"
                 element={<DeploymentDetails project={project} />}
               />
+              <Route path="drop" element={<ProjectDrop project={project} />} />
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
