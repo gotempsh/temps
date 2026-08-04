@@ -90,13 +90,12 @@ impl JobProcessorService {
             .from(temps_entities::environments::Entity)
             .and_where(temps_entities::environments::Column::DeletedAt.is_null())
             .to_owned();
+        let admitted_at = chrono::Utc::now();
 
         let admitted = deployments::Entity::update_many()
             .col_expr(deployments::Column::State, Expr::value("running"))
-            .col_expr(
-                deployments::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now()),
-            )
+            .col_expr(deployments::Column::StartedAt, Expr::value(admitted_at))
+            .col_expr(deployments::Column::UpdatedAt, Expr::value(admitted_at))
             .filter(deployments::Column::Id.eq(deployment_id))
             .filter(deployments::Column::State.eq("pending"))
             .filter(deployments::Column::ProjectId.in_subquery(active_projects))
@@ -1719,6 +1718,15 @@ mod tests {
             .await?
             .expect("deployment should exist");
         assert_eq!(deployment.state, "running");
+        assert!(
+            deployment.started_at.is_some(),
+            "admitting a deployment must record when it started"
+        );
+        assert_eq!(
+            deployment.started_at,
+            Some(deployment.updated_at),
+            "the running transition timestamps must come from the same atomic update"
+        );
 
         let mut cancelled: deployments::ActiveModel = deployment.into();
         cancelled.state = Set("cancelled".to_string());
@@ -1763,6 +1771,10 @@ mod tests {
         assert_eq!(
             denied.cancelled_reason.as_deref(),
             Some("Deployment owner is being deleted")
+        );
+        assert!(
+            denied.started_at.is_none(),
+            "a deployment denied admission must not receive a start timestamp"
         );
 
         Ok(())

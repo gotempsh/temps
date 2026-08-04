@@ -76,16 +76,10 @@ import {
 } from 'lucide-react'
 
 import { ProjectResponse } from '@/api/client'
-import {
-  getProjectBySlugOptions,
-  hasAnalyticsEventsOptions,
-  hasErrorGroupsOptions,
-  listCustomDomainsForProjectOptions,
-  listMonitorsOptions,
-  listProjectServicesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
+import { useProjectSetup } from '@/hooks/useProjectSetup'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
@@ -990,99 +984,25 @@ const projectBaseNav: ProjectNavItem[] = [
   },
 ]
 
-interface ProjectSetupStep {
-  id: string
-  title: string
-  href: string
-  done: boolean
-  icon: LucideIcon
-}
-
 function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
+  const setup = useProjectSetup(project)
+  const remainingSteps = setup.steps.filter((step) => !step.done)
 
-  const analyticsQuery = useQuery({
-    ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
-  })
-  const errorsQuery = useQuery({
-    ...hasErrorGroupsOptions({ path: { project_id: project.id } }),
-  })
-  const domainsQuery = useQuery({
-    ...listCustomDomainsForProjectOptions({
-      path: { project_id: project.id },
-    }),
-  })
-  const monitorsQuery = useQuery({
-    ...listMonitorsOptions({ path: { project_id: project.id } }),
-  })
-  const servicesQuery = useQuery({
-    ...listProjectServicesOptions({ path: { project_id: project.id } }),
-  })
-
-  const isLoading =
-    analyticsQuery.isLoading ||
-    errorsQuery.isLoading ||
-    domainsQuery.isLoading ||
-    monitorsQuery.isLoading ||
-    servicesQuery.isLoading
-
-  const steps: ProjectSetupStep[] = [
-    {
-      id: 'analytics',
-      title: 'Install analytics SDK',
-      href: `/projects/${project.slug}/analytics/setup`,
-      done: !!analyticsQuery.data?.has_events,
-      icon: BarChart3,
-    },
-    {
-      id: 'errors',
-      title: 'Install error tracking SDK',
-      href: `/projects/${project.slug}/errors/setup`,
-      done: !!errorsQuery.data?.has_error_groups,
-      icon: ShieldAlert,
-    },
-    {
-      id: 'domain',
-      title: 'Connect a custom domain',
-      href: `/projects/${project.slug}/domains`,
-      done: (domainsQuery.data?.domains?.length ?? 0) > 0,
-      icon: Globe,
-    },
-    {
-      id: 'monitoring',
-      title: 'Add an uptime monitor',
-      href: `/projects/${project.slug}/monitors`,
-      done: (monitorsQuery.data?.length ?? 0) > 0,
-      icon: Activity,
-    },
-    {
-      id: 'storage',
-      title: 'Link database or storage',
-      href: `/projects/${project.slug}/storage`,
-      done: (servicesQuery.data?.length ?? 0) > 0,
-      icon: Database,
-    },
-  ]
-
-  const remainingSteps = steps.filter((step) => !step.done)
-  const completedCount = steps.length - remainingSteps.length
-  const percent = Math.round((completedCount / steps.length) * 100)
-
-  if (isLoading || remainingSteps.length === 0) return null
+  if (setup.isLoading || remainingSteps.length === 0) return null
 
   if (compact) {
-    const nextStep = remainingSteps[0]
     return (
       <SidebarGroup className="py-0 pb-2">
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton
               asChild
-              tooltip={`Project setup — ${completedCount}/${steps.length}`}
+              tooltip={`Project setup — ${setup.completedCount}/${setup.totalCount}`}
               className="justify-center"
             >
-              <Link to={nextStep.href}>
+              <Link to={`/projects/${project.slug}/setup`}>
                 <BadgeCheck />
               </Link>
             </SidebarMenuButton>
@@ -1098,28 +1018,32 @@ function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
   return (
     <SidebarGroup className="py-0 pb-2">
       <div className="overflow-hidden rounded-lg border border-sidebar-border bg-sidebar-accent/30">
-        <div className="px-3 py-2.5">
+        <Link
+          to={`/projects/${project.slug}/setup`}
+          className="group block px-3 py-2.5 transition-colors hover:bg-sidebar-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
+        >
           <div className="flex items-center gap-2">
             <BadgeCheck className="size-4 shrink-0 text-primary" />
             <span className="flex-1 text-sm font-medium">Project setup</span>
             <span className="text-xs tabular-nums text-muted-foreground">
-              {completedCount}/{steps.length}
+              {setup.completedCount}/{setup.totalCount}
             </span>
+            <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
           </div>
           <div
             className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sidebar-border"
             role="progressbar"
             aria-label={`${project.name} setup progress`}
             aria-valuemin={0}
-            aria-valuemax={steps.length}
-            aria-valuenow={completedCount}
+            aria-valuemax={setup.totalCount}
+            aria-valuenow={setup.completedCount}
           >
             <div
               className="h-full rounded-full bg-primary transition-all duration-500"
-              style={{ width: `${percent}%` }}
+              style={{ width: `${setup.percent}%` }}
             />
           </div>
-        </div>
+        </Link>
         <ul role="list" className="border-t border-sidebar-border p-1.5">
           {visibleSteps.map((step) => (
             <li key={step.id}>
@@ -1136,8 +1060,13 @@ function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
             </li>
           ))}
           {hiddenCount > 0 && (
-            <li className="px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground">
-              +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+            <li>
+              <Link
+                to={`/projects/${project.slug}/setup`}
+                className="block rounded-md px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+              </Link>
             </li>
           )}
         </ul>

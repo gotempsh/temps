@@ -802,7 +802,6 @@ impl Role {
                 Permission::PlatformInfoRead,
                 Permission::ProjectsCreate,
                 Permission::ProjectsDelete,
-                Permission::ProjectsDelete,
                 Permission::ProjectsRead,
                 Permission::ProjectsWrite,
                 Permission::SessionMetricsRead,

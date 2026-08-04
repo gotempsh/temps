@@ -299,6 +299,7 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
             email_verification_expires: Set(None),
             password_reset_token: Set(None),
             password_reset_expires: Set(None),
+            must_change_password: Set(false),
             deleted_at: Set(None),
             mfa_enabled: Set(false),
             mfa_secret: Set(None),

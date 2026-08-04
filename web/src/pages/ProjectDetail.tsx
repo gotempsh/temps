@@ -49,6 +49,7 @@ import Traces from './Traces'
 import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
+import { ProjectSetup } from './ProjectSetup'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
@@ -347,6 +348,7 @@ export function ProjectDetail() {
                   />
                 }
               />
+              <Route path="setup" element={<ProjectSetup project={project} />} />
               <Route
                 path="deployments"
                 element={<ProjectDeployments project={project} />}
