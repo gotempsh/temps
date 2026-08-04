@@ -653,6 +653,11 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Bumped by Refresh so relative ranges recompute against "now". Without
+  // this, start/end freeze at mount (or last range change) and newly ingested
+  // traces that land after that frozen end_time stay invisible until a full
+  // page reload — including exact trace-id searches that still AND the window.
+  const [refreshKey, setRefreshKey] = useState(0)
 
   // Compute time window
   const { startTime, endTime } = useMemo(() => {
@@ -676,7 +681,7 @@ export default function TracesList({ project }: TracesListProps) {
         break
     }
     return { startTime: start.toISOString(), endTime: now.toISOString() }
-  }, [timeRange])
+  }, [timeRange, refreshKey])
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -753,8 +758,11 @@ export default function TracesList({ project }: TracesListProps) {
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
-        start_time: startTime,
-        end_time: endTime,
+        // When pinned to a trace ID, ignore the time window — same contract as
+        // LogsList. An exact ID is already specific, and a freshly ingested
+        // span can land after the frozen end_time of a long-lived page.
+        start_time: debouncedSearch ? undefined : startTime,
+        end_time: debouncedSearch ? undefined : endTime,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: debouncedSearch || undefined,
@@ -793,7 +801,11 @@ export default function TracesList({ project }: TracesListProps) {
   // expensive query on this page (measured at ~10s on an 860M-span project).
   // Asking for one row and checking whether we got it answers the same question
   // without computing a count nobody reads.
-  const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
+  const {
+    data: anyTraceData,
+    isLoading: isProbeLoading,
+    refetch: refetchProbe,
+  } = useQuery({
     ...queryTraceSummariesOptions({
       query: { project_id: project.id, limit: 1, include_total: false },
     }),
@@ -884,7 +896,15 @@ export default function TracesList({ project }: TracesListProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => refetch()}
+            onClick={() => {
+              // Advance the relative window so list queries recompute against
+              // "now". Trace-id searches omit the window, so their query key
+              // does not change — refetch those explicitly. Also re-check the
+              // unwindowed "ever received a trace" probe.
+              setRefreshKey((k) => k + 1)
+              if (debouncedSearch) void refetch()
+              void refetchProbe()
+            }}
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
