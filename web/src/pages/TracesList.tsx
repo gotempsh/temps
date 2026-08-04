@@ -23,6 +23,11 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
+  computeTracesTimeWindow,
+  tracesListTimeBounds,
+  type TracesTimeRange,
+} from '@/lib/traces-time-window'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -73,8 +78,6 @@ import { useNavigate, useSearchParams } from 'react-router'
 interface TracesListProps {
   project: ProjectResponse
 }
-
-type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
 function statusBadge(status: SpanStatusCode) {
   switch (status) {
@@ -615,8 +618,8 @@ export default function TracesList({ project }: TracesListProps) {
   usePageTitle(`Traces - ${project.name}`)
 
   // State from URL params
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
+  const [timeRange, setTimeRange] = useState<TracesTimeRange>(
+    () => (searchParams.get('range') as TracesTimeRange) || '24h'
   )
   const [serviceName, setServiceName] = useState(
     () => searchParams.get('service') || ''
@@ -659,29 +662,11 @@ export default function TracesList({ project }: TracesListProps) {
   // page reload — including exact trace-id searches that still AND the window.
   const [refreshKey, setRefreshKey] = useState(0)
 
-  // Compute time window
-  const { startTime, endTime } = useMemo(() => {
-    const now = new Date()
-    const start = new Date()
-    switch (timeRange) {
-      case '1h':
-        start.setHours(start.getHours() - 1)
-        break
-      case '6h':
-        start.setHours(start.getHours() - 6)
-        break
-      case '24h':
-        start.setDate(start.getDate() - 1)
-        break
-      case '7d':
-        start.setDate(start.getDate() - 7)
-        break
-      case '30d':
-        start.setDate(start.getDate() - 30)
-        break
-    }
-    return { startTime: start.toISOString(), endTime: now.toISOString() }
-  }, [timeRange, refreshKey])
+  // Compute time window (refreshKey forces a fresh "now" on Refresh)
+  const { startTime, endTime } = useMemo(
+    () => computeTracesTimeWindow(timeRange),
+    [timeRange, refreshKey],
+  )
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -753,16 +738,18 @@ export default function TracesList({ project }: TracesListProps) {
     ])
   }, [project.name, project.slug, setBreadcrumbs])
 
+  const timeBounds = tracesListTimeBounds(debouncedSearch || undefined, {
+    startTime,
+    endTime,
+  })
+
   // Fetch trace summaries (one row per trace, server-side aggregation)
   const { data, isLoading, isFetching, refetch } = useQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
-        // When pinned to a trace ID, ignore the time window — same contract as
-        // LogsList. An exact ID is already specific, and a freshly ingested
-        // span can land after the frozen end_time of a long-lived page.
-        start_time: debouncedSearch ? undefined : startTime,
-        end_time: debouncedSearch ? undefined : endTime,
+        start_time: timeBounds.start_time,
+        end_time: timeBounds.end_time,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: debouncedSearch || undefined,
@@ -847,7 +834,7 @@ export default function TracesList({ project }: TracesListProps) {
 
   const handleTimeRangeChange = useCallback(
     (v: string) => {
-      setTimeRange(v as TimeRange)
+      setTimeRange(v as TracesTimeRange)
       setPage(1)
     },
     []
