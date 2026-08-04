@@ -2,8 +2,8 @@ use super::AuthState;
 use crate::audit::{
     ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit,
     MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
-    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, UpdatedFields, UserCreatedAudit,
-    UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
+    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
+    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -37,7 +37,8 @@ use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
     MfaSetupResponse, MfaVerificationRequest, RouteRole, RouteUser, RouteUserWithRoles,
-    TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest, UserResponse, VerifyMfaRequest,
+    StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest, UserResponse,
+    VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -134,6 +135,32 @@ fn invalid_mfa_problem() -> Problem {
     problem_new(StatusCode::UNAUTHORIZED)
         .with_title("MFA Verification Failed")
         .with_detail("The verification code is incorrect or has expired. Please try again with a new code from your authenticator app.")
+}
+
+async fn record_step_up_verification_audit(
+    auth_state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    session_id: i32,
+    success: bool,
+    reason: Option<&str>,
+) {
+    let audit = StepUpVerificationAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        success,
+        reason: reason.map(str::to_string),
+    };
+    if let Err(error) = auth_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id,
+            session_id, %error,
+            "Failed to record sensitive-action verification audit"
+        );
+    }
 }
 
 #[utoipa::path(
@@ -457,12 +484,146 @@ pub async fn verify_mfa_challenge(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/auth/step-up",
+    request_body = VerifyStepUpRequest,
+    responses(
+        (status = 200, description = "Session elevated for sensitive actions", body = StepUpResponse),
+        (status = 400, description = "Verification code is empty"),
+        (status = 401, description = "Invalid code or expired session"),
+        (status = 403, description = "Browser session required"),
+        (status = 429, description = "Too many verification attempts"),
+        (status = 428, description = "MFA setup required"),
+        (status = 500, description = "Verification infrastructure failed")
+    ),
+    tag = "Authentication",
+    security(("session_token" = []))
+)]
+pub async fn verify_step_up(
+    State(auth_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<VerifyStepUpRequest>,
+) -> Result<Json<StepUpResponse>, Problem> {
+    let code = request.code.trim();
+    if code.is_empty() {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Verification Code Required")
+            .detail("Provide a TOTP code or recovery code")
+            .value("error_code", "STEP_UP_CODE_REQUIRED")
+            .build());
+    }
+
+    let session_id = auth.session_id().ok_or_else(|| {
+        temps_core::error_builder::forbidden()
+            .title("Browser Session Required")
+            .detail("Sensitive-action verification is available only to browser sessions")
+            .value("error_code", "STEP_UP_SESSION_REQUIRED")
+            .build()
+    })?;
+    let user_id = auth.user_id();
+    let rate_limit_key = format!("user:{user_id}:session:{session_id}");
+    if auth_state
+        .step_up_rate_limiter
+        .check(&rate_limit_key)
+        .await
+        .is_err()
+    {
+        record_step_up_verification_audit(
+            &auth_state,
+            &metadata,
+            user_id,
+            session_id,
+            false,
+            Some("rate_limited"),
+        )
+        .await;
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Too Many Verification Attempts")
+                .detail("Wait before trying another verification code")
+                .value("error_code", "STEP_UP_RATE_LIMITED")
+                .build(),
+        );
+    }
+
+    let result = auth_state
+        .step_up_service
+        .verify_and_elevate(user_id, session_id, code)
+        .await;
+
+    let (success, reason) = match &result {
+        Ok(_) => (true, None),
+        Err(crate::StepUpError::SessionRequired) => (false, Some("session_required")),
+        Err(crate::StepUpError::MfaNotConfigured { .. }) => (false, Some("mfa_not_configured")),
+        Err(crate::StepUpError::InvalidCode { .. }) => (false, Some("invalid_code")),
+        Err(crate::StepUpError::UserNotFound { .. }) => (false, Some("user_not_found")),
+        Err(crate::StepUpError::SessionNotFound { .. }) => (false, Some("session_not_found")),
+        Err(crate::StepUpError::Verification { .. }) => (false, Some("verification_failed")),
+        Err(crate::StepUpError::Database { .. }) => (false, Some("database_failed")),
+    };
+    record_step_up_verification_audit(&auth_state, &metadata, user_id, session_id, success, reason)
+        .await;
+
+    match result {
+        Ok(expires_at) => Ok(Json(StepUpResponse {
+            expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        })),
+        Err(crate::StepUpError::SessionRequired) => Err(temps_core::error_builder::forbidden()
+            .title("Browser Session Required")
+            .detail("Sensitive-action verification is available only to browser sessions")
+            .value("error_code", "STEP_UP_SESSION_REQUIRED")
+            .build()),
+        Err(crate::StepUpError::MfaNotConfigured { .. }) => Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::PRECONDITION_REQUIRED)
+                .type_("https://temps.sh/probs/mfa-setup-required")
+                .title("MFA Setup Required")
+                .detail("Configure MFA before performing sensitive actions")
+                .value("error_code", "MFA_SETUP_REQUIRED")
+                .build(),
+        ),
+        Err(crate::StepUpError::InvalidCode { .. }) => {
+            Err(temps_core::error_builder::unauthorized()
+                .title("Invalid Verification Code")
+                .detail("The TOTP or recovery code is invalid")
+                .value("error_code", "STEP_UP_CODE_INVALID")
+                .build())
+        }
+        Err(crate::StepUpError::SessionNotFound { .. })
+        | Err(crate::StepUpError::UserNotFound { .. }) => {
+            Err(temps_core::error_builder::unauthorized()
+                .title("Session Expired")
+                .detail("The authenticated browser session is no longer active")
+                .value("error_code", "STEP_UP_SESSION_EXPIRED")
+                .build())
+        }
+        Err(crate::StepUpError::Verification { user_id, reason }) => {
+            error!(user_id, %reason, "Sensitive-action MFA verification failed");
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Verification Failed")
+                .detail("The verification service could not complete the request")
+                .value("error_code", "STEP_UP_VERIFICATION_FAILED")
+                .build())
+        }
+        Err(error @ crate::StepUpError::Database { .. }) => {
+            error!(%error, "Sensitive-action verification database failure");
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Verification Failed")
+                .detail("The verification service could not complete the request")
+                .value("error_code", "STEP_UP_VERIFICATION_FAILED")
+                .build())
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
         get_current_user,
         logout,
         verify_mfa_challenge,
+        verify_step_up,
         register,
         login,
         email_status,
@@ -514,6 +675,8 @@ pub async fn verify_mfa_challenge(
             UpdateSelfRequest,
             ChangePasswordRequest,
             VerifyMfaRequest,
+            VerifyStepUpRequest,
+            StepUpResponse,
             MfaSetupResponse,
             DisableMfaRequest,
             crate::cli_device_handler::CliDeviceStartRequest,
@@ -549,6 +712,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
     let rate_limited_auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verify_mfa_challenge))
+        .route("/auth/step-up", post(verify_step_up))
         .route(
             "/auth/cli/device/start",
             post(crate::cli_device_handler::cli_device_start),

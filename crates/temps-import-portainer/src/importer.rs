@@ -1096,6 +1096,7 @@ async fn execute_plan(
         // both misrepresents the project and made determine_deployment_source_type
         // try to plan a git deploy on any future redeploy with no metadata override).
         source_type: temps_entities::source_type::SourceType::DockerImage,
+        template_slug: None,
     };
 
     let project = project_service

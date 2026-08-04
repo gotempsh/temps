@@ -1160,6 +1160,11 @@ export type ApplyHostnameModeRequest = {
     sync_dns?: boolean;
 };
 
+export type ArchiveFlagResponse = {
+    archived_at?: string | null;
+    key: string;
+};
+
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
 
 export type AssignRoleRequest = {
@@ -3258,6 +3263,33 @@ export type CreateExternalServiceRequest = {
      */
     topology?: string;
     version?: string | null;
+};
+
+export type CreateFlagRequest = {
+    /**
+     * Whether the flag may be exposed on the unauthenticated same-origin
+     * evaluation endpoint. Defaults to `false`: flags are server-only unless
+     * explicitly opted in, because targeting rules can encode business logic.
+     */
+    client_visible?: boolean;
+    /**
+     * Served whenever evaluation cannot do better. Must match `value_type`.
+     *
+     * Left unannotated so utoipa emits a free-form schema: a bool flag's
+     * default is `false`, not an object, and `value_type = Object` would tell
+     * every generated client otherwise.
+     */
+    default_value: unknown;
+    description?: string | null;
+    /**
+     * Stable key used in application code. Immutable after create.
+     */
+    key: string;
+    /**
+     * Fixed at create: retyping would invalidate every stored value and every
+     * call site.
+     */
+    value_type: FlagValueType;
 };
 
 export type CreateFunnelRequest = {
@@ -5502,6 +5534,15 @@ export type DrainStatusResponse = {
     status: string;
 };
 
+export type DropArchiveUpload = {
+    file: Blob | File;
+};
+
+export type DropInspectionResponse = {
+    candidates: Array<DropPresetCandidate>;
+    suggestedName: string;
+};
+
 /**
  * Drop-off point: pages where visitors leave the site
  */
@@ -5522,6 +5563,15 @@ export type DropOffPoint = {
      * Total views of this page
      */
     total_views: number;
+};
+
+export type DropPresetCandidate = {
+    confidence: string;
+    directory: string;
+    isStatic: boolean;
+    label: string;
+    preset: string;
+    reason: string;
 };
 
 export type EmailConfig = {
@@ -7005,6 +7055,85 @@ export type FiringSeriesEntry = {
      */
     series_label: string;
 };
+
+export type FlagEnvironmentResponse = {
+    enabled: boolean;
+    environment_id: number;
+    value?: unknown;
+};
+
+/**
+ * Note the absence of `salt`: it is never exposed. Publishing the bucketing
+ * salt would let a client predict, and self-select into, a rollout cohort.
+ */
+export type FlagListResponse = {
+    flags: Array<FlagResponse>;
+    page: number;
+    page_size: number;
+    /**
+     * Total flags matching the filter, across all pages.
+     */
+    total: number;
+    total_pages: number;
+};
+
+export type FlagResponse = {
+    archived_at?: string | null;
+    client_visible: boolean;
+    created_at: string;
+    default_value: unknown;
+    description?: string | null;
+    /**
+     * Per-environment overrides. Empty means the flag inherits its default
+     * everywhere.
+     */
+    environments: Array<FlagEnvironmentResponse>;
+    id: number;
+    key: string;
+    /**
+     * When an app last actually evaluated this flag. `None` means never seen,
+     * which is a real answer rather than missing data.
+     */
+    last_evaluated_at?: string | null;
+    updated_at: string;
+    value_type: string;
+};
+
+/**
+ * A single flag, already resolved down to one environment. This is what the
+ * evaluator sees and what the SDK caches in memory.
+ */
+export type FlagSnapshot = {
+    /**
+     * Served whenever evaluation cannot do better. Genuinely polymorphic by
+     * design — the surrounding struct carries the type.
+     */
+    default_value: unknown;
+    /**
+     * False means the kill switch is engaged for this environment.
+     */
+    enabled: boolean;
+    /**
+     * `None` means "inherit `default_value`".
+     */
+    environment_value?: unknown;
+    key: string;
+    value_type: FlagValueType;
+};
+
+export type FlagSnapshotResponse = {
+    environment_id: number;
+    /**
+     * Flags collapsed to what the evaluator needs, sorted by key so the
+     * serialized form — and therefore the ETag — is stable.
+     */
+    flags: Array<FlagSnapshot>;
+};
+
+/**
+ * The declared type of a flag's value. Fixed at create time.
+ */
+export type FlagValueType = 'bool' | 'string' | 'number' | 'json';
 
 /**
  * Forecast model family.
@@ -12737,6 +12866,27 @@ export type RecentQueryParams = {
 };
 
 /**
+ * Keys a running app actually evaluated since its last report.
+ */
+export type RecordExposureRequest = {
+    /**
+     * Flag keys evaluated since the last report. Unknown keys are ignored.
+     */
+    keys: Array<string>;
+};
+
+export type RecordExposureResponse = {
+    /**
+     * How many keys were accepted for processing.
+     *
+     * Deliberately not the number of rows updated: echoing that back would
+     * let a caller post a single candidate key and read the result as "this
+     * flag exists", turning the endpoint into an existence oracle.
+     */
+    recorded: number;
+};
+
+/**
  * Record list response
  */
 export type RecordListResponse = {
@@ -14916,6 +15066,19 @@ export type SessionSummary = {
     started_at: string;
 };
 
+export type SetFlagEnvironmentRequest = {
+    /**
+     * The kill switch. `false` makes the flag serve its default regardless of
+     * any override — and, once targeting exists, regardless of any rule.
+     */
+    enabled?: boolean | null;
+    /**
+     * Tri-state: absent leaves the override, `null` clears it (inherit the
+     * flag default), anything else sets it. Must match `value_type`.
+     */
+    value?: unknown;
+};
+
 export type SetPreviewPasswordBody = {
     /**
      * Plaintext password to protect the sandbox's preview URLs. Hashed
@@ -15336,6 +15499,10 @@ export type SmtpResult = {
     is_disabled: boolean;
 };
 
+export type SourceArchiveUpload = {
+    file: Blob | File;
+};
+
 /**
  * Entry in the source backup index. Covers both DB-tracked backups
  * (have a row in `backups`) and S3-scan discoveries (raw S3 objects with
@@ -15487,6 +15654,7 @@ export type SourceMapResponse = {
  * - `Git`: Source code from a Git repository (traditional flow)
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
+ * - `UploadedSource`: Source archive uploaded without a Git repository
  * - `Manual`: Flexible type that accepts any deployment method
  */
 export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
@@ -15898,6 +16066,14 @@ export type StepResult = {
      * Whether this step succeeded
      */
     success: boolean;
+};
+
+export type StepUpResponse = {
+    /**
+     * ISO 8601 timestamp after which sensitive actions require verification
+     * again.
+     */
+    expires_at: string;
 };
 
 export type StopSequence = string | Array<string>;
@@ -17073,6 +17249,18 @@ export type UpdateExternalServiceRequest = {
     };
 };
 
+export type UpdateFlagRequest = {
+    client_visible?: boolean | null;
+    /**
+     * Must match the flag's existing `value_type`.
+     */
+    default_value?: unknown;
+    /**
+     * Tri-state: absent leaves it, `null` clears it, a string sets it.
+     */
+    description?: string | null;
+};
+
 export type UpdateGitSettingsRequest = {
     directory: string;
     git_provider_connection_id?: number | null;
@@ -17928,6 +18116,13 @@ export type ValidationSummary = {
 };
 
 export type VerifyMfaRequest = {
+    code: string;
+};
+
+export type VerifyStepUpRequest = {
+    /**
+     * Current TOTP value or an unused recovery code.
+     */
     code: string;
 };
 
@@ -21379,6 +21574,10 @@ export type CreateApiKeyErrors = {
      */
     409: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -21654,6 +21853,10 @@ export type RotateApiKeyErrors = {
      */
     404: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -21681,6 +21884,10 @@ export type CliDeviceApproveErrors = {
      */
     401: unknown;
     /**
+     * Browser session required
+     */
+    403: unknown;
+    /**
      * Unknown user_code
      */
     404: unknown;
@@ -21692,6 +21899,10 @@ export type CliDeviceApproveErrors = {
      * Session expired
      */
     410: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -22019,6 +22230,49 @@ export type ResetPasswordResponses = {
 };
 
 export type ResetPasswordResponse = ResetPasswordResponses[keyof ResetPasswordResponses];
+
+export type VerifyStepUpData = {
+    body: VerifyStepUpRequest;
+    path?: never;
+    query?: never;
+    url: '/auth/step-up';
+};
+
+export type VerifyStepUpErrors = {
+    /**
+     * Verification code is empty
+     */
+    400: unknown;
+    /**
+     * Invalid code or expired session
+     */
+    401: unknown;
+    /**
+     * Browser session required
+     */
+    403: unknown;
+    /**
+     * MFA setup required
+     */
+    428: unknown;
+    /**
+     * Too many verification attempts
+     */
+    429: unknown;
+    /**
+     * Verification infrastructure failed
+     */
+    500: unknown;
+};
+
+export type VerifyStepUpResponses = {
+    /**
+     * Session elevated for sensitive actions
+     */
+    200: StepUpResponse;
+};
+
+export type VerifyStepUpResponse = VerifyStepUpResponses[keyof VerifyStepUpResponses];
 
 export type VerifyEmailData = {
     body?: never;
@@ -25042,6 +25296,29 @@ export type CheckDomainStatusResponses = {
 };
 
 export type CheckDomainStatusResponse = CheckDomainStatusResponses[keyof CheckDomainStatusResponses];
+
+export type InspectDropArchiveData = {
+    body: DropArchiveUpload;
+    path?: never;
+    query?: never;
+    url: '/drop/inspect';
+};
+
+export type InspectDropArchiveErrors = {
+    /**
+     * Invalid or unsupported archive
+     */
+    400: unknown;
+};
+
+export type InspectDropArchiveResponses = {
+    /**
+     * Detected deployable project roots
+     */
+    200: DropInspectionResponse;
+};
+
+export type InspectDropArchiveResponse = InspectDropArchiveResponses[keyof InspectDropArchiveResponses];
 
 export type ListEmailDomainsData = {
     body?: never;
@@ -28657,6 +28934,82 @@ export type GetFileResponses = {
 };
 
 export type GetFileResponse = GetFileResponses[keyof GetFileResponses];
+
+export type RecordFlagExposureData = {
+    body: RecordExposureRequest;
+    path?: never;
+    query?: never;
+    url: '/flags/exposure';
+};
+
+export type RecordFlagExposureErrors = {
+    /**
+     * Deployment token required
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RecordFlagExposureResponses = {
+    /**
+     * Exposure recorded
+     */
+    200: RecordExposureResponse;
+};
+
+export type RecordFlagExposureResponse = RecordFlagExposureResponses[keyof RecordFlagExposureResponses];
+
+export type GetFlagSnapshotData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Required only when the calling token is project-wide rather than scoped
+         * to a single environment.
+         */
+        environment_id?: number | null;
+    };
+    url: '/flags/snapshot';
+};
+
+export type GetFlagSnapshotErrors = {
+    /**
+     * Environment could not be determined
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFlagSnapshotResponses = {
+    /**
+     * Snapshot for the environment
+     */
+    200: FlagSnapshotResponse;
+};
+
+export type GetFlagSnapshotResponse = GetFlagSnapshotResponses[keyof GetFlagSnapshotResponses];
 
 export type GetIpGeolocationData = {
     body?: never;
@@ -38332,6 +38685,10 @@ export type DeleteEnvironmentErrors = {
      */
     404: unknown;
     /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -39431,6 +39788,36 @@ export type DeployFromImageUploadResponses = {
 
 export type DeployFromImageUploadResponse = DeployFromImageUploadResponses[keyof DeployFromImageUploadResponses];
 
+export type DeployFromUploadedSourceData = {
+    body: SourceArchiveUpload;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/source';
+};
+
+export type DeployFromUploadedSourceErrors = {
+    /**
+     * Invalid source archive
+     */
+    400: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type DeployFromUploadedSourceResponses = {
+    /**
+     * Source deployment started
+     */
+    202: RemoteDeploymentResponse;
+};
+
+export type DeployFromUploadedSourceResponse = DeployFromUploadedSourceResponses[keyof DeployFromUploadedSourceResponses];
+
 export type DeployFromStaticData = {
     body: DeployFromStaticRequest;
     path: {
@@ -40504,6 +40891,331 @@ export type GetRemoteExternalImageResponses = {
 };
 
 export type GetRemoteExternalImageResponse = GetRemoteExternalImageResponses[keyof GetRemoteExternalImageResponses];
+
+export type ListFlagsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Include archived flags. Defaults to false.
+         */
+        include_archived?: boolean;
+        /**
+         * 1-indexed page number. Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Items per page. Defaults to 20, capped at 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/flags';
+};
+
+export type ListFlagsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListFlagsResponses = {
+    /**
+     * Flags listed
+     */
+    200: FlagListResponse;
+};
+
+export type ListFlagsResponse = ListFlagsResponses[keyof ListFlagsResponses];
+
+export type CreateFlagData = {
+    body: CreateFlagRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags';
+};
+
+export type CreateFlagErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag key already exists
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateFlagResponses = {
+    /**
+     * Flag created
+     */
+    201: FlagResponse;
+};
+
+export type CreateFlagResponse = CreateFlagResponses[keyof CreateFlagResponses];
+
+export type ArchiveFlagData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}';
+};
+
+export type ArchiveFlagErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ArchiveFlagResponses = {
+    /**
+     * Flag archived
+     */
+    200: ArchiveFlagResponse;
+};
+
+export type ArchiveFlagResponse2 = ArchiveFlagResponses[keyof ArchiveFlagResponses];
+
+export type GetFlagData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}';
+};
+
+export type GetFlagErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFlagResponses = {
+    /**
+     * Flag retrieved
+     */
+    200: FlagResponse;
+};
+
+export type GetFlagResponse = GetFlagResponses[keyof GetFlagResponses];
+
+export type UpdateFlagData = {
+    body: UpdateFlagRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}';
+};
+
+export type UpdateFlagErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateFlagResponses = {
+    /**
+     * Flag updated
+     */
+    200: FlagResponse;
+};
+
+export type UpdateFlagResponse = UpdateFlagResponses[keyof UpdateFlagResponses];
+
+export type SetFlagEnvironmentData = {
+    body: SetFlagEnvironmentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/environments/{environment_id}';
+};
+
+export type SetFlagEnvironmentErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetFlagEnvironmentResponses = {
+    /**
+     * Environment value set
+     */
+    200: FlagEnvironmentResponse;
+};
+
+export type SetFlagEnvironmentResponse = SetFlagEnvironmentResponses[keyof SetFlagEnvironmentResponses];
+
+export type RestoreFlagData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Flag key
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/flags/{key}/restore';
+};
+
+export type RestoreFlagErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Flag not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RestoreFlagResponses = {
+    /**
+     * Flag restored
+     */
+    200: FlagResponse;
+};
+
+export type RestoreFlagResponse = RestoreFlagResponses[keyof RestoreFlagResponses];
 
 export type ListFunnelsData = {
     body?: never;
@@ -48179,36 +48891,3 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
-
-export type DropArchiveUpload = { file: Blob | File };
-export type SourceArchiveUpload = { file: Blob | File };
-export type DropInspectionResponse = {
-    candidates: Array<DropPresetCandidate>;
-    suggestedName: string;
-};
-export type DropPresetCandidate = {
-    confidence: string;
-    directory: string;
-    isStatic: boolean;
-    label: string;
-    preset: string;
-    reason: string;
-};
-export type InspectDropArchiveData = {
-    body: DropArchiveUpload;
-    path?: never;
-    query?: never;
-    url: '/drop/inspect';
-};
-export type InspectDropArchiveErrors = { 400: unknown };
-export type InspectDropArchiveResponses = { 200: DropInspectionResponse };
-export type InspectDropArchiveResponse = InspectDropArchiveResponses[keyof InspectDropArchiveResponses];
-export type DeployFromUploadedSourceData = {
-    body: SourceArchiveUpload;
-    path: { project_id: number; environment_id: number };
-    query?: never;
-    url: '/projects/{project_id}/environments/{environment_id}/deploy/source';
-};
-export type DeployFromUploadedSourceErrors = { 400: unknown; 404: unknown };
-export type DeployFromUploadedSourceResponses = { 202: RemoteDeploymentResponse };
-export type DeployFromUploadedSourceResponse = DeployFromUploadedSourceResponses[keyof DeployFromUploadedSourceResponses];

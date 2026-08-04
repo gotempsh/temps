@@ -153,6 +153,20 @@ pub struct VerifyMfaRequest {
     pub code: String,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct VerifyStepUpRequest {
+    /// Current TOTP value or an unused recovery code.
+    pub code: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct StepUpResponse {
+    /// ISO 8601 timestamp after which sensitive actions require verification
+    /// again.
+    #[schema(value_type = String, format = DateTime)]
+    pub expires_at: String,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MfaSetupResponse {
     pub secret_key: String,

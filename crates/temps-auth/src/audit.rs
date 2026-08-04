@@ -101,6 +101,15 @@ pub struct MfaVerifiedAudit {
     pub username: String,
 }
 
+/// Records attempts to elevate an authenticated browser session before a
+/// sensitive action. No credential or MFA code is ever serialized.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepUpVerificationAudit {
+    pub context: AuditContext,
+    pub success: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LogoutAudit {
     pub context: AuditContext,
@@ -471,6 +480,33 @@ impl AuditOperation for MfaVerifiedAudit {
     }
 }
 
+impl AuditOperation for StepUpVerificationAudit {
+    fn operation_type(&self) -> String {
+        if self.success {
+            "STEP_UP_VERIFICATION_SUCCEEDED".to_string()
+        } else {
+            "STEP_UP_VERIFICATION_FAILED".to_string()
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 impl AuditOperation for LogoutAudit {
     fn operation_type(&self) -> String {
         "USER_LOGOUT".to_string()
@@ -783,5 +819,22 @@ mod failure_audit_tests {
             login_method: "password".to_string(),
         };
         assert_eq!(audit.user_id(), Some(42));
+    }
+
+    #[test]
+    fn step_up_audit_never_contains_a_verification_code() {
+        let audit = StepUpVerificationAudit {
+            context: AuditContext {
+                user_id: 42,
+                ip_address: Some("203.0.113.9".to_string()),
+                user_agent: "test-agent".to_string(),
+            },
+            success: false,
+            reason: Some("invalid_code".to_string()),
+        };
+        assert_eq!(audit.operation_type(), "STEP_UP_VERIFICATION_FAILED");
+        let json = AuditOperation::serialize(&audit).expect("step-up audit serializes");
+        assert!(!json.contains("123456"));
+        assert!(json.contains("invalid_code"));
     }
 }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::{fmt, path::Path};
 
+mod autopack_preset;
 mod build_system;
 mod docker;
 mod docker_compose;
@@ -28,6 +29,7 @@ pub mod preset_provider;
 pub mod providers;
 
 // Re-export Preset enum from temps-entities
+pub use autopack_preset::AutopackPreset;
 use build_system::BuildSystem;
 pub use build_system::MonorepoTool;
 use docker::DockerfilePreset;
@@ -329,6 +331,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(DockerfilePreset),
         Box::new(DockerCustomPreset),
         // Nixpacks auto-detect
+        Box::new(AutopackPreset::new()),
         Box::new(NixpacksPreset::auto()),
         // Nixpacks provider-specific variants
         Box::new(NixpacksPreset::new(NixpacksProvider::Node)),
