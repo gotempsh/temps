@@ -594,36 +594,70 @@ impl ProjectCandidate {
 pub fn detect_project_candidates(
     files: &std::collections::BTreeMap<String, String>,
 ) -> Vec<ProjectCandidate> {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Directories that never contain a *deployable* root — they hold
+    /// dependencies, build output, or VCS metadata. Without this a ZIP that
+    /// shipped its `node_modules` offers thousands of bogus candidates.
+    const SKIP_SEGMENTS: [&str; 8] = [
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "vendor",
+        "target",
+        ".next",
+        "__pycache__",
+    ];
+    /// Deployable roots live near the top of an archive. Bounding depth keeps
+    /// a pathological archive from turning detection into an O(n^2) walk.
+    const MAX_ROOT_DEPTH: usize = 4;
+
+    // Index every path by its directory ONCE. The previous implementation
+    // rescanned all of `files` for each root, which is O(roots x files) — a
+    // 20k-entry archive turned into ~4x10^8 string comparisons per request.
+    let mut by_directory: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for path in files.keys() {
+        let (directory, name) = match path.rsplit_once('/') {
+            Some((directory, name)) => (directory, name),
+            None => (".", path.as_str()),
+        };
+        if directory
+            .split('/')
+            .any(|segment| SKIP_SEGMENTS.contains(&segment))
+        {
+            continue;
+        }
+        if directory != "." && directory.split('/').count() > MAX_ROOT_DEPTH {
+            continue;
+        }
+        by_directory.entry(directory).or_default().push(name);
+    }
 
     let mut roots = BTreeSet::new();
-    for path in files.keys() {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        if matches!(
-            name,
-            "package.json"
-                | "Dockerfile"
-                | "docker-compose.yml"
-                | "docker-compose.yaml"
-                | "compose.yml"
-                | "compose.yaml"
-                | "Cargo.toml"
-                | "go.mod"
-                | "requirements.txt"
-                | "pyproject.toml"
-                | "pom.xml"
-                | "build.gradle"
-                | "index.html"
-        ) || name.ends_with(".csproj")
-            || name.starts_with("next.config.")
-            || name.starts_with("vite.config.")
-            || name.starts_with("astro.config.")
-        {
-            roots.insert(
-                path.rsplit_once('/')
-                    .map(|(directory, _)| directory.to_string())
-                    .unwrap_or_else(|| ".".to_string()),
-            );
+    for (directory, names) in &by_directory {
+        if names.iter().any(|name| {
+            matches!(
+                *name,
+                "package.json"
+                    | "Dockerfile"
+                    | "docker-compose.yml"
+                    | "docker-compose.yaml"
+                    | "compose.yml"
+                    | "compose.yaml"
+                    | "Cargo.toml"
+                    | "go.mod"
+                    | "requirements.txt"
+                    | "pyproject.toml"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "index.html"
+            ) || name.ends_with(".csproj")
+                || name.starts_with("next.config.")
+                || name.starts_with("vite.config.")
+                || name.starts_with("astro.config.")
+        }) {
+            roots.insert(*directory);
         }
     }
 
@@ -636,16 +670,10 @@ pub fn detect_project_candidates(
                 format!("{root}/{name}")
             }
         };
-        let has = |name: &str| files.contains_key(&at_root(name));
-        let has_extension = |extension: &str| {
-            files.keys().any(|path| {
-                let in_root = path
-                    .rsplit_once('/')
-                    .map(|(directory, _)| directory == root)
-                    .unwrap_or(root == ".");
-                in_root && path.rsplit('/').next().is_some_and(|name| name.ends_with(extension))
-            })
-        };
+        let names = by_directory.get(root).map(Vec::as_slice).unwrap_or(&[]);
+        let has = |name: &str| names.contains(&name);
+        let has_extension =
+            |extension: &str| names.iter().any(|name| name.ends_with(extension));
 
         let detected = if has("docker-compose.yml")
             || has("docker-compose.yaml")
@@ -695,7 +723,7 @@ pub fn detect_project_candidates(
 
         if let Some((preset, confidence, reason)) = detected {
             candidates.push(ProjectCandidate {
-                path: root,
+                path: root.to_string(),
                 preset,
                 confidence,
                 reason,
@@ -980,5 +1008,101 @@ mod uploaded_source_detection_tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn detects_docker_compose_at_the_archive_root() {
+        for name in [
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ] {
+            let files = BTreeMap::from([
+                (name.to_string(), "services:\n  web:\n    image: nginx".to_string()),
+                ("package.json".to_string(), "{}".to_string()),
+            ]);
+
+            let candidates = detect_project_candidates(&files);
+
+            assert_eq!(candidates.len(), 1, "{name} should yield one candidate");
+            assert_eq!(
+                candidates[0].preset,
+                PresetType::DockerCompose,
+                "{name} should win over package.json"
+            );
+            assert_eq!(candidates[0].path, ".");
+        }
+    }
+
+    #[test]
+    fn detects_project_wrapped_in_a_single_top_level_directory() {
+        // GitHub-style archives wrap everything in `<repo>-<ref>/`.
+        let files = BTreeMap::from([(
+            "my-app-main/package.json".to_string(),
+            r#"{"dependencies":{"next":"15.0.0"}}"#.to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "my-app-main");
+        assert_eq!(candidates[0].preset, PresetType::NextJs);
+    }
+
+    #[test]
+    fn ignores_dependency_and_build_output_directories() {
+        let files = BTreeMap::from([
+            (
+                "package.json".to_string(),
+                r#"{"dependencies":{"vite":"7.0.0"}}"#.to_string(),
+            ),
+            ("node_modules/left-pad/package.json".to_string(), "{}".to_string()),
+            ("dist/index.html".to_string(), "<!doctype html>".to_string()),
+            ("vendor/thing/go.mod".to_string(), "module thing".to_string()),
+            ("target/debug/Cargo.toml".to_string(), "[package]".to_string()),
+            (".git/config".to_string(), String::new()),
+        ]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the real root is deployable, got {candidates:?}"
+        );
+        assert_eq!(candidates[0].path, ".");
+        assert_eq!(candidates[0].preset, PresetType::Vite);
+    }
+
+    #[test]
+    fn deeply_nested_directories_do_not_become_candidates() {
+        let files = BTreeMap::from([(
+            "a/b/c/d/e/package.json".to_string(),
+            r#"{"dependencies":{"express":"5.0.0"}}"#.to_string(),
+        )]);
+
+        assert!(detect_project_candidates(&files).is_empty());
+    }
+
+    /// Regression guard for the O(roots x files) scan: this fixture used to
+    /// cost ~4x10^8 string comparisons. It must now stay linear enough to
+    /// finish effectively instantly.
+    #[test]
+    fn wide_archives_do_not_blow_up_detection() {
+        let mut files = BTreeMap::new();
+        for i in 0..5_000 {
+            files.insert(format!("site{i}/index.html"), "<!doctype html>".to_string());
+        }
+
+        let started = std::time::Instant::now();
+        let candidates = detect_project_candidates(&files);
+        let elapsed = started.elapsed();
+
+        assert_eq!(candidates.len(), 5_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "detection took {elapsed:?} — the per-root full scan is back"
+        );
     }
 }

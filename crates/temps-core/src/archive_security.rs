@@ -21,7 +21,9 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, std::io::Error> {
         .get(offset..offset + 4)
         .ok_or_else(|| invalid("truncated ZIP end record"))?;
     Ok(u32::from_le_bytes(
-        value.try_into().expect("four-byte slice"),
+        value
+            .try_into()
+            .map_err(|_| invalid("truncated ZIP end record"))?,
     ))
 }
 
@@ -30,7 +32,9 @@ fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, std::io::Error> {
         .get(offset..offset + 8)
         .ok_or_else(|| invalid("truncated ZIP64 end record"))?;
     Ok(u64::from_le_bytes(
-        value.try_into().expect("eight-byte slice"),
+        value
+            .try_into()
+            .map_err(|_| invalid("truncated ZIP64 end record"))?,
     ))
 }
 

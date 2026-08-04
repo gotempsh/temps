@@ -166,6 +166,11 @@ pub struct ApiDoc;
 
 static DROP_INSPECTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// Upper bound on how many deployable roots a single Drop inspection reports.
+/// The response drives a picker, so a 20k-entry list is neither usable nor
+/// safe to serialise.
+const MAX_DROP_CANDIDATES: usize = 50;
+
 struct DropInspectionPermit;
 
 impl DropInspectionPermit {
@@ -289,9 +294,31 @@ pub async fn inspect_drop_archive(
             .with_title("Missing Archive")
             .with_detail("Expected a ZIP archive in multipart field 'file'"));
     }
-    let manifests = tokio::task::spawn_blocking(move || {
+    // Detection is CPU-bound and O(roots x files); it must run inside the same
+    // `spawn_blocking` as the ZIP walk so it stays off the async runtime AND
+    // stays covered by `inspection_permit`, which is released when this closure
+    // returns.
+    let candidates = tokio::task::spawn_blocking(move || {
         let _inspection_permit = inspection_permit;
-        inspect_zip_manifests(&archive_path)
+        let manifests = inspect_zip_manifests(&archive_path)?;
+        let mut candidates = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .map(|candidate| {
+                let preset = candidate.catalog_slug().to_string();
+                DropPresetCandidate {
+                    directory: candidate.path,
+                    preset,
+                    label: candidate.preset.display_name().to_string(),
+                    confidence: candidate.confidence.to_string(),
+                    reason: candidate.reason,
+                    is_static: candidate.preset == temps_entities::preset::Preset::Static,
+                }
+            })
+            .collect::<Vec<_>>();
+        // The response is rendered as a picker; an unbounded list is neither
+        // useful to a human nor safe to serialise.
+        candidates.truncate(MAX_DROP_CANDIDATES);
+        Ok::<_, Problem>(candidates)
     })
     .await
     .map_err(|error| {
@@ -299,20 +326,6 @@ pub async fn inspect_drop_archive(
             .with_title("Archive Inspection Failed")
             .with_detail(error.to_string())
     })??;
-    let candidates = temps_presets::detect_project_candidates(&manifests)
-        .into_iter()
-        .map(|candidate| {
-            let preset = candidate.catalog_slug().to_string();
-            DropPresetCandidate {
-                directory: candidate.path,
-                preset,
-                label: candidate.preset.display_name().to_string(),
-                confidence: candidate.confidence.to_string(),
-                reason: candidate.reason,
-                is_static: candidate.preset == temps_entities::preset::Preset::Static,
-            }
-        })
-        .collect::<Vec<_>>();
 
     if candidates.is_empty() {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
@@ -338,6 +351,16 @@ pub async fn inspect_drop_archive(
 fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
     const MAX_FILES: usize = 20_000;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    /// Aggregate budget across every manifest we buffer. `MAX_FILES` x
+    /// `MAX_MANIFEST_BYTES` is 20 GiB, and manifests compress ~1000:1, so a
+    /// ~15 MB upload could otherwise pin gigabytes of `String` per request and
+    /// OOM the whole binary on the 4 GB reference box.
+    const MAX_TOTAL_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+    /// Independent cap on how many manifests we are willing to buffer at all.
+    const MAX_MANIFESTS: usize = 512;
+    /// Aggregate budget for the entry *paths* we retain as map keys. The ZIP
+    /// central directory may legitimately be tens of MiB on its own.
+    const MAX_TOTAL_PATH_BYTES: usize = 4 * 1024 * 1024;
 
     let mut file = std::fs::File::open(path).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -361,6 +384,9 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     }
 
     let mut manifests = BTreeMap::new();
+    let mut total_manifest_bytes: u64 = 0;
+    let mut manifest_count: usize = 0;
+    let mut total_path_bytes: usize = 0;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|error| {
             problemdetails::new(StatusCode::BAD_REQUEST)
@@ -418,6 +444,14 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
                 | "pom.xml"
                 | "build.gradle"
         ) || basename.ends_with(".csproj");
+        total_path_bytes = total_path_bytes.saturating_add(normalized.len());
+        if total_path_bytes > MAX_TOTAL_PATH_BYTES {
+            return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                .with_title("Archive Manifest Too Large")
+                .with_detail(format!(
+                    "Combined entry paths exceed {MAX_TOTAL_PATH_BYTES} bytes"
+                )));
+        }
         let mut contents = String::new();
         if should_read {
             if entry.size() > MAX_MANIFEST_BYTES {
@@ -425,14 +459,34 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
                     .with_title("Manifest Is Too Large")
                     .with_detail(format!("Manifest '{normalized}' exceeds 1 MiB")));
             }
-            entry
-                .take(MAX_MANIFEST_BYTES + 1)
+            manifest_count += 1;
+            if manifest_count > MAX_MANIFESTS {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Too Many Manifests")
+                    .with_detail(format!(
+                        "Archive contains more than {MAX_MANIFESTS} project manifests"
+                    )));
+            }
+            // Budget against bytes *actually read*, not the declared header
+            // size, so a lying local header cannot get us to over-allocate.
+            let remaining = MAX_TOTAL_MANIFEST_BYTES.saturating_sub(total_manifest_bytes);
+            let read = entry
+                .take(remaining.min(MAX_MANIFEST_BYTES) + 1)
                 .read_to_string(&mut contents)
                 .map_err(|error| {
                     problemdetails::new(StatusCode::BAD_REQUEST)
                         .with_title("Invalid Manifest")
                         .with_detail(format!("Could not read '{normalized}': {error}"))
-                })?;
+                })? as u64;
+            total_manifest_bytes = total_manifest_bytes.saturating_add(read);
+            if total_manifest_bytes > MAX_TOTAL_MANIFEST_BYTES {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Archive Manifests Too Large")
+                    .with_detail(format!(
+                        "Combined project manifests exceed {} MiB",
+                        MAX_TOTAL_MANIFEST_BYTES / (1024 * 1024)
+                    )));
+            }
         }
         manifests.insert(normalized, contents);
     }
