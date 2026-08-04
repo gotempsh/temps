@@ -113,6 +113,12 @@ const Users = lazy(() =>
 const UserDetail = lazy(() =>
   import('./pages/UserDetail').then((m) => ({ default: m.UserDetail }))
 )
+const Teams = lazy(() =>
+  import('./pages/Teams').then((m) => ({ default: m.Teams }))
+)
+const TeamDetail = lazy(() =>
+  import('./pages/TeamDetail').then((m) => ({ default: m.TeamDetail }))
+)
 const CustomRoutes = lazy(() =>
   import('./pages/Routes').then((m) => ({ default: m.Routes }))
 )
@@ -516,6 +522,11 @@ const FullAppRoutes = () => {
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
+                  {/* Teams sit under /settings alongside Users and API Keys:
+                      the sidebar lists them together, and a top-level route
+                      would drop out of the settings layout on click. */}
+                  <Route path="teams" element={<Teams />} />
+                  <Route path="teams/:teamId" element={<TeamDetail />} />
                   <Route path="auth" element={<AuthSettingsPage />} />
                   <Route path="auth/new" element={<CreateOidcProviderPage />} />
                   <Route

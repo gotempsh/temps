@@ -18,7 +18,7 @@ use crate::error::OtelError;
 use crate::handlers::audit::{
     OtelMetricAlertCreatedAudit, OtelMetricAlertDeletedAudit, OtelMetricAlertUpdatedAudit,
 };
-use crate::services::anomaly_preview::compute_anomaly_preview;
+use crate::services::anomaly_preview::{compute_anomaly_preview, compute_static_preview};
 use crate::services::metric_alert_evaluator::SeriesStateEntry;
 use crate::OtelAppState;
 use temps_auth::{permission_guard, project_access_guard, RequireAuth};
@@ -251,7 +251,8 @@ pub struct AnomalyPreviewRequest {
     /// One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
     pub aggregation: String,
     pub window_secs: i32,
-    /// Must be an `anomaly` detector — the band to backtest.
+    /// The detector to backtest. `static` and `anomaly` are supported — the
+    /// kinds the evaluator actually runs.
     pub detection_config: DetectionConfig,
     /// RFC 3339; defaults to 7 days before `end_time`.
     #[schema(example = "2025-10-12T12:15:47Z")]
@@ -619,20 +620,6 @@ pub async fn preview_alert(
     permission_guard!(auth, OtelRead);
     project_access_guard!(auth, req.project_id, state.project_access_checker);
 
-    // Preview only makes sense for a band-based (anomaly) detector.
-    let params = match &req.detection_config {
-        DetectionConfig::Anomaly(p) => p.clone(),
-        other => {
-            return Err(OtelError::Validation {
-                message: format!(
-                    "preview is only available for anomaly detectors, not '{}'",
-                    other.kind_str()
-                ),
-            }
-            .into());
-        }
-    };
-
     let end = req
         .end_time
         .as_deref()
@@ -644,17 +631,82 @@ pub async fn preview_alert(
         .and_then(parse_rfc3339)
         .unwrap_or_else(|| end - chrono::Duration::days(7));
 
-    let preview = compute_anomaly_preview(
-        &state.otel_service,
-        req.project_id,
-        &req.metric_name,
-        &req.aggregation,
-        req.window_secs,
-        &params,
-        start,
-        end,
-    )
-    .await?;
+    // Bound the work before dispatching it. Range and bucket width are both
+    // caller-supplied, and the query below asks for every bucket in between and
+    // materialises them all into the response — so `start_time=2000-01-01` with
+    // `window_secs=1` asks the database for hundreds of millions of rows and
+    // then tries to serialise them. Anyone holding OtelRead on one project could
+    // stall the control plane on a 4 GB box, and this endpoint is now reachable
+    // by the AI read tool rather than only from the alert form.
+    //
+    // The limits are generous against any real backtest: a rule's window is
+    // minutes to hours, and judging noisiness needs days, not decades.
+    const MIN_WINDOW_SECS: i32 = 10;
+    const MAX_WINDOW_SECS: i32 = 86_400;
+    const MAX_RANGE_DAYS: i64 = 30;
+
+    if end <= start {
+        return Err(OtelError::Validation {
+            message: "preview range is empty: end_time must be after start_time".to_string(),
+        }
+        .into());
+    }
+    if (end - start) > chrono::Duration::days(MAX_RANGE_DAYS) {
+        return Err(OtelError::Validation {
+            message: format!(
+                "preview range is {} days; the maximum is {MAX_RANGE_DAYS}. Narrow start_time/end_time.",
+                (end - start).num_days()
+            ),
+        }
+        .into());
+    }
+    let window_secs = req.window_secs.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS);
+
+    // Both detector families that can actually be evaluated are backtestable.
+    // Static was rejected here originally, which made "would this have fired?"
+    // unanswerable for exactly the rules people create most — and left the AI
+    // suggestion flow unable to ground a proposed threshold in anything.
+    let preview = match &req.detection_config {
+        DetectionConfig::Anomaly(params) => {
+            compute_anomaly_preview(
+                &state.otel_service,
+                req.project_id,
+                &req.metric_name,
+                &req.aggregation,
+                window_secs,
+                params,
+                start,
+                end,
+            )
+            .await?
+        }
+        DetectionConfig::Static(params) => {
+            compute_static_preview(
+                &state.otel_service,
+                req.project_id,
+                &req.metric_name,
+                &req.aggregation,
+                window_secs,
+                params.comparator,
+                params.threshold,
+                start,
+                end,
+            )
+            .await?
+        }
+        // The remaining kinds are not evaluated in production yet, so there is
+        // no behaviour to replay — saying so beats inventing a backtest whose
+        // result would not predict anything.
+        other => {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "preview is available for 'static' and 'anomaly' detectors, not '{}'",
+                    other.kind_str()
+                ),
+            }
+            .into());
+        }
+    };
 
     let points = preview
         .points

@@ -1,14 +1,8 @@
 import { ProjectResponse } from '@/api/client'
-// REGEN: bun run openapi-ts — these option/mutation builders are generated from
-// the new /otel/alerts endpoints (operationIds list_alerts / delete_alert).
-// They do not exist in the committed SDK yet; import them so the page is
-// regen-ready rather than hand-rolling fetch (project rule: always use the
-// generated SDK).
 import {
   listAlertsOptions,
   deleteAlertMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-// REGEN: OtelMetricAlertRuleResponse comes from the regenerated types.gen.
 import type { OtelMetricAlertRuleResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
@@ -48,6 +42,7 @@ import {
   StatusDot,
 } from '@/components/metrics/alert-format'
 import { ruleStatus, statusRank } from '@/components/metrics/alert-status'
+import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
 
 interface MetricAlertsProps {
   project: ProjectResponse
@@ -82,7 +77,7 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
   const alerts = [...(alertsQuery.data?.data ?? [])].sort(
     (a, b) =>
       statusRank(ruleStatus(a)) - statusRank(ruleStatus(b)) ||
-      a.name.localeCompare(b.name),
+      a.name.localeCompare(b.name)
   )
 
   const goToNew = () => navigate('new')
@@ -100,10 +95,17 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
             Threshold alerts on OpenTelemetry metrics for {project.name}.
           </p>
         </div>
-        <Button size="sm" onClick={goToNew} className="gap-1.5 self-start">
-          <Plus className="size-4" />
-          New alert
-        </Button>
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <SuggestAlertsButton
+            projectId={project.id}
+            projectSlug={project.slug}
+            projectName={project.name}
+          />
+          <Button size="sm" onClick={goToNew} className="gap-1.5">
+            <Plus className="size-4" />
+            New alert
+          </Button>
+        </div>
       </div>
 
       {alertsQuery.isPending ? (

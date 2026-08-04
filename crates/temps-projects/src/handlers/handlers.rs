@@ -590,6 +590,62 @@ pub async fn create_project(
     Ok(Json(ProjectResponse::map_from_project(new_project)))
 }
 
+/// Project ids to exclude from a listing for this caller.
+///
+/// Returns empty for instance administrators (never restricted by team
+/// membership), for deployment tokens (already confined to their own
+/// project by `project_scope_guard!`), and when no `ProjectAccessChecker`
+/// is registered.
+///
+/// Fails the request on an infrastructure error rather than falling back
+/// to an unfiltered list — a checker that can't answer must not silently
+/// widen what a user sees.
+async fn resolve_hidden_projects(
+    state: &Arc<AppState>,
+    auth: &temps_auth::context::AuthContext,
+) -> Result<Vec<i32>, Problem> {
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(checker) = state.project_access_checker.as_ref() else {
+        return Ok(Vec::new());
+    };
+    // Fail closed, matching `project_permission_guard!`. Unreachable today
+    // (deployment tokens are the only user-less auth source and are handled
+    // above), but "hide nothing" on an unresolvable identity means "show
+    // every project", so a future auth source must not land here silently.
+    let Some(user_id) = auth.user_id_opt() else {
+        tracing::error!("project list filtering: authenticated caller has no user id");
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/project-access-denied")
+                .title("Project Access Denied")
+                .detail("Could not resolve caller identity")
+                .build(),
+        );
+    };
+    match checker.hidden_project_ids(user_id).await {
+        Ok(hidden) => Ok(hidden.unwrap_or_default()),
+        Err(e) => {
+            tracing::error!(
+                user_id,
+                error = %e,
+                "ProjectAccessChecker infrastructure failure while filtering the project list"
+            );
+            Err(
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .type_("https://temps.sh/probs/project-access-check-failed")
+                    .title("Project Access Check Failed")
+                    .detail("Could not verify project access; please try again")
+                    .build(),
+            )
+        }
+    }
+}
+
 /// Get a list of all projects
 #[utoipa::path(
     get,
@@ -618,9 +674,14 @@ pub async fn get_projects(
     let page = params.page.unwrap_or(1);
     let per_page = params.per_page.unwrap_or(10);
 
+    // Per-resource guards keep a user out of a project they click on; this
+    // keeps its name out of the list in the first place. Instance
+    // administrators are exempt, matching `project_access_guard!`.
+    let hidden = resolve_hidden_projects(&state, &auth).await?;
+
     let (projects, total) = state
         .project_service
-        .get_projects_paginated(page, per_page)
+        .get_projects_paginated_excluding(page, per_page, &hidden)
         .await
         .map_err(Problem::from)?;
 
@@ -1503,9 +1564,12 @@ pub async fn get_project_statistics(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
 
+    // Same exclusion as the list — see `resolve_hidden_projects`.
+    let hidden = resolve_hidden_projects(&state, &auth).await?;
+
     let statistics = state
         .project_service
-        .get_project_statistics()
+        .get_project_statistics_excluding(&hidden)
         .await
         .map_err(Problem::from)?;
 

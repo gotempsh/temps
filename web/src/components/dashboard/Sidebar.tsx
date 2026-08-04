@@ -68,6 +68,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Users,
+  UsersRound,
   Wand2,
   Webhook,
   Workflow,
@@ -192,6 +193,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
+      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
@@ -978,6 +980,7 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },
       { title: 'Secrets', url: 'settings/secrets', icon: FileLock2 },
       { title: 'Security', url: 'settings/security', icon: Shield },
+      { title: 'Access', url: 'settings/access', icon: Users },
       { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
       { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
       { title: 'Skills', url: 'settings/skills', icon: Wand2 },

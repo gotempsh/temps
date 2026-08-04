@@ -65,6 +65,7 @@ use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
@@ -1412,6 +1413,11 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_error_groups",
         "list_alert_rules",
         "get_alert_rule",
+        // ── Metric alert rules (OTel) — the rules themselves, so the AI can
+        //    see what is already alerted on before proposing anything new.
+        //    Without these it proposes duplicates of rules that exist.
+        "list_alerts",
+        "get_alert",
         // ── Service status / health / types (NOT params/env) ──
         "get_service_health_status",
         "list_service_health_statuses",
@@ -1600,6 +1606,123 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Import ──
         "list_sources",
         "get_import_status",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Mutating operations the AI may PROPOSE, for a human to confirm.
+///
+/// The AI never executes these — calling `temps_write` only stages a `proposed`
+/// `ai_pending_actions` row; a human confirm endpoint replays the mutation
+/// through the same router (`permission_guard!` + audit). The tool is also
+/// gated per-project behind `projects.ai_write_actions_enabled` (default OFF).
+///
+/// Conservative by design: high-value, mostly-reversible lifecycle + config
+/// operations. Adding an entry is a product + security decision — what may the
+/// AI propose for a human to run.
+///
+/// Extracted into its own function (rather than an inline literal at the call
+/// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
+/// which is the one rule holding up the read-only-POST mechanism.
+fn ai_write_allowlist() -> Vec<String> {
+    [
+        // ── Deployment lifecycle (reversible / safe) ──
+        // Redeploy the project from its configured branch —
+        // what a "redeploy main" request maps to
+        // (promote/rollback are NOT redeploys).
+        "trigger_project_pipeline",
+        "rollback_to_deployment",
+        "promote_deployment",
+        "pause_deployment",
+        "resume_deployment",
+        "cancel_deployment",
+        // ── Manual image deploy (no git build) ──
+        // Deploy a prebuilt Docker image by `image_ref` (a
+        // pullable registry ref) or a registered
+        // `external_image_id`, to a specific environment_id.
+        // Static-bundle deploys are intentionally NOT here: the
+        // AI can't perform the multipart file upload, so the
+        // whole static flow (upload + deploy) lives in the
+        // frontend.
+        "deploy_from_image",
+        // ── Container runtime control (reversible) ──
+        "restart_container",
+        "stop_container",
+        "start_container",
+        // ── Environment wake/sleep (reversible) ──
+        "wake_environment",
+        "sleep_environment",
+        // ── Environment settings (resource limits, replicas,
+        //    branch) — what "raise memory to 512 MB" /
+        //    "give it more CPU" / "scale to 2 replicas" map to.
+        //    Values are microcores (1_000_000 = 1 core) and MB.
+        //    Reversible: it's a config change, re-applicable.
+        "update_environment_settings",
+        // ── Environment variables (set / change) ──
+        "create_environment_variable",
+        "update_environment_variable",
+        "delete_environment_variable",
+        // ── Domains (attach / detach at the environment level only;
+        //    account-global domain create/delete excluded) ──
+        "add_environment_domain",
+        "delete_environment_domain",
+        // ── Managed external services (databases, caches, etc.) —
+        //    provisioning a new container and linking an existing
+        //    one to a project. Both reversible (a service can be
+        //    unlinked / left running unused; nothing is deleted).
+        "create_service",
+        "link_service_to_project",
+        // ── Metric alert rules (OTel) ──
+        // Create/update an alert rule. Reversible (a rule
+        // can be disabled or deleted) and non-destructive:
+        // creating one changes no running workload, it only
+        // starts evaluating a metric. This is what lets the
+        // assistant turn "your p95 has no alert on it" into
+        // a concrete rule the human confirms.
+        //
+        // `delete_alert` is deliberately excluded: deleting
+        // an alert silently removes monitoring, which is the
+        // kind of change that is only noticed when the
+        // incident it would have caught happens.
+        "create_alert",
+        "update_alert",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Vetted **read-only `POST`** operations for the AI read tool.
+///
+/// HTTP method is this codebase's structural proxy for "does this mutate?", and
+/// `ai_read_allowlist` above is GET-only for exactly that reason. This is the
+/// narrow, separately-reviewed exception: operations that are genuinely
+/// side-effect-free but are `POST` because their input is a structured document
+/// rather than a handful of query params.
+///
+/// **The rule for adding an entry: the operation must write nothing.** Not a
+/// row, not a file, not a queued job. If it mutates anything at all it belongs
+/// in the propose-then-confirm write allowlist instead, never here. Keeping this
+/// list separate from the GET allowlist is what makes each addition a conscious
+/// decision rather than a line lost in a 200-entry list.
+///
+/// Deliberately NOT here: anything that creates, updates, deletes, triggers, or
+/// enqueues — including the metric-alert CRUD operations that live next to
+/// `preview_alert` in the same handler module.
+fn ai_read_safe_posts() -> Vec<String> {
+    [
+        // Backtest a metric-alert detector over historical data: replays the
+        // metric against the band the evaluator would use and returns which
+        // points would have fired. Explicitly documented read-only, guarded by
+        // OtelRead + project_access_guard!, and persists nothing. It is a POST
+        // only because the request body is a whole detector config.
+        //
+        // This is what lets the assistant check "would this rule actually have
+        // fired?" *before* proposing it, so a suggested alert arrives with
+        // evidence attached instead of a guessed threshold.
+        "preview_alert",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1830,6 +1953,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering AuditPlugin");
     let audit_plugin = Box::new(AuditPlugin::new());
     plugin_manager.register_plugin(audit_plugin);
+
+    // 5.5. TeamsPlugin - teams + project-scoped RBAC (depends on database
+    // and AuditLogger, hence after AuditPlugin).
+    //
+    // This registers the `ProjectAccessChecker` that every project-scoped
+    // plugin resolves in its own `configure_routes`. Registration order
+    // between plugins doesn't matter for that — all `register_services`
+    // calls complete before any `configure_routes` runs — but it must come
+    // after AuditPlugin, whose `AuditLogger` it requires.
+    debug!("Registering TeamsPlugin");
+    let teams_plugin = Box::new(TeamsPlugin::new());
+    plugin_manager.register_plugin(teams_plugin);
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
@@ -2638,11 +2773,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // `ai_read_allowlist()` below for the full curated list and
                     // the security rationale behind what is/isn't included.
                     let allowlist: Vec<String> = ai_read_allowlist();
-                    let caller = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
-                        split.admin.clone(),
-                        &openapi,
-                        allowlist.clone(),
-                    );
+                    // Plus the narrow, separately-vetted set of read-only POSTs
+                    // — see `ai_read_safe_posts()` for the rule governing it.
+                    let safe_posts: Vec<String> = ai_read_safe_posts();
+                    let caller =
+                        temps_ai_api_tools::InternalApiCaller::new_allowlisted_with_safe_posts(
+                            split.admin.clone(),
+                            &openapi,
+                            allowlist.clone(),
+                            safe_posts.clone(),
+                        );
                     // Diagnostic: report which allowlist entries actually
                     // resolved to a real operation in the OpenAPI doc, and
                     // loudly flag any that did not (a typo or a wrong
@@ -2652,11 +2792,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     let resolved = caller.indexed_operation_ids();
                     let unresolved: Vec<&String> = allowlist
                         .iter()
+                        .chain(safe_posts.iter())
                         .filter(|id| !resolved.contains(id))
                         .collect();
                     info!(
                         resolved_count = resolved.len(),
-                        allowlist_count = allowlist.len(),
+                        allowlist_count = allowlist.len() + safe_posts.len(),
                         "AI read tool: indexed read operations"
                     );
                     if !unresolved.is_empty() {
@@ -2683,57 +2824,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     if let Some(write_handle) =
                         service_context.get_service::<temps_ai_api_tools::WriteApiToolsHandle>()
                     {
-                        let write_allowlist: Vec<String> = [
-                            // ── Deployment lifecycle (reversible / safe) ──
-                            // Redeploy the project from its configured branch —
-                            // what a "redeploy main" request maps to
-                            // (promote/rollback are NOT redeploys).
-                            "trigger_project_pipeline",
-                            "rollback_to_deployment",
-                            "promote_deployment",
-                            "pause_deployment",
-                            "resume_deployment",
-                            "cancel_deployment",
-                            // ── Manual image deploy (no git build) ──
-                            // Deploy a prebuilt Docker image by `image_ref` (a
-                            // pullable registry ref) or a registered
-                            // `external_image_id`, to a specific environment_id.
-                            // Static-bundle deploys are intentionally NOT here: the
-                            // AI can't perform the multipart file upload, so the
-                            // whole static flow (upload + deploy) lives in the
-                            // frontend.
-                            "deploy_from_image",
-                            // ── Container runtime control (reversible) ──
-                            "restart_container",
-                            "stop_container",
-                            "start_container",
-                            // ── Environment wake/sleep (reversible) ──
-                            "wake_environment",
-                            "sleep_environment",
-                            // ── Environment settings (resource limits, replicas,
-                            //    branch) — what "raise memory to 512 MB" /
-                            //    "give it more CPU" / "scale to 2 replicas" map to.
-                            //    Values are microcores (1_000_000 = 1 core) and MB.
-                            //    Reversible: it's a config change, re-applicable.
-                            "update_environment_settings",
-                            // ── Environment variables (set / change) ──
-                            "create_environment_variable",
-                            "update_environment_variable",
-                            "delete_environment_variable",
-                            // ── Domains (attach / detach at the environment level only;
-                            //    account-global domain create/delete excluded) ──
-                            "add_environment_domain",
-                            "delete_environment_domain",
-                            // ── Managed external services (databases, caches, etc.) —
-                            //    provisioning a new container and linking an existing
-                            //    one to a project. Both reversible (a service can be
-                            //    unlinked / left running unused; nothing is deleted).
-                            "create_service",
-                            "link_service_to_project",
-                        ]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                        let write_allowlist: Vec<String> = ai_write_allowlist();
                         let write_caller =
                             temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
                                 split.admin.clone(),
@@ -3249,6 +3340,206 @@ mod ai_tool_allowlist_tests {
     use temps_ai_api_tools::ReadOnlyApiIndex;
     use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
     use utoipa::OpenApi;
+
+    /// A throwaway admin auth context for the prepare-path tests (no request is
+    /// executed, so it only has to satisfy the advisory permission filter).
+    fn admin_auth() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "tester".to_string(),
+            email: "tester@internal".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+    }
+
+    /// End-to-end against the REAL `OtelApiDoc`: a `create_alert` proposal with
+    /// a malformed `detection_config` must be rejected while the model can
+    /// still fix it, not after a human has approved it.
+    ///
+    /// This is the exact payload a live model produced three runs running
+    /// (`{"type": "threshold"}` instead of `{"kind": "static", …}`). Before the
+    /// shape check it validated cleanly, was staged as a pending action, and
+    /// failed with a 422 only once the user clicked Confirm — the one person in
+    /// the loop who had no way to know it was wrong.
+    #[tokio::test]
+    async fn malformed_detection_config_is_rejected_before_a_human_sees_it() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller, WritePrepareOutcome};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        // No request is executed on the prepare path, so an empty router is fine.
+        let caller = InternalApiCaller::new_write_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            vec!["create_alert".to_string()],
+        );
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let base = "alerts create_alert --name p95 --metric_name http.server.duration \
+                    --aggregation avg --window_secs 300 --for_duration_secs 300 \
+                    --severity critical --enabled true";
+
+        // 1. The model's actual mistake: no `kind` discriminator.
+        let outcome = caller.prepare_write_cli(
+            &format!("{base} --detection_config '{{\"type\": \"threshold\", \"threshold\": 500}}'"),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(msg.contains("kind"), "must name the discriminator: {msg}");
+        assert!(
+            msg.contains("static"),
+            "must show the accepted variants — the model does not run --help: {msg}"
+        );
+
+        // 2. A quoted number and a natural-but-wrong comparator: both present,
+        //    both fatal, both used to reach the human before failing.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \">\", \"threshold\": \"0.5\"}}'"
+            ),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(
+            msg.contains("gt") && msg.contains("lte"),
+            "the real Comparator enum must be listed: {msg}"
+        );
+
+        // 3. The correct payload still validates and is staged.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \"gt\", \"threshold\": 500}}'"
+            ),
+            &scope,
+        );
+        assert!(
+            matches!(outcome, WritePrepareOutcome::Prepared(_)),
+            "a well-formed static detector must still be proposable"
+        );
+    }
+
+    /// `preview_alert` must be reachable from the read CLI, and its help must
+    /// describe a backtest the model can actually run.
+    ///
+    /// Allowlisted is not the same as usable. It was discoverable all along —
+    /// the reason it was never called is that it rejected every detector kind
+    /// except `anomaly`, while every rule the model proposes is a static
+    /// threshold. It also advertised its optional RFC 3339 timestamps as
+    /// `<array>`, because a nullable type union was being read as an array.
+    #[tokio::test]
+    async fn preview_alert_is_usable_from_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let caller = InternalApiCaller::new_allowlisted_with_safe_posts(
+            axum::Router::new(),
+            &openapi,
+            ai_read_allowlist(),
+            ai_read_safe_posts(),
+        );
+        let auth = admin_auth();
+        let scope = ApiCallScope {
+            auth: auth.clone(),
+            project_ids: vec![1],
+        };
+
+        // Discoverable by browsing, which is how the model finds anything.
+        let section = caller.run_cli("alerts --help", &scope).await;
+        assert!(
+            section.contains("preview_alert"),
+            "must be listed in its section: {section}"
+        );
+
+        let help = caller.run_cli("alerts preview_alert --help", &scope).await;
+
+        // The static variant has to be offered, or the backtest is impossible
+        // for the rules this flow actually proposes.
+        assert!(
+            help.contains("\"kind\": \"static\""),
+            "static detectors must be backtestable: {help}"
+        );
+        assert!(
+            help.contains("comparator") && help.contains("gt|gte|lt|lte"),
+            "the static variant's fields must be spelled out: {help}"
+        );
+
+        // Optional timestamps are strings, not lists.
+        assert!(
+            help.contains("--start_time <string>"),
+            "an Option<String> must not advertise itself as an array: {help}"
+        );
+        assert!(
+            !help.contains("--end_time <array>"),
+            "nullable != array: {help}"
+        );
+    }
+
+    /// The read-only-POST list and the write allowlist must stay disjoint.
+    ///
+    /// This is the one rule holding up the safe-POST mechanism, and until now it
+    /// existed only as prose in a doc comment. `create_alert` and
+    /// `preview_alert` are neighbours in the same handler module under the same
+    /// OpenAPI tag, so a future `preview_and_save_alert` added by pattern-match
+    /// would execute unconfirmed writes with the chat user's auth and no confirm
+    /// card. Turn the rule into a build failure.
+    #[test]
+    fn safe_post_and_write_allowlists_are_disjoint() {
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+
+        let both: Vec<&String> = safe.intersection(&writes).collect();
+        assert!(
+            both.is_empty(),
+            "an operation cannot be both a side-effect-free read and a vetted write: {both:?}"
+        );
+    }
+
+    /// Every safe-POST entry must resolve to a real operation, or it silently
+    /// does nothing — the same failure mode the read-allowlist test guards.
+    #[test]
+    fn safe_posts_resolve_against_the_real_openapi() {
+        use temps_ai_api_tools::ReadOnlyApiIndex;
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let safe = ai_read_safe_posts();
+        let safe_refs: Vec<&str> = safe.iter().map(String::as_str).collect();
+        let index =
+            ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&openapi, &[], &safe_refs);
+
+        for op in &safe {
+            assert!(
+                index.get(op).is_some(),
+                "`{op}` is allowlisted as a read-only POST but does not resolve — \
+                 check for a typo or a renamed handler"
+            );
+        }
+    }
 
     /// The AI read allowlist must never contain duplicate entries — a repeat
     /// is dead weight in the model's tool catalogue and a signal something

@@ -23,6 +23,7 @@ import { registerServicesCommands } from './commands/services/index.js'
 import { registerSettingsCommands } from './commands/settings/index.js'
 import { registerUsersCommands } from './commands/users/index.js'
 import { registerApiKeysCommands } from './commands/apikeys/index.js'
+import { registerTeamsCommands } from './commands/teams/index.js'
 import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
@@ -64,6 +65,7 @@ import { registerInitCommand } from './commands/init/index.js'
 import { registerLinkCommand } from './commands/link/index.js'
 import { registerUpCommand } from './commands/up/index.js'
 import { registerStatusCommand } from './commands/status/index.js'
+import { registerAiCommands } from './commands/ai/index.js'
 import { registerInstancesCommands } from './commands/instances/index.js'
 import { registerEnvSyncCommands } from './commands/env-sync/index.js'
 import { registerRollbackCommand } from './commands/rollback/index.js'
@@ -162,6 +164,7 @@ export function createProgram(): Command {
   registerServicesCommands(program)
   registerSettingsCommands(program)
   registerUsersCommands(program)
+  registerTeamsCommands(program)
   registerApiKeysCommands(program)
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
@@ -203,6 +206,7 @@ registerFlagsCommands(program)
   registerLinkCommand(program)
   registerUpCommand(program)
   registerStatusCommand(program)
+  registerAiCommands(program)
   registerInstancesCommands(program)
   registerEnvSyncCommands(program)
   registerRollbackCommand(program)

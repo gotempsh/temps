@@ -57,6 +57,7 @@ members = [
     "crates/temps-import-portainer",
     "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
+    "crates/temps-teams",
     "crates/temps-webhooks",
     "crates/temps-email",
     "crates/temps-email-tracking",
@@ -404,6 +405,25 @@ debug = false
 #    - Path: testcontainers → russh → libcrux-ml-kem → libcrux-intrinsics 0.0.3
 #    - Fix: Requires russh to upgrade libcrux dependencies
 #    - Status: Dev-dependency only, zero production impact
+#
+# 5. RUSTSEC-2026-0235: rkyv 0.7.46 (out-of-bounds read, lockfile-only)
+#    - Path: sea-orm 1.1.20 → rust_decimal 1.42.0 → rkyv 0.7.46 (OPTIONAL)
+#    - Fix: patched in rkyv 0.8.17; upstream no longer supports the 0.7 series,
+#      and rust_decimal 1.42.1 (latest) still declares `rkyv ^0.7.46`. A
+#      [patch.crates-io] to 0.8 is semver-incompatible and rejected. Removing
+#      the entry from Cargo.lock by hand does not stick -- cargo re-adds it on
+#      the next resolve. Total upstream block until rust_decimal bumps it.
+#    - Reachability: NOT COMPILED AT ALL. rkyv is an optional feature of
+#      rust_decimal that nothing in this workspace enables. It appears in
+#      Cargo.lock because cargo resolves the lock over the maximal feature set,
+#      but `cargo tree --target all -e normal` has zero occurrences of rkyv
+#      (verified 2026-08-04, contrast rust_decimal itself with 9). The
+#      vulnerability requires validating an untrusted archive containing
+#      Rc/Arc; temps neither compiles nor calls rkyv.
+#    - Tooling note: this is a false positive of the gate, not of the advisory.
+#      cargo-audit reads Cargo.lock rather than the built artifact. Moving the
+#      job to cargo-auditable + `cargo audit bin` would remove the need for
+#      this exception entirely, and is the preferred long-term fix.
 #
 # 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
 #

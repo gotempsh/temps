@@ -981,6 +981,10 @@ mod tests {
             "temps-providers",
             "temps-revenue",
             "temps-status-page",
+            // Who a project is shared with is part of that project's data:
+            // the access-grant endpoints guard themselves with the very
+            // checker they register.
+            "temps-teams",
             "temps-vulnerability-scanner",
             "temps-webhooks",
         ];

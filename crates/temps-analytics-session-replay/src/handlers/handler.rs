@@ -463,6 +463,14 @@ pub async fn get_visitor_sessions(
     // No project_id is available on this route (only visitor_id) — deny
     // project-scoped deployment tokens outright rather than skip scoping.
     deny_deployment_token!(auth);
+    // Resolve the project this visitor belongs to so team scoping applies:
+    // without it, any holder of instance-wide AnalyticsRead could read
+    // another team's visitors by walking visitor ids.
+    let project_id = state
+        .session_replay_service
+        .project_id_for_visitor(visitor_id)
+        .await?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!("Getting session replays for visitor: {}", visitor_id);
 
@@ -515,6 +523,11 @@ pub async fn get_session_replay(
 ) -> Result<Json<GetSessionReplayResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     deny_deployment_token!(auth);
+    let project_id = state
+        .session_replay_service
+        .project_id_for_session_pk(session_id)
+        .await?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting session replay: {} for visitor: {}",
@@ -558,6 +571,11 @@ pub async fn get_session_replay_events(
 ) -> Result<Json<SessionReplayWithEventsDto>, Problem> {
     permission_guard!(auth, AnalyticsRead);
     deny_deployment_token!(auth);
+    let project_id = state
+        .session_replay_service
+        .project_id_for_session_pk(session_id)
+        .await?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Getting session replay events: {} for visitor: {}",
@@ -601,6 +619,11 @@ pub async fn update_session_duration(
 ) -> Result<Json<UpdateSessionDurationResponse>, Problem> {
     permission_guard!(auth, AnalyticsWrite);
     deny_deployment_token!(auth);
+    let project_id = state
+        .session_replay_service
+        .project_id_for_session_replay_id(&session_id)
+        .await?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Updating duration for session: {} for visitor: {}",
@@ -644,6 +667,11 @@ pub async fn delete_session_replay(
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, AnalyticsWrite);
     deny_deployment_token!(auth);
+    let project_id = state
+        .session_replay_service
+        .project_id_for_session_replay_id(&session_id)
+        .await?;
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Deleting session replay: {} for visitor: {}",
@@ -702,6 +730,9 @@ pub async fn add_events(
         .get_project_id_for_session(&session_id)
         .await
         .map_err(Problem::from)?;
+    // Sixth handler on this route group keyed by session id rather than
+    // project id — same scoping gap as the five reads, and this one writes.
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     match state
         .session_replay_service

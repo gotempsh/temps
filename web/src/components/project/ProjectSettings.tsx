@@ -6,6 +6,7 @@ import { DomainsSettings } from './settings/DomainsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
+import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
 import { SecretsSettings } from './settings/SecretsSettings'
@@ -47,6 +48,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           element={
             <ProjectSecuritySettings project={project} refetch={refetch} />
           }
+        />
+        <Route
+          path="access"
+          element={<ProjectAccessSettings project={project} />}
         />
         <Route path="cron-jobs">
           <Route index element={<CronJobsSettings project={project} />} />

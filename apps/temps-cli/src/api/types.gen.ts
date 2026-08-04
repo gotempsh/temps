@@ -668,6 +668,33 @@ export type AiAgentTimelineRow = {
 };
 
 /**
+ * Bounds on one AI chat turn.
+ *
+ * A turn is bounded by TIME rather than by a number of steps. A step count
+ * says nothing about cost or about how long someone has been watching a
+ * spinner, and it cuts short exactly the long, productive turns the chat
+ * exists for. The user can already see each tool call and press Stop; the
+ * deadline is what guarantees an *unattended* turn still ends.
+ *
+ * The right value is a property of the model, which is why it is configurable
+ * rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+ * against a slow local model and seconds against a hosted one.
+ */
+export type AiChatLimitsSettings = {
+    /**
+     * How long one turn may run before it is stopped and the partial answer
+     * returned, in seconds. The user is told the turn was cut short.
+     *
+     * Checked between steps, not mid-call: a model round already in flight
+     * finishes, so a turn can overrun by up to one round. Against a slow
+     * self-hosted model that is a minute or two. Aborting mid-stream would cut
+     * the answer off in the middle of a sentence and throw away work already
+     * paid for, which is worse than a late stop.
+     */
+    turn_timeout_secs?: number;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -910,7 +937,8 @@ export type AnomalyPreviewRequest = {
      */
     aggregation: string;
     /**
-     * Must be an `anomaly` detector — the band to backtest.
+     * The detector to backtest. `static` and `anomaly` are supported — the
+     * kinds the evaluator actually runs.
      */
     detection_config: DetectionConfig;
     /**
@@ -965,6 +993,13 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     agent_sandbox?: AgentSandboxSettings;
+    /**
+     * Limits on a single AI chat turn. Operator-tunable because the right
+     * value depends on the model: a turn against a slow self-hosted model can
+     * legitimately take ten minutes, while a hosted one finishes in seconds
+     * and a shorter ceiling keeps costs predictable.
+     */
+    ai_chat_limits?: AiChatLimitsSettings;
     ai_config?: AiConfigSettings;
     /**
      * Build-time resource limits applied on the control plane to prevent
@@ -1073,6 +1108,10 @@ export type AppSettings = {
  */
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
+    /**
+     * Per-turn limits for the AI chat. No sensitive content.
+     */
+    ai_chat_limits: AiChatLimitsSettings;
     ai_config: AiConfigSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
@@ -1893,6 +1932,32 @@ export type ChatMessage = {
     role: string;
     tool_call_id?: string | null;
     tool_calls?: Array<unknown> | null;
+};
+
+/**
+ * What still has to be true before an AI chat can run a turn in this project.
+ *
+ * The three gates are independent and fail for different reasons with different
+ * fixes, so they are reported separately rather than collapsed into one boolean:
+ * an instance admin configures a provider (instance-wide), while the two toggles
+ * are per-project. Collapsing them would leave the user with "AI unavailable"
+ * and no idea which of three places to go.
+ */
+export type ChatReadinessResponse = {
+    /**
+     * An AI provider is configured on this instance. Fixed in
+     * Settings → AI Providers; instance-wide, not per project.
+     */
+    ai_configured: boolean;
+    /**
+     * The per-project read-only chat toggle is on (the default).
+     */
+    chat_enabled: boolean;
+    /**
+     * The per-project write-actions opt-in is on. Required for any flow where
+     * the assistant *proposes* changes; irrelevant for read-only questions.
+     */
+    write_actions_enabled: boolean;
 };
 
 /**
@@ -3558,6 +3623,11 @@ export type CreatePrResponse = {
     run: AutofixerRunResponse;
 };
 
+export type CreateProjectAccessRequest = {
+    role: TeamRole;
+    team_id: number;
+};
+
 /**
  * Request to create a project from a template
  *
@@ -3842,6 +3912,17 @@ export type CreateSlackProviderRequest = {
     config: SlackConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+export type CreateTeamMemberRequest = {
+    role: TeamRole;
+    user_id: number;
+};
+
+export type CreateTeamRequest = {
+    description?: string | null;
+    name: string;
+    slug: string;
 };
 
 export type CreateUserRequest = {
@@ -11919,6 +12000,16 @@ export type ProblemDetails = {
     type?: string | null;
 };
 
+export type ProjectAccessResponse = {
+    created_at: string;
+    granted_by: number;
+    id: number;
+    project_id: number;
+    role: TeamRole;
+    team_id: number;
+    updated_at: string;
+};
+
 /**
  * Project-level configuration
  */
@@ -16220,6 +16311,63 @@ export type TargetRecommendation = {
     yearly_savings_usd?: number | null;
 };
 
+export type TeamListResponse = {
+    page: number;
+    page_size: number;
+    teams: Array<TeamResponse>;
+    total: number;
+};
+
+export type TeamMemberResponse = {
+    added_by: number;
+    created_at: string;
+    id: number;
+    /**
+     * The source of this member's project-scoped permissions, intersected
+     * with `project_team_access.role`.
+     */
+    role: TeamRole;
+    team_id: number;
+    updated_at: string;
+    /**
+     * The member's email, joined from `users`.
+     */
+    user_email?: string | null;
+    user_id: number;
+    /**
+     * The member's display name, joined from `users`. `None` if the
+     * referenced user no longer exists.
+     */
+    user_name?: string | null;
+};
+
+export type TeamResponse = {
+    created_at: string;
+    created_by: number;
+    description?: string | null;
+    id: number;
+    name: string;
+    slug: string;
+    updated_at: string;
+};
+
+/**
+ * Role a user holds within a team, or that a team holds on a project.
+ *
+ * Named `TeamRole` rather than `Role` to keep it distinct from
+ * `temps_auth::permissions::Role`, which is the instance-wide role
+ * (Admin/User/…) attached to a session. The two are orthogonal: the
+ * instance-wide role decides whether you may touch a resource *kind* at
+ * all, `TeamRole` decides what you may do *within a project* you have
+ * team access to. See `temps_teams::fixed_role_permissions` for the
+ * project-scoped permission set each variant maps to.
+ *
+ * Stored as a `varchar(32)` rather than a Postgres enum so the role set
+ * can evolve in pure migration code without a schema-level enum
+ * alteration blocking a downgrade.
+ */
+export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
+
 /**
  * Response type for a single template
  */
@@ -17357,6 +17505,13 @@ export type UpdateMcpRequest = {
     name?: string | null;
 };
 
+/**
+ * The new fixed role for an existing membership.
+ */
+export type UpdateMemberRoleRequest = {
+    role: TeamRole;
+};
+
 export type UpdateMetricAlertRequest = {
     aggregation?: string | null;
     detection_config?: null | DetectionConfig;
@@ -17682,6 +17837,11 @@ export type UpdateStatusResponse = {
      * on this install's channel.
      */
     update_available: boolean;
+};
+
+export type UpdateTeamRequest = {
+    description?: string | null;
+    name?: string | null;
 };
 
 export type UpdateTokenRequest = {
@@ -35393,6 +35553,90 @@ export type TriggerProjectPipelineResponses = {
 
 export type TriggerProjectPipelineResponse = TriggerProjectPipelineResponses[keyof TriggerProjectPipelineResponses];
 
+export type ListProjectAccessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access';
+};
+
+export type ListProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+};
+
+export type ListProjectAccessResponses = {
+    /**
+     * Access grants
+     */
+    200: Array<ProjectAccessResponse>;
+};
+
+export type ListProjectAccessResponse = ListProjectAccessResponses[keyof ListProjectAccessResponses];
+
+export type GrantProjectAccessData = {
+    body: CreateProjectAccessRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access';
+};
+
+export type GrantProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type GrantProjectAccessResponses = {
+    /**
+     * Access granted (idempotent upsert)
+     */
+    201: ProjectAccessResponse;
+};
+
+export type GrantProjectAccessResponse = GrantProjectAccessResponses[keyof GrantProjectAccessResponses];
+
+export type RevokeProjectAccessData = {
+    body?: never;
+    path: {
+        project_id: number;
+        team_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access/{team_id}';
+};
+
+export type RevokeProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Grant not found
+     */
+    404: unknown;
+};
+
+export type RevokeProjectAccessResponses = {
+    /**
+     * Access revoked
+     */
+    204: void;
+};
+
+export type RevokeProjectAccessResponse = RevokeProjectAccessResponses[keyof RevokeProjectAccessResponses];
+
 export type GetActiveVisitorsData = {
     body?: never;
     path: {
@@ -36435,6 +36679,39 @@ export type RejectPendingActionResponses = {
 };
 
 export type RejectPendingActionResponse = RejectPendingActionResponses[keyof RejectPendingActionResponses];
+
+export type GetChatReadinessData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/readiness';
+};
+
+export type GetChatReadinessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetChatReadinessResponses = {
+    /**
+     * Which AI prerequisites are met
+     */
+    200: ChatReadinessResponse;
+};
+
+export type GetChatReadinessResponse = GetChatReadinessResponses[keyof GetChatReadinessResponses];
 
 export type ListProjectAlarmsData = {
     body?: never;
@@ -46821,6 +47098,324 @@ export type GetUpdateStatusResponses = {
 };
 
 export type GetUpdateStatusResponse = GetUpdateStatusResponses[keyof GetUpdateStatusResponses];
+
+export type ListTeamsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * 1-indexed page
+         */
+        page?: number;
+        /**
+         * default 20, max 100
+         */
+        page_size?: number;
+    };
+    url: '/teams';
+};
+
+export type ListTeamsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListTeamsResponses = {
+    /**
+     * Paginated teams
+     */
+    200: TeamListResponse;
+};
+
+export type ListTeamsResponse = ListTeamsResponses[keyof ListTeamsResponses];
+
+export type CreateTeamData = {
+    body: CreateTeamRequest;
+    path?: never;
+    query?: never;
+    url: '/teams';
+};
+
+export type CreateTeamErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Slug already taken
+     */
+    409: unknown;
+};
+
+export type CreateTeamResponses = {
+    /**
+     * Team created
+     */
+    201: TeamResponse;
+};
+
+export type CreateTeamResponse = CreateTeamResponses[keyof CreateTeamResponses];
+
+export type DeleteTeamData = {
+    body?: never;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type DeleteTeamErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type DeleteTeamResponses = {
+    /**
+     * Team deleted
+     */
+    204: void;
+};
+
+export type DeleteTeamResponse = DeleteTeamResponses[keyof DeleteTeamResponses];
+
+export type GetTeamData = {
+    body?: never;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type GetTeamErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type GetTeamResponses = {
+    /**
+     * Team
+     */
+    200: TeamResponse;
+};
+
+export type GetTeamResponse = GetTeamResponses[keyof GetTeamResponses];
+
+export type UpdateTeamData = {
+    body: UpdateTeamRequest;
+    path: {
+        /**
+         * Team id
+         */
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}';
+};
+
+export type UpdateTeamErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type UpdateTeamResponses = {
+    /**
+     * Updated team
+     */
+    200: TeamResponse;
+};
+
+export type UpdateTeamResponse = UpdateTeamResponses[keyof UpdateTeamResponses];
+
+export type ListTeamMembersData = {
+    body?: never;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members';
+};
+
+export type ListTeamMembersErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type ListTeamMembersResponses = {
+    /**
+     * Members
+     */
+    200: Array<TeamMemberResponse>;
+};
+
+export type ListTeamMembersResponse = ListTeamMembersResponses[keyof ListTeamMembersResponses];
+
+export type AddTeamMemberData = {
+    body: CreateTeamMemberRequest;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members';
+};
+
+export type AddTeamMemberErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+    /**
+     * User already a member
+     */
+    409: unknown;
+};
+
+export type AddTeamMemberResponses = {
+    /**
+     * Member added
+     */
+    201: TeamMemberResponse;
+};
+
+export type AddTeamMemberResponse = AddTeamMemberResponses[keyof AddTeamMemberResponses];
+
+export type RemoveTeamMemberData = {
+    body?: never;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}';
+};
+
+export type RemoveTeamMemberErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Member not found
+     */
+    404: unknown;
+};
+
+export type RemoveTeamMemberResponses = {
+    /**
+     * Member removed
+     */
+    204: void;
+};
+
+export type RemoveTeamMemberResponse = RemoveTeamMemberResponses[keyof RemoveTeamMemberResponses];
+
+export type UpdateTeamMemberRoleData = {
+    body: UpdateMemberRoleRequest;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}';
+};
+
+export type UpdateTeamMemberRoleErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Member not found
+     */
+    404: unknown;
+};
+
+export type UpdateTeamMemberRoleResponses = {
+    /**
+     * Updated membership
+     */
+    200: TeamMemberResponse;
+};
+
+export type UpdateTeamMemberRoleResponse = UpdateTeamMemberRoleResponses[keyof UpdateTeamMemberRoleResponses];
+
+export type ListTeamProjectsData = {
+    body?: never;
+    path: {
+        team_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/projects';
+};
+
+export type ListTeamProjectsErrors = {
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Team not found
+     */
+    404: unknown;
+};
+
+export type ListTeamProjectsResponses = {
+    /**
+     * Projects this team has access to
+     */
+    200: Array<ProjectAccessResponse>;
+};
+
+export type ListTeamProjectsResponse = ListTeamProjectsResponses[keyof ListTeamProjectsResponses];
 
 export type ListProjectTemplatesData = {
     body?: never;

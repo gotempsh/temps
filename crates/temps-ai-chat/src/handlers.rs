@@ -21,8 +21,10 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
+use temps_auth::permissions::Permission;
 use temps_auth::{
-    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+    context::AuthContext, deny_deployment_token, permission_guard, project_access_guard,
+    project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, RequestMetadata};
@@ -228,6 +230,9 @@ impl From<ChatError> for Problem {
             ChatError::NotFound(_) => problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                 .with_title("Conversation Not Found")
                 .with_detail(e.to_string()),
+            ChatError::ProjectNotFound(_) => problemdetails::new(axum::http::StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(e.to_string()),
             ChatError::NoProvider(_) | ChatError::ContextUnavailable => {
                 problemdetails::new(axum::http::StatusCode::NOT_FOUND)
                     .with_title("Context Not Available")
@@ -236,11 +241,15 @@ impl From<ChatError> for Problem {
             ChatError::AiUnavailable => problemdetails::new(axum::http::StatusCode::CONFLICT)
                 .with_title("AI Not Configured")
                 .with_detail(e.to_string()),
-            ChatError::Db(_) | ChatError::Ai(_) => {
+            ChatError::ProjectLookup { .. } | ChatError::Db(_) => {
+                error!("AI chat database operation failed: {e}");
                 problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(e.to_string())
+                    .with_detail("A database operation failed while handling the AI chat request.")
             }
+            ChatError::Ai(_) => problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(e.to_string()),
         }
     }
 }
@@ -437,6 +446,22 @@ fn too_long(field: &str, max: usize) -> Problem {
         ))
 }
 
+/// Contexts can expose domain data beyond the generic project-chat surface.
+/// Enforce the same domain permission as the canonical API before creating,
+/// reading, or running one of those conversations.
+fn ensure_context_read_permission(auth: &AuthContext, context_type: &str) -> Result<(), Problem> {
+    if !can_read_context(auth, context_type) {
+        return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail("The otel:read permission is required for alert suggestion chats."));
+    }
+    Ok(())
+}
+
+fn can_read_context(auth: &AuthContext, context_type: &str) -> bool {
+    context_type != "alert_suggest" || auth.has_permission(&Permission::OtelRead)
+}
+
 // --- handlers ----------------------------------------------------------------
 
 /// Find the existing chat for a context (returns `null` if none yet). Requires
@@ -466,6 +491,7 @@ pub async fn find_conversation(
     if q.context_id.len() > MAX_CONTEXT_ID_LEN {
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
     }
+    ensure_context_read_permission(&auth, &q.context_type)?;
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
     let found = state
         .service
@@ -496,6 +522,7 @@ pub async fn list_all_conversations(
     Ok(Json(
         items
             .into_iter()
+            .filter(|i| can_read_context(&auth, &i.conversation.context_type))
             .map(|i| GlobalConversationResponse {
                 public_id: i.conversation.public_id,
                 project_id: i.conversation.project_id,
@@ -534,6 +561,7 @@ pub async fn list_conversations(
     Ok(Json(
         conversations
             .into_iter()
+            .filter(|c| can_read_context(&auth, &c.context_type))
             .map(ConversationResponse::from)
             .collect(),
     ))
@@ -565,6 +593,7 @@ pub async fn create_conversation(
     if req.context_id.len() > MAX_CONTEXT_ID_LEN {
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
     }
+    ensure_context_read_permission(&auth, &req.context_type)?;
     ensure_enabled(&state, project_id).await?;
     let conv = state
         .service
@@ -611,6 +640,7 @@ pub async fn get_conversation(
         .service
         .get_by_public_id(project_id, &public_id)
         .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     let messages = state
         .service
         .messages(conv.id)
@@ -658,6 +688,7 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, &public_id)
         .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     // Page context is advisory framing, not user content: cap it and silently
     // drop an oversized value rather than failing the message.
     let page_context = req
@@ -744,6 +775,7 @@ pub async fn archive_conversation(
         .service
         .get_by_public_id(project_id, &public_id)
         .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     state.service.archive(&conv).await?;
     state
         .audit(&ConversationArchivedAudit {
@@ -794,6 +826,7 @@ pub async fn rename_conversation(
         .service
         .get_by_public_id(project_id, &public_id)
         .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     let updated = state.service.rename(&conv, title).await?;
 
     state
@@ -842,6 +875,7 @@ pub async fn list_pending_actions(
         .service
         .get_by_public_id(project_id, &conv_public_id)
         .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     let rows = state
         .pending_actions
         .list_for_conversation(project_id, conv.id)
@@ -880,6 +914,11 @@ pub async fn get_pending_action(
         .get(project_id, &action_public_id)
         .await
         .map_err(Problem::from)?;
+    let conv = state
+        .service
+        .get_by_id(project_id, action.conversation_id)
+        .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     Ok(Json(PendingActionResponse::from(action)))
 }
 
@@ -908,6 +947,16 @@ pub async fn confirm_pending_action(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
+    let action = state
+        .pending_actions
+        .get(project_id, &action_public_id)
+        .await
+        .map_err(Problem::from)?;
+    let conv = state
+        .service
+        .get_by_id(project_id, action.conversation_id)
+        .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     let confirmed_by = Some(auth.user_id());
     let updated = state
         .pending_actions
@@ -959,6 +1008,16 @@ pub async fn reject_pending_action(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     ensure_chat_enabled(state.db.as_ref(), project_id).await?;
+    let action = state
+        .pending_actions
+        .get(project_id, &action_public_id)
+        .await
+        .map_err(Problem::from)?;
+    let conv = state
+        .service
+        .get_by_id(project_id, action.conversation_id)
+        .await?;
+    ensure_context_read_permission(&auth, &conv.context_type)?;
     let rejected_by = Some(auth.user_id());
     let updated = state
         .pending_actions
@@ -983,8 +1042,67 @@ pub async fn reject_pending_action(
     Ok(Json(PendingActionResponse::from(updated)))
 }
 
+/// What still has to be true before an AI chat can run a turn in this project.
+///
+/// The three gates are independent and fail for different reasons with different
+/// fixes, so they are reported separately rather than collapsed into one boolean:
+/// an instance admin configures a provider (instance-wide), while the two toggles
+/// are per-project. Collapsing them would leave the user with "AI unavailable"
+/// and no idea which of three places to go.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatReadinessResponse {
+    /// An AI provider is configured on this instance. Fixed in
+    /// Settings → AI Providers; instance-wide, not per project.
+    pub ai_configured: bool,
+    /// The per-project read-only chat toggle is on (the default).
+    pub chat_enabled: bool,
+    /// The per-project write-actions opt-in is on. Required for any flow where
+    /// the assistant *proposes* changes; irrelevant for read-only questions.
+    pub write_actions_enabled: bool,
+}
+
+/// Report which AI prerequisites this project satisfies.
+///
+/// Read-only and cheap, so the UI can decide up front whether to show a working
+/// entry point, an onboarding path, or nothing — instead of letting the user
+/// click something that fails with a 409 they can't act on.
+#[utoipa::path(
+    get, tag = "AI Chat",
+    path = "/projects/{project_id}/ai/readiness",
+    params(("project_id" = i32, Path,)),
+    responses(
+        (status = 200, description = "Which AI prerequisites are met", body = ChatReadinessResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Project not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_chat_readiness(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<Json<ChatReadinessResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let readiness = state.service.chat_readiness(project_id).await?;
+
+    Ok(Json(ChatReadinessResponse {
+        ai_configured: readiness.ai_configured,
+        chat_enabled: readiness.chat_enabled,
+        write_actions_enabled: readiness.write_actions_enabled,
+    }))
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        // Readiness for the chat, so the UI can onboard instead of guessing.
+        .route(
+            "/projects/{project_id}/ai/readiness",
+            get(get_chat_readiness),
+        )
         // Unified cross-project switcher.
         .route("/ai/conversations", get(list_all_conversations))
         .route(
@@ -1031,6 +1149,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        get_chat_readiness,
         find_conversation,
         list_conversations,
         list_all_conversations,
@@ -1057,6 +1176,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         ToolCallEvent,
         ToolResultEvent,
         PendingActionResponse,
+        ChatReadinessResponse,
     ))
 )]
 pub struct AiChatApiDoc;
@@ -1085,6 +1205,13 @@ mod tests {
     }
 
     #[test]
+    fn test_project_not_found_maps_to_404() {
+        let p: Problem = ChatError::ProjectNotFound(7).into();
+        assert_eq!(p.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(title_of(&p).as_deref(), Some("Project Not Found"));
+    }
+
+    #[test]
     fn test_no_provider_maps_to_404_context_unavailable() {
         let p: Problem = ChatError::NoProvider("deployment".to_string()).into();
         assert_eq!(p.status_code, StatusCode::NOT_FOUND);
@@ -1110,6 +1237,22 @@ mod tests {
         let p: Problem = ChatError::Db(sea_orm::DbErr::Custom("boom".to_string())).into();
         assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(title_of(&p).as_deref(), Some("Internal Server Error"));
+        assert!(!serde_json::to_string(&p.body)
+            .expect("problem body serializes")
+            .contains("boom"));
+    }
+
+    #[test]
+    fn test_project_lookup_error_maps_to_stable_500() {
+        let p: Problem = ChatError::ProjectLookup {
+            project_id: 42,
+            source: sea_orm::DbErr::Custom("database.internal:5432".to_string()),
+        }
+        .into();
+        assert_eq!(p.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!serde_json::to_string(&p.body)
+            .expect("problem body serializes")
+            .contains("database.internal"));
     }
 
     #[test]
@@ -1124,6 +1267,58 @@ mod tests {
     // it directly with a MockDatabase — no router/Docker needed.
 
     use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn test_user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn custom_auth(permissions: Vec<Permission>) -> AuthContext {
+        AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(permissions),
+            "test-key".to_string(),
+            1,
+        )
+    }
+
+    #[test]
+    fn alert_suggestion_context_requires_otel_read() {
+        let without_otel = custom_auth(vec![Permission::ProjectsRead, Permission::ProjectsWrite]);
+        let err = ensure_context_read_permission(&without_otel, "alert_suggest")
+            .expect_err("OTel data must not leak through chat seeds or history");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+
+        let with_otel = custom_auth(vec![Permission::OtelRead]);
+        ensure_context_read_permission(&with_otel, "alert_suggest")
+            .expect("otel:read authorizes alert suggestion context");
+    }
+
+    #[test]
+    fn unrelated_chat_context_does_not_require_otel_read() {
+        let auth = custom_auth(vec![Permission::ProjectsRead]);
+        ensure_context_read_permission(&auth, "project")
+            .expect("project chat keeps its existing project permission boundary");
+    }
 
     fn project_with_toggle(id: i32, toggle: Option<bool>) -> temps_entities::projects::Model {
         let now = chrono::Utc::now();
