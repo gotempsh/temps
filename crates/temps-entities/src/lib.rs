@@ -54,6 +54,8 @@ pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
 pub mod external_services;
+pub mod feature_flag_environments;
+pub mod feature_flags;
 pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;

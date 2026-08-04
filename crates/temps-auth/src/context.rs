@@ -215,6 +215,12 @@ impl AuthContext {
                 // (POST /ai/v1/chat/completions, guarded by AiGatewayExecute).
                 // Same documented machine-access pattern as EmailsSend.
                 Permission::AiGatewayExecute => DeploymentTokenPermission::AiGatewayExecute,
+                // Deployed apps read their own environment's feature-flag
+                // snapshot with TEMPS_API_TOKEN. Read-only: a machine
+                // credential baked into a container must never be able to
+                // flip a flag in production, so FlagsWrite/FlagsDelete are
+                // deliberately absent from this bridge.
+                Permission::FlagsRead => DeploymentTokenPermission::FlagsRead,
                 // No implicit bridge from deployment-token permissions to
                 // general control-plane permissions.
                 _ => return false,

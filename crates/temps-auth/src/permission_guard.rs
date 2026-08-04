@@ -971,6 +971,7 @@ mod tests {
             "temps-deployments",
             "temps-environments",
             "temps-error-tracking",
+            "temps-flags",
             "temps-kv",
             "temps-log-aggregator",
             "temps-monitoring",

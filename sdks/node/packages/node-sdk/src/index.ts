@@ -6,6 +6,11 @@ export * from './client/types.gen';
 export * from './client/sdk.gen';
 export * as ErrorTracking from './errors';
 
+// Feature flags. Lives in this package rather than a separate one: it shares
+// the deployment-token bootstrap and would otherwise duplicate it.
+export * as Flags from './flags';
+export { FlagsClient, flags } from './flags';
+
 export interface TempsClientConfig {
   baseUrl: string;
   apiKey?: string;
