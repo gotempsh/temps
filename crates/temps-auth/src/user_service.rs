@@ -4,7 +4,8 @@ use chrono::Utc;
 use qrcode::QrCode;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
@@ -731,21 +732,43 @@ impl UserService {
         user_id: i32,
         code: &str,
     ) -> Result<bool, UserServiceError> {
+        let transaction = self.db.begin().await?;
+        let valid = self
+            .verify_mfa_code_in_transaction(&transaction, user_id, code)
+            .await?;
+        transaction.commit().await?;
+        Ok(valid)
+    }
+
+    /// Verify MFA while keeping the user row locked in the caller's
+    /// transaction. Step-up authorization uses this to make recovery-code
+    /// consumption and session elevation one atomic state transition.
+    pub(crate) async fn verify_mfa_code_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        user_id: i32,
+        code: &str,
+    ) -> Result<bool, UserServiceError> {
+        // Recovery codes are single-use credentials, so checking and
+        // consuming one must remain under this exclusive row lock.
         let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .one(transaction)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
         if !user.mfa_enabled {
-            return Ok(true); // MFA not enabled, always pass
+            return Err(UserServiceError::MfaNotSetup(user_id));
         }
 
         let secret = user
             .mfa_secret
+            .clone()
             .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
         // Check if it's a recovery code
-        if let Some(recovery_codes) = user.mfa_recovery_codes {
+        if let Some(recovery_codes) = user.mfa_recovery_codes.clone() {
             let hashed_codes: Vec<String> =
                 serde_json::from_str(&recovery_codes).map_err(UserServiceError::Serialization)?;
 
@@ -775,16 +798,9 @@ impl UserService {
                         .filter(|c| c != &hashed_code)
                         .collect();
 
-                    let mut user_update: temps_entities::users::ActiveModel =
-                        temps_entities::users::Entity::find_by_id(user_id)
-                            .one(self.db.as_ref())
-                            .await?
-                            .ok_or_else(|| {
-                                UserServiceError::NotFound(format!("User {} not found", user_id))
-                            })?
-                            .into();
+                    let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
                     user_update.mfa_recovery_codes = Set(Some(serde_json::to_string(&new_codes)?));
-                    user_update.update(self.db.as_ref()).await?;
+                    user_update.update(transaction).await?;
 
                     return Ok(true);
                 }
@@ -812,8 +828,10 @@ impl UserService {
     }
 
     pub async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {
+        let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&transaction)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
@@ -822,7 +840,17 @@ impl UserService {
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(None);
 
-        user_update.update(self.db.as_ref()).await?;
+        user_update.update(&transaction).await?;
+
+        temps_entities::sessions::Entity::update_many()
+            .col_expr(
+                temps_entities::sessions::Column::StepUpExpiresAt,
+                sea_orm::sea_query::Expr::value(Option::<chrono::DateTime<Utc>>::None),
+            )
+            .filter(temps_entities::sessions::Column::UserId.eq(user_id))
+            .exec(&transaction)
+            .await?;
+        transaction.commit().await?;
 
         Ok(())
     }
@@ -841,5 +869,128 @@ impl UserService {
 
         // If verification succeeds, disable MFA
         self.disable_mfa(user_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    fn user(mfa_enabled: bool, recovery_codes: Option<String>) -> temps_entities::users::Model {
+        let now = Utc::now();
+        temps_entities::users::Model {
+            id: 7,
+            name: "MFA User".to_string(),
+            email: "mfa@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: mfa_enabled.then(|| "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            mfa_enabled,
+            mfa_recovery_codes: recovery_codes,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_fails_closed_when_mfa_is_disabled() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![user(false, None)]])
+                .into_connection(),
+        );
+        let service = UserService::new(db);
+
+        let result = service.verify_mfa_code(7, "anything").await;
+        assert!(matches!(result, Err(UserServiceError::MfaNotSetup(7))));
+    }
+
+    #[tokio::test]
+    async fn recovery_code_is_consumed_under_an_exclusive_row_lock() {
+        let recovery_code = "RECOVERY-CODE";
+        let hash = argon2::Argon2::default()
+            .hash_password(recovery_code.as_bytes(), &SaltString::generate(&mut OsRng))
+            .expect("test recovery code hashes")
+            .to_string();
+        let original = user(
+            true,
+            Some(serde_json::to_string(&vec![hash]).expect("recovery codes serialize")),
+        );
+        let consumed = user(true, Some("[]".to_string()));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![original], vec![consumed]])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        assert!(service
+            .verify_mfa_code(7, recovery_code)
+            .await
+            .expect("recovery code verifies"));
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("FOR UPDATE")),
+            "verification must lock the user row"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.starts_with("UPDATE \"users\"")),
+            "verification must consume the recovery code before commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_mfa_clears_every_session_elevation() {
+        let enabled = user(true, None);
+        let disabled = user(false, None);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![enabled], vec![disabled]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 2,
+                }])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        service
+            .disable_mfa(7)
+            .await
+            .expect("MFA disable should clear elevations");
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert!(statements.iter().any(|statement| {
+            statement.sql.starts_with("UPDATE \"sessions\"")
+                && statement.sql.contains("step_up_expires_at")
+        }));
     }
 }

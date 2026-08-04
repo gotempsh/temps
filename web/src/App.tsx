@@ -697,6 +697,14 @@ const queryClient = new QueryClient({
       onError: (error: unknown, _variables, context) => {
         const problemDetails = error as ProblemDetails
 
+        // Sensitive mutations own this response: they open a step-up dialog
+        // and retry after verification. A global error toast would be both
+        // noisy and misleading because the action has not actually failed.
+        const errorCode =
+          (problemDetails as ProblemDetails & { error_code?: string })
+            .error_code ?? problemDetails.extensions?.error_code
+        if (errorCode === 'STEP_UP_REQUIRED') return
+
         // Get custom error title
         const customTitle = getErrorTitle(context, problemDetails.title)
 

@@ -28,6 +28,8 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central policy evaluator for sensitive mutations.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -42,6 +44,7 @@ pub fn create_environment_app_state(
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         environment_service,
@@ -54,6 +57,7 @@ pub fn create_environment_app_state(
         integration_env_provider,
         telemetry,
         project_access_checker,
+        sensitive_action_authorizer,
     })
 }
 
