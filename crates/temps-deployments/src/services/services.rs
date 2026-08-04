@@ -4557,6 +4557,42 @@ mod tests {
         }
     }
 
+    /// Stub `get_container_info` so the runtime ownership check in
+    /// `cleanup_project_containers` sees a container whose labels match the
+    /// project/environment being deleted.
+    ///
+    /// Cleanup refuses to remove a container that is not provably ours, so
+    /// every cleanup test has to present the labels a real managed container
+    /// would carry — otherwise the test fails on the guard rather than on the
+    /// behaviour it is actually asserting.
+    fn expect_owned_container_info(
+        deployer: &mut MockContainerDeployer,
+        project_id: i32,
+        environment_id: i32,
+    ) {
+        deployer.expect_get_container_info().returning(move |id| {
+            Ok(temps_deployer::ContainerInfo {
+                container_id: id.to_string(),
+                container_name: id.to_string(),
+                image_name: "nginx:latest".to_string(),
+                created_at: Utc::now(),
+                ports: vec![],
+                environment_vars: std::collections::HashMap::new(),
+                status: temps_deployer::ContainerStatus::Running,
+                restart_count: Some(0),
+                labels: std::collections::HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                    (
+                        "sh.temps.environment".to_string(),
+                        environment_id.to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            })
+        });
+    }
+
     fn create_cleanup_service_for_test(
         db: Arc<temps_database::DbConnection>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
@@ -4610,11 +4646,12 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let expected_container_id = container.container_id.clone();
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer
             .expect_remove_container()
             .withf(move |container_id| container_id == expected_container_id)
@@ -4659,10 +4696,11 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer.expect_remove_container().times(1).returning(|_| {
             Err(temps_deployer::DeployerError::NetworkError(
                 "worker unavailable".to_string(),
@@ -4696,6 +4734,55 @@ mod tests {
         Ok(())
     }
 
+    /// The runtime ownership guard is the last line of defence against
+    /// deleting a container that merely *recorded* a matching id: if the
+    /// container Docker actually has under that id belongs to someone else,
+    /// cleanup must refuse to touch it rather than remove another tenant's
+    /// workload.
+    #[tokio::test]
+    async fn cleanup_refuses_to_remove_a_container_owned_by_another_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup ownership integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        // Same container id, but the running container claims a different project.
+        expect_owned_container_info(&mut deployer, project.id + 1, environment.id);
+        // The whole point: removal must never be attempted.
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(temps_core::ContainerCleanupError::Removal { .. })
+            ),
+            "cleanup must fail closed when runtime labels do not match, got {result:?}"
+        );
+
+        let preserved = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("a refused cleanup must preserve the container record");
+        assert!(
+            preserved.deleted_at.is_none(),
+            "a container we refused to touch must not be marked deleted"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn interrupted_cleanup_is_idempotent_when_container_is_already_absent(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4706,7 +4793,7 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let mut interrupted: deployment_containers::ActiveModel = container.clone().into();
         interrupted.status = Set(Some("removing".to_string()));
@@ -4715,6 +4802,7 @@ mod tests {
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer.expect_remove_container().times(1).returning(|_| {
             Err(temps_deployer::DeployerError::ContainerNotFound(
                 "already removed".to_string(),
