@@ -97,12 +97,25 @@ jobs:
       #   signed payload isn't attacker-controlled). Keys are per-customer,
       #   not a shared temps secret. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
+      # - RUSTSEC-2026-0235 (rkyv 0.7.46 via rust_decimal <- sea-orm):
+      #   out-of-bounds read when validating archives containing Rc/Arc.
+      #   rkyv is an OPTIONAL feature of rust_decimal that nothing in this
+      #   workspace enables -- it is in Cargo.lock (which cargo resolves over
+      #   the maximal feature set) but has zero occurrences in
+      #   `cargo tree --target all -e normal`, i.e. it is never compiled, let
+      #   alone fed an archive. No fix is reachable from here: the patch is
+      #   in 0.8.17, upstream dropped the 0.7 series, and rust_decimal 1.42.1
+      #   (latest) still declares `rkyv ^0.7.46`.
+      #   NOTE: this entry exists only because cargo-audit reads Cargo.lock
+      #   rather than what is built. Switching this gate to cargo-auditable
+      #   (`cargo audit bin` against the compiled binary) would drop it
+      #   without an exception -- see the PR that added this line.
       # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071,RUSTSEC-2026-0235
 
   web-audit:
     name: Web Dependency Audit (bun audit)
