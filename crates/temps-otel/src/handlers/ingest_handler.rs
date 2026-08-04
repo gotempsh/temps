@@ -91,10 +91,13 @@ impl From<OtelError> for Problem {
             | OtelError::Io(_)
             | OtelError::Serialization(_)
             | OtelError::Internal { .. } => {
+                // Log the real error server-side only — the detail string can
+                // contain DB/S3 error text (schema names, paths) that must not
+                // reach the caller.
                 error!(error = %error, "OTel ingest internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("An internal error occurred")
             }
         }
     }

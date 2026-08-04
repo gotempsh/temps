@@ -224,6 +224,12 @@ impl OtelAuthService {
             .await
             .map_err(|error| OtelError::from(error.as_ref()))?;
 
+        // Unreachable in practice: `AuthCacheKey::ServiceToken` is a distinct
+        // enum discriminant from `ApiKey`/`DeploymentToken`, and this method
+        // only ever inserts `CachedAuth::Service` under that key, so a
+        // `Project` value can never be read back here. Kept as a defensive
+        // fallback (mapped to a generic 500, no cache internals leaked)
+        // rather than `unreachable!()`, in case that invariant ever changes.
         let CachedAuth::Service(auth) = cached else {
             return Err(OtelError::Internal {
                 message: "Project auth found in service-token cache entry".into(),
@@ -348,6 +354,9 @@ impl OtelAuthService {
             .await
             .map_err(|error| OtelError::from(error.as_ref()))?;
 
+        // Unreachable in practice: see the matching comment in
+        // `authenticate_service_token` — `AuthCacheKey::ApiKey` never shares
+        // a cache slot with a `Service`-typed value.
         let CachedAuth::Project(auth) = cached else {
             return Err(OtelError::Internal {
                 message: "Service auth found in API-key cache entry".into(),
@@ -508,6 +517,9 @@ impl OtelAuthService {
             .await
             .map_err(|error| OtelError::from(error.as_ref()))?;
 
+        // Unreachable in practice: see the matching comment in
+        // `authenticate_service_token` — `AuthCacheKey::DeploymentToken`
+        // never shares a cache slot with a `Service`-typed value.
         let CachedAuth::Project(auth) = cached else {
             return Err(OtelError::Internal {
                 message: "Service auth found in deployment-token cache entry".into(),
@@ -944,5 +956,82 @@ mod tests {
             service.authenticate("tk_abcdefghij", Some(24)).await,
             Err(OtelError::AuthFailed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn deployment_auth_cache_does_not_cache_failed_lookups() {
+        use sea_orm::{MockDatabase, MockExecResult};
+        use std::collections::BTreeMap;
+
+        let mut row: BTreeMap<&str, sea_orm::Value> = BTreeMap::new();
+        row.insert("token_id", 17_i32.into());
+        row.insert("project_id", 23_i32.into());
+        row.insert("environment_id", Option::<i32>::None.into());
+        row.insert("deployment_id", Option::<i32>::None.into());
+        row.insert("project_name", "recovered-project".into());
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    // First lookup: no matching row (revoked/never existed).
+                    Vec::<BTreeMap<&str, sea_orm::Value>>::new(),
+                    // Second lookup, same token: now succeeds. If the first
+                    // failure had been cached (moka's `try_get_with` is
+                    // documented to only persist `Ok` values, never `Err`),
+                    // this second call would incorrectly return the same
+                    // cached failure instead of re-querying.
+                    vec![row],
+                ])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = OtelAuthService::new(db);
+
+        let first = service.authenticate("dt_abcdefghij", None).await;
+        assert!(matches!(first, Err(OtelError::AuthFailed { .. })));
+
+        let second = service.authenticate("dt_abcdefghij", None).await;
+        assert_eq!(second.unwrap().project_id, 23);
+    }
+
+    #[tokio::test]
+    async fn deployment_auth_cache_single_flights_concurrent_lookups_for_same_token() {
+        use sea_orm::{MockDatabase, MockExecResult};
+        use std::collections::BTreeMap;
+
+        let mut row: BTreeMap<&str, sea_orm::Value> = BTreeMap::new();
+        row.insert("token_id", 17_i32.into());
+        row.insert("project_id", 23_i32.into());
+        row.insert("environment_id", Option::<i32>::None.into());
+        row.insert("deployment_id", Option::<i32>::None.into());
+        row.insert("project_name", "cached-project".into());
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // Only ONE query result is queued. If two concurrent
+                // `authenticate` calls for the same token each issued their
+                // own DB lookup instead of sharing moka's single-flight
+                // in-flight computation, the second call would find the
+                // mock's result queue exhausted and fail/panic instead of
+                // returning the cached verdict.
+                .append_query_results(vec![vec![row]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = OtelAuthService::new(db);
+
+        let (first, second) = tokio::join!(
+            service.authenticate("dt_abcdefghij", None),
+            service.authenticate("dt_abcdefghij", None)
+        );
+
+        assert_eq!(first.unwrap().project_id, 23);
+        assert_eq!(second.unwrap().project_id, 23);
     }
 }

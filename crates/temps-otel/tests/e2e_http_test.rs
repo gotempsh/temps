@@ -183,7 +183,12 @@ async fn setup_e2e() -> Option<(
     let storage = Arc::new(TimescaleDbStorage::new(db.clone(), None));
     let auth_service = Arc::new(OtelAuthService::new(db.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(10000, Duration::from_secs(60)));
-    let otel_service = Arc::new(OtelService::new(storage, auth_service, rate_limiter));
+    let otel_service = Arc::new(OtelService::new(
+        storage,
+        auth_service,
+        rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+    ));
     let dashboard_service = Arc::new(temps_otel::services::MetricDashboardService::new(
         db.clone(),
     ));

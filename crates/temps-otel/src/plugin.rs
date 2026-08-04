@@ -59,6 +59,10 @@ pub struct OtelConfig {
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
+
+    // Ingest backpressure. Process-wide operational tuning knob (not
+    // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
+    pub max_concurrent_ingest_requests: usize,
 }
 
 impl Default for OtelConfig {
@@ -77,6 +81,8 @@ impl Default for OtelConfig {
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
+            max_concurrent_ingest_requests:
+                crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
         }
     }
 }
@@ -137,6 +143,16 @@ impl OtelConfig {
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
             config.enable_anomaly_detection = v != "0" && v != "false";
+        }
+        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
+            match v.parse::<usize>() {
+                Ok(limit) if limit > 0 => config.max_concurrent_ingest_requests = limit,
+                _ => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+                     integer; keeping the default ingest concurrency ceiling"
+                ),
+            }
         }
 
         config
@@ -450,6 +466,7 @@ impl TempsPlugin for OtelPlugin {
                 storage.clone(),
                 auth_service,
                 rate_limiter,
+                config.max_concurrent_ingest_requests,
             ));
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
@@ -822,6 +839,10 @@ mod tests {
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);
+        assert_eq!(
+            config.max_concurrent_ingest_requests,
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+        );
     }
 
     #[test]

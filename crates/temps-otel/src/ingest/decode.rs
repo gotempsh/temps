@@ -13,8 +13,10 @@ use crate::error::OtelError;
 use crate::proto;
 use crate::types::*;
 
-/// Maximum decompressed size to prevent decompression bombs (10 MB)
-const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum decompressed size to prevent decompression bombs (10 MB).
+/// `pub(crate)` so the ingest router can derive its compressed-body cap from
+/// the same number — see `crate::handlers::INGEST_BODY_LIMIT`.
+pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum zstd history window (2^24 = 16 MiB). This is large enough for the
 /// accepted 10 MiB payload while preventing attacker-controlled frame headers
 /// from allocating an unbounded decoder window before output is produced.
