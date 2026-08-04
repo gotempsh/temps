@@ -376,12 +376,21 @@ debug = false
 #    - Fix: needs prometheus 0.14+ (protobuf 3.7.2+). pingora-core 0.8.0 AND 0.8.1
 #      both pin prometheus ^0.13, and a [patch.crates-io] to protobuf 3.x fails to
 #      compile (prometheus 0.13's generated code uses 2.x-only RepeatedField /
-#      CodedInputStream APIs). Total upstream block until pingora bumps prometheus.
+#      CodedInputStream APIs).
+#    - Upstream status (checked 2026-08-04): FIXED ON pingora main, NOT YET RELEASED.
+#      pingora main @402acae (2026-07-27) removed prometheus from pingora-core
+#      entirely and split it into a new `pingora-prometheus` crate that declares
+#      `prometheus = "0.14"` (i.e. protobuf 3.x). crates.io latest is still 0.8.1,
+#      which predates the split, so the released graph still pulls protobuf 2.28.0.
+#      ACTION: bump pingora as soon as the release carrying the split ships (0.9.0).
+#      Deliberately NOT pinning pingora to a git rev in the meantime -- putting the
+#      whole proxy/edge hot path on unreleased upstream code is a materially larger
+#      risk than an advisory verified unreachable below.
 #    - Reachability: the vuln is a recursion crash when PARSING untrusted protobuf.
 #      pingora emits metrics via TextEncoder (not ProtobufEncoder); its
 #      PrometheusServer is not wired into any temps listener; the OTLP ingest path
 #      uses prost, not protobuf 2.x. The 2.x parse code is compiled in but never
-#      fed attacker input -> not reachable. (re-verified 2026-07-25: no
+#      fed attacker input -> not reachable. (re-verified 2026-08-04: no
 #      ProtobufEncoder/TextEncoder/protobuf::/PrometheusServer reference anywhere
 #      under crates/. Root cause of the pull is structural: pingora-core 0.8.1
 #      declares `prometheus = "0.13"` with default features, and `protobuf` is a
@@ -391,14 +400,21 @@ debug = false
 # 2b. GHSA-w9wp-h8wv-79jx: opentelemetry_sdk 0.30.0 (MEDIUM, dependabot-only)
 #    - Path: relay-event-schema (git pin getsentry/relay) → opentelemetry-proto 0.30
 #      → opentelemetry_sdk 0.30.0
-#    - Fix: needs the pinned relay git rev moved to one using opentelemetry 0.32+;
-#      the pin locks opentelemetry-proto to ^0.30 -> opentelemetry_sdk 0.30, with no
-#      [patch] override possible. Bumping the relay rev is out of scope for a patch.
+#    - Fix: needs opentelemetry_sdk >= 0.32.1, which requires opentelemetry-proto
+#      0.32. relay-event-schema enables `opentelemetry-proto = ["gen-tonic","trace"]`
+#      and the `trace` feature is what drags in opentelemetry_sdk; there is no
+#      [patch] override possible (0.30 -> 0.32 is semver-incompatible).
+#    - Upstream status (checked 2026-08-04): BUMPING THE RELAY REV DOES NOT FIX THIS.
+#      relay master @3215baa is on opentelemetry-proto 0.31, and 0.31's `trace`
+#      feature still resolves opentelemetry_sdk 0.31 -- below the 0.32.1 fix
+#      (verified by probe build). So the block is not "we haven't moved the pin":
+#      relay must first adopt opentelemetry-proto 0.32. Moving the pin 897 commits
+#      forward would buy relay-protocol API churn and still leave the alert open.
 #    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
 #      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
 #      module is compiled in (trace feature) but BaggagePropagator is never
 #      instantiated and .extract() is never called on attacker headers anywhere in
-#      the workspace -> not reachable. (re-verified 2026-07-25: no case-insensitive
+#      the workspace -> not reachable. (re-verified 2026-08-04: no case-insensitive
 #      match for `baggage` anywhere under crates/.)
 #
 # 3. GHSA-xxx: libcrux-intrinsics 0.0.3 (HIGH severity, dev-dependency only)
