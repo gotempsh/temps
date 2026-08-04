@@ -1084,20 +1084,24 @@ pub async fn get_genai_trace(
 /// The match is exhaustive with no catch-all arm per CLAUDE.md rules.
 impl From<CrossProjectTraceError> for Problem {
     fn from(error: CrossProjectTraceError) -> Self {
-        let detail = error.to_string();
         match error {
             CrossProjectTraceError::InvalidTraceId { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Trace ID")
-                    .with_detail(detail)
+                    .with_detail(error.to_string())
             }
             CrossProjectTraceError::QuerySiblings { .. }
             | CrossProjectTraceError::QueryProjects { .. }
             | CrossProjectTraceError::Database(_)
             | CrossProjectTraceError::Storage(_) => {
+                // Log the real error server-side only — DB/storage error text
+                // can contain schema/table names or paths that must not reach
+                // the caller. Same pattern as `ingest_handler`'s
+                // `From<OtelError> for Problem`.
+                warn!(error = %error, "Cross-project trace query internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(detail)
+                    .with_detail("An internal error occurred")
             }
         }
     }
@@ -1334,6 +1338,40 @@ mod tests {
             Some(0),
             "a genuinely-zero total must still be serialized: {json}"
         );
+    }
+
+    #[test]
+    fn cross_project_trace_error_internal_variants_do_not_leak_db_error_text() {
+        let err = CrossProjectTraceError::Database(sea_orm::DbErr::Custom(
+            "column \"trace_id\" not found in table \"cross_project_trace_refs\"".into(),
+        ));
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(detail, "An internal error occurred");
+        assert!(
+            !detail.contains("cross_project_trace_refs"),
+            "detail leaked: {detail}"
+        );
+    }
+
+    #[test]
+    fn cross_project_trace_error_invalid_trace_id_keeps_user_facing_detail() {
+        let err = CrossProjectTraceError::InvalidTraceId {
+            trace_id: "not-hex".into(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("not-hex"), "detail: {detail}");
     }
 
     #[test]

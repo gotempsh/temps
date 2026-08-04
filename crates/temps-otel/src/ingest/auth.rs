@@ -997,8 +997,21 @@ mod tests {
         assert_eq!(second.unwrap().project_id, 23);
     }
 
+    /// NOTE on what this test does and does not prove: `sea_orm::MockDatabase`
+    /// resolves synchronously (it never actually yields the executor), so
+    /// under `tokio::join!` the first `authenticate` future typically runs to
+    /// completion — including the moka cache insert — before the second is
+    /// ever polled. This test therefore exercises "a second call for the same
+    /// key issued immediately after the first reuses the cached result and
+    /// does not re-query", not a genuine mid-flight race between two
+    /// in-flight lookups. The stronger single-flight guarantee (concurrent
+    /// callers for the same key share one in-flight computation rather than
+    /// each starting their own) comes from moka's documented `try_get_with`
+    /// semantics and isn't independently re-verified here. Kept as a
+    /// regression guard: if cache-sharing were accidentally removed, this
+    /// would fail (the mock has only one query result queued).
     #[tokio::test]
-    async fn deployment_auth_cache_single_flights_concurrent_lookups_for_same_token() {
+    async fn deployment_auth_cache_reuses_result_for_joined_calls_to_same_token() {
         use sea_orm::{MockDatabase, MockExecResult};
         use std::collections::BTreeMap;
 
@@ -1011,12 +1024,10 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // Only ONE query result is queued. If two concurrent
-                // `authenticate` calls for the same token each issued their
-                // own DB lookup instead of sharing moka's single-flight
-                // in-flight computation, the second call would find the
-                // mock's result queue exhausted and fail/panic instead of
-                // returning the cached verdict.
+                // Only ONE query result is queued. If the second call above
+                // issued its own DB lookup instead of reusing the cached
+                // verdict, it would find the mock's result queue exhausted
+                // and fail/panic.
                 .append_query_results(vec![vec![row]])
                 .append_exec_results(vec![MockExecResult {
                     last_insert_id: 0,

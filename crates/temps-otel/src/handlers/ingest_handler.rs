@@ -1149,6 +1149,23 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
     }
 
+    /// Extracts the `detail` string from a converted `Problem`, for asserting
+    /// on response content (not just status code).
+    fn problem_detail(problem: &Problem) -> &str {
+        problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Internal-error variants must never echo their underlying message (DB
+    /// error text, file paths, S3 reasons) into the HTTP response — only the
+    /// generic detail, with the real error logged server-side instead. See
+    /// `From<OtelError> for Problem`'s `Storage | Database | S3 | Io |
+    /// Serialization | Internal` arm.
+    const SANITIZED_INTERNAL_ERROR_DETAIL: &str = "An internal error occurred";
+
     #[test]
     fn test_error_storage_maps_to_500() {
         let err = OtelError::Storage {
@@ -1156,13 +1173,21 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("disk full"), "detail leaked: {detail}");
     }
 
     #[test]
     fn test_error_database_maps_to_500() {
-        let err = OtelError::Database(sea_orm::DbErr::Custom("test".into()));
+        let err = OtelError::Database(sea_orm::DbErr::Custom(
+            "column \"key_hash\" not found in table \"api_keys\"".into(),
+        ));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("api_keys"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1173,6 +1198,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("timeout"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1180,6 +1208,9 @@ mod tests {
         let err = OtelError::Io(std::io::Error::other("test"));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("test"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1189,6 +1220,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("unexpected"), "detail leaked: {detail}");
     }
 
     #[test]

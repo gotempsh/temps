@@ -21,7 +21,7 @@ use crate::OtelAppState;
 /// uncompressed request (`Content-Encoding` absent) had no size check of its
 /// own — `decode::decompress` returns it unmodified — and previously relied
 /// solely on Axum's implicit 2 MiB default.
-pub(crate) const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
+pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 
 /// Configure all OTel routes.
 ///
