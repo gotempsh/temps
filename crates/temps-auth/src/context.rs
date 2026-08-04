@@ -26,6 +26,11 @@ pub struct UserSchema {
 pub enum AuthSource {
     Session {
         user: users::Model,
+        /// Database identity of the authenticated browser session. Kept out
+        /// of serialized contexts because it is an internal authorization
+        /// handle, not API response data.
+        #[serde(skip)]
+        session_id: Option<i32>,
     },
     CliToken {
         user: users::Model,
@@ -100,7 +105,27 @@ impl AuthContext {
     pub fn new_session(user: users::Model, role: Role) -> Self {
         Self {
             user: Some(user.clone()),
-            source: AuthSource::Session { user },
+            source: AuthSource::Session {
+                user,
+                session_id: None,
+            },
+            effective_role: role,
+            custom_permissions: None,
+            deployment_token_permissions: None,
+        }
+    }
+
+    /// Construct a browser-session context backed by a persisted session row.
+    /// Production middleware uses this constructor so sensitive-action checks
+    /// can scope elevation to this device. `new_session` remains convenient for
+    /// unit tests that do not exercise session-bound policy.
+    pub fn new_persisted_session(user: users::Model, role: Role, session_id: i32) -> Self {
+        Self {
+            user: Some(user.clone()),
+            source: AuthSource::Session {
+                user,
+                session_id: Some(session_id),
+            },
             effective_role: role,
             custom_permissions: None,
             deployment_token_permissions: None,
@@ -254,6 +279,47 @@ impl AuthContext {
 
     pub fn is_deployment_token(&self) -> bool {
         matches!(self.source, AuthSource::DeploymentToken { .. })
+    }
+
+    /// Convert the authentication context into the stable principal shape used
+    /// by sensitive-action policy implementations.
+    pub fn sensitive_action_principal(&self) -> Option<temps_core::SensitiveActionPrincipal> {
+        match &self.source {
+            AuthSource::Session {
+                user,
+                session_id: Some(session_id),
+            } => Some(temps_core::SensitiveActionPrincipal::UserSession {
+                user_id: user.id,
+                session_id: *session_id,
+                mfa_enabled: user.mfa_enabled,
+            }),
+            AuthSource::Session {
+                session_id: None, ..
+            } => None,
+            AuthSource::ApiKey { user, key_id, .. } => {
+                Some(temps_core::SensitiveActionPrincipal::ApiKey {
+                    user_id: user.id,
+                    key_id: *key_id,
+                })
+            }
+            AuthSource::CliToken { user } => {
+                Some(temps_core::SensitiveActionPrincipal::CliToken { user_id: user.id })
+            }
+            AuthSource::DeploymentToken { token_id, .. } => {
+                Some(temps_core::SensitiveActionPrincipal::DeploymentToken {
+                    token_id: *token_id,
+                })
+            }
+        }
+    }
+
+    pub fn session_id(&self) -> Option<i32> {
+        match &self.source {
+            AuthSource::Session { session_id, .. } => *session_id,
+            AuthSource::CliToken { .. }
+            | AuthSource::ApiKey { .. }
+            | AuthSource::DeploymentToken { .. } => None,
+        }
     }
 
     pub fn api_key_info(&self) -> Option<(String, i32)> {

@@ -168,6 +168,7 @@ mod m20260730_000001_add_architecture_to_nodes;
 mod m20260730_000001_create_teams_rbac;
 mod m20260802_000001_add_environment_force_https;
 mod m20260803_000001_add_template_slug_to_projects;
+mod m20260803_000002_add_step_up_expires_at_to_sessions;
 
 pub struct Migrator;
 
@@ -343,6 +344,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260730_000001_create_teams_rbac::Migration),
             Box::new(m20260802_000001_add_environment_force_https::Migration),
             Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
+            Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
         ]
     }
 }

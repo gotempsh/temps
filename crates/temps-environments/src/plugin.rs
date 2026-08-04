@@ -74,6 +74,8 @@ impl TempsPlugin for EnvironmentsPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
@@ -86,6 +88,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             integration_env_provider,
             telemetry,
             project_access_checker,
+            sensitive_action_authorizer,
         );
 
         let routes = crate::handlers::configure_routes().with_state(app_state);

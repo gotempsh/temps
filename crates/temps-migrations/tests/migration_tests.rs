@@ -14,6 +14,92 @@ fn external_db_configured() -> bool {
         .unwrap_or(false)
 }
 
+async fn session_step_up_column_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (\
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'sessions' \
+                  AND column_name = 'step_up_expires_at'\
+             ) AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("column existence query returns one row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+#[tokio::test]
+async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "⏭️  Skipping test_step_up_session_expiration_migration_up_and_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "⏭️  Skipping test_step_up_session_expiration_migration_up_and_down: Docker unavailable ({error})"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260803_000002_add_step_up_expires_at_to_sessions";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    assert!(!session_step_up_column_exists(&db).await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(session_step_up_column_exists(&db).await?);
+
+    let metadata = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'sessions' \
+               AND column_name = 'step_up_expires_at'"
+                .to_string(),
+        ))
+        .await?
+        .expect("step-up expiration column metadata");
+    let data_type: String = metadata.try_get("", "data_type")?;
+    let is_nullable: String = metadata.try_get("", "is_nullable")?;
+    assert_eq!(data_type, "timestamp with time zone");
+    assert_eq!(is_nullable, "YES");
+
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!session_step_up_column_exists(&db).await?);
+
+    Ok(())
+}
+
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {

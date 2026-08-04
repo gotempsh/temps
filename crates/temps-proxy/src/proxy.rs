@@ -2363,6 +2363,26 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
 /// connection" bug this timeout extension exists to fix.
 const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
 
+/// Whether a `Content-Type` value's media type — its "essence", the part
+/// before any `;` parameters — is exactly `text/event-stream`.
+///
+/// Deliberately not a substring match. This gates `ctx.streaming_session`,
+/// which excludes a request from the proxy latency histograms, and the value
+/// comes from the upstream (i.e. from a tenant's own app). A `contains` check
+/// would also accept `text/html; note=text/event-stream`, letting an app
+/// classify arbitrary responses as streaming and drop itself out of the
+/// operator's latency and alerting series.
+///
+/// Note this is the right shape only for `Content-Type`, which carries a
+/// single media type plus parameters. The request-side `Accept` check stays a
+/// substring match because `Accept` is a comma-separated list.
+fn is_event_stream_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 fn upstream_io_timeout(
     peer_addr: &str,
     console_addr: &str,
@@ -4372,15 +4392,16 @@ impl ProxyHttp for LoadBalancer {
             .headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("text/event-stream"))
+            .map(is_event_stream_content_type)
             .unwrap_or(false);
 
         if is_sse {
             ctx.is_sse = true;
-            ctx.skip_tracking = true; // Skip visitor/session tracking for SSE streams
-                                      // The upstream *confirmed* a stream (as opposed to `ctx.is_sse` set
-                                      // from the request's Accept header, which is only client intent and
-                                      // may still be answered by an ordinary short response).
+            // Skip visitor/session tracking for SSE streams
+            ctx.skip_tracking = true;
+            // The upstream *confirmed* a stream, as opposed to `ctx.is_sse` set
+            // from the request's Accept header, which is only client intent and
+            // may still be answered by an ordinary short response.
             ctx.streaming_session = true;
             debug!("SSE response detected from upstream");
         }
@@ -6315,5 +6336,45 @@ mod traceparent_tests {
             LoadBalancer::extract_traceparent_trace_id(Some(&h)),
             Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::is_event_stream_content_type;
+
+    #[test]
+    fn accepts_plain_and_parameterised_event_stream() {
+        assert!(is_event_stream_content_type("text/event-stream"));
+        assert!(is_event_stream_content_type(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(is_event_stream_content_type(
+            "text/event-stream;charset=utf-8"
+        ));
+        // Media types are case-insensitive, and surrounding space is legal.
+        assert!(is_event_stream_content_type("  TEXT/Event-Stream  "));
+    }
+
+    #[test]
+    fn rejects_event_stream_hidden_in_a_parameter() {
+        // The reason this is not a substring match: an upstream that smuggles
+        // the token into a parameter would otherwise classify itself as a
+        // streaming session and drop out of the proxy latency histograms.
+        assert!(!is_event_stream_content_type(
+            "text/html; note=text/event-stream"
+        ));
+        assert!(!is_event_stream_content_type(
+            "application/json; x=\"text/event-stream\""
+        ));
+    }
+
+    #[test]
+    fn rejects_ordinary_content_types() {
+        assert!(!is_event_stream_content_type("text/html"));
+        assert!(!is_event_stream_content_type("application/json"));
+        assert!(!is_event_stream_content_type(""));
+        // A prefix match must not count either.
+        assert!(!is_event_stream_content_type("text/event-stream-x"));
     }
 }

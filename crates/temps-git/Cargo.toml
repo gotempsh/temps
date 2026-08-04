@@ -49,6 +49,7 @@ sha2 = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
+# Keep this aligned with Octocrab's public GitHub App key type.
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 uuid = { workspace = true }
 http-body-util = { workspace = true }

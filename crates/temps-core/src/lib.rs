@@ -23,6 +23,7 @@ pub mod public_hostname_resolver;
 pub mod retention;
 pub mod retry;
 pub mod secrets_manager;
+pub mod sensitive_action;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;
@@ -71,6 +72,10 @@ pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
 };
 pub use secrets_manager::SecretsManagerResolver;
+pub use sensitive_action::{
+    SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
+    SensitiveActionDecision, SensitiveActionPrincipal,
+};
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
     TraceQueryFilter, TraceReader, TraceReaderError, TraceSpanDto, TraceSpanEventDto,

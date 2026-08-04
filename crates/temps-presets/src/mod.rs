@@ -6,6 +6,7 @@ mod docker_compose;
 mod docker_custom;
 mod docusaurus;
 mod nextjs;
+mod autopack_preset;
 mod nixpacks_preset;
 mod react_app;
 mod rsbuild;
@@ -37,6 +38,7 @@ use docusaurus::Docusaurus;
 use docker::DockerfilePreset;
 use docker_custom::DockerCustomPreset;
 pub use nextjs::NextJs;
+pub use autopack_preset::AutopackPreset;
 pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
 pub use react_app::CreateReactApp;
 use rsbuild::Rsbuild;
@@ -328,6 +330,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(DockerfilePreset),
         Box::new(DockerCustomPreset),
         // Nixpacks auto-detect
+        Box::new(AutopackPreset::new()),
         Box::new(NixpacksPreset::auto()),
         // Nixpacks provider-specific variants
         Box::new(NixpacksPreset::new(NixpacksProvider::Node)),
