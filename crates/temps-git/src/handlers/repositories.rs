@@ -102,7 +102,7 @@ fn normalize_commit_sha(commit_sha: &str) -> Result<String, CommitShaValidationE
 
 fn provider_lookup_principal(auth: &AuthContext) -> String {
     match &auth.source {
-        AuthSource::Session { user } | AuthSource::CliToken { user } => {
+        AuthSource::Session { user, .. } | AuthSource::CliToken { user } => {
             format!("user:{}", user.id)
         }
         AuthSource::ApiKey { key_id, .. } => format!("api-key:{}", key_id),

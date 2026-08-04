@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
@@ -1100,7 +1100,7 @@ async fn test_full_fidelity_bad_label_key_rejected() {
 fn hist_pt(
     project_id: i32,
     name: &str,
-    secs_ago: i64,
+    timestamp: DateTime<Utc>,
     temporality: AggregationTemporality,
     count: u64,
     sum: f64,
@@ -1113,7 +1113,7 @@ fn hist_pt(
         name.into(),
         MetricType::Histogram,
         "ms".into(),
-        Utc::now() - Duration::seconds(secs_ago),
+        timestamp,
         BTreeMap::new(),
     );
     p.histogram_count = Some(count);
@@ -1126,6 +1126,16 @@ fn hist_pt(
     p
 }
 
+/// Choose a stable point inside the current hour so relative fixture offsets
+/// cannot cross an hourly aggregation boundary when a test starts near HH:00.
+fn histogram_fixture_now() -> DateTime<Utc> {
+    Utc::now()
+        .with_minute(30)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .expect("30 minutes past the current UTC hour is always valid")
+}
+
 /// DELTA histograms in the same bucket must be ELEMENT-WISE summed (validates the
 /// WITH ORDINALITY array aggregation across multiple rows — not just one).
 #[tokio::test]
@@ -1135,12 +1145,13 @@ async fn test_full_fidelity_histogram_delta_elementwise_sum() {
     };
     let project_id = 110;
     let name = "http.latency.delta";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![
             hist_pt(
                 project_id,
                 name,
-                30,
+                fixture_now - Duration::seconds(30),
                 AggregationTemporality::Delta,
                 100,
                 5000.0,
@@ -1149,7 +1160,7 @@ async fn test_full_fidelity_histogram_delta_elementwise_sum() {
             hist_pt(
                 project_id,
                 name,
-                20,
+                fixture_now - Duration::seconds(20),
                 AggregationTemporality::Delta,
                 15,
                 300.0,
@@ -1189,13 +1200,14 @@ async fn test_full_fidelity_histogram_cumulative_latest_snapshot() {
     };
     let project_id = 111;
     let name = "http.latency.cumulative";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![
             // earlier snapshot
             hist_pt(
                 project_id,
                 name,
-                40,
+                fixture_now - Duration::seconds(40),
                 AggregationTemporality::Cumulative,
                 50,
                 2500.0,
@@ -1205,7 +1217,7 @@ async fn test_full_fidelity_histogram_cumulative_latest_snapshot() {
             hist_pt(
                 project_id,
                 name,
-                10,
+                fixture_now - Duration::seconds(10),
                 AggregationTemporality::Cumulative,
                 100,
                 5000.0,
@@ -1251,11 +1263,12 @@ async fn test_full_fidelity_histogram_quantile() {
     };
     let project_id = 112;
     let name = "http.latency.quantile";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![hist_pt(
             project_id,
             name,
-            20,
+            fixture_now - Duration::seconds(20),
             AggregationTemporality::Delta,
             100,
             5000.0,
@@ -1319,11 +1332,12 @@ async fn test_full_fidelity_histogram_group_by_null_label() {
     };
     let project_id = 113;
     let name = "http.latency.bylabel";
+    let fixture_now = histogram_fixture_now();
 
     let mut with_route = hist_pt(
         project_id,
         name,
-        20,
+        fixture_now - Duration::seconds(20),
         AggregationTemporality::Delta,
         100,
         5000.0,
@@ -1334,7 +1348,7 @@ async fn test_full_fidelity_histogram_group_by_null_label() {
     let without_route = hist_pt(
         project_id,
         name,
-        20,
+        fixture_now - Duration::seconds(20),
         AggregationTemporality::Delta,
         40,
         2000.0,

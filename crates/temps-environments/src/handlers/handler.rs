@@ -1664,6 +1664,7 @@ pub async fn sleep_environment(
         (status = 204, description = "Environment permanently deleted"),
         (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1680,6 +1681,14 @@ pub async fn delete_environment(
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+
+    require_environment_deletion_authorization(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        project_id,
+        env_id,
+    )
+    .await?;
 
     // Get environment details before deletion for audit log
     let environment = state
@@ -1765,6 +1774,23 @@ pub async fn delete_environment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn require_environment_deletion_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), Problem> {
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::DeleteEnvironment {
+            project_id,
+            environment_id,
+        },
+    )
+    .await
 }
 
 /// Create a new environment for a project
@@ -2218,6 +2244,31 @@ mod tests {
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
 
+    struct RequireDeletionVerification;
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for RequireDeletionVerification {
+        async fn authorize(
+            &self,
+            action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            assert_eq!(
+                action,
+                &temps_core::SensitiveAction::DeleteEnvironment {
+                    project_id: 17,
+                    environment_id: 23,
+                }
+            );
+            Ok(temps_core::SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAuditLogger {
         serialized_operations: Mutex<Vec<(String, String)>>,
@@ -2270,6 +2321,28 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[tokio::test]
+    async fn environment_deletion_stops_at_sensitive_action_gate() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            test_auth_context(temps_auth::Role::Admin)
+                .user
+                .expect("test auth should contain a user"),
+            temps_auth::Role::Admin,
+            99,
+        );
+
+        let error =
+            require_environment_deletion_authorization(&RequireDeletionVerification, &auth, 17, 23)
+                .await
+                .expect_err("environment deletion must require recent verification");
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("delete_environment"))
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod permission_guard;
 pub mod permissions;
 mod plugin;
 pub mod rate_limit;
+pub mod sensitive_action;
 pub mod state;
 mod temps_middleware;
 mod types;
@@ -39,6 +40,10 @@ pub use temps_core::resolve_client_ip;
 
 pub use context::*;
 pub use permissions::*;
+pub use sensitive_action::{
+    require_sensitive_action, DefaultSensitiveActionAuthorizer, StepUpError, StepUpService,
+    STEP_UP_TTL_MINUTES,
+};
 pub use state::*;
 
 // Export plugins
@@ -47,7 +52,7 @@ pub use plugin::AuthPlugin;
 
 // Export services
 pub use apikey_service::{ApiKeyService, CreateApiKeyRequest, CreateApiKeyResponse};
-pub use auth_service::{validate_password_complexity, AuthService};
+pub use auth_service::{validate_password_complexity, AuthService, VerifiedSession};
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
 };

@@ -1,0 +1,140 @@
+name: Starters
+
+# Builds every temps-examples starter through the preset the deployment
+# pipeline actually uses, runs the resulting image, and asks it for a page.
+#
+# The unit tests assert on generated Dockerfile *text*, which cannot tell a
+# working build from a plausible-looking one. This is the job that would have
+# caught a preset change that renders fine and deploys broken.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/temps-presets/**'
+      - '.github/workflows/starters.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/temps-presets/**'
+      - '.github/workflows/starters.yml'
+  workflow_dispatch:
+  # The starters live in another repository, so a green PR here can still break
+  # when one of them changes. Re-run nightly to catch that.
+  schedule:
+    - cron: '0 4 * * *'
+
+concurrency:
+  group: starters-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  starters:
+    name: ${{ matrix.starter }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One red square should name the language that broke, not stop the rest.
+      fail-fast: false
+      matrix:
+        starter:
+          - astro
+          - bun/bun-server
+          - bun/elysia
+          - deno
+          - dotnet/web
+          - elixir/phoenix
+          - go/gin
+          - go/net-http
+          - nextjs/app-router
+          - nodejs/express
+          - nodejs/fastify
+          - nodejs/hono
+          - nodejs/nestjs
+          - nuxt
+          - php/laravel
+          - php/vanilla
+          - python/django
+          - python/fastapi
+          - python/flask
+          - ruby/rails
+          - rust/actix
+          - sveltekit
+          - swift/vapor
+          - vite/react
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the starters
+        uses: actions/checkout@v5
+        with:
+          repository: gotempsh/temps-examples
+          path: temps-examples
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One shared cache for the whole matrix: every job builds the same
+          # test binary, so per-starter caches would be 26 copies of it.
+          shared-key: starters
+          # Only main may write the cache — a pull request that populates it
+          # evicts main's entry from the repository's single LRU pool.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build, run and serve
+        env:
+          TEMPS_EXAMPLES_DIR: ${{ github.workspace }}/temps-examples/examples/starters
+          TEMPS_STARTERS_ONLY: ${{ matrix.starter }}
+          DOCKER_BUILDKIT: '1'
+        run: |
+          cargo test -p temps-presets --test starters -- --ignored --nocapture
+
+  known-failing:
+    # java/spring-boot does not pass yet. It runs anyway and always reports
+    # success, so the failure stays visible in the log without blocking a merge
+    # — a red required check that everyone learns to ignore is worse than no
+    # check at all.
+    #
+    # Spring deduces a REACTIVE application type from a classpath that only has
+    # spring-boot-starter-web, then fails for want of a ReactiveWebServerFactory.
+    # The boot jar is selected correctly (the `-plain.jar` exclusion works) and
+    # the application does start, so this is not jar selection. Not root-caused.
+    #
+    # Tracked in the autopack repository; remove this job when it is fixed.
+    name: known-failing (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the starters
+        uses: actions/checkout@v5
+        with:
+          repository: gotempsh/temps-examples
+          path: temps-examples
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: starters
+          save-if: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build, run and serve
+        continue-on-error: true
+        env:
+          TEMPS_EXAMPLES_DIR: ${{ github.workspace }}/temps-examples/examples/starters
+          TEMPS_STARTERS_ONLY: java/spring-boot
+          DOCKER_BUILDKIT: '1'
+        run: |
+          cargo test -p temps-presets --test starters -- --ignored --nocapture

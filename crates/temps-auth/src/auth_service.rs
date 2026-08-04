@@ -23,6 +23,12 @@ pub struct AuthStatusResponse {
     pub cli_token: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerifiedSession {
+    pub user: temps_entities::users::Model,
+    pub session_id: i32,
+}
+
 #[derive(Error, Debug)]
 pub enum AuthError {
     #[error("Database error: {reason}")]
@@ -157,6 +163,15 @@ impl AuthService {
         &self,
         session_token: &str,
     ) -> Result<temps_entities::users::Model, AuthError> {
+        Ok(self.verify_session_details(session_token).await?.user)
+    }
+
+    /// Verify a fully authenticated session and retain its database identity
+    /// for session-scoped authorization such as short-lived step-up access.
+    pub async fn verify_session_details(
+        &self,
+        session_token: &str,
+    ) -> Result<VerifiedSession, AuthError> {
         let session = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
@@ -173,7 +188,10 @@ impl AuthService {
             .await?
             .ok_or_else(|| AuthError::NotFound("User not found or deleted".to_string()))?;
 
-        Ok(user)
+        Ok(VerifiedSession {
+            user,
+            session_id: session.id,
+        })
     }
 
     fn generate_session_token(&self) -> String {
@@ -1833,6 +1851,7 @@ mod tests {
             session_token: "pending-session".to_string(),
             expires_at: now + Duration::minutes(5),
             mfa_pending: true,
+            step_up_expires_at: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![session]])
