@@ -6,10 +6,12 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::Serialize;
 use std::sync::Arc;
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
+use temps_core::{AuditLogger, AuditOperation};
 use tracing::{error, info, warn};
 
 use super::errors::{BuilderError, TlsError};
@@ -19,6 +21,35 @@ use super::repository::CertificateRepository;
 
 /// Type alias for the Tokio-based DNS resolver
 type TokioResolver = Resolver<TokioRuntimeProvider>;
+
+#[derive(Debug, Serialize)]
+struct DnsAutomationAudit {
+    domain: String,
+    zone: String,
+    provider_id: i32,
+    provider_name: String,
+    outcome: String,
+    reason: Option<String>,
+    mutations: Vec<temps_core::DnsAutomationMutation>,
+}
+
+impl AuditOperation for DnsAutomationAudit {
+    fn operation_type(&self) -> String {
+        "DNS_AUTOMATION_ACME_DNS01".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+    fn user_agent(&self) -> &str {
+        "temps-certificate-renewal-scheduler"
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
 
 pub struct TlsService {
     repository: Arc<dyn CertificateRepository>,
@@ -39,6 +70,10 @@ pub struct TlsService {
     /// provider manages the domain, DNS-01 renewals fall back to the manual
     /// "add this TXT record yourself" notification.
     dns_provider_service: Option<Arc<temps_dns::services::DnsProviderService>>,
+    /// Fail-closed authorization gate for unattended DNS mutations. Human
+    /// provider management is governed independently by API permissions.
+    dns_automation_gate: Option<Arc<dyn temps_core::DnsAutomationGate>>,
+    audit_logger: Option<Arc<dyn AuditLogger>>,
 }
 
 impl TlsService {
@@ -74,6 +109,8 @@ impl TlsService {
             db: None,
             domain_service: None,
             dns_provider_service: None,
+            dns_automation_gate: None,
+            audit_logger: None,
         }
     }
 
@@ -101,6 +138,32 @@ impl TlsService {
     ) -> Self {
         self.dns_provider_service = Some(dns_provider_service);
         self
+    }
+
+    pub fn with_dns_automation_gate(
+        mut self,
+        dns_automation_gate: Arc<dyn temps_core::DnsAutomationGate>,
+    ) -> Self {
+        self.dns_automation_gate = Some(dns_automation_gate);
+        self
+    }
+
+    pub fn with_audit_logger(mut self, audit_logger: Arc<dyn AuditLogger>) -> Self {
+        self.audit_logger = Some(audit_logger);
+        self
+    }
+
+    async fn audit_dns_automation(&self, audit: DnsAutomationAudit) {
+        let Some(logger) = &self.audit_logger else {
+            warn!(
+                "DNS automation audit logger is unavailable; outcome={}",
+                audit.outcome
+            );
+            return;
+        };
+        if let Err(error) = logger.create_audit_log(&audit).await {
+            error!("Failed to persist DNS automation audit event: {error}");
+        }
     }
 
     pub fn with_domain_service(mut self, domain_service: Arc<crate::DomainService>) -> Self {
@@ -745,12 +808,81 @@ impl TlsService {
             .map(|record| (record.name.clone(), record.value.clone()))
             .collect();
 
-        let (results, records_created) = crate::handlers::domain_handler::setup_dns_txt_records(
+        let mutations = dns_txt_records
+            .iter()
+            .map(|(name, value)| temps_core::DnsAutomationMutation {
+                record_type: "TXT".to_string(),
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let authorization_request = temps_core::DnsAutomationRequest {
+            purpose: temps_core::DnsAutomationPurpose::AcmeDns01,
+            domain: cert.domain.clone(),
+            zone: base_domain.clone(),
+            provider_id: provider.id,
+            provider_name: provider.name.clone(),
+            mutations: mutations.clone(),
+        };
+        let Some(gate) = &self.dns_automation_gate else {
+            self.audit_dns_automation(DnsAutomationAudit {
+                domain: cert.domain.clone(),
+                zone: base_domain.clone(),
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+                outcome: "denied".to_string(),
+                reason: Some("no automation gate is configured".to_string()),
+                mutations,
+            })
+            .await;
+            return false;
+        };
+        let setup = crate::handlers::domain_handler::setup_authorized_dns_txt_records(
+            gate.as_ref(),
+            &authorization_request,
             provider_instance.as_ref(),
-            &base_domain,
-            &dns_txt_records,
         )
         .await;
+        let (results, records_created) = match setup {
+            crate::handlers::domain_handler::AuthorizedDnsSetup::Denied(reason) => {
+                self.audit_dns_automation(DnsAutomationAudit {
+                    domain: cert.domain.clone(),
+                    zone: base_domain.clone(),
+                    provider_id: provider.id,
+                    provider_name: provider.name.clone(),
+                    outcome: "denied".to_string(),
+                    reason: Some(reason.clone()),
+                    mutations: mutations.clone(),
+                })
+                .await;
+                info!(
+                    "Unattended DNS-01 renewal is not authorized for {} via provider {}: {}",
+                    cert.domain, provider.name, reason
+                );
+                return false;
+            }
+            crate::handlers::domain_handler::AuthorizedDnsSetup::AuthorizationError(reason) => {
+                self.audit_dns_automation(DnsAutomationAudit {
+                    domain: cert.domain.clone(),
+                    zone: base_domain.clone(),
+                    provider_id: provider.id,
+                    provider_name: provider.name.clone(),
+                    outcome: "authorization_error".to_string(),
+                    reason: Some(reason.clone()),
+                    mutations: mutations.clone(),
+                })
+                .await;
+                warn!(
+                    "Failed to authorize unattended DNS-01 renewal for {} via provider {}: {}",
+                    cert.domain, provider.name, reason
+                );
+                return false;
+            }
+            crate::handlers::domain_handler::AuthorizedDnsSetup::Published {
+                results,
+                records_created,
+            } => (results, records_created),
+        };
 
         if (records_created as usize) < dns_txt_records.len() {
             let failed_detail = results
@@ -781,8 +913,29 @@ impl TlsService {
                 &cert.verification_method,
             )
             .await;
+            self.audit_dns_automation(DnsAutomationAudit {
+                domain: cert.domain.clone(),
+                zone: base_domain.clone(),
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+                outcome: "publish_failed".to_string(),
+                reason: Some(error_msg),
+                mutations: authorization_request.mutations.clone(),
+            })
+            .await;
             return true;
         }
+
+        self.audit_dns_automation(DnsAutomationAudit {
+            domain: cert.domain.clone(),
+            zone: base_domain.clone(),
+            provider_id: provider.id,
+            provider_name: provider.name.clone(),
+            outcome: "published".to_string(),
+            reason: None,
+            mutations: authorization_request.mutations.clone(),
+        })
+        .await;
 
         // Step 3: Give DNS a moment to propagate before asking Let's Encrypt to validate.
         info!(

@@ -5,6 +5,7 @@ pub mod audit;
 pub mod client_ip;
 pub mod config;
 pub mod deployment;
+pub mod dns_automation;
 pub mod env_vars_provider;
 pub mod error;
 pub mod error_builder;
@@ -55,6 +56,10 @@ pub use client_ip::resolve_client_ip;
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
+pub use dns_automation::{
+    DnsAutomationDecision, DnsAutomationGate, DnsAutomationGateSlot, DnsAutomationMutation,
+    DnsAutomationPurpose, DnsAutomationRequest,
+};
 pub use env_vars_provider::{
     flatten_integration_env_vars, IntegrationEnvVar, IntegrationServiceInfo,
     ProjectEnvVarsProvider, ProjectIntegrationEnvVars,

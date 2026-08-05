@@ -82,6 +82,11 @@ pub enum Permission {
     SettingsRead,
     SettingsWrite,
 
+    // DNS provider and unattended automation permissions
+    DnsProvidersRead,
+    DnsProvidersWrite,
+    DnsAutomationWrite,
+
     // Files permissions
     FilesRead,
     FilesWrite,
@@ -323,6 +328,9 @@ impl fmt::Display for Permission {
             Permission::WebSocketProxyConnect => "websocket_proxy:connect",
             Permission::SettingsRead => "settings:read",
             Permission::SettingsWrite => "settings:write",
+            Permission::DnsProvidersRead => "dns_providers:read",
+            Permission::DnsProvidersWrite => "dns_providers:write",
+            Permission::DnsAutomationWrite => "dns_automation:write",
             Permission::ErrorTrackingRead => "error_tracking:read",
             Permission::ErrorTrackingWrite => "error_tracking:write",
             Permission::ErrorTrackingCreate => "error_tracking:create",
@@ -437,6 +445,9 @@ impl Permission {
             "external_services:create" => Some(Permission::ExternalServicesCreate),
             "settings:read" => Some(Permission::SettingsRead),
             "settings:write" => Some(Permission::SettingsWrite),
+            "dns_providers:read" => Some(Permission::DnsProvidersRead),
+            "dns_providers:write" => Some(Permission::DnsProvidersWrite),
+            "dns_automation:write" => Some(Permission::DnsAutomationWrite),
             "files:read" => Some(Permission::FilesRead),
             "files:write" => Some(Permission::FilesWrite),
             "files:delete" => Some(Permission::FilesDelete),
@@ -583,6 +594,9 @@ impl Permission {
             Permission::ExternalServicesCreate,
             Permission::SettingsRead,
             Permission::SettingsWrite,
+            Permission::DnsProvidersRead,
+            Permission::DnsProvidersWrite,
+            Permission::DnsAutomationWrite,
             Permission::FilesRead,
             Permission::FilesWrite,
             Permission::FilesDelete,
@@ -808,6 +822,9 @@ impl Role {
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
                 Permission::SecretsRead,
                 Permission::SpeedInsightsRead,
                 Permission::SystemAdmin,
@@ -947,6 +964,9 @@ impl Role {
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
                 Permission::SpeedInsightsRead,
                 Permission::SystemAdmin,
                 Permission::SystemRead,
@@ -1305,6 +1325,23 @@ mod tests {
         assert!(admin_permissions.contains(&Permission::EmailDomainsDelete));
         assert!(admin_permissions.contains(&Permission::EmailsRead));
         assert!(admin_permissions.contains(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn dns_governance_permissions_round_trip_and_stay_admin_only() {
+        for (permission, serialized) in [
+            (Permission::DnsProvidersRead, "dns_providers:read"),
+            (Permission::DnsProvidersWrite, "dns_providers:write"),
+            (Permission::DnsAutomationWrite, "dns_automation:write"),
+        ] {
+            assert_eq!(permission.to_string(), serialized);
+            assert_eq!(Permission::from_str(serialized), Some(permission));
+            assert!(Permission::all().contains(&permission));
+            assert!(Role::Admin.has_permission(&permission));
+            assert!(Role::PlatformAdmin.has_permission(&permission));
+            assert!(!Role::User.has_permission(&permission));
+            assert!(!Role::Reader.has_permission(&permission));
+        }
     }
 
     #[test]

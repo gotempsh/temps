@@ -40,14 +40,15 @@ use crate::services::{
 
 /// Audit record for managed-domain write operations.
 #[derive(Debug, Clone, serde::Serialize)]
-struct ManagedDomainAudit {
+struct DnsGovernanceAudit {
     context: AuditContext,
     provider_id: i32,
     domain: String,
     action: String,
+    details: serde_json::Value,
 }
 
-impl AuditOperation for ManagedDomainAudit {
+impl AuditOperation for DnsGovernanceAudit {
     fn operation_type(&self) -> String {
         self.action.clone()
     }
@@ -484,7 +485,7 @@ async fn list_dns_providers(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let providers = state.provider_service.list().await?;
 
@@ -536,9 +537,10 @@ async fn list_dns_providers(
 async fn create_dns_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
     let credentials: ProviderCredentials = request.credentials.into();
 
@@ -567,8 +569,8 @@ async fn create_dns_provider(
 
     let response = DnsProviderResponse {
         id: provider.id,
-        name: provider.name,
-        provider_type: provider.provider_type,
+        name: provider.name.clone(),
+        provider_type: provider.provider_type.clone(),
         credentials: masked_creds,
         is_active: provider.is_active,
         description: provider.description,
@@ -578,6 +580,20 @@ async fn create_dns_provider(
         created_at: provider.created_at.to_rfc3339(),
         updated_at: provider.updated_at.to_rfc3339(),
     };
+
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider.id,
+        "",
+        "DNS_PROVIDER_CREATED",
+        serde_json::json!({
+            "provider_name": provider.name,
+            "provider_type": provider.provider_type,
+        }),
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -600,7 +616,7 @@ async fn get_dns_provider(
     State(state): State<Arc<DnsAppState>>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let provider = state.provider_service.get(id).await?;
 
@@ -650,11 +666,18 @@ async fn get_dns_provider(
 async fn update_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
     Json(request): Json<UpdateDnsProviderRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
+    let changed_fields = serde_json::json!({
+        "name": request.name.is_some(),
+        "credentials": request.credentials.is_some(),
+        "description": request.description.is_some(),
+        "is_active": request.is_active,
+    });
     let credentials: Option<ProviderCredentials> = request.credentials.map(|c| c.into());
 
     if let Some(credentials) = &credentials {
@@ -699,6 +722,17 @@ async fn update_provider(
         updated_at: provider.updated_at.to_rfc3339(),
     };
 
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider.id,
+        "",
+        "DNS_PROVIDER_UPDATED",
+        changed_fields,
+    )
+    .await;
+
     Ok(Json(response))
 }
 
@@ -718,11 +752,26 @@ async fn update_provider(
 async fn delete_dns_provider(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
+    let provider = state.provider_service.get(id).await?;
     state.provider_service.delete(id).await?;
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        id,
+        "",
+        "DNS_PROVIDER_DELETED",
+        serde_json::json!({
+            "provider_name": provider.name,
+            "provider_type": provider.provider_type,
+        }),
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -743,11 +792,22 @@ async fn delete_dns_provider(
 async fn test_provider_connection(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
     let success = state.provider_service.test_connection(id).await?;
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        id,
+        "",
+        "DNS_PROVIDER_CONNECTION_TESTED",
+        serde_json::json!({ "success": success }),
+    )
+    .await;
 
     let response = ConnectionTestResult {
         success,
@@ -779,7 +839,7 @@ async fn list_provider_zones(
     State(state): State<Arc<DnsAppState>>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let provider = state.provider_service.get(id).await?;
     let instance = state.provider_service.create_provider_instance(&provider)?;
@@ -807,10 +867,14 @@ async fn list_provider_zones(
 async fn add_managed_domain(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
     Json(request): Json<AddManagedDomainApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    if request.auto_manage {
+        permission_check!(auth, Permission::DnsAutomationWrite);
+    }
 
     let managed = state
         .provider_service
@@ -824,6 +888,20 @@ async fn add_managed_domain(
             },
         )
         .await?;
+
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        id,
+        &managed.domain,
+        "DNS_MANAGED_DOMAIN_ADDED",
+        serde_json::json!({
+            "auto_manage": managed.auto_manage,
+            "verified": managed.verified,
+        }),
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,
@@ -849,7 +927,7 @@ async fn list_managed_domains(
     State(state): State<Arc<DnsAppState>>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let domains = state.provider_service.list_managed_domains(id).await?;
 
@@ -877,14 +955,25 @@ async fn list_managed_domains(
 async fn remove_managed_domain(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((provider_id, domain)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
     state
         .provider_service
         .remove_managed_domain(provider_id, &domain)
         .await?;
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider_id,
+        &domain,
+        "DNS_MANAGED_DOMAIN_REMOVED",
+        serde_json::json!({}),
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -905,9 +994,10 @@ async fn remove_managed_domain(
 async fn verify_managed_domain(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((provider_id, domain)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
     let _verified = state
         .provider_service
@@ -923,6 +1013,16 @@ async fn verify_managed_domain(
         .into_iter()
         .find(|d| d.domain == domain)
         .ok_or_else(|| DnsError::DomainNotFound(domain))?;
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider_id,
+        &managed.domain,
+        "DNS_MANAGED_DOMAIN_VERIFIED",
+        serde_json::json!({ "verified": managed.verified }),
+    )
+    .await;
 
     Ok(Json(ManagedDomainResponse::from(managed)))
 }
@@ -948,7 +1048,15 @@ async fn update_managed_domain(
     Path((provider_id, domain)): Path<(i32, String)>,
     Json(request): Json<UpdateManagedDomainApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
+    if request.auto_manage == Some(true) {
+        permission_check!(auth, Permission::DnsAutomationWrite);
+    }
+    let changes = serde_json::json!({
+        "generated_hostname_mode": request.generated_hostname_mode,
+        "sync_generated_records": request.sync_generated_records,
+        "auto_manage": request.auto_manage,
+    });
 
     let updated = state
         .provider_service
@@ -963,13 +1071,14 @@ async fn update_managed_domain(
         )
         .await?;
 
-    log_managed_domain_audit(
+    log_dns_governance_audit(
         &state,
         &auth,
         &metadata,
         provider_id,
         &domain,
         "DNS_MANAGED_DOMAIN_UPDATED",
+        changes,
     )
     .await;
 
@@ -1009,7 +1118,7 @@ async fn preview_hostname_mode(
     Path((provider_id, domain)): Path<(i32, String)>,
     Query(query): Query<HostnamePreviewQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsRead);
+    permission_check!(auth, Permission::DnsProvidersRead);
 
     let target = PublicHostnameStrategy::from_db_str(&query.mode);
     let result = state
@@ -1042,7 +1151,7 @@ async fn apply_hostname_mode(
     Path((provider_id, domain)): Path<(i32, String)>,
     Json(request): Json<ApplyHostnameModeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_check!(auth, Permission::SettingsWrite);
+    permission_check!(auth, Permission::DnsProvidersWrite);
 
     let target = PublicHostnameStrategy::from_db_str(&request.mode);
     let result = state
@@ -1066,13 +1175,17 @@ async fn apply_hostname_mode(
         );
     }
 
-    log_managed_domain_audit(
+    log_dns_governance_audit(
         &state,
         &auth,
         &metadata,
         provider_id,
         &domain,
         "DNS_HOSTNAME_MODE_APPLIED",
+        serde_json::json!({
+            "mode": request.mode,
+            "sync_dns": request.sync_dns,
+        }),
     )
     .await;
 
@@ -1080,15 +1193,16 @@ async fn apply_hostname_mode(
 }
 
 /// Emit an audit log for a managed-domain write; failure is logged, not fatal.
-async fn log_managed_domain_audit(
+async fn log_dns_governance_audit(
     state: &Arc<DnsAppState>,
     auth: &temps_auth::AuthContext,
     metadata: &RequestMetadata,
     provider_id: i32,
     domain: &str,
     action: &str,
+    details: serde_json::Value,
 ) {
-    let audit = ManagedDomainAudit {
+    let audit = DnsGovernanceAudit {
         context: AuditContext {
             user_id: auth.user_id(),
             ip_address: Some(metadata.ip_address.clone()),
@@ -1097,6 +1211,7 @@ async fn log_managed_domain_audit(
         provider_id,
         domain: domain.to_string(),
         action: action.to_string(),
+        details,
     };
     if let Err(e) = state.audit.create_audit_log(&audit).await {
         tracing::error!("Failed to create audit log: {}", e);

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, AuditLoggerSlot};
 use utoipa::OpenApi;
 
 use crate::{handlers, AuditService};
@@ -42,7 +42,10 @@ impl TempsPlugin for AuditPlugin {
             // Create AuditService
             let audit_service = Arc::new(AuditService::new(db.clone(), ip_address_service.clone()));
             context.register_service(audit_service.clone());
-            let audit_trait: Arc<dyn AuditLogger> = audit_service.clone();
+            let initial_logger: Arc<dyn AuditLogger> = audit_service.clone();
+            let audit_slot = Arc::new(AuditLoggerSlot::new(initial_logger));
+            context.register_service(audit_slot.clone());
+            let audit_trait: Arc<dyn AuditLogger> = audit_slot;
             context.register_service(audit_trait);
 
             tracing::debug!("Audit plugin services registered successfully");

@@ -1841,6 +1841,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Background DNS mutation is fail-closed until an optional policy plugin
+    // claims this slot. DomainsPlugin captures the slot before later plugins
+    // register, so the indirection must exist before plugin initialization.
+    let dns_automation_gate_slot = Arc::new(temps_core::DnsAutomationGateSlot::new());
+    service_context.register_service(dns_automation_gate_slot);
     // Pre-registered before any plugin runs so ProxyPlugin uses this exact
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
