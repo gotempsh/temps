@@ -411,41 +411,21 @@ pub trait SandboxProvider: Send + Sync {
     /// close+reopen cycle.
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError>;
 
-    /// Reclaim per-sandbox persistent storage that no longer belongs to any
-    /// sandbox, returning how many items were freed.
-    ///
-    /// This is the backstop for the disk-fill failure mode: a host that
-    /// creates and destroys many sandboxes accumulates storage whenever a
-    /// destroy can't complete its own cleanup — the provider was
-    /// unreachable mid-destroy, the process was killed between removing the
-    /// container and removing the volume, or the sandbox predates a naming
-    /// fix. Destroy staying best-effort is deliberate (a user must always
-    /// be able to delete a sandbox even when Docker is unhappy), so
-    /// something has to sweep up afterwards.
-    ///
-    /// `claimed` is the set of storage names the caller knows a live
-    /// sandbox may still want — for Docker, home volume names. Providers
-    /// MUST NOT reclaim anything in it. The caller owns this judgement
-    /// because only it can see the database: "no container references this
-    /// volume" is a much weaker statement than "no sandbox wants this
-    /// volume", and the gap between them is where user data gets destroyed
-    /// (a sandbox mid-recreate, or a volume deliberately kept by
-    /// `destroy(purge_volumes: false)`, has no container either).
-    ///
-    /// Beyond that, implementations MUST only reclaim storage that is
-    /// provably unreferenced and provably theirs.
-    ///
-    /// The default reclaims nothing. That is correct only for backends that
-    /// own no storage outliving a sandbox — `LocalSandboxProvider`, whose
-    /// work dirs belong to the executor. Docker and Firecracker both
-    /// override it.
-    async fn reap_orphaned_volumes(
-        &self,
-        claimed: &std::collections::HashSet<String>,
-    ) -> Result<u32, AgentError> {
-        let _ = claimed;
-        Ok(0)
-    }
+    // NOTE: there is deliberately no background "reclaim orphaned storage"
+    // hook here. Sandbox storage is freed only by an explicit destroy,
+    // which knows exactly which volume belongs to the sandbox being
+    // deleted. A sweep has to *infer* that instead, and every predicate we
+    // tried infers it wrong somewhere: "no container references it" also
+    // describes a sandbox mid-recreate whose image is still pulling, and
+    // "no database row claims it" also describes every sandbox belonging to
+    // a second temps instance sharing the same Docker daemon, or to a
+    // database that was restored, swapped, or cascade-deleted. Getting it
+    // wrong destroys a user's `/home/temps` — Claude credentials, shell
+    // history, project state — silently and irreversibly.
+    //
+    // Volumes stranded by older builds are reclaimed by the operator with
+    // `docker volume prune --filter label=sh.temps.sandbox.home`, which is
+    // explicit, reviewable, and cannot run while they aren't looking.
 
     /// Stop a running sandbox without removing it. Default implementation
     /// reports the operation as unsupported so non-Docker backends compile

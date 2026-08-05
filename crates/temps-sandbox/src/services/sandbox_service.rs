@@ -1076,30 +1076,27 @@ TEMPS_ASKPASS_EOF\n\
         }
 
         self.jobs.abort_all(row.id).await;
-        let container_gone = match self.registry.destroy(row.id, public_id_value).await {
-            Ok(()) => true,
-            Err(e) => {
-                // Even if the container destroy failed, mark the row
-                // destroyed — otherwise the user is stuck with a zombie
-                // they can't delete. Log the provider error loudly.
-                tracing::error!(
-                    "Provider destroy failed for sandbox {} (internal {}): {} — marking row destroyed anyway",
-                    public_id_value,
-                    row.id,
-                    e
-                );
-                false
-            }
-        };
-        // Only pull the work dir out from under the container once we know
-        // the container is actually gone. If the provider destroy failed
-        // the container may still be running with this directory bind-mounted
-        // at /workspace, and deleting it live would half-succeed against an
-        // active writer. The sweeper's work-dir reap reclaims it later —
-        // the row is already destroyed, so it will not be claimed.
-        if container_gone {
-            self.remove_work_dir(public_id_value).await;
+        if let Err(e) = self.registry.destroy(row.id, public_id_value).await {
+            // Even if the container destroy failed, mark the row
+            // destroyed — otherwise the user is stuck with a zombie
+            // they can't delete. Log the provider error loudly.
+            tracing::error!(
+                "Provider destroy failed for sandbox {} (internal {}): {} — marking row destroyed anyway",
+                public_id_value,
+                row.id,
+                e
+            );
         }
+        // Remove the work dir even when the provider destroy failed. There
+        // is no background sweep to fall back on — this call is the only
+        // thing that ever frees the directory, so skipping it here means
+        // leaking it permanently, which is the bug this fixes. The tradeoff
+        // is that a failed destroy may leave a container still running with
+        // this directory bind-mounted at /workspace, and the delete then
+        // races that writer. Deleting is still the right call: the user
+        // explicitly asked for the sandbox to be gone, and the row is
+        // marked destroyed either way.
+        self.remove_work_dir(public_id_value).await;
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
         Ok(())
