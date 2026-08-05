@@ -689,58 +689,64 @@ impl AuthService {
         // Validate password complexity
         validate_password_complexity(&request.new_password)?;
 
-        // Find user by reset token
-        let transaction = self.db.begin().await?;
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::PasswordResetToken.eq(&request.token))
-            .lock_exclusive()
-            .one(&transaction)
-            .await?
-            .ok_or(UserAuthError::InvalidToken)?;
+        self.db
+            .transaction::<_, temps_entities::users::Model, UserAuthError>(|transaction| {
+                Box::pin(async move {
+                    // Find user by reset token. The transaction callback guarantees that
+                    // every rejection path is rolled back before this method returns.
+                    let user = temps_entities::users::Entity::find()
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
+                        )
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await?
+                        .ok_or(UserAuthError::InvalidToken)?;
 
-        // Check if token is expired
-        if let Some(expires_at) = user.password_reset_expires {
-            if expires_at < Utc::now() {
-                return Err(UserAuthError::InvalidToken);
-            }
-        } else {
-            return Err(UserAuthError::InvalidToken);
-        }
+                    // Check if token is expired
+                    if user
+                        .password_reset_expires
+                        .is_none_or(|expires_at| expires_at < Utc::now())
+                    {
+                        return Err(UserAuthError::InvalidToken);
+                    }
 
-        if user.must_change_password {
-            if let Some(current_hash) = user.password_hash.as_deref() {
-                let parsed_hash = argon2::password_hash::PasswordHash::new(current_hash)
-                    .map_err(|_| UserAuthError::PasswordHashError)?;
-                if argon2::Argon2::default()
-                    .verify_password(request.new_password.as_bytes(), &parsed_hash)
-                    .is_ok()
-                {
-                    return Err(UserAuthError::SamePassword);
-                }
-            }
-        }
+                    if user.must_change_password {
+                        if let Some(current_hash) = user.password_hash.as_deref() {
+                            let parsed_hash =
+                                argon2::password_hash::PasswordHash::new(current_hash)
+                                    .map_err(|_| UserAuthError::PasswordHashError)?;
+                            if argon2::Argon2::default()
+                                .verify_password(request.new_password.as_bytes(), &parsed_hash)
+                                .is_ok()
+                            {
+                                return Err(UserAuthError::SamePassword);
+                            }
+                        }
+                    }
 
-        // Hash new password
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
-        let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
+                    // Hash new password
+                    use argon2::password_hash::{rand_core::OsRng, SaltString};
+                    let argon2 = argon2::Argon2::default();
+                    let salt = SaltString::generate(&mut OsRng);
 
-        let password_hash = argon2
-            .hash_password(request.new_password.as_bytes(), &salt)
-            .map_err(|_| UserAuthError::PasswordHashError)?
-            .to_string();
+                    let password_hash = argon2
+                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .map_err(|_| UserAuthError::PasswordHashError)?
+                        .to_string();
 
-        // Update user password and clear reset token
-        let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.password_reset_token = Set(None);
-        user_update.password_reset_expires = Set(None);
-        user_update.must_change_password = Set(false);
-        user_update.updated_at = Set(Utc::now());
-        let updated_user = user_update.update(&transaction).await?;
-        transaction.commit().await?;
-
-        Ok(updated_user)
+                    // Update user password and clear reset token
+                    let mut user_update: temps_entities::users::ActiveModel = user.into();
+                    user_update.password_hash = Set(Some(password_hash));
+                    user_update.password_reset_token = Set(None);
+                    user_update.password_reset_expires = Set(None);
+                    user_update.must_change_password = Set(false);
+                    user_update.updated_at = Set(Utc::now());
+                    user_update.update(transaction).await.map_err(Into::into)
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Complete the first-login password change. Unlike an email reset, this
@@ -752,49 +758,55 @@ impl AuthService {
     ) -> Result<temps_entities::users::Model, UserAuthError> {
         validate_password_complexity(&request.new_password)?;
 
-        let transaction = self.db.begin().await?;
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::PasswordResetToken.eq(&request.token))
-            .lock_exclusive()
-            .one(&transaction)
-            .await?
-            .ok_or(UserAuthError::InvalidToken)?;
+        self.db
+            .transaction::<_, temps_entities::users::Model, UserAuthError>(|transaction| {
+                Box::pin(async move {
+                    let user = temps_entities::users::Entity::find()
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
+                        )
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await?
+                        .ok_or(UserAuthError::InvalidToken)?;
 
-        if !user.must_change_password
-            || user
-                .password_reset_expires
-                .is_none_or(|expires_at| expires_at < Utc::now())
-        {
-            return Err(UserAuthError::InvalidToken);
-        }
+                    if !user.must_change_password
+                        || user
+                            .password_reset_expires
+                            .is_none_or(|expires_at| expires_at < Utc::now())
+                    {
+                        return Err(UserAuthError::InvalidToken);
+                    }
 
-        if let Some(current_hash) = user.password_hash.as_deref() {
-            let parsed_hash = argon2::password_hash::PasswordHash::new(current_hash)
-                .map_err(|_| UserAuthError::PasswordHashError)?;
-            if argon2::Argon2::default()
-                .verify_password(request.new_password.as_bytes(), &parsed_hash)
-                .is_ok()
-            {
-                return Err(UserAuthError::SamePassword);
-            }
-        }
+                    if let Some(current_hash) = user.password_hash.as_deref() {
+                        let parsed_hash = argon2::password_hash::PasswordHash::new(current_hash)
+                            .map_err(|_| UserAuthError::PasswordHashError)?;
+                        if argon2::Argon2::default()
+                            .verify_password(request.new_password.as_bytes(), &parsed_hash)
+                            .is_ok()
+                        {
+                            return Err(UserAuthError::SamePassword);
+                        }
+                    }
 
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = argon2::Argon2::default()
-            .hash_password(request.new_password.as_bytes(), &salt)
-            .map_err(|_| UserAuthError::PasswordHashError)?
-            .to_string();
+                    use argon2::password_hash::{rand_core::OsRng, SaltString};
+                    let salt = SaltString::generate(&mut OsRng);
+                    let password_hash = argon2::Argon2::default()
+                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .map_err(|_| UserAuthError::PasswordHashError)?
+                        .to_string();
 
-        let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.password_reset_token = Set(None);
-        user_update.password_reset_expires = Set(None);
-        user_update.must_change_password = Set(false);
-        user_update.updated_at = Set(Utc::now());
-        let updated_user = user_update.update(&transaction).await?;
-        transaction.commit().await?;
-        Ok(updated_user)
+                    let mut user_update: temps_entities::users::ActiveModel = user.into();
+                    user_update.password_hash = Set(Some(password_hash));
+                    user_update.password_reset_token = Set(None);
+                    user_update.password_reset_expires = Set(None);
+                    user_update.must_change_password = Set(false);
+                    user_update.updated_at = Set(Utc::now());
+                    user_update.update(transaction).await.map_err(Into::into)
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn requires_mfa_enrollment(&self, user_id: i32) -> Result<bool, UserAuthError> {
@@ -1119,6 +1131,15 @@ impl From<sea_orm::DbErr> for UserAuthError {
             return UserAuthError::EmailAlreadyRegistered;
         }
         UserAuthError::DatabaseError(error)
+    }
+}
+
+impl From<sea_orm::TransactionError<UserAuthError>> for UserAuthError {
+    fn from(error: sea_orm::TransactionError<UserAuthError>) -> Self {
+        match error {
+            sea_orm::TransactionError::Transaction(error) => error,
+            sea_orm::TransactionError::Connection(error) => error.into(),
+        }
     }
 }
 
