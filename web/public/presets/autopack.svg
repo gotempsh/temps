@@ -1,0 +1,17 @@
+<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" role="img" fill="#14B8A6">
+  <title>autopack</title>
+  <!-- An open isometric box whose chevron lid doubles as an up arrow: the
+       container image autopack produces, caught mid-pack. The open lid is what
+       separates it from the closed package cube every registry uses.
+       Deliberately not a triangle — that is Vercel's, and temps competes with
+       them — and not a letter "A", which is Astro's and sits three tiles away
+       in the same preset picker.
+       Teal, not green: Node.js owns green in that picker, and autopack builds
+       24 ecosystems, so reading as a Node tool is actively wrong. Teal is also
+       clear of Docker/Nixpacks blue and Astro purple.
+       Single colour, 24x24, gaps carrying the shape, so it holds at 16px on a
+       light tile and a dark one alike. -->
+  <path d="M12 1.4 20.4 6.25V8.6L12 3.75 3.6 8.6V6.25Z"/>
+  <path d="M3.99 9.6 11.71 14.07V23L3.99 18.53Z"/>
+  <path d="M20.01 9.6 12.29 14.07V23L20.01 18.53Z"/>
+</svg>

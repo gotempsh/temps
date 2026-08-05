@@ -198,7 +198,12 @@ pub fn detect_node_framework(project_path: &Path) -> NodeFramework {
         }
     };
 
-    let package_json: PackageJson = match serde_json::from_str(&package_json_content) {
+    detect_node_framework_from_package_json(&package_json_content)
+}
+
+/// Detect a framework from already-confined, size-bounded package.json text.
+pub fn detect_node_framework_from_package_json(package_json_content: &str) -> NodeFramework {
+    let package_json: PackageJson = match serde_json::from_str(package_json_content) {
         Ok(pkg) => pkg,
         Err(e) => {
             warn!("Failed to parse package.json: {}", e);

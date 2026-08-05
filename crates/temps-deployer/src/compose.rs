@@ -235,27 +235,76 @@ impl ComposeExecutor {
     /// Tear down containers before a redeploy. Preserves volumes (database data,
     /// uploads, etc.) so they survive between deployments.
     pub async fn teardown_for_redeploy(&self, project_name: &str) -> Result<(), ComposeError> {
-        let project_dir = self.project_dir(project_name);
+        self.teardown_at(project_name, None, None, &HashMap::new())
+            .await
+    }
+
+    /// Tear down a Compose stack from the exact directory used for `up`.
+    /// Uploaded/Git deployments run Compose inside their checkout rather than
+    /// the data-dir fallback, so compensation must retain that location.
+    pub async fn teardown_at(
+        &self,
+        project_name: &str,
+        repo_dir: Option<&Path>,
+        compose_path: Option<&str>,
+        environment_vars: &HashMap<String, String>,
+    ) -> Result<(), ComposeError> {
+        if let Some(compose_path) = compose_path {
+            Self::validate_relative_path(compose_path, "compose_path")?;
+        }
+        let project_dir = repo_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.project_dir(project_name));
 
         if !project_dir.exists() {
             debug!(project = %project_name, "Project directory does not exist, nothing to tear down");
             return Ok(());
         }
 
-        let compose_file = self.find_compose_file(&project_dir);
+        let compose_file = compose_path
+            .map(ToString::to_string)
+            .unwrap_or_else(|| self.find_compose_file(&project_dir));
 
         // down WITHOUT --volumes: removes containers and networks, keeps volumes
-        let output = tokio::process::Command::new("docker")
+        let mut command = tokio::process::Command::new("docker");
+        command
             .args(["compose", "-p", project_name])
-            .args(["-f", &compose_file])
-            .args(["down", "--remove-orphans"])
+            .args(["-f", &compose_file]);
+        for generated in [
+            "docker-compose.temps-env.yml",
+            "docker-compose.temps-override.yml",
+            "docker-compose.temps-labels.yml",
+            "docker-compose.temps-security.yml",
+        ] {
+            if project_dir.join(generated).exists() {
+                command.args(["-f", generated]);
+            }
+        }
+        for env_file in [".env.temps", ".env"] {
+            if project_dir.join(env_file).exists() {
+                command.args(["--env-file", env_file]);
+            }
+        }
+        for (key, value) in environment_vars {
+            command.env(key, value);
+        }
+        command
+            .args(["down", "--remove-orphans", "--timeout", "30"])
             .current_dir(&project_dir)
-            .output()
-            .await?;
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(35), command.output())
+            .await
+            .map_err(|_| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: "docker compose down timed out after 35 seconds".to_string(),
+            })??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(project = %project_name, stderr = %stderr, "docker compose down failed (best-effort)");
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!("docker compose down failed: {stderr}"),
+            });
         }
 
         info!(project = %project_name, "Compose stack torn down (volumes preserved)");
@@ -603,6 +652,7 @@ impl ComposeExecutor {
         // Block host files exposed through top-level configs/secrets `file:` paths.
         self.validate_top_level_files(&root, "configs")?;
         self.validate_top_level_files(&root, "secrets")?;
+        self.validate_top_level_networks(&root)?;
 
         let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
             return Ok(());
@@ -765,6 +815,64 @@ impl ComposeExecutor {
             self.reject_deploy_devices(service, service_name)?;
             self.validate_build_options(service, service_name)?;
             self.validate_service_volumes(service, service_name, &forbidden_named_volumes)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_top_level_networks(&self, root: &YamlValue) -> Result<(), ComposeError> {
+        let Some(networks) = root.get("networks") else {
+            return Ok(());
+        };
+        let Some(networks) = networks.as_mapping() else {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: "<top-level>".to_string(),
+                field: "networks".to_string(),
+                reason: "top-level networks must be a mapping".to_string(),
+            });
+        };
+
+        for (network_name, network) in networks {
+            let name = network_name.as_str().unwrap_or("<non-string>");
+            if network.is_null() {
+                continue;
+            }
+            let Some(options) = network.as_mapping() else {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<top-level>".to_string(),
+                    field: format!("networks.{name}"),
+                    reason: "network configuration must be a mapping".to_string(),
+                });
+            };
+
+            if options.contains_key(YamlValue::String("external".to_string())) {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: "<top-level>".to_string(),
+                    field: format!("networks.{name}.external"),
+                    reason: "external Compose networks bypass Temps-managed network policy"
+                        .to_string(),
+                });
+            }
+
+            if let Some(driver) = options.get(YamlValue::String("driver".to_string())) {
+                let Some(driver) = driver.as_str() else {
+                    return Err(ComposeError::SecurityPolicyViolation {
+                        service: "<top-level>".to_string(),
+                        field: format!("networks.{name}.driver"),
+                        reason: "network driver must be the literal value 'bridge'".to_string(),
+                    });
+                };
+                if driver != "bridge" {
+                    return Err(ComposeError::SecurityPolicyViolation {
+                        service: "<top-level>".to_string(),
+                        field: format!("networks.{name}.driver"),
+                        reason: format!(
+                            "network driver '{driver}' can bypass routed host filtering; \
+                             only the bridge driver is allowed"
+                        ),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -1885,6 +1993,7 @@ impl ComposeExecutor {
             "shm_size",
             "tmpfs",
             "ulimits",
+            "labels",
         ];
 
         for key in service.keys().filter_map(Self::yaml_key) {
@@ -1995,16 +2104,17 @@ impl ComposeExecutor {
             cmd.args(["-f", "docker-compose.temps-env.yml"]);
         }
 
-        // Include Temps labels override (injects sh.temps.* labels for log collection)
-        let labels_override = project_dir.join("docker-compose.temps-labels.yml");
-        if labels_override.exists() {
-            cmd.args(["-f", "docker-compose.temps-labels.yml"]);
-        }
-
         // Include user-provided override (ports, volumes, etc.)
         let user_override = project_dir.join("docker-compose.temps-override.yml");
         if user_override.exists() {
             cmd.args(["-f", "docker-compose.temps-override.yml"]);
+        }
+
+        // Apply reserved ownership labels after all tenant-controlled files so
+        // an inline override cannot erase or spoof the cleanup boundary.
+        let labels_override = project_dir.join("docker-compose.temps-labels.yml");
+        if labels_override.exists() {
+            cmd.args(["-f", "docker-compose.temps-labels.yml"]);
         }
 
         // Include Temps security override LAST so its sandbox hardening
@@ -2045,6 +2155,10 @@ impl ComposeExecutor {
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
+
+        // Cancellation drops the command future; terminate the Compose CLI so
+        // compensating `compose down` cannot race a still-running `compose up`.
+        cmd.kill_on_drop(true);
 
         debug!(project = %project_name, "Running docker compose up");
 
@@ -2763,6 +2877,7 @@ services:
             "sysctls: {net.ipv4.ip_forward: '1'}",
             "volumes: ['/:/host:rw']",
             "volumes_from: ['container:temps-db']",
+            "labels: {sh.temps.managed: 'false'}",
         ];
 
         for dangerous_override in dangerous_overrides {
@@ -2979,6 +3094,48 @@ services:
             error,
             ComposeError::SecurityPolicyViolation { field, .. } if field == "volumes"
         ));
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_rejects_network_filter_bypasses() {
+        let docker = Docker::connect_with_defaults().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), PathBuf::from("/tmp/test"));
+
+        for (field, network) in [
+            ("networks.direct.driver", "driver: macvlan"),
+            ("networks.direct.driver", "driver: ipvlan"),
+            ("networks.direct.external", "external: true"),
+        ] {
+            let compose = format!(
+                "services:\n  web:\n    image: alpine\n    networks: [direct]\nnetworks:\n  direct:\n    {network}\n"
+            );
+            let error = executor
+                .validate_compose_security_policy("compose file", &compose)
+                .expect_err("L2 and external networks must not bypass metadata filtering");
+            assert!(matches!(
+                error,
+                ComposeError::SecurityPolicyViolation { field: actual, .. } if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_allows_managed_bridge_network() {
+        let docker = Docker::connect_with_defaults().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), PathBuf::from("/tmp/test"));
+        let compose = r#"
+services:
+  web:
+    image: alpine
+    networks: [app]
+networks:
+  app:
+    driver: bridge
+"#;
+
+        executor
+            .validate_compose_security_policy("compose file", compose)
+            .expect("managed bridge networks remain supported");
     }
 
     #[test]

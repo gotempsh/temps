@@ -2,7 +2,6 @@
 
 import {
   assignRoleMutation,
-  createUserMutation,
   deleteUserMutation,
   removeRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -37,30 +36,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
-import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Edit2,
-  Eye,
-  EyeOff,
   MoreHorizontal,
   Plus,
   Shield,
@@ -68,27 +48,21 @@ import {
   UserPlus,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
-import { z } from 'zod'
-
-const createUserSchema = z.object({
-  name: z.string().min(3, 'Name must be at least 3 characters'),
-  email: z.email('Invalid email address'),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
-  role: z.string().min(1, 'Please select a role'),
-})
-
-type CreateUserFormData = z.infer<typeof createUserSchema>
+import { RolePermissionDetails } from './RolePermissionDetails'
 
 const availableRoles = [
   {
     value: 'admin',
     label: 'Administrator',
-    description: 'Full access to all features',
+    description: 'Full control of projects, users, settings, and the system.',
   },
-  { value: 'user', label: 'User', description: 'Standard user access' },
+  {
+    value: 'user',
+    label: 'User',
+    description: 'Can deploy and operate every existing and future project.',
+  },
 ]
 
 interface UsersManagementProps {
@@ -96,8 +70,6 @@ interface UsersManagementProps {
   isLoading: boolean
   reloadUsers: () => void
   onEditUser: (user: { id: number; name: string; email: string }) => void
-  isCreateDialogOpen: boolean
-  onCreateDialogOpenChange: (open: boolean) => void
 }
 
 export function UsersManagement({
@@ -105,41 +77,12 @@ export function UsersManagement({
   isLoading,
   reloadUsers,
   onEditUser,
-  isCreateDialogOpen,
-  onCreateDialogOpenChange,
 }: UsersManagementProps) {
   const [userToDelete, setUserToDelete] = useState<number | null>(null)
   const [userToManageRoles, setUserToManageRoles] =
     useState<RouteUserWithRoles | null>(null)
-  const [showPassword, setShowPassword] = useState(false)
   const queryClient = useQueryClient()
   const navigate = useNavigate()
-
-  const form = useForm<CreateUserFormData>({
-    resolver: zodResolver(createUserSchema),
-    defaultValues: {
-      name: '',
-      email: '',
-      password: '',
-      role: 'user',
-    },
-  })
-
-  // Use register mutation for creating users with passwords
-  const createUser = useMutation({
-    ...createUserMutation(),
-    meta: {
-      errorTitle: 'Failed to create user',
-    },
-    onSuccess: async () => {
-      // Roles are already assigned in the body during creation
-      // No need to assign them again here - that would create duplicates
-      toast.success('User created successfully')
-      onCreateDialogOpenChange(false)
-      form.reset()
-      reloadUsers()
-    },
-  })
 
   const deleteUser = useMutation({
     ...deleteUserMutation(),
@@ -205,17 +148,6 @@ export function UsersManagement({
     },
   })
 
-  const handleCreateUser = async (data: CreateUserFormData) => {
-    await createUser.mutateAsync({
-      body: {
-        username: data.name,
-        email: data.email,
-        roles: [data.role],
-        password: data.password,
-      },
-    })
-  }
-
   const handleDeleteUser = async (userId: number) => {
     await deleteUser.mutateAsync({
       path: {
@@ -271,128 +203,10 @@ export function UsersManagement({
           </p>
         </div>
         <CreateActionButton
-          onClick={() => onCreateDialogOpenChange(true)}
+          onClick={() => navigate('/settings/users/new')}
           label="Add User"
           icon={<UserPlus className="h-4 w-4" />}
         />
-        <Dialog open={isCreateDialogOpen} onOpenChange={onCreateDialogOpenChange}>
-          <DialogContent className="sm:max-w-[425px]">
-            <DialogHeader>
-              <DialogTitle>Create New User</DialogTitle>
-            </DialogHeader>
-            <Form {...form}>
-              <form
-                onSubmit={form.handleSubmit(handleCreateUser)}
-                className="space-y-4"
-              >
-                <FormField
-                  control={form.control}
-                  name="name"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Name</FormLabel>
-                      <FormControl>
-                        <Input placeholder="John Doe" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name="email"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Email</FormLabel>
-                      <FormControl>
-                        <Input
-                          type="email"
-                          placeholder="john@example.com"
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name="password"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Password</FormLabel>
-                      <FormControl>
-                        <div className="relative">
-                          <Input
-                            type={showPassword ? 'text' : 'password'}
-                            placeholder="Enter password"
-                            {...field}
-                          />
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
-                            onClick={() => setShowPassword(!showPassword)}
-                          >
-                            {showPassword ? (
-                              <EyeOff className="h-4 w-4" />
-                            ) : (
-                              <Eye className="h-4 w-4" />
-                            )}
-                          </Button>
-                        </div>
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name="role"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Role</FormLabel>
-                      <Select
-                        value={field.value}
-                        onValueChange={field.onChange}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select a role">
-                              {field.value &&
-                                availableRoles.find(
-                                  (r) => r.value === field.value
-                                )?.label}
-                            </SelectValue>
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {availableRoles.map((role) => (
-                            <SelectItem key={role.value} value={role.value}>
-                              <div>
-                                <div className="font-medium">{role.label}</div>
-                                <div className="text-xs text-muted-foreground">
-                                  {role.description}
-                                </div>
-                              </div>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <DialogFooter>
-                  <Button type="submit" disabled={createUser.isPending}>
-                    {createUser.isPending ? 'Creating...' : 'Create User'}
-                  </Button>
-                </DialogFooter>
-              </form>
-            </Form>
-          </DialogContent>
-        </Dialog>
       </div>
 
       <AlertDialog
@@ -424,7 +238,7 @@ export function UsersManagement({
         open={!!userToManageRoles}
         onOpenChange={(open) => !open && setUserToManageRoles(null)}
       >
-        <DialogContent className="sm:max-w-[425px]">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Manage User Role</DialogTitle>
             <p className="text-sm text-muted-foreground">
@@ -500,6 +314,15 @@ export function UsersManagement({
                 })}
               </RadioGroup>
             )}
+            {userToManageRoles && (
+              <div className="mt-6 border-t border-border/60 pt-6">
+                <RolePermissionDetails
+                  roleNames={Array.from(
+                    new Set(userToManageRoles.roles.map((role) => role.name))
+                  )}
+                />
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button
@@ -539,9 +362,9 @@ export function UsersManagement({
         <EmptyState
           icon={UserPlus}
           title="No users found"
-          description="Get started by creating a new user"
+          description="Get started by creating a new user."
           action={
-            <Button onClick={() => onCreateDialogOpenChange(true)}>
+            <Button onClick={() => navigate('/settings/users/new')}>
               <Plus className="mr-2 h-4 w-4" />
               Add User
             </Button>

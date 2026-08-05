@@ -14,6 +14,14 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { cliDeviceLookupErrorKind } from '@/lib/cliDeviceProblem'
+import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
+import {
+  cliDeviceApproveMutation,
+  cliDeviceDenyMutation,
+  cliDeviceLookupOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Check, X, AlertTriangle, Terminal } from 'lucide-react'
 
 /**
@@ -32,6 +40,8 @@ export function CliLogin() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { user } = useAuth()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   // Allow `/cli-login` without a code by letting the user paste it. Most
   // traffic arrives at `/cli-login/:userCode`, but the route without a code
@@ -39,14 +49,11 @@ export function CliLogin() {
   const [pastedCode, setPastedCode] = useState('')
   const userCode = routeCode?.trim().toUpperCase() ?? ''
 
-  // These endpoints are too new to be in the regenerated SDK yet, so we
-  // hand-roll fetch + the cookie-bearing client config. Once `openapi-ts`
-  // runs against a server that has the device routes, this can move to the
-  // generated mutation/query helpers like the rest of the codebase.
-  const lookupQueryKey = ['cli-device-lookup', userCode] as const
+  const lookupOptions = cliDeviceLookupOptions({
+    query: { user_code: userCode },
+  })
   const lookup = useQuery({
-    queryKey: lookupQueryKey,
-    queryFn: () => fetchDeviceLookup(userCode),
+    ...lookupOptions,
     enabled: userCode.length > 0,
     refetchInterval: 5_000,
     refetchOnWindowFocus: false,
@@ -55,20 +62,26 @@ export function CliLogin() {
   })
 
   const approve = useMutation({
-    mutationFn: () => postDeviceAction('approve', userCode),
+    ...cliDeviceApproveMutation(),
     meta: { errorTitle: 'Approval failed' },
     onSuccess: async () => {
       toast.success('CLI device authorized')
-      await queryClient.invalidateQueries({ queryKey: lookupQueryKey })
+      await queryClient.invalidateQueries({ queryKey: lookupOptions.queryKey })
+    },
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => approve.mutate(variables))) {
+        return
+      }
+      toast.error(sensitiveActionErrorMessage(error, 'Approval failed'))
     },
   })
 
   const deny = useMutation({
-    mutationFn: () => postDeviceAction('deny', userCode),
+    ...cliDeviceDenyMutation(),
     meta: { errorTitle: 'Denial failed' },
     onSuccess: async () => {
       toast.success('CLI device login denied')
-      await queryClient.invalidateQueries({ queryKey: lookupQueryKey })
+      await queryClient.invalidateQueries({ queryKey: lookupOptions.queryKey })
     },
   })
 
@@ -135,11 +148,11 @@ export function CliLogin() {
   const requestedIp = lookup.data?.requested_ip
   const expiresAt = lookup.data?.expires_at
 
-  const lookupErrorStatus = (lookup.error as { status?: number } | null)
-    ?.status
+  const lookupErrorKind = cliDeviceLookupErrorKind(lookup.error)
 
   return (
     <div className="flex min-h-[60vh] items-center justify-center p-4">
+      {verificationDialog}
       <Card className="w-full max-w-md">
         <CardHeader>
           <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-md bg-muted">
@@ -148,7 +161,7 @@ export function CliLogin() {
           <CardTitle>Authorize the Temps CLI?</CardTitle>
           <CardDescription>
             A device is requesting access to your account. Verify the details
-            below match what's shown in your terminal.
+            below match what is shown in your terminal.
           </CardDescription>
         </CardHeader>
 
@@ -168,12 +181,12 @@ export function CliLogin() {
               <Skeleton className="h-4 w-1/2" />
               <Skeleton className="h-4 w-2/3" />
             </div>
-          ) : lookupErrorStatus === 404 ? (
+          ) : lookupErrorKind === 'not_found' ? (
             <ErrorRow
               title="Unknown code"
               detail="This code is not recognized. Check the code shown in your terminal."
             />
-          ) : lookupErrorStatus === 410 || status === 'expired' ? (
+          ) : lookupErrorKind === 'expired' || status === 'expired' ? (
             <ErrorRow
               title="Code expired"
               detail="Run the login command again in your terminal to get a fresh code."
@@ -198,9 +211,7 @@ export function CliLogin() {
               <Row
                 label="Expires"
                 value={
-                  expiresAt
-                    ? new Date(expiresAt).toLocaleString()
-                    : 'unknown'
+                  expiresAt ? new Date(expiresAt).toLocaleString() : 'unknown'
                 }
               />
             </dl>
@@ -213,14 +224,14 @@ export function CliLogin() {
               variant="outline"
               className="flex-1"
               disabled={deny.isPending || approve.isPending}
-              onClick={() => deny.mutate()}
+              onClick={() => deny.mutate({ body: { user_code: userCode } })}
             >
               Deny
             </Button>
             <Button
               className="flex-1"
               disabled={deny.isPending || approve.isPending}
-              onClick={() => approve.mutate()}
+              onClick={() => approve.mutate({ body: { user_code: userCode } })}
             >
               Authorize
             </Button>
@@ -278,67 +289,6 @@ function ErrorRow({ title, detail }: { title: string; detail: string }) {
       detail={detail}
     />
   )
-}
-
-interface DeviceLookup {
-  user_code: string
-  status: 'pending' | 'approved' | 'denied' | 'expired'
-  client_name: string | null
-  requested_ip: string | null
-  expires_at: string
-}
-
-/**
- * Wrapper around fetch that throws a `{status, title, detail}` shape so
- * react-query's `meta.errorTitle` and the rest of the UI can categorize
- * server failures the same way they do for the generated SDK.
- */
-async function jsonRequest<T>(
-  method: 'GET' | 'POST',
-  path: string,
-  body?: unknown,
-): Promise<T> {
-  const res = await fetch(path, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  if (!res.ok) {
-    let problem: { title?: string; detail?: string } | null = null
-    try {
-      problem = (await res.json()) as { title?: string; detail?: string }
-    } catch {
-      /* non-JSON body */
-    }
-    const err = new Error(problem?.detail || problem?.title || `Request failed (${res.status})`)
-    ;(err as Error & { status?: number; title?: string; detail?: string }).status = res.status
-    ;(err as Error & { status?: number; title?: string; detail?: string }).title = problem?.title
-    ;(err as Error & { status?: number; title?: string; detail?: string }).detail = problem?.detail
-    throw err
-  }
-  return (await res.json()) as T
-}
-
-// The auth plugin's routes are nested under `/api` by `temps-core`
-// (see `temps-core/src/plugin.rs`), so these endpoints live at
-// `/api/auth/cli/device/{lookup,approve,deny}` — NOT at the server root.
-// Hitting the unprefixed paths hits the SPA catch-all and returns HTML,
-// which silently leaves the page stuck on "unknown" with no Authorize button.
-async function fetchDeviceLookup(userCode: string): Promise<DeviceLookup> {
-  return jsonRequest<DeviceLookup>(
-    'GET',
-    `/api/auth/cli/device/lookup?user_code=${encodeURIComponent(userCode)}`,
-  )
-}
-
-async function postDeviceAction(
-  action: 'approve' | 'deny',
-  userCode: string,
-): Promise<{ user_code: string; status: string }> {
-  return jsonRequest('POST', `/api/auth/cli/device/${action}`, {
-    user_code: userCode,
-  })
 }
 
 // Re-export under both `default` and named so the lazy import in App.tsx

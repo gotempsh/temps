@@ -183,7 +183,12 @@ async fn setup_e2e() -> Option<(
     let storage = Arc::new(TimescaleDbStorage::new(db.clone(), None));
     let auth_service = Arc::new(OtelAuthService::new(db.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(10000, Duration::from_secs(60)));
-    let otel_service = Arc::new(OtelService::new(storage, auth_service, rate_limiter));
+    let otel_service = Arc::new(OtelService::new(
+        storage,
+        auth_service,
+        rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+    ));
     let dashboard_service = Arc::new(temps_otel::services::MetricDashboardService::new(
         db.clone(),
     ));
@@ -716,6 +721,38 @@ async fn test_e2e_missing_api_key_returns_401() {
         response.status(),
         StatusCode::UNAUTHORIZED,
         "Missing API key should return 401"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_ingest_body_over_limit_returns_413() {
+    let Some((_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // One byte over the router's `DefaultBodyLimit` (see `handlers::INGEST_BODY_LIMIT`).
+    // Axum rejects a body whose declared `Content-Length` exceeds the limit
+    // before dispatching to any handler/extractor, so this doesn't need a
+    // valid API key — the limit must fire ahead of auth.
+    let oversized_body = vec![0_u8; temps_otel::handlers::INGEST_BODY_LIMIT + 1];
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/otel/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .body(Body::from(oversized_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Body over the ingest route's DefaultBodyLimit should be rejected with 413, \
+         not reach the handler/auth layer"
     );
 }
 

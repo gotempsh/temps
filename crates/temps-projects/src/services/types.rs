@@ -108,6 +108,11 @@ pub struct CreateProjectRequest {
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Internal only; normal project-creation paths leave it
+    /// unset and operator-defined slugs are never persisted here.
+    #[serde(default)]
+    pub template_slug: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +182,9 @@ pub enum ProjectError {
 
     #[error("Deployment error: {0}")]
     DeploymentError(String),
+
+    #[error("Failed to remove deployment containers for project {project_id}: {reason}")]
+    DeploymentCleanupFailed { project_id: i32, reason: String },
 
     #[error("Other error: {0}")]
     Other(String),

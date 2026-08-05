@@ -229,7 +229,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Backend latency percentiles',
     description:
-      'Upstream duration p50 / p95 / p99 (proxied requests only: connect + processing + TTFB)',
+      'Upstream duration p50 / p95 / p99 (proxied requests only: connect + processing + TTFB). Includes WebSocket/SSE sessions, whose time-to-first-header is a real backend latency even though their total duration is not',
     series: [
       {
         metric: 'proxy.upstream_duration_p50_ms',
@@ -307,7 +307,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Streaming sessions',
     description:
-      'WebSocket tunnels and SSE streams that closed in the interval, and their mean lifetime. These are held open deliberately (up to 1h idle for WebSockets), so a long mean here is expected and is not proxy latency',
+      'WebSocket tunnels and SSE streams that closed, averaged per collection interval (not a total for the bucket). These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
     series: [
       {
         metric: 'proxy.streaming_sessions',

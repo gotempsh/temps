@@ -5,16 +5,18 @@
 //! Return correct OTLP response envelopes.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::{request::Parts, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use prost::Message;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, warn};
 
 use crate::error::OtelError;
-use crate::ingest::auth::{IngestAuth, ServiceAuth};
+use crate::ingest::auth::{IngestAuth, ProjectAuth, ServiceAuth};
 use crate::ingest::decode;
 use crate::proto;
 use crate::services::cross_project::{is_valid_trace_id, TraceHintMsg};
@@ -39,6 +41,12 @@ impl From<OtelError> for Problem {
                 warn!(error = %error, "OTel ingest rate limited");
                 problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
                     .with_title("Rate Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            OtelError::IngestSaturated { .. } => {
+                warn!(error = %error, "OTel ingest saturated");
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("OTel Ingest Saturated")
                     .with_detail(error.to_string())
             }
             OtelError::QuotaExceeded { .. } => {
@@ -83,10 +91,13 @@ impl From<OtelError> for Problem {
             | OtelError::Io(_)
             | OtelError::Serialization(_)
             | OtelError::Internal { .. } => {
+                // Log the real error server-side only — the detail string can
+                // contain DB/S3 error text (schema names, paths) that must not
+                // reach the caller.
                 error!(error = %error, "OTel ingest internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("An internal error occurred")
             }
         }
     }
@@ -283,6 +294,28 @@ struct IngestContext {
     deployment_id: Option<i32>,
 }
 
+/// Holds a process-wide ingest permit for the full handler lifetime. As a
+/// request-parts extractor it runs before Axum buffers the `Bytes` body.
+pub struct IngestPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl FromRequestParts<OtelAppState> for IngestPermit {
+    type Rejection = Problem;
+
+    fn from_request_parts(
+        _parts: &mut Parts,
+        state: &OtelAppState,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let permit = state
+            .otel_service
+            .try_acquire_ingest_permit()
+            .map(|permit| Self { _permit: permit })
+            .map_err(Problem::from);
+        async move { permit }
+    }
+}
+
 /// Authenticate the request and resolve the ingest context.
 ///
 /// For header-only requests the IDs come from the `ProjectAuth` returned
@@ -306,6 +339,13 @@ async fn resolve_ingest_context(
         .authenticate(token, effective_project_id)
         .await?;
 
+    resolve_authenticated_ingest_context(auth, path_ids)
+}
+
+fn resolve_authenticated_ingest_context(
+    auth: ProjectAuth,
+    path_ids: Option<(i32, i32, i32)>,
+) -> Result<IngestContext, OtelError> {
     match path_ids {
         Some((path_project_id, path_environment_id, path_deployment_id)) => {
             // Validate: if the token already binds to a project (dt_ tokens),
@@ -471,16 +511,14 @@ async fn do_ingest_metrics(
         .authenticate_any(token, header_project_id)
         .await?;
 
-    match auth_result {
+    let project_auth = match auth_result {
         IngestAuth::Service(service_auth) => {
             return do_ingest_service_metrics(state, service_auth, headers, body).await;
         }
-        IngestAuth::Project(_) => {
-            // Fall through to the existing project auth path below.
-        }
-    }
+        IngestAuth::Project(auth) => auth,
+    };
 
-    let ctx = resolve_ingest_context(state, token, path_ids, headers).await?;
+    let ctx = resolve_authenticated_ingest_context(project_auth, path_ids)?;
     state.otel_service.check_rate_limit(ctx.project_id)?;
     state.otel_service.check_quota(ctx.project_id).await?;
 
@@ -716,6 +754,7 @@ async fn do_ingest_logs(
 )]
 pub async fn ingest_metrics(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -750,6 +789,7 @@ pub async fn ingest_metrics(
 )]
 pub async fn ingest_traces(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -785,6 +825,7 @@ pub async fn ingest_traces(
 )]
 pub async fn ingest_logs(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -835,6 +876,7 @@ type IngestPathParams = (i32, i32, i32);
 pub async fn ingest_metrics_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -872,6 +914,7 @@ pub async fn ingest_metrics_by_path(
 pub async fn ingest_traces_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -909,6 +952,7 @@ pub async fn ingest_traces_by_path(
 pub async fn ingest_logs_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1045,6 +1089,12 @@ mod tests {
     }
 
     #[test]
+    fn test_error_ingest_saturated_maps_to_503() {
+        let problem: Problem = OtelError::IngestSaturated { limit: 64 }.into();
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn test_error_quota_exceeded_maps_to_413() {
         let err = OtelError::QuotaExceeded {
             project_id: 1,
@@ -1099,6 +1149,23 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
     }
 
+    /// Extracts the `detail` string from a converted `Problem`, for asserting
+    /// on response content (not just status code).
+    fn problem_detail(problem: &Problem) -> &str {
+        problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Internal-error variants must never echo their underlying message (DB
+    /// error text, file paths, S3 reasons) into the HTTP response — only the
+    /// generic detail, with the real error logged server-side instead. See
+    /// `From<OtelError> for Problem`'s `Storage | Database | S3 | Io |
+    /// Serialization | Internal` arm.
+    const SANITIZED_INTERNAL_ERROR_DETAIL: &str = "An internal error occurred";
+
     #[test]
     fn test_error_storage_maps_to_500() {
         let err = OtelError::Storage {
@@ -1106,13 +1173,21 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("disk full"), "detail leaked: {detail}");
     }
 
     #[test]
     fn test_error_database_maps_to_500() {
-        let err = OtelError::Database(sea_orm::DbErr::Custom("test".into()));
+        let err = OtelError::Database(sea_orm::DbErr::Custom(
+            "column \"key_hash\" not found in table \"api_keys\"".into(),
+        ));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("api_keys"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1123,6 +1198,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("timeout"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1130,6 +1208,9 @@ mod tests {
         let err = OtelError::Io(std::io::Error::other("test"));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("test"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1139,6 +1220,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("unexpected"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1177,6 +1261,39 @@ mod tests {
         assert_eq!(params.0, 1);
         assert_eq!(params.1, 2);
         assert_eq!(params.2, 3);
+    }
+
+    #[test]
+    fn authenticated_context_uses_existing_auth_without_another_lookup() {
+        let auth = ProjectAuth {
+            project_id: 10,
+            environment_id: Some(20),
+            deployment_id: Some(30),
+            token_id: 40,
+            project_name: "project".into(),
+        };
+
+        let context = resolve_authenticated_ingest_context(auth, Some((10, 20, 30))).unwrap();
+
+        assert_eq!(context.project_id, 10);
+        assert_eq!(context.environment_id, Some(20));
+        assert_eq!(context.deployment_id, Some(30));
+    }
+
+    #[test]
+    fn authenticated_context_rejects_mismatched_project() {
+        let auth = ProjectAuth {
+            project_id: 10,
+            environment_id: None,
+            deployment_id: None,
+            token_id: 40,
+            project_name: "project".into(),
+        };
+
+        assert!(matches!(
+            resolve_authenticated_ingest_context(auth, Some((11, 20, 30))),
+            Err(OtelError::AuthFailed { .. })
+        ));
     }
 
     // ── otlp_to_store_point tests ────────────────────────────────────

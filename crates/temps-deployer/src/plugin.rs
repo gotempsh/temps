@@ -170,6 +170,16 @@ impl TempsPlugin for DeployerPlugin {
                 );
             }
 
+            // Reconcile the app network and its metadata-egress rules during
+            // every server start, even when cluster DNS is disabled and no new
+            // deployment occurs after a Docker or firewall restart.
+            if let Err(error) = docker_runtime.ensure_network_exists().await {
+                tracing::warn!(
+                    error = %error,
+                    "Could not reconcile the app network during deployer startup"
+                );
+            }
+
             // Learn the daemon's architecture once, up front: every later
             // `get_native_platform()` call is synchronous (the `ImageBuilder`
             // trait requires it) and would otherwise answer with the binary's

@@ -3,12 +3,14 @@
 //! # Route
 //!
 //! ```text
-//! GET /external-services/{service_id}/pg-stat-statements/slow-queries?page=N&page_size=N&sort_by=...&sort_order=...
+//! GET  /external-services/{service_id}/pg-stat-statements/slow-queries?page=N&page_size=N&sort_by=...&sort_order=...
+//! POST /external-services/{service_id}/pg-stat-statements/reset
 //! ```
 //!
-//! Requires `ExternalServicesRead` permission. The caller must have access to
-//! the service's parent project (same access control as every other
-//! per-service endpoint in this plugin).
+//! Reads require `ExternalServicesRead`; mutations require
+//! `ExternalServicesWrite`. The caller must have access to the service's parent
+//! project (same access control as every other per-service endpoint in this
+//! plugin).
 
 use std::sync::Arc;
 
@@ -85,6 +87,11 @@ impl From<PgStatStatementsError> for Problem {
                     .with_title("Restart Failed")
                     .with_detail(error.to_string())
             }
+            PgStatStatementsError::ResetFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Statistics Reset Failed")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -103,6 +110,36 @@ struct PgStatStatementsEnabledAudit {
 impl AuditOperation for PgStatStatementsEnabledAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_PG_STAT_STATEMENTS_ENABLED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PgStatStatementsResetAudit {
+    context: AuditContext,
+    service_id: i32,
+    service_name: String,
+}
+
+impl AuditOperation for PgStatStatementsResetAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_PG_STAT_STATEMENTS_RESET".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {
@@ -166,10 +203,44 @@ pub struct EnablePgStatStatementsResponse {
     pub message: String,
 }
 
+/// Response for the pg_stat_statements reset endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResetPgStatStatementsResponse {
+    /// Human-readable message confirming the destructive action.
+    pub message: String,
+}
+
+/// Explicit confirmation required for the destructive statistics reset.
+///
+/// Requiring JSON makes the endpoint non-simple for browsers, preventing a
+/// deployed same-site application from triggering it with a plain HTML form.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResetPgStatStatementsRequest {
+    /// Must be `true` to acknowledge the global, irreversible reset.
+    pub confirm: bool,
+}
+
+fn validate_reset_confirmation(
+    request: &ResetPgStatStatementsRequest,
+) -> Result<(), PgStatStatementsError> {
+    if !request.confirm {
+        return Err(PgStatStatementsError::Validation {
+            message: "confirm must be true to reset all pg_stat_statements statistics".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_slow_queries, enable_pg_stat_statements),
-    components(schemas(SlowQueriesResponse, SlowQueryRow, EnablePgStatStatementsResponse))
+    paths(get_slow_queries, enable_pg_stat_statements, reset_pg_stat_statements),
+    components(schemas(
+        SlowQueriesResponse,
+        SlowQueryRow,
+        EnablePgStatStatementsResponse,
+        ResetPgStatStatementsRequest,
+        ResetPgStatStatementsResponse
+    ))
 )]
 pub struct PgStatStatementsApiDoc;
 
@@ -321,6 +392,77 @@ async fn enable_pg_stat_statements(
     }))
 }
 
+/// Reset all statistics accumulated by `pg_stat_statements` for a Postgres
+/// service. This affects every user, database, and normalized query tracked by
+/// the target Postgres instance and cannot be undone.
+#[utoipa::path(
+    tag = "External Services",
+    post,
+    path = "/external-services/{service_id}/pg-stat-statements/reset",
+    operation_id = "ExternalServiceResetPgStatStatements",
+    request_body(
+        content = ResetPgStatStatementsRequest,
+        description = "Explicit confirmation of the global, irreversible reset",
+        content_type = "application/json"
+    ),
+    params(
+        ("service_id" = i32, Path, description = "ID of the provisioned Postgres service"),
+    ),
+    responses(
+        (status = 200, description = "All accumulated pg_stat_statements statistics cleared", body = ResetPgStatStatementsResponse),
+        (status = 400, description = "Missing or invalid reset confirmation"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions (requires external_services:write)"),
+        (status = 404, description = "Service not found"),
+        (status = 422, description = "Service is not Postgres"),
+        (status = 502, description = "Target Postgres rejected or failed the reset operation"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn reset_pg_stat_statements(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(service_id): Path<i32>,
+    Json(request): Json<ResetPgStatStatementsRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    validate_reset_confirmation(&request).map_err(Problem::from)?;
+    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &state).await?;
+
+    let pg_stat_service = PgStatStatementsService::new(state.external_service_manager.clone());
+    pg_stat_service
+        .reset_pg_stat_statements(service_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let service_name = state
+        .external_service_manager
+        .get_service(service_id)
+        .await
+        .map(|s| s.name)
+        .unwrap_or_else(|_| service_id.to_string());
+
+    let audit = PgStatStatementsResetAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id,
+        service_name: service_name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(service_id, error = %e, "Failed to create pg_stat_statements reset audit log");
+    }
+
+    Ok(Json(ResetPgStatStatementsResponse {
+        message: format!(
+            "All pg_stat_statements statistics for service {service_name} were reset successfully."
+        ),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
@@ -334,6 +476,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{service_id}/pg-stat-statements/enable",
             post(enable_pg_stat_statements),
+        )
+        .route(
+            "/external-services/{service_id}/pg-stat-statements/reset",
+            post(reset_pg_stat_statements),
         )
 }
 
@@ -369,17 +515,21 @@ mod tests {
         )
     }
 
-    /// A deployment token can never satisfy `ExternalServicesRead` — the
-    /// deployment-token permission bridge in `AuthContext::has_permission`
-    /// only maps a small explicit whitelist (analytics/email/AI-gateway),
-    /// deliberately excluding external-services access. `get_slow_queries`
-    /// must reject it at the permission gate (403) regardless of the
-    /// service/project it targets, and never reach
-    /// `assert_service_owned_by_caller`'s DB-touching ownership check —
-    /// this is why `state.db` here is a bare, empty `MockDatabase`: any
-    /// unexpected query beyond the permission check would panic the mock.
-    #[tokio::test]
-    async fn get_slow_queries_rejects_deployment_token_at_permission_gate() {
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "pg-stat-statements-reset-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
+
+    fn test_state() -> Arc<AppState> {
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
             "pg-stat-statements-idor-test",
@@ -394,7 +544,7 @@ mod tests {
             docker,
             Arc::new(temps_dns::DnsRegistry::new(db.clone())),
         ));
-        let state = Arc::new(AppState {
+        Arc::new(AppState {
             external_service_manager: manager.clone(),
             audit_service: Arc::new(NoopAuditLogger),
             query_service: Arc::new(crate::QueryService::new(manager)),
@@ -405,7 +555,21 @@ mod tests {
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
             project_access_checker: None,
-        });
+        })
+    }
+
+    /// A deployment token can never satisfy `ExternalServicesRead` — the
+    /// deployment-token permission bridge in `AuthContext::has_permission`
+    /// only maps a small explicit whitelist (analytics/email/AI-gateway),
+    /// deliberately excluding external-services access. `get_slow_queries`
+    /// must reject it at the permission gate (403) regardless of the
+    /// service/project it targets, and never reach
+    /// `assert_service_owned_by_caller`'s DB-touching ownership check —
+    /// this is why `state.db` here is a bare, empty `MockDatabase`: any
+    /// unexpected query beyond the permission check would panic the mock.
+    #[tokio::test]
+    async fn get_slow_queries_rejects_deployment_token_at_permission_gate() {
+        let state = test_state();
 
         let result = get_slow_queries(
             RequireAuth(test_deployment_token_auth(100)),
@@ -425,5 +589,33 @@ mod tests {
             Err(problem) => problem,
         };
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reset_pg_stat_statements_rejects_deployment_token_at_permission_gate() {
+        let result = reset_pg_stat_statements(
+            RequireAuth(test_deployment_token_auth(100)),
+            State(test_state()),
+            Extension(test_request_metadata()),
+            Path(7),
+            Json(ResetPgStatStatementsRequest { confirm: true }),
+        )
+        .await;
+
+        let problem = match result {
+            Ok(_) => panic!("deployment tokens must never reset pg_stat_statements"),
+            Err(problem) => problem,
+        };
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn reset_requires_explicit_true_confirmation() {
+        let error = validate_reset_confirmation(&ResetPgStatStatementsRequest { confirm: false })
+            .expect_err("false confirmation must be rejected");
+        assert!(matches!(error, PgStatStatementsError::Validation { .. }));
+        assert!(
+            validate_reset_confirmation(&ResetPgStatStatementsRequest { confirm: true }).is_ok()
+        );
     }
 }

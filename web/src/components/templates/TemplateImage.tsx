@@ -1,33 +1,7 @@
 import { useState } from 'react'
 import { GitBranch } from 'lucide-react'
 import { cn } from '@/lib/utils'
-
-const PRESET_ICONS: Record<string, string> = {
-  nextjs: '/presets/nextjs.svg',
-  fastapi: '/presets/fastapi.svg',
-  django: '/presets/django.svg',
-  remix: '/presets/remix.svg',
-  nuxt: '/presets/nuxt.svg',
-  astro: '/presets/astro.svg',
-  rust: '/presets/rust.svg',
-  go: '/presets/go.svg',
-  nixpacks: '/presets/nixpacks.svg',
-  vite: '/presets/vite.svg',
-  react: '/presets/react.svg',
-  vue: '/presets/vue.svg',
-  angular: '/presets/angular.svg',
-  flask: '/presets/flask.svg',
-  laravel: '/presets/laravel.svg',
-  rails: '/presets/rails.svg',
-  nodejs: '/presets/nodejs.svg',
-  sveltekit: '/presets/sveltekit.svg',
-  solidstart: '/presets/solidstart.svg',
-  docusaurus: '/presets/docusaurus.svg',
-  dockerfile: '/presets/dockerfile.svg',
-  docker: '/presets/docker.svg',
-  static: '/presets/static.svg',
-  rsbuild: '/presets/rsbuild.svg',
-}
+import { presetIconPath } from '@/components/presets/preset-icon-paths'
 
 interface TemplateImageProps {
   imageUrl?: string | null
@@ -58,7 +32,7 @@ export function TemplateImage({
   const [presetIconFailed, setPresetIconFailed] = useState(false)
 
   const showImage = !!imageUrl && !imageFailed
-  const presetIcon = PRESET_ICONS[preset.toLowerCase()]
+  const presetIcon = presetIconPath(preset)
   const showPresetIcon = !showImage && !!presetIcon && !presetIconFailed
 
   return (

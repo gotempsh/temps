@@ -1,0 +1,29 @@
+[package]
+name = "temps-teams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Teams and project-scoped role-based access control"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

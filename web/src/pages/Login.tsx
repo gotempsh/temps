@@ -21,25 +21,35 @@ import { consumeReturnTo } from '@/lib/return-to'
  * through to a generic message.
  */
 const OIDC_ERROR_MESSAGES: Record<string, string> = {
-  idp_error: 'Your identity provider rejected the login. Check that your account is allowed.',
-  idp_unreachable: "We couldn't reach your identity provider. Try again in a moment.",
-  idp_rejected_code: 'Your identity provider rejected the authorization code. Try signing in again.',
-  state_invalid: 'This SSO link is invalid or has already been used. Start sign-in again.',
+  idp_error:
+    'Your identity provider rejected the login. Check that your account is allowed.',
+  idp_unreachable:
+    "We couldn't reach your identity provider. Try again in a moment.",
+  idp_rejected_code:
+    'Your identity provider rejected the authorization code. Try signing in again.',
+  state_invalid:
+    'This SSO link is invalid or has already been used. Start sign-in again.',
   state_expired: 'This SSO link expired. Start sign-in again.',
-  id_token_invalid: 'Your identity provider returned an invalid token. Contact your administrator.',
+  id_token_invalid:
+    'Your identity provider returned an invalid token. Contact your administrator.',
   callback_invalid: 'The SSO callback was malformed. Start sign-in again.',
-  email_missing: 'Your identity provider did not return an email address. Grant the "email" scope and try again.',
-  email_not_verified: 'Your identity provider has not confirmed your email. Verify it at the IdP, then try again.',
-  user_not_provisioned: 'No Temps account exists for this email. Ask an administrator to create one.',
+  email_missing:
+    'Your identity provider did not return an email address. Grant the "email" scope and try again.',
+  email_not_verified:
+    'Your identity provider has not confirmed your email. Verify it at the IdP, then try again.',
+  user_not_provisioned:
+    'No Temps account exists for this email. Ask an administrator to create one.',
   provider_disabled: 'This SSO provider is currently disabled.',
   provider_not_found: 'The SSO provider configuration was not found.',
-  no_provider_configured: 'No SSO provider is configured on this Temps instance.',
+  no_provider_configured:
+    'No SSO provider is configured on this Temps instance.',
   issuer_invalid: 'The SSO provider URL is invalid.',
   return_to_invalid: 'Invalid post-login redirect target.',
   role_invalid: 'The role assigned by the SSO provider is invalid.',
   role_mapping_not_found: 'No matching SSO role mapping.',
   provider_conflict: 'SSO provider configuration conflict.',
-  internal_error: 'An internal error occurred while processing the SSO callback.',
+  internal_error:
+    'An internal error occurred while processing the SSO callback.',
 }
 
 function oidcErrorMessage(reason: string | null): string {
@@ -76,9 +86,23 @@ export const Login = () => {
       errorTitle: 'Login failed',
     },
     onSuccess: async (data) => {
+      if (data.password_change_required) {
+        navigate('/auth/change-password', { replace: true })
+        return
+      }
+
       if (data.mfa_required) {
         toast.success('Please complete MFA verification')
         navigate('/mfa-verify')
+        return
+      }
+
+      if (data.mfa_enrollment_required && data.mfa_setup) {
+        toast.success('Set up multi-factor authentication to continue')
+        navigate('/auth/change-password', {
+          replace: true,
+          state: { mfaSetup: data.mfa_setup },
+        })
         return
       }
 
@@ -134,7 +158,9 @@ export const Login = () => {
           onSubmit={handleSubmit}
           isLoading={isLoading || login.isPending}
           oidcProviders={emailStatus?.oidc_providers ?? []}
-          passwordResetAvailable={emailStatus?.password_reset_available ?? false}
+          passwordResetAvailable={
+            emailStatus?.password_reset_available ?? false
+          }
         />
       </div>
     </div>

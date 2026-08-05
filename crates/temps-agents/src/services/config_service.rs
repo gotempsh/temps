@@ -1240,6 +1240,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             slug: "test".into(),
+            template_slug: None,
             is_deleted: false,
             deleted_at: None,
             last_deployment: None,

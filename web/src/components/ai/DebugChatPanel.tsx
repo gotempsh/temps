@@ -32,6 +32,7 @@ import {
   Wrench,
   X,
 } from 'lucide-react'
+import { CopyButton } from '@/components/ui/copy-button'
 import { cn } from '@/lib/utils'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -111,6 +112,27 @@ interface ChatMessage {
   parts?: ChatPart[]
 }
 
+
+/**
+ * Per-message copy affordance.
+ *
+ * Revealed on hover (and on keyboard focus, so it is not mouse-only) to keep a
+ * long transcript from turning into a column of icons. Nothing is rendered when
+ * the message has no copyable prose — a button that copies an empty string
+ * looks like it worked and didn't.
+ */
+function MessageCopyButton({ text }: { text: string }) {
+  if (!text) return null
+  return (
+    <CopyButton
+      value={text}
+      minimal
+      label="Copy message"
+      className="rounded p-1 text-muted-foreground opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 [&_svg]:size-3"
+    />
+  )
+}
+
 /** Render segments for an assistant message, falling back for legacy turns that
  *  predate ordered `parts` (tools first, then the prose). */
 function assistantParts(m: ChatMessage): ChatPart[] {
@@ -119,6 +141,25 @@ function assistantParts(m: ChatMessage): ChatPart[] {
   for (const tool of m.tools ?? []) parts.push({ type: 'tool', tool })
   if (m.content) parts.push({ type: 'text', text: m.content })
   return parts
+}
+
+
+/**
+ * The plain text a "copy" on this message should yield.
+ *
+ * For an assistant turn that's the prose only — the tool cards are UI around
+ * the work, not something anyone wants pasted into an issue or a commit
+ * message. A turn that ran tools but never produced prose has nothing useful to
+ * copy, so it returns empty and the caller hides the button rather than
+ * offering one that silently copies nothing.
+ */
+function messageCopyText(m: ChatMessage): string {
+  if (m.role === 'user') return m.content
+  return assistantParts(m)
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+    .join('\n')
+    .trim()
 }
 
 /**
@@ -1455,19 +1496,22 @@ export function DebugChatPanel({
 
         {visible.map((m, i) =>
           m.role === 'user' ? (
-            <div key={i} className="flex flex-col items-end gap-0.5">
+            <div key={i} className="group flex flex-col items-end gap-0.5">
               <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
                 {m.content}
               </div>
-              {m.created_at && (
-                <TimeAgo
-                  date={m.created_at}
-                  className="px-1 text-[10px] text-muted-foreground"
-                />
-              )}
+              <div className="flex items-center gap-1 px-1">
+                {m.created_at && (
+                  <TimeAgo
+                    date={m.created_at}
+                    className="text-[10px] text-muted-foreground"
+                  />
+                )}
+                <MessageCopyButton text={messageCopyText(m)} />
+              </div>
             </div>
           ) : (
-            <div key={i} className="flex items-start">
+            <div key={i} className="group flex items-start">
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
                   <AssistantBody
@@ -1477,11 +1521,16 @@ export function DebugChatPanel({
                     onFix={(text) => void send(text)}
                   />
                 </div>
-                {m.created_at && assistantParts(m).length > 0 && (
-                  <TimeAgo
-                    date={m.created_at}
-                    className="px-1 text-[10px] text-muted-foreground"
-                  />
+                {assistantParts(m).length > 0 && (
+                  <div className="flex items-center gap-1 px-1">
+                    {m.created_at && (
+                      <TimeAgo
+                        date={m.created_at}
+                        className="text-[10px] text-muted-foreground"
+                      />
+                    )}
+                    <MessageCopyButton text={messageCopyText(m)} />
+                  </div>
                 )}
               </div>
             </div>

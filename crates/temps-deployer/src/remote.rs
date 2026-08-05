@@ -285,6 +285,11 @@ impl RemoteNodeDeployer {
                     self.node_name, url, e
                 ))
             })?;
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(DeployerError::ContainerNotFound(path.to_string()));
+        }
 
         let status = response.status();
 

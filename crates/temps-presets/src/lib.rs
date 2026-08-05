@@ -13,11 +13,11 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use {
-    all_presets, detect_all_presets_from_files, detect_node_framework, detect_preset_from_files,
-    get_preset_by_slug, get_preset_for_storage, resolve_preset_slug, runtime_slug,
-    validate_preset_config, DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider,
-    NodeFramework, PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType,
-    StoredPreset,
+    all_presets, detect_all_presets_from_files, detect_node_framework,
+    detect_node_framework_from_package_json, detect_preset_from_files, get_preset_by_slug,
+    get_preset_for_storage, resolve_preset_slug, runtime_slug, validate_preset_config,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
+    PackageManager, Preset, PresetConfig, PresetResolutionError, ProjectType, StoredPreset,
 };
 
 #[cfg(test)]

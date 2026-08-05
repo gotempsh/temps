@@ -7,9 +7,20 @@ import { list } from './list.js'
 import { logs } from './logs.js'
 import { rollback } from './rollback.js'
 import { status } from './status.js'
+import { drop } from './drop.js'
 import { cancelDeploymentAction, pauseDeploymentAction, resumeDeploymentAction, teardownDeploymentAction } from './actions.js'
 
 export function registerDeployCommands(program: Command): void {
+  program
+    .command('drop <path>')
+    .description('Detect and deploy a local source directory or ZIP without Git')
+    .option('--name <name>', 'Project name (slugified automatically)')
+    .option('--preset <preset>', 'Select a detected preset')
+    .option('--directory <directory>', 'Select a detected project root')
+    .option('--no-wait', 'Do not wait for deployment to complete')
+    .option('--timeout <seconds>', 'Deployment timeout', '600')
+    .action(drop)
+
   // Main deploy command - git-based deployment
   program
     .command('deploy [project]')

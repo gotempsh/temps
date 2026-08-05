@@ -6,10 +6,22 @@ pub mod ingest_handler;
 pub mod metric_alert_handler;
 pub mod query_handler;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 
+use crate::ingest::decode::MAX_DECOMPRESSED_SIZE;
 use crate::OtelAppState;
+
+/// Cap on the *compressed* request body for OTLP ingest routes, applied
+/// before Axum buffers anything. `MAX_DECOMPRESSED_SIZE` plus a margin for
+/// payloads that don't compress well (e.g. already-compressed or
+/// high-entropy data sent as `Content-Encoding: zstd`/`gzip`, which can come
+/// out slightly *larger* than the input). This also closes the gap where an
+/// uncompressed request (`Content-Encoding` absent) had no size check of its
+/// own — `decode::decompress` returns it unmodified — and previously relied
+/// solely on Axum's implicit 2 MiB default.
+pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 
 /// Configure all OTel routes.
 ///
@@ -34,7 +46,10 @@ use crate::OtelAppState;
 ///   GET /otel/quota
 ///   GET /otel/pipeline-stats
 pub fn configure_routes() -> Router<OtelAppState> {
-    Router::new()
+    // OTLP ingest endpoints are split into their own sub-router so
+    // `DefaultBodyLimit` applies only to them, not to the query/dashboard
+    // routes below.
+    let ingest_routes = Router::new()
         // OTLP ingest endpoints (header-based auth)
         .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
         .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
@@ -52,6 +67,9 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
             post(ingest_handler::ingest_logs_by_path),
         )
+        .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT));
+
+    let query_routes = Router::new()
         // Query endpoints
         .route("/otel/metrics", get(query_handler::query_metrics))
         .route(
@@ -130,5 +148,7 @@ pub fn configure_routes() -> Router<OtelAppState> {
             get(metric_alert_handler::get_alert)
                 .patch(metric_alert_handler::update_alert)
                 .delete(metric_alert_handler::delete_alert),
-        )
+        );
+
+    ingest_routes.merge(query_routes)
 }

@@ -42,3 +42,4 @@ futures-util = { workspace = true }
 slug = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
+zip = { workspace = true }

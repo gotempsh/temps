@@ -43,13 +43,15 @@ pub const PREVIEW_COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Owner unlock bridges remain idempotent outside this window.
 pub const PREVIEW_COOKIE_REFRESH_WINDOW: Duration = Duration::from_secs(60 * 60);
 
-/// Lifetime of a scoped handoff minted by an authenticated control-plane
-/// route. This is only long enough to cross an auto-submit bridge; it
-/// is never forwarded to the sandbox and is exchanged for the normal preview
-/// cookie immediately.
-pub const PREVIEW_SESSION_GRANT_TTL: Duration = Duration::from_secs(60);
-
-const PREVIEW_SESSION_GRANT_VERSION: &str = "preview-session-v1";
+/// Preview session grants are defined in `temps-core` so the sandbox API can
+/// mint what this module verifies without either crate depending on the other.
+/// Re-exported here because callers have always reached for them via
+/// `preview_auth`.
+pub use temps_core::{
+    encode_preview_session_grant, sanitize_preview_next, validate_preview_session_grant_envelope,
+    verify_preview_session_grant, PreviewGrantError, PREVIEW_SESSION_GRANT_MAX_TTL,
+    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+};
 
 /// The local TCP address where the preview gateway listens. Pingora forwards
 /// authenticated preview requests to this peer.
@@ -218,37 +220,6 @@ pub fn preview_cookie_remaining_ttl(
         return None;
     };
     exp.checked_sub(now_secs.as_secs()).map(Duration::from_secs)
-}
-
-/// Validate a short-lived platform-session handoff for one sandbox.
-///
-/// The API and proxy share `CookieCrypto`, so an authenticated API route can
-/// mint an AES-GCM authenticated payload without making the host-only Temps
-/// session cookie available to preview application code. The version prefix
-/// keeps grants domain-separated from every other encrypted cookie payload.
-pub fn verify_preview_session_grant(
-    crypto: &CookieCrypto,
-    grant: &str,
-    subject: &str,
-    now: SystemTime,
-) -> bool {
-    let Ok(plain) = crypto.decrypt(grant) else {
-        return false;
-    };
-    let mut parts = plain.split('|');
-    if parts.next() != Some(PREVIEW_SESSION_GRANT_VERSION) || parts.next() != Some(subject) {
-        return false;
-    }
-    let Some(exp) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    let Ok(now_secs) = now.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    now_secs.as_secs() <= exp
 }
 
 /// Combine every HTTP Cookie header field into the equivalent cookie-pair
@@ -587,6 +558,36 @@ impl SandboxLookupCache {
         self.cache.insert(hex.to_string(), result.clone()).await;
         result
     }
+
+    /// Validate a share-link grant and return the current password hash used
+    /// to mint the preview cookie.
+    ///
+    /// Random or malformed public input is rejected by authenticated envelope
+    /// validation before the uncached lookup. A cryptographically valid grant
+    /// then checks the fresh row so password rotation revokes it immediately.
+    pub async fn verify_session_grant(
+        &self,
+        crypto: &CookieCrypto,
+        grant: &str,
+        hex: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        if grant.is_empty() {
+            return None;
+        }
+        let subject = format!("sbx_{hex}");
+        if !validate_preview_session_grant_envelope(crypto, grant, &subject, now) {
+            return None;
+        }
+        match self.lookup_fresh(hex).await {
+            PreviewSandboxLookup::Protected { password_hash }
+                if verify_preview_session_grant(crypto, grant, &subject, &password_hash, now) =>
+            {
+                Some(password_hash)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Run the preview auth check for a parsed preview host (cookie-only).
@@ -773,30 +774,43 @@ mod tests {
     fn platform_session_grant_is_scoped_and_expires() {
         let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let payload = format!(
-            "{}|sbx_7702c56bfb804b49|{}",
-            PREVIEW_SESSION_GRANT_VERSION,
-            1_000 + PREVIEW_SESSION_GRANT_TTL.as_secs()
-        );
-        let grant = crypto.encrypt(&payload).unwrap();
+        let password_hash = "argon2-current";
+        let (grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            password_hash,
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
 
         assert!(verify_preview_session_grant(
             &crypto,
             &grant,
             "sbx_7702c56bfb804b49",
+            password_hash,
             now
         ));
         assert!(!verify_preview_session_grant(
             &crypto,
             &grant,
             "sbx_c5d8e38f791dbc40",
+            password_hash,
             now
         ));
         assert!(!verify_preview_session_grant(
             &crypto,
             &grant,
             "sbx_7702c56bfb804b49",
+            password_hash,
             now + PREVIEW_SESSION_GRANT_TTL + Duration::from_secs(1)
+        ));
+        assert!(!verify_preview_session_grant(
+            &crypto,
+            &grant,
+            "sbx_7702c56bfb804b49",
+            "argon2-rotated",
+            now
         ));
     }
 
@@ -987,8 +1001,66 @@ mod tests {
         }
     }
 
-    /// A protected sandbox is cached after the first lookup; the second call
-    /// returns the cached result without a second DB query.
+    /// Invalid public input must not amplify into an uncached database query.
+    #[tokio::test]
+    async fn random_grant_is_rejected_before_a_fresh_database_lookup() {
+        // No query result is queued. MockDatabase would fail the test if the
+        // invalid public input reached lookup_fresh.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let cache = SandboxLookupCache::new(Arc::new(db));
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+
+        assert!(cache
+            .verify_session_grant(
+                &crypto,
+                "random-public-input",
+                "7702c56bfb804b49",
+                UNIX_EPOCH + Duration::from_secs(1_000),
+            )
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn session_grant_uses_fresh_hash_and_rejects_a_rotated_password() {
+        let current_hash = "argon2-after-rotation";
+        let model = sandbox_model("sbx_7702c56bfb804b49", "running", Some(current_hash));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model.clone()], vec![model]])
+            .into_connection();
+        let cache = SandboxLookupCache::new(Arc::new(db));
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (stale_grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            "argon2-before-rotation",
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+        let (current_grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            current_hash,
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+
+        assert!(cache
+            .verify_session_grant(&crypto, &stale_grant, "7702c56bfb804b49", now,)
+            .await
+            .is_none());
+        assert_eq!(
+            cache
+                .verify_session_grant(&crypto, &current_grant, "7702c56bfb804b49", now,)
+                .await
+                .as_deref(),
+            Some(current_hash)
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_cache_hit_avoids_second_db_call() {
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

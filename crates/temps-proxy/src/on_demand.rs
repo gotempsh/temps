@@ -1468,6 +1468,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers query
@@ -1546,6 +1547,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers query
@@ -1715,6 +1717,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers
@@ -1787,6 +1790,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             .into_connection();
@@ -1863,6 +1867,7 @@ mod tests {
                 protected: false,
                 sleeping: false,
                 attack_mode: None,
+                force_https: None,
                 last_activity_at: None,
             }]])
             // containers (3 replicas)
@@ -2245,6 +2250,7 @@ mod tests {
             protected: false,
             sleeping: true,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2350,6 +2356,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2467,6 +2474,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -2567,6 +2575,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }

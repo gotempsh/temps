@@ -59,6 +59,10 @@ pub struct OtelConfig {
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
+
+    // Ingest backpressure. Process-wide operational tuning knob (not
+    // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
+    pub max_concurrent_ingest_requests: usize,
 }
 
 impl Default for OtelConfig {
@@ -77,6 +81,8 @@ impl Default for OtelConfig {
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
+            max_concurrent_ingest_requests:
+                crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
         }
     }
 }
@@ -138,6 +144,17 @@ impl OtelConfig {
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
             config.enable_anomaly_detection = v != "0" && v != "false";
         }
+        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
+            match parse_max_concurrent_ingest_requests(&v) {
+                Some(limit) => config.max_concurrent_ingest_requests = limit,
+                None => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+                     integer within the supported range; keeping the default ingest \
+                     concurrency ceiling"
+                ),
+            }
+        }
 
         config
     }
@@ -149,6 +166,19 @@ impl OtelConfig {
             && self.s3_secret_key.is_some()
             && self.s3_bucket.is_some()
     }
+}
+
+/// Parses `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`. Returns `None` (caller
+/// keeps the default) for anything that isn't a positive integer within
+/// `Semaphore::MAX_PERMITS` — `Semaphore::new` asserts on that bound and would
+/// otherwise panic the process at startup on a mistyped value.
+///
+/// A free function (rather than inline in `from_env`) so this parsing/bounds
+/// logic is unit-testable without mutating process-global environment
+/// variables, which the other `TEMPS_OTEL_*` fields in this file don't do.
+fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
+    let limit = v.parse::<usize>().ok()?;
+    (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
 }
 
 // ── OpenAPI Schema ──────────────────────────────────────────────────
@@ -450,6 +480,7 @@ impl TempsPlugin for OtelPlugin {
                 storage.clone(),
                 auth_service,
                 rate_limiter,
+                config.max_concurrent_ingest_requests,
             ));
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
@@ -822,6 +853,41 @@ mod tests {
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);
+        assert_eq!(
+            config.max_concurrent_ingest_requests,
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_accepts_positive_integers() {
+        assert_eq!(parse_max_concurrent_ingest_requests("1"), Some(1));
+        assert_eq!(parse_max_concurrent_ingest_requests("128"), Some(128));
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_zero_and_garbage() {
+        assert_eq!(parse_max_concurrent_ingest_requests("0"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("-1"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("not-a-number"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests(""), None);
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_values_above_semaphore_max() {
+        // A value that parses as `usize` but exceeds `Semaphore::MAX_PERMITS`
+        // must fall back to the default rather than panicking `Semaphore::new`
+        // at startup — the regression this fix targets.
+        let too_large = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+        assert_eq!(parse_max_concurrent_ingest_requests(&too_large), None);
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&usize::MAX.to_string()),
+            None
+        );
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+            Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]

@@ -7,12 +7,13 @@ use utoipa::OpenApi;
 use super::AppState;
 use axum::Router;
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Json,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_auth::RequireAuth;
 use temps_auth::{
@@ -28,11 +29,16 @@ use super::types::{
     UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::io::Read;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_entities::source_type::SourceType;
+use tokio::io::AsyncWriteExt;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
+    use axum::extract::DefaultBodyLimit;
     let custom_domain_routes = super::custom_domains::configure_routes();
 
     Router::new()
@@ -44,6 +50,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
+        .route(
+            "/drop/inspect",
+            post(inspect_drop_archive).layer(DefaultBodyLimit::max(501 * 1024 * 1024)),
+        )
         .route("/projects/statistics", get(get_project_statistics))
         // Create project from template
         .route(
@@ -90,6 +100,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[openapi(
     paths(
         create_project,
+        inspect_drop_archive,
         get_project,
         update_project,
         change_project_source,
@@ -113,6 +124,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     components(
         schemas(
             CreateProjectRequest,
+            DropInspectionResponse,
+            DropPresetCandidate,
             ChangeProjectSourceRequest,
             ProjectResponse,
             PaginatedProjectList,
@@ -150,6 +163,335 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct ApiDoc;
+
+static DROP_INSPECTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Upper bound on how many deployable roots a single Drop inspection reports.
+/// The response drives a picker, so a 20k-entry list is neither usable nor
+/// safe to serialise.
+const MAX_DROP_CANDIDATES: usize = 50;
+
+struct DropInspectionPermit;
+
+impl DropInspectionPermit {
+    fn acquire() -> Result<Self, Problem> {
+        DROP_INSPECTIONS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < 4).then_some(current + 1)
+            })
+            .map_err(|_| {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Many Drop Inspections")
+                    .with_detail("At most four Drop archives may be inspected concurrently")
+            })?;
+        Ok(Self)
+    }
+}
+
+impl Drop for DropInspectionPermit {
+    fn drop(&mut self) {
+        DROP_INSPECTIONS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPresetCandidate {
+    pub directory: String,
+    pub preset: String,
+    pub label: String,
+    pub confidence: String,
+    pub reason: String,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DropInspectionResponse {
+    pub suggested_name: String,
+    pub candidates: Vec<DropPresetCandidate>,
+}
+
+#[derive(utoipa::ToSchema)]
+pub struct DropArchiveUpload {
+    #[schema(value_type = String, format = Binary)]
+    pub file: String,
+}
+
+/// Inspect a source ZIP without creating a project or retaining the upload.
+#[utoipa::path(
+    post,
+    path = "/drop/inspect",
+    tag = "Projects",
+    request_body(content = DropArchiveUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Detected deployable project roots", body = DropInspectionResponse),
+        (status = 400, description = "Invalid or unsupported archive")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn inspect_drop_archive(
+    RequireAuth(auth): RequireAuth,
+    mut multipart: Multipart,
+) -> Result<Json<DropInspectionResponse>, Problem> {
+    permission_guard!(auth, ProjectsCreate);
+    let inspection_permit = DropInspectionPermit::acquire()?;
+
+    const MAX_ARCHIVE_BYTES: u64 = 500 * 1024 * 1024;
+    let temporary = tempfile::tempdir().map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Upload Staging Failed")
+            .with_detail(error.to_string())
+    })?;
+    let archive_path = temporary.path().join("drop-inspect.zip");
+    let mut archive_received = false;
+    let mut filename = None;
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Upload")
+            .with_detail(format!("Failed to read multipart upload: {error}"))
+    })? {
+        if field.name() == Some("file") {
+            filename = field.file_name().map(ToString::to_string);
+            let mut output = tokio::fs::File::create(&archive_path)
+                .await
+                .map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Staging Failed")
+                        .with_detail(error.to_string())
+                })?;
+            let mut field = field;
+            let mut size = 0u64;
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Upload")
+                    .with_detail(format!("Failed to read uploaded archive: {error}"))
+            })? {
+                size = size.saturating_add(chunk.len() as u64);
+                if size > MAX_ARCHIVE_BYTES {
+                    return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                        .with_title("Archive Too Large")
+                        .with_detail("Drop archive exceeds 500 MiB"));
+                }
+                output.write_all(&chunk).await.map_err(|error| {
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Upload Staging Failed")
+                        .with_detail(error.to_string())
+                })?;
+            }
+            output.flush().await.map_err(|error| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Upload Staging Failed")
+                    .with_detail(error.to_string())
+            })?;
+            archive_received = true;
+            break;
+        }
+    }
+
+    if !archive_received {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Archive")
+            .with_detail("Expected a ZIP archive in multipart field 'file'"));
+    }
+    // Detection is CPU-bound and O(roots x files); it must run inside the same
+    // `spawn_blocking` as the ZIP walk so it stays off the async runtime AND
+    // stays covered by `inspection_permit`, which is released when this closure
+    // returns.
+    let candidates = tokio::task::spawn_blocking(move || {
+        let _inspection_permit = inspection_permit;
+        let manifests = inspect_zip_manifests(&archive_path)?;
+        let mut candidates = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .map(|candidate| {
+                let preset = candidate.catalog_slug().to_string();
+                DropPresetCandidate {
+                    directory: candidate.path,
+                    preset,
+                    label: candidate.preset.display_name().to_string(),
+                    confidence: candidate.confidence.to_string(),
+                    reason: candidate.reason,
+                    is_static: candidate.preset == temps_entities::preset::Preset::Static,
+                }
+            })
+            .collect::<Vec<_>>();
+        // The response is rendered as a picker; an unbounded list is neither
+        // useful to a human nor safe to serialise.
+        candidates.truncate(MAX_DROP_CANDIDATES);
+        Ok::<_, Problem>(candidates)
+    })
+    .await
+    .map_err(|error| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Archive Inspection Failed")
+            .with_detail(error.to_string())
+    })??;
+
+    if candidates.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("No Deployable Project Found")
+            .with_detail(
+                "The archive does not contain a supported project manifest or index.html",
+            ));
+    }
+
+    let suggested_name = filename
+        .as_deref()
+        .and_then(|name| name.strip_suffix(".zip"))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("drop-project")
+        .to_string();
+
+    Ok(Json(DropInspectionResponse {
+        suggested_name,
+        candidates,
+    }))
+}
+
+fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
+    const MAX_FILES: usize = 20_000;
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    /// Aggregate budget across every manifest we buffer. `MAX_FILES` x
+    /// `MAX_MANIFEST_BYTES` is 20 GiB, and manifests compress ~1000:1, so a
+    /// ~15 MB upload could otherwise pin gigabytes of `String` per request and
+    /// OOM the whole binary on the 4 GB reference box.
+    const MAX_TOTAL_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+    /// Independent cap on how many manifests we are willing to buffer at all.
+    const MAX_MANIFESTS: usize = 512;
+    /// Aggregate budget for the entry *paths* we retain as map keys. The ZIP
+    /// central directory may legitimately be tens of MiB on its own.
+    const MAX_TOTAL_PATH_BYTES: usize = 4 * 1024 * 1024;
+
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(format!("Could not read ZIP archive: {error}"))
+    })?;
+    temps_core::archive_security::validate_zip_metadata(&mut file).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(error.to_string())
+    })?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid ZIP Archive")
+            .with_detail(format!("Could not open ZIP archive: {error}"))
+    })?;
+    if archive.len() > MAX_FILES {
+        return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+            .with_title("Archive Has Too Many Files")
+            .with_detail(format!("Archive contains more than {MAX_FILES} entries")));
+    }
+
+    let mut manifests = BTreeMap::new();
+    let mut total_manifest_bytes: u64 = 0;
+    let mut manifest_count: usize = 0;
+    let mut total_path_bytes: usize = 0;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid ZIP Entry")
+                .with_detail(format!("Could not inspect ZIP entry {index}: {error}"))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let path = entry.enclosed_name().ok_or_else(|| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Unsafe ZIP Entry")
+                .with_detail(format!(
+                    "Archive entry '{}' escapes the project root",
+                    entry.name()
+                ))
+        })?;
+        if path.components().any(|component| {
+            let std::path::Component::Normal(value) = component else {
+                return false;
+            };
+            let name = value.to_string_lossy();
+            name == ".git"
+                || name == "node_modules"
+                || name == ".env"
+                || name.starts_with(".env.")
+                || name.ends_with(".pem")
+                || name.ends_with(".key")
+                || name == "credentials.json"
+        }) {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Sensitive ZIP Entry")
+                .with_detail(format!(
+                    "Archive entry '{}' must be excluded from Drop uploads",
+                    entry.name()
+                )));
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Unsupported ZIP Entry")
+                .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
+        }
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        let should_read = matches!(
+            basename,
+            "package.json"
+                | "requirements.txt"
+                | "pyproject.toml"
+                | "Cargo.toml"
+                | "go.mod"
+                | "pom.xml"
+                | "build.gradle"
+        ) || basename.ends_with(".csproj");
+        total_path_bytes = total_path_bytes.saturating_add(normalized.len());
+        if total_path_bytes > MAX_TOTAL_PATH_BYTES {
+            return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                .with_title("Archive Manifest Too Large")
+                .with_detail(format!(
+                    "Combined entry paths exceed {MAX_TOTAL_PATH_BYTES} bytes"
+                )));
+        }
+        let mut contents = String::new();
+        if should_read {
+            if entry.size() > MAX_MANIFEST_BYTES {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Manifest Is Too Large")
+                    .with_detail(format!("Manifest '{normalized}' exceeds 1 MiB")));
+            }
+            manifest_count += 1;
+            if manifest_count > MAX_MANIFESTS {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Too Many Manifests")
+                    .with_detail(format!(
+                        "Archive contains more than {MAX_MANIFESTS} project manifests"
+                    )));
+            }
+            // Budget against bytes *actually read*, not the declared header
+            // size, so a lying local header cannot get us to over-allocate.
+            let remaining = MAX_TOTAL_MANIFEST_BYTES.saturating_sub(total_manifest_bytes);
+            let read = entry
+                .take(remaining.min(MAX_MANIFEST_BYTES) + 1)
+                .read_to_string(&mut contents)
+                .map_err(|error| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Manifest")
+                        .with_detail(format!("Could not read '{normalized}': {error}"))
+                })? as u64;
+            total_manifest_bytes = total_manifest_bytes.saturating_add(read);
+            if total_manifest_bytes > MAX_TOTAL_MANIFEST_BYTES {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Archive Manifests Too Large")
+                    .with_detail(format!(
+                        "Combined project manifests exceed {} MiB",
+                        MAX_TOTAL_MANIFEST_BYTES / (1024 * 1024)
+                    )));
+            }
+        }
+        manifests.insert(normalized, contents);
+    }
+    Ok(manifests)
+}
 
 /// Create a new project
 #[utoipa::path(
@@ -203,6 +545,7 @@ pub async fn create_project(
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
         source_type: project.source_type,
+        template_slug: None,
     };
 
     let new_project = state
@@ -247,6 +590,62 @@ pub async fn create_project(
     Ok(Json(ProjectResponse::map_from_project(new_project)))
 }
 
+/// Project ids to exclude from a listing for this caller.
+///
+/// Returns empty for instance administrators (never restricted by team
+/// membership), for deployment tokens (already confined to their own
+/// project by `project_scope_guard!`), and when no `ProjectAccessChecker`
+/// is registered.
+///
+/// Fails the request on an infrastructure error rather than falling back
+/// to an unfiltered list — a checker that can't answer must not silently
+/// widen what a user sees.
+async fn resolve_hidden_projects(
+    state: &Arc<AppState>,
+    auth: &temps_auth::context::AuthContext,
+) -> Result<Vec<i32>, Problem> {
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(checker) = state.project_access_checker.as_ref() else {
+        return Ok(Vec::new());
+    };
+    // Fail closed, matching `project_permission_guard!`. Unreachable today
+    // (deployment tokens are the only user-less auth source and are handled
+    // above), but "hide nothing" on an unresolvable identity means "show
+    // every project", so a future auth source must not land here silently.
+    let Some(user_id) = auth.user_id_opt() else {
+        tracing::error!("project list filtering: authenticated caller has no user id");
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/project-access-denied")
+                .title("Project Access Denied")
+                .detail("Could not resolve caller identity")
+                .build(),
+        );
+    };
+    match checker.hidden_project_ids(user_id).await {
+        Ok(hidden) => Ok(hidden.unwrap_or_default()),
+        Err(e) => {
+            tracing::error!(
+                user_id,
+                error = %e,
+                "ProjectAccessChecker infrastructure failure while filtering the project list"
+            );
+            Err(
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .type_("https://temps.sh/probs/project-access-check-failed")
+                    .title("Project Access Check Failed")
+                    .detail("Could not verify project access; please try again")
+                    .build(),
+            )
+        }
+    }
+}
+
 /// Get a list of all projects
 #[utoipa::path(
     get,
@@ -275,9 +674,14 @@ pub async fn get_projects(
     let page = params.page.unwrap_or(1);
     let per_page = params.per_page.unwrap_or(10);
 
+    // Per-resource guards keep a user out of a project they click on; this
+    // keeps its name out of the list in the first place. Instance
+    // administrators are exempt, matching `project_access_guard!`.
+    let hidden = resolve_hidden_projects(&state, &auth).await?;
+
     let (projects, total) = state
         .project_service
-        .get_projects_paginated(page, per_page)
+        .get_projects_paginated_excluding(page, per_page, &hidden)
         .await
         .map_err(Problem::from)?;
 
@@ -407,6 +811,7 @@ pub async fn update_project(
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
         source_type: project.source_type,   // Preserve source type
+        template_slug: None,                // Template provenance is immutable
     };
     let updated_project = state
         .project_service
@@ -561,6 +966,19 @@ pub async fn delete_project(
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Project Container Cleanup Failed")
                 .with_detail(error.to_string())
+        })?;
+
+    state
+        .project_archive_cleaner
+        .cleanup_project_archives(id)
+        .await
+        .map_err(|error| {
+            error!(project_id = id, %error, "Failed to clean up project archives");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Archive Cleanup Failed")
+                .with_detail(format!(
+                    "Failed to remove uploaded archives for project {id}: {error}"
+                ))
         })?;
 
     state
@@ -1146,9 +1564,12 @@ pub async fn get_project_statistics(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
 
+    // Same exclusion as the list — see `resolve_hidden_projects`.
+    let hidden = resolve_hidden_projects(&state, &auth).await?;
+
     let statistics = state
         .project_service
-        .get_project_statistics()
+        .get_project_statistics_excluding(&hidden)
         .await
         .map_err(Problem::from)?;
 
@@ -1390,7 +1811,6 @@ pub async fn get_project_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
-
     Ok(Json(super::templates::TemplateResponse::from(template)))
 }
 
@@ -1453,6 +1873,28 @@ fn parse_owner_repo_from_git_url(git_url: &str) -> (String, String) {
     }
 }
 
+fn project_created_from_template_telemetry_event(
+    template_slug: &str,
+    deploy_mode: &'static str,
+    service_count: usize,
+) -> temps_core::telemetry::TelemetryEvent {
+    let safe_slug = temps_core::templates::telemetry_safe_template_slug(template_slug);
+    temps_core::telemetry::TelemetryEvent::new(
+        temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
+    )
+    .with(
+        "template_source",
+        if safe_slug.is_some() {
+            "bundled"
+        } else {
+            "custom"
+        },
+    )
+    .with_opt("template_slug", safe_slug.map(str::to_string))
+    .with("deploy_mode", deploy_mode)
+    .with("service_count", service_count as i64)
+}
+
 /// Create a new project from a template
 ///
 /// Creates a new repository from a template and sets up the project with the
@@ -1491,6 +1933,7 @@ pub async fn create_project_from_template(
                 .with_title("Template Not Found")
                 .with_detail(e.to_string())
         })?;
+    let template_provenance = temps_core::templates::template_provenance(&template).to_string();
 
     // 2. Build the environment variables from the request (shared by both modes).
     let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
@@ -1546,6 +1989,7 @@ pub async fn create_project_from_template(
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
+            template_slug: Some(template_provenance.clone()),
         };
         // Surface the template's source repo as the response URL (the image ref
         // isn't a browsable URL); the message clarifies it deployed from an image.
@@ -1614,6 +2058,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, new_repo.clone_url, "fork")
             }
@@ -1659,6 +2104,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: None,
                     exposed_port: None,
                     source_type: SourceType::Git,
+                    template_slug: Some(template_provenance.clone()),
                 };
                 (req, template.git.url.clone(), "public_repo")
             }
@@ -1732,14 +2178,13 @@ pub async fn create_project_from_template(
         .with("source_type", project.source_type.to_string())
         .with_opt("preset", project.preset.clone()),
     );
-    state.telemetry.report(
-        temps_core::telemetry::TelemetryEvent::new(
-            temps_core::telemetry::TelemetryEventKind::ProjectCreatedFromTemplate,
-        )
-        .with("template_slug", request.template_slug.clone())
-        .with("deploy_mode", deploy_mode)
-        .with("service_count", request.storage_service_ids.len() as i64),
-    );
+    state
+        .telemetry
+        .report(project_created_from_template_telemetry_event(
+            &template_provenance,
+            deploy_mode,
+            request.storage_service_ids.len(),
+        ));
 
     // 7. Return the response with the source/repository URL.
     let deploy_note = match deploy_mode {
@@ -1764,7 +2209,29 @@ pub async fn create_project_from_template(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_owner_repo_from_git_url;
+    use super::{parse_owner_repo_from_git_url, project_created_from_template_telemetry_event};
+
+    #[test]
+    fn template_creation_telemetry_omits_operator_defined_slug() {
+        let private_slug = "customer-acme-private-ghp_secret123";
+        let event = project_created_from_template_telemetry_event(private_slug, "image", 2);
+        let serialized = serde_json::to_string(&event).expect("telemetry event serializes");
+
+        assert_eq!(event.properties["template_source"], "custom");
+        assert!(!event.properties.contains_key("template_slug"));
+        assert!(!serialized.contains(private_slug));
+        assert_eq!(event.properties["deploy_mode"], "image");
+        assert_eq!(event.properties["service_count"], 2);
+    }
+
+    #[test]
+    fn template_creation_telemetry_keeps_bundled_observability_slug() {
+        let event =
+            project_created_from_template_telemetry_event("observability-starter", "image", 1);
+
+        assert_eq!(event.properties["template_source"], "bundled");
+        assert_eq!(event.properties["template_slug"], "observability-starter");
+    }
 
     /// Regression test for ADR-028 finding #2: `get_project_by_slug` guard bypass.
     ///

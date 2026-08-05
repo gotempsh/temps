@@ -8,6 +8,7 @@ import {
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
+import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
@@ -15,6 +16,7 @@ import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
+import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
 import { GitSettings, ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
@@ -47,6 +49,7 @@ import Traces from './Traces'
 import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
+import { ProjectSetup } from './ProjectSetup'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
@@ -345,6 +348,7 @@ export function ProjectDetail() {
                   />
                 }
               />
+              <Route path="setup" element={<ProjectSetup project={project} />} />
               <Route
                 path="deployments"
                 element={<ProjectDeployments project={project} />}
@@ -353,9 +357,14 @@ export function ProjectDetail() {
                 path="deployments/:deploymentId"
                 element={<DeploymentDetails project={project} />}
               />
+              <Route path="drop" element={<ProjectDrop project={project} />} />
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="flags"
+                element={<ProjectFeatureFlags project={project} />}
               />
               <Route
                 path="domains"

@@ -4,7 +4,6 @@ import {
   deleteConnectionMutation,
   runConnectionHealthCheckMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { isGitHubApp } from '@/lib/provider'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -88,7 +87,13 @@ export function ConnectionsCompactList({
       setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
       onConnectionDeleted?.()
     },
-    onError: () => toast.error('Failed to delete connection'),
+    // The server refuses when projects still deploy from this connection and
+    // says which ones in the Problem Details `detail`. Swallowing that left the
+    // user with a bare "Failed to delete connection" and nothing to act on.
+    onError: (error: any) =>
+      toast.error('Failed to delete connection', {
+        description: error?.detail || error?.title || error?.message,
+      }),
   })
 
   const [healthCheckInFlight, setHealthCheckInFlight] = useState<number | null>(
@@ -176,25 +181,26 @@ export function ConnectionsCompactList({
             Update token
           </DropdownMenuItem>
         )}
-        {provider && isGitHubApp(provider) && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              className="text-destructive"
-              onSelect={(e) => {
-                e.preventDefault()
-                setDeleteDialog({
-                  open: true,
-                  connectionId: c.id,
-                  connectionName: c.account_name,
-                })
-              }}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Delete connection
-            </DropdownMenuItem>
-          </>
-        )}
+        {/* Every provider type, not just GitHub Apps: DELETE /git-connections/
+            {id} is generic, and hiding it left PAT/OAuth connections with no
+            way to be removed — including the ones that block deleting their
+            provider. The server still refuses when a project depends on the
+            connection, and now says which. */}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive"
+          onSelect={(e) => {
+            e.preventDefault()
+            setDeleteDialog({
+              open: true,
+              connectionId: c.id,
+              connectionName: c.account_name,
+            })
+          }}
+        >
+          <Trash2 className="mr-2 h-4 w-4" />
+          Delete connection
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )

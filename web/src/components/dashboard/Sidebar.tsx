@@ -34,6 +34,7 @@ import {
   FileText,
   FileLock2,
   Filter,
+  Flag,
   Folder,
   Gauge,
   GitBranch,
@@ -67,15 +68,18 @@ import {
   SlidersHorizontal,
   Sparkles,
   Users,
+  UsersRound,
   Wand2,
   Webhook,
   Workflow,
   Zap,
 } from 'lucide-react'
 
+import { ProjectResponse } from '@/api/client'
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
+import { useProjectSetup } from '@/hooks/useProjectSetup'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
@@ -183,6 +187,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
+      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
@@ -351,13 +356,10 @@ export default function AppSidebar() {
       : null
 
   // Override: user pressed Back from a route-driven swap; show DefaultNav
-  // even though we're still on /settings or /projects/:slug. Cleared on
-  // any pathname change (so re-clicking Settings or any sub-link
-  // re-triggers the swap).
-  const [forceDefault, setForceDefault] = useState(false)
-  useEffect(() => {
-    setForceDefault(false)
-  }, [location.pathname])
+  // only for that exact pathname. Navigating anywhere else clears the override
+  // by derivation, without a setState-in-effect render cycle.
+  const [forceDefaultPath, setForceDefaultPath] = useState<string | null>(null)
+  const forceDefault = forceDefaultPath === location.pathname
 
   const compact = isMinimal && !isMobile
 
@@ -409,12 +411,15 @@ export default function AppSidebar() {
           <DefaultNav
             pluginItems={pluginItems}
             pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
-            onReturnToProject={() => setForceDefault(false)}
+            onReturnToProject={() => setForceDefaultPath(null)}
           />
         ) : settingsMode ? (
-          <SettingsNav onBack={() => setForceDefault(true)} />
+          <SettingsNav onBack={() => setForceDefaultPath(location.pathname)} />
         ) : projectSlug ? (
-          <ProjectNav slug={projectSlug} onBack={() => setForceDefault(true)} />
+          <ProjectNav
+            slug={projectSlug}
+            onBack={() => setForceDefaultPath(location.pathname)}
+          />
         ) : null}
       </SidebarContent>
       <SidebarFooter>
@@ -931,6 +936,7 @@ const projectBaseNav: ProjectNavItem[] = [
     url: 'environment-variables',
     icon: KeyRound,
   },
+  { title: 'Feature Flags', url: 'flags', icon: Flag },
   { title: 'Domains', url: 'domains', icon: Globe },
   { title: 'Git', url: 'git', icon: GitFork },
   { title: 'Logs', url: 'runtime', icon: ScrollText },
@@ -968,6 +974,7 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },
       { title: 'Secrets', url: 'settings/secrets', icon: FileLock2 },
       { title: 'Security', url: 'settings/security', icon: Shield },
+      { title: 'Access', url: 'settings/access', icon: Users },
       { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
       { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
       { title: 'Skills', url: 'settings/skills', icon: Wand2 },
@@ -976,6 +983,97 @@ const projectBaseNav: ProjectNavItem[] = [
     ],
   },
 ]
+
+function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const setup = useProjectSetup(project)
+  const remainingSteps = setup.steps.filter((step) => !step.done)
+
+  if (setup.isLoading || remainingSteps.length === 0) return null
+
+  if (compact) {
+    return (
+      <SidebarGroup className="py-0 pb-2">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              tooltip={`Project setup — ${setup.completedCount}/${setup.totalCount}`}
+              className="justify-center"
+            >
+              <Link to={`/projects/${project.slug}/setup`}>
+                <BadgeCheck />
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+
+  const visibleSteps = remainingSteps.slice(0, 2)
+  const hiddenCount = remainingSteps.length - visibleSteps.length
+
+  return (
+    <SidebarGroup className="py-0 pb-2">
+      <div className="overflow-hidden rounded-lg border border-sidebar-border bg-sidebar-accent/30">
+        <Link
+          to={`/projects/${project.slug}/setup`}
+          className="group block px-3 py-2.5 transition-colors hover:bg-sidebar-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
+        >
+          <div className="flex items-center gap-2">
+            <BadgeCheck className="size-4 shrink-0 text-primary" />
+            <span className="flex-1 text-sm font-medium">Project setup</span>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {setup.completedCount}/{setup.totalCount}
+            </span>
+            <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+          </div>
+          <div
+            className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sidebar-border"
+            role="progressbar"
+            aria-label={`${project.name} setup progress`}
+            aria-valuemin={0}
+            aria-valuemax={setup.totalCount}
+            aria-valuenow={setup.completedCount}
+          >
+            <div
+              className="h-full rounded-full bg-primary transition-all duration-500"
+              style={{ width: `${setup.percent}%` }}
+            />
+          </div>
+        </Link>
+        <ul role="list" className="border-t border-sidebar-border p-1.5">
+          {visibleSteps.map((step) => (
+            <li key={step.id}>
+              <Link
+                to={step.href}
+                className="group flex items-center gap-2 rounded-md px-1.5 py-2 text-xs transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                <step.icon className="size-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
+                <span className="min-w-0 flex-1 leading-tight">
+                  {step.title}
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+              </Link>
+            </li>
+          ))}
+          {hiddenCount > 0 && (
+            <li>
+              <Link
+                to={`/projects/${project.slug}/setup`}
+                className="block rounded-md px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+              </Link>
+            </li>
+          )}
+        </ul>
+      </div>
+    </SidebarGroup>
+  )
+}
 
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery({
@@ -1040,6 +1138,8 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     if (didSyncDrillRef.current || !activeRoute) return
     didSyncDrillRef.current = true
     const parent = findDrillParent(activeRoute)
+    // Reconcile the async project lookup with the route-derived initial view.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (parent) setDrilledTo(parent)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRoute])
@@ -1132,6 +1232,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         onBack={onBack}
         backLabel="Back to menu"
       />
+      <ProjectSetupNavItem project={project} />
       <SidebarGroup className="pt-0">
         <SidebarMenu>
           {items.map((item) => {

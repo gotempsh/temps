@@ -72,6 +72,7 @@ clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Rate limiting
 tokio-util = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 
 [build-dependencies]
 prost-build = "0.13"

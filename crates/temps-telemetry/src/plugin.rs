@@ -19,7 +19,8 @@ use crate::TelemetryService;
 pub struct TelemetryPlugin {
     server_config: Arc<ServerConfig>,
     /// Version string stamped onto every event (typically the server's
-    /// `CARGO_PKG_VERSION`).
+    /// git-describe `TEMPS_VERSION`, not the static `CARGO_PKG_VERSION` --
+    /// the latter is identical across nightly/beta/release builds).
     temps_version: String,
 }
 

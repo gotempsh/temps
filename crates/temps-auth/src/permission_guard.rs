@@ -435,6 +435,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -971,6 +972,7 @@ mod tests {
             "temps-deployments",
             "temps-environments",
             "temps-error-tracking",
+            "temps-flags",
             "temps-kv",
             "temps-log-aggregator",
             "temps-monitoring",
@@ -980,6 +982,10 @@ mod tests {
             "temps-providers",
             "temps-revenue",
             "temps-status-page",
+            // Who a project is shared with is part of that project's data:
+            // the access-grant endpoints guard themselves with the very
+            // checker they register.
+            "temps-teams",
             "temps-vulnerability-scanner",
             "temps-webhooks",
         ];

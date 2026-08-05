@@ -165,6 +165,14 @@ mod m20260724_000001_add_run_config_to_agent_runs;
 mod m20260725_000001_sandboxes_agent_run_link;
 mod m20260728_000001_add_environment_id_to_metric_alert_rules;
 mod m20260730_000001_add_architecture_to_nodes;
+mod m20260730_000001_create_teams_rbac;
+mod m20260731_000001_create_source_bundles;
+mod m20260802_000001_add_environment_force_https;
+mod m20260802_000002_create_feature_flags;
+mod m20260803_000001_add_flag_last_evaluated_at;
+mod m20260803_000001_add_template_slug_to_projects;
+mod m20260803_000002_add_step_up_expires_at_to_sessions;
+mod m20260804_000001_add_must_change_password_to_users;
 
 pub struct Migrator;
 
@@ -337,6 +345,14 @@ impl MigratorTrait for Migrator {
                 m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
             ),
             Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
+            Box::new(m20260730_000001_create_teams_rbac::Migration),
+            Box::new(m20260731_000001_create_source_bundles::Migration),
+            Box::new(m20260802_000001_add_environment_force_https::Migration),
+            Box::new(m20260802_000002_create_feature_flags::Migration),
+            Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
+            Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
+            Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
+            Box::new(m20260804_000001_add_must_change_password_to_users::Migration),
         ]
     }
 }

@@ -1,7 +1,7 @@
 use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
-    EnvironmentVariableValueRevealedAudit,
+    EnvironmentVariablePromotedToSecretAudit, EnvironmentVariableValueRevealedAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -64,6 +64,7 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .build()
             }
             EnvVarError::CannotDemoteSecret { .. } => temps_core::error_builder::bad_request()
+                .title("Secret cannot be converted back to a regular variable")
                 .detail(err.to_string())
                 .build(),
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
@@ -176,6 +177,7 @@ pub async fn get_environments(
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
@@ -246,6 +248,7 @@ pub async fn get_environment(
         protected: env.protected,
         sleeping: env.sleeping,
         attack_mode: env.attack_mode,
+        force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
@@ -891,6 +894,7 @@ pub async fn update_environment_variable(
     State(state): State<Arc<AppState>>,
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
@@ -901,7 +905,7 @@ pub async fn update_environment_variable(
     );
     project_scope_guard!(auth, project_id);
 
-    let var = state
+    let outcome = state
         .env_var_service
         .update_environment_variable(
             project_id,
@@ -913,6 +917,34 @@ pub async fn update_environment_variable(
             request.is_secret,
         )
         .await?;
+    let var = outcome.var;
+
+    // Converting a variable to a secret is irreversible and removes the value
+    // from every read path — audit it explicitly.
+    if outcome.promoted_to_secret {
+        info!(
+            user_id = auth.user_id(),
+            project_id,
+            var_id,
+            environment_variable_key = %var.key,
+            "Environment variable promoted to write-only secret"
+        );
+
+        let audit = EnvironmentVariablePromotedToSecretAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id,
+            var_id,
+            key: var.key.clone(),
+            environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        };
+        if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
 
     let response = EnvironmentVariableResponse {
         id: var.id,
@@ -1147,6 +1179,7 @@ pub async fn update_environment_settings(
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
         attack_mode: settings.attack_mode,
+        force_https: settings.force_https,
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {
@@ -1222,6 +1255,7 @@ pub async fn update_environment_settings(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1326,6 +1360,7 @@ pub async fn update_environment_subdomain(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1481,6 +1516,7 @@ pub async fn wake_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1622,6 +1658,7 @@ pub async fn sleep_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
             .map(|t| t.timestamp_millis()),
@@ -1657,6 +1694,7 @@ pub async fn sleep_environment(
         (status = 204, description = "Environment permanently deleted"),
         (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -1673,6 +1711,14 @@ pub async fn delete_environment(
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+
+    require_environment_deletion_authorization(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        project_id,
+        env_id,
+    )
+    .await?;
 
     // Get environment details before deletion for audit log
     let environment = state
@@ -1760,6 +1806,23 @@ pub async fn delete_environment(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn require_environment_deletion_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), Problem> {
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::DeleteEnvironment {
+            project_id,
+            environment_id,
+        },
+    )
+    .await
+}
+
 /// Create a new environment for a project
 #[utoipa::path(
     post,
@@ -1828,6 +1891,7 @@ pub async fn create_environment(
             protected: environment.protected,
             sleeping: environment.sleeping,
             attack_mode: environment.attack_mode,
+            force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !environment.sleeping {
                 environment
@@ -2210,6 +2274,31 @@ mod tests {
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
 
+    struct RequireDeletionVerification;
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for RequireDeletionVerification {
+        async fn authorize(
+            &self,
+            action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            assert_eq!(
+                action,
+                &temps_core::SensitiveAction::DeleteEnvironment {
+                    project_id: 17,
+                    environment_id: 23,
+                }
+            );
+            Ok(temps_core::SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAuditLogger {
         serialized_operations: Mutex<Vec<(String, String)>>,
@@ -2252,6 +2341,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -2262,6 +2352,28 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[tokio::test]
+    async fn environment_deletion_stops_at_sensitive_action_gate() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            test_auth_context(temps_auth::Role::Admin)
+                .user
+                .expect("test auth should contain a user"),
+            temps_auth::Role::Admin,
+            99,
+        );
+
+        let error =
+            require_environment_deletion_authorization(&RequireDeletionVerification, &auth, 17, 23)
+                .await
+                .expect_err("environment deletion must require recent verification");
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("delete_environment"))
+        );
     }
 
     #[test]

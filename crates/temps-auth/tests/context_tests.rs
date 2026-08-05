@@ -14,6 +14,7 @@ fn create_mock_user() -> users::Model {
         email_verification_expires: None,
         password_reset_token: None,
         password_reset_expires: None,
+        must_change_password: false,
         deleted_at: None,
         mfa_secret: None,
         mfa_enabled: false,
@@ -39,7 +40,10 @@ fn test_auth_context_new_session() {
     assert!(!context.is_cli_token());
     assert!(!context.is_api_key());
 
-    if let AuthSource::Session { user: source_user } = &context.source {
+    if let AuthSource::Session {
+        user: source_user, ..
+    } = &context.source
+    {
         assert_eq!(source_user.id, user.id);
     } else {
         panic!("Expected Session auth source");

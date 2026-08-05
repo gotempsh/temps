@@ -1,12 +1,13 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::{env_var_environments, env_vars, environments};
 use thiserror::Error;
 
-use super::types::{EnvVarEnvironment, EnvVarWithEnvironments};
+use super::types::{EnvVarEnvironment, EnvVarWithEnvironments, UpdateEnvVarOutcome};
 
 #[derive(Error, Debug)]
 pub enum EnvVarError {
@@ -34,14 +35,21 @@ pub enum EnvVarError {
 
     /// `is_secret` is one-way: a row already marked secret cannot be flipped
     /// back to a normal env var. Toggling it off would let a caller leak the
-    /// value by reading the next `list` response.
-    #[error("Cannot demote secret env var '{key}' (id={var_id}) back to non-secret")]
+    /// value by reading the next `list` response. The only way back is to
+    /// delete the variable and create it again as a regular one, which forces
+    /// the operator to supply the value rather than recover it from storage.
+    #[error(
+        "Environment variable '{key}' (id={var_id}) is a secret and cannot be converted back to a regular variable. Delete it and create it again as a non-secret variable, supplying the value yourself."
+    )]
     CannotDemoteSecret { var_id: i32, key: String },
 
-    /// Secret env vars require a value on create. On update the value is
-    /// optional (omit to keep the existing ciphertext), but explicitly passing
-    /// an empty string is a logic error in the caller.
-    #[error("Secret env var '{key}' requires a non-empty value on create")]
+    /// Secret env vars require a non-empty value. On update the value is
+    /// optional — omitting it keeps the existing ciphertext — but explicitly
+    /// passing an empty string is a logic error in the caller, and a
+    /// destructive one: the write cannot be read back or undone.
+    #[error(
+        "Secret env var '{key}' requires a non-empty value. Omit the value entirely to keep the one already stored."
+    )]
     SecretValueRequired { key: String },
 
     #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
@@ -326,6 +334,12 @@ impl EnvVarService {
     /// - `is_secret: Some(true)` promotes a regular env var to a secret.
     ///   `Some(false)` is rejected if the row is already a secret — the flag
     ///   is one-way. `None` leaves the flag unchanged.
+    ///
+    /// Promotion also guarantees the value is encrypted at rest: a legacy row
+    /// still stored as plaintext (`is_encrypted = false`) is re-encrypted as
+    /// part of the same transaction, even when the caller supplies no new
+    /// value. Without that, "secret" would only hide the value from the API
+    /// while leaving it readable in the database.
     // 8 args after adding `is_secret`. Refactoring to an UpdateEnvVarRequest
     // struct would ripple through every caller (handlers + tests) for no
     // semantic gain; the args are the genuine inputs to the operation.
@@ -339,100 +353,162 @@ impl EnvVarService {
         environment_ids: Vec<i32>,
         include_in_preview: bool,
         is_secret: Option<bool>,
-    ) -> Result<EnvVarWithEnvironments, EnvVarError> {
+    ) -> Result<UpdateEnvVarOutcome, EnvVarError> {
         let encrypted_value_opt = match &value {
             Some(v) => Some(self.encrypt_value(&key, v)?),
             None => None,
         };
+        // An explicitly-supplied empty value is only ever a caller bug when the
+        // row ends up secret: the write is unreadable afterwards and the flag
+        // cannot be undone, so there is no way to notice the mistake or recover
+        // the old value. Omitting `value` entirely is the supported way to keep
+        // the existing ciphertext.
+        let value_is_explicitly_empty = value.as_ref().is_some_and(|v| v.is_empty());
+        let encryption_service = self.encryption_service.clone();
 
-        let result = self
-            .db
-            .transaction::<_, EnvVarWithEnvironments, EnvVarError>(|txn| {
-                let encrypted_value_opt = encrypted_value_opt.clone();
-                let key = key.clone();
-                let environment_ids = environment_ids.clone();
+        let result =
+            self.db
+                .transaction::<_, UpdateEnvVarOutcome, EnvVarError>(|txn| {
+                    let encrypted_value_opt = encrypted_value_opt.clone();
+                    let key = key.clone();
+                    let environment_ids = environment_ids.clone();
+                    let encryption_service = encryption_service.clone();
 
-                Box::pin(async move {
-                    let env_var = env_vars::Entity::find_by_id(var_id)
-                        .filter(env_vars::Column::ProjectId.eq(project_id))
-                        .one(txn)
-                        .await?
-                        .ok_or(EnvVarError::Other(
-                            "Environment variable not found".to_string(),
-                        ))?;
-
-                    // One-way secret flag: reject demotion.
-                    let final_is_secret = match (env_var.is_secret, is_secret) {
-                        (true, Some(false)) => {
-                            return Err(EnvVarError::CannotDemoteSecret {
-                                var_id: env_var.id,
-                                key: env_var.key.clone(),
-                            });
-                        }
-                        (current, Some(new)) => current || new,
-                        (current, None) => current,
-                    };
-
-                    let mut active_var: env_vars::ActiveModel = env_var.into();
-                    active_var.key = Set(key.clone());
-                    if let Some(encrypted_value) = encrypted_value_opt {
-                        active_var.value = Set(encrypted_value);
-                        active_var.is_encrypted = Set(true);
-                    }
-                    active_var.is_secret = Set(final_is_secret);
-                    active_var.include_in_preview = Set(include_in_preview);
-                    active_var.updated_at = Set(chrono::Utc::now());
-                    let var = active_var.update(txn).await?;
-
-                    env_var_environments::Entity::delete_many()
-                        .filter(env_var_environments::Column::EnvVarId.eq(var_id))
-                        .exec(txn)
-                        .await?;
-
-                    let mut environments = Vec::new();
-                    for env_id in &environment_ids {
-                        let new_env_rel = env_var_environments::ActiveModel {
-                            env_var_id: Set(var.id),
-                            environment_id: Set(*env_id),
-                            created_at: Set(chrono::Utc::now()),
-                            ..Default::default()
-                        };
-
-                        new_env_rel.insert(txn).await?;
-
-                        let env = environments::Entity::find_by_id(*env_id)
+                    Box::pin(async move {
+                        // SELECT ... FOR UPDATE. Every decision below is derived
+                        // from this row — whether the flag may change, and
+                        // whether an empty value is about to be sealed — so the
+                        // read has to be serialized with concurrent updates.
+                        // Without the lock, a promotion committing between this
+                        // read and our own write lets a deliberate blank land on
+                        // a row that has since become secret, which is the
+                        // unrecoverable state both guards exist to prevent.
+                        let env_var = env_vars::Entity::find_by_id(var_id)
+                            .filter(env_vars::Column::ProjectId.eq(project_id))
+                            .lock_exclusive()
                             .one(txn)
                             .await?
-                            .ok_or(EnvVarError::Other("Environment not found".to_string()))?;
+                            .ok_or(EnvVarError::Other(
+                                "Environment variable not found".to_string(),
+                            ))?;
 
-                        environments.push(EnvVarEnvironment {
-                            id: env.id,
-                            name: env.name,
-                            main_url: env.subdomain,
-                            current_deployment_id: env.current_deployment_id,
-                        });
-                    }
+                        // One-way secret flag: reject demotion.
+                        let final_is_secret = match (env_var.is_secret, is_secret) {
+                            (true, Some(false)) => {
+                                return Err(EnvVarError::CannotDemoteSecret {
+                                    var_id: env_var.id,
+                                    key: env_var.key.clone(),
+                                });
+                            }
+                            (current, Some(new)) => current || new,
+                            (current, None) => current,
+                        };
 
-                    // Secret rows never return plaintext, even from update.
-                    // Non-secret rows return the supplied plaintext or
-                    // None when value wasn't changed (caller already has
-                    // the current value via list).
-                    let value = if var.is_secret { None } else { value };
+                        // Refuse to seal an empty value over a real one. Without
+                        // this a client that failed to load the current value
+                        // (a denied or transient reveal) silently overwrites the
+                        // credential with "" and marks it write-only, which is
+                        // unrecoverable: it cannot be read back to notice the
+                        // loss, and cannot be demoted to inspect it. Mirrors the
+                        // create-time `SecretValueRequired` guard.
+                        if final_is_secret && value_is_explicitly_empty {
+                            return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                        }
 
-                    Ok(EnvVarWithEnvironments {
-                        id: var.id,
-                        project_id: var.project_id,
-                        key: var.key,
-                        value,
-                        created_at: var.created_at,
-                        updated_at: var.updated_at,
-                        environments,
-                        include_in_preview: var.include_in_preview,
-                        is_secret: var.is_secret,
+                        // A promotion is the transition non-secret -> secret. It is
+                        // reported back to the handler so the write can be audited
+                        // as the one-way, security-relevant change that it is.
+                        let was_secret = env_var.is_secret;
+                        let promoted_to_secret = !was_secret && final_is_secret;
+                        let was_encrypted = env_var.is_encrypted;
+                        let stored_value = env_var.value.clone();
+
+                        let mut active_var: env_vars::ActiveModel = env_var.into();
+                        active_var.key = Set(key.clone());
+                        if let Some(encrypted_value) = encrypted_value_opt {
+                            active_var.value = Set(encrypted_value);
+                            active_var.is_encrypted = Set(true);
+                        } else if promoted_to_secret && !was_encrypted {
+                            // Legacy plaintext row being promoted without a new
+                            // value: encrypt what is already there so the secret is
+                            // unreadable at rest, not merely hidden from the API.
+                            let ciphertext = encryption_service
+                                .encrypt_string(&stored_value)
+                                .map_err(|e| EnvVarError::EncryptionFailed {
+                                    key: key.clone(),
+                                    reason: e.to_string(),
+                                })?;
+                            active_var.value = Set(ciphertext);
+                            active_var.is_encrypted = Set(true);
+                        }
+                        // Only touch the column on an actual promotion. Writing
+                        // it unconditionally re-asserts a value derived from an
+                        // unlocked read, so two concurrent updates that both saw
+                        // `is_secret = false` would let the second (an ordinary
+                        // edit that never asked to change the flag) clear the
+                        // promotion the first one just committed — silently
+                        // unmasking the secret, since the ciphertext survives.
+                        // Leaving the column out of the UPDATE makes an
+                        // unrequested demote impossible regardless of ordering.
+                        if promoted_to_secret {
+                            active_var.is_secret = Set(true);
+                        }
+                        active_var.include_in_preview = Set(include_in_preview);
+                        active_var.updated_at = Set(chrono::Utc::now());
+                        let var = active_var.update(txn).await?;
+
+                        env_var_environments::Entity::delete_many()
+                            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+                            .exec(txn)
+                            .await?;
+
+                        let mut environments = Vec::new();
+                        for env_id in &environment_ids {
+                            let new_env_rel = env_var_environments::ActiveModel {
+                                env_var_id: Set(var.id),
+                                environment_id: Set(*env_id),
+                                created_at: Set(chrono::Utc::now()),
+                                ..Default::default()
+                            };
+
+                            new_env_rel.insert(txn).await?;
+
+                            let env = environments::Entity::find_by_id(*env_id)
+                                .one(txn)
+                                .await?
+                                .ok_or(EnvVarError::Other("Environment not found".to_string()))?;
+
+                            environments.push(EnvVarEnvironment {
+                                id: env.id,
+                                name: env.name,
+                                main_url: env.subdomain,
+                                current_deployment_id: env.current_deployment_id,
+                            });
+                        }
+
+                        // Secret rows never return plaintext, even from update.
+                        // Non-secret rows return the supplied plaintext or
+                        // None when value wasn't changed (caller already has
+                        // the current value via list).
+                        let value = if var.is_secret { None } else { value };
+
+                        Ok(UpdateEnvVarOutcome {
+                            var: EnvVarWithEnvironments {
+                                id: var.id,
+                                project_id: var.project_id,
+                                key: var.key,
+                                value,
+                                created_at: var.created_at,
+                                updated_at: var.updated_at,
+                                environments,
+                                include_in_preview: var.include_in_preview,
+                                is_secret: var.is_secret,
+                            },
+                            promoted_to_secret,
+                        })
                     })
                 })
-            })
-            .await?;
+                .await?;
 
         Ok(result)
     }
@@ -521,7 +597,7 @@ impl EnvVarService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 
     fn make_encryption_service() -> Arc<EncryptionService> {
         Arc::new(
@@ -918,5 +994,256 @@ mod tests {
                 ref key,
             } if key == "WRITE_ONLY_TOKEN"
         ));
+    }
+
+    /// Building a mock that walks the update transaction: SELECT the row,
+    /// UPDATE ... RETURNING the new row, then DELETE the environment links.
+    /// `environment_ids` is empty in these tests so no link inserts follow.
+    fn mock_update_db(
+        before: env_vars::Model,
+        after: env_vars::Model,
+    ) -> Arc<sea_orm::DatabaseConnection> {
+        Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![before]])
+                .append_query_results(vec![vec![after]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_update_promoting_to_secret_reports_promotion_and_withholds_value() {
+        // Converting an existing variable to a secret is the whole point of the
+        // is_secret transition: the caller must learn it happened (so it can be
+        // audited) and the response must stop carrying the plaintext.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("old_value").unwrap();
+        let before = make_env_var_model_full(3, 10, "API_KEY", &encrypted, true, false);
+        let after = make_env_var_model_full(3, 10, "API_KEY", &encrypted, true, true);
+
+        let service = EnvVarService::new(mock_update_db(before, after), encryption_service);
+
+        let outcome = service
+            .update_environment_variable(
+                10,
+                3,
+                "API_KEY".to_string(),
+                None,
+                vec![],
+                false,
+                Some(true),
+            )
+            .await
+            .expect("promotion should succeed");
+
+        assert!(outcome.promoted_to_secret);
+        assert!(outcome.var.is_secret);
+        assert_eq!(outcome.var.value, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_of_already_secret_var_is_not_reported_as_promotion() {
+        // Editing a variable that is already secret (e.g. changing which
+        // environments it applies to) must not emit a second promotion audit.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("still_secret").unwrap();
+        let before = make_env_var_model_full(4, 10, "TOKEN", &encrypted, true, true);
+        let after = make_env_var_model_full(4, 10, "TOKEN", &encrypted, true, true);
+
+        let service = EnvVarService::new(mock_update_db(before, after), encryption_service);
+
+        let outcome = service
+            .update_environment_variable(10, 4, "TOKEN".to_string(), None, vec![], false, None)
+            .await
+            .expect("no-op update should succeed");
+
+        assert!(!outcome.promoted_to_secret);
+        assert!(outcome.var.is_secret);
+        assert_eq!(outcome.var.value, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_cannot_demote_a_secret_back_to_plain_var() {
+        // The flag is one-way. Allowing is_secret: false would let a caller
+        // unmask the value simply by toggling it off and re-reading the list.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("stays_hidden").unwrap();
+        let before = make_env_var_model_full(5, 10, "PRIVATE_KEY", &encrypted, true, true);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![before]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .update_environment_variable(
+                10,
+                5,
+                "PRIVATE_KEY".to_string(),
+                None,
+                vec![],
+                false,
+                Some(false),
+            )
+            .await
+            .expect_err("demotion must be rejected");
+
+        assert!(matches!(
+            error,
+            EnvVarError::CannotDemoteSecret { var_id: 5, ref key } if key == "PRIVATE_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_empty_value_when_row_ends_up_secret() {
+        // The destructive case: a client that could not load the current value
+        // (denied or failed reveal) submits an empty string together with the
+        // promotion. Sealing "" over a real credential is unrecoverable — it
+        // can never be read back to notice, nor demoted to inspect — so the
+        // write must be refused rather than reported as a success.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service
+            .encrypt_string("real_credential")
+            .unwrap();
+        let before = make_env_var_model_full(6, 10, "API_KEY", &encrypted, true, false);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![before]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .update_environment_variable(
+                10,
+                6,
+                "API_KEY".to_string(),
+                Some(String::new()),
+                vec![],
+                false,
+                Some(true),
+            )
+            .await
+            .expect_err("promoting with an empty value must be refused");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_empty_value_for_an_existing_secret() {
+        // Same hazard without a promotion: blanking a secret that is already
+        // write-only is equally unrecoverable.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("still_needed").unwrap();
+        let before = make_env_var_model_full(7, 10, "TOKEN", &encrypted, true, true);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![before]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .update_environment_variable(
+                10,
+                7,
+                "TOKEN".to_string(),
+                Some(String::new()),
+                vec![],
+                false,
+                None,
+            )
+            .await
+            .expect_err("blanking an existing secret must be refused");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequired { ref key } if key == "TOKEN"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_promoting_legacy_plaintext_row_encrypts_the_stored_value() {
+        // Rows written before encryption was enabled hold plaintext. Promoting
+        // one without supplying a new value must encrypt what is already there:
+        // a secret that is merely hidden from the API but still readable in the
+        // database is not a secret. This is the only coverage of that branch —
+        // the other tests all start from is_encrypted = true.
+        //
+        // Asserted against the statement the transaction actually emitted, not
+        // against the mock's canned return row: the returned model is whatever
+        // the fixture says, so checking it would pass even if the encryption
+        // branch were deleted.
+        let encryption_service = make_encryption_service();
+        let before =
+            make_env_var_model_full(8, 10, "LEGACY_KEY", "plain_secret_value", false, false);
+        let after = make_env_var_model_full(8, 10, "LEGACY_KEY", "ciphertext", true, true);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![before]])
+            .append_query_results(vec![vec![after]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = EnvVarService::new(db.clone(), encryption_service.clone());
+
+        let outcome = service
+            .update_environment_variable(
+                10,
+                8,
+                "LEGACY_KEY".to_string(),
+                None,
+                vec![],
+                false,
+                Some(true),
+            )
+            .await
+            .expect("promoting a legacy plaintext row should succeed");
+        assert!(outcome.promoted_to_secret);
+
+        // DatabaseConnection is not Clone under the `mock` feature, and
+        // into_transaction_log consumes it — drop the service so this Arc is
+        // the sole owner.
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+
+        // Inspect the statements the transaction actually emitted. `Transaction`
+        // keeps its statements private, so match on the Debug rendering: every
+        // bound String shows up quoted, and exactly one of them is the
+        // ciphertext (it is the only candidate our key can decrypt).
+        let log = db.into_transaction_log();
+        let dump = format!("{:?}", log);
+        assert!(
+            dump.to_uppercase().contains("UPDATE"),
+            "the transaction must emit an UPDATE"
+        );
+        let written = dump
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .find(|candidate| encryption_service.decrypt_string(candidate).is_ok())
+            .map(|candidate| candidate.to_string())
+            .expect("the UPDATE must write a ciphertext this key can decrypt");
+
+        // The plaintext was encrypted exactly once, and survived intact.
+        assert_ne!(written, "plain_secret_value");
+        assert_eq!(
+            encryption_service.decrypt_string(&written).unwrap(),
+            "plain_secret_value"
+        );
     }
 }

@@ -88,6 +88,29 @@ impl From<sea_orm::DbErr> for DeploymentError {
     }
 }
 
+fn confined_archive_path(
+    data_dir: &std::path::Path,
+    stored_path: &str,
+) -> Result<std::path::PathBuf, DeploymentError> {
+    let relative = std::path::Path::new(stored_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeploymentError::InvalidBundlePath {
+            path: stored_path.to_string(),
+            reason: "stored archive path escapes the Temps data directory".to_string(),
+        });
+    }
+    Ok(data_dir.join(relative))
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -130,9 +153,10 @@ impl DeploymentService {
             }
         })?;
 
-        if containers.is_empty() {
-            return Ok(0);
-        }
+        let recorded_container_ids: std::collections::HashSet<String> = containers
+            .iter()
+            .map(|container| container.container_id.clone())
+            .collect();
 
         let deployment_ids: Vec<i32> = containers
             .iter()
@@ -213,6 +237,42 @@ impl DeploymentService {
                 }
             };
 
+            match deployer.get_container_info(&container_id).await {
+                Ok(info) => {
+                    let expected_project = project_id.to_string();
+                    let expected_environment = container_environment_id.to_string();
+                    if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                        || info.labels.get("sh.temps.project_id") != Some(&expected_project)
+                        || info.labels.get("sh.temps.environment") != Some(&expected_environment)
+                    {
+                        let reason = "runtime container labels do not match the project and environment being deleted".to_string();
+                        let _ = self
+                            .restore_cleanup_marker(&original, already_prepared)
+                            .await;
+                        return Err(temps_core::ContainerCleanupError::Removal {
+                            project_id,
+                            environment_id: container_environment_id,
+                            container_id,
+                            node_id,
+                            reason,
+                        });
+                    }
+                }
+                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+                Err(error) => {
+                    let _ = self
+                        .restore_cleanup_marker(&original, already_prepared)
+                        .await;
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason: format!("failed to verify runtime container ownership: {error}"),
+                    });
+                }
+            }
+
             let removal_error = match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 deployer.remove_container(&container_id),
@@ -256,6 +316,70 @@ impl DeploymentService {
                 ?node_id,
                 "Removed application container before owner deletion"
             );
+        }
+
+        // Compose can create labeled containers before the deployment rows are
+        // registered. Discover those runtime-owned containers as well so a
+        // concurrent cancellation/deletion cannot orphan an unrecorded stack.
+        let runtime_containers = self.deployer.list_containers().await.map_err(|error| {
+            temps_core::ContainerCleanupError::Discovery {
+                project_id,
+                environment_id,
+                reason: format!("failed to discover labeled runtime containers: {error}"),
+            }
+        })?;
+        let expected_project = project_id.to_string();
+        let expected_environment = environment_id.map(|id| id.to_string());
+        for container in runtime_containers {
+            if recorded_container_ids.contains(&container.container_id)
+                || container.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                || container.labels.get("sh.temps.project_id") != Some(&expected_project)
+                || expected_environment.as_ref().is_some_and(|expected| {
+                    container.labels.get("sh.temps.environment") != Some(expected)
+                })
+            {
+                continue;
+            }
+            let container_environment_id = container
+                .labels
+                .get("sh.temps.environment")
+                .and_then(|value| value.parse::<i32>().ok())
+                .ok_or_else(|| temps_core::ContainerCleanupError::Discovery {
+                    project_id,
+                    environment_id,
+                    reason: format!(
+                        "managed container '{}' has an invalid environment label",
+                        container.container_id
+                    ),
+                })?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.deployer.remove_container(&container.container_id),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
+                    removed += 1;
+                }
+                Ok(Err(error)) => {
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container.container_id,
+                        node_id: None,
+                        reason: error.to_string(),
+                    });
+                }
+                Err(_) => {
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container.container_id,
+                        node_id: None,
+                        reason: "runtime container removal timed out after 30 seconds".to_string(),
+                    });
+                }
+            }
         }
 
         Ok(removed)
@@ -3359,6 +3483,53 @@ impl DeploymentService {
         Ok(count)
     }
 
+    /// Remove every uploaded archive recorded for a project before deletion.
+    /// Runtime containers are handled by `DeploymentContainerCleaner`.
+    pub async fn cleanup_project_archives(&self, project_id: i32) -> Result<u64, DeploymentError> {
+        let data_dir = self.config_service.data_dir();
+        let source_archives = temps_entities::source_bundles::Entity::find()
+            .filter(temps_entities::source_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let static_archives = temps_entities::static_bundles::Entity::find()
+            .filter(temps_entities::static_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let archive_paths: Vec<String> = source_archives
+            .into_iter()
+            .map(|bundle| bundle.archive_path)
+            .chain(static_archives.into_iter().map(|bundle| bundle.blob_path))
+            .collect();
+        let removed = archive_paths.len() as u64;
+        for relative_path in archive_paths {
+            let archive_path =
+                confined_archive_path(&data_dir, &relative_path).map_err(|error| {
+                    DeploymentError::InvalidBundlePath {
+                        path: relative_path.clone(),
+                        reason: format!("stored path for project {project_id} is invalid: {error}"),
+                    }
+                })?;
+            match tokio::fs::remove_file(&archive_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to remove archive '{}' for project {}: {}",
+                        archive_path.display(),
+                        project_id,
+                        error
+                    )));
+                }
+            }
+        }
+
+        info!(
+            "Removed {} uploaded archive(s) before deleting project {}",
+            removed, project_id
+        );
+        Ok(removed)
+    }
+
     /// Cancel a specific deployment
     pub async fn cancel_deployment(
         &self,
@@ -3947,6 +4118,18 @@ impl temps_core::DeploymentCanceller for DeploymentService {
 }
 
 #[async_trait::async_trait]
+impl temps_core::ProjectArchiveCleaner for DeploymentService {
+    async fn cleanup_project_archives(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cleanup_project_archives(project_id)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[async_trait::async_trait]
 impl temps_core::DeploymentContainerCleaner for DeploymentService {
     async fn cleanup_project_containers(
         &self,
@@ -3975,6 +4158,25 @@ mod tests {
 
     use std::sync::Arc;
     use temps_core::EncryptionService;
+
+    #[test]
+    fn archive_cleanup_paths_are_lexically_confined() {
+        let root = std::path::Path::new("/var/lib/temps");
+        assert_eq!(
+            confined_archive_path(root, "source-bundles/archive.zip").unwrap(),
+            root.join("source-bundles/archive.zip")
+        );
+        for path in [
+            "../archive.zip",
+            "source-bundles/../../archive.zip",
+            "/tmp/archive.zip",
+        ] {
+            assert!(matches!(
+                confined_archive_path(root, path),
+                Err(DeploymentError::InvalidBundlePath { .. })
+            ));
+        }
+    }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_config::DeploymentConfig, deployments, env_vars, environments,
@@ -4355,6 +4557,42 @@ mod tests {
         }
     }
 
+    /// Stub `get_container_info` so the runtime ownership check in
+    /// `cleanup_project_containers` sees a container whose labels match the
+    /// project/environment being deleted.
+    ///
+    /// Cleanup refuses to remove a container that is not provably ours, so
+    /// every cleanup test has to present the labels a real managed container
+    /// would carry — otherwise the test fails on the guard rather than on the
+    /// behaviour it is actually asserting.
+    fn expect_owned_container_info(
+        deployer: &mut MockContainerDeployer,
+        project_id: i32,
+        environment_id: i32,
+    ) {
+        deployer.expect_get_container_info().returning(move |id| {
+            Ok(temps_deployer::ContainerInfo {
+                container_id: id.to_string(),
+                container_name: id.to_string(),
+                image_name: "nginx:latest".to_string(),
+                created_at: Utc::now(),
+                ports: vec![],
+                environment_vars: std::collections::HashMap::new(),
+                status: temps_deployer::ContainerStatus::Running,
+                restart_count: Some(0),
+                labels: std::collections::HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                    (
+                        "sh.temps.environment".to_string(),
+                        environment_id.to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            })
+        });
+    }
+
     fn create_cleanup_service_for_test(
         db: Arc<temps_database::DbConnection>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
@@ -4408,10 +4646,12 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let expected_container_id = container.container_id.clone();
         let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer
             .expect_remove_container()
             .withf(move |container_id| container_id == expected_container_id)
@@ -4456,9 +4696,11 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer.expect_remove_container().times(1).returning(|_| {
             Err(temps_deployer::DeployerError::NetworkError(
                 "worker unavailable".to_string(),
@@ -4492,6 +4734,55 @@ mod tests {
         Ok(())
     }
 
+    /// The runtime ownership guard is the last line of defence against
+    /// deleting a container that merely *recorded* a matching id: if the
+    /// container Docker actually has under that id belongs to someone else,
+    /// cleanup must refuse to touch it rather than remove another tenant's
+    /// workload.
+    #[tokio::test]
+    async fn cleanup_refuses_to_remove_a_container_owned_by_another_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup ownership integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        // Same container id, but the running container claims a different project.
+        expect_owned_container_info(&mut deployer, project.id + 1, environment.id);
+        // The whole point: removal must never be attempted.
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(temps_core::ContainerCleanupError::Removal { .. })
+            ),
+            "cleanup must fail closed when runtime labels do not match, got {result:?}"
+        );
+
+        let preserved = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("a refused cleanup must preserve the container record");
+        assert!(
+            preserved.deleted_at.is_none(),
+            "a container we refused to touch must not be marked deleted"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn interrupted_cleanup_is_idempotent_when_container_is_already_absent(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4502,7 +4793,7 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let mut interrupted: deployment_containers::ActiveModel = container.clone().into();
         interrupted.status = Set(Some("removing".to_string()));
@@ -4510,6 +4801,8 @@ mod tests {
         interrupted.update(db.as_ref()).await?;
 
         let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
         deployer.expect_remove_container().times(1).returning(|_| {
             Err(temps_deployer::DeployerError::ContainerNotFound(
                 "already removed".to_string(),

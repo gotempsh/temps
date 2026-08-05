@@ -75,7 +75,9 @@ impl TelemetryService {
     /// Build a reporter rooted at `data_dir`.
     ///
     /// `temps_version` is stamped onto every event (pass the server's
-    /// `CARGO_PKG_VERSION`). Telemetry is enabled unless the operator opted out
+    /// git-describe `TEMPS_VERSION`, not `CARGO_PKG_VERSION` -- the latter is
+    /// a static Cargo.toml value shared by nightly, beta, and release
+    /// builds alike). Telemetry is enabled unless the operator opted out
     /// via `TEMPS_TELEMETRY` set to `0`/`false`/`off`/`no`. The anonymous id is
     /// always loaded/generated (even when disabled) so flipping telemetry back
     /// on doesn't churn the instance identity.

@@ -1,26 +1,129 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Check, Copy, Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import type { HighlighterCore } from 'shiki/core'
+
+/**
+ * Languages this block can highlight.
+ *
+ * Adding one means adding its grammar to `LANG_LOADERS` below — the list is
+ * explicit rather than shiki's full bundle because that bundle is several
+ * megabytes of grammars for languages the console will never render.
+ */
+export type CodeLanguage =
+  | 'bash'
+  | 'shell'
+  | 'yaml'
+  | 'json'
+  | 'javascript'
+  | 'typescript'
+  | 'tsx'
+  | 'text'
+  | 'python'
+  | 'go'
+  | 'rust'
+  | 'ruby'
+  | 'php'
+  | 'java'
+  | 'sql'
+  | 'dockerfile'
 
 interface CodeBlockProps {
   code: string
-  language?:
-    | 'bash'
-    | 'yaml'
-    | 'json'
-    | 'javascript'
-    | 'typescript'
-    | 'shell'
-    | 'text'
-    | 'python'
-    | 'go'
+  language?: CodeLanguage
   className?: string
   showCopy?: boolean
   title?: string
   defaultWrap?: boolean
   defaultShowLineNumbers?: boolean
   disableWrapToggle?: boolean
+}
+
+// Same themes the docs site compiles its MDX with, so a snippet reads
+// identically whether it's on temps.sh/docs or inside the console.
+const THEMES = { light: 'github-light', dark: 'github-dark' } as const
+
+const LANG_LOADERS: Record<
+  Exclude<CodeLanguage, 'text'>,
+  () => Promise<unknown>
+> = {
+  bash: () => import('shiki/langs/bash.mjs'),
+  shell: () => import('shiki/langs/shellscript.mjs'),
+  yaml: () => import('shiki/langs/yaml.mjs'),
+  json: () => import('shiki/langs/json.mjs'),
+  javascript: () => import('shiki/langs/javascript.mjs'),
+  typescript: () => import('shiki/langs/typescript.mjs'),
+  tsx: () => import('shiki/langs/tsx.mjs'),
+  python: () => import('shiki/langs/python.mjs'),
+  go: () => import('shiki/langs/go.mjs'),
+  rust: () => import('shiki/langs/rust.mjs'),
+  ruby: () => import('shiki/langs/ruby.mjs'),
+  php: () => import('shiki/langs/php.mjs'),
+  java: () => import('shiki/langs/java.mjs'),
+  sql: () => import('shiki/langs/sql.mjs'),
+  dockerfile: () => import('shiki/langs/docker.mjs'),
+}
+
+// One highlighter for the whole app, built lazily on the first code block and
+// grown one grammar at a time. Loading every grammar up front would pull
+// megabytes into the initial bundle for pages that show no code at all.
+let highlighterPromise: Promise<HighlighterCore> | null = null
+const loadedLangs = new Set<string>()
+
+async function getHighlighter(): Promise<HighlighterCore> {
+  if (!highlighterPromise) {
+    highlighterPromise = (async () => {
+      const [{ createHighlighterCore }, { createJavaScriptRegexEngine }] =
+        await Promise.all([
+          import('shiki/core'),
+          import('shiki/engine/javascript'),
+        ])
+      // The JS engine keeps us off the 450 KB oniguruma wasm blob, which
+      // rsbuild would have to serve as a separate asset.
+      return createHighlighterCore({
+        themes: [
+          import('shiki/themes/github-light.mjs'),
+          import('shiki/themes/github-dark.mjs'),
+        ],
+        langs: [],
+        engine: createJavaScriptRegexEngine({ forgiving: true }),
+      })
+    })()
+  }
+  return highlighterPromise
+}
+
+async function highlight(
+  code: string,
+  language: CodeLanguage
+): Promise<string | null> {
+  if (language === 'text') return null
+
+  const highlighter = await getHighlighter()
+  if (!loadedLangs.has(language)) {
+    await highlighter.loadLanguage(
+      (await LANG_LOADERS[language]()) as Parameters<
+        typeof highlighter.loadLanguage
+      >[0]
+    )
+    loadedLangs.add(language)
+  }
+
+  const html = highlighter.codeToHtml(code, {
+    lang: language,
+    themes: THEMES,
+    // Emits --shiki-light / --shiki-dark custom properties instead of baking
+    // one theme's colours in, so the block follows the console's theme
+    // toggle without re-highlighting. globals.css maps the vars to `color`.
+    defaultColor: false,
+  })
+
+  // Shiki hands back a full <pre><code>…</code></pre>; we only want the token
+  // markup, since the surrounding chrome is ours.
+  return (
+    html.match(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/)?.[1] ?? null
+  )
 }
 
 export function CodeBlock({
@@ -36,6 +139,21 @@ export function CodeBlock({
   const [copied, setCopied] = useState(false)
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
+  const [html, setHtml] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    highlight(code, language)
+      .then((result) => {
+        if (!cancelled) setHtml(result)
+      })
+      // A grammar that fails to load must not blank the snippet — the plain
+      // fallback below is already rendered and stays.
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [code, language])
 
   const visibleButtonCount =
     1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
@@ -46,826 +164,33 @@ export function CodeBlock({
     setTimeout(() => setCopied(false), 2000)
   }
 
-  // Simple syntax highlighting - returns React elements instead of HTML strings
-  const renderHighlightedCode = (code: string, lang: string) => {
-    const lines = code.split('\n')
-
-    if (lang === 'bash' || lang === 'shell') {
-      return lines.map((line, i) => (
-        <span key={i} className="block">
-          {showLineNumbers && (
-            <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-              {i + 1}
-            </span>
-          )}
-          {line.trim().startsWith('#') ? (
-            <span className="text-muted-foreground opacity-70 italic">
-              {line || '\u00A0'}
-            </span>
-          ) : (
-            <>
-              {line.split(' ').map((word, j) => {
-                // Commands
-                if (
-                  j === 0 &&
-                  [
-                    'npm',
-                    'yarn',
-                    'pnpm',
-                    'bun',
-                    'curl',
-                    'brew',
-                    'sudo',
-                    'chmod',
-                    'cloudflared',
-                    'systemctl',
-                    'mkdir',
-                    'cd',
-                    'ls',
-                    'echo',
-                    'export',
-                    'cat',
-                    'mv',
-                    'cp',
-                  ].includes(word)
-                ) {
-                  return (
-                    <span
-                      key={j}
-                      className="text-blue-600 dark:text-blue-400 font-semibold"
-                    >
-                      {word}{' '}
-                    </span>
-                  )
-                }
-                // Flags
-                if (word.startsWith('-')) {
-                  return (
-                    <span
-                      key={j}
-                      className="text-orange-600 dark:text-orange-400"
-                    >
-                      {word}{' '}
-                    </span>
-                  )
-                }
-                // Environment variables
-                if (word.includes('=') && !word.startsWith('-')) {
-                  const [key, value] = word.split('=')
-                  return (
-                    <span key={j}>
-                      <span className="text-purple-600 dark:text-purple-400">
-                        {key}
-                      </span>
-                      <span className="text-muted-foreground">=</span>
-                      <span className="text-green-600 dark:text-green-400">
-                        {value}
-                      </span>
-                      <span> </span>
-                    </span>
-                  )
-                }
-                return <span key={j}>{word} </span>
-              })}
-            </>
-          )}
-        </span>
-      ))
-    }
-
-    if (lang === 'python') {
-      const keywords = [
-        'import',
-        'from',
-        'def',
-        'class',
-        'return',
-        'if',
-        'elif',
-        'else',
-        'for',
-        'while',
-        'try',
-        'except',
-        'finally',
-        'with',
-        'as',
-        'pass',
-        'break',
-        'continue',
-        'global',
-        'nonlocal',
-        'lambda',
-        'yield',
-        'raise',
-        'del',
-        'assert',
-        'and',
-        'or',
-        'not',
-        'in',
-        'is',
-      ]
-      const builtins = [
-        'True',
-        'False',
-        'None',
-        'print',
-        'len',
-        'range',
-        'str',
-        'int',
-        'float',
-        'list',
-        'dict',
-        'tuple',
-        'set',
-        'open',
-        'file',
-        'input',
-        'type',
-        'super',
-        'self',
-      ]
-
-      return lines.map((line, lineIdx) => {
-        // Comments
-        if (line.trim().startsWith('#')) {
-          return (
-            <span key={lineIdx} className="block">
-              {showLineNumbers && (
-                <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                  {lineIdx + 1}
-                </span>
-              )}
-              <span className="text-muted-foreground opacity-70 italic">
-                {line || '\u00A0'}
-              </span>
-            </span>
-          )
-        }
-
-        // Process each line with a simple tokenizer
-        const tokens: React.ReactNode[] = []
-        let current = ''
-        let inString = false
-        let stringChar = ''
-
-        for (let i = 0; i < line.length; i++) {
-          const char = line[i]
-
-          // Handle strings
-          if ((char === '"' || char === "'") && !inString) {
-            if (current) {
-              tokens.push(renderPythonToken(current, keywords, builtins))
-            }
-            inString = true
-            stringChar = char
-            current = char
-          } else if (char === stringChar && inString) {
-            current += char
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-            current = ''
-            inString = false
-            stringChar = ''
-          } else if (inString) {
-            current += char
-          } else if (
-            char === ' ' ||
-            char === '(' ||
-            char === ')' ||
-            char === '[' ||
-            char === ']' ||
-            char === ':' ||
-            char === ',' ||
-            char === '.' ||
-            char === '=' ||
-            char === '+' ||
-            char === '-' ||
-            char === '*' ||
-            char === '/'
-          ) {
-            if (current) {
-              tokens.push(renderPythonToken(current, keywords, builtins))
-              current = ''
-            }
-            tokens.push(char)
-          } else {
-            current += char
-          }
-        }
-
-        if (current) {
-          if (inString) {
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-          } else {
-            tokens.push(renderPythonToken(current, keywords, builtins))
-          }
-        }
-
-        return (
-          <span key={lineIdx} className="block">
-            {showLineNumbers && (
-              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                {lineIdx + 1}
-              </span>
-            )}
-            {tokens.length === 0 ? '\u00A0' : tokens}
-          </span>
-        )
-      })
-    }
-
-    if (lang === 'json') {
-      return lines.map((line, lineIdx) => {
-        // HTML-escape first: the highlighter below injects <span> markup and
-        // renders via dangerouslySetInnerHTML, and JSON string values/keys can
-        // be attacker-controlled (e.g. custom event props). Escaping &, <, >
-        // neutralises tag injection; the token regexes below match on ", :,
-        // digits and keywords, which escaping leaves intact, and user content
-        // only ever lands in text position (never inside an attribute).
-        let processedLine = line
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-
-        // Keys (property names with quotes followed by colon)
-        processedLine = processedLine.replace(
-          /"([^"]+)"(\s*):/g,
-          '<span class="text-purple-600 dark:text-purple-400">"$1"</span>$2:'
-        )
-
-        // String values (quotes not followed by colon)
-        processedLine = processedLine.replace(
-          /:(\s*)"([^"]*)"/g,
-          ':<span class="text-green-600 dark:text-green-400">$1"$2"</span>'
-        )
-
-        // Booleans
-        processedLine = processedLine.replace(
-          /\b(true|false)\b/g,
-          '<span class="text-orange-600 dark:text-orange-400">$1</span>'
-        )
-
-        // Null
-        processedLine = processedLine.replace(
-          /\bnull\b/g,
-          '<span class="text-red-600 dark:text-red-400">null</span>'
-        )
-
-        // Numbers
-        processedLine = processedLine.replace(
-          /:\s*(-?\d+(\.\d+)?)/g,
-          ': <span class="text-cyan-600 dark:text-cyan-400">$1</span>'
-        )
-
-        return (
-          <span key={lineIdx} className="block">
-            {showLineNumbers && (
-              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                {lineIdx + 1}
-              </span>
-            )}
-            <span
-              dangerouslySetInnerHTML={{ __html: processedLine || '&nbsp;' }}
-            />
-          </span>
-        )
-      })
-    }
-
-    if (lang === 'typescript' || lang === 'javascript') {
-      const keywords = [
-        'import',
-        'from',
-        'export',
-        'const',
-        'let',
-        'var',
-        'function',
-        'return',
-        'if',
-        'else',
-        'for',
-        'while',
-        'class',
-        'extends',
-        'implements',
-        'interface',
-        'type',
-        'enum',
-        'async',
-        'await',
-        'new',
-        'this',
-        'super',
-        'static',
-        'public',
-        'private',
-        'protected',
-        'readonly',
-        'default',
-      ]
-      const types = [
-        'string',
-        'number',
-        'boolean',
-        'void',
-        'null',
-        'undefined',
-        'any',
-        'unknown',
-        'never',
-        'React',
-        'ReactNode',
-        'AppProps',
-        'Metadata',
-        'NextApiRequest',
-        'NextApiResponse',
-        'Readonly',
-      ]
-
-      return lines.map((line, lineIdx) => {
-        // Comments
-        if (line.trim().startsWith('//')) {
-          return (
-            <span key={lineIdx} className="block">
-              {showLineNumbers && (
-                <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                  {lineIdx + 1}
-                </span>
-              )}
-              <span className="text-muted-foreground opacity-70 italic">
-                {line || '\u00A0'}
-              </span>
-            </span>
-          )
-        }
-
-        // Process each line with a simple tokenizer
-        const tokens: React.ReactNode[] = []
-        let current = ''
-        let inString = false
-        let stringChar = ''
-
-        for (let i = 0; i < line.length; i++) {
-          const char = line[i]
-
-          // Handle strings
-          if ((char === '"' || char === "'" || char === '`') && !inString) {
-            if (current) {
-              tokens.push(renderToken(current, keywords, types))
-            }
-            inString = true
-            stringChar = char
-            current = char
-          } else if (char === stringChar && inString) {
-            current += char
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-            current = ''
-            inString = false
-            stringChar = ''
-          } else if (inString) {
-            current += char
-          } else if (
-            char === ' ' ||
-            char === '(' ||
-            char === ')' ||
-            char === '{' ||
-            char === '}' ||
-            char === '[' ||
-            char === ']' ||
-            char === ':' ||
-            char === ';' ||
-            char === ',' ||
-            char === '.' ||
-            char === '<' ||
-            char === '>' ||
-            char === '=' ||
-            char === '!'
-          ) {
-            if (current) {
-              tokens.push(renderToken(current, keywords, types))
-              current = ''
-            }
-            tokens.push(char)
-          } else {
-            current += char
-          }
-        }
-
-        if (current) {
-          if (inString) {
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-          } else {
-            tokens.push(renderToken(current, keywords, types))
-          }
-        }
-
-        return (
-          <span key={lineIdx} className="block">
-            {showLineNumbers && (
-              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                {lineIdx + 1}
-              </span>
-            )}
-            {tokens.length === 0 ? '\u00A0' : tokens}
-          </span>
-        )
-      })
-    }
-
-    if (lang === 'go') {
-      const keywords = [
-        'package',
-        'import',
-        'func',
-        'return',
-        'if',
-        'else',
-        'for',
-        'range',
-        'switch',
-        'case',
-        'default',
-        'break',
-        'continue',
-        'goto',
-        'fallthrough',
-        'defer',
-        'go',
-        'chan',
-        'select',
-        'type',
-        'struct',
-        'interface',
-        'map',
-        'var',
-        'const',
-        'nil',
-        'true',
-        'false',
-      ]
-      const types = [
-        'string',
-        'int',
-        'int8',
-        'int16',
-        'int32',
-        'int64',
-        'uint',
-        'uint8',
-        'uint16',
-        'uint32',
-        'uint64',
-        'float32',
-        'float64',
-        'bool',
-        'byte',
-        'rune',
-        'error',
-        'any',
-      ]
-
-      return lines.map((line, lineIdx) => {
-        // Comments
-        if (line.trim().startsWith('//')) {
-          return (
-            <span key={lineIdx} className="block">
-              {showLineNumbers && (
-                <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                  {lineIdx + 1}
-                </span>
-              )}
-              <span className="text-muted-foreground opacity-70 italic">
-                {line || '\u00A0'}
-              </span>
-            </span>
-          )
-        }
-
-        // Process each line with a simple tokenizer
-        const tokens: React.ReactNode[] = []
-        let current = ''
-        let inString = false
-        let stringChar = ''
-
-        for (let i = 0; i < line.length; i++) {
-          const char = line[i]
-
-          // Handle strings
-          if ((char === '"' || char === "'" || char === '`') && !inString) {
-            if (current) {
-              tokens.push(renderGoToken(current, keywords, types))
-            }
-            inString = true
-            stringChar = char
-            current = char
-          } else if (char === stringChar && inString) {
-            current += char
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-            current = ''
-            inString = false
-            stringChar = ''
-          } else if (inString) {
-            current += char
-          } else if (
-            char === ' ' ||
-            char === '(' ||
-            char === ')' ||
-            char === '{' ||
-            char === '}' ||
-            char === '[' ||
-            char === ']' ||
-            char === ':' ||
-            char === ';' ||
-            char === ',' ||
-            char === '.' ||
-            char === '<' ||
-            char === '>' ||
-            char === '=' ||
-            char === '!' ||
-            char === '&' ||
-            char === '*'
-          ) {
-            if (current) {
-              tokens.push(renderGoToken(current, keywords, types))
-              current = ''
-            }
-            tokens.push(char)
-          } else {
-            current += char
-          }
-        }
-
-        if (current) {
-          if (inString) {
-            tokens.push(
-              <span className="text-green-600 dark:text-green-400">
-                {current}
-              </span>
-            )
-          } else {
-            tokens.push(renderGoToken(current, keywords, types))
-          }
-        }
-
-        return (
-          <span key={lineIdx} className="block">
-            {showLineNumbers && (
-              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                {lineIdx + 1}
-              </span>
-            )}
-            {tokens.length === 0 ? '\u00A0' : tokens}
-          </span>
-        )
-      })
-    }
-
-    if (lang === 'yaml') {
-      return lines.map((line, lineIdx) => {
-        // Comments
-        if (line.trim().startsWith('#')) {
-          return (
-            <span key={lineIdx} className="block">
-              {showLineNumbers && (
-                <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                  {lineIdx + 1}
-                </span>
-              )}
-              <span className="text-muted-foreground opacity-70 italic">
-                {line || '\u00A0'}
-              </span>
-            </span>
-          )
-        }
-
-        // Preserve leading whitespace for indentation
-        const leadingWs = line.match(/^(\s*)/)?.[1] ?? ''
-        const rest = line.slice(leadingWs.length)
-
-        // List items: leading "- "
-        let listDash: string | null = null
-        let afterList = rest
-        if (rest.startsWith('- ')) {
-          listDash = '- '
-          afterList = rest.slice(2)
-        } else if (rest === '-') {
-          listDash = '-'
-          afterList = ''
-        }
-
-        // Match `key:` optionally followed by a value
-        const keyMatch = afterList.match(/^([^:#\s][^:]*?):(\s*)(.*)$/)
-
-        const renderValue = (value: string) => {
-          const trimmed = value.trim()
-          if (trimmed === '') return value
-          // Block scalar markers
-          if (
-            trimmed === '|' ||
-            trimmed === '>' ||
-            trimmed === '|-' ||
-            trimmed === '>-'
-          ) {
-            return (
-              <span className="text-orange-600 dark:text-orange-400">
-                {value}
-              </span>
-            )
-          }
-          // Quoted strings
-          if (
-            (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-            (trimmed.startsWith("'") && trimmed.endsWith("'"))
-          ) {
-            return (
-              <span className="text-green-600 dark:text-green-400">
-                {value}
-              </span>
-            )
-          }
-          // Booleans / null
-          if (['true', 'false', 'null', '~', 'yes', 'no'].includes(trimmed)) {
-            return (
-              <span className="text-orange-600 dark:text-orange-400">
-                {value}
-              </span>
-            )
-          }
-          // Numbers
-          if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
-            return (
-              <span className="text-cyan-600 dark:text-cyan-400">{value}</span>
-            )
-          }
-          // Plain string value
-          return (
-            <span className="text-green-600 dark:text-green-400">{value}</span>
-          )
-        }
-
-        return (
-          <span key={lineIdx} className="block">
-            {showLineNumbers && (
-              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-                {lineIdx + 1}
-              </span>
-            )}
-            {leadingWs && <span>{leadingWs}</span>}
-            {listDash && (
-              <span className="text-muted-foreground">{listDash}</span>
-            )}
-            {keyMatch ? (
-              <>
-                <span className="text-purple-600 dark:text-purple-400">
-                  {keyMatch[1]}
-                </span>
-                <span className="text-muted-foreground">:</span>
-                {keyMatch[2]}
-                {keyMatch[3] && renderValue(keyMatch[3])}
-              </>
-            ) : (
-              afterList && renderValue(afterList)
-            )}
-            {!leadingWs && !listDash && !keyMatch && !afterList && '\u00A0'}
-          </span>
-        )
-      })
-    }
-
-    // Default - no highlighting
-    return lines.map((line, i) => (
-      <span key={i} className="block">
-        {showLineNumbers && (
-          <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
-            {i + 1}
-          </span>
-        )}
-        {line || '\u00A0'}
-      </span>
-    ))
-  }
-
-  const renderGoToken = (
-    token: string,
-    keywords: string[],
-    types: string[]
-  ) => {
-    if (keywords.includes(token)) {
-      return (
-        <span className="text-purple-600 dark:text-purple-400 font-semibold">
-          {token}
-        </span>
-      )
-    }
-    if (types.includes(token)) {
-      return <span className="text-cyan-600 dark:text-cyan-400">{token}</span>
-    }
-    if (/^\d+$/.test(token)) {
-      return (
-        <span className="text-orange-600 dark:text-orange-400">{token}</span>
-      )
-    }
-    // Check if it might be a type (starts with uppercase)
-    if (/^[A-Z]/.test(token)) {
-      return <span className="text-blue-600 dark:text-blue-400">{token}</span>
-    }
-    return token
-  }
-
-  const renderPythonToken = (
-    token: string,
-    keywords: string[],
-    builtins: string[]
-  ) => {
-    if (keywords.includes(token)) {
-      return (
-        <span className="text-purple-600 dark:text-purple-400 font-semibold">
-          {token}
-        </span>
-      )
-    }
-    if (builtins.includes(token)) {
-      return <span className="text-cyan-600 dark:text-cyan-400">{token}</span>
-    }
-    if (/^\d+(\.\d+)?$/.test(token)) {
-      return (
-        <span className="text-orange-600 dark:text-orange-400">{token}</span>
-      )
-    }
-    return token
-  }
-
-  const renderToken = (token: string, keywords: string[], types: string[]) => {
-    if (keywords.includes(token)) {
-      return (
-        <span className="text-purple-600 dark:text-purple-400 font-semibold">
-          {token}
-        </span>
-      )
-    }
-    if (types.includes(token)) {
-      return <span className="text-cyan-600 dark:text-cyan-400">{token}</span>
-    }
-    if (/^\d+$/.test(token)) {
-      return (
-        <span className="text-orange-600 dark:text-orange-400">{token}</span>
-      )
-    }
-    if (token.startsWith('@')) {
-      return <span className="text-pink-600 dark:text-pink-400">{token}</span>
-    }
-    // Check if it might be a component (starts with uppercase)
-    if (/^[A-Z]/.test(token)) {
-      return <span className="text-blue-600 dark:text-blue-400">{token}</span>
-    }
-    return token
-  }
-
   return (
-    <div className={cn('relative group', className)}>
+    // Container, header and type scale are lifted verbatim from the docs site's
+    // `CodeGroup` (temps-landing `src/components/Code.tsx`): a rounded-2xl
+    // panel on zinc-900 in dark with a hairline ring, rather than a bordered
+    // zinc-950 box. Same snippet, same surface, whether you're reading
+    // temps.sh/docs or the console.
+    <div
+      className={cn(
+        'group overflow-hidden rounded-2xl bg-white shadow-md ring-1 ring-zinc-900/[0.075]',
+        'dark:bg-zinc-900 dark:ring-white/10',
+        className
+      )}
+    >
       {title && (
-        <div className="px-4 py-2 bg-zinc-200/70 dark:bg-zinc-900/50 border-b border-border text-xs text-muted-foreground font-mono rounded-t-lg">
+        <div className="flex h-9 items-center gap-2 border-b border-zinc-900/[0.075] bg-zinc-900/[0.025] px-4 font-mono text-xs text-muted-foreground dark:border-b-white/5 dark:bg-white/[0.01]">
           {title}
         </div>
       )}
-      <div
-        className={cn(
-          'relative rounded-lg min-w-0',
-          'bg-zinc-100 dark:bg-zinc-950/50',
-          'border border-border',
-          'transition-colors duration-200',
-          'hover:bg-zinc-100/80 dark:group-hover:bg-zinc-950/70',
-          title && 'rounded-t-none border-t-0'
-        )}
-      >
+      {/* The white/2.5 wash over zinc-900 is what gives the dark panel its
+          slightly-lifted tone in the docs; without it the block reads as a
+          flat hole in the page. */}
+      <div className="relative min-w-0 dark:bg-white/[0.025]">
         <div
           className={cn(
             // w-0 min-w-full max-w-full is the trick: forces this element to
             // parent width while letting its children overflow horizontally.
-            'w-0 min-w-full max-w-full rounded-lg py-3.5 pl-4',
+            'w-0 min-w-full max-w-full py-4 pl-4',
             visibleButtonCount === 3 && 'pr-28',
             visibleButtonCount === 2 && 'pr-20',
             visibleButtonCount === 1 && 'pr-12',
@@ -875,18 +200,37 @@ export function CodeBlock({
         >
           <pre
             className={cn(
-              'text-sm font-mono leading-6 m-0',
+              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
               wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
             )}
           >
-            <code
-              className={cn(
-                `language-${language}`,
-                'text-foreground dark:text-zinc-100'
-              )}
-            >
-              {renderHighlightedCode(code, language)}
-            </code>
+            {/* Shiki's output is HTML-escaped token markup — the only thing it
+                emits around user text is <span style="--shiki-*">. */}
+            {html ? (
+              <code
+                className={cn(
+                  'shiki-code',
+                  showLineNumbers && 'shiki-line-numbers'
+                )}
+                dangerouslySetInnerHTML={{ __html: html }}
+              />
+            ) : (
+              <code
+                className={cn(
+                  'shiki-code text-foreground dark:text-zinc-100',
+                  showLineNumbers && 'shiki-line-numbers'
+                )}
+              >
+                {/* Pre-highlight (and for `text`) the same lines render
+                    unstyled, so nothing shifts when colours arrive. */}
+                {code.split('\n').map((line, i, all) => (
+                  <span key={i} className="line">
+                    {line}
+                    {i < all.length - 1 ? '\n' : ''}
+                  </span>
+                ))}
+              </code>
+            )}
           </pre>
         </div>
         <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">

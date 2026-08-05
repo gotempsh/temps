@@ -111,6 +111,15 @@ pub struct DeployFromStaticAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DeployFromUploadedSourceAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub deployment_id: i32,
+    pub source_bundle_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DeployFromImageUploadAudit {
     pub context: AuditContext,
     pub project_id: i32,
@@ -219,6 +228,7 @@ impl_audit_operation!(ExternalImagePushedAudit, "EXTERNAL_IMAGE_PUSHED");
 impl_audit_operation!(DeploymentOperationAudit, "DEPLOYMENT_OPERATION_EXECUTED");
 impl_audit_operation!(DeployFromImageAudit, "DEPLOY_FROM_IMAGE");
 impl_audit_operation!(DeployFromStaticAudit, "DEPLOY_FROM_STATIC");
+impl_audit_operation!(DeployFromUploadedSourceAudit, "DEPLOY_FROM_UPLOADED_SOURCE");
 impl_audit_operation!(DeployFromImageUploadAudit, "DEPLOY_FROM_IMAGE_UPLOAD");
 impl_audit_operation!(StaticBundleUploadedAudit, "STATIC_BUNDLE_UPLOADED");
 impl_audit_operation!(ExternalImageRegisteredAudit, "EXTERNAL_IMAGE_REGISTERED");

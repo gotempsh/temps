@@ -18,6 +18,9 @@ pub enum OtelError {
     #[error("Rate limit exceeded for service {service_id}: {limit} requests/min")]
     ServiceRateLimitExceeded { service_id: i32, limit: u32 },
 
+    #[error("OTel ingest is saturated: at most {limit} requests may be processed concurrently")]
+    IngestSaturated { limit: usize },
+
     #[error(
         "Storage quota exceeded for project {project_id}: used {used_bytes} of {limit_bytes} bytes"
     )]
@@ -100,6 +103,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Rate limit exceeded for project 7: 500 requests/min"
+        );
+    }
+
+    #[test]
+    fn test_display_ingest_saturated() {
+        let err = OtelError::IngestSaturated { limit: 64 };
+        assert_eq!(
+            err.to_string(),
+            "OTel ingest is saturated: at most 64 requests may be processed concurrently"
         );
     }
 

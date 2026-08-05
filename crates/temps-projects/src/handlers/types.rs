@@ -22,6 +22,7 @@ pub struct AppState {
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///
@@ -911,6 +912,12 @@ impl From<ProjectError> for Problem {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Deployment Error")
                     .with_detail(msg)
+            }
+
+            ProjectError::DeploymentCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Runtime Cleanup Failed")
+                    .with_detail(error.to_string())
             }
 
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

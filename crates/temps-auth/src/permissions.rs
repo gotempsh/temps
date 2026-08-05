@@ -203,6 +203,11 @@ pub enum Permission {
     KvWrite,
     KvDelete,
 
+    // Feature flag permissions
+    FlagsRead,
+    FlagsWrite,
+    FlagsDelete,
+
     // Status Page permissions
     StatusPageRead,
     StatusPageWrite,
@@ -358,6 +363,9 @@ impl fmt::Display for Permission {
             Permission::KvRead => "kv:read",
             Permission::KvWrite => "kv:write",
             Permission::KvDelete => "kv:delete",
+            Permission::FlagsRead => "flags:read",
+            Permission::FlagsWrite => "flags:write",
+            Permission::FlagsDelete => "flags:delete",
             Permission::StatusPageRead => "status_page:read",
             Permission::StatusPageWrite => "status_page:write",
             Permission::StatusPageCreate => "status_page:create",
@@ -504,6 +512,9 @@ impl Permission {
             "kv:read" => Some(Permission::KvRead),
             "kv:write" => Some(Permission::KvWrite),
             "kv:delete" => Some(Permission::KvDelete),
+            "flags:read" => Some(Permission::FlagsRead),
+            "flags:write" => Some(Permission::FlagsWrite),
+            "flags:delete" => Some(Permission::FlagsDelete),
             "status_page:read" => Some(Permission::StatusPageRead),
             "status_page:write" => Some(Permission::StatusPageWrite),
             "status_page:create" => Some(Permission::StatusPageCreate),
@@ -647,6 +658,9 @@ impl Permission {
             Permission::KvRead,
             Permission::KvWrite,
             Permission::KvDelete,
+            Permission::FlagsRead,
+            Permission::FlagsWrite,
+            Permission::FlagsDelete,
             Permission::StatusPageRead,
             Permission::StatusPageWrite,
             Permission::StatusPageCreate,
@@ -788,7 +802,6 @@ impl Role {
                 Permission::PlatformInfoRead,
                 Permission::ProjectsCreate,
                 Permission::ProjectsDelete,
-                Permission::ProjectsDelete,
                 Permission::ProjectsRead,
                 Permission::ProjectsWrite,
                 Permission::SessionMetricsRead,
@@ -848,6 +861,9 @@ impl Role {
                 Permission::KvRead,
                 Permission::KvWrite,
                 Permission::KvDelete,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
+                Permission::FlagsDelete,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -923,7 +939,6 @@ impl Role {
                 Permission::NotificationProvidersWrite,
                 Permission::PipelinesCreate,
                 Permission::PipelinesDelete,
-                Permission::PipelinesExecute,
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
@@ -983,6 +998,9 @@ impl Role {
                 Permission::KvRead,
                 Permission::KvWrite,
                 Permission::KvDelete,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
+                Permission::FlagsDelete,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -992,14 +1010,11 @@ impl Role {
                 Permission::AiGatewayRead,
                 Permission::AiGatewayWrite,
                 Permission::AiGatewayExecute,
-                Permission::ContainersExec,
                 Permission::StacksRead,
                 Permission::StacksWrite,
                 Permission::StacksDelete,
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
-                Permission::SandboxesWrite,
-                Permission::SandboxesExec,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1090,6 +1105,8 @@ impl Role {
                 Permission::BlobWrite,
                 Permission::KvRead,
                 Permission::KvWrite,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -1138,6 +1155,7 @@ impl Role {
                 Permission::VulnerabilityScansRead,
                 Permission::BlobRead,
                 Permission::KvRead,
+                Permission::FlagsRead,
                 Permission::StatusPageRead,
                 Permission::OtelRead,
                 Permission::AiGatewayRead,
@@ -1484,5 +1502,31 @@ mod tests {
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensWrite));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensCreate));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_platform_admin_cannot_execute_in_customer_workloads() {
+        // PlatformAdmin is documented as read-only on deployable resources, so
+        // it must not hold permissions that run code inside customer workloads
+        // (a container/sandbox shell or a pipeline run would bypass that intent).
+        // An operator who wants that capability can grant these to an API key.
+        let platform_admin = Role::PlatformAdmin.permissions();
+        assert!(!platform_admin.contains(&Permission::ContainersExec));
+        assert!(!platform_admin.contains(&Permission::SandboxesWrite));
+        assert!(!platform_admin.contains(&Permission::SandboxesExec));
+        assert!(!platform_admin.contains(&Permission::PipelinesExecute));
+
+        // The Admin role still holds them (unchanged), and User keeps the two it
+        // legitimately needs for its own deployable resources.
+        let admin = Role::Admin.permissions();
+        assert!(admin.contains(&Permission::ContainersExec));
+        assert!(admin.contains(&Permission::SandboxesWrite));
+        assert!(admin.contains(&Permission::SandboxesExec));
+        assert!(admin.contains(&Permission::PipelinesExecute));
+        let user = Role::User.permissions();
+        assert!(user.contains(&Permission::SandboxesWrite));
+        assert!(user.contains(&Permission::SandboxesExec));
+        assert!(user.contains(&Permission::PipelinesExecute));
+        assert!(!user.contains(&Permission::ContainersExec));
     }
 }

@@ -2480,9 +2480,12 @@ pub async fn get_provider_connections(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitConnectionsRead);
 
+    // Every connection under this provider, not just the caller's active ones:
+    // this list is what tells the user why a provider cannot be deleted, so a
+    // connection it hides is a dead end.
     let connections = state
         .git_provider_manager
-        .get_provider_connections(provider_id)
+        .get_all_provider_connections(provider_id)
         .await?;
 
     let response: Vec<ConnectionResponse> = connections

@@ -77,6 +77,8 @@ impl TempsPlugin for ProjectsPlugin {
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
+        let project_archive_cleaner =
+            context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -93,6 +95,7 @@ impl TempsPlugin for ProjectsPlugin {
             custom_domain_service,
             audit_service,
             template_service,
+            project_archive_cleaner,
             telemetry,
             project_access_checker,
         });

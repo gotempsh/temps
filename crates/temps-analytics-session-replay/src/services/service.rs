@@ -1510,6 +1510,53 @@ impl SessionReplayService {
 
         Ok(session.project_id)
     }
+
+    // -----------------------------------------------------------------
+    // Authorization lookups
+    //
+    // Most read/write handlers on this crate are keyed by session or
+    // visitor id rather than project id, so there is no project_id in the
+    // path for `project_access_guard!` to check. These resolve one so the
+    // guard can run. They deliberately do NOT filter on `is_active`: an
+    // authorization decision must be made for the row that exists, not
+    // only for currently-live sessions, or ended sessions would fall out
+    // of scoping entirely.
+    // -----------------------------------------------------------------
+
+    /// Project owning the session with this numeric primary key.
+    pub async fn project_id_for_session_pk(
+        &self,
+        session_pk: i32,
+    ) -> Result<i32, SessionReplayError> {
+        let session = session_replay_sessions::Entity::find_by_id(session_pk)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_pk.to_string()))?;
+        Ok(session.project_id)
+    }
+
+    /// Project owning the session with this `session_replay_id` string,
+    /// regardless of whether it is still active.
+    pub async fn project_id_for_session_replay_id(
+        &self,
+        session_replay_id: &str,
+    ) -> Result<i32, SessionReplayError> {
+        let session = session_replay_sessions::Entity::find()
+            .filter(session_replay_sessions::Column::SessionReplayId.eq(session_replay_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_replay_id.to_string()))?;
+        Ok(session.project_id)
+    }
+
+    /// Project the visitor belongs to.
+    pub async fn project_id_for_visitor(&self, visitor_id: i32) -> Result<i32, SessionReplayError> {
+        let visitor = temps_entities::visitor::Entity::find_by_id(visitor_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(format!("visitor {visitor_id}")))?;
+        Ok(visitor.project_id)
+    }
 }
 
 #[cfg(test)]
@@ -1655,6 +1702,53 @@ mod tests {
         assert!(
             msg.contains("42"),
             "error message must include project_id, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Authorization lookups (added with the project-scoping fix)
+    //
+    // These resolve the project that owns a session/visitor so the
+    // handlers can run `project_access_guard!`. If they ever stop
+    // returning the owning project, the guard silently checks the wrong
+    // project — so pin the behaviour.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_returns_owning_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_session_model(7, "sess-x", 42)]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(svc.project_id_for_session_pk(7).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn project_id_for_session_pk_errors_when_missing() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<session_replay_sessions::Model>::new()])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert!(svc.project_id_for_session_pk(999).await.is_err());
+    }
+
+    /// Deliberately does NOT filter on `is_active`: an authorization
+    /// decision has to be made for the row that exists, or an ended
+    /// session falls out of scoping entirely and becomes readable by
+    /// anyone.
+    #[tokio::test]
+    async fn project_id_for_session_replay_id_resolves_inactive_sessions() {
+        let mut inactive = make_session_model(7, "sess-x", 42);
+        inactive.is_active = false;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![inactive]])
+            .into_connection();
+        let svc = SessionReplayService::new(Arc::new(db));
+        assert_eq!(
+            svc.project_id_for_session_replay_id("sess-x")
+                .await
+                .unwrap(),
+            42
         );
     }
 }

@@ -1,7 +1,7 @@
-//! Java preset implementation using Nixpacks
+//! Java preset implementation using autopack
 //!
 //! This preset detects Java projects (pom.xml, build.gradle, build.gradle.kts)
-//! and uses Nixpacks for building.
+//! and uses autopack for building.
 
 use crate::{DockerfileConfig, DockerfileWithArgs, NixpacksPreset, NixpacksProvider, Preset, ProjectType};
 use async_trait::async_trait;
@@ -44,15 +44,15 @@ impl Preset for JavaPreset {
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Java provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Java);
-        nixpacks.dockerfile(config).await
+        // Delegate to autopack with the Java provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Java);
+        builder.dockerfile(config).await
     }
 
     async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Java provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Java);
-        nixpacks.dockerfile_with_build_dir(local_path).await
+        // Delegate to autopack with the Java provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Java);
+        builder.dockerfile_with_build_dir(local_path).await
     }
 
     fn install_command(&self, local_path: &Path) -> String {

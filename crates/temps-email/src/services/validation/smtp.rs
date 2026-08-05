@@ -14,12 +14,83 @@
 
 use std::time::Duration;
 
+use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
 use super::ProxyConfig;
+
+const MAX_MX_HOSTS_PER_PROBE: usize = 5;
+
+#[derive(Debug, Error)]
+enum SmtpConnectError {
+    #[error("DNS resolution of {address} timed out")]
+    DnsTimeout { address: String },
+    #[error("Failed to resolve {address}: {source}")]
+    Resolve {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("No addresses found for {address}")]
+    NoAddresses { address: String },
+    #[error("Refusing to probe {host} at {ip}: {source}")]
+    BlockedAddress {
+        host: String,
+        ip: std::net::IpAddr,
+        #[source]
+        source: temps_core::url_validation::UrlValidationError,
+    },
+    #[error("TCP connect to validated addresses for {host} timed out")]
+    TcpTimeout { host: String },
+    #[error("TCP connect to validated addresses for {host} failed: {source}")]
+    TcpConnect {
+        host: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("SOCKS5 proxy credentials must provide both username and password, or neither")]
+    InvalidProxyCredentials,
+    #[error("SOCKS5 proxy DNS resolution timed out")]
+    ProxyDnsTimeout,
+    #[error("Failed to resolve SOCKS5 proxy: {source}")]
+    ProxyResolve {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("SOCKS5 proxy resolved without any addresses")]
+    ProxyNoAddresses,
+    #[error("SOCKS5 connect to validated MX addresses for {host} timed out")]
+    SocksTimeout { host: String },
+    #[error("SOCKS5 connect to validated MX addresses for {host} failed: {source}")]
+    SocksConnect {
+        host: String,
+        #[source]
+        source: tokio_socks::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+enum SmtpProbeError {
+    #[error(transparent)]
+    Connect(#[from] SmtpConnectError),
+    #[error("SMTP greeting from {host} was not successful: {reply}")]
+    GreetingRejected { host: String, reply: String },
+    #[error("SMTP {operation} timed out")]
+    OperationTimeout { operation: &'static str },
+    #[error("SMTP {operation} failed: {source}")]
+    OperationIo {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("SMTP connection closed while reading {operation}")]
+    ConnectionClosed { operation: &'static str },
+    #[error("SMTP reply for {operation} exceeded 64 KiB")]
+    ReplyTooLarge { operation: &'static str },
+}
 
 /// Result of probing a single mailbox over SMTP.
 #[derive(Debug, Clone, Default)]
@@ -44,6 +115,8 @@ pub struct SmtpProbeConfig<'a> {
     pub hello_name: &'a str,
     /// Per-operation timeout.
     pub timeout: Duration,
+    /// Absolute deadline for the complete probe across all MX hosts.
+    pub deadline: Duration,
     /// Optional SOCKS5 proxy.
     pub proxy: Option<&'a ProxyConfig>,
 }
@@ -73,6 +146,31 @@ impl SmtpStream {
 /// Probe a mailbox. Tries each MX host until one accepts a TCP connection;
 /// the first reachable host decides the result.
 pub async fn probe_mailbox(config: SmtpProbeConfig<'_>) -> SmtpProbe {
+    let deadline = config.deadline;
+    match enforce_deadline(deadline, probe_mailbox_before_deadline(&config)).await {
+        Ok(probe) => probe,
+        Err(_) => SmtpProbe {
+            can_connect: false,
+            error: Some(format!(
+                "SMTP mailbox probe exceeded its {}ms deadline",
+                deadline.as_millis()
+            )),
+            ..Default::default()
+        },
+    }
+}
+
+async fn enforce_deadline<F>(
+    deadline: Duration,
+    probe: F,
+) -> Result<SmtpProbe, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = SmtpProbe>,
+{
+    timeout(deadline, probe).await
+}
+
+async fn probe_mailbox_before_deadline(config: &SmtpProbeConfig<'_>) -> SmtpProbe {
     if config.mx_hosts.is_empty() {
         return SmtpProbe {
             error: Some("no MX hosts to probe".to_string()),
@@ -81,12 +179,12 @@ pub async fn probe_mailbox(config: SmtpProbeConfig<'_>) -> SmtpProbe {
     }
 
     let mut last_error = None;
-    for host in config.mx_hosts {
-        match probe_single_host(host, &config).await {
+    for host in config.mx_hosts.iter().take(MAX_MX_HOSTS_PER_PROBE) {
+        match probe_single_host(host, config).await {
             Ok(probe) => return probe,
             Err(e) => {
                 debug!("SMTP probe via {host} failed: {e}");
-                last_error = Some(e);
+                last_error = Some(e.to_string());
             }
         }
     }
@@ -101,37 +199,45 @@ pub async fn probe_mailbox(config: SmtpProbeConfig<'_>) -> SmtpProbe {
 /// Run the full SMTP conversation against one MX host. Returns `Err` only
 /// when the host could not be reached at all (so the caller can try the next
 /// MX); a reachable host that rejects the mailbox is still `Ok`.
-async fn probe_single_host(host: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpProbe, String> {
+async fn probe_single_host(
+    host: &str,
+    config: &SmtpProbeConfig<'_>,
+) -> Result<SmtpProbe, SmtpProbeError> {
     let addr = format!("{host}:25");
-    let mut stream = connect(&addr, config).await?;
+    let mut stream = connect(host, &addr, config).await?;
 
     // Greeting.
-    let greeting = read_reply(&mut stream, config.timeout).await?;
+    let greeting = read_reply(&mut stream, "server greeting", config.timeout).await?;
     if !greeting.starts_with('2') {
-        return Err(format!("server greeting was not 2xx: {greeting}"));
+        return Err(SmtpProbeError::GreetingRejected {
+            host: host.to_string(),
+            reply: greeting,
+        });
     }
 
     // EHLO.
     send(
         &mut stream,
         &format!("EHLO {}\r\n", config.hello_name),
+        "EHLO write",
         config.timeout,
     )
     .await?;
-    let _ = read_reply(&mut stream, config.timeout).await?;
+    let _ = read_reply(&mut stream, "EHLO reply", config.timeout).await?;
 
     // MAIL FROM — envelope sender.
     send(
         &mut stream,
         &format!("MAIL FROM:<{}>\r\n", config.from_email),
+        "MAIL FROM write",
         config.timeout,
     )
     .await?;
-    let mail_reply = read_reply(&mut stream, config.timeout).await?;
+    let mail_reply = read_reply(&mut stream, "MAIL FROM reply", config.timeout).await?;
     if !mail_reply.starts_with('2') {
         // Connected, but the server won't take our envelope sender — we can't
         // determine deliverability. Reachable, but Unknown.
-        let _ = send(&mut stream, "QUIT\r\n", config.timeout).await;
+        let _ = send(&mut stream, "QUIT\r\n", "QUIT write", config.timeout).await;
         return Ok(SmtpProbe {
             can_connect: true,
             error: Some(format!("MAIL FROM rejected: {mail_reply}")),
@@ -150,7 +256,7 @@ async fn probe_single_host(host: &str, config: &SmtpProbeConfig<'_>) -> Result<S
         Err(_) => false,
     };
 
-    let _ = send(&mut stream, "QUIT\r\n", config.timeout).await;
+    let _ = send(&mut stream, "QUIT\r\n", "QUIT write", config.timeout).await;
 
     Ok(SmtpProbe {
         can_connect: true,
@@ -175,9 +281,15 @@ async fn rcpt_outcome(
     stream: &mut SmtpStream,
     address: &str,
     op_timeout: Duration,
-) -> Result<RcptOutcome, String> {
-    send(stream, &format!("RCPT TO:<{address}>\r\n",), op_timeout).await?;
-    let reply = read_reply(stream, op_timeout).await?;
+) -> Result<RcptOutcome, SmtpProbeError> {
+    send(
+        stream,
+        &format!("RCPT TO:<{address}>\r\n",),
+        "RCPT TO write",
+        op_timeout,
+    )
+    .await?;
+    let reply = read_reply(stream, "RCPT TO reply", op_timeout).await?;
     Ok(classify_rcpt_reply(&reply))
 }
 
@@ -213,60 +325,203 @@ fn classify_rcpt_reply(reply: &str) -> RcptOutcome {
 }
 
 /// Open the connection — direct or via SOCKS5 — applying the connect timeout.
-async fn connect(addr: &str, config: &SmtpProbeConfig<'_>) -> Result<SmtpStream, String> {
+///
+/// `host` is a domain's own MX record, resolved from whatever email address
+/// a caller submits for validation — attacker-controlled input. For the
+/// Temps resolves the MX host itself, so a domain whose MX record points at an
+/// internal/private/link-local/cloud-metadata address would otherwise let an
+/// authenticated user make this server probe its own internal network on
+/// port 25. The optional SOCKS proxy is operator-configured and cannot be
+/// overridden by API callers, but the MX target is still locally validated
+/// and passed to the proxy as a pinned IP address.
+///
+/// The direct path resolves `host` exactly once and connects to that pinned
+/// `SocketAddr` — it deliberately does NOT validate via
+/// `validate_domain_async(host)` and then separately `TcpStream::connect(addr)`,
+/// since that would re-resolve the hostname a second time. Because `host` is
+/// attacker-controlled, an attacker's DNS server can answer a public IP for
+/// the first (validation) lookup and a private/internal one for the second
+/// (connect) lookup — a classic DNS-rebinding TOCTOU that fully defeats the
+/// validation. Resolving once and validating the address actually used
+/// closes that window.
+async fn connect(
+    host: &str,
+    addr: &str,
+    config: &SmtpProbeConfig<'_>,
+) -> Result<SmtpStream, SmtpConnectError> {
+    let resolved = resolve_addresses(addr, config.timeout).await?;
+    validate_external_addresses(host, &resolved)?;
+
     match config.proxy {
         Some(proxy) => {
             let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
-            let connect = async {
-                match (&proxy.username, &proxy.password) {
-                    (Some(user), Some(pass)) => {
-                        tokio_socks::tcp::Socks5Stream::connect_with_password(
-                            proxy_addr.as_str(),
-                            addr,
-                            user.as_str(),
-                            pass.as_str(),
-                        )
-                        .await
+            let credentials = proxy_credentials(proxy)?;
+            // Resolve the trusted operator proxy once to avoid a second DNS
+            // lookup between selection and connection. Private proxy addresses
+            // remain supported because this setting is not exposed by the API.
+            let proxy_addresses = resolve_proxy_addresses(&proxy_addr, config.timeout).await?;
+            let mut last_error = None;
+
+            for target in &resolved {
+                let connect = async {
+                    match credentials {
+                        Some((user, pass)) => {
+                            tokio_socks::tcp::Socks5Stream::connect_with_password(
+                                proxy_addresses.as_slice(),
+                                *target,
+                                user,
+                                pass,
+                            )
+                            .await
+                        }
+                        None => {
+                            tokio_socks::tcp::Socks5Stream::connect(
+                                proxy_addresses.as_slice(),
+                                *target,
+                            )
+                            .await
+                        }
                     }
-                    _ => tokio_socks::tcp::Socks5Stream::connect(proxy_addr.as_str(), addr).await,
+                };
+
+                match timeout(config.timeout, connect).await {
+                    Ok(Ok(stream)) => return Ok(SmtpStream::Proxied(stream)),
+                    Ok(Err(source)) => {
+                        last_error = Some(SmtpConnectError::SocksConnect {
+                            host: host.to_string(),
+                            source,
+                        })
+                    }
+                    Err(_) => {
+                        last_error = Some(SmtpConnectError::SocksTimeout {
+                            host: host.to_string(),
+                        })
+                    }
                 }
-            };
-            timeout(config.timeout, connect)
-                .await
-                .map_err(|_| format!("SOCKS5 connect to {addr} timed out"))?
-                .map(SmtpStream::Proxied)
-                .map_err(|e| format!("SOCKS5 connect to {addr} failed: {e}"))
+            }
+
+            Err(last_error.unwrap_or(SmtpConnectError::NoAddresses {
+                address: addr.to_string(),
+            }))
         }
-        None => timeout(config.timeout, TcpStream::connect(addr))
+        None => timeout(config.timeout, TcpStream::connect(resolved.as_slice()))
             .await
-            .map_err(|_| format!("TCP connect to {addr} timed out"))?
+            .map_err(|_| SmtpConnectError::TcpTimeout {
+                host: host.to_string(),
+            })?
             .map(SmtpStream::Direct)
-            .map_err(|e| format!("TCP connect to {addr} failed: {e}")),
+            .map_err(|source| SmtpConnectError::TcpConnect {
+                host: host.to_string(),
+                source,
+            }),
     }
 }
 
+fn proxy_credentials(proxy: &ProxyConfig) -> Result<Option<(&str, &str)>, SmtpConnectError> {
+    match (&proxy.username, &proxy.password) {
+        (Some(username), Some(password)) => Ok(Some((username.as_str(), password.as_str()))),
+        (None, None) => Ok(None),
+        _ => Err(SmtpConnectError::InvalidProxyCredentials),
+    }
+}
+
+async fn resolve_proxy_addresses(
+    proxy_addr: &str,
+    op_timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, SmtpConnectError> {
+    let resolved: Vec<std::net::SocketAddr> =
+        timeout(op_timeout, tokio::net::lookup_host(proxy_addr))
+            .await
+            .map_err(|_| SmtpConnectError::ProxyDnsTimeout)?
+            .map_err(|source| SmtpConnectError::ProxyResolve { source })?
+            .collect();
+
+    if resolved.is_empty() {
+        return Err(SmtpConnectError::ProxyNoAddresses);
+    }
+
+    Ok(resolved)
+}
+
+async fn resolve_addresses(
+    addr: &str,
+    op_timeout: Duration,
+) -> Result<Vec<std::net::SocketAddr>, SmtpConnectError> {
+    let resolved: Vec<std::net::SocketAddr> = timeout(op_timeout, tokio::net::lookup_host(addr))
+        .await
+        .map_err(|_| SmtpConnectError::DnsTimeout {
+            address: addr.to_string(),
+        })?
+        .map_err(|source| SmtpConnectError::Resolve {
+            address: addr.to_string(),
+            source,
+        })?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(SmtpConnectError::NoAddresses {
+            address: addr.to_string(),
+        });
+    }
+
+    Ok(resolved)
+}
+
+fn validate_external_addresses(
+    host: &str,
+    resolved: &[std::net::SocketAddr],
+) -> Result<(), SmtpConnectError> {
+    // Reject the entire DNS result if any address is blocked. A mixed
+    // public/private response must never get a free choice of which address
+    // validation sees.
+    for socket_addr in resolved {
+        let validation = match socket_addr.ip() {
+            std::net::IpAddr::V4(ip) => temps_core::url_validation::validate_ipv4(&ip),
+            std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+        };
+        if let Err(source) = validation {
+            return Err(SmtpConnectError::BlockedAddress {
+                host: host.to_string(),
+                ip: socket_addr.ip(),
+                source,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Write a command, bounded by the operation timeout.
-async fn send(stream: &mut SmtpStream, cmd: &str, op_timeout: Duration) -> Result<(), String> {
+async fn send(
+    stream: &mut SmtpStream,
+    cmd: &str,
+    operation: &'static str,
+    op_timeout: Duration,
+) -> Result<(), SmtpProbeError> {
     timeout(op_timeout, stream.write_all(cmd.as_bytes()))
         .await
-        .map_err(|_| "SMTP write timed out".to_string())?
-        .map_err(|e| format!("SMTP write failed: {e}"))
+        .map_err(|_| SmtpProbeError::OperationTimeout { operation })?
+        .map_err(|source| SmtpProbeError::OperationIo { operation, source })
 }
 
 /// Read one SMTP reply. Handles multi-line replies (`250-…` continuation
 /// lines) by reading until a line whose 4th byte is a space. Returns the
 /// final line, which carries the authoritative status code.
-async fn read_reply(stream: &mut SmtpStream, op_timeout: Duration) -> Result<String, String> {
+async fn read_reply(
+    stream: &mut SmtpStream,
+    operation: &'static str,
+    op_timeout: Duration,
+) -> Result<String, SmtpProbeError> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
 
     loop {
         let n = timeout(op_timeout, stream.read(&mut chunk))
             .await
-            .map_err(|_| "SMTP read timed out".to_string())?
-            .map_err(|e| format!("SMTP read failed: {e}"))?;
+            .map_err(|_| SmtpProbeError::OperationTimeout { operation })?
+            .map_err(|source| SmtpProbeError::OperationIo { operation, source })?;
         if n == 0 {
-            return Err("SMTP connection closed by server".to_string());
+            return Err(SmtpProbeError::ConnectionClosed { operation });
         }
         buf.extend_from_slice(&chunk[..n]);
 
@@ -278,7 +533,7 @@ async fn read_reply(stream: &mut SmtpStream, op_timeout: Duration) -> Result<Str
             }
         }
         if buf.len() > 64 * 1024 {
-            return Err("SMTP reply exceeded 64 KiB".to_string());
+            return Err(SmtpProbeError::ReplyTooLarge { operation });
         }
     }
 }
@@ -349,13 +604,193 @@ mod tests {
     #[test]
     fn test_last_complete_line_incomplete() {
         // No trailing newline → reply not yet complete.
-        assert_eq!(last_complete_line(b"250 HEL"), None);
+        assert_eq!(last_complete_line(b"250 HELP"), None);
     }
 
     #[test]
     fn test_random_token_unique() {
         assert_ne!(random_token(), random_token());
         assert_eq!(random_token().len(), 16);
+    }
+
+    fn test_config() -> SmtpProbeConfig<'static> {
+        SmtpProbeConfig {
+            mx_hosts: &[],
+            to_email: "test@example.com",
+            from_email: "noreply@temps.sh",
+            hello_name: "temps.sh",
+            timeout: Duration::from_secs(2),
+            deadline: Duration::from_secs(5),
+            proxy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_private_ip_host() {
+        let config = test_config();
+        match connect("10.0.0.5", "10.0.0.5:25", &config).await {
+            Ok(_) => panic!("must refuse an RFC 1918 private host"),
+            Err(e) => assert!(e.to_string().contains("Refusing to probe"), "got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_loopback_host() {
+        let config = test_config();
+        match connect("127.0.0.1", "127.0.0.1:25", &config).await {
+            Ok(_) => panic!("must refuse a loopback host"),
+            Err(e) => assert!(e.to_string().contains("Refusing to probe"), "got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_rejects_cloud_metadata_host() {
+        let config = test_config();
+        match connect("169.254.169.254", "169.254.169.254:25", &config).await {
+            Ok(_) => panic!("must refuse the cloud metadata address"),
+            Err(e) => assert!(e.to_string().contains("Refusing to probe"), "got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_external_addresses_rejects_mixed_dns_answers() {
+        let addresses = [
+            "1.1.1.1:25".parse().unwrap(),
+            "10.0.0.5:25".parse().unwrap(),
+        ];
+
+        let error = validate_external_addresses("mx.attacker.test", &addresses)
+            .expect_err("a single blocked address must reject the complete DNS result");
+        assert!(error.to_string().contains("10.0.0.5"), "got: {error}");
+    }
+
+    #[test]
+    fn test_validate_external_addresses_rejects_ipv4_mapped_ipv6() {
+        for address in [
+            "[::ffff:127.0.0.1]:25",
+            "[::ffff:10.0.0.5]:25",
+            "[::ffff:169.254.169.254]:25",
+            "[::ffff:100.64.0.1]:25",
+        ] {
+            let addresses = [address.parse().unwrap()];
+            assert!(
+                validate_external_addresses("mx.attacker.test", &addresses).is_err(),
+                "must reject mapped address {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_external_addresses_accepts_public_ipv4_and_ipv6() {
+        let addresses = [
+            "1.1.1.1:25".parse().unwrap(),
+            "[2606:4700:4700::1111]:25".parse().unwrap(),
+        ];
+        assert!(validate_external_addresses("mx.example.com", &addresses).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_operator_proxy_does_not_bypass_target_validation() {
+        let proxy = ProxyConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: None,
+            password: None,
+        };
+        let config = SmtpProbeConfig {
+            proxy: Some(&proxy),
+            ..test_config()
+        };
+
+        let error = match connect("127.0.0.1", "127.0.0.1:25", &config).await {
+            Ok(_) => panic!("proxying must not bypass MX target validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("Refusing to probe"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_proxy_credentials_reject_partial_configuration() {
+        for (username, password) in [
+            (Some("proxy-user".to_string()), None),
+            (None, Some("proxy-password".to_string())),
+        ] {
+            let proxy = ProxyConfig {
+                host: "internal-proxy.example".to_string(),
+                port: 1080,
+                username,
+                password,
+            };
+            let error = proxy_credentials(&proxy)
+                .expect_err("partial proxy credentials must not downgrade to anonymous SOCKS");
+            let message = error.to_string();
+            assert!(message.contains("both username and password"));
+            assert!(!message.contains(&proxy.host));
+            assert!(!message.contains(&proxy.port.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_proxy_connection_errors_do_not_expose_endpoint() {
+        let endpoint = "sensitive-proxy.internal:1080";
+        let errors = [
+            SmtpConnectError::ProxyDnsTimeout.to_string(),
+            SmtpConnectError::ProxyResolve {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "host not found"),
+            }
+            .to_string(),
+            SmtpConnectError::ProxyNoAddresses.to_string(),
+            SmtpConnectError::SocksTimeout {
+                host: "mx.example.com".to_string(),
+            }
+            .to_string(),
+        ];
+        for error in errors {
+            assert!(!error.contains(endpoint));
+            assert!(!error.contains("sensitive-proxy"));
+            assert!(!error.contains("1080"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_probe_enforces_absolute_deadline() {
+        let result = enforce_deadline(
+            Duration::from_millis(1),
+            std::future::pending::<SmtpProbe>(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "pending probe must hit the absolute deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_attempts_at_most_five_mx_hosts() {
+        let mx_hosts = (1..=6)
+            .map(|suffix| format!("10.0.0.{suffix}"))
+            .collect::<Vec<_>>();
+        let probe = probe_mailbox(SmtpProbeConfig {
+            mx_hosts: &mx_hosts,
+            to_email: "test@example.com",
+            from_email: "noreply@temps.sh",
+            hello_name: "temps.sh",
+            timeout: Duration::from_secs(1),
+            deadline: Duration::from_secs(2),
+            proxy: None,
+        })
+        .await;
+
+        let error = probe.error.expect("private MX hosts must be rejected");
+        assert!(error.contains("10.0.0.5"), "got: {error}");
+        assert!(
+            !error.contains("10.0.0.6"),
+            "sixth MX must not be attempted"
+        );
     }
 
     #[tokio::test]
@@ -366,6 +801,7 @@ mod tests {
             from_email: "noreply@temps.sh",
             hello_name: "temps.sh",
             timeout: Duration::from_secs(1),
+            deadline: Duration::from_secs(2),
             proxy: None,
         })
         .await;

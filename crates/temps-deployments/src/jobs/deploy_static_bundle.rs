@@ -7,7 +7,9 @@
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tar::EntryType;
@@ -65,6 +67,7 @@ impl DeployStaticBundleOutput {
 }
 
 /// Job that deploys a static bundle from local storage
+#[derive(Clone)]
 pub struct DeployStaticBundleJob {
     /// Unique job identifier
     job_id: String,
@@ -82,6 +85,8 @@ pub struct DeployStaticBundleJob {
     environment_slug: String,
     /// Deployment slug for organizing files
     deployment_slug: String,
+    /// Directory within the uploaded archive selected by preset detection.
+    source_directory: String,
     /// Data directory for reading the bundle
     data_dir: PathBuf,
     /// Static deployer for deploying files
@@ -158,6 +163,24 @@ fn validate_zip_entry_name(name: &str) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+fn confined_static_source(root: &Path, source_directory: &str) -> Result<PathBuf, WorkflowError> {
+    validate_archive_entry_path(Path::new(source_directory))?;
+    let canonical_root = root.canonicalize().map_err(WorkflowError::IoError)?;
+    let source = root.join(source_directory);
+    let canonical_source = source.canonicalize().map_err(|error| {
+        WorkflowError::JobExecutionFailed(format!(
+            "Detected static project directory '{source_directory}' is unavailable: {error}"
+        ))
+    })?;
+    if !canonical_source.starts_with(&canonical_root) || !canonical_source.is_dir() {
+        return Err(WorkflowError::InvalidArchiveEntry {
+            path: source_directory.to_string(),
+            reason: "detected static project directory escapes the archive root".to_string(),
+        });
+    }
+    Ok(canonical_source)
+}
+
 impl DeployStaticBundleJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -169,6 +192,7 @@ impl DeployStaticBundleJob {
         project_slug: String,
         environment_slug: String,
         deployment_slug: String,
+        source_directory: String,
         data_dir: PathBuf,
         static_deployer: Arc<dyn StaticDeployer>,
     ) -> Self {
@@ -181,6 +205,7 @@ impl DeployStaticBundleJob {
             project_slug,
             environment_slug,
             deployment_slug,
+            source_directory,
             data_dir,
             static_deployer,
             log_service: None,
@@ -234,6 +259,18 @@ impl DeployStaticBundleJob {
     pub const MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
     /// Maximum decompressed bytes for a single archive entry (Fix #27).
     pub const MAX_ENTRY_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
+    pub const MAX_ENTRIES: u32 = 20_000;
+
+    fn count_archive_entry(entry_count: &mut u32) -> Result<(), WorkflowError> {
+        *entry_count = entry_count.saturating_add(1);
+        if *entry_count > Self::MAX_ENTRIES {
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Static archive exceeds the {} entry limit",
+                Self::MAX_ENTRIES
+            )));
+        }
+        Ok(())
+    }
 
     /// Extract tar.gz bundle to the target directory.
     ///
@@ -242,17 +279,18 @@ impl DeployStaticBundleJob {
     ///  - Fix #19: skips symlink and hardlink entries (they can escape the sandbox).
     ///  - Fix #27: rejects entries whose declared size exceeds per-entry or
     ///    aggregate limits, and wraps the decoder in `io::Take` as a backstop.
-    fn extract_tar_gz(
+    fn extract_tar_gz_reader<R: Read>(
         &self,
-        data: &[u8],
+        reader: R,
         target_dir: &std::path::Path,
     ) -> Result<u32, WorkflowError> {
         // Fix #27: io::Take backstop so any read past the aggregate limit
         // returns EOF and tar parsing fails before we accumulate unbounded data.
-        let decoder = GzDecoder::new(Cursor::new(data));
+        let decoder = GzDecoder::new(reader);
         let limited = decoder.take(Self::MAX_EXTRACTED_BYTES);
         let mut archive = tar::Archive::new(limited);
 
+        let mut entry_count = 0u32;
         let mut file_count = 0u32;
         let mut extracted_total: u64 = 0;
 
@@ -262,6 +300,7 @@ impl DeployStaticBundleJob {
             let mut entry = entry.map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!("Failed to read tar entry: {}", e))
             })?;
+            Self::count_archive_entry(&mut entry_count)?;
 
             let path = entry.path().map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!("Failed to get entry path: {}", e))
@@ -358,16 +397,25 @@ impl DeployStaticBundleJob {
     ///  - Fix #18: validates every entry path via component walk before joining.
     ///  - Fix #27: rejects entries whose declared uncompressed size exceeds
     ///    per-entry or aggregate limits.
-    fn extract_zip(&self, data: &[u8], target_dir: &std::path::Path) -> Result<u32, WorkflowError> {
-        let cursor = Cursor::new(data);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| {
+    fn extract_zip_reader<R: Read + std::io::Seek>(
+        &self,
+        mut reader: R,
+        target_dir: &std::path::Path,
+    ) -> Result<u32, WorkflowError> {
+        temps_core::archive_security::validate_zip_metadata(&mut reader).map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!("Unsafe static ZIP metadata: {error}"))
+        })?;
+        let mut archive = ZipArchive::new(reader).map_err(|e| {
             WorkflowError::JobExecutionFailed(format!("Failed to open zip archive: {}", e))
         })?;
 
+        let mut entry_count = 0u32;
         let mut file_count = 0u32;
         let mut extracted_total: u64 = 0;
+        let mut written_total: u64 = 0;
 
         for i in 0..archive.len() {
+            Self::count_archive_entry(&mut entry_count)?;
             let mut file = archive.by_index(i).map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!("Failed to read zip entry {}: {}", i, e))
             })?;
@@ -431,22 +479,33 @@ impl DeployStaticBundleJob {
                     }
                 }
 
-                // Read file contents
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents).map_err(|e| {
+                let mut output = std::fs::File::create(&outpath).map_err(|e| {
                     WorkflowError::JobExecutionFailed(format!(
-                        "Failed to read zip file contents: {}",
-                        e
-                    ))
-                })?;
-
-                // Write to destination
-                std::fs::write(&outpath, contents).map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to write file {:?}: {}",
+                        "Failed to create file {:?}: {}",
                         outpath, e
                     ))
                 })?;
+                let written = std::io::copy(
+                    &mut file.by_ref().take(Self::MAX_ENTRY_BYTES + 1),
+                    &mut output,
+                )
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to extract file {:?}: {}",
+                        outpath, e
+                    ))
+                })?;
+                if written > Self::MAX_ENTRY_BYTES {
+                    return Err(WorkflowError::ArchiveTooLarge {
+                        limit_bytes: Self::MAX_ENTRY_BYTES,
+                    });
+                }
+                written_total = written_total.saturating_add(written);
+                if written_total > Self::MAX_EXTRACTED_BYTES {
+                    return Err(WorkflowError::ArchiveTooLarge {
+                        limit_bytes: Self::MAX_EXTRACTED_BYTES,
+                    });
+                }
 
                 file_count += 1;
             }
@@ -455,17 +514,25 @@ impl DeployStaticBundleJob {
         Ok(file_count)
     }
 
-    /// Read the bundle data from local storage.
-    ///
-    /// Canonicalizes both the data_dir root and the resolved bundle path and
-    /// verifies the result is still inside data_dir (defense-in-depth against
-    /// a tampered bundle_path in the database).
-    async fn download_bundle(&self) -> Result<Vec<u8>, WorkflowError> {
+    #[cfg(test)]
+    fn extract_tar_gz(
+        &self,
+        data: &[u8],
+        target_dir: &std::path::Path,
+    ) -> Result<u32, WorkflowError> {
+        self.extract_tar_gz_reader(Cursor::new(data), target_dir)
+    }
+
+    #[cfg(test)]
+    fn extract_zip(&self, data: &[u8], target_dir: &std::path::Path) -> Result<u32, WorkflowError> {
+        self.extract_zip_reader(Cursor::new(data), target_dir)
+    }
+
+    fn resolve_bundle_path(&self) -> Result<std::path::PathBuf, WorkflowError> {
         let local_path = self.data_dir.join(&self.bundle_path);
 
         debug!("Reading bundle from local storage: {:?}", local_path);
 
-        // Canonicalize the data_dir root (must already exist).
         let canonical_root =
             self.data_dir
                 .canonicalize()
@@ -473,8 +540,6 @@ impl DeployStaticBundleJob {
                     path: self.data_dir.display().to_string(),
                     reason: format!("data_dir canonicalization failed: {e}"),
                 })?;
-
-        // Canonicalize the resolved bundle path (file must exist).
         let canonical =
             local_path
                 .canonicalize()
@@ -482,14 +547,23 @@ impl DeployStaticBundleJob {
                     path: local_path.display().to_string(),
                     reason: format!("canonicalization failed: {e}"),
                 })?;
-
-        // Reject any path that escapes the data directory.
         if !canonical.starts_with(&canonical_root) {
             return Err(WorkflowError::InvalidBundlePath {
                 path: canonical.display().to_string(),
                 reason: format!("escapes data_dir {}", canonical_root.display()),
             });
         }
+        Ok(canonical)
+    }
+
+    /// Read the bundle data from local storage.
+    ///
+    /// Canonicalizes both the data_dir root and the resolved bundle path and
+    /// verifies the result is still inside data_dir (defense-in-depth against
+    /// a tampered bundle_path in the database).
+    #[cfg(test)]
+    async fn download_bundle(&self) -> Result<Vec<u8>, WorkflowError> {
+        let canonical = self.resolve_bundle_path()?;
 
         tokio::fs::read(&canonical).await.map_err(|e| {
             WorkflowError::JobExecutionFailed(format!(
@@ -534,21 +608,23 @@ impl WorkflowTask for DeployStaticBundleJob {
         self.log(LogLevel::Info, "Reading bundle from local storage...")
             .await;
 
-        let bundle_data = self.download_bundle().await?;
+        let bundle_path = self.resolve_bundle_path()?;
+        let bundle_size = std::fs::metadata(&bundle_path)
+            .map_err(WorkflowError::IoError)?
+            .len();
 
         self.log(
             LogLevel::Success,
-            &format!("Read {} bytes from local storage", bundle_data.len()),
+            &format!("Opened {} bytes from local storage", bundle_size),
         )
         .await;
 
         // Create temporary directory for extraction
-        let temp_dir = std::env::temp_dir().join(format!("temps-bundle-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir).map_err(|e| {
+        let temp_dir = tempfile::tempdir().map_err(|e| {
             WorkflowError::JobExecutionFailed(format!("Failed to create temp directory: {}", e))
         })?;
 
-        debug!("Extracting bundle to: {:?}", temp_dir);
+        debug!("Extracting bundle to: {:?}", temp_dir.path());
         self.log(
             LogLevel::Info,
             "Extracting bundle to temporary directory...",
@@ -557,13 +633,23 @@ impl WorkflowTask for DeployStaticBundleJob {
 
         // Extract based on content type.
         // Note: Must check for exact "application/zip" since "application/gzip" also contains "zip".
-        let content_type = self.detect_content_type();
-        let file_count = if content_type == "application/zip" {
-            self.extract_zip(&bundle_data, &temp_dir)?
-        } else {
-            // Default to tar.gz (application/gzip, application/x-gzip, etc.)
-            self.extract_tar_gz(&bundle_data, &temp_dir)?
-        };
+        let content_type = self.detect_content_type().to_string();
+        let extraction_target = temp_dir.path().to_path_buf();
+        let extraction_job = self.clone();
+        let extraction_permit = super::acquire_archive_extraction_permit().await?;
+        let file_count = tokio::task::spawn_blocking(move || {
+            let _extraction_permit = extraction_permit;
+            let file = std::fs::File::open(&bundle_path).map_err(WorkflowError::IoError)?;
+            if content_type == "application/zip" {
+                extraction_job.extract_zip_reader(file, &extraction_target)
+            } else {
+                extraction_job.extract_tar_gz_reader(file, &extraction_target)
+            }
+        })
+        .await
+        .map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!("Static extraction task failed: {error}"))
+        })??;
 
         self.log(
             LogLevel::Success,
@@ -572,8 +658,10 @@ impl WorkflowTask for DeployStaticBundleJob {
         .await;
 
         // Deploy using StaticDeployer
+        let canonical_source = confined_static_source(temp_dir.path(), &self.source_directory)?;
+
         let request = StaticDeployRequest {
-            source_dir: temp_dir.clone(),
+            source_dir: canonical_source,
             project_slug: self.project_slug.clone(),
             environment_slug: self.environment_slug.clone(),
             deployment_slug: self.deployment_slug.clone(),
@@ -590,11 +678,6 @@ impl WorkflowTask for DeployStaticBundleJob {
             &format!("Deployed to: {}", result.storage_path),
         )
         .await;
-
-        // Clean up temporary directory
-        if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
-            debug!("Warning: Failed to clean up temp directory: {}", e);
-        }
 
         // Store outputs in context
         context.set_output(&self.job_id, "static_dir_location", &result.storage_path)?;
@@ -630,6 +713,27 @@ mod tests {
     use tempfile::TempDir;
 
     // ── Archive builders ──────────────────────────────────────────────────────
+
+    #[test]
+    fn serves_the_detected_nested_static_directory() {
+        let temporary = TempDir::new().expect("tempdir");
+        let nested = temporary.path().join("examples/site");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        std::fs::write(nested.join("index.html"), "ok").expect("fixture");
+
+        let selected = confined_static_source(temporary.path(), "examples/site")
+            .expect("nested static root should be selected");
+        assert_eq!(selected, nested.canonicalize().expect("canonical nested"));
+    }
+
+    #[test]
+    fn rejects_static_directory_traversal() {
+        let temporary = TempDir::new().expect("tempdir");
+        assert!(matches!(
+            confined_static_source(temporary.path(), "../outside"),
+            Err(WorkflowError::InvalidArchiveEntry { .. })
+        ));
+    }
 
     /// Build a raw (uncompressed) POSIX ustar tar archive with a single entry.
     ///
@@ -797,6 +901,7 @@ mod tests {
             project_slug: "proj".to_string(),
             environment_slug: "env".to_string(),
             deployment_slug: "dep".to_string(),
+            source_directory: ".".to_string(),
             data_dir: tmp.clone(),
             static_deployer: Arc::new(FilesystemStaticDeployer::new(tmp)),
             log_service: None,
@@ -815,6 +920,7 @@ mod tests {
             project_slug: "proj".to_string(),
             environment_slug: "env".to_string(),
             deployment_slug: "dep".to_string(),
+            source_directory: ".".to_string(),
             data_dir: data_dir.to_path_buf(),
             static_deployer: Arc::new(FilesystemStaticDeployer::new(data_dir.to_path_buf())),
             log_service: None,
@@ -1158,5 +1264,12 @@ mod tests {
             matches!(err, WorkflowError::InvalidBundlePath { .. }),
             "expected InvalidBundlePath (canonicalization failed), got: {err:?}"
         );
+    }
+
+    #[test]
+    fn archive_entry_counter_rejects_more_than_twenty_thousand_entries() {
+        let mut count = DeployStaticBundleJob::MAX_ENTRIES;
+        let error = DeployStaticBundleJob::count_archive_entry(&mut count).unwrap_err();
+        assert!(error.to_string().contains("entry limit"));
     }
 }

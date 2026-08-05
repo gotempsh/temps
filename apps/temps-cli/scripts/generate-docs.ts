@@ -29,6 +29,7 @@ import { registerApiKeysCommands } from '../src/commands/apikeys/index.js'
 import { registerMonitorsCommands } from '../src/commands/monitors/index.js'
 import { registerWebhooksCommands } from '../src/commands/webhooks/index.js'
 import { registerContainersCommands } from '../src/commands/containers/index.js'
+import { registerFlagsCommands } from '../src/commands/flags/index.js'
 
 interface CommandInfo {
   name: string
@@ -300,6 +301,7 @@ async function main() {
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
+registerFlagsCommands(program)
 
   // Extract command information
   const commands: CommandInfo[] = program.commands.map((cmd: Command) =>

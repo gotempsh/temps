@@ -102,9 +102,17 @@ pub(crate) fn resolve<'a>(
         };
     }
 
-    // Leniency: accept a bare `operation_id` (it's globally unique).
+    // Leniency: accept a bare `operation_id` (it's globally unique) — but apply
+    // the same discovery filter as the section path. Without this, naming an
+    // operation directly skipped `permit` entirely, so the "operations you
+    // cannot read are not offered" property held only for callers who browsed
+    // to them. The router's `permission_guard!` was still the real boundary, so
+    // nothing was exploitable; this just stops a request being formed that
+    // should never have been.
     if let Some(op) = index.get(first) {
-        return resolve_operation(op, &tokens[1..]);
+        if permit(op) {
+            return resolve_operation(op, &tokens[1..]);
+        }
     }
 
     CliAction::Terminal(format!(
@@ -300,16 +308,26 @@ fn render_operation_help(op: &ApiOperation) -> String {
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required; query params are optional
-            // filters (omit the ones you don't need).
-            let req = if matches!(p.location, ParamLocation::Path) {
-                " (required)"
-            } else {
-                ""
+            // Path params are structurally required, and so are body fields the
+            // schema marks required — a write call fails without them, so the
+            // help has to say which ones they are. (Query params stay unmarked:
+            // they're optional filters, and OpenAPI required-ness is frequently
+            // wrong for them, so claiming "required" would send the model
+            // inventing values for filters it should simply omit.)
+            let req = match p.location {
+                ParamLocation::Path => " (required)",
+                ParamLocation::Body if p.required => " (required)",
+                _ => "",
             };
             out.push_str(&format!("  --{} <{}>{}", p.name, p.ty, req));
             if !p.enum_values.is_empty() {
                 out.push_str(&format!(" — one of: {}", p.enum_values.join(", ")));
+            }
+            // For an object-valued field, the accepted JSON is the single most
+            // useful thing we can say — a bare "<object>" tells the caller
+            // nothing, and guessing it wrong fails the whole call.
+            if let Some(shape) = &p.object_shape {
+                out.push_str(&format!(" — {}", shape.describe()));
             }
             if let Some(d) = &p.description {
                 out.push_str(&format!(" — {d}"));
@@ -468,6 +486,18 @@ fn coerce(s: &str) -> Value {
     if let Ok(n) = s.parse::<i64>() {
         return Value::from(n);
     }
+    // Floats too, or every fractional value becomes a string and the API
+    // rejects it with `invalid type: string "0.5", expected f64`. Thresholds
+    // are the obvious case: `--threshold 0.5` has to arrive as a number.
+    // Guarded against `f64::from_str` accepting "inf"/"NaN", which are not
+    // representable in JSON and would serialize as `null`.
+    if let Ok(n) = s.parse::<f64>() {
+        if n.is_finite() {
+            if let Some(v) = serde_json::Number::from_f64(n) {
+                return Value::Number(v);
+            }
+        }
+    }
     match s {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
@@ -529,6 +559,41 @@ mod tests {
         assert_eq!(v["limit"], Value::from(20));
         assert_eq!(v["name"], Value::from("foo"));
         assert_eq!(v["flag"], Value::Bool(true));
+    }
+
+    /// `--threshold 0.5` must arrive as a JSON number. It used to fall through
+    /// to a string (only `i64` was attempted), and the API answered
+    /// `invalid type: string "0.5", expected f64`.
+    #[test]
+    fn parse_flags_coerces_floats_to_numbers() {
+        let v = parse_flags(&[
+            "--threshold".into(),
+            "0.5".into(),
+            "--ratio".into(),
+            "-1.25".into(),
+        ])
+        .unwrap();
+        assert_eq!(v["threshold"], serde_json::json!(0.5));
+        assert_eq!(v["ratio"], serde_json::json!(-1.25));
+        assert!(v["threshold"].is_number() && !v["threshold"].is_string());
+    }
+
+    /// Integers must keep parsing as integers, not become floats.
+    #[test]
+    fn parse_flags_keeps_integers_integral() {
+        let v = parse_flags(&["--window_secs".into(), "300".into()]).unwrap();
+        assert_eq!(v["window_secs"], Value::from(300));
+        assert!(v["window_secs"].is_i64());
+    }
+
+    /// `f64::from_str` accepts these; JSON cannot represent them, and
+    /// `Number::from_f64` would yield `null`. They stay strings.
+    #[test]
+    fn parse_flags_leaves_non_finite_floats_as_strings() {
+        for token in ["inf", "-inf", "NaN"] {
+            let v = parse_flags(&["--x".into(), token.into()]).unwrap();
+            assert!(v["x"].is_string(), "{token} became {:?}", v["x"]);
+        }
     }
 
     #[test]

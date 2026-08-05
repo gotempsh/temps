@@ -56,6 +56,11 @@ jobs:
       # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
       TEMPS_TELEMETRY: "0"
       TEMPS_BIN: ./ci-prebuilt/temps
+      # Main and PR builds exercise the beta binary channel. Point sandbox
+      # pulls at the matching published image set; the default stable tag is
+      # only published by a stable release and otherwise forces a multi-minute
+      # local image build that exceeds Playwright's request timeout.
+      TEMPS_SANDBOX_CHANNEL: beta
 
     steps:
       - name: Free up disk space

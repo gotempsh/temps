@@ -54,6 +54,8 @@ pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
 pub mod external_services;
+pub mod feature_flag_environments;
+pub mod feature_flags;
 pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
@@ -91,6 +93,7 @@ pub mod secrets;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod source_bundles;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
@@ -100,6 +103,14 @@ pub mod types;
 pub mod upstream_config;
 pub mod user_roles;
 pub mod users;
+
+// Teams + project-scoped RBAC entities
+pub mod project_team_access;
+pub mod team_members;
+pub mod team_role;
+pub mod teams;
+
+pub use team_role::{TeamRole, TeamRoleParseError};
 
 // OpenTelemetry entities
 

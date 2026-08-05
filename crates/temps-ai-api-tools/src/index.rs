@@ -67,6 +67,113 @@ impl std::fmt::Display for ParamLocation {
     }
 }
 
+/// One field inside a `$ref`'d body object.
+///
+/// Carries the type and enum members, not just the name: knowing a key is
+/// *required* only catches half the mistakes. A `threshold` supplied as the
+/// string `"0.5"` and a `comparator` of `">"` (the schema wants `gt`) are both
+/// present and both fatal, and both used to survive validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectField {
+    pub name: String,
+    pub required: bool,
+    /// Short JSON Schema type: `string`, `number`, `integer`, `boolean`,
+    /// `array`, `object`, or `any` when it could not be determined.
+    pub ty: String,
+    /// Permitted values, when the field is an enum. Empty otherwise.
+    pub enum_values: Vec<String>,
+}
+
+impl ObjectField {
+    /// `"name": <type>` or `"name": one of a|b|c` — the form used in help text
+    /// and in the validation error.
+    fn describe(&self) -> String {
+        if self.enum_values.is_empty() {
+            format!("\"{}\": <{}>", self.name, self.ty)
+        } else {
+            format!("\"{}\": one of {}", self.name, self.enum_values.join("|"))
+        }
+    }
+}
+
+/// The inner shape of a body parameter whose type is a `$ref`'d object.
+///
+/// Without this, such a parameter reaches the model as a bare `object` with no
+/// hint of what belongs inside it, and a wrong guess is not caught until the
+/// request is actually executed — which, on the propose-then-confirm path,
+/// means *after* a human has approved it. Capturing the fields lets the call be
+/// rejected at validation time, while the model can still fix it.
+///
+/// Two shapes are modelled:
+///
+/// - a plain object → [`Self::fields`] describes it;
+/// - a tagged union (`oneOf` where every variant pins one property to a single
+///   enum value) → [`Self::discriminator`] names that property and
+///   [`Self::variants`] maps each tag to that variant's fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ObjectShape {
+    /// Property that selects the variant (e.g. `kind`), for a tagged union.
+    pub discriminator: Option<String>,
+    /// Variant tag → that variant's fields (discriminator included).
+    /// Empty for a plain object.
+    pub variants: BTreeMap<String, Vec<ObjectField>>,
+    /// Fields of a plain (non-union) object.
+    pub fields: Vec<ObjectField>,
+}
+
+impl ObjectShape {
+    /// Is there anything worth validating or showing? A resolved-but-empty
+    /// shape tells the model nothing.
+    pub fn is_informative(&self) -> bool {
+        !self.fields.is_empty() || !self.variants.is_empty()
+    }
+
+    /// The fields that apply to a value carrying the given discriminator tag,
+    /// or the plain object's fields when this is not a union.
+    pub fn fields_for(&self, tag: Option<&str>) -> Option<&[ObjectField]> {
+        match tag {
+            Some(tag) => self.variants.get(tag).map(Vec::as_slice),
+            None => Some(&self.fields),
+        }
+    }
+
+    /// One-line summary of the accepted JSON, for `--help` and error messages.
+    ///
+    /// The model does not reliably run `--help` before calling a write
+    /// operation, so this same text is repeated in the validation error — that
+    /// is the one place it is guaranteed to be read. Types and enum members are
+    /// included because the mistakes seen in practice are a quoted number and a
+    /// plausible-but-wrong enum spelling (`">"` for `gt`), neither of which a
+    /// bare list of key names would have prevented.
+    pub fn describe(&self) -> String {
+        match &self.discriminator {
+            Some(d) => {
+                let variants: Vec<String> = self
+                    .variants
+                    .iter()
+                    .map(|(tag, fields)| {
+                        let rest: Vec<String> = fields
+                            .iter()
+                            .filter(|f| f.name != *d)
+                            .map(ObjectField::describe)
+                            .collect();
+                        format!("{{\"{d}\": \"{tag}\", {}}}", rest.join(", "))
+                    })
+                    .collect();
+                format!("object, one of: {}", variants.join(" | "))
+            }
+            None => format!(
+                "object: {{{}}}",
+                self.fields
+                    .iter()
+                    .map(ObjectField::describe)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
 /// Compact description of a single parameter, extracted from the utoipa schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSpec {
@@ -87,6 +194,11 @@ pub struct ParamSpec {
     pub enum_values: Vec<String>,
     /// Optional human-readable description from the OpenAPI document.
     pub description: Option<String>,
+    /// For a body param that is a `$ref` to an object schema: the keys that
+    /// object requires, so a malformed value is caught during validation rather
+    /// than at execution. `None` for scalars and unresolvable schemas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_shape: Option<ObjectShape>,
 }
 
 /// A single operation kept in the index (GET *or* an allowlisted write method).
@@ -265,6 +377,68 @@ impl ReadOnlyApiIndex {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
         }
+    }
+
+    /// Build the read index from an OpenAPI document: allowlisted `GET`
+    /// operations PLUS a separate, explicitly-vetted set of **read-only
+    /// `POST`** operations.
+    ///
+    /// ## Why this exists
+    ///
+    /// HTTP method is the crate's structural proxy for "does this mutate?", and
+    /// it is right almost everywhere. A handful of genuinely read-only
+    /// operations are nonetheless `POST` because their *input* is too large or
+    /// too structured for a query string — the motivating case is the metric
+    /// alert backtest (`preview_alert`), which takes a whole detector config and
+    /// returns "would this rule have fired?" without writing anything.
+    ///
+    /// Routing those through the *write* tool would be wrong in the other
+    /// direction: the write tool is propose-then-confirm, so a backtest would
+    /// stage a pending action and wait for a human — turning the cheap
+    /// "check before you propose" step into the very thing it is meant to
+    /// inform.
+    ///
+    /// ## Security posture
+    ///
+    /// `safe_posts` is a SECOND allowlist, deliberately separate from the GET
+    /// allowlist so that adding an entry is a conscious act with its own review:
+    /// **an operation belongs here only if it has no side effects.** A `POST`
+    /// that writes anything must go in the write allowlist instead. Membership
+    /// in `allowlist` does NOT grant POST access and membership here does NOT
+    /// grant GET access — the two lists are matched against disjoint sets of
+    /// operations. The router's `permission_guard!` remains the real boundary;
+    /// this is defence in depth for what the model can even name.
+    ///
+    /// Request-body fields are resolved exactly as for the write index, so the
+    /// model can pass body params as CLI flags.
+    pub fn from_openapi_allowlist_with_safe_posts(
+        openapi: &utoipa::openapi::OpenApi,
+        allowlist: &[&str],
+        safe_posts: &[&str],
+    ) -> Self {
+        let mut index = Self::from_openapi_allowlist(openapi, allowlist);
+
+        for (path, path_item) in &openapi.paths.paths {
+            let Some(op) = path_item.post.as_ref() else {
+                continue;
+            };
+            let Some(ref op_id) = op.operation_id else {
+                continue;
+            };
+            if !safe_posts.contains(&op_id.as_str()) {
+                continue;
+            }
+            let body_params = resolve_body_params(op, openapi);
+            index.operations.push(build_api_operation(
+                op_id.clone(),
+                path.clone(),
+                "POST",
+                op,
+                &body_params,
+            ));
+        }
+
+        index
     }
 
     /// Build the write index from an OpenAPI document, including ONLY non-GET
@@ -534,10 +708,20 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
     for (prop_name, prop_schema) in &obj.properties {
         let required = obj.required.contains(prop_name);
         let (ty, enum_values) = extract_type_and_enum(Some(prop_schema));
+        let object_shape =
+            resolve_object_shape(prop_schema, openapi).filter(ObjectShape::is_informative);
 
-        // Try to get a description from the property schema if it's an Object.
+        // Description from the property schema.
+        //
+        // The `$ref` arm matters more than it looks. A property that points at a
+        // component schema still carries its own sibling `description` — and for
+        // a field whose type resolves to a bare "object" here (a discriminated
+        // union, say), that prose is the ONLY place the required shape is
+        // written down. Dropping it left the model guessing at the JSON, and
+        // guessing wrong: it has no other way to learn the discriminator's name.
         let description = match prop_schema {
             RefOr::T(Schema::Object(prop_obj)) => prop_obj.description.clone(),
+            RefOr::Ref(r) if !r.description.trim().is_empty() => Some(r.description.clone()),
             _ => None,
         };
 
@@ -548,9 +732,150 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
             ty,
             enum_values,
             description,
+            object_shape,
         });
     }
     params
+}
+
+/// Resolve a body property's schema into an [`ObjectShape`], if it names one.
+///
+/// Follows a `$ref` into `components.schemas` (one level) and understands the
+/// two shapes utoipa emits for Rust types that matter here: a plain struct
+/// (`Schema::Object` with `required`) and an internally-tagged enum
+/// (`Schema::OneOf` of `Schema::AllOf`s, each combining the variant's payload
+/// `$ref` with an inline object pinning the tag property to one enum value).
+///
+/// Best effort throughout: anything it cannot make sense of yields `None`, and
+/// the parameter is simply treated as an opaque object exactly as before.
+fn resolve_object_shape(
+    prop_schema: &RefOr<Schema>,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Option<ObjectShape> {
+    let schema = deref_schema(prop_schema, openapi)?;
+    match schema {
+        Schema::Object(o) => Some(ObjectShape {
+            discriminator: None,
+            variants: BTreeMap::new(),
+            fields: object_fields(o, openapi),
+        }),
+        Schema::OneOf(one_of) => {
+            let mut discriminator: Option<String> = None;
+            let mut variants: BTreeMap<String, Vec<ObjectField>> = BTreeMap::new();
+
+            for item in &one_of.items {
+                let (tag_prop, tag_value, fields) = variant_shape(item, openapi)?;
+                // Every variant must agree on the discriminator, otherwise this
+                // is not a tagged union and we should not pretend it is.
+                match &discriminator {
+                    Some(existing) if *existing != tag_prop => return None,
+                    Some(_) => {}
+                    None => discriminator = Some(tag_prop),
+                }
+                variants.insert(tag_value, fields);
+            }
+
+            discriminator.map(|d| ObjectShape {
+                discriminator: Some(d),
+                variants,
+                fields: Vec::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Describe every property of an object schema, resolving each property's own
+/// `$ref` so an enum defined as its own component (utoipa's default for a Rust
+/// enum) still yields its permitted values rather than an opaque "string".
+fn object_fields(
+    obj: &utoipa::openapi::schema::Object,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Vec<ObjectField> {
+    obj.properties
+        .iter()
+        .map(|(name, prop)| {
+            let resolved = deref_schema(prop, openapi);
+            let (ty, enum_values) = match resolved {
+                Some(Schema::Object(o)) => (
+                    schema_type_to_string(&o.schema_type),
+                    o.enum_values
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ),
+                _ => ("any".to_string(), Vec::new()),
+            };
+            ObjectField {
+                name: name.clone(),
+                required: obj.required.contains(name),
+                ty,
+                enum_values,
+            }
+        })
+        .collect()
+}
+
+/// Follow one level of `$ref` into `components.schemas`.
+fn deref_schema<'a>(
+    schema: &'a RefOr<Schema>,
+    openapi: &'a utoipa::openapi::OpenApi,
+) -> Option<&'a Schema> {
+    match schema {
+        RefOr::T(s) => Some(s),
+        RefOr::Ref(r) => {
+            let name = r.ref_location.split('/').next_back()?;
+            match openapi.components.as_ref()?.schemas.get(name)? {
+                RefOr::T(s) => Some(s),
+                RefOr::Ref(_) => None, // nested ref — not worth chasing
+            }
+        }
+    }
+}
+
+/// Read one `oneOf` variant, returning `(tag property, tag value, required keys)`.
+///
+/// Expects the utoipa shape for an internally-tagged enum: an `allOf` whose
+/// members are the payload (often a `$ref`) plus an inline object that pins the
+/// tag property to a single-valued enum.
+fn variant_shape(
+    item: &RefOr<Schema>,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Option<(String, String, Vec<ObjectField>)> {
+    let Schema::AllOf(all_of) = deref_schema(item, openapi)? else {
+        return None;
+    };
+
+    let mut fields: Vec<ObjectField> = Vec::new();
+    let mut tag: Option<(String, String)> = None;
+
+    for member in &all_of.items {
+        let Some(Schema::Object(o)) = deref_schema(member, openapi) else {
+            continue;
+        };
+        for field in object_fields(o, openapi) {
+            if !fields.iter().any(|f| f.name == field.name) {
+                fields.push(field);
+            }
+        }
+        // The tag is a property whose enum admits exactly one value.
+        for (name, prop) in &o.properties {
+            let RefOr::T(Schema::Object(p)) = prop else {
+                continue;
+            };
+            let Some(values) = p.enum_values.as_ref() else {
+                continue;
+            };
+            if let [serde_json::Value::String(v)] = values.as_slice() {
+                tag = Some((name.clone(), v.clone()));
+            }
+        }
+    }
+
+    let (tag_prop, tag_value) = tag?;
+    Some((tag_prop, tag_value, fields))
 }
 
 /// Convert a single utoipa [`Parameter`] into a [`ParamSpec`].
@@ -575,6 +900,9 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
         ty,
         enum_values,
         description: param.description.clone(),
+        // Path/query params are scalars in this API; only body fields carry
+        // nested object schemas worth resolving.
+        object_shape: None,
     })
 }
 
@@ -617,7 +945,22 @@ fn schema_type_to_string(st: &utoipa::openapi::schema::SchemaType) -> String {
         SchemaType::Type(Type::Array) => "array",
         SchemaType::Type(Type::Object) => "object",
         SchemaType::Type(Type::Null) => "null",
-        SchemaType::Array(_) => "array",
+        // NOT an array — this is a *type union*, which utoipa emits as
+        // `type: ["string", "null"]` for an `Option<String>`. Reporting it as
+        // "array" told the model that every optional field wanted a list, so
+        // `--start_time <array>` for what is an RFC 3339 string. Report the one
+        // real type instead and ignore the null.
+        SchemaType::Array(types) => {
+            let mut concrete = types.iter().filter(|t| !matches!(t, Type::Null));
+            return match (concrete.next(), concrete.next()) {
+                // The overwhelmingly common case: `T | null`.
+                (Some(single), None) => schema_type_to_string(&SchemaType::Type(single.clone())),
+                // Genuinely polymorphic, or null-only — neither is a type the
+                // caller can act on, so don't pretend otherwise.
+                (Some(_), Some(_)) => "any".to_string(),
+                (None, _) => "null".to_string(),
+            };
+        }
         SchemaType::AnyValue => "any",
     }
     .to_string()
@@ -1168,5 +1511,360 @@ mod tests {
         assert_eq!(allowlist_index.len(), 1);
         assert!(allowlist_index.get("list_projects").is_some());
         assert!(allowlist_index.get("create_project").is_none());
+    }
+
+    /// A `$ref` body property's own description must survive into the param
+    /// spec.
+    ///
+    /// Found against a live model: `create_alert`'s `detection_config` is a
+    /// discriminated union, so it resolves to a bare "object" here. Its sibling
+    /// description is the only place the required shape (the `kind`
+    /// discriminator) is written down, and dropping it left the model to guess
+    /// the JSON — it guessed `{"type": ...}` instead of `{"kind": ...}` and the
+    /// confirmed write failed with a 422.
+    #[test]
+    fn ref_body_property_keeps_its_own_description() {
+        use utoipa::openapi::{
+            request_body::RequestBodyBuilder, schema::ComponentsBuilder, ContentBuilder,
+        };
+
+        const SHAPE: &str = "Discriminated union keyed by `kind`, e.g. \
+                             `{ \"kind\": \"static\", \"threshold\": 500 }`.";
+
+        let components = ComponentsBuilder::new()
+            .schema(
+                "Detector",
+                RefOr::T(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .build(),
+                )),
+            )
+            .schema(
+                "CreateAlertRequest",
+                RefOr::T(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .property(
+                            "detection_config",
+                            RefOr::Ref(
+                                utoipa::openapi::schema::Ref::builder()
+                                    .ref_location_from_schema_name("Detector")
+                                    .description(Some(SHAPE))
+                                    .build(),
+                            ),
+                        )
+                        .required("detection_config")
+                        .build(),
+                )),
+            )
+            .build();
+
+        let create = OperationBuilder::new()
+            .operation_id(Some("create_alert"))
+            .tag("Alerts")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        ContentBuilder::new()
+                            .schema(Some(RefOr::Ref(
+                                utoipa::openapi::schema::Ref::from_schema_name(
+                                    "CreateAlertRequest",
+                                ),
+                            )))
+                            .build(),
+                    )
+                    .build(),
+            ))
+            .build();
+
+        let paths = PathsBuilder::new()
+            .path("/otel/alerts", {
+                let mut item = PathItem::default();
+                item.post = Some(create);
+                item
+            })
+            .build();
+
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(paths)
+            .components(Some(components))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_alert"]);
+        let op = index.get("create_alert").expect("indexed");
+        let param = op
+            .params
+            .iter()
+            .find(|p| p.name == "detection_config")
+            .expect("body param resolved");
+
+        assert_eq!(
+            param.description.as_deref(),
+            Some(SHAPE),
+            "the shape guidance must reach the model — it is the only description of the JSON"
+        );
+    }
+
+    /// The resolver must recognise utoipa's internally-tagged-enum encoding —
+    /// `oneOf` of `allOf`s, each pairing a payload `$ref` with an inline object
+    /// pinning the tag. This is exactly how `DetectionConfig` is emitted, and
+    /// getting it wrong is what left the model guessing.
+    #[test]
+    fn tagged_union_body_param_resolves_to_its_variants() {
+        use utoipa::openapi::{
+            request_body::RequestBodyBuilder,
+            schema::{AllOfBuilder, ComponentsBuilder, OneOfBuilder},
+            ContentBuilder,
+        };
+
+        fn tag(name: &str, value: &str) -> RefOr<Schema> {
+            RefOr::T(Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::Object))
+                    .property(
+                        name,
+                        RefOr::T(Schema::Object(
+                            ObjectBuilder::new()
+                                .schema_type(SchemaType::Type(Type::String))
+                                .enum_values(Some([value]))
+                                .build(),
+                        )),
+                    )
+                    .required(name)
+                    .build(),
+            ))
+        }
+
+        let static_params = Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .property(
+                    "comparator",
+                    RefOr::T(Schema::Object(ObjectBuilder::new().build())),
+                )
+                .property(
+                    "threshold",
+                    RefOr::T(Schema::Object(ObjectBuilder::new().build())),
+                )
+                .required("comparator")
+                .required("threshold")
+                .build(),
+        );
+        let anomaly_params = Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::Object))
+                .property(
+                    "deviations",
+                    RefOr::T(Schema::Object(ObjectBuilder::new().build())),
+                )
+                .required("deviations")
+                .build(),
+        );
+
+        let detection_config = Schema::OneOf(
+            OneOfBuilder::new()
+                .item(RefOr::T(Schema::AllOf(
+                    AllOfBuilder::new()
+                        .item(RefOr::Ref(utoipa::openapi::schema::Ref::from_schema_name(
+                            "StaticParams",
+                        )))
+                        .item(tag("kind", "static"))
+                        .build(),
+                )))
+                .item(RefOr::T(Schema::AllOf(
+                    AllOfBuilder::new()
+                        .item(RefOr::Ref(utoipa::openapi::schema::Ref::from_schema_name(
+                            "AnomalyParams",
+                        )))
+                        .item(tag("kind", "anomaly"))
+                        .build(),
+                )))
+                .build(),
+        );
+
+        let components = ComponentsBuilder::new()
+            .schema("StaticParams", RefOr::T(static_params))
+            .schema("AnomalyParams", RefOr::T(anomaly_params))
+            .schema("DetectionConfig", RefOr::T(detection_config))
+            .schema(
+                "CreateAlertRequest",
+                RefOr::T(Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Type(Type::Object))
+                        .property(
+                            "detection_config",
+                            RefOr::Ref(utoipa::openapi::schema::Ref::from_schema_name(
+                                "DetectionConfig",
+                            )),
+                        )
+                        .required("detection_config")
+                        .build(),
+                )),
+            )
+            .build();
+
+        let create = OperationBuilder::new()
+            .operation_id(Some("create_alert"))
+            .tag("Alerts")
+            .request_body(Some(
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        ContentBuilder::new()
+                            .schema(Some(RefOr::Ref(
+                                utoipa::openapi::schema::Ref::from_schema_name(
+                                    "CreateAlertRequest",
+                                ),
+                            )))
+                            .build(),
+                    )
+                    .build(),
+            ))
+            .build();
+
+        let paths = PathsBuilder::new()
+            .path("/otel/alerts", {
+                let mut item = PathItem::default();
+                item.post = Some(create);
+                item
+            })
+            .build();
+
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(paths)
+            .components(Some(components))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_alert"]);
+        let param = index
+            .get("create_alert")
+            .expect("indexed")
+            .params
+            .iter()
+            .find(|p| p.name == "detection_config")
+            .expect("body param")
+            .clone();
+
+        let shape = param.object_shape.expect("union shape resolved");
+        assert_eq!(shape.discriminator.as_deref(), Some("kind"));
+
+        let static_keys = shape.variants.get("static").expect("static variant");
+        for key in ["kind", "comparator", "threshold"] {
+            assert!(
+                static_keys.iter().any(|f| f.name == key),
+                "missing {key} in {static_keys:?}"
+            );
+        }
+        let anomaly_keys = shape.variants.get("anomaly").expect("anomaly variant");
+        assert!(anomaly_keys.iter().any(|f| f.name == "deviations"));
+
+        // And the rendered form names the discriminator, which is the detail
+        // the model needs and cannot otherwise discover.
+        assert!(
+            shape.describe().contains("\"kind\": \"static\""),
+            "{}",
+            shape.describe()
+        );
+    }
+
+    /// `Option<T>` must report `T`, not "array".
+    ///
+    /// utoipa encodes a nullable field as `type: ["string", "null"]`, which is
+    /// a type UNION. Mapping that to "array" told the model every optional
+    /// field wanted a list — `--start_time <array>` for an RFC 3339 string.
+    #[test]
+    fn nullable_type_union_reports_the_concrete_type() {
+        use utoipa::openapi::schema::{SchemaType, Type};
+
+        let nullable_string = SchemaType::Array(vec![Type::String, Type::Null]);
+        assert_eq!(schema_type_to_string(&nullable_string), "string");
+
+        let nullable_number = SchemaType::Array(vec![Type::Null, Type::Number]);
+        assert_eq!(schema_type_to_string(&nullable_number), "number");
+
+        // A real array is still an array.
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Type(Type::Array)),
+            "array"
+        );
+
+        // Genuinely polymorphic, or null-only: neither is actionable, so don't
+        // claim a type the caller could act on.
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Array(vec![Type::String, Type::Number])),
+            "any"
+        );
+        assert_eq!(
+            schema_type_to_string(&SchemaType::Array(vec![Type::Null])),
+            "null"
+        );
+    }
+
+    #[test]
+    fn safe_posts_are_indexed_with_post_method_and_body_params() {
+        let api = write_test_openapi();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &["list_projects"],
+            &["create_project"],
+        );
+
+        assert_eq!(index.len(), 2, "the GET plus the vetted read-only POST");
+
+        let post = index.get("create_project").expect("safe POST indexed");
+        assert_eq!(post.method, "POST", "must dispatch as a real POST");
+        let name = post
+            .params
+            .iter()
+            .find(|p| p.name == "name")
+            .expect("body params resolved through the $ref");
+        assert_eq!(name.location, ParamLocation::Body);
+        assert!(name.required);
+    }
+
+    /// The two allowlists are disjoint: naming an operation in one does not
+    /// grant it through the other. This is the property that keeps "vetted
+    /// read-only POST" from quietly widening into "any POST".
+    #[test]
+    fn safe_post_and_get_allowlists_do_not_leak_into_each_other() {
+        let api = write_test_openapi();
+
+        // A POST named only in the GET allowlist stays out.
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &["create_project"],
+            &[],
+        );
+        assert!(
+            index.get("create_project").is_none(),
+            "a POST must never be reachable via the GET allowlist"
+        );
+
+        // A GET named only in the safe-POST list stays out.
+        let index =
+            ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&api, &[], &["list_projects"]);
+        assert!(index.get("list_projects").is_none());
+        assert_eq!(index.len(), 0);
+    }
+
+    /// PATCH/PUT/DELETE can never enter the read index, even if someone
+    /// mistakenly adds one to `safe_posts` — only `path_item.post` is consulted.
+    #[test]
+    fn safe_posts_never_admit_non_post_write_methods() {
+        let api = write_test_openapi();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(
+            &api,
+            &[],
+            &["update_project", "delete_project"],
+        );
+        assert_eq!(
+            index.len(),
+            0,
+            "PATCH/DELETE must be structurally unreachable from the read index"
+        );
     }
 }

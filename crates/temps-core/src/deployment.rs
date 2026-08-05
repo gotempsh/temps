@@ -90,6 +90,22 @@ pub trait DeploymentCanceller: Send + Sync {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Removes source/static archives owned by a project before its database rows
+/// are deleted.
+///
+/// The trait lives in `temps-core` so the projects crate can require cleanup
+/// without depending on the deployments crate. Implementations must be
+/// idempotent: retrying after a partial cleanup must safely continue.
+#[async_trait]
+pub trait ProjectArchiveCleaner: Send + Sync {
+    /// Remove all persisted upload archives known to belong to `project_id`.
+    /// A failure must leave the project row intact so callers can retry.
+    async fn cleanup_project_archives(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// The result of a [`DeploymentGate`] check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {

@@ -1,0 +1,252 @@
+export const metadata = {
+  title: 'Feature Flags',
+  description:
+    'Built-in feature flags on Temps. Change how your app behaves at runtime — kill switches, gradual enablement, and runtime tuning — without a redeploy.',
+  alternates: {
+    canonical: '/docs/feature-flags',
+  },
+}
+
+# Feature Flags
+
+Temps includes feature flags scoped to a project and overridable per environment. Changing a flag takes effect in seconds; changing an environment variable requires a redeploy. That difference is the whole point. {{ className: 'lead' }}
+
+---
+
+## Overview
+
+<Row>
+  <Col>
+    **Key Features**
+    - Typed values: boolean, string, number, JSON
+    - A default value per flag, overridable per environment
+    - A one-action kill switch per environment
+    - Synchronous, in-memory reads in your app — no network call per check
+    - Zero-config SDK: credentials are already injected into your deployment
+    - Full audit trail of who changed what, and what it was before
+  </Col>
+  <Col>
+    **Why Use It**
+    - Merge code now, turn it on later
+    - Kill a broken feature in seconds instead of waiting for a rebuild
+    - Retune batch sizes, rate limits, or timeouts under load
+    - Different values in preview and production, from one definition
+    - No third-party flag vendor, no extra bill
+  </Col>
+</Row>
+
+---
+
+## Flags vs. environment variables
+
+Both are runtime configuration, and they are not interchangeable.
+
+| | Environment variable | Feature flag |
+| --- | --- | --- |
+| Time to take effect | A redeploy | Seconds |
+| Good for | Secrets, connection strings, static config | Kill switches, gradual enablement, runtime tuning |
+| Typed | No — always a string | Yes — bool, string, number, JSON |
+| Per environment | Yes | Yes |
+| Encrypted at rest | Yes, when marked secret | **No** |
+
+**Never put a secret in a feature flag.** Flag values are not encrypted, and a flag can be marked visible to browsers. Use an environment variable marked secret instead.
+
+---
+
+## Creating a flag
+
+In the dashboard, open your project and go to **Feature Flags**, then **New flag**.
+
+- **Key** — the identifier you use in code, e.g. `checkout.v2`. Lowercase letters, digits, dot, underscore and hyphen. **Immutable after create**, because it appears verbatim in your source.
+- **Type** — `bool`, `string`, `number`, or `json`. **Fixed at create**, because changing it would invalidate every stored value.
+- **Default value** — served whenever nothing more specific applies, and whenever the flag is disabled.
+- **Expose to browsers** — off by default. Leave it off unless a browser genuinely needs to read the flag.
+
+Or from the CLI:
+
+```bash
+bunx @temps-sdk/cli flags create checkout.v2 \
+  --type bool \
+  --default false \
+  --description "New checkout flow"
+```
+
+---
+
+## Reading flags in your app
+
+Install the SDK and initialise it once at startup. `TEMPS_API_URL` and `TEMPS_API_TOKEN` are injected into every Temps deployment, so there is nothing to configure.
+
+```bash
+bun add @temps-sdk/node-sdk
+```
+
+```js
+import { flags } from '@temps-sdk/node-sdk'
+
+// Fetches the flag set once, then refreshes in the background.
+await flags.init()
+
+app.get('/checkout', (req, res) => {
+  // Synchronous, in-memory, no network I/O.
+  const useV2 = flags.get('checkout.v2', { key: req.user.id }, false)
+
+  return useV2 ? renderCheckoutV2(res) : renderCheckout(res)
+})
+```
+
+The third argument is a **fallback**. It is returned whenever the flag cannot be resolved — unknown key, snapshot not loaded yet, or a stored value that does not match the flag's type. Always pass the value you want if Temps is unreachable.
+
+<Note>
+  `flags.init()` never throws. If the flag service is unreachable, every read
+  returns your fallback, `flags.ready` stays `false`, and `flags.lastError`
+  explains why. A flag outage must not stop your app from booting.
+</Note>
+
+### Why reads are synchronous
+
+The SDK holds the whole environment's flag set in memory and refreshes it in the background, so a flag check costs microseconds instead of a network round trip. A per-check HTTP request (~200–500ms) is unusable inside a request handler.
+
+### Understanding a value
+
+When a flag isn't doing what you expect, ask for the reason:
+
+```js
+const { value, reason } = flags.getDetails('checkout.v2', {}, false)
+```
+
+| `reason.kind` | Meaning |
+| --- | --- |
+| `ENVIRONMENT_VALUE` | A value is set for this environment |
+| `DEFAULT` | Nothing set here; the flag default was served |
+| `DISABLED` | The kill switch is on; the default was served |
+| `FLAG_NOT_FOUND` | No such flag (or it is archived); your fallback was served |
+| `ERROR` | The stored value didn't match the flag's type; the default was served |
+
+---
+
+## The kill switch
+
+Disabling a flag in an environment makes it serve its **default value**, ignoring any value set there. It does not delete the value — re-enabling restores exactly what was set before.
+
+```bash
+# Incident: turn it off now.
+bunx @temps-sdk/cli flags disable checkout.v2 --environment production
+
+# Later, restore the previous value.
+bunx @temps-sdk/cli flags enable checkout.v2 --environment production
+```
+
+This is why the default value matters: it is what your users get during an incident. Set it to the safe, known-good behaviour.
+
+---
+
+## Per-environment values
+
+A flag is defined once for the project and overridden per environment, so preview and production can differ without touching your code.
+
+```bash
+bunx @temps-sdk/cli flags set checkout.v2 true  --environment preview
+bunx @temps-sdk/cli flags set checkout.v2 false --environment production
+
+# Drop the override so this environment follows the flag default again.
+bunx @temps-sdk/cli flags clear checkout.v2 --environment preview
+```
+
+Resolution order, exactly as your app sees it:
+
+1. Flag missing or archived → your fallback
+2. Kill switch on → the flag default
+3. A value set for this environment → that value
+4. Otherwise → the flag default
+
+---
+
+## Beyond on/off
+
+Flags are typed, so they are also a way to retune a running service:
+
+```bash
+bunx @temps-sdk/cli flags create worker.batch_size --type number --default 50
+bunx @temps-sdk/cli flags create llm.model --type string --default claude-haiku-4-5
+bunx @temps-sdk/cli flags create ui.theme --type json --default '{"accent":"violet"}'
+```
+
+```js
+const batchSize = flags.get('worker.batch_size', {}, 50)
+```
+
+---
+
+## Knowing what's still in use
+
+Every flag shows **Last evaluated by an app** in its detail panel. This is
+reported by the SDK when your code actually reads the flag — it is deliberately
+*not* stamped when the console opens or when a deploy fetches the flag set,
+because that would make every flag look freshly used and defeat the purpose.
+
+`Never` means exactly that: no running app has read this flag since the feature
+shipped. That is the signal that a flag is safe to archive.
+
+Reporting is on by default, batched on the refresh interval, and only ever
+includes keys that exist in your project. Turn it off if you'd rather not send
+it:
+
+```js
+await flags.init()   // reporting on by default
+
+const client = new FlagsClient({ reportExposure: false })
+```
+
+---
+
+## Archiving
+
+Archiving stops a flag being served. Apps fall back to the default compiled into their own code, so check that fallback is what you want in production before archiving.
+
+```bash
+bunx @temps-sdk/cli flags archive checkout.v2
+```
+
+Archived flags keep their key reserved. Use `--include-archived` on `flags list` to see them, and restore one if you archived it by mistake:
+
+```bash
+bunx @temps-sdk/cli flags restore checkout.v2
+```
+
+---
+
+## Security
+
+- **Flags are not secrets.** Values are stored unencrypted. Use secret environment variables for credentials.
+- **Flags are server-only by default.** `client_visible` is off unless you turn it on.
+- **Deployment tokens are read-only.** The `TEMPS_API_TOKEN` baked into your container can read the flag snapshot but can never change a flag — a compromised app cannot flip production.
+- **Changes are audited.** Every mutation records who, when, and the old and new value. A flag change is a production change with no deployment behind it, so the audit log is the only record.
+
+---
+
+## CLI reference
+
+```bash
+temps flags list [--environment <name>] [--include-archived] [--page <n>] [--json]
+temps flags get <key>
+temps flags create <key> --type <bool|string|number|json> --default <value>
+temps flags update <key> [--default <value>] [--description <text>]
+temps flags set <key> <value> --environment <name>
+temps flags clear <key> --environment <name>
+temps flags disable <key> --environment <name>
+temps flags enable <key> --environment <name>
+temps flags archive <key>
+```
+
+---
+
+## Limitations
+
+Phase 1 covers per-environment values and kill switches. Not yet available:
+
+- Targeting rules (serve a value based on user attributes)
+- Percentage rollouts
+- Reading flags directly from a browser
+- Flag-change correlation with analytics and error tracking
+- Per-environment usage (today "last evaluated" is per flag, across all environments)

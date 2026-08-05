@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use temps_core::{
@@ -17,6 +18,126 @@ use temps_entities::preset::{Preset as StoredPreset, PresetConfig as StoredPrese
 use temps_logs::{LogLevel, LogService};
 use temps_presets;
 use tokio::time::{sleep, Duration};
+
+fn validate_relative_build_path(path: &Path, label: &str) -> Result<(), WorkflowError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "{label} '{}' must be relative and contained by the build context",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_confined_regular_file(root: &Path, path: &Path) -> Result<(), WorkflowError> {
+    let metadata = fs::symlink_metadata(path).map_err(WorkflowError::IoError)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build input '{}' must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize().map_err(WorkflowError::IoError)?;
+    if !canonical.starts_with(root) {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build input '{}' escapes build context '{}'",
+            canonical.display(),
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_no_follow(path: &Path, contents: &[u8], create_new: bool) -> Result<(), WorkflowError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(WorkflowError::IoError)?;
+    if !file.metadata().map_err(WorkflowError::IoError)?.is_file() {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build output '{}' must be a regular file",
+            path.display()
+        )));
+    }
+    file.write_all(contents).map_err(WorkflowError::IoError)
+}
+
+fn read_confined_control_file(
+    root: &Path,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<String>, WorkflowError> {
+    let canonical_root = root.canonicalize().map_err(WorkflowError::IoError)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(WorkflowError::IoError(error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build control file '{}' must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize().map_err(WorkflowError::IoError)?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build control file '{}' escapes build context '{}'",
+            canonical.display(),
+            canonical_root.display()
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build control file '{}' exceeds the {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    let mut contents = String::new();
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(WorkflowError::IoError)?;
+    if !file.metadata().map_err(WorkflowError::IoError)?.is_file() {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build control file '{}' must remain a regular file",
+            path.display()
+        )));
+    }
+    file.take(max_bytes + 1)
+        .read_to_string(&mut contents)
+        .map_err(WorkflowError::IoError)?;
+    if contents.len() as u64 > max_bytes {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Build control file '{}' exceeds the {max_bytes} byte limit",
+            path.display()
+        )));
+    }
+    Ok(Some(contents))
+}
 
 /// Typed output from DownloadRepoJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,25 +428,30 @@ impl BuildImageJob {
         build_context_dir: &Path,
     ) -> Result<(), WorkflowError> {
         let nixpacks_toml_path = build_context_dir.join("nixpacks.toml");
+        let hidden_nixpacks_toml_path = build_context_dir.join(".nixpacks.toml");
         let package_json_path = build_context_dir.join("package.json");
 
-        // Skip if nixpacks.toml already exists (user provided)
-        if nixpacks_toml_path.exists() {
-            self.log(
-                context,
-                "Custom nixpacks.toml found, skipping framework detection".to_string(),
-            )
-            .await?;
-            return Ok(());
+        // Validate user-provided Nixpacks config before any host-side planner
+        // can follow it, then preserve it unchanged.
+        for config_path in [&nixpacks_toml_path, &hidden_nixpacks_toml_path] {
+            if read_confined_control_file(build_context_dir, config_path, 1024 * 1024)?.is_some() {
+                self.log(
+                    context,
+                    "Custom nixpacks.toml found, skipping framework detection".to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
         }
 
-        // Skip if not a Node.js project
-        if !package_json_path.exists() {
+        let Some(package_json) =
+            read_confined_control_file(build_context_dir, &package_json_path, 5 * 1024 * 1024)?
+        else {
             return Ok(());
-        }
+        };
 
         // Detect framework
-        let framework = temps_presets::detect_node_framework(build_context_dir);
+        let framework = temps_presets::detect_node_framework_from_package_json(&package_json);
 
         self.log(
             context,
@@ -335,7 +461,15 @@ impl BuildImageJob {
 
         // Generate nixpacks.toml if framework has specific configuration
         if let Some(config) = framework.nixpacks_config() {
-            fs::write(&nixpacks_toml_path, config).map_err(WorkflowError::IoError)?;
+            if let Ok(metadata) = fs::symlink_metadata(&nixpacks_toml_path) {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(WorkflowError::JobValidationFailed(format!(
+                        "nixpacks config '{}' must be a regular non-symlink file",
+                        nixpacks_toml_path.display()
+                    )));
+                }
+            }
+            write_no_follow(&nixpacks_toml_path, config.as_bytes(), false)?;
 
             self.log(
                 context,
@@ -358,13 +492,24 @@ impl BuildImageJob {
 
     /// Load and parse .temps.yaml from the build context directory.
     /// Returns None if the file does not exist or cannot be parsed.
-    fn load_temps_config(&self, build_context_dir: &Path) -> Option<TempsConfig> {
+    fn load_temps_config(
+        &self,
+        build_context_dir: &Path,
+    ) -> Result<Option<TempsConfig>, WorkflowError> {
         let config_path = build_context_dir.join(".temps.yaml");
-        if !config_path.exists() {
-            return None;
-        }
-        let contents = fs::read_to_string(&config_path).ok()?;
-        TempsConfig::from_yaml(&contents).ok()
+        let Some(contents) =
+            read_confined_control_file(build_context_dir, &config_path, 1024 * 1024)?
+        else {
+            return Ok(None);
+        };
+        TempsConfig::from_yaml(&contents)
+            .map(Some)
+            .map_err(|error| {
+                WorkflowError::JobValidationFailed(format!(
+                    "Invalid .temps.yaml at '{}': {error}",
+                    config_path.display()
+                ))
+            })
     }
 
     async fn ensure_dockerfile(
@@ -374,7 +519,7 @@ impl BuildImageJob {
         dockerfile_path: &PathBuf,
     ) -> Result<std::collections::HashMap<String, String>, WorkflowError> {
         // If Dockerfile exists, we're done (no preset build args)
-        if dockerfile_path.exists() {
+        if fs::symlink_metadata(dockerfile_path).is_ok() {
             return Ok(std::collections::HashMap::new());
         }
 
@@ -419,11 +564,8 @@ impl BuildImageJob {
 
             // Try to read package.json for more accurate detection
             let package_json_path = build_context_dir.join("package.json");
-            let package_json_content = if package_json_path.exists() {
-                fs::read_to_string(&package_json_path).ok()
-            } else {
-                None
-            };
+            let package_json_content =
+                read_confined_control_file(build_context_dir, &package_json_path, 5 * 1024 * 1024)?;
 
             // Check for Create React App by looking for react-scripts in package.json
             let detected_slug = if let Some(content) = &package_json_content {
@@ -491,7 +633,7 @@ impl BuildImageJob {
         let project_slug = repo_output.repo_name.replace("-", "_").to_lowercase();
 
         // Load .temps.yaml for build overrides (install_command, build_command, output_dir)
-        let temps_config = self.load_temps_config(build_context_dir);
+        let temps_config = self.load_temps_config(build_context_dir)?;
         let build_overrides = temps_config.as_ref().and_then(|c| c.build.as_ref());
 
         let install_cmd_owned = build_overrides.and_then(|b| b.install_command.clone());
@@ -525,8 +667,11 @@ impl BuildImageJob {
             .await;
 
         // Write the Dockerfile
-        fs::write(dockerfile_path, &dockerfile_with_args.content)
-            .map_err(WorkflowError::IoError)?;
+        write_no_follow(
+            dockerfile_path,
+            dockerfile_with_args.content.as_bytes(),
+            true,
+        )?;
 
         self.log(
             context,
@@ -573,7 +718,15 @@ impl BuildImageJob {
         };
 
         let npmrc_path = build_context_dir.join(".npmrc");
-        fs::write(&npmrc_path, &plan.contents).map_err(|e| {
+        if let Ok(metadata) = fs::symlink_metadata(&npmrc_path) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(WorkflowError::JobValidationFailed(format!(
+                    ".npmrc '{}' must be a regular non-symlink file",
+                    npmrc_path.display()
+                )));
+            }
+        }
+        write_no_follow(&npmrc_path, plan.contents.as_bytes(), false).map_err(|e| {
             WorkflowError::JobExecutionFailed(format!(
                 "Failed to write .npmrc to {}: {}",
                 npmrc_path.display(),
@@ -608,17 +761,67 @@ impl BuildImageJob {
 
         // Determine build context first (needed for Dockerfile path)
         let build_context = if let Some(ref context_path) = self.build_config.build_context {
+            let context_path = Path::new(context_path);
+            if context_path.is_absolute()
+                || context_path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(WorkflowError::JobValidationFailed(format!(
+                    "Build context '{}' must be relative and contained by the source root",
+                    context_path.display()
+                )));
+            }
             repo_output.repo_dir.join(context_path)
         } else {
             repo_output.repo_dir.clone()
         };
 
+        let canonical_root = repo_output
+            .repo_dir
+            .canonicalize()
+            .map_err(WorkflowError::IoError)?;
+        let canonical_context = build_context
+            .canonicalize()
+            .map_err(WorkflowError::IoError)?;
+        if !canonical_context.starts_with(&canonical_root) {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Build context '{}' escapes source root '{}'",
+                canonical_context.display(),
+                canonical_root.display()
+            )));
+        }
+
         // Determine dockerfile path relative to build context
-        let dockerfile_path = if let Some(ref dockerfile) = self.build_config.dockerfile_path {
-            build_context.join(dockerfile)
-        } else {
-            build_context.join("Dockerfile")
-        };
+        let dockerfile_relative = self
+            .build_config
+            .dockerfile_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("Dockerfile"));
+        validate_relative_build_path(dockerfile_relative, "Dockerfile path")?;
+        let dockerfile_path = build_context.join(dockerfile_relative);
+        let dockerfile_parent = dockerfile_path.parent().ok_or_else(|| {
+            WorkflowError::JobValidationFailed("Dockerfile path has no parent".to_string())
+        })?;
+        let canonical_parent = dockerfile_parent
+            .canonicalize()
+            .map_err(WorkflowError::IoError)?;
+        if !canonical_parent.starts_with(&canonical_context) {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Dockerfile parent '{}' escapes build context '{}'",
+                canonical_parent.display(),
+                canonical_context.display()
+            )));
+        }
+        if fs::symlink_metadata(&dockerfile_path).is_ok() {
+            validate_confined_regular_file(&canonical_context, &dockerfile_path)?;
+        }
 
         self.log(
             context,
@@ -1024,7 +1227,7 @@ impl WorkflowTask for BuildImageJob {
         // Read .temps.yaml health config and pass it to downstream jobs
         // The DeployImageJob will use this to configure its health check path
         let build_context_dir = &image_output.build_context;
-        if let Some(temps_config) = self.load_temps_config(build_context_dir) {
+        if let Some(temps_config) = self.load_temps_config(build_context_dir)? {
             if let Some(health) = &temps_config.health {
                 context.set_output(&self.job_id, "health_check_path", &health.path)?;
                 context.set_output(&self.job_id, "health_check_timeout", health.timeout)?;
@@ -1492,6 +1695,90 @@ mod tests {
             repo_name: "repo".to_string(),
         };
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn rejects_dockerfile_path_traversal() {
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .dockerfile_path("../Dockerfile".to_string())
+            .build(builder)
+            .unwrap();
+        let (_dir, repo) = repo_with_dockerfile();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_dockerfile_and_npmrc_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside");
+        std::fs::write(&outside_file, "unchanged").unwrap();
+        symlink(&outside_file, dir.path().join("Dockerfile")).unwrap();
+        let repo = RepositoryOutput {
+            repo_dir: dir.path().to_path_buf(),
+            checkout_ref: "main".to_string(),
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+        };
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build(builder.clone())
+            .unwrap();
+        assert!(matches!(
+            job.build_image(&repo, &context).await,
+            Err(WorkflowError::JobValidationFailed(_))
+        ));
+
+        std::fs::remove_file(dir.path().join("Dockerfile")).unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        symlink(&outside_file, dir.path().join(".npmrc")).unwrap();
+        let npm_job = BuildImageJobBuilder::new()
+            .job_id("build".to_string())
+            .download_job_id("download_repo".to_string())
+            .image_tag("myapp:latest".to_string())
+            .build_args(vec![("NPM_TOKEN".to_string(), "secret".to_string())])
+            .build(builder)
+            .unwrap();
+        assert!(matches!(
+            npm_job.build_image(&repo, &context).await,
+            Err(WorkflowError::JobValidationFailed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_build_control_files_before_reading_them() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            "package.json",
+            ".temps.yaml",
+            "nixpacks.toml",
+            ".nixpacks.toml",
+        ] {
+            let path = directory.path().join(name);
+            symlink("/dev/zero", &path).unwrap();
+            assert!(matches!(
+                read_confined_control_file(directory.path(), &path, 1024),
+                Err(WorkflowError::JobValidationFailed(_))
+            ));
+        }
     }
 
     /// Single-platform builds must keep behaving exactly as before: one build,

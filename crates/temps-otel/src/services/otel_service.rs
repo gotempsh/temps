@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 use crate::error::OtelError;
@@ -33,8 +34,26 @@ pub struct OtelService {
     /// over the OTel hypertables on every ingest request. See
     /// [`crate::ingest::quota_cache`].
     quota_cache: Arc<QuotaCache>,
+    ingest_semaphore: Arc<Semaphore>,
+    /// The configured value backing `ingest_semaphore`'s capacity, kept
+    /// alongside it so `IngestSaturated` errors report the limit that is
+    /// actually in effect (which may differ from
+    /// [`DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`] when overridden via
+    /// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`).
+    ingest_permit_limit: usize,
     stats: PipelineStatsAtomic,
 }
+
+/// Default process-wide limit for OTLP requests that may authenticate,
+/// decompress, decode, and write concurrently. The permit is acquired before
+/// Axum buffers the request body, bounding both task and payload memory
+/// during exporter retry storms.
+///
+/// This is a process-wide operational tuning knob, not per-tenant config, so
+/// deployments that need a higher ceiling (larger hardware, many
+/// projects/services sharing one instance) can override it via
+/// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS` — see `OtelConfig::from_env`.
+pub const DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS: usize = 64;
 
 /// Max `si_` ingest requests per service per window. ~10 req/s — far above a
 /// healthy exporter's cadence, low enough to stop a tight-loop flood from
@@ -81,6 +100,7 @@ impl OtelService {
         storage: Arc<dyn OtelStorage>,
         auth_service: Arc<OtelAuthService>,
         rate_limiter: Arc<RateLimiter>,
+        max_concurrent_ingest_requests: usize,
     ) -> Self {
         Self {
             storage,
@@ -91,8 +111,20 @@ impl OtelService {
                 SERVICE_INGEST_WINDOW,
             )),
             quota_cache: Arc::new(QuotaCache::new(QUOTA_CACHE_TTL)),
+            ingest_semaphore: Arc::new(Semaphore::new(max_concurrent_ingest_requests)),
+            ingest_permit_limit: max_concurrent_ingest_requests,
             stats: PipelineStatsAtomic::default(),
         }
+    }
+
+    /// Acquire an ingest slot without queueing more work in memory.
+    pub fn try_acquire_ingest_permit(&self) -> Result<OwnedSemaphorePermit, OtelError> {
+        self.ingest_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OtelError::IngestSaturated {
+                limit: self.ingest_permit_limit,
+            })
     }
 
     /// Authenticate a token (API key `tk_` or deployment token `dt_`).
@@ -457,7 +489,12 @@ mod tests {
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let limiter = Arc::new(RateLimiter::new(1000, Duration::from_secs(60)));
-        let svc = OtelService::new(Arc::new(storage) as Arc<dyn OtelStorage>, auth, limiter);
+        let svc = OtelService::new(
+            Arc::new(storage) as Arc<dyn OtelStorage>,
+            auth,
+            limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
         (svc, storage_clone)
     }
 
@@ -723,7 +760,12 @@ mod tests {
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60))); // only 2 allowed
         let storage = Arc::new(MockOtelStorage::new()) as Arc<dyn OtelStorage>;
-        let svc = OtelService::new(storage, auth, limiter);
+        let svc = OtelService::new(
+            storage,
+            auth,
+            limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
 
         assert!(svc.check_rate_limit(1).is_ok());
         assert!(svc.check_rate_limit(1).is_ok());
@@ -787,7 +829,12 @@ mod tests {
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let project_limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
         let storage = Arc::new(MockOtelStorage::new()) as Arc<dyn OtelStorage>;
-        let svc = OtelService::new(storage, auth, project_limiter);
+        let svc = OtelService::new(
+            storage,
+            auth,
+            project_limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
 
         // Spend many service-ingest tokens for service 1...
         for _ in 0..10 {
@@ -1130,5 +1177,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OtelError::Validation { .. }));
+    }
+
+    #[test]
+    fn ingest_concurrency_is_bounded_and_permits_are_released() {
+        let (service, _storage) = make_service(MockOtelStorage::new());
+        let permits: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS)
+            .map(|_| service.try_acquire_ingest_permit().unwrap())
+            .collect();
+
+        assert!(matches!(
+            service.try_acquire_ingest_permit(),
+            Err(OtelError::IngestSaturated {
+                limit: DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+            })
+        ));
+
+        drop(permits);
+        assert!(service.try_acquire_ingest_permit().is_ok());
     }
 }

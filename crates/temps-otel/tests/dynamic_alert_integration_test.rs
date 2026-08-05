@@ -186,6 +186,7 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         storage.clone(),
         auth_service,
         rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
     ));
     let alert_service = Arc::new(MetricAlertService::new(db.clone()));
 

@@ -80,6 +80,8 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/{id}/jobs",
         // Client-generated preview password (temps extension).
         "/v1/sandboxes/{id}/preview-password",
+        // Expiring preview share links (temps extension).
+        "/v1/sandboxes/{id}/preview-link",
         // Firecracker backend extensions (ADR-029): operations timeline,
         // live disk resize, and host-global rootfs inventory/GC.
         "/v1/sandboxes/{id}/events",

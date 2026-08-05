@@ -19,6 +19,46 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
 // Placeholder functions - these should be implemented properly or imported from other services
 
+/// Whether changing `repo_owner`/`repo_name` would leave `git_url` pointing at
+/// a different repository.
+///
+/// Returns `Some((old, new))` — both as `owner/name` — only when the stored URL
+/// demonstrably identifies the *current* repo and the requested change moves
+/// away from it. A URL that doesn't carry a recognisable `owner/name` tail
+/// (self-hosted layouts, ssh remotes with unusual paths) returns `None`: we
+/// can't prove a desync, so we don't block the operator.
+fn would_desync_git_url(
+    git_url: &Option<String>,
+    current: (&str, &str),
+    requested: (Option<&str>, Option<&str>),
+) -> Option<(String, String)> {
+    let (new_owner, new_name) = (
+        requested.0.unwrap_or(current.0),
+        requested.1.unwrap_or(current.1),
+    );
+    let old_pair = format!("{}/{}", current.0, current.1);
+    let new_pair = format!("{}/{}", new_owner, new_name);
+    if old_pair == new_pair {
+        return None;
+    }
+
+    let url = git_url.as_deref()?;
+    // Compare on the `owner/name` tail, ignoring a `.git` suffix and any
+    // trailing slash, so https/ssh and with/without `.git` all match.
+    let tail = url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit(['/', ':'])
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.len() < 2 {
+        return None;
+    }
+    let url_pair = format!("{}/{}", tail[1], tail[0]);
+
+    (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
+
 fn slugify(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -143,6 +183,35 @@ fn validate_preset_config(
     Ok(config)
 }
 
+fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(".".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':');
+    if has_windows_drive_prefix
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project directory '{directory}' must be a relative path inside the source root"
+        )));
+    }
+    Ok(normalized.trim_start_matches("./").to_string())
+}
+
 /// Resolve an explicit catalog selection for create/update.
 ///
 /// Existing config is retained when it belongs to the same canonical preset.
@@ -230,6 +299,15 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
+        if request.template_slug.as_deref().is_some_and(|slug| {
+            slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+        }) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template slug cannot exceed {} characters",
+                temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+            )));
+        }
+
         // Verify storage service IDs exist if provided
         if !request.storage_service_ids.is_empty() {
             use temps_entities::external_services;
@@ -249,20 +327,7 @@ impl ProjectService {
             }
         }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
         let resolved = resolve_preset_selection(
@@ -314,6 +379,7 @@ impl ProjectService {
             deleted_at: Set(None),
             last_deployment: Set(None),
             source_type: Set(request.source_type),
+            template_slug: Set(request.template_slug),
             ..Default::default()
         };
 
@@ -786,20 +852,7 @@ impl ProjectService {
                 project_id
             )))?;
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
@@ -1241,6 +1294,33 @@ impl ProjectService {
                     "Project {} not found",
                     project_id
                 )))?;
+
+            // `repo_owner`/`repo_name` and `git_url` are read by different
+            // code paths — branch resolution uses the former, the clone uses
+            // the latter — and this endpoint only writes the former. Changing
+            // the repo identity here therefore used to leave a stale clone
+            // URL behind, and the next deploy resolved a commit from one repo
+            // and cloned another:
+            //
+            //   Starting repository download for owner/new-repo
+            //   Checking out ref: <commit that only exists in new-repo>
+            //   Cloning public repository from: .../old-repo.git
+            //
+            // The project could not be recovered through the API. Reject the
+            // change when it would actually desync — the git URL is owned by
+            // `POST /projects/{id}/git`, which validates it.
+            let desync = would_desync_git_url(
+                &project.git_url,
+                (&project.repo_owner, &project.repo_name),
+                (repo_owner.as_deref(), repo_name.as_deref()),
+            );
+            if let Some((old, new)) = desync {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Changing the repository to '{new}' would leave the clone URL pointing at \
+                     '{old}'. Update both together with POST /projects/{project_id}/git, which \
+                     sets git_url alongside the owner and name."
+                )));
+            }
 
             let existing_preset_config = project.preset_config.clone();
             let mut active_project: projects::ActiveModel = project.into();
@@ -2332,14 +2412,42 @@ impl ProjectService {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding(page, per_page, &[])
+            .await
+    }
+
+    /// [`Self::get_projects_paginated`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// `hidden` comes from
+    /// [`ProjectAccessChecker::hidden_project_ids`](temps_core::ProjectAccessChecker::hidden_project_ids)
+    /// and is empty on an instance with no access grants configured, which
+    /// makes this identical to the unfiltered query in that case. The
+    /// exclusion is applied to the **count** as well as the page, so
+    /// pagination doesn't advertise rows the caller can never see.
+    pub async fn get_projects_paginated_excluding(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
         // Calculate offset
         let offset = ((page - 1) * per_page) as u64;
 
+        let filtered = || {
+            let query = projects::Entity::find();
+            if hidden.is_empty() {
+                query
+            } else {
+                query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+            }
+        };
+
         // Get total count
-        let total = projects::Entity::find()
+        let total = filtered()
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2348,7 +2456,7 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = projects::Entity::find()
+        let projects = filtered()
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,
@@ -2378,10 +2486,30 @@ impl ProjectService {
     }
 
     pub async fn get_project_statistics(&self) -> Result<ProjectStatistics, ProjectError> {
+        self.get_project_statistics_excluding(&[]).await
+    }
+
+    /// [`Self::get_project_statistics`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// The count has to honour the same exclusion as the list, or the
+    /// dashboard tells a scoped user how many projects exist on the
+    /// instance while showing them only their own — a smaller leak than
+    /// the names, but the same leak.
+    pub async fn get_project_statistics_excluding(
+        &self,
+        hidden: &[i32],
+    ) -> Result<ProjectStatistics, ProjectError> {
         use sea_orm::PaginatorTrait;
 
-        // Get total count of projects
-        let total_count = projects::Entity::find()
+        let query = projects::Entity::find();
+        let query = if hidden.is_empty() {
+            query
+        } else {
+            query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+        };
+
+        let total_count = query
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2995,6 +3123,74 @@ impl ProjectService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    // ── git_url / repo identity consistency ─────────────────────────────
+
+    /// The failure this guards: the repo identity was changed through
+    /// `/settings`, the clone URL was left behind, and the next deploy
+    /// resolved a commit from the new repo while cloning the old one.
+    #[test]
+    fn test_repo_change_that_strands_git_url_is_detected() {
+        let url = Some("https://github.com/acme/old-repo.git".to_string());
+        let desync = would_desync_git_url(&url, ("acme", "old-repo"), (None, Some("new-repo")));
+
+        let (old, new) = desync.expect("changing the name strands the URL");
+        assert_eq!(old, "acme/old-repo");
+        assert_eq!(new, "acme/new-repo");
+    }
+
+    /// Changing the owner counts too.
+    #[test]
+    fn test_owner_change_is_detected() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (Some("other"), None)).is_some());
+    }
+
+    /// No repo change means nothing to desync, whatever the URL looks like.
+    #[test]
+    fn test_no_repo_change_is_allowed() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (None, None)).is_none());
+        assert!(
+            would_desync_git_url(&url, ("acme", "app"), (Some("acme"), Some("app"))).is_none(),
+            "restating the same values is not a change"
+        );
+    }
+
+    /// A URL that doesn't identify the current repo can't be proven stale, so
+    /// the operator isn't blocked — self-hosted layouts and unusual remotes
+    /// must keep working.
+    #[test]
+    fn test_unrelated_or_unparsable_url_does_not_block() {
+        // Points somewhere that isn't the current repo: not our call to make.
+        let other = Some("https://git.internal/mirrors/vendored.git".to_string());
+        assert!(would_desync_git_url(&other, ("acme", "app"), (None, Some("app2"))).is_none());
+
+        // No URL at all.
+        assert!(would_desync_git_url(&None, ("acme", "app"), (None, Some("app2"))).is_none());
+    }
+
+    /// ssh remotes and missing `.git` must match the same way https does,
+    /// or the guard would fire on projects it shouldn't.
+    #[test]
+    fn test_matching_is_scheme_and_suffix_insensitive() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://github.com/ACME/App.git",
+        ] {
+            assert!(
+                would_desync_git_url(
+                    &Some(url.to_string()),
+                    ("acme", "app"),
+                    (None, Some("app2"))
+                )
+                .is_some(),
+                "should recognise {url} as the current repo"
+            );
+        }
+    }
     use std::sync::Arc;
     use std::sync::Mutex;
     use temps_core::async_trait::async_trait;
@@ -3168,6 +3364,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         let result = project_service
@@ -3302,6 +3499,7 @@ mod tests {
             git_provider_connection_id: None,
             exposed_port: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         project_service
@@ -3352,6 +3550,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         }
     }
 
@@ -3403,6 +3602,59 @@ mod tests {
             .deployment_config
             .expect("default environment should seed deployment_config");
         assert_eq!(env_config.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_persists_curated_template_provenance() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Observability Starter");
+        request.template_slug = Some("observability-starter".to_string());
+
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("template project creation should succeed");
+        let persisted = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .expect("template project query should succeed")
+            .expect("template project should exist");
+
+        assert_eq!(
+            persisted.template_slug.as_deref(),
+            Some("observability-starter")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+        let mut request = create_request("Custom Template");
+        request.template_slug =
+            Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+
+        let error = match project_service.create_project(request).await {
+            Ok(_) => panic!("oversized template slug must be rejected before insertion"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::InvalidInput(message) if message.contains("255")
+        ));
     }
 
     #[tokio::test]
@@ -4511,5 +4763,26 @@ mod tests {
             !matches!(result, Err(ProjectError::NotFound(_))),
             "caller_user_id with no connection_id must not be rejected by the ownership guard"
         );
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }
