@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+
 import {
   Table,
   TableBody,
@@ -33,11 +34,12 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Flag, MoreHorizontal, Plus, RefreshCcw } from 'lucide-react'
+import { Code2, Flag, MoreHorizontal, Plus, RefreshCcw } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { CreateFlagDialog } from './CreateFlagDialog'
 import { FlagDetailSheet } from './FlagDetailSheet'
+import { FlagsSetupGuide } from './FlagsSetupGuide'
 import {
   asFlagValueType,
   environmentOverride,
@@ -56,6 +58,7 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
   const [page, setPage] = useState(1)
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  const [tab, setTab] = useState<'flags' | 'setup'>('flags')
 
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
@@ -119,36 +122,20 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
           </p>
         </div>
 
+        {/* Two actions only. Filtering belongs to the table below, not up
+            here competing with the things that actually create something. */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          {/* Filters first, primary CTA last. */}
+          {/* A flag nobody's app can read is just a row in a table, so the
+              integration guide gets a permanent home in the header rather
+              than living in docs the operator would have to know exist. */}
           <Button
-            variant="ghost"
-            size="sm"
-            className="w-full justify-start sm:w-auto"
-            onClick={() => {
-              setShowArchived((v) => !v)
-              setPage(1)
-            }}
+            variant={tab === 'setup' ? 'secondary' : 'outline'}
+            className="w-full sm:w-auto"
+            onClick={() => setTab(tab === 'setup' ? 'flags' : 'setup')}
           >
-            {showArchived ? 'Hide archived' : 'Show archived'}
+            <Code2 className="mr-1.5 h-4 w-4" />
+            {tab === 'setup' ? 'Back to flags' : 'Setup'}
           </Button>
-
-          <Select
-            value={environmentId ? String(environmentId) : undefined}
-            onValueChange={(next) => setChosenEnvironmentId(Number(next))}
-            disabled={environments.length === 0}
-          >
-            <SelectTrigger className="w-full sm:w-[200px]">
-              <SelectValue placeholder="Environment" />
-            </SelectTrigger>
-            <SelectContent>
-              {environments.map((environment) => (
-                <SelectItem key={environment.id} value={String(environment.id)}>
-                  {environment.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
 
           <Button
             className="w-full sm:w-auto"
@@ -160,101 +147,155 @@ export function ProjectFeatureFlags({ project }: ProjectFeatureFlagsProps) {
         </div>
       </div>
 
-      {isLoading ? (
-        <FlagTableSkeleton />
-      ) : flags.length === 0 ? (
-        <EmptyPlaceholder
-          icon={Flag}
-          title={showArchived ? 'No flags found' : 'No feature flags yet'}
-          description="Create a flag to turn features on and off without shipping a new deployment."
-          action={
-            <Button onClick={() => setCreateOpen(true)}>
-              <Plus className="mr-1.5 h-4 w-4" />
-              New flag
-            </Button>
-          }
+      {tab === 'setup' ? (
+        <FlagsSetupGuide
+          environmentId={environmentId}
+          environmentName={selectedEnvironment?.name}
+          sampleFlagKey={flags[0]?.key}
         />
       ) : (
-        <div className="overflow-x-auto">
-          {/* A min-width plus horizontal scroll, rather than letting the
-              columns compress — the flag key is the one thing that must stay
-              readable, and on a phone it would otherwise crush to "ch…". */}
-          <Table className="min-w-[600px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="min-w-[200px] whitespace-nowrap">
-                  Flag
-                </TableHead>
-                {/* Fixed widths keep the value and its source side by side
-                    instead of drifting to opposite edges on wide screens. */}
-                <TableHead className="w-[220px] whitespace-nowrap">
-                  Value in {selectedEnvironment?.name ?? 'environment'}
-                </TableHead>
-                <TableHead className="hidden w-[140px] whitespace-nowrap sm:table-cell">
-                  Source
-                </TableHead>
-                <TableHead className="w-[60px] text-right">
-                  <span className="sr-only">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {flags.map((flag) => (
-                <FlagRow
-                  key={flag.key}
-                  flag={flag}
-                  environmentId={environmentId}
-                  environmentName={selectedEnvironment?.name}
-                  pending={setEnvironmentValue.isPending}
-                  onOpen={() => setSelectedKey(flag.key)}
-                  onSet={(body) => {
-                    if (environmentId === undefined) return
-                    setEnvironmentValue.mutate({
-                      path: {
-                        project_id: project.id,
-                        key: flag.key,
-                        environment_id: environmentId,
-                      },
-                      body,
-                    })
-                  }}
-                />
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
+        <div className="space-y-4">
+          {/* The environment picker sits on the table because it isn't a page
+              filter — it decides what the "Value in …" column means. Archived
+              is next to it for the same reason: both change what the rows
+              below say. */}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <Select
+              value={environmentId ? String(environmentId) : undefined}
+              onValueChange={(next) => setChosenEnvironmentId(Number(next))}
+              disabled={environments.length === 0}
+            >
+              <SelectTrigger className="w-full sm:w-[200px]">
+                <SelectValue placeholder="Environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environments.map((environment) => (
+                  <SelectItem
+                    key={environment.id}
+                    value={String(environment.id)}
+                  >
+                    {environment.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-      {/* Hidden entirely when everything fits on one page. */}
-      {total > pageSize && (
-        <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-          <p className="text-xs tabular-nums text-muted-foreground">
-            <span className="hidden sm:inline">
-              Showing {(page - 1) * pageSize + 1}–
-              {Math.min(page * pageSize, total)} of {total}
-            </span>
-            <span className="sm:hidden">
-              Page {page} / {totalPages}
-            </span>
-          </p>
-          <div className="flex items-center gap-2">
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
-              disabled={page === 1}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              className="w-full justify-start text-muted-foreground sm:w-auto"
+              onClick={() => {
+                setShowArchived((v) => !v)
+                setPage(1)
+              }}
             >
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={page >= totalPages}
-              onClick={() => setPage((p) => p + 1)}
-            >
-              Next
+              {showArchived ? 'Hide archived' : 'Show archived'}
             </Button>
           </div>
+
+          {isLoading ? (
+            <FlagTableSkeleton />
+          ) : flags.length === 0 ? (
+            <EmptyPlaceholder
+              icon={Flag}
+              title={showArchived ? 'No flags found' : 'No feature flags yet'}
+              description="Create a flag to turn features on and off without shipping a new deployment, then read it from your app in any language."
+              action={
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Button onClick={() => setCreateOpen(true)}>
+                    <Plus className="mr-1.5 h-4 w-4" />
+                    New flag
+                  </Button>
+                  <Button variant="outline" onClick={() => setTab('setup')}>
+                    <Code2 className="mr-1.5 h-4 w-4" />
+                    Integrate your app
+                  </Button>
+                </div>
+              }
+            />
+          ) : (
+            <div className="overflow-x-auto">
+              {/* A min-width plus horizontal scroll, rather than letting the
+              columns compress — the flag key is the one thing that must stay
+              readable, and on a phone it would otherwise crush to "ch…". */}
+              <Table className="min-w-[600px]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="min-w-[200px] whitespace-nowrap">
+                      Flag
+                    </TableHead>
+                    {/* Fixed widths keep the value and its source side by side
+                    instead of drifting to opposite edges on wide screens. */}
+                    <TableHead className="w-[220px] whitespace-nowrap">
+                      Value in {selectedEnvironment?.name ?? 'environment'}
+                    </TableHead>
+                    <TableHead className="hidden w-[140px] whitespace-nowrap sm:table-cell">
+                      Source
+                    </TableHead>
+                    <TableHead className="w-[60px] text-right">
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {flags.map((flag) => (
+                    <FlagRow
+                      key={flag.key}
+                      flag={flag}
+                      environmentId={environmentId}
+                      environmentName={selectedEnvironment?.name}
+                      pending={setEnvironmentValue.isPending}
+                      onOpen={() => setSelectedKey(flag.key)}
+                      onSet={(body) => {
+                        if (environmentId === undefined) return
+                        setEnvironmentValue.mutate({
+                          path: {
+                            project_id: project.id,
+                            key: flag.key,
+                            environment_id: environmentId,
+                          },
+                          body,
+                        })
+                      }}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+
+          {/* Hidden entirely when everything fits on one page. */}
+          {total > pageSize && (
+            <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs tabular-nums text-muted-foreground">
+                <span className="hidden sm:inline">
+                  Showing {(page - 1) * pageSize + 1}–
+                  {Math.min(page * pageSize, total)} of {total}
+                </span>
+                <span className="sm:hidden">
+                  Page {page} / {totalPages}
+                </span>
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page === 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                >
+                  Previous
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page >= totalPages}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
