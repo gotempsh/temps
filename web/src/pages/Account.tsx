@@ -60,16 +60,14 @@ type FormValues = z.infer<typeof formSchema>
 const passwordSchema = z
   .object({
     current_password: z.string().min(1, 'Current password is required'),
-    new_password: z
-      .string()
-      .min(8, 'Password must be at least 8 characters'),
+    new_password: z.string().min(8, 'Password must be at least 8 characters'),
     confirm_password: z.string().min(1, 'Please confirm your new password'),
     mfa_code: z
       .string()
       .optional()
       .refine(
         (v) => !v || /^\d{6}$/.test(v) || v.length >= 8,
-        'Enter a 6-digit TOTP code or a recovery code',
+        'Enter a 6-digit TOTP code or a recovery code'
       ),
     revoke_other_sessions: z.boolean(),
   })
@@ -150,16 +148,18 @@ export function Account() {
     },
   })
 
-  const { mutate: changePassword, isPending: isChangingPassword } = useMutation({
-    ...changePasswordSelfMutation(),
-    meta: {
-      errorTitle: 'Failed to change password',
-    },
-    onSuccess: () => {
-      toast.success('Password changed successfully')
-      passwordForm.reset()
-    },
-  })
+  const { mutate: changePassword, isPending: isChangingPassword } = useMutation(
+    {
+      ...changePasswordSelfMutation(),
+      meta: {
+        errorTitle: 'Failed to change password',
+      },
+      onSuccess: () => {
+        toast.success('Password changed successfully')
+        passwordForm.reset()
+      },
+    }
+  )
 
   const mfaForm = useForm<MfaVerifyValues>({
     resolver: zodResolver(mfaVerifySchema),
@@ -300,7 +300,9 @@ export function Account() {
                 <div className="space-y-2">
                   <FormLabel>Role</FormLabel>
                   <div className="flex items-center gap-2">
-                    <Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>
+                    <Badge
+                      variant={user.role === 'admin' ? 'default' : 'secondary'}
+                    >
                       {user.role}
                     </Badge>
                     <span className="text-xs text-muted-foreground">
@@ -511,6 +513,25 @@ export function Account() {
                 {mfaSetupData?.secret_key}
               </code>
             </div>
+            {mfaSetupData?.recovery_codes?.length ? (
+              <div className="space-y-2 text-sm">
+                <div className="font-medium">Recovery codes</div>
+                <p className="text-muted-foreground">
+                  Save these somewhere secure before enabling MFA. Each code can
+                  be used once.
+                </p>
+                <div className="grid grid-cols-2 gap-2 rounded-md bg-muted p-3 font-mono">
+                  {mfaSetupData.recovery_codes.map((code) => (
+                    <code key={code}>{code}</code>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-destructive">
+                Recovery codes could not be prepared. Close this dialog and
+                restart MFA setup.
+              </p>
+            )}
             <Form {...mfaForm}>
               <form
                 onSubmit={mfaForm.handleSubmit(onVerifyMfa)}
@@ -530,7 +551,12 @@ export function Account() {
                   )}
                 />
                 <div className="flex justify-end">
-                  <Button type="submit" disabled={isVerifyingMfa}>
+                  <Button
+                    type="submit"
+                    disabled={
+                      isVerifyingMfa || !mfaSetupData?.recovery_codes?.length
+                    }
+                  >
                     {isVerifyingMfa && (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     )}

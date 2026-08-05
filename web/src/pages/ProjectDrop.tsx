@@ -3,11 +3,14 @@ import {
   deployFromUploadedSource,
   getEnvironments,
   inspectDropArchive,
+  uploadStaticBundle,
   updateProjectSettings,
   type DropInspectionResponse,
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
+import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
+import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { DropZone } from '@/components/drop/DropZone'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -20,21 +23,26 @@ import {
 } from '@/components/ui/select'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  formatDetectedProjectLabel,
   htmlRootCandidates,
   isDropArchive,
-  prepareDrop,
   type DropFile,
 } from '@/lib/drop-archive'
 import { dropErrorMessage } from '@/lib/drop-files'
+import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
 import { cn } from '@/lib/utils'
-import { Loader2, UploadCloud } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import { Loader2, UploadCloud, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
-type Stage = 'idle' | 'packing' | 'detecting' | 'saving' | 'uploading' | 'deploying'
+type Stage =
+  'idle' | 'packing' | 'detecting' | 'saving' | 'uploading' | 'deploying'
 
-function stageLabel(stage: Stage, detected: boolean): string {
+function stageLabel(
+  stage: Stage,
+  detectedLabel?: string,
+  hasFiles = false
+): string {
   switch (stage) {
     case 'packing':
       return 'Packing files locally'
@@ -47,7 +55,8 @@ function stageLabel(stage: Stage, detected: boolean): string {
     case 'deploying':
       return 'Starting deployment'
     default:
-      return detected ? 'Deploy' : 'Detect preset'
+      if (detectedLabel) return `Deploy ${detectedLabel}`
+      return hasFiles ? 'Retry preset detection' : 'Select project files'
   }
 }
 
@@ -70,6 +79,7 @@ function stageLabel(stage: Stage, detected: boolean): string {
  */
 export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const navigate = useNavigate()
+  const reduceMotion = useReducedMotion()
   const [files, setFiles] = useState<DropFile[]>([])
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<Stage>('idle')
@@ -81,6 +91,8 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const [candidateIndex, setCandidateIndex] = useState('0')
   const [environments, setEnvironments] = useState<EnvironmentResponse[]>([])
   const [environmentId, setEnvironmentId] = useState('')
+  const detectionRunRef = useRef(0)
+  const detectionAbortRef = useRef<AbortController | null>(null)
 
   usePageTitle(`Upload source · ${project.name}`)
 
@@ -89,6 +101,9 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const hasRootIndex = htmlPages.some((p) => p.toLowerCase() === 'index.html')
   const isArchive = files.length === 1 && isDropArchive(files[0].file.name)
   const candidate = inspection?.candidates[Number(candidateIndex)]
+  const transition = reduceMotion
+    ? { duration: 0 }
+    : { duration: 0.32, ease: [0.22, 1, 0.36, 1] as const }
 
   // Environments are needed before the first deploy; production is the sane
   // default so the common case is zero clicks.
@@ -113,19 +128,71 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     }
   }, [project.id])
 
-  // Once detection returns, prefer the candidate matching the project's current
-  // build directory — a repeat upload of the same app should not silently
-  // switch which directory gets built.
-  useEffect(() => {
-    if (!inspection) return
-    const current = (project.directory || '.').replace(/^\.\/+/, '') || '.'
-    const match = inspection.candidates.findIndex(
-      (c) => (c.directory || '.') === current
-    )
-    setCandidateIndex(String(match >= 0 ? match : 0))
-  }, [inspection, project.directory])
+  useEffect(
+    () => () => {
+      detectionAbortRef.current?.abort()
+    },
+    []
+  )
+
+  const inspectArchive = async (archive: File, signal?: AbortSignal) => {
+    const response = await inspectDropArchive({
+      throwOnError: true,
+      body: { file: archive },
+      signal,
+    })
+    return response.data
+  }
+
+  async function detectSelection(
+    nextFiles: DropFile[],
+    nextRootPage: string,
+    runId: number
+  ) {
+    detectionAbortRef.current?.abort()
+    const controller = new AbortController()
+    detectionAbortRef.current = controller
+    try {
+      setStage('packing')
+      const result = await prepareAndInspectDrop(
+        nextFiles,
+        nextRootPage || undefined,
+        (archive) => inspectArchive(archive, controller.signal),
+        {
+          signal: controller.signal,
+          onArchivePrepared: (archive) => {
+            if (detectionRunRef.current !== runId) return
+            setPreparedArchive(archive)
+            setStage('detecting')
+          },
+        }
+      )
+      if (detectionRunRef.current !== runId) return
+      setPreparedArchive(result.archive)
+      setInspection(result.inspection)
+      const current = (project.directory || '.').replace(/^\.\/+/, '') || '.'
+      const match = result.inspection.candidates.findIndex(
+        (candidate) => (candidate.directory || '.') === current
+      )
+      setCandidateIndex(String(match >= 0 ? match : 0))
+      setStage('idle')
+    } catch (caught) {
+      if (detectionRunRef.current !== runId) return
+      setError(dropErrorMessage(caught))
+      setPreparedArchive(null)
+      setInspection(null)
+      setStage('idle')
+    } finally {
+      if (detectionAbortRef.current === controller) {
+        detectionAbortRef.current = null
+      }
+    }
+  }
 
   const select = (next: DropFile[]) => {
+    const runId = ++detectionRunRef.current
+    detectionAbortRef.current?.abort()
+    detectionAbortRef.current = null
     setFiles(next)
     setError(null)
     setPreparedArchive(null)
@@ -134,37 +201,33 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     setStage('idle')
     const candidates = htmlRootCandidates(next)
     const hasIndex = candidates.some((p) => p.toLowerCase() === 'index.html')
-    setRootPage(hasIndex ? '' : candidates[0] || '')
+    const nextRootPage = hasIndex ? '' : candidates[0] || ''
+    setRootPage(nextRootPage)
+    if (next.length > 0) {
+      void detectSelection(next, nextRootPage, runId)
+    }
   }
 
   const run = async () => {
     if (files.length === 0 || isBusy || !environmentId) return
     setError(null)
     try {
-      // First press packs + detects and stops, so the user can confirm the
-      // detected directory before anything is written.
       if (!preparedArchive || !inspection) {
-        setStage('packing')
-        const prepared = await prepareDrop(files, rootPage || undefined)
-        setPreparedArchive(prepared.file)
-
-        setStage('detecting')
-        const response = await inspectDropArchive({
-          throwOnError: true,
-          body: { file: prepared.file },
-        })
-        if (!response.data) throw new Error('Preset detection returned no result')
-        setInspection(response.data)
-        setStage('idle')
+        const runId = ++detectionRunRef.current
+        await detectSelection(files, rootPage, runId)
         return
       }
 
       if (!candidate) throw new Error('Choose a detected project')
 
       // Only persist directory/preset, and only when they actually changed.
-      const currentDirectory = (project.directory || '.').replace(/^\.\/+/, '') || '.'
+      const currentDirectory =
+        (project.directory || '.').replace(/^\.\/+/, '') || '.'
       const nextDirectory = candidate.directory || '.'
-      if (nextDirectory !== currentDirectory || candidate.preset !== project.preset) {
+      if (
+        nextDirectory !== currentDirectory ||
+        candidate.preset !== project.preset
+      ) {
         setStage('saving')
         await updateProjectSettings({
           throwOnError: true,
@@ -177,21 +240,13 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
 
       if (candidate.isStatic) {
         setStage('uploading')
-        const body = new FormData()
-        body.append('file', preparedArchive)
-        const uploadResponse = await fetch(
-          `/api/projects/${project.id}/upload/static`,
-          { method: 'POST', credentials: 'include', body }
-        )
-        if (!uploadResponse.ok) {
-          const problem = (await uploadResponse.json().catch(() => null)) as {
-            detail?: string
-          } | null
-          throw new Error(
-            problem?.detail || `Upload failed (${uploadResponse.status})`
-          )
-        }
-        const bundle = (await uploadResponse.json()) as { id: number }
+        const uploadResponse = await uploadStaticBundle({
+          throwOnError: true,
+          path: { project_id: project.id },
+          body: { file: preparedArchive },
+        })
+        const bundle = uploadResponse.data
+        if (!bundle) throw new Error('Static upload returned no bundle')
 
         setStage('deploying')
         await deployFromStatic({
@@ -236,144 +291,179 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
         </p>
       </header>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.6fr)_minmax(20rem,0.8fr)]">
-        <DropZone
-          files={files}
-          onSelect={select}
-          onError={setError}
-          disabled={isBusy}
-        />
-
-        <aside className="flex flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7">
-          <div className="flex items-center justify-between border-b pb-5">
-            <div>
-              <p className="font-mono text-[0.68rem] uppercase tracking-[0.24em] text-muted-foreground">
-                Deployment card
-              </p>
-              <h2 className="mt-1 text-xl font-semibold">Configure upload</h2>
-            </div>
-            <div
-              className={cn(
-                'size-2.5 rounded-full',
-                files.length ? 'bg-emerald-500' : 'bg-muted-foreground/30'
-              )}
-            />
-          </div>
-
-          <div className="flex-1 space-y-6 py-6">
-            <div className="space-y-2">
-              <Label>Environment</Label>
-              <Select
-                value={environmentId}
-                onValueChange={setEnvironmentId}
+      <div className="grid gap-6">
+        <AnimatePresence mode="wait" initial={false}>
+          {files.length === 0 ? (
+            <motion.div
+              key="drop-target"
+              initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
+              transition={transition}
+            >
+              <DropZone
+                files={files}
+                onSelect={select}
+                onError={setError}
                 disabled={isBusy}
+              />
+            </motion.div>
+          ) : (
+            <motion.aside
+              key="configuration"
+              initial={{ opacity: 0, x: reduceMotion ? 0 : 18 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: reduceMotion ? 0 : -12 }}
+              transition={transition}
+              className="relative flex min-h-[28rem] flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7"
+            >
+              <button
+                type="button"
+                className="absolute right-5 top-5 z-10 rounded-full border bg-background p-2 text-muted-foreground transition-colors hover:text-foreground"
+                onClick={() => select([])}
+                disabled={['saving', 'uploading', 'deploying'].includes(stage)}
+                aria-label="Clear selected files"
               >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select environment..." />
-                </SelectTrigger>
-                <SelectContent>
-                  {environments.map((env) => (
-                    <SelectItem key={env.id} value={String(env.id)}>
-                      {env.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+                <X className="size-4" />
+              </button>
+              <div className="flex items-center justify-between border-b pb-5">
+                <div>
+                  <p className="font-mono text-[0.68rem] uppercase tracking-[0.24em] text-muted-foreground">
+                    Deployment card
+                  </p>
+                  <h2 className="mt-1 text-xl font-semibold">
+                    Configure upload
+                  </h2>
+                </div>
+                <div
+                  className={cn(
+                    'mr-12 size-2.5 rounded-full',
+                    files.length ? 'bg-emerald-500' : 'bg-muted-foreground/30'
+                  )}
+                />
+              </div>
 
-            {!isArchive && !hasRootIndex && htmlPages.length > 0 && (
-              <div className="space-y-2">
-                <Label>Root page</Label>
-                <Select
-                  value={rootPage}
-                  onValueChange={setRootPage}
-                  disabled={isBusy}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose the landing page" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {htmlPages.map((page) => (
-                      <SelectItem key={page} value={page}>
-                        {page}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
+              <div className="flex-1 space-y-6 py-6">
+                <div className="space-y-2">
+                  <Label>Environment</Label>
+                  <Select
+                    value={environmentId}
+                    onValueChange={setEnvironmentId}
+                    disabled={isBusy}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select environment..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {environments.map((env) => (
+                        <SelectItem key={env.id} value={String(env.id)}>
+                          {env.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
 
-            {inspection && (
-              <div className="space-y-2">
-                <Label>Detected project</Label>
-                <Select
-                  value={candidateIndex}
-                  onValueChange={setCandidateIndex}
-                  disabled={isBusy}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose a project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {inspection.candidates.map((item, index) => (
-                      <SelectItem
-                        key={`${item.directory}:${item.preset}`}
-                        value={String(index)}
-                      >
-                        {formatDetectedProjectLabel(item.label, item.directory)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  {candidate?.reason}
-                </p>
-              </div>
-            )}
+                {!isArchive && !hasRootIndex && htmlPages.length > 0 && (
+                  <div className="space-y-2">
+                    <Label>Root page</Label>
+                    <Select
+                      value={rootPage}
+                      onValueChange={(value) => {
+                        const runId = ++detectionRunRef.current
+                        setRootPage(value)
+                        setPreparedArchive(null)
+                        setInspection(null)
+                        setError(null)
+                        void detectSelection(files, value, runId)
+                      }}
+                      disabled={isBusy}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Choose the landing page" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {htmlPages.map((page) => (
+                          <SelectItem key={page} value={page}>
+                            {page}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
 
-            <div className="rounded-xl border bg-muted/35 p-4 text-sm">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Build directory</span>
-                <span className="font-medium">
-                  {candidate ? candidate.directory || '.' : project.directory || '.'}
-                </span>
-              </div>
-              <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Preset</span>
-                <span className="font-medium">
-                  {candidate ? candidate.label : 'Pending detection'}
-                </span>
-              </div>
-              <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Upload limit</span>
-                <span className="font-medium">500 MB ZIP / 100 MB folder</span>
-              </div>
-            </div>
+                {inspection && inspection.candidates.length > 1 && (
+                  <div className="space-y-2">
+                    <Label>Detected projects</Label>
+                    <DetectedPresetGrid
+                      candidates={inspection.candidates}
+                      selectedIndex={Number(candidateIndex)}
+                      onSelect={(index) => setCandidateIndex(String(index))}
+                      disabled={isBusy}
+                    />
+                  </div>
+                )}
 
-            {error && (
-              <div
-                role="alert"
-                className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                {(!inspection || inspection.candidates.length === 1) && (
+                  <DetectedPresetCard
+                    candidate={candidate}
+                    isDetecting={stage === 'packing' || stage === 'detecting'}
+                    phase={stage === 'packing' ? 'packing' : 'detecting'}
+                  />
+                )}
+
+                <div className="rounded-xl border bg-muted/35 p-4 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">
+                      Build directory
+                    </span>
+                    <span className="font-medium">
+                      {candidate
+                        ? candidate.directory || '.'
+                        : project.directory || '.'}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Preset</span>
+                    <span className="font-medium">
+                      {candidate ? candidate.label : 'Pending detection'}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Upload limit</span>
+                    <span className="font-medium">
+                      500 MB ZIP / 100 MB folder
+                    </span>
+                  </div>
+                </div>
+
+                {error && (
+                  <div
+                    role="alert"
+                    className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                  >
+                    {error}
+                  </div>
+                )}
+              </div>
+
+              <Button
+                size="lg"
+                className="h-12 w-full"
+                disabled={files.length === 0 || isBusy || !environmentId}
+                onClick={run}
               >
-                {error}
-              </div>
-            )}
-          </div>
-
-          <Button
-            size="lg"
-            className="h-12 w-full"
-            disabled={files.length === 0 || isBusy || !environmentId}
-            onClick={run}
-          >
-            {isBusy ? (
-              <Loader2 className="mr-2 size-4 animate-spin" />
-            ) : (
-              <UploadCloud className="mr-2 size-4" />
-            )}
-            {stageLabel(stage, Boolean(inspection))}
-          </Button>
-        </aside>
+                {isBusy ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <UploadCloud className="mr-2 size-4" />
+                )}
+                {stageLabel(stage, candidate?.label, files.length > 0)}
+              </Button>
+            </motion.aside>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   )

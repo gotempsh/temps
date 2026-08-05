@@ -1763,6 +1763,7 @@ pub async fn deploy_from_image_upload(
     post,
     tag = "Static Bundles",
     path = "/projects/{project_id}/upload/static",
+    request_body(content = SourceArchiveUpload, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Bundle uploaded successfully", body = StaticBundleResponse),
         (status = 400, description = "Invalid request or unsupported format"),

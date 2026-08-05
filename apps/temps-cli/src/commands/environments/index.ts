@@ -15,6 +15,7 @@ import {
   deleteEnvironmentVariable,
   updateEnvironmentVariable,
   updateEnvironmentSettings,
+  getEnvironmentVariableValue,
   getProjectBySlug,
   getEnvironmentCrons,
   getCronById,
@@ -91,7 +92,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
-    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — a secret cannot later be made non-secret')
+    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -414,8 +415,16 @@ async function listEnvVars(
     { header: 'Key', key: 'key', color: (v) => colors.bold(v) },
     {
       header: 'Value',
-      accessor: (v) => options.showValues ? v.value : '••••••••',
-      color: (v) => options.showValues ? colors.primary(v) : colors.muted(v),
+      // Secrets come back with no value at all — the API never returns their
+      // plaintext — so --show-values must say so rather than print an empty cell.
+      accessor: (v) =>
+        v.is_secret ? '(secret)' : options.showValues ? (v.value ?? '') : '••••••••',
+      color: (v) =>
+        v === '(secret)'
+          ? colors.warning(v)
+          : options.showValues
+            ? colors.primary(v)
+            : colors.muted(v),
     },
     {
       header: 'Environments',
@@ -436,6 +445,16 @@ async function listEnvVars(
     info(`Use ${colors.bold('--show-values')} to reveal actual values`)
   }
   newline()
+}
+
+/**
+ * Render an env var's value for display. Secrets carry no value at all — the
+ * API never returns their plaintext — so they must read as deliberately
+ * withheld rather than as an empty variable.
+ */
+function formatEnvVarValue(v: EnvironmentVariableResponse): string {
+  if (v.is_secret) return colors.warning('(secret - write-only, never returned by the API)')
+  return v.value ?? ''
 }
 
 async function getEnvVar(
@@ -501,7 +520,7 @@ async function getEnvVar(
 
     newline()
     keyValue('Key', envVar.key)
-    keyValue('Value', envVar.value)
+    keyValue('Value', formatEnvVarValue(envVar))
     keyValue('Environment', targetEnv.name)
     keyValue('Include in Preview', envVar.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -514,7 +533,7 @@ async function getEnvVar(
 
   for (const v of matchingVars) {
     keyValue('ID', String(v.id))
-    keyValue('Value', v.value)
+    keyValue('Value', formatEnvVarValue(v))
     keyValue('Environments', v.environments.map(e => e.name).join(', ') || 'None')
     keyValue('Include in Preview', v.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -893,6 +912,44 @@ async function importEnvVars(
   }
 }
 
+/**
+ * Resolve real plaintext values for a set of variables.
+ *
+ * The list endpoint deliberately masks every value as `***` so a bulk read can
+ * never become a credential dump — plaintext is only available one key at a
+ * time through the audited reveal endpoint. Anything that writes a .env file
+ * has to go through here, or it writes `KEY=***` over the user's real config.
+ *
+ * Secrets are skipped by the caller (they have no readable value at all).
+ * A failed reveal is reported, never silently substituted.
+ */
+async function resolveEnvVarValues(
+  projectId: number,
+  vars: EnvironmentVariableResponse[],
+  environmentId?: number
+): Promise<{ resolved: Map<number, string>; failed: string[] }> {
+  // Keyed by row id, not key: the same name can exist as separate rows in
+  // separate environments, and keying by name would print one row's value
+  // under the other's line.
+  const resolved = new Map<number, string>()
+  const failed: string[] = []
+
+  for (const v of vars) {
+    const result = await getEnvironmentVariableValue({
+      client,
+      path: { project_id: projectId, key: v.key },
+      query: { environment_id: environmentId, var_id: v.id },
+    })
+    if (result.error || !result.data) {
+      failed.push(v.key)
+      continue
+    }
+    resolved.set(v.id, result.data.value)
+  }
+
+  return { resolved, failed }
+}
+
 async function exportEnvVars(
   project: string,
   options: { environment?: string; output?: string }
@@ -900,7 +957,7 @@ async function exportEnvVars(
   await requireAuth()
   await setupClient()
 
-  const [vars, environments] = await withSpinner('Fetching environment variables...', async () => {
+  const [projectId, vars, environments] = await withSpinner('Fetching environment variables...', async () => {
     const projectId = await getProjectId(project)
 
     const [varsResult, envsResult] = await Promise.all([
@@ -917,7 +974,7 @@ async function exportEnvVars(
     if (varsResult.error) throw new Error(getErrorMessage(varsResult.error))
     if (envsResult.error) throw new Error(getErrorMessage(envsResult.error))
 
-    return [varsResult.data ?? [], envsResult.data ?? []] as const
+    return [projectId, varsResult.data ?? [], envsResult.data ?? []] as const
   })
 
   let filteredVars = vars
@@ -942,14 +999,52 @@ async function exportEnvVars(
     return
   }
 
+  // Write-only secrets have no readable value at all. Drop them, but say so
+  // explicitly rather than emitting an empty assignment that would blank the
+  // variable wherever this file gets loaded.
+  const secretVars = filteredVars.filter(v => v.is_secret)
+  const exportableVars = filteredVars.filter(v => !v.is_secret)
+
+  if (secretVars.length > 0) {
+    warning(
+      `Skipping ${secretVars.length} write-only secret(s): ${secretVars.map(v => v.key).join(', ')}. ` +
+        'Their values are never returned by the API — set them by hand where you need them.'
+    )
+  }
+
+  const targetEnvId = options.environment
+    ? environments.find(
+        e => e.name.toLowerCase() === options.environment!.toLowerCase() ||
+             e.slug === options.environment!.toLowerCase()
+      )?.id
+    : undefined
+
+  const { resolved, failed } = await withSpinner(
+    'Resolving values...',
+    () => resolveEnvVarValues(projectId, exportableVars, targetEnvId)
+  )
+
+  if (failed.length > 0) {
+    errorOutput(
+      `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
+        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'a partial export would silently blank these variables.'
+    )
+    // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
+    // or missing file believing the export succeeded.
+    process.exitCode = 1
+    return
+  }
+
   // Generate .env content
-  const envContent = filteredVars
+  const envContent = exportableVars
     .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
+      const value = resolved.get(v.id) ?? ''
+      const escapedValue = value.includes('\n') || value.includes('"')
+        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+        : value.includes(' ') || value.includes('#')
+          ? `"${value}"`
+          : value
       return `${v.key}=${escapedValue}`
     })
     .join('\n')
@@ -959,7 +1054,7 @@ async function exportEnvVars(
       ? options.output
       : path.resolve(process.cwd(), options.output)
     fs.writeFileSync(outputPath, envContent + '\n')
-    success(`Exported ${filteredVars.length} variables to ${options.output}`)
+    success(`Exported ${exportableVars.length} variables to ${options.output}`)
   } else {
     // Output to stdout
     console.log(envContent)

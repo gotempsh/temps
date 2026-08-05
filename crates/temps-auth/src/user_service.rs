@@ -8,13 +8,60 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::types::RoleType;
 use thiserror::Error;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{debug, error, info, warn};
+
+const MAX_USER_EMAIL_BYTES: usize = 254;
+const MAX_USER_NAME_CHARS: usize = 100;
+const MAX_CONCURRENT_MFA_SETUPS: usize = 2;
+
+pub(crate) fn normalize_user_email(email: &str) -> Option<String> {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > MAX_USER_EMAIL_BYTES
+        || normalized.chars().any(char::is_whitespace)
+        || normalized.chars().any(char::is_control)
+    {
+        return None;
+    }
+
+    let (local, domain) = normalized.split_once('@')?;
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.is_empty()
+        || domain.contains('@')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+    {
+        return None;
+    }
+
+    let labels: Vec<_> = domain.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+    {
+        return None;
+    }
+
+    Some(normalized)
+}
 
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
@@ -39,6 +86,9 @@ pub enum UserServiceError {
 
     #[error("MFA not set up for user {0}")]
     MfaNotSetup(i32),
+
+    #[error("MFA is already enabled for user {0}")]
+    MfaAlreadyEnabled(i32),
 
     #[error("User {0} is already deleted")]
     AlreadyDeleted(i32),
@@ -89,6 +139,78 @@ pub struct MfaSetupData {
     pub recovery_codes: Vec<String>,
 }
 
+struct MfaSetupCandidate {
+    secret_key: String,
+    qr_code: String,
+    recovery_codes: Vec<String>,
+    hashed_recovery_codes: Vec<String>,
+}
+
+fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserServiceError> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::Argon2;
+
+    let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
+    let secret_key = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
+    let recovery_codes: Vec<String> = (0..8)
+        .map(|_| {
+            (0..6)
+                .map(|_| rand::rng().random_range(0..10).to_string())
+                .collect()
+        })
+        .collect();
+
+    let argon2 = Argon2::default();
+    let hashed_recovery_codes = recovery_codes
+        .iter()
+        .map(|code| {
+            let salt = SaltString::generate(&mut OsRng);
+            argon2
+                .hash_password(code.as_bytes(), &salt)
+                .map(|hash| hash.to_string())
+                .map_err(|error| {
+                    UserServiceError::Mfa(format!("Failed to hash MFA recovery code: {}", error))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        Secret::Raw(secret).to_bytes().map_err(|error| {
+            UserServiceError::Mfa(format!("Failed to create TOTP secret: {}", error))
+        })?,
+    )
+    .map_err(|error| UserServiceError::Mfa(format!("Failed to create TOTP: {}", error)))?;
+
+    let otp_auth_url = format!(
+        "otpauth://totp/Temps:{}?secret={}&issuer=Temps&algorithm=SHA1&digits=6&period=30",
+        email, secret_key
+    );
+    let qr = QrCode::new(otp_auth_url)
+        .map_err(|error| UserServiceError::Mfa(format!("Failed to generate QR code: {}", error)))?;
+    let qr_image = qr.render::<image::Luma<u8>>().quiet_zone(false).build();
+    let mut bytes = Vec::new();
+    qr_image
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .map_err(|error| {
+            UserServiceError::Mfa(format!("Failed to encode MFA QR code: {}", error))
+        })?;
+    let qr_code = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+
+    Ok(MfaSetupCandidate {
+        secret_key,
+        qr_code,
+        recovery_codes,
+        hashed_recovery_codes,
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServiceUser {
     pub id: i32,
@@ -97,6 +219,7 @@ pub struct ServiceUser {
     pub image: String,
     pub mfa_enabled: bool,
     pub email_verified: bool,
+    pub must_change_password: bool,
     pub deleted_at: Option<UtcDateTime>,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
@@ -125,6 +248,7 @@ impl From<temps_entities::users::Model> for ServiceUser {
             image: generate_avatar_data_url(&db_user.name),
             mfa_enabled: db_user.mfa_enabled,
             email_verified: db_user.email_verified,
+            must_change_password: db_user.must_change_password,
             deleted_at: db_user.deleted_at,
             created_at: db_user.created_at,
             updated_at: db_user.updated_at,
@@ -145,11 +269,64 @@ impl From<temps_entities::roles::Model> for ServiceRole {
 
 pub struct UserService {
     db: Arc<DatabaseConnection>,
+    mfa_setup_global: Arc<Semaphore>,
+    mfa_setup_users: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+}
+
+struct MfaSetupPermit {
+    _user: OwnedMutexGuard<()>,
+    _global: OwnedSemaphorePermit,
+}
+
+async fn run_mfa_setup_blocking<T, F>(
+    permit: MfaSetupPermit,
+    work: F,
+) -> Result<(MfaSetupPermit, T), UserServiceError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, UserServiceError> + Send + 'static,
+{
+    let (permit, result) = tokio::task::spawn_blocking(move || (permit, work()))
+        .await
+        .map_err(|error| {
+            UserServiceError::Internal(format!("MFA setup worker failed: {}", error))
+        })?;
+    Ok((permit, result?))
 }
 
 impl UserService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            mfa_setup_global: Arc::new(Semaphore::new(MAX_CONCURRENT_MFA_SETUPS)),
+            mfa_setup_users: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn acquire_mfa_setup_permit(
+        &self,
+        user_id: i32,
+    ) -> Result<MfaSetupPermit, UserServiceError> {
+        let user_lock = {
+            let mut users = self.mfa_setup_users.lock().await;
+            users
+                .entry(user_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let user = user_lock.lock_owned().await;
+        let global = self
+            .mfa_setup_global
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                UserServiceError::Internal("MFA setup concurrency limiter closed".to_string())
+            })?;
+        Ok(MfaSetupPermit {
+            _user: user,
+            _global: global,
+        })
     }
 
     pub async fn initialize_roles(&self) -> Result<(), UserServiceError> {
@@ -391,8 +568,43 @@ impl UserService {
         email: String,
         password: Option<String>,
         roles: Vec<RoleType>,
-    ) -> anyhow::Result<UserWithRoles, UserServiceError> {
+        must_change_password: bool,
+    ) -> Result<UserWithRoles, UserServiceError> {
         let now = Utc::now();
+
+        let username = username.trim().to_string();
+        let username_chars = username.chars().count();
+        if !(1..=MAX_USER_NAME_CHARS).contains(&username_chars)
+            || username.chars().any(char::is_control)
+        {
+            return Err(UserServiceError::Validation(format!(
+                "Name must contain between 1 and {MAX_USER_NAME_CHARS} characters"
+            )));
+        }
+
+        let email = normalize_user_email(&email).ok_or_else(|| {
+            UserServiceError::Validation("A valid email address is required".to_string())
+        })?;
+
+        if roles.is_empty() {
+            return Err(UserServiceError::Validation(
+                "At least one valid role is required".to_string(),
+            ));
+        }
+
+        let mut role_names = std::collections::HashSet::new();
+        if roles.iter().any(|role| !role_names.insert(role.as_str())) {
+            return Err(UserServiceError::Validation(
+                "Duplicate roles are not allowed".to_string(),
+            ));
+        }
+
+        if must_change_password && password.is_none() {
+            return Err(UserServiceError::Validation(
+                "A temporary password is required when first-login password change is enabled"
+                    .to_string(),
+            ));
+        }
 
         // Hash password if provided using Argon2 (same as auth_service for consistency)
         let password_hash = if let Some(pwd) = password {
@@ -423,7 +635,38 @@ impl UserService {
             None
         };
 
-        // Create the user
+        let transaction = self.db.begin().await?;
+
+        // Resolve every role before writing the user. This both produces a
+        // precise error and prevents a missing role from creating an account
+        // that cannot be administered as intended.
+        let mut resolved_roles = Vec::with_capacity(roles.len());
+        for role_type in roles {
+            let role = temps_entities::roles::Entity::find()
+                .filter(temps_entities::roles::Column::Name.eq(role_type.as_str()))
+                .one(&transaction)
+                .await?
+                .ok_or_else(|| {
+                    UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
+                });
+
+            match role {
+                Ok(role) => resolved_roles.push(role),
+                Err(error) => {
+                    transaction.rollback().await.map_err(|rollback_error| {
+                        UserServiceError::Database {
+                            reason: format!(
+                                "failed to roll back user creation after {error}: {rollback_error}"
+                            ),
+                        }
+                    })?;
+                    return Err(error);
+                }
+            }
+        }
+
+        // Create the user and all role assignments atomically. If any write
+        // fails, dropping the uncommitted transaction rolls back every write.
         let new_user = temps_entities::users::ActiveModel {
             name: Set(username.clone()),
             email: Set(email.clone()),
@@ -437,21 +680,23 @@ impl UserService {
             email_verification_expires: Set(None),
             password_reset_token: Set(None),
             password_reset_expires: Set(None),
+            must_change_password: Set(must_change_password),
             ..Default::default()
         };
 
-        let user = new_user.insert(self.db.as_ref()).await?;
+        let user = new_user.insert(&transaction).await?;
+
+        // Build the response from the records already resolved inside this
+        // transaction. Once commit succeeds there must be no fallible read
+        // that can turn a successfully-created account into an HTTP 500.
+        let response_roles = resolved_roles
+            .iter()
+            .cloned()
+            .map(ServiceRole::from)
+            .collect();
 
         // Assign roles
-        for role_type in roles {
-            let role = temps_entities::roles::Entity::find()
-                .filter(temps_entities::roles::Column::Name.eq(role_type.as_str()))
-                .one(self.db.as_ref())
-                .await?
-                .ok_or_else(|| {
-                    UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
-                })?;
-
+        for role in resolved_roles {
             let new_user_role = temps_entities::user_roles::ActiveModel {
                 user_id: Set(user.id),
                 role_id: Set(role.id),
@@ -460,13 +705,16 @@ impl UserService {
                 ..Default::default()
             };
 
-            new_user_role.insert(self.db.as_ref()).await?;
+            new_user_role.insert(&transaction).await?;
         }
 
-        info!("Created new user with id: {}", user.id);
+        transaction.commit().await?;
 
-        // Fetch the user with roles to return
-        self.get_user_with_roles(user.id).await
+        info!("Created new user with id: {}", user.id);
+        Ok(UserWithRoles {
+            user: ServiceUser::from(user),
+            roles: response_roles,
+        })
     }
 
     pub async fn delete_user(
@@ -594,90 +842,60 @@ impl UserService {
     }
 
     pub async fn setup_mfa(&self, user_id: i32) -> Result<MfaSetupData, UserServiceError> {
-        let user = temps_entities::users::Entity::find_by_id(user_id)
+        // Serialize setup per user and cap total Argon2 work across accounts.
+        // This guard is acquired before any database or CPU work so repeated
+        // requests cannot amplify password hashing for one account.
+        let permit = self.acquire_mfa_setup_permit(user_id).await?;
+
+        // Fetch the display identity before generating the candidate. The
+        // exclusive database lock below is only held for the final
+        // compare-and-write, never for Argon2 or QR rendering.
+        let initial_user = temps_entities::users::Entity::find_by_id(user_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
-        // Generate random secret with explicit type
-        let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
-        let secret_b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
+        if initial_user.mfa_enabled {
+            return Err(UserServiceError::MfaAlreadyEnabled(user_id));
+        }
 
-        // Generate recovery codes
-        let recovery_codes: Vec<String> = (0..8)
-            .map(|_| {
-                let code: String = (0..6)
-                    .map(|_| rand::rng().random_range(0..10).to_string())
-                    .collect();
-                code
-            })
-            .collect();
+        // Argon2 and PNG encoding are intentionally kept off Tokio's async
+        // workers. An unverified enrollment is replaceable as one complete
+        // bundle, so every successful retry rotates all credentials together.
+        let email = initial_user.email;
+        // The permit moves into the non-cancellable blocking task. If the HTTP
+        // request is cancelled, Argon2 retains both guards until it actually
+        // exits instead of silently escaping the concurrency cap.
+        let (_permit, candidate) =
+            run_mfa_setup_blocking(permit, move || generate_mfa_setup_candidate(&email)).await?;
 
-        // Hash recovery codes before storing using Argon2id
-        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-        use argon2::Argon2;
+        // Lock only for the final state check and atomic bundle replacement.
+        // A concurrent request may have enabled MFA while the candidate was
+        // generated, so the condition must be checked again under the lock.
+        let transaction = self.db.begin().await?;
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+        if user.mfa_enabled {
+            return Err(UserServiceError::MfaAlreadyEnabled(user_id));
+        }
 
-        let argon2 = Argon2::default();
-        let hashed_recovery_codes: Vec<String> = recovery_codes
-            .iter()
-            .map(|code| {
-                let salt = SaltString::generate(&mut OsRng);
-                argon2
-                    .hash_password(code.as_bytes(), &salt)
-                    .map(|hash| hash.to_string())
-                    .map_err(|e| {
-                        UserServiceError::Mfa(format!("Failed to hash recovery code: {}", e))
-                    })
-            })
-            .collect::<Result<Vec<String>, UserServiceError>>()?;
-
-        // Create TOTP with proper parameters & verify it
-        TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            Secret::Raw(secret.clone()).to_bytes().map_err(|e| {
-                UserServiceError::Mfa(format!("Failed to create TOTP secret: {}", e))
-            })?,
-        )
-        .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
-
-        // Generate the otpauth URL manually
-        let otp_auth_url = format!(
-            "otpauth://totp/Temps:{}?secret={}&issuer=Temps&algorithm=SHA1&digits=6&period=30",
-            user.email, // Use email for MFA identifier
-            secret_b32
-        );
-
-        // Generate QR code
-        let qr = QrCode::new(otp_auth_url)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to generate QR code: {}", e)))?;
-        let qr_image = qr.render::<image::Luma<u8>>().quiet_zone(false).build();
-
-        // Convert QR code to base64 PNG
-        let mut bytes: Vec<u8> = Vec::new();
-        qr_image
-            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to encode QR code: {}", e)))?;
-        let qr_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let qr_data_url = format!("data:image/png;base64,{}", qr_base64);
-
-        // Update user in database
         let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.mfa_secret = Set(Some(secret_b32.clone()));
+        user_update.mfa_secret = Set(Some(candidate.secret_key.clone()));
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(Some(
-            serde_json::to_string(&hashed_recovery_codes)
+            serde_json::to_string(&candidate.hashed_recovery_codes)
                 .map_err(UserServiceError::Serialization)?,
         ));
-
-        user_update.update(self.db.as_ref()).await?;
+        user_update.update(&transaction).await?;
+        transaction.commit().await?;
 
         Ok(MfaSetupData {
-            secret_key: secret_b32,
-            qr_code: qr_data_url,
-            recovery_codes,
+            secret_key: candidate.secret_key,
+            qr_code: candidate.qr_code,
+            recovery_codes: candidate.recovery_codes,
         })
     }
 
@@ -827,7 +1045,7 @@ impl UserService {
             .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))
     }
 
-    pub async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {
+    async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {
         let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .lock_exclusive()
@@ -859,7 +1077,7 @@ impl UserService {
         &self,
         user_id: i32,
         code: &str,
-    ) -> anyhow::Result<(), UserServiceError> {
+    ) -> Result<(), UserServiceError> {
         // First verify the code
         if !self.verify_mfa_code(user_id, code).await? {
             return Err(UserServiceError::Validation(
@@ -876,7 +1094,7 @@ impl UserService {
 mod tests {
     use super::*;
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
     fn user(mfa_enabled: bool, recovery_codes: Option<String>) -> temps_entities::users::Model {
         let now = Utc::now();
@@ -890,6 +1108,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: mfa_enabled.then(|| "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             mfa_enabled,
@@ -899,6 +1118,229 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn role(role_type: RoleType) -> temps_entities::roles::Model {
+        let now = Utc::now();
+        temps_entities::roles::Model {
+            id: match role_type {
+                RoleType::Admin => 1,
+                RoleType::User => 2,
+            },
+            name: role_type.as_str().to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn user_email_is_normalized_and_strictly_validated() {
+        assert_eq!(
+            normalize_user_email("  Admin@Example.COM  "),
+            Some("admin@example.com".to_string())
+        );
+        for invalid in ["", "missing-at.example.com", "@example.com", "user@"] {
+            assert_eq!(normalize_user_email(invalid), None, "accepted {invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_invalid_identity_before_database_writes() {
+        let service = UserService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+
+        let blank_name = service
+            .create_user(
+                "  ".to_string(),
+                "valid@example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+            )
+            .await;
+        assert!(matches!(blank_name, Err(UserServiceError::Validation(_))));
+
+        let malformed_email = service
+            .create_user(
+                "Valid User".to_string(),
+                "not-an-email".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+            )
+            .await;
+        assert!(matches!(
+            malformed_email,
+            Err(UserServiceError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_user_requires_at_least_one_role() {
+        let service = UserService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+
+        let result = service
+            .create_user(
+                "roleless".to_string(),
+                "roleless@example.com".to_string(),
+                None,
+                vec![],
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(UserServiceError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_duplicate_roles() {
+        let service = UserService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+
+        let result = service
+            .create_user(
+                "duplicate-role".to_string(),
+                "duplicate@example.com".to_string(),
+                None,
+                vec![RoleType::User, RoleType::User],
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(UserServiceError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn create_user_does_not_insert_account_when_role_is_missing() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::roles::Model>::new()])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let result = service
+            .create_user(
+                "missing-role".to_string(),
+                "missing-role@example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(UserServiceError::RoleNotFound(_))));
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert!(statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("SELECT")));
+        assert!(!statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("INSERT INTO \"users\"")));
+    }
+
+    #[tokio::test]
+    async fn create_user_rolls_back_when_role_assignment_fails() {
+        let new_user = user(false, None);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![role(RoleType::User)]])
+                .append_query_results([vec![new_user]])
+                .append_query_errors([DbErr::Custom(
+                    "simulated role assignment failure".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let result = service
+            .create_user(
+                "atomic-user".to_string(),
+                "atomic@example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(UserServiceError::Database { .. })));
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "all provisioning writes share one transaction"
+        );
+        let statements = log[0].statements();
+        assert!(statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("INSERT INTO \"users\"")));
+        assert!(statements
+            .iter()
+            .any(|statement| { statement.sql.starts_with("INSERT INTO \"user_roles\"") }));
+    }
+
+    #[tokio::test]
+    async fn create_user_returns_committed_records_without_a_post_commit_read() {
+        let new_user = user(false, None);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![role(RoleType::User)]])
+                .append_query_results([vec![new_user.clone()]])
+                .append_query_results([vec![temps_entities::user_roles::Model {
+                    id: 1,
+                    user_id: new_user.id,
+                    role_id: 2,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                }]])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let created = service
+            .create_user(
+                "Created User".to_string(),
+                "created@example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+            )
+            .await
+            .expect("committed user should be returned without another query");
+
+        assert_eq!(created.user.id, new_user.id);
+        assert_eq!(created.roles.len(), 1);
+        assert_eq!(created.roles[0].name, RoleType::User.as_str());
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.sql.starts_with("SELECT"))
+                .count(),
+            1,
+            "only role resolution may read during account creation"
+        );
     }
 
     #[tokio::test]
@@ -912,6 +1354,190 @@ mod tests {
 
         let result = service.verify_mfa_code(7, "anything").await;
         assert!(matches!(result, Err(UserServiceError::MfaNotSetup(7))));
+    }
+
+    #[tokio::test]
+    async fn mfa_setup_limits_parallel_work_globally_and_per_user() {
+        use std::time::Duration;
+
+        let service = UserService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let first_user = service
+            .acquire_mfa_setup_permit(7)
+            .await
+            .expect("first setup should acquire a permit");
+
+        let duplicate = tokio::time::timeout(
+            Duration::from_millis(25),
+            service.acquire_mfa_setup_permit(7),
+        )
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "a second setup for the same account must be serialized"
+        );
+
+        let second_user = service
+            .acquire_mfa_setup_permit(8)
+            .await
+            .expect("a second account may use the remaining global permit");
+        let global_overflow = tokio::time::timeout(
+            Duration::from_millis(25),
+            service.acquire_mfa_setup_permit(9),
+        )
+        .await;
+        assert!(
+            global_overflow.is_err(),
+            "MFA setup must cap total concurrent password hashing"
+        );
+
+        drop(first_user);
+        service
+            .acquire_mfa_setup_permit(9)
+            .await
+            .expect("a queued account should proceed after a permit is released");
+        drop(second_user);
+    }
+
+    #[tokio::test]
+    async fn cancelled_mfa_setup_holds_admission_until_blocking_work_exits() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let service = Arc::new(UserService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        )));
+        let first = service
+            .acquire_mfa_setup_permit(7)
+            .await
+            .expect("first setup should acquire a permit");
+        let second = service
+            .acquire_mfa_setup_permit(8)
+            .await
+            .expect("second setup should fill the global limit");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let task = tokio::spawn(run_mfa_setup_blocking(first, move || {
+            let _ = started_tx.send(());
+            release_rx.recv().map_err(|error| {
+                UserServiceError::Internal(format!(
+                    "MFA cancellation test release failed: {}",
+                    error
+                ))
+            })?;
+            Ok(())
+        }));
+        started_rx
+            .await
+            .expect("blocking setup should report that it started");
+        task.abort();
+        let cancelled = task.await;
+        assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                service.acquire_mfa_setup_permit(7)
+            )
+            .await
+            .is_err(),
+            "cancellation must not release the per-user guard while work continues"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                service.acquire_mfa_setup_permit(9)
+            )
+            .await
+            .is_err(),
+            "cancellation must not release the global permit while work continues"
+        );
+
+        release_tx
+            .send(())
+            .expect("blocking work should still own its release receiver");
+        tokio::time::timeout(Duration::from_secs(1), service.acquire_mfa_setup_permit(9))
+            .await
+            .expect("permit should be released after blocking work exits")
+            .expect("limiter should remain open");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn setup_mfa_retry_rotates_complete_unverified_credential_bundle() {
+        let mut pending = user(false, Some("[\"existing-hash\"]".to_string()));
+        pending.mfa_secret = Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string());
+        let updated = pending.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending.clone()], vec![pending], vec![updated]])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let setup = service
+            .setup_mfa(7)
+            .await
+            .expect("pending MFA setup should be resumable");
+
+        assert_ne!(setup.secret_key, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+        assert_eq!(setup.recovery_codes.len(), 8);
+        assert!(setup.recovery_codes.iter().all(
+            |code| code.len() == 6 && code.chars().all(|character| character.is_ascii_digit())
+        ));
+        assert!(setup.qr_code.starts_with("data:image/png;base64,"));
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert!(statements
+            .iter()
+            .any(|statement| statement.sql.contains("FOR UPDATE")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("UPDATE \"users\"")));
+    }
+
+    #[tokio::test]
+    async fn setup_mfa_rechecks_enabled_state_under_the_write_lock() {
+        let pending = user(false, Some("[\"pending-hash\"]".to_string()));
+        let enabled = user(true, Some("[\"existing-hash\"]".to_string()));
+        let expected_secret = enabled.mfa_secret.clone();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending], vec![enabled]])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let result = service.setup_mfa(7).await;
+
+        assert!(matches!(
+            result,
+            Err(UserServiceError::MfaAlreadyEnabled(7))
+        ));
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        assert!(statements
+            .iter()
+            .any(|statement| statement.sql.contains("FOR UPDATE")));
+        assert!(!statements
+            .iter()
+            .any(|statement| statement.sql.starts_with("UPDATE \"users\"")));
+        assert!(expected_secret.is_some());
     }
 
     #[tokio::test]

@@ -94,13 +94,27 @@ function writeU32(view: DataView, offset: number, value: number) {
   view.setUint32(offset, value >>> 0, true)
 }
 
-function crc32(bytes: Uint8Array): number {
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new DOMException('Preset detection was cancelled', 'AbortError')
+  }
+}
+
+async function crc32(bytes: Uint8Array, signal?: AbortSignal): Promise<number> {
   let crc = 0xffffffff
-  for (const byte of bytes) {
-    crc ^= byte
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  const yieldEveryBytes = 2 * 1024 * 1024
+  for (let offset = 0; offset < bytes.length; offset += yieldEveryBytes) {
+    throwIfAborted(signal)
+    const end = Math.min(offset + yieldEveryBytes, bytes.length)
+    for (let index = offset; index < end; index += 1) {
+      crc ^= bytes[index]
+      for (let bit = 0; bit < 8; bit += 1) {
+        crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+      }
     }
+    // Keep the clear button responsive while a large folder is checksummed.
+    if (end < bytes.length)
+      await new Promise((resolve) => setTimeout(resolve, 0))
   }
   return (crc ^ 0xffffffff) >>> 0
 }
@@ -117,7 +131,8 @@ function dosTimestamp(date: Date): { date: number; time: number } {
 }
 
 async function createStoredZip(
-  entries: Array<{ path: string; contents: Blob }>
+  entries: Array<{ path: string; contents: Blob }>,
+  signal?: AbortSignal
 ): Promise<Blob> {
   const localParts: BlobPart[] = []
   const centralParts: BlobPart[] = []
@@ -126,9 +141,10 @@ async function createStoredZip(
   const now = dosTimestamp(new Date())
 
   for (const entry of entries) {
+    throwIfAborted(signal)
     const name = textEncoder.encode(cleanPath(entry.path))
     const contents = new Uint8Array(await entry.contents.arrayBuffer())
-    const checksum = crc32(contents)
+    const checksum = await crc32(contents, signal)
 
     const localHeader = new ArrayBuffer(30)
     const localView = new DataView(localHeader)
@@ -204,8 +220,10 @@ function redirectPage(target: string): Blob {
 
 export async function prepareDrop(
   rawFiles: DropFile[],
-  selectedRootPage?: string
+  selectedRootPage?: string,
+  signal?: AbortSignal
 ): Promise<PreparedDrop> {
+  throwIfAborted(signal)
   if (rawFiles.length === 1 && isDropArchive(rawFiles[0].file.name)) {
     if (rawFiles[0].file.size > 500 * 1024 * 1024) {
       throw new Error('Drop exceeds the 500 MB upload limit')
@@ -238,7 +256,7 @@ export async function prepareDrop(
     }
   }
 
-  const archive = await createStoredZip(entries)
+  const archive = await createStoredZip(entries, signal)
   return {
     file: new File([archive], 'temps-drop.zip', { type: 'application/zip' }),
     fileCount: files.length,

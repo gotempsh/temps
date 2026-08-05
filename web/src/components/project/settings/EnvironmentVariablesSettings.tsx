@@ -211,6 +211,15 @@ function EnvironmentVariableRow({
   const [editIncludeInPreview, setEditIncludeInPreview] = useState(
     variable.include_in_preview ?? false
   )
+  // Whether the edit box actually holds the variable's current value. False
+  // when the reveal was denied (it needs SecretsRead on top of EnvironmentsWrite)
+  // or failed, which is what distinguishes "cleared on purpose" from "never
+  // loaded" when the box is empty on save.
+  const [valueLoaded, setValueLoaded] = useState(false)
+  // Opt-in conversion of an existing plain variable into a write-only secret.
+  // One-way: once saved, the value can never be read back through the UI or the
+  // API, so it stays off unless the operator explicitly turns it on.
+  const [convertToSecret, setConvertToSecret] = useState(false)
 
   // Update selected environments and preview flag when variable changes (after refetch)
   useEffect(() => {
@@ -227,6 +236,7 @@ function EnvironmentVariableRow({
       if (value !== undefined) {
         setEditValue(value)
         setIsEditMultiline(value.includes('\n'))
+        setValueLoaded(true)
       }
     }
   }
@@ -236,6 +246,8 @@ function EnvironmentVariableRow({
     if (!open) {
       setEditValue('')
       setIsEditMultiline(false)
+      setConvertToSecret(false)
+      setValueLoaded(false)
       if (!isVisible && !showAllValues) {
         revealGuard.current.cancel('value')
         setRevealedValue(undefined)
@@ -243,12 +255,23 @@ function EnvironmentVariableRow({
     }
   }
 
+  // Both the secret case and the failed-reveal case mean "blank keeps what is
+  // already stored" — say so, so an empty box is never mistaken for an empty value.
+  const valuePlaceholder =
+    isSecret || !valueLoaded ? 'Leave blank to keep current value' : undefined
+
   const submitEdit = async () => {
-    // For secrets we never preloaded the value; an empty editValue means
-    // "keep the existing ciphertext". For regular vars we send the current
-    // text either way.
+    // An empty box means "keep the existing ciphertext" whenever we never had
+    // the value to begin with: always for secrets (never preloaded), and for a
+    // regular variable whose reveal was denied or failed. Sending "" in that
+    // case would overwrite the credential with an empty string — and if the
+    // same save also promotes the variable, that loss is unrecoverable.
+    // A cleared box after a *successful* reveal is a deliberate edit and is
+    // still sent as-is.
     const valueField =
-      isSecret && editValue.length === 0 ? undefined : editValue
+      editValue.length === 0 && (isSecret || !valueLoaded)
+        ? undefined
+        : editValue
     await updateMutation.mutateAsync({
       path: {
         project_id: project.id,
@@ -259,10 +282,16 @@ function EnvironmentVariableRow({
         environment_ids: selectedEditEnvironments,
         key: variable.key,
         include_in_preview: editIncludeInPreview,
+        // Only sent when the operator asked for the conversion. Omitting the
+        // field leaves the existing flag untouched; sending `false` against an
+        // already-secret variable is rejected by the API as a demotion.
+        ...(convertToSecret ? { is_secret: true } : {}),
       },
     })
     setIsEditModalOpen(false)
     setEditValue('')
+    setConvertToSecret(false)
+    setValueLoaded(false)
   }
 
   const { data: allEnvironments } = useQuery({
@@ -435,14 +464,14 @@ function EnvironmentVariableRow({
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono resize-y"
                     rows={6}
-                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
+                    placeholder={valuePlaceholder}
                   />
                 ) : (
                   <Input
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono"
-                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
+                    placeholder={valuePlaceholder}
                   />
                 )}
                 {isSecret && (
@@ -493,6 +522,34 @@ function EnvironmentVariableRow({
                   onCheckedChange={setEditIncludeInPreview}
                 />
               </div>
+              {!isSecret && (
+                <div
+                  className={`flex items-center justify-between space-x-2 rounded-lg border p-4 ${
+                    convertToSecret
+                      ? 'border-amber-500/40 bg-amber-500/5'
+                      : ''
+                  }`}
+                >
+                  <div className="flex-1 space-y-1">
+                    <Label
+                      htmlFor="edit-convert-secret"
+                      className="text-sm font-medium"
+                    >
+                      Convert to secret
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      {convertToSecret
+                        ? `On save, ${variable.key} becomes write-only: the value is masked in the UI and no longer returned by the API. You can still overwrite it, but never read it back — to make it a regular variable again you must delete it and create it anew.`
+                        : 'Make this variable write-only so its value can never be read from the UI or the API again. One-way: converting back means deleting and recreating the variable.'}
+                    </p>
+                  </div>
+                  <Switch
+                    id="edit-convert-secret"
+                    checked={convertToSecret}
+                    onCheckedChange={setConvertToSecret}
+                  />
+                </div>
+              )}
             </div>
             <DialogFooter>
               <Button

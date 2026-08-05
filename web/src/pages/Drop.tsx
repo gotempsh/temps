@@ -5,11 +5,15 @@ import {
   deployFromStatic,
   getEnvironments,
   inspectDropArchive,
+  uploadStaticBundle,
   type DropInspectionResponse,
   type EnvironmentResponse,
   type ProjectResponse,
 } from '@/api/client'
 import { DropZone } from '@/components/drop/DropZone'
+import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVariables'
+import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
+import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -24,17 +28,30 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  formatDetectedProjectLabel,
   htmlRootCandidates,
   isDropArchive,
-  prepareDrop,
   type DropFile,
 } from '@/lib/drop-archive'
 import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
+import { consumeDropFilesHandoff } from '@/lib/drop-handoff'
+import {
+  serializeDropEnvironmentVariables,
+  validateDropEnvironmentVariables,
+  type DropEnvironmentVariable,
+} from '@/lib/drop-environment-variables'
+import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
-import { ArrowRight, Check, Loader2, RotateCcw, UploadCloud } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import {
+  ArrowRight,
+  Check,
+  Loader2,
+  RotateCcw,
+  UploadCloud,
+  X,
+} from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 
 type DropStage =
@@ -46,7 +63,11 @@ type DropStage =
   | 'deploying'
   | 'done'
 
-function stageLabel(stage: DropStage): string {
+function stageLabel(
+  stage: DropStage,
+  detectedLabel?: string,
+  hasFiles = false
+): string {
   switch (stage) {
     case 'packing':
       return 'Packing files locally'
@@ -61,12 +82,14 @@ function stageLabel(stage: DropStage): string {
     case 'done':
       return 'Deployment started'
     default:
-      return 'Ready to deploy'
+      if (detectedLabel) return `Deploy ${detectedLabel}`
+      return hasFiles ? 'Retry preset detection' : 'Select project files'
   }
 }
 
 export function Drop() {
   const navigate = useNavigate()
+  const reduceMotion = useReducedMotion()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
@@ -83,6 +106,12 @@ export function Drop() {
     null
   )
   const [selectedCandidateIndex, setSelectedCandidateIndex] = useState('0')
+  const [environmentVariables, setEnvironmentVariables] = useState<
+    DropEnvironmentVariable[]
+  >([])
+  const [handedOffFiles] = useState(() => consumeDropFilesHandoff())
+  const detectionRunRef = useRef(0)
+  const detectionAbortRef = useRef<AbortController | null>(null)
 
   usePageTitle('Drop')
   useEffect(() => {
@@ -91,6 +120,12 @@ export function Drop() {
       { label: 'Drop' },
     ])
   }, [setBreadcrumbs])
+  useEffect(
+    () => () => {
+      detectionAbortRef.current?.abort()
+    },
+    []
+  )
 
   const normalizedCandidates = useMemo(() => htmlRootCandidates(files), [files])
   const hasRootIndex = normalizedCandidates.some(
@@ -98,8 +133,70 @@ export function Drop() {
   )
   const isArchive = files.length === 1 && isDropArchive(files[0].file.name)
   const isBusy = !['idle', 'done'].includes(stage)
+  const selectedCandidate =
+    inspection?.candidates[Number(selectedCandidateIndex)]
+  const transition = reduceMotion
+    ? { duration: 0 }
+    : { duration: 0.32, ease: [0.22, 1, 0.36, 1] as const }
+
+  const inspectArchive = async (archive: File, signal?: AbortSignal) => {
+    const response = await inspectDropArchive({
+      throwOnError: true,
+      body: { file: archive },
+      signal,
+    })
+    return response.data
+  }
+
+  async function detectSelection(
+    nextFiles: DropFile[],
+    nextRootPage: string,
+    runId: number
+  ) {
+    detectionAbortRef.current?.abort()
+    const controller = new AbortController()
+    detectionAbortRef.current = controller
+    try {
+      setStage('packing')
+      const result = await prepareAndInspectDrop(
+        nextFiles,
+        nextRootPage || undefined,
+        (archive) => inspectArchive(archive, controller.signal),
+        {
+          signal: controller.signal,
+          onArchivePrepared: (archive) => {
+            if (detectionRunRef.current !== runId) return
+            setPreparedArchive(archive)
+            setStage('detecting')
+          },
+        }
+      )
+      if (detectionRunRef.current !== runId) return
+
+      setPreparedArchive(result.archive)
+      setInspection(result.inspection)
+      setSelectedCandidateIndex('0')
+      if (!nameWasEdited) {
+        setProjectName(ensureDropProjectName(result.inspection.suggestedName))
+      }
+      setStage('idle')
+    } catch (caught) {
+      if (detectionRunRef.current !== runId) return
+      setError(dropErrorMessage(caught))
+      setPreparedArchive(null)
+      setInspection(null)
+      setStage('idle')
+    } finally {
+      if (detectionAbortRef.current === controller) {
+        detectionAbortRef.current = null
+      }
+    }
+  }
 
   const setSelection = (nextFiles: DropFile[]) => {
+    const runId = ++detectionRunRef.current
+    detectionAbortRef.current?.abort()
+    detectionAbortRef.current = null
     setFiles(nextFiles)
     setError(null)
     setProject(null)
@@ -112,13 +209,31 @@ export function Drop() {
     const hasIndex = candidates.some(
       (path) => path.toLowerCase() === 'index.html'
     )
-    setRootPage(hasIndex ? '' : candidates[0] || '')
+    const nextRootPage = hasIndex ? '' : candidates[0] || ''
+    setRootPage(nextRootPage)
     if (!nameWasEdited) {
       setProjectName(ensureDropProjectName(inferredProjectName(nextFiles)))
     }
+    if (nextFiles.length > 0) {
+      void detectSelection(nextFiles, nextRootPage, runId)
+    }
   }
 
+  useEffect(() => {
+    if (!handedOffFiles?.length) return
+    const startHandoff = window.setTimeout(
+      () => setSelection(handedOffFiles),
+      0
+    )
+    return () => window.clearTimeout(startHandoff)
+    // The handoff is deliberately consumed only on the first `/drop` mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handedOffFiles])
+
   const reset = () => {
+    detectionRunRef.current += 1
+    detectionAbortRef.current?.abort()
+    detectionAbortRef.current = null
     setFiles([])
     setProjectName('')
     setNameWasEdited(false)
@@ -130,6 +245,7 @@ export function Drop() {
     setPreparedArchive(null)
     setInspection(null)
     setSelectedCandidateIndex('0')
+    setEnvironmentVariables([])
   }
 
   const deploy = async () => {
@@ -141,27 +257,18 @@ export function Drop() {
     setProjectName(normalizedProjectName)
     setError(null)
     try {
-      let archive = preparedArchive
-      let detected = inspection
+      const archive = preparedArchive
+      const detected = inspection
       if (!archive || !detected) {
-        setStage('packing')
-        const prepared = await prepareDrop(files, rootPage || undefined)
-        archive = prepared.file
-        setPreparedArchive(archive)
+        const runId = ++detectionRunRef.current
+        await detectSelection(files, rootPage, runId)
+        return
+      }
 
-        setStage('detecting')
-        const inspectResponse = await inspectDropArchive({
-          throwOnError: true,
-          body: { file: archive },
-        })
-        detected = inspectResponse.data
-        if (!detected) throw new Error('Preset detection returned no result')
-        setInspection(detected)
-        setSelectedCandidateIndex('0')
-        if (!nameWasEdited) {
-          setProjectName(ensureDropProjectName(detected.suggestedName))
-        }
-        setStage('idle')
+      const environmentVariableError =
+        validateDropEnvironmentVariables(environmentVariables)
+      if (environmentVariableError) {
+        setError(environmentVariableError)
         return
       }
 
@@ -183,6 +290,8 @@ export function Drop() {
           project_type: candidate.isStatic ? 'static' : 'server',
           automatic_deploy: false,
           storage_service_ids: [],
+          environment_variables:
+            serializeDropEnvironmentVariables(environmentVariables),
         },
       })
       createdProject = projectResult.data
@@ -201,8 +310,6 @@ export function Drop() {
         throw new Error('The project has no deployment environment')
 
       setStage('uploading')
-      const body = new FormData()
-      body.append('file', archive)
       if (!candidate.isStatic) {
         const sourceResponse = await deployFromUploadedSource({
           throwOnError: true,
@@ -221,19 +328,13 @@ export function Drop() {
         )
         return
       }
-      const uploadResponse = await fetch(
-        `/api/projects/${createdProject.id}/upload/static`,
-        { method: 'POST', credentials: 'include', body }
-      )
-      if (!uploadResponse.ok) {
-        const problem = (await uploadResponse.json().catch(() => null)) as {
-          detail?: string
-        } | null
-        throw new Error(
-          problem?.detail || `Upload failed (${uploadResponse.status})`
-        )
-      }
-      const bundle = (await uploadResponse.json()) as { id: number }
+      const uploadResponse = await uploadStaticBundle({
+        throwOnError: true,
+        path: { project_id: createdProject.id },
+        body: { file: archive },
+      })
+      const bundle = uploadResponse.data
+      if (!bundle) throw new Error('Static upload returned no bundle')
 
       setStage('deploying')
       await deployFromStatic({
@@ -332,161 +433,200 @@ export function Drop() {
         </div>
       </header>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.6fr)_minmax(20rem,0.8fr)]">
-        <DropZone
-          files={files}
-          onSelect={setSelection}
-          onError={setError}
-          disabled={isBusy}
-        />
-
-        <aside className="flex flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7">
-          <div className="flex items-center justify-between border-b pb-5">
-            <div>
-              <p className="font-mono text-[0.68rem] uppercase tracking-[0.24em] text-muted-foreground">
-                Deployment card
-              </p>
-              <h2 className="mt-1 text-xl font-semibold">Configure drop</h2>
-            </div>
-            <div
-              className={cn(
-                'size-2.5 rounded-full',
-                files.length ? 'bg-emerald-500' : 'bg-muted-foreground/30'
-              )}
-            />
-          </div>
-
-          <div className="flex-1 space-y-6 py-6">
-            <div className="space-y-2">
-              <Label htmlFor="drop-name">Project name</Label>
-              <Input
-                id="drop-name"
-                value={projectName}
-                placeholder="my-static-site"
+      <div className="grid gap-6">
+        <AnimatePresence mode="wait" initial={false}>
+          {files.length === 0 ? (
+            <motion.div
+              key="drop-target"
+              initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
+              transition={transition}
+            >
+              <DropZone
+                files={files}
+                onSelect={setSelection}
+                onError={setError}
                 disabled={isBusy}
-                onChange={(event) => {
-                  setProjectName(event.target.value)
-                  setNameWasEdited(true)
-                }}
-                onBlur={() =>
-                  setProjectName(ensureDropProjectName(projectName))
-                }
               />
-            </div>
-
-            {!isArchive && !hasRootIndex && normalizedCandidates.length > 0 && (
-              <div className="space-y-2">
-                <Label>Root page</Label>
-                <Select
-                  value={rootPage}
-                  onValueChange={setRootPage}
-                  disabled={isBusy}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose the landing page" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {normalizedCandidates.map((candidate) => (
-                      <SelectItem key={candidate} value={candidate}>
-                        {candidate}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  Temps adds a small index redirect; your selected file stays in
-                  place.
-                </p>
-              </div>
-            )}
-
-            {inspection && (
-              <div className="space-y-2">
-                <Label>Detected project</Label>
-                <Select
-                  value={selectedCandidateIndex}
-                  onValueChange={setSelectedCandidateIndex}
-                  disabled={isBusy}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose a project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {inspection.candidates.map((candidate, index) => (
-                      <SelectItem
-                        key={`${candidate.directory}:${candidate.preset}`}
-                        value={String(index)}
-                      >
-                        {formatDetectedProjectLabel(
-                          candidate.label,
-                          candidate.directory
-                        )}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  {
-                    inspection.candidates[Number(selectedCandidateIndex)]
-                      ?.reason
-                  }
-                </p>
-              </div>
-            )}
-
-            <div className="rounded-xl border bg-muted/35 p-4 text-sm">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Source</span>
-                <span className="font-medium">
-                  {inspection
-                    ? inspection.candidates[Number(selectedCandidateIndex)]
-                        ?.label
-                    : 'Pending detection'}
-                </span>
-              </div>
-              <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Git connection</span>
-                <span className="font-medium">None</span>
-              </div>
-              <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Upload limit</span>
-                <span className="font-medium">500 MB ZIP / 100 MB folder</span>
-              </div>
-            </div>
-
-            {error && (
-              <div
-                role="alert"
-                className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+            </motion.div>
+          ) : (
+            <motion.aside
+              key="configuration"
+              initial={{ opacity: 0, x: reduceMotion ? 0 : 18 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: reduceMotion ? 0 : -12 }}
+              transition={transition}
+              className="relative flex min-h-[28rem] flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7"
+            >
+              <button
+                type="button"
+                className="absolute right-5 top-5 z-10 rounded-full border bg-background p-2 text-muted-foreground transition-colors hover:text-foreground"
+                onClick={reset}
+                disabled={['creating', 'uploading', 'deploying'].includes(
+                  stage
+                )}
+                aria-label="Clear selected files"
               >
-                {error}
+                <X className="size-4" />
+              </button>
+              <div className="flex items-center justify-between border-b pb-5">
+                <div>
+                  <p className="font-mono text-[0.68rem] uppercase tracking-[0.24em] text-muted-foreground">
+                    Deployment card
+                  </p>
+                  <h2 className="mt-1 text-xl font-semibold">Configure drop</h2>
+                </div>
+                <div
+                  className={cn(
+                    'mr-12 size-2.5 rounded-full',
+                    files.length ? 'bg-emerald-500' : 'bg-muted-foreground/30'
+                  )}
+                />
               </div>
-            )}
-          </div>
 
-          <Button
-            size="lg"
-            className="h-12 w-full"
-            disabled={files.length === 0 || isBusy}
-            onClick={deploy}
-          >
-            {isBusy ? (
-              <Loader2 className="mr-2 size-4 animate-spin" />
-            ) : (
-              <UploadCloud className="mr-2 size-4" />
-            )}
-            {inspection
-              ? stageLabel(stage)
-              : isBusy
-                ? stageLabel(stage)
-                : 'Detect preset'}
-          </Button>
-          <p className="mt-3 text-center text-xs text-muted-foreground">
-            Failed setup is rolled back automatically.
-          </p>
-        </aside>
+              <div className="flex-1 space-y-6 py-6">
+                <div className="space-y-2">
+                  <Label htmlFor="drop-name">Project name</Label>
+                  <Input
+                    id="drop-name"
+                    value={projectName}
+                    placeholder="my-static-site"
+                    disabled={isBusy}
+                    onChange={(event) => {
+                      setProjectName(event.target.value)
+                      setNameWasEdited(true)
+                    }}
+                    onBlur={() =>
+                      setProjectName(ensureDropProjectName(projectName))
+                    }
+                  />
+                </div>
+
+                <DropEnvironmentVariables
+                  variables={environmentVariables}
+                  onChange={setEnvironmentVariables}
+                  disabled={isBusy}
+                />
+
+                {!isArchive &&
+                  !hasRootIndex &&
+                  normalizedCandidates.length > 0 && (
+                    <div className="space-y-2">
+                      <Label>Root page</Label>
+                      <Select
+                        value={rootPage}
+                        onValueChange={(value) => {
+                          const runId = ++detectionRunRef.current
+                          setRootPage(value)
+                          setPreparedArchive(null)
+                          setInspection(null)
+                          setError(null)
+                          void detectSelection(files, value, runId)
+                        }}
+                        disabled={isBusy}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Choose the landing page" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {normalizedCandidates.map((candidate) => (
+                            <SelectItem key={candidate} value={candidate}>
+                              {candidate}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        Temps adds a small index redirect; your selected file
+                        stays in place.
+                      </p>
+                    </div>
+                  )}
+
+                {inspection && inspection.candidates.length > 1 && (
+                  <div className="space-y-2">
+                    <Label>Detected projects</Label>
+                    <DetectedPresetGrid
+                      candidates={inspection.candidates}
+                      selectedIndex={Number(selectedCandidateIndex)}
+                      onSelect={(index) =>
+                        setSelectedCandidateIndex(String(index))
+                      }
+                      disabled={isBusy}
+                    />
+                  </div>
+                )}
+
+                {(!inspection || inspection.candidates.length === 1) && (
+                  <DetectedPresetCard
+                    candidate={selectedCandidate}
+                    isDetecting={stage === 'packing' || stage === 'detecting'}
+                    phase={stage === 'packing' ? 'packing' : 'detecting'}
+                  />
+                )}
+
+                <div className="rounded-xl border bg-muted/35 p-4 text-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Source</span>
+                    <span className="font-medium">
+                      {inspection
+                        ? selectedCandidate?.label
+                        : 'Pending detection'}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">
+                      Git connection
+                    </span>
+                    <span className="font-medium">None</span>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">
+                      Environment variables
+                    </span>
+                    <span className="font-medium tabular-nums">
+                      {environmentVariables.length}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground">Upload limit</span>
+                    <span className="font-medium">
+                      500 MB ZIP / 100 MB folder
+                    </span>
+                  </div>
+                </div>
+
+                {error && (
+                  <div
+                    role="alert"
+                    className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm leading-6 text-destructive"
+                  >
+                    {error}
+                  </div>
+                )}
+              </div>
+
+              <Button
+                size="lg"
+                className="h-12 w-full"
+                disabled={files.length === 0 || isBusy}
+                onClick={deploy}
+              >
+                {isBusy ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <UploadCloud className="mr-2 size-4" />
+                )}
+                {stageLabel(stage, selectedCandidate?.label, files.length > 0)}
+              </Button>
+              <p className="mt-3 text-center text-xs text-muted-foreground">
+                Failed setup is rolled back automatically.
+              </p>
+            </motion.aside>
+          )}
+        </AnimatePresence>
       </div>
-
     </PageContainer>
   )
 }

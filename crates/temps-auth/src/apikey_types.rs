@@ -94,7 +94,9 @@ impl RoleInfo {
             Role::PlatformAdmin => {
                 "Platform administration (users, settings, system) without deploy access to projects or deployments"
             }
-            Role::User => "Standard user access with ability to manage own resources",
+            Role::User => {
+                "Manage every existing and future project without user or system administration"
+            }
             Role::Reader => "Read-only access to resources",
             Role::ApiReader => "Read-only API access",
             Role::Custom => "Custom role with specific permissions",
@@ -122,4 +124,42 @@ pub fn get_available_permissions() -> AvailablePermissions {
     let roles = Role::all().iter().map(RoleInfo::from_role).collect();
 
     AvailablePermissions { permissions, roles }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn role_catalog_exposes_the_exact_permission_set() {
+        let catalog = get_available_permissions();
+        let user = catalog
+            .roles
+            .iter()
+            .find(|role| role.name == "user")
+            .expect("user role is present");
+        let expected: Vec<String> = Role::User
+            .permissions()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(user.permissions, expected);
+        assert!(user
+            .description
+            .contains("every existing and future project"));
+    }
+
+    #[test]
+    fn predefined_roles_do_not_report_duplicate_permissions() {
+        for role in Role::all() {
+            let unique: HashSet<_> = role.permissions().iter().collect();
+            assert_eq!(
+                unique.len(),
+                role.permissions().len(),
+                "role {role} contains duplicate permissions"
+            );
+        }
+    }
 }

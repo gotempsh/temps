@@ -5,6 +5,7 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 nightly_workflow="$repository_root/.github/workflows/nightly-release.yml"
 release_workflow="$repository_root/.github/workflows/release.yml"
 sandbox_workflow="$repository_root/.github/workflows/sandbox-images-beta.yml"
+e2e_workflow="$repository_root/.github/workflows/e2e-tests.yml"
 decision_script="$repository_root/.github/scripts/nightly-release-decision.sh"
 validation_script="$repository_root/.github/scripts/validate-release-ref.sh"
 
@@ -43,13 +44,18 @@ if [[ "$tag_aware_dispatch_count" -ne 5 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
-ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" <<'RUBY'
+ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" "$e2e_workflow" <<'RUBY'
 require "yaml"
 
 repository_root = ARGV[0]
 nightly = YAML.safe_load(File.read(ARGV[1]), aliases: true)
 release = YAML.safe_load(File.read(ARGV[2]), aliases: true)
 sandbox = YAML.safe_load(File.read(ARGV[3]), aliases: true)
+e2e = YAML.safe_load(File.read(ARGV[4]), aliases: true)
+
+e2e_sandbox_channel = e2e.dig("jobs", "e2e-test", "env", "TEMPS_SANDBOX_CHANNEL")
+abort "E2E must pull the beta sandbox images published for main and PR builds" unless
+  e2e_sandbox_channel == "beta"
 
 check_permissions = nightly.dig("jobs", "check-and-tag", "permissions")
 abort "check-and-tag permissions are not read-actions/write-contents" unless

@@ -852,7 +852,7 @@ impl OidcService {
 
         let created = self
             .user_service
-            .create_user(display_name, email.clone(), None, vec![role.clone()])
+            .create_user(display_name, email.clone(), None, vec![role.clone()], false)
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),

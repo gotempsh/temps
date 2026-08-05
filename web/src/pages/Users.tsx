@@ -6,6 +6,7 @@ import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect, useState } from 'react'
 import { UserEditDialog } from '@/components/users/UserEditDialog'
+import { useNavigate } from 'react-router'
 
 export function Users() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -14,7 +15,7 @@ export function Users() {
     name: string
     email: string
   } | null>(null)
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
+  const navigate = useNavigate()
 
   const {
     data: users,
@@ -34,7 +35,7 @@ export function Users() {
 
   useKeyboardShortcut({
     key: 'n',
-    callback: () => setIsCreateDialogOpen(true),
+    callback: () => navigate('/settings/users/new'),
   })
 
   usePageTitle('Users')
@@ -47,8 +48,6 @@ export function Users() {
           isLoading={isLoading}
           reloadUsers={refetch}
           onEditUser={setSelectedUser}
-          isCreateDialogOpen={isCreateDialogOpen}
-          onCreateDialogOpenChange={setIsCreateDialogOpen}
         />
       </div>
       {selectedUser && (

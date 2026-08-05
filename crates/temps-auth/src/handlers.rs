@@ -8,7 +8,7 @@ use crate::audit::{
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
 use crate::permissions::Permission;
-use crate::user_service::UserServiceError;
+use crate::user_service::{normalize_user_email, UserServiceError};
 use crate::{permission_guard, RequireAuth};
 use axum::extract::Path;
 use axum::http::header::SET_COOKIE;
@@ -58,27 +58,20 @@ fn bounded_audit_identity(identity: &str) -> String {
 }
 
 fn normalized_login_email(email: &str) -> Option<String> {
-    let normalized = email.to_lowercase();
-    if normalized.is_empty()
-        || normalized.len() > MAX_LOGIN_EMAIL_BYTES
-        || normalized.chars().any(char::is_whitespace)
-        || normalized.chars().any(char::is_control)
-    {
-        return None;
-    }
+    normalize_user_email(email)
+}
 
-    let (local, domain) = normalized.split_once('@')?;
-    if local.is_empty()
-        || local.len() > 64
-        || domain.is_empty()
-        || domain.contains('@')
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-    {
-        return None;
-    }
-
-    Some(normalized)
+fn parse_user_roles(role_names: &[String]) -> Result<Vec<RoleType>, UserServiceError> {
+    role_names
+        .iter()
+        .map(|role| {
+            RoleType::from_str(role).map_err(|_| {
+                UserServiceError::Validation(format!(
+                    "Unsupported role '{role}'. Expected one of: admin, user"
+                ))
+            })
+        })
+        .collect()
 }
 
 async fn record_login_failure(
@@ -127,6 +120,32 @@ async fn record_mfa_rejection(
         error!(
             user_id,
             reason, "Failed to record MFA rejection audit event: {}", error
+        );
+    }
+}
+
+async fn record_pending_login(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    login_method: &'static str,
+) {
+    if let Err(error) = state
+        .audit_service
+        .create_audit_log(&LoginAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            success: true,
+            login_method: login_method.to_string(),
+        })
+        .await
+    {
+        error!(
+            user_id,
+            login_method, "Failed to record pending login audit event: {}", error
         );
     }
 }
@@ -629,6 +648,7 @@ pub async fn verify_step_up(
         email_status,
         request_password_reset,
         reset_password,
+        change_required_password,
         verify_email,
         list_users,
         create_user,
@@ -663,6 +683,8 @@ pub async fn verify_step_up(
             LoginRequest,
             EmailRequest,
             ResetPasswordRequest,
+            RequiredPasswordChangeRequest,
+            RequiredPasswordChangeResponse,
             AuthResponse,
             EmailStatusResponse,
             crate::oidc_types::OidcProviderSummary,
@@ -723,6 +745,10 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         )
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
+        .route(
+            "/auth/password-change-required",
+            post(change_required_password),
+        )
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
@@ -800,6 +826,11 @@ pub struct ResetPasswordRequest {
     pub new_password: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RequiredPasswordChangeRequest {
+    pub new_password: String,
+}
+
 // Implement From traits for conversions
 impl From<RegisterRequest> for crate::auth_service::RegisterRequest {
     fn from(req: RegisterRequest) -> Self {
@@ -835,6 +866,18 @@ pub struct AuthResponse {
     pub message: String,
     pub user_id: Option<i32>,
     pub mfa_required: bool,
+    pub mfa_enrollment_required: bool,
+    pub mfa_setup: Option<MfaSetupResponse>,
+    pub password_change_required: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RequiredPasswordChangeResponse {
+    pub success: bool,
+    pub message: String,
+    pub user_id: i32,
+    pub mfa_enrollment_required: bool,
+    pub mfa_setup: Option<MfaSetupResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -905,6 +948,9 @@ pub async fn register(
                     message: "User created successfully".to_string(),
                     user_id: Some(user.id),
                     mfa_required: false,
+                    mfa_enrollment_required: false,
+                    mfa_setup: None,
+                    password_change_required: false,
                 }),
             ))
         }
@@ -958,6 +1004,87 @@ pub async fn login(
 
     match state.auth_service.login(request.into()).await {
         Ok(user) => {
+            if user.must_change_password {
+                let reset_token = state
+                    .auth_service
+                    .create_required_password_change_token(user.id)
+                    .await
+                    .map_err(|error| {
+                        error!(
+                            user_id = user.id,
+                            error = %error,
+                            "Failed to create required password-change session"
+                        );
+                        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Authentication Error")
+                            .with_detail(
+                                "Could not start the required password change. Please try again.",
+                            )
+                    })?;
+
+                let encrypted_token =
+                    state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
+                        error!(
+                            user_id = user.id,
+                            error = %error,
+                            "Failed to encrypt required password-change session"
+                        );
+                        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .with_title("Authentication Error")
+                            .with_detail(
+                                "Could not secure the required password change. Please try again.",
+                            )
+                    })?;
+
+                let password_change_cookie =
+                    Cookie::build(("password_change_session", encrypted_token))
+                        .http_only(true)
+                        .path("/")
+                        .max_age(cookie::time::Duration::minutes(15))
+                        .same_site(cookie::SameSite::Strict)
+                        .secure(metadata.is_secure)
+                        .build();
+                let cookie_header =
+                    password_change_cookie
+                        .to_string()
+                        .parse()
+                        .map_err(|error| {
+                            error!(
+                                user_id = user.id,
+                                error = %error,
+                                "Failed to create required password-change cookie header"
+                            );
+                            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Authentication Error")
+                        .with_detail(
+                            "Could not secure the required password change. Please try again.",
+                        )
+                        })?;
+                let mut headers = HeaderMap::new();
+                headers.insert(SET_COOKIE, cookie_header);
+
+                record_pending_login(
+                    state.as_ref(),
+                    &metadata,
+                    user.id,
+                    "password-change-required",
+                )
+                .await;
+
+                return Ok((
+                    headers,
+                    Json(AuthResponse {
+                        success: false,
+                        message: "Password change required".to_string(),
+                        user_id: Some(user.id),
+                        mfa_required: false,
+                        mfa_enrollment_required: false,
+                        mfa_setup: None,
+                        password_change_required: true,
+                    }),
+                ));
+            }
+
             // Check if user has MFA enabled
             if user.mfa_enabled {
                 // Create temporary MFA session
@@ -1025,6 +1152,9 @@ pub async fn login(
                                 message: "MFA authentication required".to_string(),
                                 user_id: None,
                                 mfa_required: true,
+                                mfa_enrollment_required: false,
+                                mfa_setup: None,
+                                password_change_required: false,
                             }),
                         ))
                     }
@@ -1131,6 +1261,9 @@ pub async fn login(
                                 message: "Login successful".to_string(),
                                 user_id: Some(user.id),
                                 mfa_required: false,
+                                mfa_enrollment_required: false,
+                                mfa_setup: None,
+                                password_change_required: false,
                             }),
                         ))
                     }
@@ -1176,32 +1309,70 @@ pub async fn login(
                     .with_detail("Invalid email or password."))
             }
             crate::auth_service::UserAuthError::MfaRequiredForRole { user_id, role } => {
-                // Deliberately the *same* status/title/detail as
-                // InvalidCredentials above -- this error is only reachable
-                // after the password has already been verified correct, so
-                // a distinguishable response here would let an attacker use
-                // login attempts as an oracle to confirm a guessed admin
-                // password (and that the account holds the Admin role)
-                // without ever completing a login. The real reason is only
-                // ever surfaced server-side via this log line.
                 warn!(
                     user_id,
                     role = %role,
                     email = %login_email,
-                    "Login blocked: MFA is required for this role but is not enrolled"
+                    "Starting required MFA enrollment for role"
                 );
-                record_login_failure(
+                let setup = state.user_service.setup_mfa(user_id).await.map_err(|error| {
+                    error!(user_id, error = %error, "Failed to prepare resumable MFA enrollment");
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("MFA Enrollment Failed")
+                        .with_detail("Could not start MFA enrollment. Please try again.")
+                })?;
+                let mfa_token = state.auth_service.create_mfa_session(user_id).await.map_err(|error| {
+                    error!(user_id, error = %error, "Failed to create MFA enrollment challenge");
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("MFA Enrollment Failed")
+                        .with_detail("Could not start MFA enrollment. Please try again.")
+                })?;
+                let encrypted_token = state.cookie_crypto.encrypt(&mfa_token).map_err(|error| {
+                    error!(user_id, error = %error, "Failed to encrypt MFA enrollment challenge");
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("MFA Enrollment Failed")
+                        .with_detail("Could not start MFA enrollment. Please try again.")
+                })?;
+                let mfa_cookie = Cookie::build(("mfa_session", encrypted_token))
+                    .http_only(true)
+                    .path("/")
+                    .max_age(cookie::time::Duration::minutes(5))
+                    .same_site(cookie::SameSite::Strict)
+                    .secure(metadata.is_secure)
+                    .build();
+                let cookie_header = mfa_cookie.to_string().parse().map_err(|error| {
+                    error!(user_id, error = %error, "Failed to create MFA enrollment cookie");
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("MFA Enrollment Failed")
+                        .with_detail("Could not start MFA enrollment. Please try again.")
+                })?;
+                let mut headers = HeaderMap::new();
+                headers.insert(SET_COOKIE, cookie_header);
+
+                record_pending_login(
                     state.as_ref(),
                     &metadata,
-                    Some(user_id),
-                    &login_email,
-                    "password",
-                    "mfa_required_for_role",
+                    user_id,
+                    "password-mfa-enrollment-pending",
                 )
                 .await;
-                Err(problem_new(StatusCode::UNAUTHORIZED)
-                    .with_title("Invalid Credentials")
-                    .with_detail("Invalid email or password."))
+
+                Ok((
+                    headers,
+                    Json(AuthResponse {
+                        success: false,
+                        message: "Multi-factor authentication setup required".to_string(),
+                        user_id: Some(user_id),
+                        mfa_required: false,
+                        mfa_enrollment_required: true,
+                        mfa_setup: Some(MfaSetupResponse {
+                            secret_key: setup.secret_key,
+                            qr_code: setup.qr_code,
+                            recovery_codes: setup.recovery_codes,
+                        }),
+                        password_change_required: false,
+                    }),
+                ))
             }
             _ => {
                 // Log the real error server-side (email is PII but legitimate
@@ -1284,6 +1455,9 @@ pub async fn request_password_reset(
                         .to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
     }
@@ -1333,12 +1507,175 @@ pub async fn reset_password(
                     .to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
-        Err(e) => Err(problem_new(StatusCode::BAD_REQUEST)
-            .with_title("Password Reset Failed")
-            .with_detail(e.to_string())),
+        Err(crate::auth_service::UserAuthError::InvalidToken) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Password Reset Failed")
+                .with_detail("The password reset link is invalid or expired."))
+        }
+        Err(crate::auth_service::UserAuthError::WeakPassword(message)) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Password Requirements Not Met")
+                .with_detail(message))
+        }
+        Err(crate::auth_service::UserAuthError::SamePassword) => {
+            Err(problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Choose a Different Password")
+                .with_detail("Your new password must differ from the temporary password."))
+        }
+        Err(error) => {
+            error!(error = %error, "Password reset failed internally");
+            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Password Reset Failed")
+                .with_detail("Could not reset the password. Please try again."))
+        }
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/password-change-required",
+    request_body = RequiredPasswordChangeRequest,
+    responses(
+        (status = 200, description = "Required password change completed", body = RequiredPasswordChangeResponse),
+        (status = 400, description = "Password does not meet requirements"),
+        (status = 401, description = "Password-change session is missing or expired"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Authentication"
+)]
+pub async fn change_required_password(
+    State(state): State<Arc<AuthState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+    Json(request): Json<RequiredPasswordChangeRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    let encrypted_token = headers
+        .get_all("Cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookie_header| Cookie::split_parse(cookie_header).filter_map(Result::ok))
+        .find_map(|cookie| {
+            (cookie.name() == "password_change_session").then(|| cookie.value().to_string())
+        })
+        .ok_or_else(|| {
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Required")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    let token = state
+        .cookie_crypto
+        .decrypt(&encrypted_token)
+        .map_err(|error| {
+            warn!(error = %error, "Rejected invalid required password-change cookie");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Expired")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    let pending_user = state
+        .auth_service
+        .required_password_change_user(&token)
+        .await
+        .map_err(|error| {
+            error!(error = %error, "Failed to resolve required password-change session");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Password Change Session Expired")
+                .with_detail("Log in again to restart the required password change.")
+        })?;
+
+    // Prepare the response cookie before changing the password. If header
+    // construction fails, the temporary credential remains usable and the
+    // user can safely retry instead of being locked out.
+    let clear_cookie = Cookie::build(("password_change_session", ""))
+        .http_only(true)
+        .path("/")
+        .max_age(cookie::time::Duration::seconds(0))
+        .same_site(cookie::SameSite::Strict)
+        .secure(metadata.is_secure)
+        .build();
+    let cookie_header = clear_cookie.to_string().parse().map_err(|error| {
+        error!(error = %error, "Failed to clear required password-change cookie");
+        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Password Change Failed")
+            .with_detail("Could not prepare the password change. Please try again.")
+    })?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.append(SET_COOKIE, cookie_header);
+
+    let requires_mfa_enrollment = state
+        .auth_service
+        .requires_mfa_enrollment(pending_user.id)
+        .await
+        .map_err(|error| {
+            error!(user_id = pending_user.id, error = %error, "Failed to evaluate MFA enrollment policy");
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Password Change Failed")
+                .with_detail("Could not prepare required MFA enrollment. Please try again.")
+        })?;
+
+    let user = state
+        .auth_service
+        .reset_required_password(crate::auth_service::ResetPasswordRequest {
+            token,
+            new_password: request.new_password,
+        })
+        .await
+        .map_err(|error| match error {
+            crate::auth_service::UserAuthError::WeakPassword(message) => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Password Requirements Not Met")
+                    .with_detail(message)
+            }
+            crate::auth_service::UserAuthError::SamePassword => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Choose a Different Password")
+                    .with_detail("Your new password must differ from the temporary password.")
+            }
+            crate::auth_service::UserAuthError::InvalidToken => {
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Password Change Session Expired")
+                    .with_detail("Log in again to restart the required password change.")
+            }
+            internal_error => {
+                error!(error = %internal_error, "Required password change failed internally");
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Password Change Failed")
+                    .with_detail("Could not change the password. Please try again.")
+            }
+        })?;
+
+    let audit = PasswordResetAudit {
+        context: AuditContext {
+            user_id: user.id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        username: user.name,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!(user_id = user.id, error = %error, "Failed to audit required password change");
+    }
+
+    Ok((
+        response_headers,
+        Json(RequiredPasswordChangeResponse {
+            success: true,
+            message: if requires_mfa_enrollment {
+                "Password changed. Log in to set up multi-factor authentication.".to_string()
+            } else {
+                "Password changed. Log in with your new password.".to_string()
+            },
+            user_id: user.id,
+            mfa_enrollment_required: requires_mfa_enrollment,
+            mfa_setup: None,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -1387,6 +1724,9 @@ pub async fn verify_email(
                 message: "Email verified successfully. You can now login.".to_string(),
                 user_id: None,
                 mfa_required: false,
+                mfa_enrollment_required: false,
+                mfa_setup: None,
+                password_change_required: false,
             }))
         }
         Err(e) => Err(problem_new(StatusCode::BAD_REQUEST)
@@ -1422,6 +1762,12 @@ impl From<UserServiceError> for Problem {
             UserServiceError::MfaNotSetup(user_id) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("MFA not setup")
                 .with_detail(format!("MFA is not setup for user {}", user_id)),
+            UserServiceError::MfaAlreadyEnabled(user_id) => problem_new(StatusCode::CONFLICT)
+                .with_title("MFA already enabled")
+                .with_detail(format!(
+                    "MFA is already enabled for user {}. Disable it with current MFA verification before setting it up again.",
+                    user_id
+                )),
             UserServiceError::AlreadyDeleted(user_id) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("User already deleted")
                 .with_detail(format!("User {} is already deleted", user_id)),
@@ -1746,12 +2092,9 @@ async fn create_user(
         warn!("No password provided for new user - user will not be able to login with password!");
     }
 
-    // Convert role strings to RoleTypes
-    let roles: Vec<RoleType> = create_req
-        .roles
-        .iter()
-        .filter_map(|r| RoleType::from_str(r).ok())
-        .collect();
+    // Reject the entire request if any role is unknown. Silently discarding a
+    // role can create a different account than the administrator approved.
+    let roles = parse_user_roles(&create_req.roles)?;
 
     let user = app_state
         .user_service
@@ -1760,6 +2103,7 @@ async fn create_user(
             create_req.email.clone().unwrap_or("".to_string()),
             create_req.password.clone(),
             roles.clone(),
+            create_req.must_change_password,
         )
         .await?;
 
@@ -1775,7 +2119,7 @@ async fn create_user(
     let user_audit = UserCreatedAudit {
         context: audit_context,
         target_user_id: user.user.id,
-        username: create_req.username.clone(),
+        username: user.user.name.clone(),
         assigned_roles: roles.iter().map(|r| r.to_string()).collect(),
     };
 
@@ -2155,6 +2499,7 @@ async fn restore_user(
     responses(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -2394,15 +2739,17 @@ async fn disable_mfa(
 mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
-        create_user, delete_user, login, normalized_login_email, remove_role, restore_user,
-        update_user, verify_mfa_challenge, AdminTargetDenied, AssignRoleRequest, CreateUserRequest,
-        LoginRequest, RoleChangeDenied, UpdateUserRequest,
+        create_user, delete_user, login, normalized_login_email, parse_user_roles,
+        record_pending_login, remove_role, restore_user, update_user, verify_mfa_challenge,
+        AdminTargetDenied, AssignRoleRequest, CreateUserRequest, LoginRequest, RoleChangeDenied,
+        UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
     use crate::permissions::{Permission, Role};
     use crate::state::AuthState;
     use crate::types::MfaVerificationRequest;
+    use crate::user_service::UserServiceError;
     use crate::RequireAuth;
     use async_trait::async_trait;
     use axum::extract::{Path, State};
@@ -2416,6 +2763,7 @@ mod tests {
         EmailMessage, NotificationData, NotificationError, NotificationService,
     };
     use temps_core::{AuditLogger, RequestMetadata};
+    use temps_entities::types::RoleType;
     use temps_entities::{roles, sessions, user_roles, users};
 
     // Regression tests for the user-management privilege-escalation hole. The
@@ -2440,6 +2788,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -2643,6 +2992,18 @@ mod tests {
         assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
     }
 
+    #[test]
+    fn create_user_roles_are_strictly_validated() {
+        assert_eq!(
+            parse_user_roles(&["user".to_string(), "admin".to_string()])
+                .expect("known roles should parse"),
+            vec![RoleType::User, RoleType::Admin]
+        );
+
+        let result = parse_user_roles(&["user".to_string(), "administrator".to_string()]);
+        assert!(matches!(result, Err(UserServiceError::Validation(_))));
+    }
+
     #[tokio::test]
     async fn invalid_login_identifier_is_audited_without_querying_the_database() {
         let audit = Arc::new(RecordingAuditLogger::default());
@@ -2704,6 +3065,53 @@ mod tests {
             ),
             StatusCode::UNAUTHORIZED,
         );
+    }
+
+    #[tokio::test]
+    async fn pending_password_and_mfa_logins_are_durably_audited() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            audit.clone(),
+        );
+        let metadata = request_metadata();
+
+        record_pending_login(state.as_ref(), &metadata, 41, "password-change-required").await;
+        record_pending_login(
+            state.as_ref(),
+            &metadata,
+            42,
+            "password-mfa-enrollment-pending",
+        )
+        .await;
+
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[0].user_id, Some(41));
+        assert_eq!(events[0].data["login_method"], "password-change-required");
+        assert_eq!(events[1].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[1].user_id, Some(42));
+        assert_eq!(
+            events[1].data["login_method"],
+            "password-mfa-enrollment-pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_login_audit_failure_does_not_block_authentication_progress() {
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            Arc::new(FailingAuditLogger),
+        );
+
+        record_pending_login(
+            state.as_ref(),
+            &request_metadata(),
+            41,
+            "password-change-required",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3063,6 +3471,7 @@ mod tests {
                     // Requesting the admin role is the case the gate must stop a
                     // restricted credential from performing.
                     roles: vec!["admin".to_string()],
+                    must_change_password: true,
                 }),
             )
             .await;

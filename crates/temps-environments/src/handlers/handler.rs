@@ -1,7 +1,7 @@
 use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
-    EnvironmentVariableValueRevealedAudit,
+    EnvironmentVariablePromotedToSecretAudit, EnvironmentVariableValueRevealedAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -64,6 +64,7 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .build()
             }
             EnvVarError::CannotDemoteSecret { .. } => temps_core::error_builder::bad_request()
+                .title("Secret cannot be converted back to a regular variable")
                 .detail(err.to_string())
                 .build(),
             EnvVarError::SecretValueRequired { .. } => temps_core::error_builder::bad_request()
@@ -893,6 +894,7 @@ pub async fn update_environment_variable(
     State(state): State<Arc<AppState>>,
     Path((project_id, var_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateEnvironmentVariableRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
@@ -903,7 +905,7 @@ pub async fn update_environment_variable(
     );
     project_scope_guard!(auth, project_id);
 
-    let var = state
+    let outcome = state
         .env_var_service
         .update_environment_variable(
             project_id,
@@ -915,6 +917,34 @@ pub async fn update_environment_variable(
             request.is_secret,
         )
         .await?;
+    let var = outcome.var;
+
+    // Converting a variable to a secret is irreversible and removes the value
+    // from every read path — audit it explicitly.
+    if outcome.promoted_to_secret {
+        info!(
+            user_id = auth.user_id(),
+            project_id,
+            var_id,
+            environment_variable_key = %var.key,
+            "Environment variable promoted to write-only secret"
+        );
+
+        let audit = EnvironmentVariablePromotedToSecretAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id,
+            var_id,
+            key: var.key.clone(),
+            environment_ids: var.environments.iter().map(|env| env.id).collect(),
+        };
+        if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log: {}", e);
+        }
+    }
 
     let response = EnvironmentVariableResponse {
         id: var.id,
@@ -2311,6 +2341,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,

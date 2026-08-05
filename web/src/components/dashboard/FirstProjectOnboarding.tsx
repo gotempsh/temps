@@ -1,4 +1,4 @@
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import {
   Activity,
   ArrowRight,
@@ -6,6 +6,8 @@ import {
   BookOpen,
   Bug,
   Database,
+  FileArchive,
+  FolderOpen,
   GitBranch,
   Mail,
   Network,
@@ -14,11 +16,14 @@ import {
   Terminal,
   UploadCloud,
 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ConnectionList } from '@/components/dashboard/ConnectionList'
 import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
 import { cn } from '@/lib/utils'
+import { filesFromDrop, filesFromInput } from '@/lib/drop-files'
+import { handOffDropFiles } from '@/lib/drop-handoff'
 
 interface FirstProjectOnboardingProps {
   /**
@@ -227,28 +232,125 @@ export function FirstProjectOnboarding({
             </ol>
           </div>
 
-          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted">
-                <UploadCloud className="h-4 w-4 text-muted-foreground" />
-              </div>
-              <div className="min-w-0">
-                <h4 className="text-sm font-semibold">Drop project files</h4>
-                <p className="text-xs text-muted-foreground">
-                  Upload a folder or ZIP; Temps detects and builds it
-                </p>
-              </div>
-            </div>
-            <p className="mt-3 flex-1 text-sm leading-6 text-muted-foreground">
-              Create and deploy a project directly from your browser without a
-              repository or local CLI setup.
-            </p>
-            <Button asChild variant="outline" className="mt-4">
-              <Link to="/drop">Open Drop</Link>
-            </Button>
-          </div>
+          <EmptyStateDropCard />
         </div>
       </section>
+    </div>
+  )
+}
+
+function EmptyStateDropCard() {
+  const navigate = useNavigate()
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  const zipInputRef = useRef<HTMLInputElement>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    folderInputRef.current?.setAttribute('webkitdirectory', '')
+  }, [])
+
+  const continueToDrop = (files: ReturnType<typeof filesFromInput>) => {
+    if (files.length === 0) return
+    handOffDropFiles(files)
+    navigate('/drop')
+  }
+
+  return (
+    <div
+      className={cn(
+        'group flex flex-col rounded-xl border bg-background p-4 text-left transition-colors sm:p-5',
+        isDragging && 'border-primary bg-primary/5'
+      )}
+      onDragEnter={(event) => {
+        event.preventDefault()
+        setIsDragging(true)
+      }}
+      onDragOver={(event) => event.preventDefault()}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+          setIsDragging(false)
+        }
+      }}
+      onDrop={async (event) => {
+        event.preventDefault()
+        setIsDragging(false)
+        setError(null)
+        try {
+          const files = await filesFromDrop(event)
+          if (files.length === 0)
+            throw new Error('Choose a project folder or ZIP')
+          handOffDropFiles(files)
+          navigate('/drop')
+        } catch (caught) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : 'Those project files could not be read'
+          )
+        }
+      }}
+    >
+      <div className="flex items-center gap-2.5">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted transition-colors group-hover:bg-primary/10">
+          <UploadCloud className="h-4 w-4 text-muted-foreground group-hover:text-primary" />
+        </div>
+        <div className="min-w-0">
+          <h4 className="text-sm font-semibold">Drop project files</h4>
+          <p className="text-xs text-muted-foreground">
+            Package locally, then detect on this Temps instance
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-1 flex-col justify-center rounded-lg border border-dashed border-border/80 bg-muted/20 p-4 text-center transition-colors group-hover:border-muted-foreground/50">
+        <p className="text-sm font-medium">
+          {isDragging
+            ? 'Release to inspect your project'
+            : 'Drop a folder or ZIP here'}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Common secret files are excluded before the archive is uploaded for
+          preset detection.
+        </p>
+        <div className="mt-4 grid gap-2 sm:grid-cols-2">
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => folderInputRef.current?.click()}
+          >
+            <FolderOpen className="size-4" /> Open folder
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => zipInputRef.current?.click()}
+          >
+            <FileArchive className="size-4" /> Upload ZIP
+          </Button>
+        </div>
+      </div>
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <Button asChild variant="ghost" size="sm" className="mt-2">
+        <Link to="/drop">Open Drop without files</Link>
+      </Button>
+
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(event) => continueToDrop(filesFromInput(event.target.files))}
+      />
+      <input
+        ref={zipInputRef}
+        type="file"
+        accept=".zip,application/zip"
+        className="hidden"
+        onChange={(event) => continueToDrop(filesFromInput(event.target.files))}
+      />
     </div>
   )
 }

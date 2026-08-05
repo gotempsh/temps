@@ -296,6 +296,70 @@ async fn complete_oidc_login(
 
     let return_to = OidcService::sanitize_return_to(login_state.return_to);
 
+    if user.must_change_password {
+        let reset_token = state
+            .auth_service
+            .create_required_password_change_token(user.id)
+            .await
+            .map_err(|error| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to create required password-change session for user {}: {error}",
+                    user.id
+                ),
+            })?;
+        let encrypted_token = state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
+            OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to encrypt required password-change session for user {}: {error}",
+                    user.id
+                ),
+            }
+        })?;
+        let password_change_cookie = Cookie::build(("password_change_session", encrypted_token))
+            .http_only(true)
+            .path("/")
+            .max_age(cookie::time::Duration::minutes(15))
+            .same_site(cookie::SameSite::Strict)
+            .secure(metadata.is_secure)
+            .build();
+        let cookie_header = password_change_cookie
+            .to_string()
+            .parse()
+            .map_err(|error| OidcError::DiscoveryFailed {
+                issuer: provider.issuer_url.clone(),
+                reason: format!(
+                    "failed to build required password-change cookie for user {}: {error}",
+                    user.id
+                ),
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(SET_COOKIE, cookie_header);
+
+        if let Err(error) = state
+            .audit_service
+            .create_audit_log(&LoginAudit {
+                context: AuditContext {
+                    user_id: user.id,
+                    ip_address: Some(metadata.ip_address.to_string()),
+                    user_agent: metadata.user_agent.as_str().to_string(),
+                },
+                success: true,
+                login_method: "oidc-password-change-required".to_string(),
+            })
+            .await
+        {
+            error!(
+                user_id = user.id,
+                error = %error,
+                "Failed to audit OIDC required password-change redirect"
+            );
+        }
+
+        return Ok((headers, Redirect::to("/auth/change-password")).into_response());
+    }
+
     if user.mfa_enabled {
         let mfa_token = state
             .auth_service
