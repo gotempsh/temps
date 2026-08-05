@@ -206,6 +206,22 @@ fn run_status_is_terminal(status: Option<&str>) -> bool {
         .unwrap_or(true)
 }
 
+/// The container-name suffix for a standalone sandbox: the `public_id` with
+/// its `sbx_` prefix stripped.
+///
+/// The same label the preview hostname embeds, so the gateway can
+/// DNS-resolve `temps-sandbox-<label>` straight from the URL — and, because
+/// the Docker provider derives the home volume name from the container
+/// name, the thing that decides which volume this sandbox owns. Extracted
+/// so `sandbox_service_and_provider_agree_on_volume_naming` can pin the
+/// cross-crate half of that agreement; the original leak was exactly two
+/// places deriving one identity independently.
+fn container_label_for(public_id_value: &str) -> &str {
+    public_id_value
+        .strip_prefix(public_id::PUBLIC_ID_PREFIX)
+        .unwrap_or(public_id_value)
+}
+
 /// Which host directory (if any) `destroy_sandbox` may recursively delete
 /// for a given public id.
 ///
@@ -669,13 +685,7 @@ impl SandboxService {
             });
         }
 
-        // Use the hex-only label (strip `sbx_`) as the container name
-        // suffix — same label the preview hostname embeds so the gateway
-        // can DNS-resolve `temps-sandbox-<label>` directly from the URL.
-        let container_label = public_id_value
-            .strip_prefix("sbx_")
-            .unwrap_or(&public_id_value)
-            .to_string();
+        let container_label = container_label_for(&public_id_value).to_string();
 
         let config = SandboxCreateConfig {
             owner_user_id: None,
@@ -697,6 +707,15 @@ impl SandboxService {
         let handle = match self.registry.create(config).await {
             Ok(h) => h,
             Err(e) => {
+                // Tear the container down before touching the work dir.
+                // A provider `create` can fail *after* the container is
+                // running — the ownership-normalisation step propagates its
+                // error — and containers carry `restart_policy: unless-stopped`,
+                // so skipping this leaves a live container holding the
+                // caller's env vars, unreachable through the API once the
+                // row is destroyed, with its /workspace deleted underneath
+                // it. Same order as the seeding-failure arm below.
+                let _ = self.registry.destroy(row.id, &public_id_value).await;
                 // The work dir was already created above; without this the
                 // row goes to "destroyed" and no later `destroy_sandbox`
                 // can ever reach the directory again.
@@ -1695,6 +1714,34 @@ mod tests {
         }
     }
 
+    /// The cross-crate half of the naming agreement.
+    ///
+    /// `temps-sandbox` decides the container label; `temps-agents` turns a
+    /// container name into a volume name. Nothing at the type level forces
+    /// those to line up, and the leak this PR fixes was exactly one identity
+    /// derived independently in two places. If either side changes its
+    /// scheme without the other, this goes red — and it needs no Docker.
+    #[test]
+    fn sandbox_service_and_provider_agree_on_volume_naming() {
+        let public_id = "sbx_a1b2c3d4e5f60718";
+        let label = container_label_for(public_id);
+        assert_eq!(label, "a1b2c3d4e5f60718", "label is public_id minus sbx_");
+
+        // What the provider will name the volume for a container built from
+        // this label, i.e. what `destroy` will try to remove.
+        assert_eq!(
+            temps_agents::sandbox::home_volume_name_for_label(label),
+            "temps-sandbox-home-v2-a1b2c3d4e5f60718"
+        );
+
+        // And it must not be a name from the pre-fix namespace, where a
+        // stranded volume from another tenant could still be sitting.
+        assert!(!temps_agents::sandbox::home_volume_name_for_label(label)
+            .trim_start_matches("temps-sandbox-home-")
+            .chars()
+            .all(|c| c.is_ascii_digit()));
+    }
+
     #[test]
     fn timeout_constants_are_sane() {
         const _: () = assert!(MIN_TIMEOUT_SECS < DEFAULT_TIMEOUT_SECS);
@@ -1800,5 +1847,498 @@ mod tests {
         assert_eq!(s.status, "running");
         assert_eq!(s.image.as_deref(), Some("node:20"));
         assert_eq!(s.agent_run_id, Some(42));
+    }
+}
+
+/// Service-level tests for the storage-cleanup paths.
+///
+/// These exist because the unit tests above only cover the *guard*
+/// (`work_dir_to_remove`), not the call sites — and the call sites are where
+/// the bug was. Deleting the `remove_work_dir` call from `destroy_sandbox`,
+/// or from either create-failure arm, used to leave every test green.
+///
+/// No Docker daemon required: the provider is faked and the database is
+/// `MockDatabase`. The work dir is real, under a unique temp directory, so
+/// a `remove_dir_all` → `remove_dir` regression (non-recursive) fails here.
+#[cfg(test)]
+mod storage_cleanup_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_agents::error::AgentError;
+    use temps_agents::sandbox::{
+        SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
+    };
+
+    /// Minimal provider. Each knob corresponds to a failure the service is
+    /// supposed to clean up after.
+    struct FakeProvider {
+        /// `create` fails — the provider-failure arm of `create_sandbox`.
+        fail_create: bool,
+        /// `exec` returns a non-zero exit — the seeding-failure arm.
+        fail_exec: bool,
+        /// `destroy` errors — the case where the container may still be
+        /// running and we delete the work dir anyway.
+        fail_destroy: bool,
+        destroys: AtomicUsize,
+    }
+
+    impl FakeProvider {
+        fn new() -> Self {
+            Self {
+                fail_create: false,
+                fail_exec: false,
+                fail_destroy: false,
+                destroys: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    fn handle_for(name: &str) -> SandboxHandle {
+        SandboxHandle {
+            sandbox_id: format!("docker-id-{}", name),
+            sandbox_name: format!("temps-sandbox-{}", name),
+            work_dir: PathBuf::from("/workspace"),
+            backend: SandboxBackend::Docker,
+            image: String::new(),
+        }
+    }
+
+    #[async_trait]
+    impl SandboxProvider for FakeProvider {
+        async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            if self.fail_create {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "fake".into(),
+                    reason: "image pull failed".into(),
+                });
+            }
+            Ok(handle_for(
+                config.container_name_override.as_deref().unwrap_or("x"),
+            ))
+        }
+
+        async fn exec(
+            &self,
+            _handle: &SandboxHandle,
+            _cmd: Vec<String>,
+            _env: HashMap<String, String>,
+            _on_output: Option<temps_agents::ai_cli::OnEventCallback>,
+        ) -> Result<SandboxExecResult, AgentError> {
+            Ok(SandboxExecResult {
+                exit_code: if self.fail_exec { 1 } else { 0 },
+                stdout: String::new(),
+                stderr: if self.fail_exec {
+                    "clone failed".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+
+        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &SandboxHandle,
+            _local_dir: &std::path::Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn kill_processes(
+            &self,
+            _handle: &SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn destroy(
+            &self,
+            handle: &SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            self.destroys.fetch_add(1, Ordering::SeqCst);
+            if self.fail_destroy {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: format!(
+                        "daemon unreachable while destroying {}",
+                        handle.sandbox_name
+                    ),
+                });
+            }
+            Ok(())
+        }
+
+        async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+
+        async fn recover_by_name(
+            &self,
+            container_name: &str,
+        ) -> Result<Option<SandboxHandle>, AgentError> {
+            Ok(Some(handle_for(container_name)))
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "fake:latest".into()))
+        }
+
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("fake:latest".into())
+        }
+    }
+
+    /// A `ServerConfig` built by struct literal rather than `ServerConfig::new`,
+    /// which has filesystem side effects (creates `~/.temps` and writes an
+    /// auth secret + encryption key). A test must not touch the developer's
+    /// real data dir.
+    fn test_server_config(data_dir: PathBuf) -> temps_config::ServerConfig {
+        temps_config::ServerConfig {
+            address: "127.0.0.1:3000".into(),
+            database_url: "postgresql://test".into(),
+            tls_address: None,
+            console_address: "127.0.0.1:3001".into(),
+            console_admin_address: None,
+            admin_allowed_ips: Vec::new(),
+            admin_allowed_hosts: Vec::new(),
+            admin_trust_forwarded_for: false,
+            data_dir,
+            auth_secret: "test-auth-secret".into(),
+            encryption_key: "0123456789abcdef0123456789abcdef\
+                             0123456789abcdef0123456789abcdef"
+                .into(),
+            api_base_url: "http://127.0.0.1:3000".into(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
+        }
+    }
+
+    struct PanicOnSendJobQueue;
+
+    #[async_trait]
+    impl temps_core::JobQueue for PanicOnSendJobQueue {
+        async fn send(&self, job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            panic!("no job should be queued in these tests, got: {job:?}");
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            panic!("subscribe not needed for these tests")
+        }
+    }
+
+    /// A unique data root per test so concurrent tests can't collide.
+    fn unique_data_root(tag: &str) -> PathBuf {
+        let uniq = std::process::id() as u64
+            + std::sync::atomic::AtomicU64::new(0).fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("temps-sbx-test-{}-{}", tag, uniq))
+    }
+
+    fn build_service(
+        db: sea_orm::DatabaseConnection,
+        provider: FakeProvider,
+        data_root: PathBuf,
+    ) -> (Arc<SandboxService>, Arc<StandaloneSandboxRegistry>) {
+        let db = Arc::new(db);
+        let registry = Arc::new(StandaloneSandboxRegistry::new(
+            Arc::new(provider) as Arc<dyn SandboxProvider>
+        ));
+        let config = Arc::new(temps_config::ConfigService::new(
+            Arc::new(test_server_config(data_root.clone())),
+            db.clone(),
+        ));
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+        let git = Arc::new(GitProviderManager::new(
+            db.clone(),
+            encryption,
+            Arc::new(PanicOnSendJobQueue) as Arc<dyn temps_core::JobQueue>,
+            config.clone(),
+        ));
+        let service = Arc::new(SandboxService::new(
+            db,
+            registry.clone(),
+            Arc::new(JobTracker::new()),
+            config,
+            git,
+            data_root,
+        ));
+        (service, registry)
+    }
+
+    fn row(public_id: &str, agent_run_id: Option<i32>) -> sandboxes::Model {
+        let now = Utc::now();
+        sandboxes::Model {
+            id: 7,
+            public_id: public_id.to_string(),
+            user_id: Some(1),
+            agent_run_id,
+            name: "sbx-7".into(),
+            status: "running".into(),
+            image: None,
+            work_dir: "/workspace".into(),
+            timeout_secs: 3600,
+            metadata: None,
+            backend: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+            preview_password_hash: None,
+            preview_password_hint: None,
+        }
+    }
+
+    /// Seed a work dir with nested, non-empty content — a shallow
+    /// `remove_dir` would fail on this, a recursive delete succeeds.
+    fn seed_work_dir(data_root: &Path, public_id: &str) -> PathBuf {
+        let dir = data_root.join(public_id);
+        let nested = dir.join("node_modules").join("pkg");
+        std::fs::create_dir_all(&nested).expect("seed work dir");
+        std::fs::write(nested.join("index.js"), b"module.exports = {}").expect("seed file");
+        dir
+    }
+
+    const PUBLIC_ID: &str = "sbx_deadbeef01234567";
+
+    #[tokio::test]
+    async fn destroy_sandbox_removes_the_work_dir() {
+        let data_root = unique_data_root("destroy-ok");
+        let dir = seed_work_dir(&data_root, PUBLIC_ID);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // find_by_public_id
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // record_event insert (RETURNING)
+            .append_query_results([vec![sandbox_events::Model {
+                id: 1,
+                sandbox_id: 7,
+                event_type: "destroyed".into(),
+                detail: None,
+                created_at: Utc::now(),
+            }]])
+            // mark_destroyed update (RETURNING)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        service
+            .destroy_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect("destroy should succeed");
+
+        assert!(
+            !dir.exists(),
+            "destroy must remove the work dir {} — nothing else ever will, \
+             so leaving it is a permanent leak",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The documented tradeoff: with no background sweep, skipping cleanup
+    /// when the provider destroy fails would leak the directory forever, so
+    /// we delete regardless. If someone reintroduces a `container_gone`
+    /// guard around the call, this goes red.
+    #[tokio::test]
+    async fn destroy_sandbox_removes_the_work_dir_even_when_provider_destroy_fails() {
+        let data_root = unique_data_root("destroy-fail");
+        let dir = seed_work_dir(&data_root, PUBLIC_ID);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![sandbox_events::Model {
+                id: 1,
+                sandbox_id: 7,
+                event_type: "destroyed".into(),
+                detail: None,
+                created_at: Utc::now(),
+            }]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_destroy = true;
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        // The user must still be able to delete a sandbox when Docker is
+        // unhappy — the call succeeds and the row is marked destroyed.
+        service
+            .destroy_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect("destroy must succeed even when the provider fails");
+
+        assert!(
+            !dir.exists(),
+            "work dir {} must be removed even when the provider destroy \
+             failed — there is no sweeper to reclaim it later",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// Agent-run sandboxes take an early return through
+    /// `release_for_agent_run`, and their work dir belongs to the executor,
+    /// not to `data_root`. If that early return is ever lost, this test
+    /// catches it before it recursively deletes a live run's workspace.
+    #[tokio::test]
+    async fn destroy_sandbox_for_agent_run_leaves_the_work_dir_alone() {
+        let data_root = unique_data_root("agent-run");
+        let dir = seed_work_dir(&data_root, PUBLIC_ID);
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // find_by_public_id → row owned by agent run 42
+            .append_query_results([vec![row(PUBLIC_ID, Some(42))]])
+            // agent_runs lookup → empty, i.e. run is gone ⇒ terminal
+            .append_query_results([Vec::<agent_runs::Model>::new()])
+            // release_for_agent_run: rows for this run
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let _ = service.destroy_sandbox(PUBLIC_ID, 1).await;
+
+        assert!(
+            dir.exists(),
+            "an agent-run sandbox must not have {} deleted — that directory \
+             is owned by the executor, and this path is only for standalone \
+             sandboxes",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_provider_failure_leaves_no_work_dir() {
+        let data_root = unique_data_root("create-fail");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // insert of the new row (RETURNING)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // mark_destroyed update
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_create = true;
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .create_sandbox(1, CreateSandboxRequest::default())
+            .await
+            .expect_err("provider create failed, so create_sandbox must fail");
+        assert!(
+            matches!(err, SandboxError::CreateFailed { .. }),
+            "{:?}",
+            err
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&data_root)
+            .expect("read data root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed create must not strand a work dir; found {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The costly one: seeding runs after the clone, so by the time it fails
+    /// the directory can hold an entire repository, and the row is already
+    /// destroyed so no later `destroy_sandbox` can reach it.
+    #[tokio::test]
+    async fn create_sandbox_seed_failure_leaves_no_work_dir() {
+        let data_root = unique_data_root("seed-fail");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // insert of the new row
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // update after create (status/metadata write-back)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // mark_destroyed
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_exec = true;
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let req = CreateSandboxRequest {
+            source: Some(SandboxSource::Tarball {
+                url: "https://example.invalid/src.tar.gz".into(),
+            }),
+            ..Default::default()
+        };
+        let err = service
+            .create_sandbox(1, req)
+            .await
+            .expect_err("seeding failed, so create_sandbox must fail");
+        assert!(matches!(err, SandboxError::ExecFailed { .. }), "{:?}", err);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&data_root)
+            .expect("read data root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed seed must not strand a work dir holding a cloned \
+             repository; found {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
     }
 }

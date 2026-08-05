@@ -19,21 +19,54 @@ use crate::error::AgentError;
 const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
 
 /// Naming prefix for the named volume backing a sandbox's `/home/temps`.
-const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+pub(crate) const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+
+/// Scheme marker in every home volume name this build generates.
+///
+/// This exists to make one specific attack impossible. Before the naming
+/// fix, standalone sandboxes keyed their home volume on `sandboxes.id` and
+/// agent runs keyed theirs on `agent_runs.id` — two independent sequences
+/// sharing one namespace. On an upgraded host the standalone ones are
+/// stranded (destroy no longer computes their name), and Docker attaches an
+/// existing volume by name, so a later agent run whose id happened to match
+/// would silently mount a *different user's* `/home/temps` — their Claude
+/// credentials, shell history, and project state, read-write.
+///
+/// Every name we generate now carries this infix, so no name this build
+/// produces can ever collide with a pre-fix volume. Stranded legacy volumes
+/// become inert: nothing mounts them again, and the operator removes them
+/// (see `HOME_VOLUME_LABEL`).
+///
+/// Cost of the change: a sandbox whose container is recreated across the
+/// upgrade gets a fresh home once. Agent-run homes are ephemeral (purged on
+/// destroy) and standalone containers are not recreated in place — stop,
+/// start, and restart all reuse the existing container and its mounts — so
+/// nothing a user is actively relying on is lost.
+pub(crate) const HOME_VOLUME_SCHEME: &str = "v2-";
 
 /// Label stamped on every home volume this provider creates.
 ///
 /// Nothing in the server reads it — volumes are removed only by an explicit
 /// sandbox destroy, which knows the exact name. It exists so an operator
-/// can safely reclaim volumes stranded by older builds:
+/// can reclaim volumes this build strands (a destroy that failed to reach
+/// the daemon, or a create that failed after the volume was made):
 ///
 /// ```text
 /// docker volume prune --filter label=sh.temps.sandbox.home
 /// ```
 ///
-/// A label is the right key for that and a name prefix is not: `prune` only
-/// touches volumes no container references, and the label cannot collide
-/// with something the operator created themselves.
+/// That command does NOT cover volumes created before this build — those
+/// were auto-created by the bind mount and carry no label. They are the
+/// `v2-`-less numeric names, and are removed with:
+///
+/// ```text
+/// docker volume ls -q --filter dangling=true \
+///   | grep -E '^temps-sandbox-home-[0-9]+$' \
+///   | xargs -r docker volume rm
+/// ```
+///
+/// `dangling=true` is what makes that safe to run on a live host: a volume
+/// still attached to a container is not listed.
 const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
 
 /// Single-quote a string for safe embedding in a `sh -c` command line.
@@ -1092,6 +1125,21 @@ impl DockerSandboxProvider {
         (container_name, home_volume_name)
     }
 
+    /// The `HostConfig.binds` for a sandbox container: the host work dir at
+    /// `/workspace`, and the home volume at `/home/temps`.
+    ///
+    /// Pure, and separate from `create`, so a test can assert that the
+    /// volume the container actually mounts is the one `destroy` will
+    /// remove — without needing a Docker daemon. The original leak lived
+    /// exactly here: `create` built this bind from one name while `destroy`
+    /// computed another, and only an e2e could see it.
+    fn container_binds(host_work_dir: &str, home_volume_name: &str) -> Vec<String> {
+        vec![
+            format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
+            format!("{}:{}", home_volume_name, SANDBOX_HOME),
+        ]
+    }
+
     /// Name of the named volume holding a sandbox's `/home/temps`.
     ///
     /// Derived from the **container** name, never from `run_id` directly.
@@ -1104,16 +1152,18 @@ impl DockerSandboxProvider {
     /// the host forever. Both sides now go through this one function, so
     /// they cannot drift again.
     ///
-    /// Deriving from the container name also removes a latent collision:
-    /// standalone sandbox row 5 and agent run 5 used to share
-    /// `temps-sandbox-home-5`.
+    /// Deriving from the container name also removes a cross-tenant
+    /// collision: standalone sandbox row 5 and agent run 5 used to share
+    /// `temps-sandbox-home-5`, i.e. one user's `~/.claude` credentials and
+    /// shell history mounted into another user's sandbox. `HOME_VOLUME_SCHEME`
+    /// is what makes that unreachable rather than merely unlikely — it keeps
+    /// every generated name out of the pre-fix namespace, so a stranded
+    /// legacy volume can never be picked up by a new sandbox either.
     fn home_volume_name(container_name: &str) -> String {
-        format!(
-            "{}{}",
-            HOME_VOLUME_PREFIX,
+        super::home_volume_name_for_label(
             container_name
                 .strip_prefix(SANDBOX_NAME_PREFIX)
-                .unwrap_or(container_name)
+                .unwrap_or(container_name),
         )
     }
 
@@ -1351,33 +1401,6 @@ impl SandboxProvider for DockerSandboxProvider {
 
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
 
-        // Create the home volume up front, labelled, rather than letting
-        // the bind auto-create it unlabelled — see HOME_VOLUME_LABEL for
-        // why the label is worth one extra call. Idempotent: Docker returns
-        // an existing volume unchanged, which is what recreating a sandbox
-        // over a surviving home relies on.
-        if let Err(e) = self
-            .docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(home_volume_name.clone()),
-                labels: Some(HashMap::from([(
-                    HOME_VOLUME_LABEL.to_string(),
-                    "true".to_string(),
-                )])),
-                ..Default::default()
-            })
-            .await
-        {
-            // Non-fatal: the bind below still auto-creates the volume. The
-            // only loss is the label, i.e. this one volume won't show up in
-            // an operator's label-filtered prune.
-            tracing::warn!(
-                "Could not pre-create labelled home volume {}: {} — continuing",
-                home_volume_name,
-                e
-            );
-        }
-
         // Remove existing container with the same name if any (leftover from crash)
         let _ = self
             .docker
@@ -1475,10 +1498,7 @@ impl SandboxProvider for DockerSandboxProvider {
         // `home_volume_name` came from `sandbox_names` above, alongside the
         // container name — `destroy` re-derives it from the container name
         // via `home_volume_name`, which is what keeps the two in sync.
-        let binds = vec![
-            format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
-            format!("{}:{}", home_volume_name, SANDBOX_HOME),
-        ];
+        let binds = Self::container_binds(&host_work_dir, &home_volume_name);
 
         // tmpfs mount for secrets — in-memory only, never written to disk
         let mut tmpfs = HashMap::new();
@@ -1565,6 +1585,40 @@ impl SandboxProvider for DockerSandboxProvider {
             labels: Some(labels),
             ..Default::default()
         };
+
+        // Create the home volume explicitly, labelled, rather than letting
+        // the bind auto-create it unlabelled — see HOME_VOLUME_LABEL for why
+        // the label earns its extra call. Idempotent: Docker returns an
+        // existing volume unchanged, which is what recreating a sandbox over
+        // a surviving home relies on.
+        //
+        // Deliberately here rather than at the top of `create`: everything
+        // that can fail cheaply and repeatedly (image resolution, a cold
+        // pull of a caller-supplied image) has already happened, so a caller
+        // looping failed creates can't mint a volume per attempt. A failure
+        // after this point still strands an empty one, which is what the
+        // label-filtered prune is for.
+        if let Err(e) = self
+            .docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(home_volume_name.clone()),
+                labels: Some(HashMap::from([(
+                    HOME_VOLUME_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+        {
+            // Non-fatal: the bind still auto-creates the volume. The only
+            // loss is the label, i.e. this one volume won't appear in an
+            // operator's label-filtered prune.
+            tracing::warn!(
+                "Could not pre-create labelled home volume {}: {} — continuing",
+                home_volume_name,
+                e
+            );
+        }
 
         let container = self
             .docker
@@ -1820,9 +1874,10 @@ impl SandboxProvider for DockerSandboxProvider {
                 )
                 .await
             {
-                // Not fatal — the container is already gone, so the
-                // sandbox is destroyed either way. The orphan reaper
-                // picks the volume up on its next pass.
+                // Not fatal — the container is already gone, so the sandbox
+                // is destroyed either way. Nothing sweeps up afterwards, so
+                // the volume is stranded until an operator reclaims it; it
+                // carries HOME_VOLUME_LABEL for exactly that.
                 tracing::warn!(
                     "Failed to remove sandbox home volume {} (may not exist): {}",
                     home_volume_name,
@@ -2650,13 +2705,13 @@ mod tests {
         // Agent-run style: numeric suffix.
         assert_eq!(
             DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(42)),
-            "temps-sandbox-home-42"
+            "temps-sandbox-home-v2-42"
         );
         // Standalone style: opaque public_id label suffix. This is the
         // case that used to leak.
         assert_eq!(
             DockerSandboxProvider::home_volume_name("temps-sandbox-a1b2c3d4e5f60718"),
-            "temps-sandbox-home-a1b2c3d4e5f60718"
+            "temps-sandbox-home-v2-a1b2c3d4e5f60718"
         );
     }
 
@@ -2705,16 +2760,89 @@ mod tests {
         let (container, volume) =
             DockerSandboxProvider::sandbox_names(&create_config_for(7, Some("a1b2c3d4e5f60718")));
         assert_eq!(container, "temps-sandbox-a1b2c3d4e5f60718");
-        assert_eq!(volume, "temps-sandbox-home-a1b2c3d4e5f60718");
+        assert_eq!(volume, "temps-sandbox-home-v2-a1b2c3d4e5f60718");
         assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
         assert_ne!(volume, "temps-sandbox-home-7");
+        assert_ne!(volume, "temps-sandbox-home-v2-7");
 
         // Agent run: numeric naming, no override.
         let (container, volume) =
             DockerSandboxProvider::sandbox_names(&create_config_for(42, None));
         assert_eq!(container, "temps-sandbox-42");
-        assert_eq!(volume, "temps-sandbox-home-42");
+        assert_eq!(volume, "temps-sandbox-home-v2-42");
         assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+    }
+
+    /// The bind the container actually gets must mount the volume `destroy`
+    /// will remove.
+    ///
+    /// This is the Docker-less guard for the original bug's *call site*.
+    /// The naming tests above only prove the helpers agree with each other;
+    /// re-inlining `format!("temps-sandbox-home-{}", config.run_id)` into
+    /// `create`'s binds would leave every one of them green and re-ship the
+    /// leak on any CI runner without a daemon. Asserting on the bind string
+    /// closes that, because the bind is what `create` actually hands Docker.
+    #[test]
+    fn create_binds_mount_the_volume_destroy_will_remove() {
+        let cfg = create_config_for(7, Some("a1b2c3d4e5f60718"));
+        let (container, volume) = DockerSandboxProvider::sandbox_names(&cfg);
+        let binds = DockerSandboxProvider::container_binds("/host/work", &volume);
+
+        // The home bind must name the volume destroy re-derives from the
+        // container name — not anything keyed on run_id.
+        let home_bind = format!(
+            "{}:{}",
+            DockerSandboxProvider::home_volume_name(&container),
+            SANDBOX_HOME
+        );
+        assert!(
+            binds.contains(&home_bind),
+            "binds {:?} must mount {} — otherwise create and destroy \
+             disagree about which volume belongs to this sandbox",
+            binds,
+            home_bind
+        );
+        assert!(
+            !binds.iter().any(|b| b.starts_with("temps-sandbox-home-7:")),
+            "binds {:?} must not key the home volume on run_id",
+            binds
+        );
+        // And the work dir is still mounted where the sandbox expects it.
+        assert!(binds.contains(&format!("/host/work:{}", CONTAINER_WORK_DIR)));
+    }
+
+    /// No name this build generates may land in the pre-fix namespace.
+    ///
+    /// Legacy volumes are `temps-sandbox-home-<digits>`. On an upgraded host
+    /// they are stranded but still present, and Docker attaches an existing
+    /// volume by name — so if we could still generate one of those names, an
+    /// agent run would mount a previous standalone sandbox's `/home/temps`,
+    /// i.e. another user's credentials and shell history.
+    #[test]
+    fn generated_names_never_reenter_the_pre_fix_namespace() {
+        let legacy_shaped = |name: &str| {
+            name.strip_prefix(HOME_VOLUME_PREFIX)
+                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+        };
+        // Sanity: the predicate really does describe the legacy shape.
+        assert!(legacy_shaped("temps-sandbox-home-5"));
+
+        for container in [
+            DockerSandboxProvider::container_name(5),
+            DockerSandboxProvider::container_name(1),
+            DockerSandboxProvider::container_name(i32::MAX),
+            "temps-sandbox-0123456789012345".to_string(), // all-digit hex label
+        ] {
+            let volume = DockerSandboxProvider::home_volume_name(&container);
+            assert!(
+                !legacy_shaped(&volume),
+                "{} produced {}, which collides with a pre-fix volume and \
+                 could mount another tenant's home",
+                container,
+                volume
+            );
+        }
     }
 
     /// Every home volume must carry the prefix an operator filters on when
@@ -3620,10 +3748,43 @@ mod tests {
 
         // Standalone naming: opaque label suffix, numeric run_id. The two
         // deliberately disagree — that divergence is what the bug rode on.
-        let label = "purge-test-c0ffee01";
+        let label = "purgetestc0ffee01";
         let run_id = 99993;
         let work_dir = std::env::temp_dir().join(format!("sandbox-purge-test-{}", run_id));
         let _ = std::fs::create_dir_all(&work_dir);
+
+        // A `temps serve` on this host reaps sandbox containers whose run
+        // isn't in its DB, which would kill this test mid-flight. Same guard
+        // the sibling e2e tests use — and this repo's dev workflow runs
+        // several slots, so it fires in practice.
+        let existing = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec!["temps-sandbox-".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            println!(
+                "temps serve is managing {} sandbox(es) — skipping volume purge test",
+                existing.len()
+            );
+            return;
+        }
+
+        let volume_name = format!("{}{}{}", HOME_VOLUME_PREFIX, HOME_VOLUME_SCHEME, label);
+        let legacy_volume_name = format!("{}{}", HOME_VOLUME_PREFIX, run_id);
+        // Clear both names first: a leftover from an older build would make
+        // the label assertion below fail for a reason that isn't this code.
+        for name in [&volume_name, &legacy_volume_name] {
+            let _ = docker
+                .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+                .await;
+        }
 
         let handle = provider
             .create(SandboxCreateConfig {
@@ -3645,33 +3806,71 @@ mod tests {
             .await
             .expect("create sandbox");
 
-        let volume_name = format!("{}{}", HOME_VOLUME_PREFIX, label);
-        docker
-            .inspect_volume(&volume_name)
-            .await
-            .expect("home volume should exist while the sandbox does");
-
-        // The numeric name is the one the old code would have created.
-        // Assert it was never made, so this test can't pass by accident on
-        // a host where both happen to exist.
-        assert!(
-            docker
-                .inspect_volume(&format!("{}{}", HOME_VOLUME_PREFIX, run_id))
-                .await
-                .is_err(),
-            "home volume must be keyed on the container label, not run_id"
-        );
+        // Gather every observation BEFORE tearing down, then assert after —
+        // an assertion that fires between create and destroy would leak the
+        // container, its volume, and the work dir onto the host.
+        let volume = docker.inspect_volume(&volume_name).await;
+        let legacy_volume = docker.inspect_volume(&legacy_volume_name).await;
+        let container = docker
+            .inspect_container(
+                &handle.sandbox_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
 
         provider.destroy(&handle, true).await.expect("destroy");
 
+        let after_destroy = docker.inspect_volume(&volume_name).await;
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        // 1. The volume exists while the sandbox does, and is labelled so an
+        //    operator can find it if a later destroy ever fails to.
+        let volume = volume.expect("home volume should exist while the sandbox does");
         assert!(
-            docker.inspect_volume(&volume_name).await.is_err(),
+            volume.labels.contains_key(HOME_VOLUME_LABEL),
+            "home volume {} must carry {} — it is the only handle an \
+             operator has for reclaiming stranded volumes; labels were {:?}",
+            volume_name,
+            HOME_VOLUME_LABEL,
+            volume.labels
+        );
+
+        // 2. The container actually mounts that volume at /home/temps.
+        //    Without this, the assertion above passes on its own merits —
+        //    `create` pre-creates the volume, so its existence no longer
+        //    proves the bind exists, and dropping the bind entirely would
+        //    go unnoticed.
+        let mounts = container
+            .expect("container should exist")
+            .mounts
+            .unwrap_or_default();
+        assert!(
+            mounts.iter().any(|m| {
+                m.name.as_deref() == Some(volume_name.as_str())
+                    && m.destination.as_deref() == Some(SANDBOX_HOME)
+            }),
+            "container must mount {} at {} — mounts were {:?}",
+            volume_name,
+            SANDBOX_HOME,
+            mounts
+        );
+
+        // 3. The run_id-keyed name is the one the old code would have made.
+        //    Assert it was never created, so this test cannot pass by
+        //    accident on a host where both happen to exist.
+        assert!(
+            legacy_volume.is_err(),
+            "home volume must be keyed on the container label, not run_id"
+        );
+
+        // 4. And destroy actually frees it — the leak this PR exists for.
+        assert!(
+            after_destroy.is_err(),
             "destroy must remove the sandbox home volume {} — leaving it \
              behind is the leak that fills the host disk after enough \
              create/destroy cycles",
             volume_name
         );
-        let _ = std::fs::remove_dir_all(&work_dir);
     }
 
     // ---- egress filter tests (no Docker / iptables required) ----------------

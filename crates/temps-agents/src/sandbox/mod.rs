@@ -7,6 +7,23 @@ pub mod pty_agent_bundle;
 pub mod routing;
 pub mod user;
 
+/// The Docker named volume holding `/home/temps` for a sandbox whose
+/// container suffix is `label`.
+///
+/// Public because the standalone sandbox service derives that label itself
+/// (it strips `sbx_` off the `public_id`) and a test needs to prove the two
+/// crates still agree — the leak this replaced was precisely two places
+/// deriving one identity independently. Production code goes through
+/// `DockerSandboxProvider::sandbox_names`.
+pub fn home_volume_name_for_label(label: &str) -> String {
+    format!(
+        "{}{}{}",
+        docker::HOME_VOLUME_PREFIX,
+        docker::HOME_VOLUME_SCHEME,
+        label
+    )
+}
+
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
     SANDBOX_WORK_DIR,
