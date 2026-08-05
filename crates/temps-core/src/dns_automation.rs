@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// The only background DNS purpose currently supported by Temps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,13 +46,43 @@ pub enum DnsAutomationDecision {
     Deny { reason: String },
 }
 
+/// Typed failure returned when an automation policy cannot be evaluated.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DnsAutomationError {
+    #[error(
+        "DNS automation policy evaluation failed for provider {provider_id} ({provider_name}), domain {domain}, zone {zone}: {reason}"
+    )]
+    PolicyEvaluationFailed {
+        provider_id: i32,
+        provider_name: String,
+        domain: String,
+        zone: String,
+        reason: String,
+    },
+}
+
+impl DnsAutomationError {
+    pub fn policy_evaluation_failed(
+        request: &DnsAutomationRequest,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::PolicyEvaluationFailed {
+            provider_id: request.provider_id,
+            provider_name: request.provider_name.clone(),
+            domain: request.domain.clone(),
+            zone: request.zone.clone(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Policy extension point for unattended DNS mutations.
 #[async_trait]
 pub trait DnsAutomationGate: Send + Sync {
     async fn authorize(
         &self,
         request: &DnsAutomationRequest,
-    ) -> Result<DnsAutomationDecision, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<DnsAutomationDecision, DnsAutomationError>;
 }
 
 /// Deferred, write-once gate used across the plugin registration boundary.
@@ -82,7 +113,7 @@ impl DnsAutomationGate for DnsAutomationGateSlot {
     async fn authorize(
         &self,
         request: &DnsAutomationRequest,
-    ) -> Result<DnsAutomationDecision, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DnsAutomationDecision, DnsAutomationError> {
         let Some(gate) = self.gate.get() else {
             return Ok(DnsAutomationDecision::Deny {
                 reason: "unattended DNS automation is not enabled for this installation"
@@ -105,7 +136,7 @@ mod tests {
         async fn authorize(
             &self,
             _request: &DnsAutomationRequest,
-        ) -> Result<DnsAutomationDecision, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<DnsAutomationDecision, DnsAutomationError> {
             Ok(DnsAutomationDecision::Allow)
         }
     }
@@ -149,5 +180,25 @@ mod tests {
         let slot = DnsAutomationGateSlot::new();
         assert!(slot.set(Arc::new(AllowGate)).is_ok());
         assert!(slot.set(Arc::new(AllowGate)).is_err());
+    }
+
+    #[test]
+    fn policy_error_carries_provider_and_zone_context() {
+        let request = request();
+        let error = DnsAutomationError::policy_evaluation_failed(&request, "policy store offline");
+
+        assert!(matches!(
+            error,
+            DnsAutomationError::PolicyEvaluationFailed {
+                provider_id: 7,
+                ref provider_name,
+                ref domain,
+                ref zone,
+                ref reason,
+            } if provider_name == "production-dns"
+                && domain == "example.com"
+                && zone == "example.com"
+                && reason == "policy store offline"
+        ));
     }
 }

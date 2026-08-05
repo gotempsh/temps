@@ -1955,6 +1955,10 @@ async fn setup_dns_challenge(
                 .build()
         })?;
 
+    // This governance check intentionally precedes zone lookup and provider-client
+    // construction, which decrypts credentials and can initiate external calls.
+    ensure_dns_provider_active(&dns_provider, &domain.domain, domain_id)?;
+
     let managed_domain = dns_provider_service
         .find_verified_zone_for_provider(request.dns_provider_id, &domain.domain)
         .await
@@ -2048,6 +2052,24 @@ async fn setup_dns_challenge(
     }
 
     Ok(Json(response))
+}
+
+fn ensure_dns_provider_active(
+    provider: &temps_entities::dns_providers::Model,
+    domain: &str,
+    domain_id: i32,
+) -> Result<(), Problem> {
+    if provider.is_active {
+        return Ok(());
+    }
+
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .title("DNS Provider Is Inactive")
+        .detail(format!(
+            "DNS provider {} ({}) is inactive and cannot set up the DNS challenge for domain {} (ID {})",
+            provider.id, provider.name, domain, domain_id
+        ))
+        .build())
 }
 
 /// Extract the record name relative to the base domain
@@ -2470,6 +2492,38 @@ mod tests {
     };
     use temps_dns::DnsError;
 
+    #[test]
+    fn inactive_dns_provider_is_rejected_with_context() {
+        let now = chrono::Utc::now();
+        let provider = temps_entities::dns_providers::Model {
+            id: 42,
+            name: "disabled-cloudflare".to_string(),
+            provider_type: "cloudflare".to_string(),
+            credentials: "encrypted".to_string(),
+            is_active: false,
+            description: None,
+            last_used_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let problem = ensure_dns_provider_active(&provider, "api.example.com", 17)
+            .expect_err("inactive providers must be rejected before DNS setup");
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("DNS Provider Is Inactive")
+        );
+        let detail = problem.body.get("detail").and_then(|value| value.as_str());
+        assert!(detail.is_some_and(|detail| {
+            detail.contains("42 (disabled-cloudflare)")
+                && detail.contains("api.example.com")
+                && detail.contains("ID 17")
+        }));
+    }
+
     /// In-memory DNS provider used to drive `setup_dns_txt_records` end-to-end without
     /// a live Cloudflare/Route53/etc. account. Mirrors the real providers' semantics:
     /// `list_records`/`remove_record` see every record in the zone, `create_record`
@@ -2706,8 +2760,7 @@ mod tests {
         async fn authorize(
             &self,
             _request: &temps_core::DnsAutomationRequest,
-        ) -> Result<temps_core::DnsAutomationDecision, Box<dyn std::error::Error + Send + Sync>>
-        {
+        ) -> Result<temps_core::DnsAutomationDecision, temps_core::DnsAutomationError> {
             panic!("invalid requests must be rejected before the authorization gate")
         }
     }
@@ -2716,12 +2769,11 @@ mod tests {
     impl temps_core::DnsAutomationGate for TestAutomationGate {
         async fn authorize(
             &self,
-            _request: &temps_core::DnsAutomationRequest,
-        ) -> Result<temps_core::DnsAutomationDecision, Box<dyn std::error::Error + Send + Sync>>
-        {
-            self.decision
-                .clone()
-                .map_err(|reason| std::io::Error::other(reason).into())
+            request: &temps_core::DnsAutomationRequest,
+        ) -> Result<temps_core::DnsAutomationDecision, temps_core::DnsAutomationError> {
+            self.decision.clone().map_err(|reason| {
+                temps_core::DnsAutomationError::policy_evaluation_failed(request, reason)
+            })
         }
     }
 

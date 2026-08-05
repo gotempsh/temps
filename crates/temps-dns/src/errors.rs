@@ -8,6 +8,12 @@ pub enum DnsError {
     #[error("Provider not found: {0}")]
     ProviderNotFound(i32),
 
+    #[error("DNS provider {provider_id} ({provider_name}) is inactive")]
+    ProviderInactive {
+        provider_id: i32,
+        provider_name: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 

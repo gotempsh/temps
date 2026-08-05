@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
+use thiserror::Error;
 
 /// Context information common to all audit events
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +55,14 @@ pub struct AuditLoggerSlot {
     target: RwLock<Arc<dyn AuditLogger>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuditLoggerSlotError {
+    #[error("audit logger slot read lock is poisoned")]
+    ReadLockPoisoned,
+    #[error("audit logger slot write lock is poisoned")]
+    WriteLockPoisoned,
+}
+
 impl AuditLoggerSlot {
     pub fn new(target: Arc<dyn AuditLogger>) -> Self {
         Self {
@@ -61,18 +70,21 @@ impl AuditLoggerSlot {
         }
     }
 
-    pub fn current(&self) -> Result<Arc<dyn AuditLogger>> {
+    pub fn current(&self) -> std::result::Result<Arc<dyn AuditLogger>, AuditLoggerSlotError> {
         self.target
             .read()
             .map(|target| target.clone())
-            .map_err(|_| anyhow::anyhow!("audit logger slot read lock is poisoned"))
+            .map_err(|_| AuditLoggerSlotError::ReadLockPoisoned)
     }
 
-    pub fn replace(&self, target: Arc<dyn AuditLogger>) -> Result<()> {
+    pub fn replace(
+        &self,
+        target: Arc<dyn AuditLogger>,
+    ) -> std::result::Result<(), AuditLoggerSlotError> {
         let mut current = self
             .target
             .write()
-            .map_err(|_| anyhow::anyhow!("audit logger slot write lock is poisoned"))?;
+            .map_err(|_| AuditLoggerSlotError::WriteLockPoisoned)?;
         *current = target;
         Ok(())
     }
@@ -81,7 +93,7 @@ impl AuditLoggerSlot {
 #[async_trait::async_trait]
 impl AuditLogger for AuditLoggerSlot {
     async fn create_audit_log(&self, operation: &dyn AuditOperation) -> Result<()> {
-        let target = self.current()?;
+        let target = self.current().map_err(anyhow::Error::new)?;
         target.create_audit_log(operation).await
     }
 }
@@ -136,5 +148,35 @@ mod tests {
 
         assert_eq!(original_count.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poisoned_slot_returns_typed_errors() {
+        fn poisoned_slot() -> Arc<AuditLoggerSlot> {
+            let logger: Arc<dyn AuditLogger> =
+                Arc::new(CountingLogger(Arc::new(AtomicUsize::new(0))));
+            let slot = Arc::new(AuditLoggerSlot::new(logger));
+            let worker_slot = slot.clone();
+            let _ = std::thread::spawn(move || {
+                let _write_guard = worker_slot.target.write().unwrap();
+                panic!("poison audit logger slot for test");
+            })
+            .join();
+            slot
+        }
+
+        let read_slot = poisoned_slot();
+        assert!(matches!(
+            read_slot.current(),
+            Err(AuditLoggerSlotError::ReadLockPoisoned)
+        ));
+
+        let write_slot = poisoned_slot();
+        let replacement: Arc<dyn AuditLogger> =
+            Arc::new(CountingLogger(Arc::new(AtomicUsize::new(0))));
+        assert!(matches!(
+            write_slot.replace(replacement),
+            Err(AuditLoggerSlotError::WriteLockPoisoned)
+        ));
     }
 }

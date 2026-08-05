@@ -57,8 +57,8 @@ pub use config::*;
 pub use constants::*;
 pub use deployment::*;
 pub use dns_automation::{
-    DnsAutomationDecision, DnsAutomationGate, DnsAutomationGateSlot, DnsAutomationMutation,
-    DnsAutomationPurpose, DnsAutomationRequest,
+    DnsAutomationDecision, DnsAutomationError, DnsAutomationGate, DnsAutomationGateSlot,
+    DnsAutomationMutation, DnsAutomationPurpose, DnsAutomationRequest,
 };
 pub use env_vars_provider::{
     flatten_integration_env_vars, IntegrationEnvVar, IntegrationServiceInfo,

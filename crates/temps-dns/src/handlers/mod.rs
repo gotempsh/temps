@@ -301,6 +301,10 @@ fn default_true() -> bool {
     true
 }
 
+fn managed_domain_automation_enabled(auto_manage: bool, sync_generated_records: bool) -> bool {
+    auto_manage || sync_generated_records
+}
+
 /// Request to update a managed domain's settings.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateManagedDomainApiRequest {
@@ -428,6 +432,15 @@ impl From<DnsError> for Problem {
             DnsError::ProviderNotFound(id) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Provider Not Found")
                 .with_detail(format!("DNS provider with ID {} not found", id)),
+            DnsError::ProviderInactive {
+                provider_id,
+                provider_name,
+            } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("DNS Provider Is Inactive")
+                .with_detail(format!(
+                    "DNS provider {} ({}) is inactive and cannot perform this operation",
+                    provider_id, provider_name
+                )),
             DnsError::DomainNotFound(domain) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Domain Not Found")
                 .with_detail(format!("Domain {} not found", domain)),
@@ -872,7 +885,7 @@ async fn add_managed_domain(
     Json(request): Json<AddManagedDomainApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
-    if request.auto_manage {
+    if managed_domain_automation_enabled(request.auto_manage, request.sync_generated_records) {
         permission_check!(auth, Permission::DnsAutomationWrite);
     }
 
@@ -1049,7 +1062,15 @@ async fn update_managed_domain(
     Json(request): Json<UpdateManagedDomainApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
-    if request.auto_manage == Some(true) {
+    let existing = state
+        .provider_service
+        .get_managed_domain(provider_id, &domain)
+        .await?;
+    let resulting_auto_manage = request.auto_manage.unwrap_or(existing.auto_manage);
+    let resulting_sync_generated_records = request
+        .sync_generated_records
+        .unwrap_or(existing.sync_generated_records);
+    if managed_domain_automation_enabled(resulting_auto_manage, resulting_sync_generated_records) {
         permission_check!(auth, Permission::DnsAutomationWrite);
     }
     let changes = serde_json::json!({
@@ -1333,3 +1354,18 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
     )
 )]
 pub struct DnsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::managed_domain_automation_enabled;
+
+    #[test]
+    fn generated_record_sync_is_an_automation_capability() {
+        assert!(managed_domain_automation_enabled(false, true));
+    }
+
+    #[test]
+    fn manual_domain_without_generated_sync_is_not_automation() {
+        assert!(!managed_domain_automation_enabled(false, false));
+    }
+}

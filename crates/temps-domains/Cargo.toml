@@ -58,3 +58,6 @@ webpki-roots = "1.0"
 bollard = { workspace = true }
 futures-util = { workspace = true }
 tar = { workspace = true }
+tower.workspace = true
+wiremock = "0.6"
+serial_test = "4.0"

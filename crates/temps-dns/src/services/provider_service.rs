@@ -8,7 +8,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -69,6 +69,12 @@ pub struct UpdateManagedDomainRequest {
 }
 
 impl DnsProviderService {
+    // A valid DNS name has at most 127 labels. Keeping the candidate set capped
+    // also bounds malformed input before it reaches an IN predicate.
+    const MAX_AUTHORITATIVE_SUFFIX_CANDIDATES: usize = 127;
+    const NORMALIZED_MANAGED_DOMAIN_SQL: &'static str =
+        "LOWER(REGEXP_REPLACE(RTRIM(BTRIM(\"dns_managed_domains\".\"domain\"), '.'), '^((\\*\\.)+)', ''))";
+
     pub fn new(db: Arc<DatabaseConnection>, encryption_service: Arc<EncryptionService>) -> Self {
         Self {
             db,
@@ -360,6 +366,13 @@ impl DnsProviderService {
         &self,
         provider: &dns_providers::Model,
     ) -> Result<Box<dyn DnsProvider>, DnsError> {
+        if !provider.is_active {
+            return Err(DnsError::ProviderInactive {
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+            });
+        }
+
         // Decrypt credentials
         let credentials_json = self
             .encryption_service
@@ -606,6 +619,21 @@ impl DnsProviderService {
             .await?;
 
         Ok(domains)
+    }
+
+    /// Load one managed domain so authorization can be evaluated against the
+    /// resulting settings before a handler mutates it.
+    pub async fn get_managed_domain(
+        &self,
+        provider_id: i32,
+        domain: &str,
+    ) -> Result<dns_managed_domains::Model, DnsError> {
+        dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(domain))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DnsError::DomainNotFound(domain.to_string()))
     }
 
     /// Verify a managed domain (check if provider can access it)
@@ -867,20 +895,8 @@ impl DnsProviderService {
         &self,
         domain: &str,
     ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
-        let managed_domains = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::Verified.eq(true))
-            .filter(dns_managed_domains::Column::AutoManage.eq(true))
-            .all(self.db.as_ref())
-            .await?;
-
-        if let Some(managed) = Self::longest_managed_domain_match(domain, managed_domains) {
-            let provider = self.get(managed.provider_id).await?;
-            if provider.is_active {
-                return Ok(Some((provider, managed)));
-            }
-        }
-
-        Ok(None)
+        self.find_active_managed_domain_candidate(domain, None, true)
+            .await
     }
 
     /// Find the verified zone belonging to `provider_id` that authoritatively
@@ -891,15 +907,80 @@ impl DnsProviderService {
         provider_id: i32,
         domain: &str,
     ) -> Result<Option<dns_managed_domains::Model>, DnsError> {
-        let managed_domains = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_domains::Column::Verified.eq(true))
-            .all(self.db.as_ref())
-            .await?;
-
-        Ok(Self::longest_managed_domain_match(domain, managed_domains))
+        Ok(self
+            .find_active_managed_domain_candidate(domain, Some(provider_id), false)
+            .await?
+            .map(|(_, managed)| managed))
     }
 
+    /// Find the longest authoritative suffix without loading the managed-zone
+    /// table. The normalized equality predicate is backed by
+    /// `idx_dns_managed_domains_normalized_domain`, preserving legacy mixed-case,
+    /// wildcard, whitespace, and trailing-dot rows without a sequential scan.
+    async fn find_active_managed_domain_candidate(
+        &self,
+        domain: &str,
+        provider_id: Option<i32>,
+        require_auto_manage: bool,
+    ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
+        let candidates = Self::authoritative_suffix_candidates(domain);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let placeholders = (1..=candidates.len())
+            .map(|position| format!("${position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = dns_managed_domains::Entity::find()
+            .find_also_related(dns_providers::Entity)
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!(
+                    "{} IN ({placeholders})",
+                    Self::NORMALIZED_MANAGED_DOMAIN_SQL
+                ),
+                candidates,
+            ))
+            .filter(dns_managed_domains::Column::Verified.eq(true))
+            // This predicate must execute in the same SQL statement before
+            // LIMIT, otherwise an inactive duplicate can shadow an active zone.
+            .filter(dns_providers::Column::IsActive.eq(true));
+        if let Some(provider_id) = provider_id {
+            query = query.filter(dns_managed_domains::Column::ProviderId.eq(provider_id));
+        }
+        if require_auto_manage {
+            query = query.filter(dns_managed_domains::Column::AutoManage.eq(true));
+        }
+
+        query
+            .order_by_desc(sea_orm::sea_query::Expr::cust(format!(
+                "CHAR_LENGTH({})",
+                Self::NORMALIZED_MANAGED_DOMAIN_SQL
+            )))
+            .limit(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(DnsError::from)
+            .map(|row| row.and_then(|(managed, provider)| provider.map(|p| (p, managed))))
+    }
+
+    fn authoritative_suffix_candidates(domain: &str) -> Vec<String> {
+        let normalized = Self::normalize_domain(domain);
+        let mut candidates = Vec::new();
+        let mut suffix = normalized.as_str();
+
+        while !suffix.is_empty() && candidates.len() < Self::MAX_AUTHORITATIVE_SUFFIX_CANDIDATES {
+            candidates.push(suffix.to_string());
+            suffix = match suffix.find('.') {
+                Some(separator) => &suffix[separator + 1..],
+                None => break,
+            };
+        }
+
+        candidates
+    }
+
+    #[cfg(test)]
     fn longest_managed_domain_match(
         domain: &str,
         managed_domains: Vec<dns_managed_domains::Model>,
@@ -939,6 +1020,7 @@ impl temps_core::PublicHostnameResolver for DnsProviderService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     fn managed_domain(id: i32, provider_id: i32, domain: &str) -> dns_managed_domains::Model {
         let now = chrono::Utc::now();
@@ -958,6 +1040,44 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn dns_provider(id: i32, name: &str, is_active: bool) -> dns_providers::Model {
+        let now = chrono::Utc::now();
+        dns_providers::Model {
+            id,
+            name: name.to_string(),
+            provider_type: "cloudflare".to_string(),
+            credentials: "deliberately-not-encrypted".to_string(),
+            is_active,
+            description: None,
+            last_used_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn inactive_provider_is_rejected_before_credentials_are_decrypted() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = DnsProviderService::new(
+            db,
+            Arc::new(EncryptionService::new_from_password(
+                "inactive-provider-test",
+            )),
+        );
+
+        let result =
+            service.create_provider_instance(&dns_provider(42, "disabled-cloudflare", false));
+
+        assert!(matches!(
+            result,
+            Err(DnsError::ProviderInactive {
+                provider_id: 42,
+                provider_name
+            }) if provider_name == "disabled-cloudflare"
+        ));
     }
 
     #[test]
@@ -987,5 +1107,68 @@ mod tests {
         assert!(
             DnsProviderService::longest_managed_domain_match("notexample.com", domains).is_none()
         );
+    }
+
+    #[test]
+    fn authoritative_suffix_candidates_are_normalized_longest_first() {
+        assert_eq!(
+            DnsProviderService::authoritative_suffix_candidates("  *.API.Dev.Example.COM.  "),
+            vec![
+                "api.dev.example.com",
+                "dev.example.com",
+                "example.com",
+                "com"
+            ]
+        );
+    }
+
+    #[test]
+    fn authoritative_suffix_candidates_are_bounded_for_malformed_input() {
+        let domain = std::iter::repeat_n("label", 200)
+            .collect::<Vec<_>>()
+            .join(".");
+
+        let candidates = DnsProviderService::authoritative_suffix_candidates(&domain);
+
+        assert_eq!(
+            candidates.len(),
+            DnsProviderService::MAX_AUTHORITATIVE_SUFFIX_CANDIDATES
+        );
+        assert_eq!(candidates.first(), Some(&domain));
+    }
+
+    #[tokio::test]
+    async fn verified_zone_query_binds_candidates_before_provider_filter() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<dns_managed_domains::Model>::new()])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("provider-query-test")),
+        );
+
+        let result = service
+            .find_verified_zone_for_provider(42, "*.API.Dev.Example.COM.")
+            .await;
+
+        assert!(matches!(result, Ok(None)));
+        drop(service);
+        let transaction_log = Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log();
+        let statement = &transaction_log[0].statements()[0];
+        assert!(statement.sql.contains(
+            "LOWER(REGEXP_REPLACE(RTRIM(BTRIM(\"dns_managed_domains\".\"domain\"), '.'), '^((\\*\\.)+)', '')) IN ($1, $2, $3, $4)"
+        ));
+        assert!(statement.sql.contains("LEFT JOIN \"dns_providers\""));
+        assert!(statement
+            .sql
+            .contains(r#""dns_providers"."is_active" = $6"#));
+        assert!(statement
+            .sql
+            .contains(r#""dns_managed_domains"."provider_id" = $7"#));
+        assert!(statement.sql.contains("LIMIT $8"));
     }
 }
