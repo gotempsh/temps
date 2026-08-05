@@ -5,7 +5,8 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   categoryLabel,
-  groupRolePermissions,
+  effectivePlatformRole,
+  groupRolesPermissions,
   permissionAction,
 } from '@/lib/role-permissions'
 import { useQuery } from '@tanstack/react-query'
@@ -24,24 +25,27 @@ const ROLE_SCOPE = {
   },
 } as const
 
-export function RolePermissionDetails({ roleName }: { roleName: string }) {
+export function RolePermissionDetails({ roleNames }: { roleNames: string[] }) {
   const { data, isLoading, isError } = useQuery({
     ...getApiKeyPermissionsOptions({}),
   })
 
-  const role = data?.roles.find((item) => item.name === roleName)
-  const groups = groupRolePermissions(role, data?.permissions ?? [])
+  const uniqueRoleNames = Array.from(new Set(roleNames))
+  const roles =
+    data?.roles.filter((role) => uniqueRoleNames.includes(role.name)) ?? []
+  const groups = groupRolesPermissions(roles, data?.permissions ?? [])
   const permissionCount = groups.reduce(
     (total, group) => total + group.permissions.length,
-    0,
+    0
   )
-  const scope = ROLE_SCOPE[roleName as keyof typeof ROLE_SCOPE]
+  const effectiveRoleName = effectivePlatformRole(uniqueRoleNames)
+  const scope = effectiveRoleName ? ROLE_SCOPE[effectiveRoleName] : undefined
 
   return (
     <div className="space-y-4">
       {scope && (
-        <Alert variant={roleName === 'admin' ? 'warning' : 'default'}>
-          {roleName === 'admin' ? (
+        <Alert variant={effectiveRoleName === 'admin' ? 'warning' : 'default'}>
+          {effectiveRoleName === 'admin' ? (
             <ShieldAlert className="size-4 shrink-0" />
           ) : (
             <Globe2 className="size-4 shrink-0" />
@@ -59,10 +63,12 @@ export function RolePermissionDetails({ roleName }: { roleName: string }) {
         <div>
           <h3 className="font-medium">Exact permissions</h3>
           <p className="text-pretty text-base text-muted-foreground sm:text-sm">
-            Granted directly by the {roleName} role.
+            {uniqueRoleNames.length > 0
+              ? `Effective union of the ${uniqueRoleNames.join(', ')} role${uniqueRoleNames.length === 1 ? '' : 's'}.`
+              : 'No platform role is currently assigned.'}
           </p>
         </div>
-        {role && (
+        {roles.length > 0 && (
           <Badge variant="secondary" className="tabular-nums">
             {permissionCount} permissions
           </Badge>
@@ -75,7 +81,7 @@ export function RolePermissionDetails({ roleName }: { roleName: string }) {
           <Skeleton className="h-20 w-full" />
           <Skeleton className="h-20 w-full" />
         </div>
-      ) : isError || !role ? (
+      ) : isError || roles.length !== uniqueRoleNames.length ? (
         <Alert variant="destructive">
           <AlertTitle>Permissions unavailable</AlertTitle>
           <AlertDescription>

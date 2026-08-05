@@ -317,13 +317,9 @@ export function UsersManagement({
             {userToManageRoles && (
               <div className="mt-6 border-t border-border/60 pt-6">
                 <RolePermissionDetails
-                  roleName={
-                    Array.from(
-                      new Map(
-                        userToManageRoles.roles.map((role) => [role.name, role])
-                      ).values()
-                    )[0]?.name || 'user'
-                  }
+                  roleNames={Array.from(
+                    new Set(userToManageRoles.roles.map((role) => role.name))
+                  )}
                 />
               </div>
             )}

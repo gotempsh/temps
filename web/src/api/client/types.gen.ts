@@ -43892,7 +43892,7 @@ export type GetUniqueCountsResponses = {
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
 export type UploadStaticBundleData = {
-    body?: never;
+    body: SourceArchiveUpload;
     path: {
         project_id: number;
     };
@@ -47685,6 +47685,10 @@ export type SetupMfaErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * MFA is already enabled; verify and disable it before re-enrollment
+     */
+    409: unknown;
     /**
      * Internal server error
      */

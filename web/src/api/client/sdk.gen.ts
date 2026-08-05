@@ -6481,9 +6481,14 @@ export const getUniqueCounts = <ThrowOnError extends boolean = false>(options: O
  * deployed later using the deploy/static endpoint.
  */
 export const uploadStaticBundle = <ThrowOnError extends boolean = false>(options: Options<UploadStaticBundleData, ThrowOnError>): RequestResult<UploadStaticBundleResponses, UploadStaticBundleErrors, ThrowOnError> => (options.client ?? client).post<UploadStaticBundleResponses, UploadStaticBundleErrors, ThrowOnError>({
+    ...formDataBodySerializer,
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/upload/static',
-    ...options
+    ...options,
+    headers: {
+        'Content-Type': null,
+        ...options.headers
+    }
 });
 
 export const listProjectScans = <ThrowOnError extends boolean = false>(options: Options<ListProjectScansData, ThrowOnError>): RequestResult<ListProjectScansResponses, ListProjectScansErrors, ThrowOnError> => (options.client ?? client).get<ListProjectScansResponses, ListProjectScansErrors, ThrowOnError>({

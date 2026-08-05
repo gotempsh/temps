@@ -6,6 +6,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamRole } from '@/api/client'
 import { RolePermissionDetails } from '@/components/users/RolePermissionDetails'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -114,6 +115,11 @@ export function CreateUser() {
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [showPassword, setShowPassword] = useState(false)
+  const [teamAssignmentFailure, setTeamAssignmentFailure] = useState<{
+    userId: number
+    teamId: number
+    role: TeamRole
+  } | null>(null)
   const pendingTeamAssignment = useRef<{
     teamId: number
     role: TeamRole
@@ -172,9 +178,16 @@ export function CreateUser() {
           })
           toast.success('User created and added to the team')
         } catch {
+          setTeamAssignmentFailure({
+            userId: createdUser.user.id,
+            teamId: teamAssignment.teamId,
+            role: teamAssignment.role,
+          })
           toast.error(
-            'User created, but team assignment failed. You can add them from the team page.'
+            'User created, but team assignment failed. Retry it before leaving this page.'
           )
+          await queryClient.invalidateQueries({ queryKey: ['listUsers'] })
+          return
         }
       } else {
         toast.success('User created successfully')
@@ -185,6 +198,7 @@ export function CreateUser() {
   })
 
   const handleSubmit = async (data: CreateUserFormData) => {
+    if (teamAssignmentFailure) return
     pendingTeamAssignment.current = data.teamId
       ? { teamId: Number(data.teamId), role: data.teamRole }
       : null
@@ -197,6 +211,26 @@ export function CreateUser() {
         must_change_password: data.mustChangePassword,
       },
     })
+  }
+
+  const retryTeamAssignment = async () => {
+    if (!teamAssignmentFailure) return
+    try {
+      await addTeamMember.mutateAsync({
+        path: { team_id: teamAssignmentFailure.teamId },
+        body: {
+          user_id: teamAssignmentFailure.userId,
+          role: teamAssignmentFailure.role,
+        },
+      })
+      setTeamAssignmentFailure(null)
+      toast.success('User added to the team')
+      navigate('/settings/users')
+    } catch {
+      toast.error(
+        'Team assignment still failed. The account was not created again; you can retry safely.'
+      )
+    }
   }
 
   const selectedRoleAvailable = permissionsQuery.data?.roles.some(
@@ -530,24 +564,56 @@ export function CreateUser() {
             </Card>
 
             <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-              <Button type="button" variant="outline" asChild>
-                <Link to="/settings/users">Cancel</Link>
-              </Button>
-              <Button
-                type="submit"
-                disabled={
-                  createUser.isPending ||
-                  addTeamMember.isPending ||
-                  permissionsQuery.isLoading ||
-                  permissionsQuery.isError ||
-                  !selectedRoleAvailable
-                }
-              >
-                {createUser.isPending && (
-                  <Loader2 className="size-4 shrink-0 animate-spin" />
-                )}
-                {createUser.isPending ? 'Creating user…' : 'Create user'}
-              </Button>
+              {teamAssignmentFailure ? (
+                <Alert className="w-full text-left">
+                  <AlertTitle>
+                    Account created; team assignment pending
+                  </AlertTitle>
+                  <AlertDescription className="space-y-3">
+                    <p>
+                      The account is ready, but it has not been added to the
+                      selected team. Retry safely without creating a duplicate
+                      account.
+                    </p>
+                    <div className="flex flex-wrap gap-3">
+                      <Button
+                        type="button"
+                        onClick={retryTeamAssignment}
+                        disabled={addTeamMember.isPending}
+                      >
+                        {addTeamMember.isPending && (
+                          <Loader2 className="size-4 shrink-0 animate-spin" />
+                        )}
+                        Retry team assignment
+                      </Button>
+                      <Button type="button" variant="outline" asChild>
+                        <Link to="/settings/users">Finish without team</Link>
+                      </Button>
+                    </div>
+                  </AlertDescription>
+                </Alert>
+              ) : (
+                <>
+                  <Button type="button" variant="outline" asChild>
+                    <Link to="/settings/users">Cancel</Link>
+                  </Button>
+                  <Button
+                    type="submit"
+                    disabled={
+                      createUser.isPending ||
+                      addTeamMember.isPending ||
+                      permissionsQuery.isLoading ||
+                      permissionsQuery.isError ||
+                      !selectedRoleAvailable
+                    }
+                  >
+                    {createUser.isPending && (
+                      <Loader2 className="size-4 shrink-0 animate-spin" />
+                    )}
+                    {createUser.isPending ? 'Creating user…' : 'Create user'}
+                  </Button>
+                </>
+              )}
             </div>
           </div>
 
@@ -558,7 +624,7 @@ export function CreateUser() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <RolePermissionDetails roleName={selectedRole} />
+              <RolePermissionDetails roleNames={[selectedRole]} />
             </CardContent>
           </Card>
         </form>

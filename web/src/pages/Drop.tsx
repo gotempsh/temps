@@ -5,6 +5,7 @@ import {
   deployFromStatic,
   getEnvironments,
   inspectDropArchive,
+  uploadStaticBundle,
   type DropInspectionResponse,
   type EnvironmentResponse,
   type ProjectResponse,
@@ -32,6 +33,7 @@ import {
   type DropFile,
 } from '@/lib/drop-archive'
 import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
+import { consumeDropFilesHandoff } from '@/lib/drop-handoff'
 import {
   serializeDropEnvironmentVariables,
   validateDropEnvironmentVariables,
@@ -107,6 +109,7 @@ export function Drop() {
   const [environmentVariables, setEnvironmentVariables] = useState<
     DropEnvironmentVariable[]
   >([])
+  const [handedOffFiles] = useState(() => consumeDropFilesHandoff())
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
 
@@ -216,6 +219,17 @@ export function Drop() {
     }
   }
 
+  useEffect(() => {
+    if (!handedOffFiles?.length) return
+    const startHandoff = window.setTimeout(
+      () => setSelection(handedOffFiles),
+      0
+    )
+    return () => window.clearTimeout(startHandoff)
+    // The handoff is deliberately consumed only on the first `/drop` mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handedOffFiles])
+
   const reset = () => {
     detectionRunRef.current += 1
     detectionAbortRef.current?.abort()
@@ -296,8 +310,6 @@ export function Drop() {
         throw new Error('The project has no deployment environment')
 
       setStage('uploading')
-      const body = new FormData()
-      body.append('file', archive)
       if (!candidate.isStatic) {
         const sourceResponse = await deployFromUploadedSource({
           throwOnError: true,
@@ -316,19 +328,13 @@ export function Drop() {
         )
         return
       }
-      const uploadResponse = await fetch(
-        `/api/projects/${createdProject.id}/upload/static`,
-        { method: 'POST', credentials: 'include', body }
-      )
-      if (!uploadResponse.ok) {
-        const problem = (await uploadResponse.json().catch(() => null)) as {
-          detail?: string
-        } | null
-        throw new Error(
-          problem?.detail || `Upload failed (${uploadResponse.status})`
-        )
-      }
-      const bundle = (await uploadResponse.json()) as { id: number }
+      const uploadResponse = await uploadStaticBundle({
+        throwOnError: true,
+        path: { project_id: createdProject.id },
+        body: { file: archive },
+      })
+      const bundle = uploadResponse.data
+      if (!bundle) throw new Error('Static upload returned no bundle')
 
       setStage('deploying')
       await deployFromStatic({

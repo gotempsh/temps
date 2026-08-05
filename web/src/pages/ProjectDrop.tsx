@@ -3,6 +3,7 @@ import {
   deployFromUploadedSource,
   getEnvironments,
   inspectDropArchive,
+  uploadStaticBundle,
   updateProjectSettings,
   type DropInspectionResponse,
   type EnvironmentResponse,
@@ -239,21 +240,13 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
 
       if (candidate.isStatic) {
         setStage('uploading')
-        const body = new FormData()
-        body.append('file', preparedArchive)
-        const uploadResponse = await fetch(
-          `/api/projects/${project.id}/upload/static`,
-          { method: 'POST', credentials: 'include', body }
-        )
-        if (!uploadResponse.ok) {
-          const problem = (await uploadResponse.json().catch(() => null)) as {
-            detail?: string
-          } | null
-          throw new Error(
-            problem?.detail || `Upload failed (${uploadResponse.status})`
-          )
-        }
-        const bundle = (await uploadResponse.json()) as { id: number }
+        const uploadResponse = await uploadStaticBundle({
+          throwOnError: true,
+          path: { project_id: project.id },
+          body: { file: preparedArchive },
+        })
+        const bundle = uploadResponse.data
+        if (!bundle) throw new Error('Static upload returned no bundle')
 
         setStage('deploying')
         await deployFromStatic({

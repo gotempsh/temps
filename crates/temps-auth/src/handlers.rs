@@ -124,6 +124,32 @@ async fn record_mfa_rejection(
     }
 }
 
+async fn record_pending_login(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    user_id: i32,
+    login_method: &'static str,
+) {
+    if let Err(error) = state
+        .audit_service
+        .create_audit_log(&LoginAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.to_string()),
+                user_agent: metadata.user_agent.as_str().to_string(),
+            },
+            success: true,
+            login_method: login_method.to_string(),
+        })
+        .await
+    {
+        error!(
+            user_id,
+            login_method, "Failed to record pending login audit event: {}", error
+        );
+    }
+}
+
 fn invalid_mfa_problem() -> Problem {
     problem_new(StatusCode::UNAUTHORIZED)
         .with_title("MFA Verification Failed")
@@ -1037,6 +1063,14 @@ pub async fn login(
                 let mut headers = HeaderMap::new();
                 headers.insert(SET_COOKIE, cookie_header);
 
+                record_pending_login(
+                    state.as_ref(),
+                    &metadata,
+                    user.id,
+                    "password-change-required",
+                )
+                .await;
+
                 return Ok((
                     headers,
                     Json(AuthResponse {
@@ -1314,6 +1348,14 @@ pub async fn login(
                 })?;
                 let mut headers = HeaderMap::new();
                 headers.insert(SET_COOKIE, cookie_header);
+
+                record_pending_login(
+                    state.as_ref(),
+                    &metadata,
+                    user_id,
+                    "password-mfa-enrollment-pending",
+                )
+                .await;
 
                 Ok((
                     headers,
@@ -2697,9 +2739,10 @@ async fn disable_mfa(
 mod tests {
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
-        create_user, delete_user, login, normalized_login_email, parse_user_roles, remove_role,
-        restore_user, update_user, verify_mfa_challenge, AdminTargetDenied, AssignRoleRequest,
-        CreateUserRequest, LoginRequest, RoleChangeDenied, UpdateUserRequest,
+        create_user, delete_user, login, normalized_login_email, parse_user_roles,
+        record_pending_login, remove_role, restore_user, update_user, verify_mfa_challenge,
+        AdminTargetDenied, AssignRoleRequest, CreateUserRequest, LoginRequest, RoleChangeDenied,
+        UpdateUserRequest,
     };
     use crate::auth_service::UserAuthError;
     use crate::context::AuthContext;
@@ -3022,6 +3065,53 @@ mod tests {
             ),
             StatusCode::UNAUTHORIZED,
         );
+    }
+
+    #[tokio::test]
+    async fn pending_password_and_mfa_logins_are_durably_audited() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            audit.clone(),
+        );
+        let metadata = request_metadata();
+
+        record_pending_login(state.as_ref(), &metadata, 41, "password-change-required").await;
+        record_pending_login(
+            state.as_ref(),
+            &metadata,
+            42,
+            "password-mfa-enrollment-pending",
+        )
+        .await;
+
+        let events = audit.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[0].user_id, Some(41));
+        assert_eq!(events[0].data["login_method"], "password-change-required");
+        assert_eq!(events[1].operation_type, "LOGIN_SUCCESS");
+        assert_eq!(events[1].user_id, Some(42));
+        assert_eq!(
+            events[1].data["login_method"],
+            "password-mfa-enrollment-pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_login_audit_failure_does_not_block_authentication_progress() {
+        let state = auth_state_with_audit(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            Arc::new(FailingAuditLogger),
+        );
+
+        record_pending_login(
+            state.as_ref(),
+            &request_metadata(),
+            41,
+            "password-change-required",
+        )
+        .await;
     }
 
     #[tokio::test]
