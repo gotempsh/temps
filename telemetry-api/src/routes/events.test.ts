@@ -3,10 +3,10 @@ import { createEventsRoutes, KNOWN_EVENT_TYPES } from "./events.js";
 import type { Pool } from "pg";
 
 describe("KNOWN_EVENT_TYPES", () => {
-  it("stays in lockstep with the Rust binary (34 events)", () => {
+  it("stays in lockstep with the Rust binary (38 events)", () => {
     // Mirror of temps-core TelemetryEventKind::all().len(). If this changes,
     // update both this set and the Rust enum together.
-    expect(KNOWN_EVENT_TYPES.size).toBe(34);
+    expect(KNOWN_EVENT_TYPES.size).toBe(38);
   });
 
   it("uses only snake_case names", () => {

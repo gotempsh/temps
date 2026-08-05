@@ -1898,10 +1898,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // (depends only on ServerConfig for the data dir). Registered early so
     // every later plugin can require the Arc<dyn TelemetryReporter>.
     debug!("Registering TelemetryPlugin");
-    let telemetry_plugin = Box::new(TelemetryPlugin::new(
-        config.clone(),
-        env!("CARGO_PKG_VERSION"),
-    ));
+    // TEMPS_VERSION (git-describe, set by build.rs) is used instead of
+    // CARGO_PKG_VERSION so nightly/beta builds report a version telemetry
+    // can actually distinguish from a tagged release -- CARGO_PKG_VERSION
+    // is the static Cargo.toml version and is identical across all of them.
+    let telemetry_plugin = Box::new(TelemetryPlugin::new(config.clone(), env!("TEMPS_VERSION")));
     plugin_manager.register_plugin(telemetry_plugin);
 
     // 2. QueuePlugin - registers the pre-created job queue into the service context
