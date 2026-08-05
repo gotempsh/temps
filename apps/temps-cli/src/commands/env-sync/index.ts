@@ -117,7 +117,8 @@ async function pull(
   // The list endpoint masks every value as `***`; plaintext only comes from the
   // audited per-key reveal endpoint. Without this the pull would overwrite the
   // developer's .env with a file full of `***`.
-  const resolvedValues = new Map<string, string>()
+  // Keyed by row id: the same name can exist in several environments.
+  const resolvedValues = new Map<number, string>()
   const unreadable: string[] = []
   await withSpinner('Resolving values...', async () => {
     for (const v of exportableVars) {
@@ -130,7 +131,7 @@ async function pull(
         unreadable.push(v.key)
         continue
       }
-      resolvedValues.set(v.key, valueResult.data.value)
+      resolvedValues.set(v.id, valueResult.data.value)
     }
   })
 
@@ -140,13 +141,14 @@ async function pull(
         'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
         `overwriting ${outputFile} with partial values would blank these variables.`
     )
+    process.exitCode = 1
     return
   }
 
   // Generate .env content
   const envContent = exportableVars
     .map(v => {
-      const value = resolvedValues.get(v.key) ?? ''
+      const value = resolvedValues.get(v.id) ?? ''
       const escapedValue = value.includes('\n') || value.includes('"')
         ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
         : value.includes(' ') || value.includes('#')
@@ -173,7 +175,7 @@ async function pull(
   }
 
   fs.writeFileSync(outputPath, envContent + '\n')
-  success(`Pulled ${filteredVars.length} variables to ${outputFile}`)
+  success(`Pulled ${exportableVars.length} variables to ${outputFile}`)
 }
 
 async function push(

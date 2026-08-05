@@ -927,8 +927,11 @@ async function resolveEnvVarValues(
   projectId: number,
   vars: EnvironmentVariableResponse[],
   environmentId?: number
-): Promise<{ resolved: Map<string, string>; failed: string[] }> {
-  const resolved = new Map<string, string>()
+): Promise<{ resolved: Map<number, string>; failed: string[] }> {
+  // Keyed by row id, not key: the same name can exist as separate rows in
+  // separate environments, and keying by name would print one row's value
+  // under the other's line.
+  const resolved = new Map<number, string>()
   const failed: string[] = []
 
   for (const v of vars) {
@@ -941,7 +944,7 @@ async function resolveEnvVarValues(
       failed.push(v.key)
       continue
     }
-    resolved.set(v.key, result.data.value)
+    resolved.set(v.id, result.data.value)
   }
 
   return { resolved, failed }
@@ -1027,13 +1030,16 @@ async function exportEnvVars(
         'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
         'a partial export would silently blank these variables.'
     )
+    // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
+    // or missing file believing the export succeeded.
+    process.exitCode = 1
     return
   }
 
   // Generate .env content
   const envContent = exportableVars
     .map(v => {
-      const value = resolved.get(v.key) ?? ''
+      const value = resolved.get(v.id) ?? ''
       const escapedValue = value.includes('\n') || value.includes('"')
         ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
         : value.includes(' ') || value.includes('#')

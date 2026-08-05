@@ -1,5 +1,6 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -374,8 +375,17 @@ impl EnvVarService {
                     let encryption_service = encryption_service.clone();
 
                     Box::pin(async move {
+                        // SELECT ... FOR UPDATE. Every decision below is derived
+                        // from this row — whether the flag may change, and
+                        // whether an empty value is about to be sealed — so the
+                        // read has to be serialized with concurrent updates.
+                        // Without the lock, a promotion committing between this
+                        // read and our own write lets a deliberate blank land on
+                        // a row that has since become secret, which is the
+                        // unrecoverable state both guards exist to prevent.
                         let env_var = env_vars::Entity::find_by_id(var_id)
                             .filter(env_vars::Column::ProjectId.eq(project_id))
+                            .lock_exclusive()
                             .one(txn)
                             .await?
                             .ok_or(EnvVarError::Other(
@@ -1167,15 +1177,29 @@ mod tests {
     async fn test_promoting_legacy_plaintext_row_encrypts_the_stored_value() {
         // Rows written before encryption was enabled hold plaintext. Promoting
         // one without supplying a new value must encrypt what is already there:
-        // a secret that is merely hidden from the API but readable in the
-        // database is not a secret. This is the branch the other tests miss,
-        // since they all start from is_encrypted = true.
+        // a secret that is merely hidden from the API but still readable in the
+        // database is not a secret. This is the only coverage of that branch —
+        // the other tests all start from is_encrypted = true.
+        //
+        // Asserted against the statement the transaction actually emitted, not
+        // against the mock's canned return row: the returned model is whatever
+        // the fixture says, so checking it would pass even if the encryption
+        // branch were deleted.
         let encryption_service = make_encryption_service();
         let before =
             make_env_var_model_full(8, 10, "LEGACY_KEY", "plain_secret_value", false, false);
-        let after = make_env_var_model_full(8, 10, "LEGACY_KEY", "plain_secret_value", true, true);
+        let after = make_env_var_model_full(8, 10, "LEGACY_KEY", "ciphertext", true, true);
 
-        let service = EnvVarService::new(mock_update_db(before, after), encryption_service.clone());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![before]])
+            .append_query_results(vec![vec![after]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = EnvVarService::new(db.clone(), encryption_service.clone());
 
         let outcome = service
             .update_environment_variable(
@@ -1189,17 +1213,33 @@ mod tests {
             )
             .await
             .expect("promoting a legacy plaintext row should succeed");
-
         assert!(outcome.promoted_to_secret);
-        assert!(outcome.var.is_secret);
-        assert_eq!(outcome.var.value, None);
 
-        // The ciphertext the transaction wrote must decrypt back to the
-        // original plaintext — proving it was encrypted exactly once and the
-        // value survived the promotion intact.
-        let written = service
-            .encrypt_value("LEGACY_KEY", "plain_secret_value")
-            .unwrap();
+        // DatabaseConnection is not Clone under the `mock` feature, and
+        // into_transaction_log consumes it — drop the service so this Arc is
+        // the sole owner.
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+
+        // Inspect the statements the transaction actually emitted. `Transaction`
+        // keeps its statements private, so match on the Debug rendering: every
+        // bound String shows up quoted, and exactly one of them is the
+        // ciphertext (it is the only candidate our key can decrypt).
+        let log = db.into_transaction_log();
+        let dump = format!("{:?}", log);
+        assert!(
+            dump.to_uppercase().contains("UPDATE"),
+            "the transaction must emit an UPDATE"
+        );
+        let written = dump
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .find(|candidate| encryption_service.decrypt_string(candidate).is_ok())
+            .map(|candidate| candidate.to_string())
+            .expect("the UPDATE must write a ciphertext this key can decrypt");
+
+        // The plaintext was encrypted exactly once, and survived intact.
         assert_ne!(written, "plain_secret_value");
         assert_eq!(
             encryption_service.decrypt_string(&written).unwrap(),
