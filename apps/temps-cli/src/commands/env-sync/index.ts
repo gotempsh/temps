@@ -99,14 +99,28 @@ async function pull(
     return
   }
 
+  // Secrets carry no value — the API never returns their plaintext — so they
+  // cannot be written to a .env file. Drop them, but say so explicitly rather
+  // than emitting an empty assignment that would silently blank the variable.
+  const secretVars = filteredVars.filter(v => v.is_secret)
+  const exportableVars = filteredVars.filter(v => !v.is_secret)
+
+  if (secretVars.length > 0) {
+    warning(
+      `Skipping ${secretVars.length} write-only secret(s): ${secretVars.map(v => v.key).join(', ')}. ` +
+        'Their values are never returned by the API — set them by hand where you need them.'
+    )
+  }
+
   // Generate .env content
-  const envContent = filteredVars
+  const envContent = exportableVars
     .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
+      const value = v.value ?? ''
+      const escapedValue = value.includes('\n') || value.includes('"')
+        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+        : value.includes(' ') || value.includes('#')
+          ? `"${value}"`
+          : value
       return `${v.key}=${escapedValue}`
     })
     .join('\n')

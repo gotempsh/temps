@@ -91,7 +91,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
-    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — a secret cannot later be made non-secret')
+    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -414,8 +414,16 @@ async function listEnvVars(
     { header: 'Key', key: 'key', color: (v) => colors.bold(v) },
     {
       header: 'Value',
-      accessor: (v) => options.showValues ? v.value : '••••••••',
-      color: (v) => options.showValues ? colors.primary(v) : colors.muted(v),
+      // Secrets come back with no value at all — the API never returns their
+      // plaintext — so --show-values must say so rather than print an empty cell.
+      accessor: (v) =>
+        v.is_secret ? '(secret)' : options.showValues ? (v.value ?? '') : '••••••••',
+      color: (v) =>
+        v === '(secret)'
+          ? colors.warning(v)
+          : options.showValues
+            ? colors.primary(v)
+            : colors.muted(v),
     },
     {
       header: 'Environments',
@@ -436,6 +444,16 @@ async function listEnvVars(
     info(`Use ${colors.bold('--show-values')} to reveal actual values`)
   }
   newline()
+}
+
+/**
+ * Render an env var's value for display. Secrets carry no value at all — the
+ * API never returns their plaintext — so they must read as deliberately
+ * withheld rather than as an empty variable.
+ */
+function formatEnvVarValue(v: EnvironmentVariableResponse): string {
+  if (v.is_secret) return colors.warning('(secret - write-only, never returned by the API)')
+  return v.value ?? ''
 }
 
 async function getEnvVar(
@@ -501,7 +519,7 @@ async function getEnvVar(
 
     newline()
     keyValue('Key', envVar.key)
-    keyValue('Value', envVar.value)
+    keyValue('Value', formatEnvVarValue(envVar))
     keyValue('Environment', targetEnv.name)
     keyValue('Include in Preview', envVar.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -514,7 +532,7 @@ async function getEnvVar(
 
   for (const v of matchingVars) {
     keyValue('ID', String(v.id))
-    keyValue('Value', v.value)
+    keyValue('Value', formatEnvVarValue(v))
     keyValue('Environments', v.environments.map(e => e.name).join(', ') || 'None')
     keyValue('Include in Preview', v.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -942,14 +960,28 @@ async function exportEnvVars(
     return
   }
 
+  // Secrets carry no value — the API never returns their plaintext — so they
+  // cannot be written to a .env file. Drop them, but say so explicitly rather
+  // than emitting an empty assignment that would silently blank the variable.
+  const secretVars = filteredVars.filter(v => v.is_secret)
+  const exportableVars = filteredVars.filter(v => !v.is_secret)
+
+  if (secretVars.length > 0) {
+    warning(
+      `Skipping ${secretVars.length} write-only secret(s): ${secretVars.map(v => v.key).join(', ')}. ` +
+        'Their values are never returned by the API — set them by hand where you need them.'
+    )
+  }
+
   // Generate .env content
-  const envContent = filteredVars
+  const envContent = exportableVars
     .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
+      const value = v.value ?? ''
+      const escapedValue = value.includes('\n') || value.includes('"')
+        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+        : value.includes(' ') || value.includes('#')
+          ? `"${value}"`
+          : value
       return `${v.key}=${escapedValue}`
     })
     .join('\n')

@@ -211,6 +211,10 @@ function EnvironmentVariableRow({
   const [editIncludeInPreview, setEditIncludeInPreview] = useState(
     variable.include_in_preview ?? false
   )
+  // Opt-in conversion of an existing plain variable into a write-only secret.
+  // One-way: once saved, the value can never be read back through the UI or the
+  // API, so it stays off unless the operator explicitly turns it on.
+  const [convertToSecret, setConvertToSecret] = useState(false)
 
   // Update selected environments and preview flag when variable changes (after refetch)
   useEffect(() => {
@@ -236,6 +240,7 @@ function EnvironmentVariableRow({
     if (!open) {
       setEditValue('')
       setIsEditMultiline(false)
+      setConvertToSecret(false)
       if (!isVisible && !showAllValues) {
         revealGuard.current.cancel('value')
         setRevealedValue(undefined)
@@ -259,10 +264,15 @@ function EnvironmentVariableRow({
         environment_ids: selectedEditEnvironments,
         key: variable.key,
         include_in_preview: editIncludeInPreview,
+        // Only sent when the operator asked for the conversion. Omitting the
+        // field leaves the existing flag untouched; sending `false` against an
+        // already-secret variable is rejected by the API as a demotion.
+        ...(convertToSecret ? { is_secret: true } : {}),
       },
     })
     setIsEditModalOpen(false)
     setEditValue('')
+    setConvertToSecret(false)
   }
 
   const { data: allEnvironments } = useQuery({
@@ -493,6 +503,34 @@ function EnvironmentVariableRow({
                   onCheckedChange={setEditIncludeInPreview}
                 />
               </div>
+              {!isSecret && (
+                <div
+                  className={`flex items-center justify-between space-x-2 rounded-lg border p-4 ${
+                    convertToSecret
+                      ? 'border-amber-500/40 bg-amber-500/5'
+                      : ''
+                  }`}
+                >
+                  <div className="flex-1 space-y-1">
+                    <Label
+                      htmlFor="edit-convert-secret"
+                      className="text-sm font-medium"
+                    >
+                      Convert to secret
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      {convertToSecret
+                        ? `On save, ${variable.key} becomes write-only: the value is masked in the UI and no longer returned by the API. You can still overwrite it, but never read it back — to make it a regular variable again you must delete it and create it anew.`
+                        : 'Make this variable write-only so its value can never be read from the UI or the API again. One-way: converting back means deleting and recreating the variable.'}
+                    </p>
+                  </div>
+                  <Switch
+                    id="edit-convert-secret"
+                    checked={convertToSecret}
+                    onCheckedChange={setConvertToSecret}
+                  />
+                </div>
+              )}
             </div>
             <DialogFooter>
               <Button
