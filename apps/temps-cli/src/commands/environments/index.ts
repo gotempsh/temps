@@ -15,6 +15,7 @@ import {
   deleteEnvironmentVariable,
   updateEnvironmentVariable,
   updateEnvironmentSettings,
+  getEnvironmentVariableValue,
   getProjectBySlug,
   getEnvironmentCrons,
   getCronById,
@@ -911,6 +912,41 @@ async function importEnvVars(
   }
 }
 
+/**
+ * Resolve real plaintext values for a set of variables.
+ *
+ * The list endpoint deliberately masks every value as `***` so a bulk read can
+ * never become a credential dump — plaintext is only available one key at a
+ * time through the audited reveal endpoint. Anything that writes a .env file
+ * has to go through here, or it writes `KEY=***` over the user's real config.
+ *
+ * Secrets are skipped by the caller (they have no readable value at all).
+ * A failed reveal is reported, never silently substituted.
+ */
+async function resolveEnvVarValues(
+  projectId: number,
+  vars: EnvironmentVariableResponse[],
+  environmentId?: number
+): Promise<{ resolved: Map<string, string>; failed: string[] }> {
+  const resolved = new Map<string, string>()
+  const failed: string[] = []
+
+  for (const v of vars) {
+    const result = await getEnvironmentVariableValue({
+      client,
+      path: { project_id: projectId, key: v.key },
+      query: { environment_id: environmentId, var_id: v.id },
+    })
+    if (result.error || !result.data) {
+      failed.push(v.key)
+      continue
+    }
+    resolved.set(v.key, result.data.value)
+  }
+
+  return { resolved, failed }
+}
+
 async function exportEnvVars(
   project: string,
   options: { environment?: string; output?: string }
@@ -918,7 +954,7 @@ async function exportEnvVars(
   await requireAuth()
   await setupClient()
 
-  const [vars, environments] = await withSpinner('Fetching environment variables...', async () => {
+  const [projectId, vars, environments] = await withSpinner('Fetching environment variables...', async () => {
     const projectId = await getProjectId(project)
 
     const [varsResult, envsResult] = await Promise.all([
@@ -935,7 +971,7 @@ async function exportEnvVars(
     if (varsResult.error) throw new Error(getErrorMessage(varsResult.error))
     if (envsResult.error) throw new Error(getErrorMessage(envsResult.error))
 
-    return [varsResult.data ?? [], envsResult.data ?? []] as const
+    return [projectId, varsResult.data ?? [], envsResult.data ?? []] as const
   })
 
   let filteredVars = vars
@@ -960,9 +996,9 @@ async function exportEnvVars(
     return
   }
 
-  // Secrets carry no value — the API never returns their plaintext — so they
-  // cannot be written to a .env file. Drop them, but say so explicitly rather
-  // than emitting an empty assignment that would silently blank the variable.
+  // Write-only secrets have no readable value at all. Drop them, but say so
+  // explicitly rather than emitting an empty assignment that would blank the
+  // variable wherever this file gets loaded.
   const secretVars = filteredVars.filter(v => v.is_secret)
   const exportableVars = filteredVars.filter(v => !v.is_secret)
 
@@ -973,10 +1009,31 @@ async function exportEnvVars(
     )
   }
 
+  const targetEnvId = options.environment
+    ? environments.find(
+        e => e.name.toLowerCase() === options.environment!.toLowerCase() ||
+             e.slug === options.environment!.toLowerCase()
+      )?.id
+    : undefined
+
+  const { resolved, failed } = await withSpinner(
+    'Resolving values...',
+    () => resolveEnvVarValues(projectId, exportableVars, targetEnvId)
+  )
+
+  if (failed.length > 0) {
+    errorOutput(
+      `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
+        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'a partial export would silently blank these variables.'
+    )
+    return
+  }
+
   // Generate .env content
   const envContent = exportableVars
     .map(v => {
-      const value = v.value ?? ''
+      const value = resolved.get(v.key) ?? ''
       const escapedValue = value.includes('\n') || value.includes('"')
         ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
         : value.includes(' ') || value.includes('#')
@@ -991,7 +1048,7 @@ async function exportEnvVars(
       ? options.output
       : path.resolve(process.cwd(), options.output)
     fs.writeFileSync(outputPath, envContent + '\n')
-    success(`Exported ${filteredVars.length} variables to ${options.output}`)
+    success(`Exported ${exportableVars.length} variables to ${options.output}`)
   } else {
     // Output to stdout
     console.log(envContent)

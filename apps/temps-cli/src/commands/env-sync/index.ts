@@ -10,6 +10,7 @@ import {
   getEnvironmentVariables,
   createEnvironmentVariable,
   updateEnvironmentVariable,
+  getEnvironmentVariableValue,
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptSelect, promptConfirm, promptCheckbox } from '../../ui/prompts.js'
@@ -55,6 +56,7 @@ async function pull(
     if (envsResult.error) throw new Error(getErrorMessage(envsResult.error))
 
     return {
+      projectId,
       vars: varsResult.data ?? [],
       envs: envsResult.data ?? [],
     }
@@ -99,9 +101,9 @@ async function pull(
     return
   }
 
-  // Secrets carry no value — the API never returns their plaintext — so they
-  // cannot be written to a .env file. Drop them, but say so explicitly rather
-  // than emitting an empty assignment that would silently blank the variable.
+  // Write-only secrets have no readable value at all. Drop them, but say so
+  // explicitly rather than emitting an empty assignment that would blank the
+  // variable wherever this file gets loaded.
   const secretVars = filteredVars.filter(v => v.is_secret)
   const exportableVars = filteredVars.filter(v => !v.is_secret)
 
@@ -112,10 +114,39 @@ async function pull(
     )
   }
 
+  // The list endpoint masks every value as `***`; plaintext only comes from the
+  // audited per-key reveal endpoint. Without this the pull would overwrite the
+  // developer's .env with a file full of `***`.
+  const resolvedValues = new Map<string, string>()
+  const unreadable: string[] = []
+  await withSpinner('Resolving values...', async () => {
+    for (const v of exportableVars) {
+      const valueResult = await getEnvironmentVariableValue({
+        client,
+        path: { project_id: result.projectId, key: v.key },
+        query: { var_id: v.id },
+      })
+      if (valueResult.error || !valueResult.data) {
+        unreadable.push(v.key)
+        continue
+      }
+      resolvedValues.set(v.key, valueResult.data.value)
+    }
+  })
+
+  if (unreadable.length > 0) {
+    errorOutput(
+      `Could not read ${unreadable.length} value(s): ${unreadable.join(', ')}. ` +
+        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        `overwriting ${outputFile} with partial values would blank these variables.`
+    )
+    return
+  }
+
   // Generate .env content
   const envContent = exportableVars
     .map(v => {
-      const value = v.value ?? ''
+      const value = resolvedValues.get(v.key) ?? ''
       const escapedValue = value.includes('\n') || value.includes('"')
         ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
         : value.includes(' ') || value.includes('#')

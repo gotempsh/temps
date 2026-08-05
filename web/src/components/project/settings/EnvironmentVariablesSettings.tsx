@@ -211,6 +211,11 @@ function EnvironmentVariableRow({
   const [editIncludeInPreview, setEditIncludeInPreview] = useState(
     variable.include_in_preview ?? false
   )
+  // Whether the edit box actually holds the variable's current value. False
+  // when the reveal was denied (it needs SecretsRead on top of EnvironmentsWrite)
+  // or failed, which is what distinguishes "cleared on purpose" from "never
+  // loaded" when the box is empty on save.
+  const [valueLoaded, setValueLoaded] = useState(false)
   // Opt-in conversion of an existing plain variable into a write-only secret.
   // One-way: once saved, the value can never be read back through the UI or the
   // API, so it stays off unless the operator explicitly turns it on.
@@ -231,6 +236,7 @@ function EnvironmentVariableRow({
       if (value !== undefined) {
         setEditValue(value)
         setIsEditMultiline(value.includes('\n'))
+        setValueLoaded(true)
       }
     }
   }
@@ -241,6 +247,7 @@ function EnvironmentVariableRow({
       setEditValue('')
       setIsEditMultiline(false)
       setConvertToSecret(false)
+      setValueLoaded(false)
       if (!isVisible && !showAllValues) {
         revealGuard.current.cancel('value')
         setRevealedValue(undefined)
@@ -248,12 +255,23 @@ function EnvironmentVariableRow({
     }
   }
 
+  // Both the secret case and the failed-reveal case mean "blank keeps what is
+  // already stored" — say so, so an empty box is never mistaken for an empty value.
+  const valuePlaceholder =
+    isSecret || !valueLoaded ? 'Leave blank to keep current value' : undefined
+
   const submitEdit = async () => {
-    // For secrets we never preloaded the value; an empty editValue means
-    // "keep the existing ciphertext". For regular vars we send the current
-    // text either way.
+    // An empty box means "keep the existing ciphertext" whenever we never had
+    // the value to begin with: always for secrets (never preloaded), and for a
+    // regular variable whose reveal was denied or failed. Sending "" in that
+    // case would overwrite the credential with an empty string — and if the
+    // same save also promotes the variable, that loss is unrecoverable.
+    // A cleared box after a *successful* reveal is a deliberate edit and is
+    // still sent as-is.
     const valueField =
-      isSecret && editValue.length === 0 ? undefined : editValue
+      editValue.length === 0 && (isSecret || !valueLoaded)
+        ? undefined
+        : editValue
     await updateMutation.mutateAsync({
       path: {
         project_id: project.id,
@@ -273,6 +291,7 @@ function EnvironmentVariableRow({
     setIsEditModalOpen(false)
     setEditValue('')
     setConvertToSecret(false)
+    setValueLoaded(false)
   }
 
   const { data: allEnvironments } = useQuery({
@@ -445,14 +464,14 @@ function EnvironmentVariableRow({
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono resize-y"
                     rows={6}
-                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
+                    placeholder={valuePlaceholder}
                   />
                 ) : (
                   <Input
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
                     className="font-mono"
-                    placeholder={isSecret ? 'Leave blank to keep current value' : undefined}
+                    placeholder={valuePlaceholder}
                   />
                 )}
                 {isSecret && (
