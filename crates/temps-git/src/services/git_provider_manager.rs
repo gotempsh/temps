@@ -4194,21 +4194,29 @@ impl GitProviderManager {
 
         // Check each connection for project usage
         for connection in &connections {
-            let projects: Vec<temps_entities::projects::Model> =
-                temps_entities::projects::Entity::find()
-                    .filter(
-                        temps_entities::projects::Column::GitProviderConnectionId
-                            .eq(Some(connection.id)),
-                    )
-                    .order_by_desc(temps_entities::projects::Column::CreatedAt)
-                    .all(self.db.as_ref())
-                    .await?;
+            // id/name/slug only — see delete_connection: deserializing full
+            // project models turns "used by project X" into an opaque
+            // "Database Error: unexpected value for Preset enum" the moment one
+            // blocking project has a column value this build can't decode.
+            let projects: Vec<(i32, String, String)> = temps_entities::projects::Entity::find()
+                .select_only()
+                .column(temps_entities::projects::Column::Id)
+                .column(temps_entities::projects::Column::Name)
+                .column(temps_entities::projects::Column::Slug)
+                .filter(
+                    temps_entities::projects::Column::GitProviderConnectionId
+                        .eq(Some(connection.id)),
+                )
+                .order_by_desc(temps_entities::projects::Column::CreatedAt)
+                .into_tuple()
+                .all(self.db.as_ref())
+                .await?;
 
-            for project in projects {
+            for (id, name, slug) in projects {
                 projects_in_use.push(ProjectUsageInfo {
-                    id: project.id,
-                    name: project.name,
-                    slug: project.slug,
+                    id,
+                    name,
+                    slug,
                     connection_id: connection.id,
                     connection_name: connection.account_name.clone(),
                 });
@@ -4302,19 +4310,26 @@ impl GitProviderManager {
         // Check if connection is in use by any projects. Name them — "used by 2
         // project(s)" leaves the user hunting through every project to work out
         // which ones to disconnect first.
-        let projects: Vec<temps_entities::projects::Model> =
-            temps_entities::projects::Entity::find()
-                .filter(
-                    temps_entities::projects::Column::GitProviderConnectionId
-                        .eq(Some(connection_id)),
-                )
-                .all(self.db.as_ref())
-                .await?;
+        // Select id + name only. Loading whole project models makes the check
+        // fail with an opaque "Database Error: unexpected value for Preset
+        // enum" if any blocking project carries a column value this build's
+        // enums don't know — and the user loses the real reason they can't
+        // delete, which is the whole point of this branch.
+        let projects: Vec<(i32, String)> = temps_entities::projects::Entity::find()
+            .select_only()
+            .column(temps_entities::projects::Column::Id)
+            .column(temps_entities::projects::Column::Name)
+            .filter(
+                temps_entities::projects::Column::GitProviderConnectionId.eq(Some(connection_id)),
+            )
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
 
         if !projects.is_empty() {
             let project_names: Vec<String> = projects
                 .iter()
-                .map(|p| format!("'{}' (ID: {})", p.name, p.id))
+                .map(|(id, name)| format!("'{}' (ID: {})", name, id))
                 .collect();
             return Err(GitProviderManagerError::InvalidConfiguration(format!(
                 "Cannot delete connection {} because it is used by {} project(s): {}. Change the git source of those projects (or delete them) first.",
