@@ -93,6 +93,7 @@
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "rrweb-player": "^2.1.1",
+    "shiki": "^4.4.2",
     "simple-icons": "^16.27.1",
     "slugify": "^1.6.9",
     "sonner": "^2.0.7",
