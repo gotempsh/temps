@@ -2387,11 +2387,18 @@ mod storage_cleanup_tests {
             Arc::new(PanicOnSendJobQueue) as Arc<dyn temps_core::JobQueue>,
             config.clone(),
         ));
+        let cookie_crypto = Arc::new(
+            temps_core::CookieCrypto::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test cookie key"),
+        );
         let service = Arc::new(SandboxService::new(
             db,
             registry.clone(),
             Arc::new(JobTracker::new()),
             config,
+            cookie_crypto,
             git,
             data_root,
         ));
