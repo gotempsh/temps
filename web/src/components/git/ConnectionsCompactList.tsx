@@ -88,7 +88,13 @@ export function ConnectionsCompactList({
       setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
       onConnectionDeleted?.()
     },
-    onError: () => toast.error('Failed to delete connection'),
+    // The server refuses when projects still deploy from this connection and
+    // says which ones in the Problem Details `detail`. Swallowing that left the
+    // user with a bare "Failed to delete connection" and nothing to act on.
+    onError: (error: any) =>
+      toast.error('Failed to delete connection', {
+        description: error?.detail || error?.title || error?.message,
+      }),
   })
 
   const [healthCheckInFlight, setHealthCheckInFlight] = useState<number | null>(

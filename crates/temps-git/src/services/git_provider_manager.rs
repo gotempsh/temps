@@ -3886,7 +3886,27 @@ impl GitProviderManager {
         )))
     }
 
-    /// Get all connections for a specific provider
+    /// Get every connection for a provider, regardless of owner or active state.
+    ///
+    /// Deletion checks must use this rather than [`Self::get_provider_connections`]:
+    /// a deactivated connection (or one owned by another user) still holds rows
+    /// that block or get cascaded by a provider delete, and counting only the
+    /// active ones produced errors referencing connections the caller could not
+    /// see anywhere in the UI.
+    pub async fn get_all_provider_connections(
+        &self,
+        provider_id: i32,
+    ) -> Result<Vec<git_provider_connections::Model>, GitProviderManagerError> {
+        let connections = git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
+            .order_by_desc(git_provider_connections::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(connections)
+    }
+
+    /// Get the active connections for a specific provider
     pub async fn get_provider_connections(
         &self,
         provider_id: i32,
@@ -4136,30 +4156,16 @@ impl GitProviderManager {
         Ok(())
     }
 
-    /// Permanently delete a git provider (hard delete)
+    /// Permanently delete a git provider (hard delete).
+    ///
+    /// A provider is only blocked by *projects* that still depend on one of its
+    /// connections — never by the mere existence of a connection row. Connections
+    /// are listed per-user in the UI, so refusing on connection count made
+    /// providers permanently undeletable whenever the connection belonged to
+    /// another user, had no owner, or was deactivated: the error named a
+    /// connection the caller had no way to find or remove.
     pub async fn delete_provider(&self, provider_id: i32) -> Result<(), GitProviderManagerError> {
-        // Check if provider exists
-        let provider = self.get_provider(provider_id).await?;
-
-        // Check if any connections exist for this provider
-        let connections = self.get_provider_connections(provider_id).await?;
-        if !connections.is_empty() {
-            return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                "Cannot delete provider {} because it has {} connection(s)",
-                provider.name,
-                connections.len()
-            )));
-        }
-
-        // Delete the provider
-        git_providers::Entity::delete_by_id(provider_id)
-            .exec(self.db.as_ref())
-            .await?;
-
-        // Remove from cache
-        self.providers_cache.write().await.remove(&provider_id);
-
-        Ok(())
+        self.delete_provider_safely(provider_id).await
     }
 
     /// Check if a provider can be safely deleted and return detailed usage information
@@ -4171,7 +4177,7 @@ impl GitProviderManager {
         let provider = self.get_provider(provider_id).await?;
 
         // Get all connections for this provider
-        let connections = self.get_provider_connections(provider_id).await?;
+        let connections = self.get_all_provider_connections(provider_id).await?;
 
         if connections.is_empty() {
             return Ok(ProviderDeletionCheck {
@@ -4251,7 +4257,7 @@ impl GitProviderManager {
         let provider = self.get_provider(provider_id).await?;
 
         // Get all connections to delete them along with the provider
-        let connections = self.get_provider_connections(provider_id).await?;
+        let connections = self.get_all_provider_connections(provider_id).await?;
 
         // Delete all repositories associated with these connections
         for connection in &connections {
@@ -4293,18 +4299,28 @@ impl GitProviderManager {
         // Check if connection exists
         self.get_connection(connection_id).await?;
 
-        // Check if connection is in use by any projects
-        let project_count = temps_entities::projects::Entity::find()
-            .filter(
-                temps_entities::projects::Column::GitProviderConnectionId.eq(Some(connection_id)),
-            )
-            .count(self.db.as_ref())
-            .await?;
+        // Check if connection is in use by any projects. Name them — "used by 2
+        // project(s)" leaves the user hunting through every project to work out
+        // which ones to disconnect first.
+        let projects: Vec<temps_entities::projects::Model> =
+            temps_entities::projects::Entity::find()
+                .filter(
+                    temps_entities::projects::Column::GitProviderConnectionId
+                        .eq(Some(connection_id)),
+                )
+                .all(self.db.as_ref())
+                .await?;
 
-        if project_count > 0 {
+        if !projects.is_empty() {
+            let project_names: Vec<String> = projects
+                .iter()
+                .map(|p| format!("'{}' (ID: {})", p.name, p.id))
+                .collect();
             return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                "Cannot delete connection {} because it is used by {} project(s)",
-                connection_id, project_count
+                "Cannot delete connection {} because it is used by {} project(s): {}. Change the git source of those projects (or delete them) first.",
+                connection_id,
+                projects.len(),
+                project_names.join(", ")
             )));
         }
 
@@ -5675,6 +5691,99 @@ mod tests {
 
         // Verify connection and provider were deactivated
         // (actual verification would require querying the database)
+    }
+
+    /// Regression: a provider whose only connection belongs to another user (or
+    /// to nobody, or is deactivated) used to be permanently undeletable — the
+    /// UI lists connections per-user, so the "it has 1 connection(s)" error
+    /// pointed at a row the caller could not see or remove anywhere. Only
+    /// projects actually deploying from the provider may block the delete.
+    #[tokio::test]
+    async fn delete_provider_removes_connections_the_caller_cannot_see() {
+        use chrono::Utc;
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("GitLab".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Two rows the caller can never see: an active but ownerless one
+        // (user_id = NULL — invisible to the per-user list yet counted by the
+        // old guard) and a deactivated one (invisible to the active-only list
+        // but still cascaded on delete).
+        let now = Utc::now();
+        for (account, active) in [("orphan-account", true), ("stale-account", false)] {
+            git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(None),
+                account_name: Set(account.to_string()),
+                account_type: Set("User".to_string()),
+                access_token: Set(None),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(active),
+                is_expired: Set(false),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        );
+
+        manager
+            .delete_provider(provider.id)
+            .await
+            .expect("provider with no project usage should delete");
+
+        assert!(
+            git_providers::Entity::find_by_id(provider.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "provider row should be gone"
+        );
+        assert!(
+            manager
+                .get_all_provider_connections(provider.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the hidden connection should have been cascaded away"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 import {
   deleteGitProviderMutation,
   getGitProviderOptions,
-  listConnectionsOptions,
+  getProviderConnectionsOptions,
+  getProviderConnectionsQueryKey,
   listConnectionsQueryKey,
   syncRepositoriesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -89,25 +90,37 @@ export default function GitProviderDetail() {
     isLoading: connectionsLoading,
     refetch: refetchConnections,
   } = useQuery({
-    ...listConnectionsOptions({}),
+    // Provider-scoped endpoint, not the caller's own connection list: the
+    // per-user list hides connections owned by someone else (or by nobody),
+    // and those are exactly the ones that block deleting the provider. Showing
+    // "No connections found" next to "cannot delete, it has 1 connection" left
+    // the user with nothing to act on.
+    ...getProviderConnectionsOptions({ path: { provider_id: providerId } }),
     retry: false,
     enabled: !!provider,
-    select: (data) =>
-      data?.connections?.filter(
-        (connection) => connection.provider_id === providerId
-      ) || [],
+    select: (data) => data || [],
     // Poll every 2s while any connection under this provider is syncing so
     // the running repo count + "Syncing" badge advance live. Polling stops
     // automatically once no connection reports `syncing=true`, keeping idle
     // tabs quiet.
     refetchInterval: (query) => {
-      const anySyncing = query.state.data?.connections?.some(
-        (c) => c.provider_id === providerId && c.syncing,
-      )
+      const anySyncing = query.state.data?.some((c) => c.syncing)
       return anySyncing ? 2000 : false
     },
     refetchIntervalInBackground: false,
   })
+
+  // Connection state shows up in two places: this provider-scoped list and the
+  // per-user list the dashboard renders. Refresh both together so neither goes
+  // stale after a sync or a delete.
+  const invalidateConnectionQueries = () => {
+    queryClient.invalidateQueries({
+      queryKey: getProviderConnectionsQueryKey({
+        path: { provider_id: providerId },
+      }),
+    })
+    queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
+  }
 
   const syncMutation = useMutation({
     ...syncRepositoriesMutation(),
@@ -119,7 +132,7 @@ export default function GitProviderDetail() {
     // already in its syncing state. Without this the user saw nothing change
     // until the full sync finished (potentially minutes on 20k-repo orgs).
     onMutate: () => {
-      queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
+      invalidateConnectionQueries()
     },
     onSuccess: () => {
       // 202 = sync started, not finished. The background task updates
@@ -127,12 +140,12 @@ export default function GitProviderDetail() {
       // progresses; the periodic refetch on this page surfaces that.
       showSuccess('Repository sync started')
       refetchConnections()
-      queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
+      invalidateConnectionQueries()
     },
     onError: (error: any) => {
       // The backend's drop-guard resets `syncing=false` on failure too, so
       // refresh the list to clear any stale "syncing" spinner.
-      queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
+      invalidateConnectionQueries()
 
       // Surface the failure. RFC 7807 Problem Details puts the human
       // message in `detail`; fall back to `title` then `message`.
@@ -147,7 +160,7 @@ export default function GitProviderDetail() {
     // Failures surface via the global mutation error handler in App.tsx,
     // which renders Problem Details as a toast: errorTitle becomes the
     // toast title and the API's `detail` becomes the description (e.g.
-    // "Cannot delete provider X because it has N connection(s)").
+    // "Cannot delete provider X because it is used by N project(s): ...").
     meta: { errorTitle: 'Failed to delete provider' },
     onSuccess: () => {
       toast.success('Git provider deleted successfully')
@@ -566,8 +579,10 @@ export default function GitProviderDetail() {
             <DialogTitle>Delete Git Provider</DialogTitle>
             <DialogDescription>
               Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone. Providers with existing connections
-              cannot be deleted — remove connections first.
+              action cannot be undone. Its {connections?.length ?? 0}{' '}
+              connection(s) and their synced repositories are deleted with it.
+              Projects still deployed from this provider block the delete — the
+              error names them.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
