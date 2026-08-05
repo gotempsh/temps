@@ -30,7 +30,33 @@ struct DnsAutomationAudit {
     provider_name: String,
     outcome: String,
     reason: Option<String>,
+    #[serde(serialize_with = "serialize_redacted_mutations")]
     mutations: Vec<temps_core::DnsAutomationMutation>,
+}
+
+fn serialize_redacted_mutations<S>(
+    mutations: &[temps_core::DnsAutomationMutation],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct RedactedMutation<'a> {
+        record_type: &'a str,
+        name: &'a str,
+        value: &'static str,
+    }
+
+    mutations
+        .iter()
+        .map(|mutation| RedactedMutation {
+            record_type: &mutation.record_type,
+            name: &mutation.name,
+            value: "[REDACTED]",
+        })
+        .collect::<Vec<_>>()
+        .serialize(serializer)
 }
 
 impl AuditOperation for DnsAutomationAudit {
@@ -718,7 +744,7 @@ impl TlsService {
         dns_provider_service: &Arc<temps_dns::services::DnsProviderService>,
         report: &mut RenewalReport,
     ) -> bool {
-        let (provider, _managed_domain) = match dns_provider_service
+        let (provider, managed_domain) = match dns_provider_service
             .find_provider_for_domain(&cert.domain)
             .await
         {
@@ -741,7 +767,7 @@ impl TlsService {
             }
         };
 
-        let base_domain = crate::handlers::domain_handler::extract_base_domain(&cert.domain);
+        let authoritative_zone = managed_domain.domain;
 
         info!(
             "🔄 Auto-renewing DNS-01 certificate for {} via DNS provider {}",
@@ -819,7 +845,7 @@ impl TlsService {
         let authorization_request = temps_core::DnsAutomationRequest {
             purpose: temps_core::DnsAutomationPurpose::AcmeDns01,
             domain: cert.domain.clone(),
-            zone: base_domain.clone(),
+            zone: authoritative_zone.clone(),
             provider_id: provider.id,
             provider_name: provider.name.clone(),
             mutations: mutations.clone(),
@@ -827,7 +853,7 @@ impl TlsService {
         let Some(gate) = &self.dns_automation_gate else {
             self.audit_dns_automation(DnsAutomationAudit {
                 domain: cert.domain.clone(),
-                zone: base_domain.clone(),
+                zone: authoritative_zone.clone(),
                 provider_id: provider.id,
                 provider_name: provider.name.clone(),
                 outcome: "denied".to_string(),
@@ -840,6 +866,7 @@ impl TlsService {
         let setup = crate::handlers::domain_handler::setup_authorized_dns_txt_records(
             gate.as_ref(),
             &authorization_request,
+            provider.id,
             provider_instance.as_ref(),
         )
         .await;
@@ -847,7 +874,7 @@ impl TlsService {
             crate::handlers::domain_handler::AuthorizedDnsSetup::Denied(reason) => {
                 self.audit_dns_automation(DnsAutomationAudit {
                     domain: cert.domain.clone(),
-                    zone: base_domain.clone(),
+                    zone: authoritative_zone.clone(),
                     provider_id: provider.id,
                     provider_name: provider.name.clone(),
                     outcome: "denied".to_string(),
@@ -864,7 +891,7 @@ impl TlsService {
             crate::handlers::domain_handler::AuthorizedDnsSetup::AuthorizationError(reason) => {
                 self.audit_dns_automation(DnsAutomationAudit {
                     domain: cert.domain.clone(),
-                    zone: base_domain.clone(),
+                    zone: authoritative_zone.clone(),
                     provider_id: provider.id,
                     provider_name: provider.name.clone(),
                     outcome: "authorization_error".to_string(),
@@ -915,7 +942,7 @@ impl TlsService {
             .await;
             self.audit_dns_automation(DnsAutomationAudit {
                 domain: cert.domain.clone(),
-                zone: base_domain.clone(),
+                zone: authoritative_zone.clone(),
                 provider_id: provider.id,
                 provider_name: provider.name.clone(),
                 outcome: "publish_failed".to_string(),
@@ -928,7 +955,7 @@ impl TlsService {
 
         self.audit_dns_automation(DnsAutomationAudit {
             domain: cert.domain.clone(),
-            zone: base_domain.clone(),
+            zone: authoritative_zone.clone(),
             provider_id: provider.id,
             provider_name: provider.name.clone(),
             outcome: "published".to_string(),
@@ -1477,6 +1504,29 @@ fn load_private_key(content: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_automation_audit_redacts_acme_values() {
+        let audit = DnsAutomationAudit {
+            domain: "example.com".to_string(),
+            zone: "example.com".to_string(),
+            provider_id: 7,
+            provider_name: "production-dns".to_string(),
+            outcome: "published".to_string(),
+            reason: None,
+            mutations: vec![temps_core::DnsAutomationMutation {
+                record_type: "TXT".to_string(),
+                name: "_acme-challenge.example.com".to_string(),
+                value: "super-secret-acme-token".to_string(),
+            }],
+        };
+
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+
+        assert!(!serialized.contains("super-secret-acme-token"));
+        assert!(serialized.contains("[REDACTED]"));
+        assert!(serialized.contains("_acme-challenge.example.com"));
+    }
     use crate::tls::errors::ProviderError;
     use crate::tls::models::{
         Certificate, CertificateFilter, CertificateStatus, ChallengeData, ChallengeType,

@@ -325,7 +325,7 @@ impl DomainService {
                             );
                             for (i, txt_record) in challenge_data.dns_txt_records.iter().enumerate()
                             {
-                                info!("  [{}] {} = {}", i + 1, txt_record.name, txt_record.value);
+                                info!("  [{}] {} = [REDACTED]", i + 1, txt_record.name);
                             }
                         }
                     }

@@ -49,7 +49,7 @@ pub trait AuditLogger: Send + Sync {
 
 /// Stable indirection for audit consumers constructed before optional
 /// decorators register. Replacing the target updates every previously-captured
-/// `Arc<dyn AuditLogger>`, so late EE decorators cannot be bypassed.
+/// `Arc<dyn AuditLogger>`, so decorators registered later cannot be bypassed.
 pub struct AuditLoggerSlot {
     target: RwLock<Arc<dyn AuditLogger>>,
 }

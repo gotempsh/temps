@@ -618,7 +618,7 @@ impl DnsProviderService {
         let instance = self.create_provider_instance(&provider)?;
 
         // Distinguish "token lacks zone access" (PermissionDenied) from "zone
-        // absent" so the UI can flag a mis-scoped token.
+        // absent" so the UI can flag an incorrectly scoped token.
         let access = instance.check_zone_access(domain).await;
         let can_manage = access.is_ok();
         let (zone_access_ok, zone_access_error) = match &access {
@@ -867,17 +867,13 @@ impl DnsProviderService {
         &self,
         domain: &str,
     ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
-        // Extract base domain
-        let base_domain = Self::extract_base_domain(domain);
-
-        let managed_domain = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::Domain.eq(&base_domain))
+        let managed_domains = dns_managed_domains::Entity::find()
             .filter(dns_managed_domains::Column::Verified.eq(true))
             .filter(dns_managed_domains::Column::AutoManage.eq(true))
-            .one(self.db.as_ref())
+            .all(self.db.as_ref())
             .await?;
 
-        if let Some(managed) = managed_domain {
+        if let Some(managed) = Self::longest_managed_domain_match(domain, managed_domains) {
             let provider = self.get(managed.provider_id).await?;
             if provider.is_active {
                 return Ok(Some((provider, managed)));
@@ -887,14 +883,43 @@ impl DnsProviderService {
         Ok(None)
     }
 
-    /// Extract base domain from a full domain name
-    fn extract_base_domain(domain: &str) -> String {
-        let parts: Vec<&str> = domain.split('.').collect();
-        if parts.len() >= 2 {
-            parts[parts.len() - 2..].join(".")
-        } else {
-            domain.to_string()
-        }
+    /// Find the verified zone belonging to `provider_id` that authoritatively
+    /// covers `domain`. Human-triggered writes do not require `auto_manage`, but
+    /// they must never be allowed to use arbitrary provider credentials.
+    pub async fn find_verified_zone_for_provider(
+        &self,
+        provider_id: i32,
+        domain: &str,
+    ) -> Result<Option<dns_managed_domains::Model>, DnsError> {
+        let managed_domains = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Verified.eq(true))
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(Self::longest_managed_domain_match(domain, managed_domains))
+    }
+
+    fn longest_managed_domain_match(
+        domain: &str,
+        managed_domains: Vec<dns_managed_domains::Model>,
+    ) -> Option<dns_managed_domains::Model> {
+        let domain = Self::normalize_domain(domain);
+        managed_domains
+            .into_iter()
+            .filter(|managed| {
+                let zone = Self::normalize_domain(&managed.domain);
+                domain == zone || domain.ends_with(&format!(".{zone}"))
+            })
+            .max_by_key(|managed| Self::normalize_domain(&managed.domain).len())
+    }
+
+    fn normalize_domain(domain: &str) -> String {
+        domain
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
     }
 }
 
@@ -915,19 +940,52 @@ impl temps_core::PublicHostnameResolver for DnsProviderService {
 mod tests {
     use super::*;
 
+    fn managed_domain(id: i32, provider_id: i32, domain: &str) -> dns_managed_domains::Model {
+        let now = chrono::Utc::now();
+        dns_managed_domains::Model {
+            id,
+            provider_id,
+            domain: domain.to_string(),
+            zone_id: None,
+            auto_manage: true,
+            verified: true,
+            verified_at: Some(now),
+            verification_error: None,
+            generated_hostname_mode: "standard".to_string(),
+            sync_generated_records: false,
+            zone_access_ok: Some(true),
+            zone_access_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[test]
-    fn test_extract_base_domain() {
-        assert_eq!(
-            DnsProviderService::extract_base_domain("example.com"),
-            "example.com"
+    fn longest_managed_domain_suffix_wins() {
+        let matched = DnsProviderService::longest_managed_domain_match(
+            "API.Dev.Example.COM.",
+            vec![
+                managed_domain(1, 10, "example.com"),
+                managed_domain(2, 20, "dev.example.com"),
+            ],
         );
+
         assert_eq!(
-            DnsProviderService::extract_base_domain("sub.example.com"),
-            "example.com"
+            matched.map(|managed| (managed.provider_id, managed.domain)),
+            Some((20, "dev.example.com".to_string()))
         );
+    }
+
+    #[test]
+    fn managed_domain_match_respects_label_boundaries_and_wildcards() {
+        let domains = vec![managed_domain(1, 10, "example.com")];
         assert_eq!(
-            DnsProviderService::extract_base_domain("deep.sub.example.com"),
-            "example.com"
+            DnsProviderService::longest_managed_domain_match("*.www.example.com", domains.clone())
+                .map(|managed| managed.domain),
+            Some("example.com".to_string())
+        );
+        assert!(
+            DnsProviderService::longest_managed_domain_match("notexample.com", domains).is_none()
         );
     }
 }
