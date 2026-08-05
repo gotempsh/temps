@@ -300,93 +300,91 @@ impl AuthService {
         session_token: &str,
         code: &str,
     ) -> Result<temps_entities::users::Model, MfaChallengeError> {
-        let transaction = self
-            .db
-            .begin()
+        let session_token = session_token.to_owned();
+        let code = code.to_owned();
+        self.db
+            .transaction::<_, temps_entities::users::Model, MfaChallengeError>(|transaction| {
+                Box::pin(async move {
+                    // Get the user from the temporary session. Require mfa_pending so a
+                    // real (fully authenticated) session token can never be spent as an
+                    // MFA challenge -- the discriminator cuts both ways.
+                    let session = temps_entities::sessions::Entity::find()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the pending session",
+                            user_id: None,
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
+
+                    let user = temps_entities::users::Entity::find_by_id(session.user_id)
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the challenge user",
+                            user_id: Some(session.user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::UserNotFound {
+                            user_id: session.user_id,
+                        })?;
+
+                    // Verify the MFA code
+                    if !Self::verify_totp_code(&user, &code)? {
+                        return Err(MfaChallengeError::InvalidCode { user_id: user.id });
+                    }
+
+                    let mut verified_user = user;
+                    if !verified_user.mfa_enabled {
+                        let mut user_update: temps_entities::users::ActiveModel =
+                            verified_user.into();
+                        user_update.mfa_enabled = Set(true);
+                        verified_user =
+                            user_update.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "enable MFA for the challenge user",
+                                    user_id: Some(session.user_id),
+                                    source,
+                                }
+                            })?;
+                    }
+
+                    // Consume the challenge in the same transaction as enrollment so a
+                    // failed update never strands the user without a retryable challenge.
+                    let deletion = temps_entities::sessions::Entity::delete_many()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .exec(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "consume the verified pending session",
+                            user_id: Some(verified_user.id),
+                            source,
+                        })?;
+                    if deletion.rows_affected != 1 {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    Ok(verified_user)
+                })
+            })
             .await
-            .map_err(|source| MfaChallengeError::Database {
-                operation: "start the MFA challenge transaction",
-                user_id: None,
-                source,
-            })?;
-
-        // Get the user from the temporary session. Require mfa_pending so a
-        // real (fully authenticated) session token can never be spent as an
-        // MFA challenge -- the discriminator cuts both ways.
-        let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
-            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
-            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-            .one(&transaction)
-            .await
-            .map_err(|source| MfaChallengeError::Database {
-                operation: "load the pending session",
-                user_id: None,
-                source,
-            })?
-            .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
-
-        let user = temps_entities::users::Entity::find_by_id(session.user_id)
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(|source| MfaChallengeError::Database {
-                operation: "load the challenge user",
-                user_id: Some(session.user_id),
-                source,
-            })?
-            .ok_or(MfaChallengeError::UserNotFound {
-                user_id: session.user_id,
-            })?;
-
-        // Verify the MFA code
-        if !self.verify_totp_code(&user, code)? {
-            return Err(MfaChallengeError::InvalidCode { user_id: user.id });
-        }
-
-        let mut verified_user = user;
-        if !verified_user.mfa_enabled {
-            let mut user_update: temps_entities::users::ActiveModel = verified_user.into();
-            user_update.mfa_enabled = Set(true);
-            verified_user = user_update.update(&transaction).await.map_err(|source| {
-                MfaChallengeError::Database {
-                    operation: "enable MFA for the challenge user",
-                    user_id: Some(session.user_id),
+            .map_err(|error| match error {
+                sea_orm::TransactionError::Transaction(error) => error,
+                sea_orm::TransactionError::Connection(source) => MfaChallengeError::Database {
+                    operation: "run the MFA challenge transaction",
+                    user_id: None,
                     source,
-                }
-            })?;
-        }
-
-        // Consume the challenge in the same transaction as enrollment so a
-        // failed update never strands the user without a retryable challenge.
-        let deletion = temps_entities::sessions::Entity::delete_many()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
-            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-            .exec(&transaction)
-            .await
-            .map_err(|source| MfaChallengeError::Database {
-                operation: "consume the verified pending session",
-                user_id: Some(verified_user.id),
-                source,
-            })?;
-        if deletion.rows_affected != 1 {
-            return Err(MfaChallengeError::InvalidOrExpiredSession);
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| MfaChallengeError::Database {
-                operation: "commit the verified MFA challenge",
-                user_id: Some(verified_user.id),
-                source,
-            })?;
-
-        Ok(verified_user)
+                },
+            })
     }
 
     fn verify_totp_code(
-        &self,
         user: &temps_entities::users::Model,
         code: &str,
     ) -> Result<bool, MfaChallengeError> {
