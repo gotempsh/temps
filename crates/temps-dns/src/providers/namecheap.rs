@@ -29,6 +29,22 @@ pub struct NamecheapProvider {
 }
 
 impl NamecheapProvider {
+    /// Summarize an API request without exposing parameter values in logs.
+    fn api_request_summary(command: &str, params: &[(&str, &str)]) -> String {
+        let parameter_names = params
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "command={} parameter_count={} parameter_names=[{}]",
+            command,
+            params.len(),
+            parameter_names
+        )
+    }
+
     /// Create a new Namecheap provider with the given credentials
     pub fn new(credentials: NamecheapCredentials) -> Result<Self, DnsError> {
         let client = Client::builder()
@@ -88,8 +104,8 @@ impl NamecheapProvider {
         query_params.extend(params);
 
         debug!(
-            "Namecheap API request: {} with params: {:?}",
-            command, params
+            request = %Self::api_request_summary(command, params),
+            "Namecheap API request"
         );
 
         let response = self
@@ -516,6 +532,24 @@ mod tests {
         let (sld, tld) = NamecheapProvider::split_domain("sub.example.com");
         assert_eq!(sld, "sub.example");
         assert_eq!(tld, "com");
+    }
+
+    #[test]
+    fn test_api_request_summary_excludes_parameter_values() {
+        const SENTINEL_TXT_VALUE: &str = "acme-secret-sentinel-value";
+        let params = [
+            ("SLD", "example"),
+            ("TLD", "com"),
+            ("Address1", SENTINEL_TXT_VALUE),
+        ];
+
+        let summary =
+            NamecheapProvider::api_request_summary("namecheap.domains.dns.setHosts", &params);
+
+        assert!(!summary.contains(SENTINEL_TXT_VALUE));
+        assert!(summary.contains("command=namecheap.domains.dns.setHosts"));
+        assert!(summary.contains("parameter_count=3"));
+        assert!(summary.contains("parameter_names=[SLD,TLD,Address1]"));
     }
 
     #[test]
