@@ -517,6 +517,13 @@ impl DnsProviderService {
         &self,
         provider: &dns_providers::Model,
     ) -> Result<serde_json::Value, DnsError> {
+        if !provider.is_active {
+            return Err(DnsError::ProviderInactive {
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+            });
+        }
+
         let credentials_json = self
             .encryption_service
             .decrypt_string(&provider.credentials)
@@ -540,17 +547,33 @@ impl DnsProviderService {
         // Verify provider exists
         let _provider = self.get(provider_id).await?;
 
-        // Check if domain is already managed
+        let canonical_domain = Self::normalize_domain(&request.domain);
+        if canonical_domain.is_empty() {
+            return Err(DnsError::Validation(format!(
+                "Managed domain '{}' has no DNS labels after canonicalization",
+                request.domain
+            )));
+        }
+
+        // Check the same canonical form used by authoritative lookup. New rows
+        // are stored canonically, so the existing raw unique constraint also
+        // closes the race between this preflight query and the insert.
         let existing = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::Domain.eq(&request.domain))
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!("{} = $1", Self::NORMALIZED_MANAGED_DOMAIN_SQL),
+                [canonical_domain.clone()],
+            ))
+            .limit(1)
             .one(self.db.as_ref())
             .await?;
 
-        if existing.is_some() {
-            return Err(DnsError::Validation(format!(
-                "Domain {} is already managed by another provider",
-                request.domain
-            )));
+        if let Some(existing) = existing {
+            return Err(DnsError::ManagedDomainAlreadyExists {
+                requested_domain: request.domain,
+                canonical_domain,
+                existing_managed_domain_id: existing.id,
+                existing_provider_id: existing.provider_id,
+            });
         }
 
         // Normalize the requested mode; unknown values fall back to standard.
@@ -565,7 +588,7 @@ impl DnsProviderService {
 
         let managed_domain = dns_managed_domains::ActiveModel {
             provider_id: Set(provider_id),
-            domain: Set(request.domain.clone()),
+            domain: Set(canonical_domain.clone()),
             auto_manage: Set(request.auto_manage),
             verified: Set(false),
             generated_hostname_mode: Set(mode),
@@ -577,7 +600,7 @@ impl DnsProviderService {
 
         info!(
             "Added managed domain {} to provider {}",
-            request.domain, provider_id
+            canonical_domain, provider_id
         );
 
         Ok(result)
@@ -952,16 +975,39 @@ impl DnsProviderService {
             query = query.filter(dns_managed_domains::Column::AutoManage.eq(true));
         }
 
-        query
+        let rows = query
             .order_by_desc(sea_orm::sea_query::Expr::cust(format!(
                 "CHAR_LENGTH({})",
                 Self::NORMALIZED_MANAGED_DOMAIN_SQL
             )))
-            .limit(1)
-            .one(self.db.as_ref())
+            .order_by_asc(dns_managed_domains::Column::Id)
+            .limit(2)
+            .all(self.db.as_ref())
             .await
-            .map_err(DnsError::from)
-            .map(|row| row.and_then(|(managed, provider)| provider.map(|p| (p, managed))))
+            .map_err(DnsError::from)?
+            .into_iter()
+            .filter_map(|(managed, provider)| provider.map(|provider| (provider, managed)))
+            .collect::<Vec<_>>();
+
+        let Some((provider, managed)) = rows.first() else {
+            return Ok(None);
+        };
+        let canonical_zone = Self::normalize_domain(&managed.domain);
+
+        if rows.get(1).is_some_and(|(_, candidate)| {
+            Self::normalize_domain(&candidate.domain) == canonical_zone
+        }) {
+            return Err(DnsError::AmbiguousManagedDomain {
+                requested_domain: domain.to_string(),
+                canonical_zone,
+                managed_domain_ids: rows.iter().map(|(_, managed)| managed.id).collect(),
+                provider_ids: rows.iter().map(|(provider, _)| provider.id).collect(),
+            });
+        }
+
+        let mut selected = managed.clone();
+        selected.domain = canonical_zone;
+        Ok(Some((provider.clone(), selected)))
     }
 
     fn authoritative_suffix_candidates(domain: &str) -> Vec<String> {
@@ -1123,6 +1169,14 @@ mod tests {
     }
 
     #[test]
+    fn managed_domain_canonicalization_strips_repeated_wildcards_and_root_dots() {
+        assert_eq!(
+            DnsProviderService::normalize_domain("  *.*.*.API.Example.COM...  "),
+            "api.example.com"
+        );
+    }
+
+    #[test]
     fn authoritative_suffix_candidates_are_bounded_for_malformed_input() {
         let domain = std::iter::repeat_n("label", 200)
             .collect::<Vec<_>>()
@@ -1170,5 +1224,147 @@ mod tests {
             .sql
             .contains(r#""dns_managed_domains"."provider_id" = $7"#));
         assert!(statement.sql.contains("LIMIT $8"));
+        assert_eq!(
+            format!("{:?}", statement.values),
+            "Some(Values([String(Some(\"api.dev.example.com\")), String(Some(\"dev.example.com\")), String(Some(\"example.com\")), String(Some(\"com\")), Bool(Some(true)), Bool(Some(true)), Int(Some(42)), BigUnsigned(Some(2))]))"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_best_canonical_zone_fails_closed() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    (
+                        managed_domain(11, 101, "Example.COM."),
+                        Some(dns_provider(101, "first", true)),
+                    ),
+                    (
+                        managed_domain(12, 202, "*.example.com"),
+                        Some(dns_provider(202, "second", true)),
+                    ),
+                ]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db,
+            Arc::new(EncryptionService::new_from_password("ambiguous-zone-test")),
+        );
+
+        let result = service.find_provider_for_domain("api.example.com").await;
+
+        assert!(matches!(
+            result,
+            Err(DnsError::AmbiguousManagedDomain {
+                requested_domain,
+                canonical_zone,
+                managed_domain_ids,
+                provider_ids,
+            }) if requested_domain == "api.example.com"
+                && canonical_zone == "example.com"
+                && managed_domain_ids == vec![11, 12]
+                && provider_ids == vec![101, 202]
+        ));
+    }
+
+    #[tokio::test]
+    async fn more_specific_zone_wins_without_treating_parent_as_ambiguous() {
+        let child = managed_domain(11, 101, "*.Dev.Example.COM.");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    (child.clone(), Some(dns_provider(101, "child", true))),
+                    (
+                        managed_domain(12, 202, "example.com"),
+                        Some(dns_provider(202, "parent", true)),
+                    ),
+                ]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db,
+            Arc::new(EncryptionService::new_from_password("parent-zone-test")),
+        );
+
+        let result = service
+            .find_provider_for_domain("api.dev.example.com")
+            .await;
+
+        assert!(matches!(
+            result,
+            Ok(Some((provider, managed))) if provider.id == 101
+                && managed.id == child.id
+                && managed.domain == "dev.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_managed_domain_rejects_canonical_duplicate_using_indexed_predicate() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![dns_provider(101, "provider", true)]])
+                .append_query_results(vec![vec![managed_domain(11, 202, "example.com")]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("canonical-add-test")),
+        );
+
+        let result = service
+            .add_managed_domain(
+                101,
+                AddManagedDomainRequest {
+                    domain: "  *.*.Example.COM...  ".to_string(),
+                    auto_manage: true,
+                    generated_hostname_mode: None,
+                    sync_generated_records: false,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DnsError::ManagedDomainAlreadyExists {
+                requested_domain,
+                canonical_domain,
+                existing_managed_domain_id: 11,
+                existing_provider_id: 202,
+            }) if requested_domain == "  *.*.Example.COM...  "
+                && canonical_domain == "example.com"
+        ));
+        drop(service);
+        let transaction_log = Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log();
+        let statement = &transaction_log[1].statements()[0];
+        assert!(statement.sql.contains(
+            "LOWER(REGEXP_REPLACE(RTRIM(BTRIM(\"dns_managed_domains\".\"domain\"), '.'), '^((\\*\\.)+)', '')) = $1"
+        ));
+        assert!(statement.sql.contains("LIMIT $2"));
+        assert_eq!(
+            format!("{:?}", statement.values),
+            "Some(Values([String(Some(\"example.com\")), BigUnsigned(Some(1))]))"
+        );
+    }
+
+    #[test]
+    fn masked_credentials_for_inactive_provider_fail_before_decryption() {
+        let service = DnsProviderService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            Arc::new(EncryptionService::new_from_password("inactive-mask-test")),
+        );
+        let mut provider = dns_provider(101, "inactive", false);
+        provider.credentials = "not-valid-ciphertext".to_string();
+
+        let result = service.get_masked_credentials(&provider);
+
+        assert!(matches!(
+            result,
+            Err(DnsError::ProviderInactive {
+                provider_id: 101,
+                provider_name,
+            }) if provider_name == "inactive"
+        ));
     }
 }

@@ -308,3 +308,130 @@ async fn test_setup_dns_inactive_provider_rejects_without_dns_or_audit_touch() {
         "rejected inactive providers must not emit a successful DNS setup audit"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(dns_governance_db)]
+async fn test_setup_dns_normalized_zone_ambiguity_returns_conflict() {
+    use temps_domains::tls::models::AcmeOrder;
+    use temps_entities::{dns_managed_domains, dns_providers};
+
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            eprintln!("Docker unavailable; skipping setup-DNS ambiguity test: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create test database: {error}"),
+    };
+    let db = test_db.db.clone();
+    let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+    let repository = Arc::new(DefaultCertificateRepository::new(
+        db.clone(),
+        encryption.clone(),
+    ));
+    let certificate_provider = Arc::new(UnusedCertificateProvider);
+    let domain_service = Arc::new(DomainService::new(
+        db.clone(),
+        certificate_provider.clone(),
+        repository.clone(),
+        encryption.clone(),
+    ));
+    let domain = domain_service
+        .create_domain("app.example.com", "dns-01")
+        .await
+        .expect("create domain");
+    repository
+        .save_acme_order(AcmeOrder {
+            id: 0,
+            order_url: "https://acme.test/order/ambiguity".to_string(),
+            domain_id: domain.id,
+            email: "acme@example.com".to_string(),
+            status: "pending".to_string(),
+            identifiers: serde_json::json!([]),
+            authorizations: Some(serde_json::json!({
+                "dns_txt_records": [{
+                    "name": "_acme-challenge.app.example.com",
+                    "value": "must-not-be-published"
+                }]
+            })),
+            finalize_url: None,
+            certificate_url: None,
+            error: None,
+            error_type: None,
+            token: Some("token".to_string()),
+            key_authorization: Some("key-auth".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        })
+        .await
+        .expect("save order");
+    let provider = dns_providers::ActiveModel {
+        name: Set("ambiguous-provider".to_string()),
+        provider_type: Set("manual".to_string()),
+        credentials: Set("not-valid-ciphertext".to_string()),
+        is_active: Set(true),
+        description: Set(None),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert provider");
+    for zone in ["example.com", "  *.EXAMPLE.COM. "] {
+        dns_managed_domains::ActiveModel {
+            provider_id: Set(provider.id),
+            domain: Set(zone.to_string()),
+            auto_manage: Set(false),
+            verified: Set(true),
+            generated_hostname_mode: Set("standard".to_string()),
+            sync_generated_records: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert equivalent managed zone");
+    }
+
+    let dns_provider_service =
+        Arc::new(temps_dns::services::DnsProviderService::new(db, encryption));
+    let state = Arc::new(DomainAppState {
+        tls_service: Arc::new(TlsService::new(repository.clone(), certificate_provider)),
+        repository,
+        domain_service,
+        dns_provider_service: Some(dns_provider_service),
+        audit_service: Arc::new(RecordingAudit::default()),
+        telemetry: Arc::new(NoopTelemetryReporter),
+    });
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/domains/{}/setup-dns", domain.id))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"dns_provider_id":{}}}"#,
+            provider.id
+        )))
+        .unwrap();
+    request.extensions_mut().insert(auth(vec![
+        Permission::DomainsWrite,
+        Permission::DnsProvidersWrite,
+    ]));
+    request.extensions_mut().insert(metadata());
+
+    let response = temps_domains::configure_routes()
+        .with_state(state)
+        .oneshot(request)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["title"], "Ambiguous Managed DNS Zone");
+    assert!(problem["detail"].as_str().unwrap().contains("example.com"));
+    assert!(!problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("must-not-be-published"));
+}

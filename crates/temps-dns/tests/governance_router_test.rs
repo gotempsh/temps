@@ -238,6 +238,37 @@ async fn test_add_non_automated_domain_does_not_require_automation_permission() 
 }
 
 #[tokio::test]
+async fn test_apply_hostname_mode_with_dns_sync_without_automation_permission_returns_forbidden_before_db_touch(
+) {
+    let status = request(
+        Method::POST,
+        "/dns-providers/7/domains/example.com/apply-hostname-mode",
+        vec![Permission::DnsProvidersWrite],
+        r#"{"mode":"flat","sync_dns":true}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_apply_hostname_mode_without_dns_sync_does_not_require_automation_permission() {
+    let status = request(
+        Method::POST,
+        "/dns-providers/7/domains/example.com/apply-hostname-mode",
+        vec![Permission::DnsProvidersWrite],
+        r#"{"mode":"flat","sync_dns":false}"#,
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "dns:providers:write must retain access when sync_dns is false; the empty mock DB may fail later"
+    );
+}
+
+#[tokio::test]
 async fn test_add_managed_domain_success_emits_governance_audit() {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
     use temps_entities::dns_providers;
@@ -486,4 +517,195 @@ async fn test_find_provider_for_duplicate_zone_skips_inactive_provider_candidate
     assert_eq!(provider.id, active_provider_id);
     assert!(provider.is_active);
     assert_eq!(managed.provider_id, active_provider_id);
+}
+
+#[tokio::test]
+#[serial_test::serial(dns_governance_db)]
+async fn test_add_managed_domain_canonical_duplicate_returns_conflict() {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    use temps_dns::services::AddManagedDomainRequest;
+    use temps_entities::{dns_managed_domains, dns_providers};
+
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            eprintln!("Docker unavailable; skipping canonical duplicate router test: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create test database: {error}"),
+    };
+    let db = test_db.db.clone();
+    let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+    let encrypted_credentials = encryption.encrypt_string("{}").unwrap();
+
+    let existing_provider = dns_providers::ActiveModel {
+        name: Set("existing-provider".to_string()),
+        provider_type: Set("manual".to_string()),
+        credentials: Set(encrypted_credentials.clone()),
+        is_active: Set(true),
+        description: Set(None),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert existing provider");
+    dns_managed_domains::ActiveModel {
+        provider_id: Set(existing_provider.id),
+        domain: Set("  *.EXAMPLE.COM. ".to_string()),
+        auto_manage: Set(false),
+        verified: Set(true),
+        generated_hostname_mode: Set("standard".to_string()),
+        sync_generated_records: Set(false),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert legacy non-canonical managed domain");
+    let target_provider = dns_providers::ActiveModel {
+        name: Set("target-provider".to_string()),
+        provider_type: Set("manual".to_string()),
+        credentials: Set(encrypted_credentials),
+        is_active: Set(true),
+        description: Set(None),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert target provider");
+
+    let response = router_with_db(db.clone(), encryption.clone())
+        .oneshot(request_for(
+            Method::POST,
+            format!("/dns-providers/{}/domains", target_provider.id),
+            vec![Permission::DnsProvidersWrite],
+            Body::from(
+                r#"{"domain":"example.com","auto_manage":false,"sync_generated_records":false}"#,
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["title"], "Managed DNS Domain Already Exists");
+    assert!(problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("canonicalizes to 'example.com', which is already managed"));
+
+    let service = DnsProviderService::new(db, encryption);
+    let fresh = service
+        .add_managed_domain(
+            target_provider.id,
+            AddManagedDomainRequest {
+                domain: "  *.Fresh.Example.NET. ".to_string(),
+                auto_manage: false,
+                generated_hostname_mode: None,
+                sync_generated_records: false,
+            },
+        )
+        .await
+        .expect("add a fresh non-canonical managed domain");
+    assert_eq!(fresh.domain, "fresh.example.net");
+}
+
+#[tokio::test]
+#[serial_test::serial(dns_governance_db)]
+async fn test_find_provider_for_canonical_duplicate_eligible_zones_returns_ambiguity() {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    use temps_dns::errors::DnsError;
+    use temps_entities::{dns_managed_domains, dns_providers};
+
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error)
+            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+        {
+            eprintln!("Docker unavailable; skipping ambiguous managed-zone test: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to create test database: {error}"),
+    };
+    let db = test_db.db.clone();
+    let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+    let encrypted_credentials = encryption.encrypt_string("{}").unwrap();
+    let mut longest_zones = Vec::new();
+
+    for (name, domain) in [
+        ("longest-one", "api.example.com"),
+        ("longest-two", "  *.API.EXAMPLE.COM. "),
+        ("parent", "example.com"),
+    ] {
+        let provider = dns_providers::ActiveModel {
+            name: Set(name.to_string()),
+            provider_type: Set("manual".to_string()),
+            credentials: Set(encrypted_credentials.clone()),
+            is_active: Set(true),
+            description: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert active provider");
+        let managed = dns_managed_domains::ActiveModel {
+            provider_id: Set(provider.id),
+            domain: Set(domain.to_string()),
+            auto_manage: Set(true),
+            verified: Set(true),
+            generated_hostname_mode: Set("standard".to_string()),
+            sync_generated_records: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert eligible managed domain");
+        if name.starts_with("longest") {
+            longest_zones.push((provider.id, managed));
+        }
+    }
+    let service = DnsProviderService::new(db.clone(), encryption);
+
+    let error = service
+        .find_provider_for_domain("app.api.example.com")
+        .await
+        .expect_err("equivalent longest eligible zones must fail closed");
+    match error {
+        DnsError::AmbiguousManagedDomain {
+            requested_domain,
+            canonical_zone,
+            managed_domain_ids,
+            provider_ids,
+        } => {
+            assert_eq!(requested_domain, "app.api.example.com");
+            assert_eq!(canonical_zone, "api.example.com");
+            assert_eq!(managed_domain_ids.len(), 2);
+            assert_eq!(provider_ids.len(), 2);
+            assert!(longest_zones
+                .iter()
+                .all(|(provider_id, managed)| provider_ids.contains(provider_id)
+                    && managed_domain_ids.contains(&managed.id)));
+        }
+        other => panic!("expected AmbiguousManagedDomain, got {other:?}"),
+    }
+
+    for (_, managed) in longest_zones {
+        let mut active: dns_managed_domains::ActiveModel = managed.into();
+        active.auto_manage = Set(false);
+        active
+            .update(db.as_ref())
+            .await
+            .expect("make tied longest zone ineligible");
+    }
+    let (provider, managed) = service
+        .find_provider_for_domain("app.api.example.com")
+        .await
+        .expect("lookup with only parent eligible")
+        .expect("shorter parent must remain a valid fallback");
+    assert_eq!(provider.name, "parent");
+    assert_eq!(managed.domain, "example.com");
 }

@@ -759,17 +759,6 @@ impl TlsService {
             }
         };
 
-        let provider_instance = match dns_provider_service.create_provider_instance(&provider) {
-            Ok(instance) => instance,
-            Err(e) => {
-                warn!(
-                    "Failed to initialize DNS provider {} for {}: {}",
-                    provider.name, cert.domain, e
-                );
-                return false;
-            }
-        };
-
         let authoritative_zone = managed_domain.domain;
 
         info!(
@@ -866,15 +855,15 @@ impl TlsService {
             .await;
             return false;
         };
-        let setup = crate::handlers::domain_handler::setup_authorized_dns_txt_records(
+        match crate::handlers::domain_handler::authorize_dns_automation_request(
             gate.as_ref(),
             &authorization_request,
             provider.id,
-            provider_instance.as_ref(),
         )
-        .await;
-        let (results, records_created) = match setup {
-            crate::handlers::domain_handler::AuthorizedDnsSetup::Denied(reason) => {
+        .await
+        {
+            crate::handlers::domain_handler::DnsAutomationAuthorization::Allowed => {}
+            crate::handlers::domain_handler::DnsAutomationAuthorization::Denied(reason) => {
                 self.audit_dns_automation(DnsAutomationAudit {
                     domain: cert.domain.clone(),
                     zone: authoritative_zone.clone(),
@@ -891,7 +880,9 @@ impl TlsService {
                 );
                 return false;
             }
-            crate::handlers::domain_handler::AuthorizedDnsSetup::AuthorizationError(reason) => {
+            crate::handlers::domain_handler::DnsAutomationAuthorization::AuthorizationError(
+                reason,
+            ) => {
                 self.audit_dns_automation(DnsAutomationAudit {
                     domain: cert.domain.clone(),
                     zone: authoritative_zone.clone(),
@@ -908,11 +899,27 @@ impl TlsService {
                 );
                 return false;
             }
-            crate::handlers::domain_handler::AuthorizedDnsSetup::Published {
-                results,
-                records_created,
-            } => (results, records_created),
+        }
+
+        // Provider construction decrypts credentials, so it must happen only
+        // after the unattended mutation policy has explicitly allowed this
+        // exact provider, zone, domain, and record batch.
+        let provider_instance = match dns_provider_service.create_provider_instance(&provider) {
+            Ok(instance) => instance,
+            Err(error) => {
+                warn!(
+                    "Failed to initialize DNS provider {} for {} after automation authorization: {}",
+                    provider.name, cert.domain, error
+                );
+                return false;
+            }
         };
+        let (results, records_created) = crate::handlers::domain_handler::setup_dns_txt_records(
+            provider_instance.as_ref(),
+            &authoritative_zone,
+            &dns_txt_records,
+        )
+        .await;
 
         if (records_created as usize) < dns_txt_records.len() {
             let failed_detail = results
@@ -1551,6 +1558,21 @@ mod tests {
         }
     }
 
+    struct ErroringDnsAutomationGate;
+
+    #[async_trait::async_trait]
+    impl temps_core::DnsAutomationGate for ErroringDnsAutomationGate {
+        async fn authorize(
+            &self,
+            request: &temps_core::DnsAutomationRequest,
+        ) -> Result<temps_core::DnsAutomationDecision, temps_core::DnsAutomationError> {
+            Err(temps_core::DnsAutomationError::policy_evaluation_failed(
+                request,
+                "policy store offline",
+            ))
+        }
+    }
+
     struct AllowingDnsAutomationGate;
 
     #[async_trait::async_trait]
@@ -1681,7 +1703,166 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(dns_renewal_db)]
-    async fn test_try_dns01_renewal_with_provider_denied_gate_audits_and_leaves_order_pending() {
+    async fn test_dns01_renewal_policy_failures_precede_provider_credential_decryption() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_core::AppSettings;
+        use temps_entities::{dns_managed_domains, dns_providers, settings};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping DNS policy ordering test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let db = test_db.db.clone();
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "dns-policy-ordering-test",
+        ));
+        let repository = Arc::new(MockCertificateRepository::new());
+        let certificate_provider = Arc::new(DnsRenewalCertificateProvider {
+            completion_calls: AtomicUsize::new(0),
+        });
+        let domain_service = Arc::new(crate::DomainService::new(
+            db.clone(),
+            certificate_provider.clone(),
+            repository.clone(),
+            encryption.clone(),
+        ));
+        let dns_provider_service = Arc::new(temps_dns::services::DnsProviderService::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let mut app_settings = AppSettings::default();
+        app_settings.letsencrypt.email = Some("acme@example.com".to_string());
+        settings::ActiveModel {
+            id: Set(1),
+            data: Set(serde_json::to_value(app_settings).unwrap()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert ACME settings");
+        let config_dir = std::env::temp_dir().join(format!(
+            "temps-dns-policy-ordering-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(dns_renewal_test_server_config(config_dir)),
+            db.clone(),
+        ));
+
+        struct PolicyCase {
+            label: &'static str,
+            gate: Option<Arc<dyn temps_core::DnsAutomationGate>>,
+            expected_reason: &'static str,
+        }
+        let cases = [
+            PolicyCase {
+                label: "missing",
+                gate: None,
+                expected_reason: "no automation gate is configured",
+            },
+            PolicyCase {
+                label: "denied",
+                gate: Some(Arc::new(DenyingDnsAutomationGate::default())),
+                expected_reason: "automation policy denied the request",
+            },
+            PolicyCase {
+                label: "error",
+                gate: Some(Arc::new(ErroringDnsAutomationGate)),
+                expected_reason: "automation policy evaluation failed",
+            },
+        ];
+
+        for PolicyCase {
+            label,
+            gate,
+            expected_reason,
+        } in cases
+        {
+            let zone = format!("{label}.example.com");
+            let domain = format!("app.{zone}");
+            let persisted_domain = domain_service
+                .create_domain(&domain, "dns-01")
+                .await
+                .expect("create DNS-01 domain for policy-ordering case");
+            let provider = dns_providers::ActiveModel {
+                name: Set(format!("{label}-provider")),
+                provider_type: Set("cloudflare".to_string()),
+                // A policy-ordering regression tries to decrypt this and fails
+                // before it can produce the expected policy/manual outcome.
+                credentials: Set("not-valid-ciphertext".to_string()),
+                is_active: Set(true),
+                description: Set(None),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert active provider");
+            dns_managed_domains::ActiveModel {
+                provider_id: Set(provider.id),
+                domain: Set(zone),
+                auto_manage: Set(true),
+                verified: Set(true),
+                generated_hostname_mode: Set("standard".to_string()),
+                sync_generated_records: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert eligible managed zone");
+
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut service = TlsService::new(repository.clone(), certificate_provider.clone())
+                .with_config_service(config_service.clone())
+                .with_domain_service(domain_service.clone())
+                .with_dns_provider_service(dns_provider_service.clone())
+                .with_audit_logger(audit.clone());
+            if let Some(gate) = gate {
+                service = service.with_dns_automation_gate(gate);
+            }
+            let certificate = Certificate {
+                id: persisted_domain.id,
+                domain: domain.clone(),
+                certificate_pem: "old-certificate".to_string(),
+                private_key_pem: "old-private-key".to_string(),
+                expiration_time: chrono::Utc::now() + chrono::Duration::days(7),
+                last_renewed: None,
+                is_wildcard: false,
+                verification_method: "dns-01".to_string(),
+                status: CertificateStatus::Active,
+            };
+            let mut report = RenewalReport {
+                total_checked: 1,
+                auto_renewed: vec![],
+                renewal_failed: vec![],
+                manual_action_needed: vec![],
+            };
+
+            service
+                .handle_dns01_notification(&certificate, &mut report)
+                .await;
+
+            assert_eq!(report.manual_action_needed.len(), 1, "case {label}");
+            assert_eq!(
+                report.manual_action_needed[0].domain, domain,
+                "case {label}"
+            );
+            let operations = audit.operations.lock().unwrap();
+            assert_eq!(operations.len(), 1, "case {label}");
+            assert!(operations[0].1.contains(expected_reason), "case {label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(dns_renewal_db)]
+    async fn test_check_and_renew_certificates_dns01_denied_gate_falls_back_to_manual_action() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
         use temps_core::AppSettings;
         use temps_dns::providers::{CloudflareCredentials, DnsProviderType, ProviderCredentials};
@@ -1780,6 +1961,8 @@ mod tests {
         let audit = Arc::new(RecordingAuditLogger::default());
         let service = TlsService::new(repository.clone(), certificate_provider.clone())
             .with_config_service(config_service)
+            .with_domain_service(domain_service.clone())
+            .with_dns_provider_service(dns_provider_service.clone())
             .with_dns_automation_gate(gate.clone())
             .with_audit_logger(audit.clone());
         let certificate = Certificate {
@@ -1793,25 +1976,21 @@ mod tests {
             verification_method: "dns-01".to_string(),
             status: CertificateStatus::Active,
         };
-        let mut report = RenewalReport {
-            total_checked: 1,
-            auto_renewed: vec![],
-            renewal_failed: vec![],
-            manual_action_needed: vec![],
-        };
+        repository
+            .save_certificate(certificate)
+            .await
+            .expect("persist expiring DNS-01 certificate");
 
-        let handled = service
-            .try_dns01_renewal_with_provider(
-                &certificate,
-                &domain_service,
-                &dns_provider_service,
-                &mut report,
-            )
-            .await;
+        let report = service
+            .check_and_renew_certificates(30)
+            .await
+            .expect("run scheduled certificate renewal");
 
-        assert!(!handled, "denial must fall back to the manual renewal path");
+        assert_eq!(report.total_checked, 1);
         assert!(report.auto_renewed.is_empty());
         assert!(report.renewal_failed.is_empty());
+        assert_eq!(report.manual_action_needed.len(), 1);
+        assert_eq!(report.manual_action_needed[0].domain, "app.example.com");
         assert_eq!(
             certificate_provider
                 .completion_calls
@@ -1839,7 +2018,7 @@ mod tests {
         assert!(operations[0].1.contains("\"outcome\":\"denied\""));
         assert!(operations[0]
             .1
-            .contains("scheduler principal lacks dns:automation:write"));
+            .contains("automation policy denied the request"));
         assert!(operations[0].1.contains("[REDACTED]"));
         assert!(!operations[0].1.contains("secret-acme-proof"));
 

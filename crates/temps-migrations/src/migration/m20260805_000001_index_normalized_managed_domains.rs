@@ -16,11 +16,17 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // SeaORM 1.1 wraps PostgreSQL migrations in a transaction, so
-        // CREATE INDEX CONCURRENTLY is not legal here. Bound how long the
-        // ordinary idempotent build may wait on a conflicting table lock.
+        // CREATE INDEX CONCURRENTLY is not legal here. lock_timeout only
+        // bounds lock acquisition; statement_timeout also bounds the complete
+        // index operation. This configuration table is intentionally small,
+        // so a short non-concurrent build is preferable to an unbounded wait.
         manager
             .get_connection()
             .execute_unprepared("SET LOCAL lock_timeout = '5s'")
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared("SET LOCAL statement_timeout = '30s'")
             .await?;
         manager
             .get_connection()
@@ -35,6 +41,10 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared("SET LOCAL lock_timeout = '5s'")
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared("SET LOCAL statement_timeout = '30s'")
             .await?;
         manager
             .get_connection()

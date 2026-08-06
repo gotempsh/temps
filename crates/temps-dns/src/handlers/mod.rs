@@ -444,6 +444,14 @@ impl From<DnsError> for Problem {
             DnsError::DomainNotFound(domain) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Domain Not Found")
                 .with_detail(format!("Domain {} not found", domain)),
+            DnsError::ManagedDomainAlreadyExists { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Managed DNS Domain Already Exists")
+                    .with_detail(error.to_string())
+            }
+            DnsError::AmbiguousManagedDomain { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Ambiguous Managed DNS Zone")
+                .with_detail(error.to_string()),
             DnsError::ZoneNotFound(zone) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Zone Not Found")
                 .with_detail(format!("DNS zone {} not found", zone)),
@@ -1173,6 +1181,9 @@ async fn apply_hostname_mode(
     Json(request): Json<ApplyHostnameModeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
+    if request.sync_dns {
+        permission_check!(auth, Permission::DnsAutomationWrite);
+    }
 
     let target = PublicHostnameStrategy::from_db_str(&request.mode);
     let result = state

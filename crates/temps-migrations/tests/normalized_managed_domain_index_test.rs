@@ -1,9 +1,9 @@
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::Migrator;
+use temps_migrations::NormalizedManagedDomainIndexMigration;
 use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
-const TARGET: &str = "m20260805_000001_index_normalized_managed_domains";
 const INDEX_NAME: &str = "idx_dns_managed_domains_normalized_domain";
 
 async fn connect_with_retries(database_url: &str) -> anyhow::Result<DatabaseConnection> {
@@ -32,6 +32,20 @@ async fn index_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
         .await?
         .expect("index existence query returns one row");
     Ok(row.try_get("", "present")?)
+}
+
+async fn index_definition<C>(db: &C) -> anyhow::Result<String>
+where
+    C: ConnectionTrait,
+{
+    let row = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT pg_get_indexdef('{INDEX_NAME}'::regclass) AS definition"),
+        ))
+        .await?
+        .expect("index definition query returns one row");
+    Ok(row.try_get("", "definition")?)
 }
 
 #[tokio::test]
@@ -77,11 +91,47 @@ async fn test_normalized_managed_domain_index_migration_is_used_and_reversible(
         "normalized-domain index must exist after up"
     );
 
-    // A second full `up` is a no-op and must preserve the index.
-    Migrator::up(&db, None).await?;
+    // Invoke this migration directly even though the migrator already created
+    // the index. Both calls execute the CREATE INDEX IF NOT EXISTS statement.
+    let transaction = db.begin().await?;
+    let manager = SchemaManager::new(&transaction);
+    NormalizedManagedDomainIndexMigration.up(&manager).await?;
+    NormalizedManagedDomainIndexMigration.up(&manager).await?;
+    assert_eq!(
+        transaction
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT current_setting('lock_timeout') AS lock_timeout, \
+                        current_setting('statement_timeout') AS statement_timeout"
+                    .to_string(),
+            ))
+            .await?
+            .expect("timeout settings query returns one row")
+            .try_get::<String>("", "lock_timeout")?,
+        "5s"
+    );
+    let timeout_row = transaction
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_setting('statement_timeout') AS statement_timeout".to_string(),
+        ))
+        .await?
+        .expect("statement timeout query returns one row");
+    assert_eq!(
+        timeout_row.try_get::<String>("", "statement_timeout")?,
+        "30s"
+    );
+    transaction.commit().await?;
     assert!(
         index_exists(&db).await?,
-        "repeated up must preserve the index"
+        "direct repeated up must preserve the index"
+    );
+    let definition = index_definition(&db).await?;
+    assert!(
+        definition.contains(
+            "lower(regexp_replace(rtrim(btrim((domain)::text), '.'::text), '^((\\*\\.)+)'::text, ''::text))"
+        ),
+        "index must retain the canonical managed-domain expression; definition was: {definition}"
     );
 
     db.execute_unprepared(
@@ -116,25 +166,33 @@ async fn test_normalized_managed_domain_index_migration_is_used_and_reversible(
         "planner must use {INDEX_NAME}; plan was:\n{plan}"
     );
 
-    let after = db
+    let transaction = db.begin().await?;
+    let manager = SchemaManager::new(&transaction);
+    NormalizedManagedDomainIndexMigration.down(&manager).await?;
+    let absent = transaction
         .query_one(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT count(*)::int AS n FROM seaql_migrations WHERE version > '{TARGET}'"),
+            format!("SELECT to_regclass('public.{INDEX_NAME}') IS NULL AS absent"),
         ))
         .await?
-        .expect("migration count query returns one row");
-    let steps_after: i32 = after.try_get("", "n")?;
-    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+        .expect("index absence query returns one row");
     assert!(
-        !index_exists(&db).await?,
-        "down must remove the normalized-domain index"
+        absent.try_get::<bool>("", "absent")?,
+        "direct down must remove the normalized-domain index"
     );
-
-    Migrator::up(&db, None).await?;
+    NormalizedManagedDomainIndexMigration.up(&manager).await?;
     assert!(
-        index_exists(&db).await?,
-        "up after rollback must restore the normalized-domain index"
+        transaction
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT to_regclass('public.{INDEX_NAME}') IS NOT NULL AS present"),
+            ))
+            .await?
+            .expect("restored index query returns one row")
+            .try_get::<bool>("", "present")?,
+        "direct up after direct down must restore the normalized-domain index"
     );
+    transaction.commit().await?;
 
     Ok(())
 }

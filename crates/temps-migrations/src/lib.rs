@@ -9,4 +9,5 @@ pub use sea_orm_migration::prelude::*;
 mod migration;
 // Re-export for convenience
 // Re-export removed
+pub use migration::m20260805_000001_index_normalized_managed_domains::Migration as NormalizedManagedDomainIndexMigration;
 pub use migration::Migrator;
