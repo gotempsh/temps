@@ -2,7 +2,10 @@
 # Translated READMEs (README.es.md, README.de.md, ...) are not English —
 # the checker "corrects" valid foreign words (oder→order, Cliente→Client).
 # The English README.md itself is still checked.
-extend-exclude = ["README.*.md"]
+# Captured-payload fixtures: real trace/span ids are hex, and the checker
+# "corrects" letter runs inside them (`e14b54b28caf9283` → `...calf9283`),
+# silently corrupting the very data the fixture exists to preserve.
+extend-exclude = ["README.*.md", "**/__fixtures__/**"]
 
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,

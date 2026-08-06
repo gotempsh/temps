@@ -49,7 +49,7 @@ import {
   ProjectLegend,
 } from '@/components/traces/ProjectBadge'
 import { TraceStatBadges } from '@/components/traces/TraceStatBadges'
-import { buildSpanTree, flattenTree } from '@/utils/spanTree'
+import { buildSpanTree, flattenTree, traceWindow } from '@/utils/spanTree'
 import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
@@ -570,17 +570,11 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   usePageTitle(tree[0]?.span?.name ?? 'Trace')
 
   // Calculate trace-level timing for waterfall positioning
-  const traceStart = useMemo(() => {
-    if (displaySpans.length === 0) return 0
-    return Math.min(...displaySpans.map((s) => new Date(s.start_time).getTime()))
-  }, [displaySpans])
-
-  const traceEnd = useMemo(() => {
-    if (displaySpans.length === 0) return 0
-    return Math.max(...displaySpans.map((s) => new Date(s.end_time).getTime()))
-  }, [displaySpans])
-
-  const traceDuration = traceEnd - traceStart
+  const {
+    start: traceStart,
+    end: traceEnd,
+    duration: traceDuration,
+  } = useMemo(() => traceWindow(displaySpans), [displaySpans])
 
   // Shared props for every trace-detail layout variant (ui.sh picker below).
   // In the unified view, tag each span with its project and de-emphasise spans

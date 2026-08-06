@@ -24,7 +24,7 @@ import {
   ProjectDot,
   ProjectLegend,
 } from '@/components/traces/ProjectBadge'
-import { buildSpanTree, flattenTree } from '@/utils/spanTree'
+import { buildSpanTree, flattenTree, traceWindow } from '@/utils/spanTree'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import {
@@ -152,15 +152,14 @@ export default function CrossProjectTraceDetail() {
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
   usePageTitle(tree[0]?.span?.name ?? 'Unified trace')
 
-  const traceStart = useMemo(
-    () => (data ? new Date(data.start_time).getTime() : 0),
-    [data]
-  )
-  const traceEnd = useMemo(
-    () => (data ? new Date(data.end_time).getTime() : 0),
-    [data]
-  )
-  const traceDuration = traceEnd - traceStart
+  // Derived from the spans being rendered rather than the response's
+  // start_time/end_time: those are millisecond-truncated, so the header would
+  // round to a duration the root span's own bar disagrees with.
+  const {
+    start: traceStart,
+    end: traceEnd,
+    duration: traceDuration,
+  } = useMemo(() => traceWindow(spans), [spans])
 
   const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null)
   const selectedSpan = useMemo(
