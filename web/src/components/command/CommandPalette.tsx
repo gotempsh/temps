@@ -974,7 +974,8 @@ export function CommandPalette() {
   const [search, setSearch] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
-  const { plugins, projectNavEntries } = usePluginsContext()
+  const { platformNavEntries, settingsNavEntries, projectNavEntries } =
+    usePluginsContext()
   const showFullBrowseCatalog =
     localStorage.getItem('temps:show-full-command-catalog') === 'true'
 
@@ -1135,20 +1136,21 @@ export function CommandPalette() {
     runCommand(command)
   }
 
-  // Build plugin navigation items for the command palette
+  // Build plugin navigation items for the command palette.
+  //
+  // These come from the context's *resolved* entries, not from
+  // `plugins[].nav` — a manifest's own path (`/vibe`) matches no console
+  // route, so mapping the manifests here sent every plugin command to a 404
+  // while the sidebar, which uses the resolved entries, worked.
   const pluginNavItems: NavigationItem[] = useMemo(
     () =>
-      plugins.flatMap((p) =>
-        p.nav
-          .filter((e) => e.section !== 'project')
-          .map((entry) => ({
-            title: entry.label,
-            url: entry.path,
-            icon: resolvePluginIcon(entry.icon),
-            keywords: ['plugin', p.name, entry.label.toLowerCase()],
-          }))
-      ),
-    [plugins]
+      [...platformNavEntries, ...settingsNavEntries].map((entry) => ({
+        title: entry.label,
+        url: entry.path,
+        icon: resolvePluginIcon(entry.icon),
+        keywords: ['plugin', entry.pluginName, entry.label.toLowerCase()],
+      })),
+    [platformNavEntries, settingsNavEntries]
   )
 
   // Project-scoped plugin nav entries (relative URLs, prefixed at render time)

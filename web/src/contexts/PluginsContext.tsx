@@ -1,18 +1,24 @@
 import { createContext, useContext, useMemo, type ReactNode } from 'react'
 import { usePlugins } from '@/hooks/usePlugins'
-import type { PluginManifest, NavEntry } from '@/types/plugins'
+import type { PluginManifest, ResolvedNavEntry } from '@/types/plugins'
 
 interface PluginsContextType {
-  /** All loaded external plugin manifests */
+  /**
+   * All loaded external plugin manifests.
+   *
+   * For navigation use the `*NavEntries` below instead: a manifest's own
+   * `nav[].path` is the plugin's internal route and does not match the
+   * console's router.
+   */
   plugins: PluginManifest[]
   /** Whether the initial fetch is still loading */
   isLoading: boolean
   /** Nav entries for the platform sidebar section, sorted by order */
-  platformNavEntries: NavEntry[]
+  platformNavEntries: ResolvedNavEntry[]
   /** Nav entries for the settings sidebar section, sorted by order */
-  settingsNavEntries: NavEntry[]
+  settingsNavEntries: ResolvedNavEntry[]
   /** Nav entries for the project detail sidebar, sorted by order */
-  projectNavEntries: NavEntry[]
+  projectNavEntries: ResolvedNavEntry[]
   /** Get a plugin manifest by name */
   getPlugin: (name: string) => PluginManifest | undefined
 }
@@ -24,11 +30,12 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
 
   // Build nav entries with resolved paths: /plugins/{pluginName} for
   // platform/settings sections so they match the <Route path="/plugins/:pluginName/*"> in App.tsx
-  const resolvedEntries = useMemo(
+  const resolvedEntries = useMemo<ResolvedNavEntry[]>(
     () =>
       plugins.flatMap((p) =>
         p.nav.map((entry) => ({
           ...entry,
+          pluginName: p.name,
           path:
             entry.section === 'project'
               ? entry.path // Project entries stay relative
