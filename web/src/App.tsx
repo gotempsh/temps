@@ -525,7 +525,14 @@ const FullAppRoutes = () => {
                   )
                 }}
               >
-                <div className="h-full overflow-y-auto py-2 px-0 sm:p-4">
+                {/* `flex-1 min-h-0`, not `h-full`. `SidebarInset` is a
+                    fixed-height (`h-dvh`) flex column holding the banners,
+                    the header and this; `h-full` resolved to the whole
+                    viewport height rather than what is left after them, so
+                    with a banner showing this box hung past the bottom of
+                    the screen. Anything sized to 100% of it — a plugin
+                    iframe, say — lost its last rows off-screen. */}
+                <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />
