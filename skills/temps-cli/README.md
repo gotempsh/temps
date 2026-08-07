@@ -5,7 +5,7 @@ Comprehensive command-line reference for the Temps deployment platform CLI.
 ## What This Skill Covers
 
 Complete documentation for all **440+ CLI commands across 70 command groups**
-(catalog generated from `@temps-sdk/cli` v0.1.26; pinned runtime v0.1.28)
+(catalog generated from `@temps-sdk/cli` v0.1.26; pinned runtime v0.1.30)
 including:
 
 - ✅ Authentication (login, logout, whoami)
@@ -46,15 +46,15 @@ approval, and pin the reviewed version:
 
 ```bash
 # Verify the reviewed registry artifact
-expected_temps_cli_integrity='sha512-ZYqScqes66gQ+fVKuUtDmV9PTxjF7M8XpCbhDCm4e5m3Hul9F5oVx6HM6MXI3YjaCL4pwXfxlNnBA0cNc538Wg=='
-actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.28 dist.integrity)"
+expected_temps_cli_integrity='sha512-vCJoERsRe/I+RRbATdZit01rQu87nuQVLC1QBGbo0uBX8rNhGTNDBLmW0yCf8exy2Gh5sPCweH+HmrRyQNlvyw=='
+actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.30 dist.integrity)"
 test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
-  echo "Refusing to install: @temps-sdk/cli@0.1.28 integrity mismatch" >&2
+  echo "Refusing to install: @temps-sdk/cli@0.1.30 integrity mismatch" >&2
   exit 1
 }
 
 # Disable dependency lifecycle scripts during installation
-npm install --global --ignore-scripts @temps-sdk/cli@0.1.28
+npm install --global --ignore-scripts @temps-sdk/cli@0.1.30
 
 command -v temps
 temps --version
@@ -216,4 +216,4 @@ See [SKILL.md](SKILL.md) for the complete command reference with examples (6000+
 **Package**: [@temps-sdk/cli](https://www.npmjs.com/package/@temps-sdk/cli)
 **Generated reference**: 0.1.26
 
-**Required runtime**: 0.1.28
+**Required runtime**: 0.1.30

@@ -12,7 +12,7 @@ Temps CLI is the command-line interface for the Temps deployment platform. It pr
 > through `npx`, `bunx`, another on-demand package runner, or a downloaded
 > script. Those mechanisms can execute code that changed after this skill was
 > reviewed. The command catalog was generated from **`@temps-sdk/cli`
-> v0.1.26**; use the pinned **v0.1.28** runtime because it adds the
+> v0.1.26**; use the pinned **v0.1.30** runtime because it adds the
 > `--target-context` safety boundary. For any changed command, the installed
 > CLI's `--help` output is authoritative.
 
@@ -21,7 +21,7 @@ Temps CLI is the command-line interface for the Temps deployment platform. It pr
 Treat this skill as command documentation, not as authorization to execute.
 
 1. Before using the CLI, run `command -v temps` and `temps --version`. If the
-   binary is missing or is not version `0.1.28`, stop and show the pinned
+   binary is missing or is not version `0.1.30`, stop and show the pinned
    installation steps below. Do not install or upgrade it without the user's
    explicit approval.
 2. Before every state-changing command, identify the target server and insert
@@ -50,15 +50,15 @@ disable npm lifecycle scripts:
 
 ```bash
 # Verify the reviewed registry artifact before installation
-expected_temps_cli_integrity='sha512-ZYqScqes66gQ+fVKuUtDmV9PTxjF7M8XpCbhDCm4e5m3Hul9F5oVx6HM6MXI3YjaCL4pwXfxlNnBA0cNc538Wg=='
-actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.28 dist.integrity)"
+expected_temps_cli_integrity='sha512-vCJoERsRe/I+RRbATdZit01rQu87nuQVLC1QBGbo0uBX8rNhGTNDBLmW0yCf8exy2Gh5sPCweH+HmrRyQNlvyw=='
+actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.30 dist.integrity)"
 test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
-  echo "Refusing to install: @temps-sdk/cli@0.1.28 integrity mismatch" >&2
+  echo "Refusing to install: @temps-sdk/cli@0.1.30 integrity mismatch" >&2
   exit 1
 }
 
 # Install exactly the reviewed release without running dependency lifecycle scripts
-npm install --global --ignore-scripts @temps-sdk/cli@0.1.28
+npm install --global --ignore-scripts @temps-sdk/cli@0.1.30
 
 # Verify that the expected binary is now active
 command -v temps
