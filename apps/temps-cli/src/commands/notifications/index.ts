@@ -10,7 +10,7 @@ import {
   testNotificationProvider as testProvider2,
   updateNotificationProvider as updateProvider2,
   updateSlackProvider,
-  updateEmailProvider,
+  updateNotificationEmailProvider,
 } from '../../api/sdk.gen.js'
 import type { NotificationProviderResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -567,7 +567,7 @@ async function updateEmailProviderAction(
   } | null
 
   const updated = await withSpinner('Updating Email provider...', async () => {
-    const { data, error } = await updateEmailProvider({
+    const { data, error } = await updateNotificationEmailProvider({
       client,
       path: { id },
       body: {

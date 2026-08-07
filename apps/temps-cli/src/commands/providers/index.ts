@@ -961,9 +961,9 @@ async function syncConnectionAction(options: IdOptions): Promise<void> {
     return data
   })
 
-  success(`Synced ${result?.total_count ?? 0} repositories for connection ${id}`)
-  if (result?.synced_at) {
-    info(`Synced at: ${result.synced_at}`)
+  success(`Repository sync started for connection ${id}`)
+  if (result?.started_at) {
+    info(`Started at: ${result.started_at}`)
   }
 }
 
