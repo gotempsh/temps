@@ -526,6 +526,25 @@ async fn do_ingest_metrics(
     let points = decode::decode_metrics_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = points.len();
 
+    // Fire decoded batch at the relay extension point (non-blocking).
+    // `data.clone()` is O(1) — bytes::Bytes is ref-counted. The relay channel
+    // is bounded; try_send drops silently on full rather than blocking.
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Metrics,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; metrics batch dropped (backpressure)"
+            );
+        }
+    }
+
     for point in &points {
         debug!(
             project_id = ctx.project_id,
@@ -608,6 +627,23 @@ async fn do_ingest_traces(
     let data = decode::decompress(body, content_encoding(headers))?;
     let spans = decode::decode_traces_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = spans.len();
+
+    // Fire decoded batch at the relay extension point (non-blocking).
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Traces,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; traces batch dropped (backpressure)"
+            );
+        }
+    }
 
     // Log each span at debug level so operators can see what arrived
     for span in &spans {
@@ -699,6 +735,23 @@ async fn do_ingest_logs(
     let data = decode::decompress(body, content_encoding(headers))?;
     let records = decode::decode_logs_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = records.len();
+
+    // Fire decoded batch at the relay extension point (non-blocking).
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Logs,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; logs batch dropped (backpressure)"
+            );
+        }
+    }
 
     for record in &records {
         debug!(
@@ -1499,6 +1552,68 @@ mod tests {
         };
         // The service_id is what gets written as source_id in service_metrics
         assert_eq!(auth.service_id, 42);
+    }
+
+    // ── Relay channel backpressure ──────────────────────────────────────
+    //
+    // Verifies that a full or closed relay channel does NOT propagate as an
+    // ingest error. The do_ingest_* handlers only call try_send and warn on
+    // Err — the OTLP HTTP response must still succeed.
+    //
+    // A full HTTP-level test would require constructing a real OtelAppState
+    // (which needs OtelService, storage backends, a live DB, etc.). Instead,
+    // this focused unit test exercises the exact try_send-then-discard pattern
+    // used in the handlers, confirming the Err is not propagated.
+
+    #[test]
+    fn relay_channel_full_try_send_returns_err_not_panic() {
+        use crate::relay::{OtelRelayMessage, OtelSignal};
+
+        // Capacity-1 channel: fill it with the first send.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(1);
+
+        let make_msg = |project_id: i32| OtelRelayMessage {
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            signal: OtelSignal::Metrics,
+            payload: bytes::Bytes::new(),
+        };
+
+        // Fill the channel (capacity = 1).
+        assert!(tx.try_send(make_msg(1)).is_ok(), "first send must succeed");
+
+        // Second send: channel is full. Must return Err, must not panic.
+        let result = tx.try_send(make_msg(2));
+        assert!(
+            result.is_err(),
+            "try_send on a full channel must return Err; handlers discard this error (warn-only)"
+        );
+        // Reaching here confirms no panic — the backpressure path is safe.
+    }
+
+    #[test]
+    fn relay_channel_closed_try_send_returns_err_not_panic() {
+        use crate::relay::{OtelRelayMessage, OtelSignal};
+
+        // Drop the receiver immediately — channel is closed.
+        let (tx, rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(10);
+        drop(rx);
+
+        let msg = OtelRelayMessage {
+            project_id: 1,
+            environment_id: None,
+            deployment_id: None,
+            signal: OtelSignal::Traces,
+            payload: bytes::Bytes::new(),
+        };
+
+        let result = tx.try_send(msg);
+        assert!(
+            result.is_err(),
+            "try_send on a closed channel must return Err; handlers discard this error (warn-only)"
+        );
+        // Reaching here confirms no panic — the closed-channel path is safe.
     }
 
     #[test]

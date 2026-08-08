@@ -35,6 +35,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod plugin;
 pub mod proto;
+pub mod relay;
 pub mod services;
 pub mod sidecar;
 pub mod storage;
@@ -99,6 +100,17 @@ pub struct OtelAppState {
     /// banner) and `GET /otel/global/traces/{trace_id}` (Phase 2 unified
     /// waterfall) query handlers.
     pub cross_project_service: std::sync::Arc<crate::services::CrossProjectTraceService>,
+    /// Bounded sender for fire-and-forget relay of decoded OTLP batches.
+    ///
+    /// After a successful decode in each `do_ingest_*` function, the handler
+    /// sends an [`crate::relay::OtelRelayMessage`] here via `try_send` (never
+    /// blocking). A dedicated background consumer calls
+    /// [`crate::relay::OtelRelaySlot::relay`], which dispatches to whichever
+    /// [`crate::relay::OtelRelay`] implementation was registered by a plugin
+    /// (defaulting to the no-op). When the channel is full the batch is
+    /// silently dropped and a warning is emitted — relay loss is non-fatal and
+    /// must never add latency to the OTLP HTTP response.
+    pub otel_relay_tx: Option<tokio::sync::mpsc::Sender<crate::relay::OtelRelayMessage>>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<std::sync::Arc<dyn temps_core::ProjectAccessChecker>>,
 }

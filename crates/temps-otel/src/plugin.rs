@@ -20,6 +20,7 @@ use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::relay::OtelRelay;
 use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
@@ -323,12 +324,21 @@ pub struct OtelPlugin {
     /// per-project retention) gets a chance to provide a resolver — same
     /// two-phase handoff `DeploymentsPlugin` uses for `DeploymentGate`.
     retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+    /// Handle to the `OtelRelaySlot` captured in `register_services` and
+    /// written into from `initialize_plugin_services` — same two-phase
+    /// handoff as `retention_resolver_slot`. The background relay consumer
+    /// (spawned in `register_services`) holds its own `Arc` clone and calls
+    /// `relay_slot.relay(msg)` for each batch received from `otel_relay_tx`.
+    /// When no plugin provides an `Arc<dyn OtelRelay>`, the slot stays loaded
+    /// with `NoopOtelRelay` and the relay loop is a cheap no-op.
+    relay_slot: tokio::sync::OnceCell<Arc<crate::relay::OtelRelaySlot>>,
 }
 
 impl OtelPlugin {
     pub fn new() -> Self {
         Self {
             retention_resolver_slot: tokio::sync::OnceCell::new(),
+            relay_slot: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -521,6 +531,22 @@ impl TempsPlugin for OtelPlugin {
             let (trace_hint_tx, mut trace_hint_rx) =
                 tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
 
+            // ── OtelRelay extension point ────────────────────────────────────
+            //
+            // Slot defaults to NoopOtelRelay; a plugin (e.g. one implementing
+            // OTLP batch forwarding) is wired in later from
+            // `initialize_plugin_services` — see `relay_slot` field doc for
+            // why a direct `get_service` call here would never find it.
+            let relay_slot = Arc::new(crate::relay::OtelRelaySlot::new_default());
+            let _ = self.relay_slot.set(relay_slot.clone());
+
+            // Bounded channel (capacity 1 000 messages) for fire-and-forget
+            // relay of decoded OTLP batches. Ingest handlers call `try_send`
+            // (non-blocking); when the channel is full the batch is dropped
+            // and a warning is emitted — relay loss is non-fatal.
+            let (otel_relay_tx, mut otel_relay_rx) =
+                tokio::sync::mpsc::channel::<crate::relay::OtelRelayMessage>(1000);
+
             let cross_project_service =
                 Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
             context.register_service(cross_project_service.clone());
@@ -588,6 +614,7 @@ impl TempsPlugin for OtelPlugin {
                 audit_service: audit_service.clone(),
                 trace_hint_tx: Some(trace_hint_tx),
                 cross_project_service: cross_project_service.clone(),
+                otel_relay_tx: Some(otel_relay_tx),
                 project_access_checker: None,
             };
             context.register_service(Arc::new(app_state.clone()));
@@ -660,6 +687,23 @@ impl TempsPlugin for OtelPlugin {
                         }
                     }
                     info!("Cross-project trace hint writer consumer stopped (channel closed)");
+                });
+            }
+
+            // 1c-relay. Background consumer for the OtelRelay extension point.
+            //
+            // Drains `otel_relay_rx` and calls `relay_slot.relay(msg)` for
+            // each batch, dispatching to whichever `OtelRelay` implementation
+            // was registered by a plugin (NoopOtelRelay when none registered).
+            // Errors are not possible here (relay is infallible by contract).
+            // The task exits cleanly when all senders drop.
+            {
+                tokio::spawn(async move {
+                    info!("OTel relay consumer started");
+                    while let Some(msg) = otel_relay_rx.recv().await {
+                        relay_slot.relay(msg).await;
+                    }
+                    info!("OTel relay consumer stopped (channel closed)");
                 });
             }
 
@@ -760,6 +804,24 @@ impl TempsPlugin for OtelPlugin {
                     }
                 }
             }
+
+            // Wire in an optional OtelRelay implementation registered by a
+            // plugin. When no plugin registers one, the slot stays loaded with
+            // NoopOtelRelay and the relay background consumer is a cheap no-op.
+            if let Some(slot) = self.relay_slot.get() {
+                if let Some(relay) = context.get_service::<dyn crate::relay::OtelRelay>() {
+                    if slot.set(relay) {
+                        debug!("otel: OtelRelay wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "otel: OtelRelay slot was already claimed; \
+                             this plugin's relay was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+
             Ok(())
         })
     }

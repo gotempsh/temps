@@ -11975,6 +11975,7 @@ name = "temps-otel"
 version = "0.1.0-beta.55"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",

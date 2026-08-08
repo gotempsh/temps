@@ -74,6 +74,9 @@ clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 tokio-util = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 
+# Write-once ArcSwap handle for the OtelRelay extension point.
+arc-swap = "1.7"
+
 [build-dependencies]
 prost-build = "0.13"
 
