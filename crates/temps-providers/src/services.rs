@@ -909,6 +909,15 @@ pub struct ResourceLimitsUpdateResponse {
     pub applied: Vec<ResourceLimitApplyResult>,
 }
 
+/// Every field is `Arc`-wrapped, so `Clone` is a cheap refcount bump that
+/// shares the SAME `reconciler_shutdowns` map with the original -- unlike
+/// `ExternalServiceManager::new(...)`, which always allocates a fresh, empty
+/// one. Background tasks spawned off a manager method (e.g. cluster
+/// initialization) must clone `self` for exactly this reason: constructing a
+/// new instance instead orphans any role reconciler that task spawns in a
+/// map nobody else can ever reach, so `stop_role_reconciler` (called on the
+/// real, shared instance) silently no-ops and the reconciler leaks forever.
+#[derive(Clone)]
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -1596,20 +1605,17 @@ impl ExternalServiceManager {
             service_update.status = Set("creating".to_string());
             service_update.update(self.db.as_ref()).await?;
 
+            // `self.clone()`, not `ExternalServiceManager::new(...)`: the clone
+            // shares this instance's `reconciler_shutdowns` map, so a role
+            // reconciler spawned inside `initialize_cluster` stays reachable by
+            // `stop_role_reconciler` on the real, shared manager later. See the
+            // struct's doc comment.
+            let manager = self.clone();
             let db = self.db.clone();
-            let docker = self.docker.clone();
-            let encryption_service = self.encryption_service.clone();
-            let dns_registry = self.dns_registry.clone();
             let service_id = service.id;
             let members = request.members.clone();
 
             tokio::spawn(async move {
-                let manager = ExternalServiceManager::new(
-                    db.clone(),
-                    encryption_service,
-                    docker,
-                    dns_registry,
-                );
                 let result = manager.initialize_cluster(service_id, &members).await;
 
                 match result {
@@ -5804,16 +5810,16 @@ echo "[restore] Pre-seed complete"
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
-        // Spawn background task to re-initialize (same pattern as create)
+        // Spawn background task to re-initialize (same pattern as create).
+        // `self.clone()`, not `ExternalServiceManager::new(...)` -- see the
+        // struct's doc comment: a fresh instance would allocate its own empty
+        // `reconciler_shutdowns` map, orphaning any reconciler this retry
+        // spawns from `stop_role_reconciler` on the real, shared manager.
+        let manager = self.clone();
         let db = self.db.clone();
-        let docker = self.docker.clone();
-        let encryption_service = self.encryption_service.clone();
-        let dns_registry = self.dns_registry.clone();
         let members = effective_members;
 
         tokio::spawn(async move {
-            let manager =
-                ExternalServiceManager::new(db.clone(), encryption_service, docker, dns_registry);
             let result = manager.initialize_cluster(service_id, &members).await;
 
             match result {
