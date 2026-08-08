@@ -10,6 +10,7 @@ import { dns01WildcardScenarioCommand } from './commands/dns01-wildcard-scenario
 import { emailScenarioCommand } from './commands/email-scenario.ts'
 import { cliScenarioCommand } from './commands/cli-scenario.ts'
 import { kvScenarioCommand } from './commands/kv-scenario.ts'
+import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
@@ -146,6 +147,17 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await kvScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('blob-scenario')
+  .description(
+    'Real blob-storage (RustFS) data-plane round trip: put/download/head/list/copy/delete, deleted-blob 404, and cross-project tenant isolation',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await blobScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

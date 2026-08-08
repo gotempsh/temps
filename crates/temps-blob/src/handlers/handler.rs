@@ -132,6 +132,12 @@ pub fn configure_routes() -> Router<Arc<BlobAppState>> {
     tag = "Blob",
     post,
     path = "/blob",
+    params(
+        ("pathname" = Option<String>, Query, description = "Path where the blob will be stored"),
+        ("content_type" = Option<String>, Query, description = "Content type of the blob (optional, will be guessed from extension)"),
+        ("add_random_suffix" = Option<bool>, Query, description = "Add random suffix to pathname to prevent collisions"),
+        ("project_id" = Option<i32>, Query, description = "Project ID (required for API key/session auth, optional for deployment tokens)"),
+    ),
     request_body(content = String, content_type = "application/octet-stream", description = "Binary blob data"),
     responses(
         (status = 201, description = "Blob uploaded successfully", body = BlobResponse),
@@ -204,6 +210,7 @@ async fn blob_delete(
         ("limit" = Option<i32>, Query, description = "Maximum number of items to return"),
         ("prefix" = Option<String>, Query, description = "Prefix to filter by"),
         ("cursor" = Option<String>, Query, description = "Continuation token for pagination"),
+        ("project_id" = Option<i32>, Query, description = "Project ID (required for API key/session auth, optional for deployment tokens)"),
     ),
     responses(
         (status = 200, description = "List of blobs", body = ListBlobsResponse),

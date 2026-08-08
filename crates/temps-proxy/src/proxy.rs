@@ -4362,7 +4362,7 @@ impl ProxyHttp for LoadBalancer {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut PingoraSession,
+        session: &mut PingoraSession,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -4406,11 +4406,17 @@ impl ProxyHttp for LoadBalancer {
             debug!("SSE response detected from upstream");
         }
 
-        // Strip content-length from HEAD responses. The upstream correctly includes it
-        // (per RFC 9110 §9.3.2, HEAD responses SHOULD have the same content-length as GET)
-        // but when proxied over HTTP/2, clients like curl interpret the content-length as
-        // a promise of body bytes and error when none arrive. Cloudflare strips it too.
-        if ctx.method == "HEAD" {
+        // Strip content-length from HEAD responses, but ONLY when the downstream
+        // client is on HTTP/2. The upstream correctly includes it (per RFC 9110
+        // §9.3.2, HEAD responses SHOULD have the same content-length as GET) --
+        // over HTTP/2, clients like curl interpret the content-length as a promise
+        // of body bytes and error when none arrive, and Cloudflare strips it too.
+        // But an HTTP/1.1 downstream needs content-length (or chunked encoding) on
+        // a keep-alive connection to know the response is complete; a HEAD response
+        // with neither leaves the client blocked waiting for a body that will never
+        // come, since HTTP/1.1 has no other framing signal for "zero-length body,
+        // connection stays open."
+        if ctx.method == "HEAD" && session.is_http2() {
             upstream_response.remove_header("content-length");
         }
 

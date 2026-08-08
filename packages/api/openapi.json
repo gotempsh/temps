@@ -51594,6 +51594,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -51640,6 +51650,45 @@
       },
       "post": {
         "operationId": "blob_put",
+        "parameters": [
+          {
+            "description": "Path where the blob will be stored",
+            "in": "query",
+            "name": "pathname",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Content type of the blob (optional, will be guessed from extension)",
+            "in": "query",
+            "name": "content_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add random suffix to pathname to prevent collisions",
+            "in": "query",
+            "name": "add_random_suffix",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {

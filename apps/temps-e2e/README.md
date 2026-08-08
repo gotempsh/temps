@@ -2,7 +2,7 @@
 
 End-to-end + load testing CLI for a **live** Temps instance. Most commands
 (`scenario`, `tls-scenario`, `dns01-wildcard-scenario`, `email-scenario`,
-`kv-scenario`, `audit-scenario`, `managed-services-scenario`,
+`kv-scenario`, `blob-scenario`, `audit-scenario`, `managed-services-scenario`,
 `rbac-scenario`, `monitoring-scenario`, `error-tracking-scenario`,
 `logs-scenario`, `analytics-scenario`, `session-replay-scenario`,
 `examples`) drive the real
@@ -105,6 +105,10 @@ bun run src/index.ts cli-scenario --image traefik/whoami:latest --json  # machin
 # kv-storage: real Redis-backed data-plane round trip (no console UI exists
 # for this feature beyond an enabled/healthy badge).
 bun run src/index.ts kv-scenario
+
+# blob storage: real RustFS (S3-compatible) data-plane round trip --
+# put/download/head/list/copy/delete, deleted-blob 404, cross-project isolation.
+bun run src/index.ts blob-scenario
 
 # audit-logs: real PROJECT_CREATED/PROJECT_DELETED rows read back exactly,
 # plus an RBAC-gate check on the read endpoint itself.
@@ -334,6 +338,50 @@ platform-wide singleton (one shared Redis container), not a per-project
 resource — the scenario never disables it in teardown, since other
 concurrent e2e runs or real users on a shared instance may depend on it
 staying up.
+
+### `blob-scenario` steps
+
+12-step round trip against the platform-wide blob-storage feature (RustFS,
+S3-compatible — same shared-singleton shape as kv-storage): enable blob
+storage, create 2 projects, `put` (exact metadata echoed back), `download`
+(exact byte-for-byte content + Content-Type match), `head` (Content-Length/
+Content-Type headers, no body), `list` (prefix-scoped, exact match), `copy`
+(byte-identical to the source), `delete` (exact count + idempotent second
+call), a deleted blob is actually gone (404 on direct HEAD, not just absent
+from list), cross-project isolation (identical pathname, different
+project_id, non-crossing content), and a 400 on a missing `project_id`.
+
+**Three real bugs found and fixed while building this**:
+
+1. `blob_put`'s `#[utoipa::path]` never declared its query params
+   (`pathname`, `content_type`, `add_random_suffix`, `project_id`) at all,
+   and `blob_list`'s declared params were missing `project_id` — both
+   existed on the Rust query-extractor structs but were invisible to the
+   OpenAPI spec, so the generated SDK typed them as `query?: never` /
+   omitted `project_id` entirely. No client could actually call these with
+   a project scope. Fixed both `#[utoipa::path]` blocks and regenerated
+   `packages/api`.
+2. `temps-proxy` unconditionally stripped `Content-Length` from every HEAD
+   response, regardless of downstream HTTP version. The existing comment
+   explained the real reason (HTTP/2 clients treat a Content-Length on a
+   HEAD response as a promise of body bytes and error when none arrive),
+   but the code didn't gate on it — so an HTTP/1.1 client got a HEAD
+   response with no Content-Length *and* no chunked encoding on a
+   keep-alive connection, with no way to tell the response was complete.
+   Confirmed live: `curl -I` through the proxy port hung indefinitely,
+   while the identical request against the console port (same handler, no
+   proxy in front) returned instantly with the header present. Fixed by
+   only stripping when the downstream session is actually HTTP/2.
+3. `BlobService::del` counted every successful S3 `DeleteObject` call as a
+   deletion, but S3's `DeleteObject` is idempotent by design — it returns
+   success whether or not the key existed. So the documented "number of
+   blobs deleted" was really "number of delete calls that didn't error,"
+   and a second delete of the same (already-gone) keys kept reporting them
+   deleted. Fixed by `HeadObject`-checking existence before each delete so
+   the count reflects what was actually removed.
+
+Like kv-storage, blob storage is a platform-wide singleton — the scenario
+never disables it in teardown.
 
 ### `audit-scenario` steps
 

@@ -24604,6 +24604,10 @@ export type BlobListData = {
      * Continuation token for pagination
      */
     cursor?: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number;
   };
   url: "/blob";
 };
@@ -24636,7 +24640,24 @@ export type BlobPutData = {
    */
   body: string;
   path?: never;
-  query?: never;
+  query?: {
+    /**
+     * Path where the blob will be stored
+     */
+    pathname?: string;
+    /**
+     * Content type of the blob (optional, will be guessed from extension)
+     */
+    content_type?: string;
+    /**
+     * Add random suffix to pathname to prevent collisions
+     */
+    add_random_suffix?: boolean;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number;
+  };
   url: "/blob";
 };
 

@@ -31,6 +31,8 @@ import {
   getEmailEvents,
   kvStatus,
   kvEnable,
+  blobStatus,
+  blobEnable,
   createDnsProvider,
   addManagedDomain,
   verifyManagedDomain,
@@ -1064,6 +1066,40 @@ export async function ensureKvEnabled(
     await sleep(intervalMs)
   }
   throw new Error(`kv-storage did not become enabled+healthy within ${Math.round(timeoutMs / 1000)}s`)
+}
+
+export interface BlobEnableResult {
+  alreadyEnabled: boolean
+}
+
+/**
+ * Blob storage is a platform-wide RustFS (S3-compatible) singleton, same
+ * shape as kv-storage's shared Redis container -- callers must NOT disable
+ * it in teardown, since other concurrent e2e runs or real users on a shared
+ * instance may depend on it staying up. First-time enable pulls a Docker
+ * image and waits for container health, so `blobEnable`'s own response is
+ * not proof of usability -- only a `healthy` status read is.
+ */
+export async function ensureBlobEnabled(
+  client: Client,
+  opts: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<BlobEnableResult> {
+  const initial = unwrap(await blobStatus({ client }), 'blobStatus')
+  if (initial.enabled && initial.healthy) {
+    return { alreadyEnabled: true }
+  }
+  if (!initial.enabled) {
+    await blobEnable({ client, body: {} })
+  }
+  const timeoutMs = opts.timeoutMs ?? 120_000
+  const intervalMs = opts.intervalMs ?? 2000
+  const start = performance.now()
+  while (performance.now() - start < timeoutMs) {
+    const s = unwrap(await blobStatus({ client }), 'blobStatus')
+    if (s.enabled && s.healthy) return { alreadyEnabled: false }
+    await sleep(intervalMs)
+  }
+  throw new Error(`blob storage did not become enabled+healthy within ${Math.round(timeoutMs / 1000)}s`)
 }
 
 /** Best-effort teardown of the email-provider/domain resources this flow created. Never throws. */
