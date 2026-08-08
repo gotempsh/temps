@@ -740,8 +740,12 @@ impl MonitorService {
                     time_bucket('{}', checked_at) AS bucket,
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as operational_count,
-                    COUNT(*) FILTER (WHERE status = 'degraded') as degraded_count,
-                    COUNT(*) FILTER (WHERE status = 'down') as down_count,
+                    -- health_check_service.rs writes 'partial_outage'/'major_outage' for
+                    -- the finer-grained cases, not just plain 'degraded'/'down' -- without
+                    -- these, a bucket made entirely of real outage checks fell through to
+                    -- "unknown" below instead of "down".
+                    COUNT(*) FILTER (WHERE status IN ('degraded', 'partial_outage')) as degraded_count,
+                    COUNT(*) FILTER (WHERE status IN ('down', 'major_outage')) as down_count,
                     AVG(response_time_ms) as avg_response_time_ms,
                     MIN(response_time_ms) as min_response_time_ms,
                     MAX(response_time_ms) as max_response_time_ms,

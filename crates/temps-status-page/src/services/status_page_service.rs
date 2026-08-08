@@ -118,15 +118,19 @@ impl StatusPageService {
             return "partial_outage".to_string();
         }
 
-        // Check monitor statuses
+        // Check monitor statuses. health_check_service.rs writes the finer-grained
+        // "major_outage"/"partial_outage" (not the plain "down"/"degraded" this used
+        // to compare against), so a fully-down monitor was silently invisible here
+        // unless an incident also happened to exist to catch it via the severity
+        // checks above.
         let down_count = monitors
             .iter()
-            .filter(|m| m.current_status == "down")
+            .filter(|m| matches!(m.current_status.as_str(), "down" | "major_outage"))
             .count();
 
         let degraded_count = monitors
             .iter()
-            .filter(|m| m.current_status == "degraded")
+            .filter(|m| matches!(m.current_status.as_str(), "degraded" | "partial_outage"))
             .count();
 
         if down_count > 0 {
