@@ -1219,3 +1219,27 @@ export async function teardownEmailResources(
   }
   return errors
 }
+
+/**
+ * Mirror of `PostgresService::normalize_database_name`
+ * (`crates/temps-providers/src/externalsvc/postgres.rs`): lowercase,
+ * non-alphanumeric -> `_`, `db_`-prefix if it'd start with a digit, capped
+ * at 63 bytes (Postgres identifier limit).
+ *
+ * A linked postgres service does NOT hand a deployed app the database named
+ * at service-creation time -- linking auto-provisions (and injects
+ * `POSTGRES_URL` for) a SEPARATE per-project-per-environment database named
+ * `normalize_database_name("{project_slug}_{environment_name}")` (see
+ * `PostgresService::get_runtime_env_vars`), e.g. project slug
+ * `my-app` + environment `production` -> database `my_app_production`.
+ * Anything reading the actual table data back (not just calling the
+ * deployed app's own HTTP API) needs this exact name, not the service's
+ * own `database` parameter.
+ */
+export function normalizePostgresDatabaseName(name: string): string {
+  let normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '_')
+  if (/^[0-9]/.test(normalized)) {
+    normalized = `db_${normalized}`
+  }
+  return normalized.slice(0, 63)
+}

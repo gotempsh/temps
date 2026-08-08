@@ -5,8 +5,8 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `kv-scenario`, `blob-scenario`, `flags-scenario`, `audit-scenario`,
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
-`session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
-`examples`) drive the real
+`session-replay-scenario`, `backup-restore-scenario`, `pitr-scenario`,
+`git-deploy-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -153,6 +153,14 @@ bun run src/index.ts session-replay-scenario --registry localhost:5111
 # wal-g backup-push, real S3 upload), then in-place restored, proven by
 # reverting writes made after the backup. Needs MinIO (docker-compose.e2e.yml).
 bun run src/index.ts backup-restore-scenario --registry localhost:5111
+
+# pitr: point-in-time recovery of a real postgres service via MinIO -- write
+# rows, wait for their WAL to archive, capture a recovery-target timestamp,
+# write MORE rows, PITR-restore to the captured timestamp, and prove via the
+# read-only data-browser API (not /probe) that exactly the pre-target rows
+# survive. Needs MinIO (docker-compose.e2e.yml). Runs ~90s of real wall-clock
+# wait time so a WAL segment actually archives -- see the steps section below.
+bun run src/index.ts pitr-scenario --registry localhost:5111
 
 # git-deploy: real clone + build of a public GitHub repo
 # (github.com/gotempsh/temps-examples) via trigger-pipeline -- proves the
@@ -696,6 +704,68 @@ every single backup. Confirmed live 3x, including that the second and third
 backups on the same service skip the archiving setup entirely (faster
 restore, no extra container recreate).
 
+### `pitr-scenario` steps
+
+1. provision a real standalone postgres service, link it to a project,
+   deploy the same `db-probe` app `backup-restore-scenario` uses
+2. create an S3 source pointed at the local MinIO
+3. trigger a real base backup and poll it to `completed` (real `wal-g
+   backup-push`)
+4. write 5 real rows through the injected `POSTGRES_URL` (the "T1" marker)
+5. wait 75s for the WAL segment covering T1 to actually archive to S3 --
+   every managed postgres runs with `archive_timeout=60` (see
+   `PostgresService::create_container`), which forces the archiver to close
+   and archive the current WAL segment every 60s even though 5 tiny inserts
+   never fill the 16MB size threshold on their own. `wal-g wal-fetch` during
+   a restore can only see WAL that's actually landed in S3, not whatever's
+   still sitting in the live container's `pg_wal`
+6. capture a recovery-target timestamp strictly after T1 and strictly
+   before the next write
+7. write 3 MORE rows (the "T2" marker, count now 8) -- data the PITR target
+   must NOT include -- then a short wait so T2's WAL is durably fsynced
+8. start a PITR restore in place to the captured T1 timestamp
+   (`POST /external-services/{id}/restore`, `mode: "pitr"`) and poll
+   `GET /restore-runs/{id}` to `completed`
+9. read the actual `e2e_probe` table back through the read-only
+   data-browser API (`GET
+   /external-services/{id}/query/containers/{path}/entities/{entity}/data`
+   -- the same endpoint `temps data rows` uses) and assert the exact row
+   count (5) and exact primary-key set (`[1,2,3,4,5]`) -- an INDEPENDENT
+   side channel from `/probe`, which mutates on every call, so this is a
+   genuine content check, not just "the restore run's status flipped to
+   completed"
+10. hit `/probe` once more and re-read the table, asserting total_count is
+    6, the first 5 ids are still exactly T1s `[1,2,3,4,5]`, and the new
+    row's id is strictly greater than all of them -- proving the recovered
+    cluster is fully writable on top of the restored data, not just
+    readable
+11. teardown (deployment, project, service, S3 source)
+
+PITR depends on the same WAL-G continuous-archiving fix documented above
+under `backup-restore-scenario` already being on `main` -- without it, no
+backup on this platform is restorable at all, PITR included.
+
+Two things worth documenting, neither a platform bug -- both correct
+platform/Postgres behavior that this scenario's first draft got wrong:
+
+- Step 9's container path is NOT `{service's own database}/public`.
+  Linking a service to a project auto-provisions a SEPARATE
+  per-project-per-environment database and points the deployed app's
+  injected `POSTGRES_URL` at THAT (`PostgresService::get_runtime_env_vars`
+  in `crates/temps-providers/src/externalsvc/postgres.rs`), named
+  `normalize_database_name("{project_slug}_{environment_name}")` -- e.g.
+  project slug `my-app` + environment `production` ->
+  `my_app_production`. `normalizePostgresDatabaseName`
+  (`apps/temps-e2e/src/lib/flows.ts`) mirrors the Rust normalization so the
+  scenario can compute the real path instead of guessing.
+- Step 10 does NOT assert the new row lands as id 6. Postgres WAL-logs
+  sequence advances `SEQ_LOG_VALS` (32) values ahead of what's actually
+  been handed out, specifically so crash/PITR recovery can never replay a
+  value a client already received -- the first `nextval()` after ANY
+  recovery legitimately jumps past `count+1`. The scenario asserts the row
+  count and the restored ids' exact identity instead of the new row's
+  specific id.
+
 ### `git-deploy-scenario` steps
 
 1. create a project pointed at a real public repo
@@ -806,6 +876,36 @@ via `POST /set-default-ipv4` before provisioning, so Pebble's validation
 request actually reaches the host.
 
 ## Known gaps (not covered end-to-end)
+
+**Postgres major-version upgrade** — deliberately scoped out of
+`pitr-scenario` (and not covered by any other scenario), unlike PITR which
+IS fully covered. `POST /external-services/{id}/upgrades`
+(`crates/temps-backup/src/handlers/pg_upgrade_handler.rs`,
+`PostgresUpgradeOrchestrator` in
+`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) is real and
+reachable — a multi-phase `pre_backup -> snapshot -> dump -> new_container
+-> restore -> swap -> analyze` workflow that dumps the live cluster,
+provisions a fresh container on the target major version, restores into it,
+and swaps traffic over — but exercising it live needs meaningfully more
+setup than PITR: (1) the source service must be pinned to an explicit older
+major version at creation time (`version: "16"` or similar) compatible with
+`validate_os_family`'s from/to image check, not the platform default; (2)
+`phase_pre_backup` requires a **default** S3 source
+(`ExternalService::default_s3_source_id`, `is_default: true`) rather than
+the ad-hoc, non-default source `pitr-scenario`'s S3 setup uses; (3) the
+workflow pulls TWO postgres major-version images and does a real
+dump+restore, meaningfully longer and higher-blast-radius than PITR's
+WAL-replay. Given the severe background-process instability hit while
+building `pitr-scenario` on this shared dev host (the target `temps serve`
+instance died unpredictably — no panic, no OOM, no crash report — multiple
+times across an otherwise-successful run, requiring repeated restarts to
+get 3 clean end-to-end passes), there wasn't a reliable enough window left
+to also stand up and live-verify the upgrade path in the same session. A
+future pass should build `pg-upgrade-scenario` as its own command following
+this same pattern (base backup via a **default** S3 source, provision on an
+explicit older `version`, write a marker row, trigger the upgrade, poll to
+`completed`, assert the marker row survived via the data-browser API, and
+assert the service is reachable on the new major version).
 
 **Slack notifications** — deliberately not covered by any scenario command,
 and not expected to be: two independent guards stand between a real
