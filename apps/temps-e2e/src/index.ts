@@ -13,6 +13,7 @@ import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
 import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
+import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario.ts'
 
 const program = new Command()
 
@@ -180,6 +181,17 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await monitoringScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('error-tracking-scenario')
+  .description(
+    'Real Sentry-compatible error-tracking lifecycle: create a DSN, POST real Sentry-shaped events authenticated with the DSN key (not the bearer token), and assert fingerprint-based grouping actually groups repeats and separates distinct exceptions -- not just that the error-group CRUD routes return 2xx',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await errorTrackingScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
