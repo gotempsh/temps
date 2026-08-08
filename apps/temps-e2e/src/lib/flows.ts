@@ -11,6 +11,8 @@ import {
   getEnvironments,
   deployFromImage,
   getDeployment,
+  triggerProjectPipeline,
+  getLastDeployment,
   createService,
   deleteService,
   getProxyLogs,
@@ -89,6 +91,99 @@ export async function createE2eProject(
   })
   const p = unwrap(res, 'createProject')
   return { id: p.id, name: p.name, slug: p.slug }
+}
+
+/**
+ * Create a real Git-backed project against a public repo -- `source_type`
+ * defaults to `'git'` server-side. Note: creating a Git project always
+ * auto-queues an initial deployment as a side effect, regardless of
+ * `automatic_deploy` (that flag governs future git-push-triggered deploys,
+ * not this one) -- `triggerPipelineAndGetDeploymentId` accounts for it.
+ */
+export async function createE2eGitProject(
+  client: Client,
+  opts: {
+    name: string
+    repoOwner: string
+    repoName: string
+    gitUrl: string
+    directory: string
+    preset: string
+    mainBranch?: string
+  },
+): Promise<CreatedProject> {
+  const res = await createProject({
+    client,
+    body: {
+      name: opts.name,
+      repo_owner: opts.repoOwner,
+      repo_name: opts.repoName,
+      git_url: opts.gitUrl,
+      is_public_repo: true,
+      directory: opts.directory,
+      main_branch: opts.mainBranch ?? 'main',
+      preset: opts.preset,
+      storage_service_ids: [],
+      automatic_deploy: false,
+      is_web_app: true,
+    },
+  })
+  const p = unwrap(res, 'createProject')
+  return { id: p.id, name: p.name, slug: p.slug }
+}
+
+/**
+ * Trigger a real build+deploy pipeline for a project (the same action a git
+ * push to the tracked branch would cause) and return the id of the
+ * deployment it created. `GET /projects/{id}/last-deployment` 404s until a
+ * deployment row exists, so this polls through that instead of assuming the
+ * trigger call itself returns one -- `TriggerPipelineResponse` doesn't carry
+ * a deployment id.
+ */
+export async function triggerPipelineAndGetDeploymentId(
+  client: Client,
+  opts: { projectId: number; environmentId: number; branch?: string },
+): Promise<number> {
+  // Git-type projects auto-queue an initial deployment as a side effect of
+  // `POST /projects` itself (`Queueing initial deployment job for Git
+  // project` server-side) -- unconditionally, regardless of
+  // `automatic_deploy`, and asynchronously (the row doesn't exist the
+  // instant `createProject` returns). Wait for THAT one to actually land
+  // and use its id as the baseline -- a single unpolled check races it: if
+  // the auto-deployment's row is created after our check but before our
+  // trigger call, it looks like "the deployment our trigger created" (its id
+  // is > whatever we saw, possibly 0/none), and we'd end up watching it
+  // instead. The platform correctly cancels/supersedes the auto-deployment
+  // the moment our explicit trigger creates a newer one for the same
+  // environment, so watching the wrong one surfaces as a spurious
+  // "cancelled" failure.
+  const baseline = await pollUntil(
+    async () => {
+      const res = await getLastDeployment({ client, path: { id: opts.projectId } })
+      return res.data ?? null
+    },
+    (d) => d !== null,
+    { timeoutMs: 15_000, intervalMs: 1000, label: 'the auto-queued initial deployment to land' },
+  )
+  const baselineId = baseline!.id
+
+  unwrap(
+    await triggerProjectPipeline({
+      client,
+      path: { id: opts.projectId },
+      body: { environment_id: opts.environmentId, branch: opts.branch ?? null, tag: null, commit: null },
+    }),
+    'triggerProjectPipeline',
+  )
+  const deployment = await pollUntil(
+    async () => {
+      const res = await getLastDeployment({ client, path: { id: opts.projectId } })
+      return res.data ?? null
+    },
+    (d) => d !== null && d.id > baselineId,
+    { timeoutMs: 30_000, intervalMs: 2000, label: 'a NEW deployment row (id > baseline) to appear after trigger-pipeline' },
+  )
+  return deployment!.id
 }
 
 /** Pick the production (non-preview) environment for a project. */

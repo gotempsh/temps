@@ -21,6 +21,7 @@ import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario
 import { logsScenarioCommand } from './commands/logs-scenario.ts'
 import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
+import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
 
 const program = new Command()
 
@@ -176,7 +177,7 @@ program
 program
   .command('backup-restore-scenario')
   .description(
-    'Backup + restore a real postgres service via MinIO: real pg_dump, real S3 upload, real in-place restore proven by reverting post-backup writes',
+    'Backup + restore a real postgres service via MinIO: real wal-g backup-push, real S3 upload, real in-place restore proven by reverting post-backup writes',
   )
   .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
   .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
@@ -186,6 +187,18 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await backupRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('git-deploy-scenario')
+  .description(
+    'Real git-triggered deploy against a public repo (github.com/gotempsh/temps-examples): clone + build a language-preset subdirectory, trigger-pipeline, verify the exact response body baked into the real repo source',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for the build+deploy to go healthy (real clone + real build)', '600000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await gitDeployScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

@@ -5,7 +5,8 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `kv-scenario`, `blob-scenario`, `flags-scenario`, `audit-scenario`,
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
-`session-replay-scenario`, `backup-restore-scenario`, `examples`) drive the real
+`session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
+`examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -152,6 +153,13 @@ bun run src/index.ts session-replay-scenario --registry localhost:5111
 # wal-g backup-push, real S3 upload), then in-place restored, proven by
 # reverting writes made after the backup. Needs MinIO (docker-compose.e2e.yml).
 bun run src/index.ts backup-restore-scenario --registry localhost:5111
+
+# git-deploy: real clone + build of a public GitHub repo
+# (github.com/gotempsh/temps-examples) via trigger-pipeline -- proves the
+# actual git pipeline, not an image pull or a synthesized Dockerfile. Hits
+# real github.com (documented exception to this suite's "no real internet"
+# rule -- see "External-service test infra" below).
+bun run src/index.ts git-deploy-scenario
 ```
 
 ### `examples`
@@ -687,6 +695,50 @@ archiving was off. Made a no-op after the first backup on a given service
 every single backup. Confirmed live 3x, including that the second and third
 backups on the same service skip the archiving setup entirely (faster
 restore, no extra container recreate).
+
+### `git-deploy-scenario` steps
+
+1. create a project pointed at a real public repo
+   (`github.com/gotempsh/temps-examples`), scoped to one subdirectory
+   (`examples/starters/go/net-http`) via `directory`, with a `go` preset
+2. resolve its production environment
+3. `POST /projects/{id}/trigger-pipeline` -- the same action a real git push
+   to the tracked branch would cause -- and poll
+   `GET /projects/{id}/last-deployment` for the deployment it created
+4. wait for the deployment to go healthy -- real clone + real build, so this
+   needs a materially longer timeout (`--deploy-timeout`, default 600000ms)
+   than the prebuilt-image scenarios
+5. hit the deployed app's `/` and `/health` and assert their EXACT JSON
+   bodies match the checked-in source (`{"message":"Hello from Go on
+   Temps!"}` / `{"status":"ok"}`) -- proving the real upstream repo got
+   cloned and built, not a cached/stale/wrong artifact
+6. teardown (deployment, project)
+
+**Real bug found and fixed (test-side, not platform)**: creating a
+Git-type project always auto-queues an initial deployment as a side effect
+of `POST /projects` itself ("Queueing initial deployment job for Git
+project" server-side) -- unconditionally, regardless of the
+`automatic_deploy` flag, and asynchronously (the deployment row doesn't
+exist the instant `createProject` returns). The first version of this
+scenario polled `GET /projects/{id}/last-deployment` once right after
+project creation to use as a "baseline" for spotting the deployment the
+explicit `trigger-pipeline` call would create, then triggered and waited
+for any deployment with a newer id. That race the auto-deployment: its row
+can land *after* the baseline check but *before* (or racing) the explicit
+trigger, so it looks like "the deployment trigger-pipeline just created".
+The platform then correctly cancels/supersedes that auto-deployment the
+moment the real explicit-trigger deployment is created for the same
+environment -- and the scenario, watching the wrong (auto) deployment,
+saw it go straight to `cancelled` and reported a false failure, while the
+real deployment was still building underneath. Fixed by having
+`triggerPipelineAndGetDeploymentId` (`apps/temps-e2e/src/lib/flows.ts`)
+*wait* for the auto-queued deployment to actually land before triggering,
+so the baseline id is deterministic, then poll for a deployment id
+strictly greater than it. Confirmed live 3x.
+
+This is deliberately the one scenario in this suite that hits real
+`github.com` -- see "External-service test infra" below for why the others
+don't.
 
 ## External-service test infra (TLS, DNS, email, backups)
 
