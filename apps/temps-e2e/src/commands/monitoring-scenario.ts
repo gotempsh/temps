@@ -96,7 +96,7 @@ import {
   resolveLoadTarget,
   teardown,
   makeRunId,
-  sleep,
+  pollUntil,
 } from '../lib/flows.ts'
 import { buildToggleImage, setToggleState } from '../lib/toggle-app.ts'
 
@@ -119,26 +119,6 @@ interface MonitoringScenarioResult {
   runId: string
   ok: boolean
   steps: StepLog[]
-}
-
-/** Poll `fn` until `predicate` passes or `timeoutMs` elapses; logs each observed value via `onPoll`. */
-async function pollUntil<T>(
-  fn: () => Promise<T>,
-  predicate: (v: T) => boolean,
-  opts: { timeoutMs: number; intervalMs?: number; onPoll?: (v: T, elapsedMs: number) => void; label: string },
-): Promise<T> {
-  const intervalMs = opts.intervalMs ?? 3000
-  const start = performance.now()
-  let last: T | undefined
-  while (performance.now() - start < opts.timeoutMs) {
-    last = await fn()
-    opts.onPoll?.(last, performance.now() - start)
-    if (predicate(last)) return last
-    await sleep(intervalMs)
-  }
-  throw new Error(
-    `${opts.label} did not converge within ${Math.round(opts.timeoutMs / 1000)}s (last: ${JSON.stringify(last)})`,
-  )
 }
 
 export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions): Promise<void> {

@@ -14,6 +14,7 @@ import { managedServicesScenarioCommand } from './commands/managed-services-scen
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
 import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
 import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario.ts'
+import { logsScenarioCommand } from './commands/logs-scenario.ts'
 
 const program = new Command()
 
@@ -192,6 +193,19 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await errorTrackingScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('logs-scenario')
+  .description(
+    'Real log-aggregation lifecycle: deploy an app that emits structured JSON stdout/stderr lines, wait out the actual chunk-flush window, and verify full-text search, level filtering, JSONB `fields` passthrough, env filtering, grep-style context, and purge -- through the real Docker log collector, not synthetic rows',
+  )
+  .option('--registry <host>', 'registry to push the log-emitter image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await logsScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

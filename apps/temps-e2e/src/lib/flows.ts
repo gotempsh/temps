@@ -270,6 +270,26 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/** Poll `fn` until `predicate` passes or `timeoutMs` elapses; logs each observed value via `onPoll`. */
+export async function pollUntil<T>(
+  fn: () => Promise<T>,
+  predicate: (v: T) => boolean,
+  opts: { timeoutMs: number; intervalMs?: number; onPoll?: (v: T, elapsedMs: number) => void; label: string },
+): Promise<T> {
+  const intervalMs = opts.intervalMs ?? 3000
+  const start = performance.now()
+  let last: T | undefined
+  while (performance.now() - start < opts.timeoutMs) {
+    last = await fn()
+    opts.onPoll?.(last, performance.now() - start)
+    if (predicate(last)) return last
+    await sleep(intervalMs)
+  }
+  throw new Error(
+    `${opts.label} did not converge within ${Math.round(opts.timeoutMs / 1000)}s (last: ${JSON.stringify(last)})`,
+  )
+}
+
 /**
  * Turn a deployment's public `main_url` into a target the load generator can
  * actually reach. The proxy routes by Host header, so we send requests to the
