@@ -79,11 +79,11 @@ pub struct ListAuditLogsQuery {
     /// Filter logs by user ID (omit for all users)
     #[param(example = 1)]
     pub user_id: Option<i32>,
-    /// Start timestamp (milliseconds since epoch)
-    #[param(example = 1)]
+    /// Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+    #[param(example = "2024-01-15T14:30:00Z")]
     pub from: Option<DateTime>,
-    /// End timestamp (milliseconds since epoch)
-    #[param(example = 1)]
+    /// End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+    #[param(example = "2024-01-15T14:30:00Z")]
     pub to: Option<DateTime>,
     /// Maximum number of logs to return
     #[param(example = 100)]
