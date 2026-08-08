@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::{get, post, put},
     Extension, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -945,7 +945,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/visitors/{visitor_id}/session-replays/{session_id}/duration",
-            post(update_session_duration),
+            put(update_session_duration),
         )
 }
 

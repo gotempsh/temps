@@ -776,19 +776,24 @@ impl SessionReplayService {
         // Build filtered base for total count. Exclude replays with no
         // measurable duration: both 0ms and NULL (never-finalized sessions,
         // typically single-burst bot traffic) have nothing to play back.
+        // Also exclude soft-deleted sessions (is_active=false) — otherwise a
+        // deleted replay keeps showing up here forever, since delete_session_replay
+        // only flips the flag and no read path ever checked it.
         let mut count_select = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::ProjectId.eq(project_id))
-            .filter(session_replay_sessions::Column::Duration.gt(0));
+            .filter(session_replay_sessions::Column::Duration.gt(0))
+            .filter(session_replay_sessions::Column::IsActive.eq(true));
         if let Some(env_id) = environment_id {
             count_select =
                 count_select.filter(session_replay_sessions::Column::EnvironmentId.eq(env_id));
         }
         let total_count: u64 = count_select.count(self.db.as_ref()).await?;
 
-        // Same duration filter as the count query above — must stay in sync.
+        // Same duration/is_active filters as the count query above — must stay in sync.
         let mut query = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::ProjectId.eq(project_id))
             .filter(session_replay_sessions::Column::Duration.gt(0))
+            .filter(session_replay_sessions::Column::IsActive.eq(true))
             .inner_join(visitor::Entity)
             .join(
                 sea_orm::JoinType::LeftJoin,
@@ -982,7 +987,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.visitor_id = $1 AND s.duration > 0
+            WHERE s.visitor_id = $1 AND s.duration > 0 AND s.is_active = true
             ORDER BY s.created_at DESC
             LIMIT {} OFFSET {}
             "#,
@@ -1126,7 +1131,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.id = $1
+            WHERE s.id = $1 AND s.is_active = true
         "#;
 
         let statement = sea_orm::Statement::from_sql_and_values(
@@ -1146,6 +1151,7 @@ impl SessionReplayService {
 
         let events = session_replay_events::Entity::find()
             .filter(session_replay_events::Column::SessionId.eq(row.id))
+            .filter(session_replay_events::Column::IsActive.eq(true))
             .order_by_asc(session_replay_events::Column::Timestamp)
             .limit(MAX_REPLAY_EVENTS)
             .all(self.db.as_ref())
@@ -1248,7 +1254,7 @@ impl SessionReplayService {
             FROM session_replay_sessions s
             INNER JOIN visitor v ON s.visitor_id = v.id
             LEFT JOIN ip_geolocations g ON v.ip_address_id = g.id
-            WHERE s.id = $1
+            WHERE s.id = $1 AND s.is_active = true
         "#;
 
         let statement = sea_orm::Statement::from_sql_and_values(
