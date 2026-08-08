@@ -139,6 +139,13 @@ jobs:
           timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
           echo "TimescaleDB is ready"
 
+      # Pulled explicitly (rather than left to the first `docker run` that
+      # needs it) so a slow/rate-limited registry pull fails clearly here,
+      # under an obvious step name, instead of surfacing later as a mystery
+      # delay inside the pre-flight check below or the Playwright test itself.
+      - name: Pre-pull alpine:latest (used by the host.docker.internal pre-flight)
+        run: docker pull alpine:latest
+
       # domain-tls-pebble.spec.ts and email-provider-mailpit.spec.ts (below)
       # each document this requirement themselves ("Requires docker compose
       # -f apps/temps-e2e/docker-compose.e2e.yml up -d") -- brought up here so
@@ -148,6 +155,8 @@ jobs:
       # this job (console/API e2e, not apps/temps-e2e's own scenarios) needs it.
       - name: Start Pebble + Mailpit test infra
         run: |
+          set -o pipefail
+
           docker compose -f apps/temps-e2e/docker-compose.e2e.yml up -d pebble pebble-challtestsrv mailpit
           echo "Waiting for Pebble (ACME directory, :14000)..."
           timeout 60 bash -c 'until nc -z localhost 14000; do sleep 1; done'
@@ -156,6 +165,45 @@ jobs:
           echo "Waiting for Mailpit (SMTP :1025, API :8025)..."
           timeout 60 bash -c 'until nc -z localhost 1025 && nc -z localhost 8025; do sleep 1; done'
           echo "Pebble + Mailpit test infra ready"
+
+          # Pre-flight: reproduce domain-tls-pebble.spec.ts's
+          # resolveHostDockerInternal() exactly (same network, same image, same
+          # free-resolution-then---add-host fallback order), so a broken
+          # host.docker.internal resolution on this runner fails HERE, with a
+          # clear step name, instead of three minutes later as a Playwright
+          # retry timeout inside the TLS-via-Pebble test.
+          PEBBLE_NET="temps-e2e-pebble-net"
+          IPV4_RE='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+          echo "Resolving host.docker.internal on $PEBBLE_NET (as domain-tls-pebble.spec.ts does)..."
+
+          HOST_IP=""
+          if GETENT_OUT=$(docker run --rm --network "$PEBBLE_NET" alpine:latest getent hosts host.docker.internal 2>&1); then
+            # A no-match here is a legitimate outcome (falls through to the
+            # --add-host retry below), not a script error -- hence `|| true`.
+            HOST_IP=$(awk '{print $1}' <<<"$GETENT_OUT" | grep -E "$IPV4_RE" | head -n1 || true)
+          fi
+
+          if [ -z "$HOST_IP" ]; then
+            echo "Free resolution found no IPv4 address; retrying with --add-host host.docker.internal:host-gateway..."
+            if GETENT_OUT=$(docker run --rm --network "$PEBBLE_NET" --add-host host.docker.internal:host-gateway alpine:latest getent hosts host.docker.internal 2>&1); then
+              HOST_IP=$(awk '{print $1}' <<<"$GETENT_OUT" | grep -E "$IPV4_RE" | head -n1 || true)
+            else
+              echo "$GETENT_OUT"
+            fi
+          fi
+
+          if [ -z "$HOST_IP" ]; then
+            echo "ERROR: could not resolve an IPv4 host.docker.internal on $PEBBLE_NET (needed by domain-tls-pebble.spec.ts)." >&2
+            echo "--- docker version ---"
+            docker version || true
+            echo "--- docker network ls ---"
+            docker network ls || true
+            echo "--- docker network inspect $PEBBLE_NET ---"
+            docker network inspect "$PEBBLE_NET" || true
+            exit 1
+          fi
+
+          echo "host.docker.internal -> $HOST_IP (pre-flight OK)"
 
       - name: Run temps setup
         run: |
