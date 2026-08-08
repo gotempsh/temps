@@ -132,7 +132,13 @@ export async function runScenarioForImage(
 
     if (spec.withDb) {
       const svc = await step('provision postgres', () =>
-        createE2eService(client, { name: `${runId}-db`, serviceType: 'postgres' }),
+        // `database`/`username` are required by PostgresParameterStrategy::validate_for_creation
+        // (crates/temps-providers/src/parameter_strategies.rs) -- omitting them 400s.
+        createE2eService(client, {
+          name: `${runId}-db`,
+          serviceType: 'postgres',
+          parameters: { database: 'app', username: 'app' },
+        }),
       )
       serviceIds.push(svc.id)
       log(`  service #${svc.id} (${svc.name})`)
