@@ -7,6 +7,7 @@
       "dependencies": {
         "@hey-api/client-fetch": "^0.13.1",
         "@temps-sdk/api": "link:@temps-sdk/api",
+        "@temps-sdk/node-sdk": "link:@temps-sdk/node-sdk",
         "commander": "^14.0.2",
       },
       "devDependencies": {
@@ -35,6 +36,8 @@
     "@lukeed/ms": ["@lukeed/ms@2.0.2", "", {}, "sha512-9I2Zn6+NJLfaGoz9jN3lpwDgAYvfGeNYdbAIjJOqzs4Tpc+VU3Jqq4IofSUBKajiDS8k9fZIg18/z13mpk1bsA=="],
 
     "@temps-sdk/api": ["@temps-sdk/api@link:@temps-sdk/api", {}],
+
+    "@temps-sdk/node-sdk": ["@temps-sdk/node-sdk@link:@temps-sdk/node-sdk", {}],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

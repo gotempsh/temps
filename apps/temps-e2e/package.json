@@ -14,6 +14,7 @@
   "dependencies": {
     "@hey-api/client-fetch": "^0.13.1",
     "@temps-sdk/api": "link:@temps-sdk/api",
+    "@temps-sdk/node-sdk": "link:@temps-sdk/node-sdk",
     "commander": "^14.0.2"
   },
   "devDependencies": {

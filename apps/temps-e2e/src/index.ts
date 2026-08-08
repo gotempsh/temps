@@ -11,6 +11,7 @@ import { emailScenarioCommand } from './commands/email-scenario.ts'
 import { cliScenarioCommand } from './commands/cli-scenario.ts'
 import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
+import { flagsScenarioCommand } from './commands/flags-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
@@ -158,6 +159,17 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await blobScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('flags-scenario')
+  .description(
+    'Feature flags driven through the real @temps-sdk/node-sdk FlagsClient: defaults, per-environment overrides, the kill switch, ETag/304 caching, and exposure reporting',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await flagsScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

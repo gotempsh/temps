@@ -2,10 +2,10 @@
 
 End-to-end + load testing CLI for a **live** Temps instance. Most commands
 (`scenario`, `tls-scenario`, `dns01-wildcard-scenario`, `email-scenario`,
-`kv-scenario`, `blob-scenario`, `audit-scenario`, `managed-services-scenario`,
-`rbac-scenario`, `monitoring-scenario`, `error-tracking-scenario`,
-`logs-scenario`, `analytics-scenario`, `session-replay-scenario`,
-`examples`) drive the real
+`kv-scenario`, `blob-scenario`, `flags-scenario`, `audit-scenario`,
+`managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
+`error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
+`session-replay-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -109,6 +109,10 @@ bun run src/index.ts kv-scenario
 # blob storage: real RustFS (S3-compatible) data-plane round trip --
 # put/download/head/list/copy/delete, deleted-blob 404, cross-project isolation.
 bun run src/index.ts blob-scenario
+
+# feature flags: driven through the real @temps-sdk/node-sdk FlagsClient --
+# defaults, per-environment overrides, the kill switch, ETag/304, exposure reporting.
+bun run src/index.ts flags-scenario
 
 # audit-logs: real PROJECT_CREATED/PROJECT_DELETED rows read back exactly,
 # plus an RBAC-gate check on the read endpoint itself.
@@ -382,6 +386,51 @@ project_id, non-crossing content), and a 400 on a missing `project_id`.
 
 Like kv-storage, blob storage is a platform-wide singleton — the scenario
 never disables it in teardown.
+
+### `flags-scenario` steps
+
+Driven through the real `@temps-sdk/node-sdk` `FlagsClient` for every read
+(not just the raw HTTP API), since that's the actual client apps deployed on
+Temps use — same shape as pointing `tls-scenario` at a real ACME exchange
+instead of asserting a 200:
+
+1. create a project + resolve its production environment
+2. create a bool flag and a string flag via the admin API
+3. mint a deployment token scoped to (project, environment) — the same
+   `TEMPS_API_URL`/`TEMPS_API_TOKEN` pair Temps injects into every real
+   deployment
+4. `FlagsClient.refresh()` (real HTTP call, real ETag caching) then
+   `get()`/`getDetails()`: both flags resolve to their declared defaults,
+   and an unrecognized key resolves to the caller's fallback
+5. set a per-environment override via the admin API, `refresh()` again,
+   confirm the override wins over the default
+6. set the kill switch (`enabled: false`) on a flag that *also* carries an
+   override value, `refresh()` again, confirm the flag reverts to its
+   default — proving the kill switch outranks any override, not just that
+   it exists
+7. `ETag`/`If-None-Match`: a second `GET /flags/snapshot` with the ETag
+   from the first response is a genuine 304
+8. exposure reporting: `getDetails()` on a flag marks it evaluated,
+   `flushExposure()` reports it, and the admin API's `last_evaluated_at`
+   (null beforehand) is now set — proving the whole loop, not just that the
+   endpoint accepts a POST
+9. auth boundary: the delivery endpoint rejects a plain admin API key with
+   400 (deployment-token-only, by design)
+10. teardown (delete the deployment token, then the project)
+
+Verified passing (3x back-to-back): every step green on the first attempt —
+no platform bugs found.
+
+**Scope note**: only boolean-style values, the kill switch, and
+per-environment overrides are live in the shipped Phase 1
+(`docs/adr/034-feature-flags.md`). Percentage rollout and targeting rules
+exist in the schema but are dead code server-side (`bucket()` is never
+called, `rules` is always `[]`), so this scenario doesn't exercise them.
+
+Required `@temps-sdk/node-sdk` to be added as a workspace dependency of
+`apps/temps-e2e` (`link:@temps-sdk/node-sdk`, matching the existing
+`@temps-sdk/api` link) and built (`bun run build` in
+`sdks/node/packages/node-sdk`) — it had no `dist/` yet.
 
 ### `audit-scenario` steps
 
