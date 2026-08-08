@@ -2472,21 +2472,45 @@ impl OtelStorage for TimescaleDbStorage {
         // `COUNT(*)` scans every chunk, and this runs three times per call on
         // the ingest hot path (`check_quota`), so the denominator uses
         // TimescaleDB's `approximate_row_count` (planner stats, microseconds).
-        // `GREATEST(.., 1)` still guards against a zero/negative estimate on a
-        // freshly-created, never-analyzed table.
+        // `GREATEST(.., 1)` guards against a zero/negative estimate on a
+        // freshly-created, never-analyzed table; `LEAST(1.0, ..)` around the
+        // ratio guards the other direction -- a project's share of a table
+        // can never exceed 100% of that table, but `approximate_row_count`
+        // can UNDER-count right after a write burst (autovacuum/ANALYZE
+        // hasn't caught up yet -- the exact scenario this quota exists to
+        // catch), which without the clamp would inflate the computed
+        // `total_bytes` past what `table_size` itself reports. With the
+        // clamp, a lagging denominator can only make the estimate MORE
+        // conservative (trip earlier), never silently let a flood through.
+        //
+        // CORRECTNESS: `table_size` MUST be the whole hypertable's storage,
+        // not just its root. A hypertable's "root" relation (the name you
+        // create it under, e.g. `otel_spans`) holds no rows and almost no
+        // bytes itself -- TimescaleDB partitions all actual data into child
+        // "chunk" tables under `_timescaledb_internal`. `pg_total_relation_size`
+        // on the root name (the previous query here) therefore measures only
+        // the root's own tiny catalog/index footprint and NEVER grows with
+        // real ingest volume, so `total_bytes` stayed near-zero regardless of
+        // how much data a project actually stored and `usage_pct` could
+        // never reach 100 -- quota enforcement was silently inert for every
+        // project, the exact 160GB/day-flood failure mode this quota exists
+        // to prevent. `hypertable_size()` is TimescaleDB's chunk-aware
+        // equivalent: it sums every chunk's `pg_total_relation_size` (plus
+        // the negligible root), which is still cheap (proportional to chunk
+        // count, not row count) and gives the real total.
         let sql = r#"
             SELECT
-                COALESCE((SELECT pg_total_relation_size('otel_metrics') *
-                    (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_metrics'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_spans') *
-                    (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_spans'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_log_events') *
-                    (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_log_events'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float)
                 ), 0)::bigint as total_bytes
         "#;
 

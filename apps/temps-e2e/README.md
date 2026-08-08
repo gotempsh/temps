@@ -6,7 +6,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
-`examples`) drive the real
+`otel-quota-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -160,6 +160,15 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # real github.com (documented exception to this suite's "no real internet"
 # rule -- see "External-service test infra" below).
 bun run src/index.ts git-deploy-scenario
+
+# otel-quota: real OTLP/HTTP protobuf traces/metrics/logs (hand-encoded, no
+# @opentelemetry/* SDK) round-tripped through the query API + Observe feed,
+# then real storage-quota enforcement pushed past a configured
+# TEMPS_OTEL_QUOTA_GB until ingestion is actually rejected (413). The target
+# instance MUST be launched with TEMPS_OTEL_QUOTA_GB=1 (the smallest nonzero
+# value) for the quota half to mean anything -- see its section below.
+bun run src/index.ts otel-quota-scenario
+bun run src/index.ts otel-quota-scenario --max-quota-batches 400 --json
 ```
 
 ### `examples`
@@ -739,6 +748,137 @@ strictly greater than it. Confirmed live 3x.
 This is deliberately the one scenario in this suite that hits real
 `github.com` -- see "External-service test infra" below for why the others
 don't.
+
+### `otel-quota-scenario` steps
+
+Requires the target instance to be launched with `TEMPS_OTEL_QUOTA_GB=1`
+(the smallest nonzero value the knob accepts -- it's parsed as a whole
+`u64` GB count, see `crates/temps-otel/src/plugin.rs`). Without it, quota
+is disabled instance-wide and step 5 fails fast with a clear "you didn't
+configure this" error instead of a false pass.
+
+1. create a project. OTel's `tk_` (API-key) ingest path authenticates with a
+   bearer `tk_` token plus `X-Temps-Project-Id`
+   (`crates/temps-otel/src/ingest/auth.rs::authenticate_api_key`) -- the same
+   shape the harness's own control-plane calls already use, so this scenario
+   ingests with that same key rather than minting a fresh one via
+   `POST /api-keys`: creating an API key is a `SensitiveAction::CreateApiKey`
+   that the OSS `RequireVerificationAuthorizer` always downgrades to "needs
+   interactive step-up verification" for every principal type, including an
+   already-authenticated API key, by design (so a leaked `tk_` key can't mint
+   itself more credentials). A scriptable run has no session to step up
+   with, so it uses the credential it was given -- exactly what a real
+   deployed collector does.
+2. hand-encode one real root span, one gauge metric point, and one log
+   record as raw OTLP/HTTP protobuf (`apps/temps-e2e/src/lib/otlp.ts` --
+   field numbers copied directly from the vendored `.proto` files at
+   `crates/temps-otel/proto/opentelemetry/proto/**`, not guessed) and POST
+   each to `/otel/v1/{traces,metrics,logs}`
+3. read them all back through the real query API -- `GET /otel/traces`
+   (by `trace_id`), `GET /otel/traces/{project_id}/{trace_id}`,
+   `GET /otel/logs` (body + trace correlation), `GET /otel/metrics` (exact
+   value) -- asserting decoded field values, not just "a row exists"
+4. confirm the root span appears in the unified Observe feed
+   (`GET /projects/{id}/observe/events?kinds=span`), and that
+   `kinds=log` is rejected 400 (there is no `Log` variant in
+   `ObservabilityEvent` by design -- logs have their own page; see the bug
+   fix below)
+5. read `GET /otel/quota/{project_id}` and confirm a fresh project starts
+   well under 100% with a nonzero configured limit
+6. push ~9 MB OTLP trace batches (one span each, one giant filler
+   attribute) in a loop, polling the **uncached** `GET /otel/quota`
+   endpoint after every batch, until `usage_pct >= 100` (capped at
+   `--max-quota-batches`, default 250)
+7. sleep past the ingest-time quota cache TTL (30s, see
+   `crates/temps-otel/src/ingest/quota_cache.rs::QUOTA_CACHE_TTL`) --
+   `check_quota` on the hot ingest path deliberately reuses a cached
+   result for up to 30s (an exact per-project `COUNT(*)`-based estimate on
+   every request would be too expensive), so a burst inside that window
+   can legitimately land after crossing 100%; that's a documented
+   accuracy/hot-path tradeoff, not a bug, and pushing through it would
+   make the next assertion flaky
+8. send one more (small) batch with a unique canary span name and assert
+   it's rejected with HTTP 413 (`OtelError::QuotaExceeded`, body mentions
+   "quota") -- twice, to rule out a one-off race
+9. query `GET /otel/traces` for the canary span name and confirm it never
+   landed -- proves the rejection is real (the row didn't get written),
+   not just that the HTTP call happened to error while ingestion secretly
+   continued
+10. teardown: delete the project
+
+**Real bug found and fixed (the headline one): quota enforcement was
+silently inert for every project.** `TimescaleDbStorage::get_storage_quota`
+(`crates/temps-otel/src/storage/timescaledb.rs`) estimates a project's
+share of each OTel hypertable as `hypertable_size * (project_rows /
+approximate_row_count(hypertable))` -- but the code being fixed called
+`pg_total_relation_size('otel_spans')` (etc.) instead of
+`hypertable_size('otel_spans'::regclass)`. A hypertable's "root" relation
+(the name you create it under) holds no rows and almost no bytes of its
+own -- TimescaleDB partitions all actual data into child "chunk" tables
+under `_timescaledb_internal`, and `pg_total_relation_size` on the root
+name measures only that root's tiny catalog/index footprint. Verified live:
+with `TEMPS_OTEL_QUOTA_GB=1` configured, pushing over 2GB of real OTLP
+trace data into one project (250 batches, `--max-quota-batches`'s cap)
+never moved `total_bytes` past ~15MB or `usage_pct` past ~1.5% -- the quota
+could not be crossed no matter how much was ingested. `hypertable_size()`
+is TimescaleDB's chunk-aware equivalent (sums every chunk's own
+`pg_total_relation_size`, still cheap -- proportional to chunk count, not
+row count). After the fix, the same volume test trips the quota
+consistently at ~110 batches / ~990MB sent against a 1024MB (1 GiB)
+configured limit, across 4 consecutive clean runs. This is the exact
+160GB/day-flood failure mode the quota exists to prevent, and it could not
+have been caught by unit tests against a mocked storage layer -- only a
+real TimescaleDB instance has real chunk partitioning to get wrong.
+Alongside this, `LEAST(1.0, ratio)` was added around each per-table
+proportion: `approximate_row_count` is a planner-statistics estimate that
+can lag the true count right after a write burst, and without the clamp a
+stale (too-low) denominator could compute a per-project share above 100%
+of the table, inflating `total_bytes` past what the table itself reports.
+
+**Residual limitation found (not fixed here, documented as a known
+follow-up)**: because `approximate_row_count` is planner-statistics-based
+and shared across every project on the same hypertable, a project that
+checks its quota shortly after a DIFFERENT project on the same instance
+just finished a large write burst can be told it's already near/over 100%
+usage from a handful of its own rows -- the stale (too-low) row-count
+denominator combined with the `LEAST(1.0, ..)` clamp above conservatively
+(but incorrectly) attributes the whole table to whichever project asks
+first. Reproduced live: running this scenario twice back-to-back against
+the *same* database (no fresh project/DB in between) makes the second
+run's very first quota check fail with `usage_pct` already `>100` on a
+project with only its own 3 initial spans. It self-heals once
+autovacuum/`ANALYZE` catches up (seconds, in practice), and does not
+recur when each run gets an isolated database (the normal way this suite
+runs, and how CI would run it). A proper fix -- e.g. a periodic background
+`ANALYZE` of the three OTel hypertables, decoupled from any single
+project's request path -- is a bigger design/cost tradeoff than fits this
+PR; flagged here rather than silently patched around or ignored.
+
+**Real bug found and fixed (secondary)**: `EventsQuery.kinds`'s doc comment
+(which `utoipa` surfaces into the OpenAPI spec, and from there into
+`@temps-sdk/api`'s generated docs) advertised `log` as a valid Observe
+`kinds` filter value alongside `request,span,error,revenue`. It never was
+-- `ObservabilityEvent` has no `Log` variant (a deliberate, documented
+design choice: runtime logs are too high-volume to interleave with
+business signals, and have their own retention/storage model), and
+`EventKind::parse("log")` returns `None`, so `kinds=log` has always 400'd
+with `InvalidKindsFilter`. Fixed the doc comment in
+`crates/temps-observability/src/handlers/events.rs` to match what the code
+has always actually done, instead of leaving a promise nothing implements
+for the next reader (human or agent) to trip over. Step 4 asserts the real
+behavior directly: `kinds=span` finds the span, `kinds=log` 400s.
+
+**Real bug found and fixed (third, minor)**: `query_traces`'s utoipa
+`#[utoipa::path(params(...))]` list (`crates/temps-otel/src/handlers/query_handler.rs`)
+was missing `attributes` and `name_pattern` -- both real, functioning query
+params on `TraceQueryParams` (and both already correctly documented on the
+neighboring `query_trace_summaries` handler a few lines below), silently
+absent from the generated OpenAPI spec and therefore from `@temps-sdk/api`'s
+typed `queryTraces()` signature: a real server capability the typed SDK
+couldn't express. Fixed by adding both to the params list. This scenario
+doesn't depend on the fix (it filters the quota canary span by `trace_id`,
+which was already typed correctly) -- found while checking why `name_pattern`
+wasn't available on the typed client during development.
 
 ## External-service test infra (TLS, DNS, email, backups)
 
