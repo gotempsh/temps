@@ -15,6 +15,7 @@ import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
 import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
 import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario.ts'
 import { logsScenarioCommand } from './commands/logs-scenario.ts'
+import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 
 const program = new Command()
 
@@ -206,6 +207,19 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await logsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('analytics-scenario')
+  .description(
+    'Real web-analytics lifecycle: deploy an HTML app so the proxy actually issues visitor/session cookies, replay them on POST /api/_temps/event the way a real tracking snippet would, and verify event-entries custom-property round-trip plus visitor-journey session stitching -- not just that the query routes return 2xx',
+  )
+  .option('--registry <host>', 'registry to push the analytics-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await analyticsScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
