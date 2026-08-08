@@ -118,7 +118,12 @@ impl StatusPageService {
         for monitor in monitors {
             match self.monitor_service.get_monitor_status(monitor.id).await {
                 Ok(status) => monitor_statuses.push(status),
-                Err(_) => {
+                Err(e) => {
+                    tracing::error!(
+                        "get_monitor_status failed for monitor {} -- status overview will show it as unknown: {:?}",
+                        monitor.id,
+                        e
+                    );
                     // If we can't get status, create a default one
                     monitor_statuses.push(MonitorStatus {
                         monitor,

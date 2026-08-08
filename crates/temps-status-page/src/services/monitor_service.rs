@@ -671,13 +671,18 @@ impl MonitorService {
             avg_time: Option<f64>,
         }
 
+        // Postgres' AVG() over an integer column returns NUMERIC, not
+        // double precision -- casting here keeps sqlx's try_get<f64> from
+        // erroring on the type mismatch (this silently failed
+        // get_monitor_status -> get_status_overview swallowed it into a
+        // fake "unknown" status for every monitor, even fully healthy ones).
         let result = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_date))
             .from_raw_sql(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"
-                SELECT AVG(response_time_ms) as avg_time
+                SELECT AVG(response_time_ms)::double precision as avg_time
                 FROM status_checks
                 WHERE monitor_id = $1 AND checked_at >= $2 AND response_time_ms IS NOT NULL
                 "#,
