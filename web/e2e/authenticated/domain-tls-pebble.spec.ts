@@ -32,27 +32,55 @@ import { expect, expectAppMounted, test, uniqueSlug } from '../fixtures'
  * natively on the host, so `host.docker.internal` has to be resolved from
  * INSIDE a container on that compose network; the host process itself can't
  * resolve that name.
+ *
+ * Docker Desktop (macOS/Windows) resolves `host.docker.internal` inside any
+ * container for free, with a real IPv4 address. Linux Docker Engine (what CI
+ * runners use) has no such magic and needs an explicit
+ * `--add-host=host.docker.internal:host-gateway` -- but that same flag, when
+ * added on Docker Desktop, resolves to an IPv6 host-gateway address instead
+ * of reusing the free IPv4 resolution. So: try the free resolution first
+ * (covers macOS), and only fall back to `--add-host` if that fails (covers
+ * Linux CI) -- and always pick the IPv4-shaped address out of the result,
+ * since `getent hosts` can return more than one line/family.
  */
-async function registerPebbleDefaultIp(): Promise<void> {
+function resolveHostDockerInternal(): string {
+  const pickIpv4 = (out: string): string | undefined =>
+    out
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/)[0])
+      .find((token) => /^\d{1,3}(\.\d{1,3}){3}$/.test(token ?? ''))
+
+  const baseArgs = [
+    'run',
+    '--rm',
+    '--network',
+    'temps-e2e-pebble-net',
+  ]
+  const getentArgs = ['alpine:latest', 'getent', 'hosts', 'host.docker.internal']
+
+  try {
+    const out = execFileSync('docker', [...baseArgs, ...getentArgs], {
+      encoding: 'utf8',
+    })
+    const ip = pickIpv4(out)
+    if (ip) return ip
+  } catch {
+    // Fall through to the --add-host retry below (expected on Linux CI).
+  }
+
   const out = execFileSync(
     'docker',
-    [
-      'run',
-      '--rm',
-      '--network',
-      'temps-e2e-pebble-net',
-      'alpine:latest',
-      'getent',
-      'hosts',
-      'host.docker.internal',
-    ],
+    [...baseArgs, '--add-host', 'host.docker.internal:host-gateway', ...getentArgs],
     { encoding: 'utf8' }
   )
-  const ip = out.trim().split(/\s+/)[0]
+  const ip = pickIpv4(out)
   if (!ip)
-    throw new Error(
-      `could not resolve host.docker.internal: ${JSON.stringify(out)}`
-    )
+    throw new Error(`could not resolve an IPv4 host.docker.internal: ${JSON.stringify(out)}`)
+  return ip
+}
+
+async function registerPebbleDefaultIp(): Promise<void> {
+  const ip = resolveHostDockerInternal()
 
   const v4 = await fetch('http://localhost:8056/set-default-ipv4', {
     method: 'POST',
