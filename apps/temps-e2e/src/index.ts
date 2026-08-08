@@ -12,6 +12,7 @@ import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
+import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
 
 const program = new Command()
 
@@ -166,6 +167,19 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await rbacScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('monitoring-scenario')
+  .description(
+    'Real uptime-monitoring lifecycle: confirm a fresh project auto-gets a default monitor, create an explicit second one, deploy a toggleable app, wait for the FIXED 60s check cycle to catch a real 5xx outage (raw status "major_outage") and later its recovery, and assert the incident/bucketed-chart/status-overview side effects at each step -- not just that monitor/incident CRUD returns 2xx',
+  )
+  .option('--registry <host>', 'registry to push the toggle-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await monitoringScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
