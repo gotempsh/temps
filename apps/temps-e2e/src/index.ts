@@ -6,6 +6,7 @@ import { loadCommand } from './commands/load.ts'
 import { scenarioCommand } from './commands/scenario.ts'
 import { examplesCommand } from './commands/examples.ts'
 import { tlsScenarioCommand } from './commands/tls-scenario.ts'
+import { dns01WildcardScenarioCommand } from './commands/dns01-wildcard-scenario.ts'
 import { emailScenarioCommand } from './commands/email-scenario.ts'
 import { cliScenarioCommand } from './commands/cli-scenario.ts'
 import { kvScenarioCommand } from './commands/kv-scenario.ts'
@@ -96,6 +97,18 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await tlsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('dns01-wildcard-scenario')
+  .description(
+    'Register a Pebble DNS provider, issue a wildcard certificate via a real DNS-01 challenge, and verify it',
+  )
+  .option('--pebble-management-url <url>', 'pebble-challtestsrv management API URL', 'http://localhost:8056')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await dns01WildcardScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

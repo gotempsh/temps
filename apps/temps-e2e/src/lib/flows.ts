@@ -31,6 +31,12 @@ import {
   getEmailEvents,
   kvStatus,
   kvEnable,
+  createDnsProvider,
+  addManagedDomain,
+  verifyManagedDomain,
+  setupDnsChallenge,
+  removeManagedDomain,
+  deleteDnsProvider,
 } from '@temps-sdk/api'
 import type { Client } from '@temps-sdk/api/client'
 import tls, { type TLSSocket } from 'node:tls'
@@ -607,6 +613,118 @@ export async function teardownTlsDomain(
       await deleteDomain({ client, path: { domain: opts.domain } })
     } catch (e) {
       errors.push(`deleteDomain(${opts.domain}): ${(e as Error).message}`)
+    }
+  }
+  return errors
+}
+
+/**
+ * Register a Pebble-backed DNS provider (`PebbleDnsProvider` --
+ * LOCAL DEV/TEST ONLY, gated by `TEMPS_ALLOW_PEBBLE_PROVIDER=1` and an
+ * inverted SSRF guard requiring `managementUrl` to be loopback/private) and
+ * add + verify a managed zone for it. Verification against Pebble always
+ * succeeds -- `PebbleDnsProvider::get_zone` unconditionally returns `Some`,
+ * unlike a real provider's zone lookup -- so this never blocks on real DNS
+ * propagation or external credentials.
+ */
+export async function setupPebbleDnsZone(
+  client: Client,
+  opts: { zone: string; managementUrl?: string; name?: string },
+): Promise<{ dnsProviderId: number }> {
+  const provider = unwrap(
+    await createDnsProvider({
+      client,
+      body: {
+        name: opts.name ?? `e2e-pebble-${opts.zone}`,
+        provider_type: 'pebble',
+        credentials: { type: 'pebble', management_url: opts.managementUrl ?? 'http://localhost:8056' },
+        description: 'temps-e2e dns01-wildcard-scenario (local test only)',
+      },
+    }),
+    'createDnsProvider',
+  )
+
+  unwrap(
+    await addManagedDomain({
+      client,
+      path: { id: provider.id },
+      body: { domain: opts.zone, auto_manage: true },
+    }),
+    'addManagedDomain',
+  )
+
+  unwrap(
+    await verifyManagedDomain({ client, path: { provider_id: provider.id, domain: opts.zone } }),
+    'verifyManagedDomain',
+  )
+
+  return { dnsProviderId: provider.id }
+}
+
+export interface Dns01SetupResult {
+  domainId: number
+  recordsCreated: number
+  totalRecords: number
+}
+
+/**
+ * Create a wildcard domain with a `dns-01` challenge (`createDomain` already
+ * auto-requests the ACME order via `DomainService::request_challenge`, same
+ * as the HTTP-01 path) and push its TXT record(s) to the linked Pebble
+ * provider. `setup-dns` resolves the record values from the just-created
+ * order and calls `PebbleDnsProvider::create_record`, which POSTs to
+ * pebble-challtestsrv's `/set-txt` -- no DNS state needs to be pre-seeded by
+ * the test itself.
+ */
+export async function setupDns01WildcardDomain(
+  client: Client,
+  opts: { wildcardDomain: string; dnsProviderId: number },
+): Promise<Dns01SetupResult> {
+  const domain = unwrap(
+    await createDomain({ client, body: { domain: opts.wildcardDomain, challenge_type: 'dns-01' } }),
+    'createDomain',
+  )
+
+  const setup = unwrap(
+    await setupDnsChallenge({
+      client,
+      path: { domain_id: domain.id },
+      body: { dns_provider_id: opts.dnsProviderId },
+    }),
+    'setupDnsChallenge',
+  )
+
+  return { domainId: domain.id, recordsCreated: setup.records_created, totalRecords: setup.total_records }
+}
+
+/**
+ * Best-effort teardown of everything `setupPebbleDnsZone` +
+ * `setupDns01WildcardDomain` created. Never throws.
+ */
+export async function teardownDns01Resources(
+  client: Client,
+  opts: { wildcardDomain?: string; dnsProviderId?: number; zone?: string },
+): Promise<string[]> {
+  const errors: string[] = []
+  if (opts.wildcardDomain) {
+    try {
+      await deleteDomain({ client, path: { domain: opts.wildcardDomain } })
+    } catch (e) {
+      errors.push(`deleteDomain(${opts.wildcardDomain}): ${(e as Error).message}`)
+    }
+  }
+  if (opts.dnsProviderId && opts.zone) {
+    try {
+      await removeManagedDomain({ client, path: { provider_id: opts.dnsProviderId, domain: opts.zone } })
+    } catch (e) {
+      errors.push(`removeManagedDomain(${opts.zone}): ${(e as Error).message}`)
+    }
+  }
+  if (opts.dnsProviderId) {
+    try {
+      await deleteDnsProvider({ client, path: { id: opts.dnsProviderId } })
+    } catch (e) {
+      errors.push(`deleteDnsProvider(${opts.dnsProviderId}): ${(e as Error).message}`)
     }
   }
   return errors

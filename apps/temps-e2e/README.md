@@ -1,10 +1,11 @@
 # @temps-sdk/e2e
 
 End-to-end + load testing CLI for a **live** Temps instance. Most commands
-(`scenario`, `tls-scenario`, `email-scenario`, `kv-scenario`,
-`audit-scenario`, `managed-services-scenario`, `rbac-scenario`,
-`monitoring-scenario`, `error-tracking-scenario`, `logs-scenario`,
-`analytics-scenario`, `session-replay-scenario`, `examples`) drive the real
+(`scenario`, `tls-scenario`, `dns01-wildcard-scenario`, `email-scenario`,
+`kv-scenario`, `audit-scenario`, `managed-services-scenario`,
+`rbac-scenario`, `monitoring-scenario`, `error-tracking-scenario`,
+`logs-scenario`, `analytics-scenario`, `session-replay-scenario`,
+`examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -84,6 +85,12 @@ bun run src/index.ts examples --json                            # machine-readab
 # "External-service test infra" below.
 bun run src/index.ts tls-scenario --image traefik/whoami:latest --port 80
 bun run src/index.ts tls-scenario --keep --json                 # inspect the issued cert/domain after
+
+# Register a Pebble DNS provider, issue a wildcard certificate via a real
+# DNS-01 challenge, and verify it. Needs the same Pebble/pebble-challtestsrv
+# infra as tls-scenario, but no dedicated fixed-port instance.
+bun run src/index.ts dns01-wildcard-scenario
+bun run src/index.ts dns01-wildcard-scenario --keep --json      # inspect the issued cert/domain after
 
 # Create an SMTP provider pointed at Mailpit, send a tracked email, and verify
 # real receipt + open/click tracking. Needs Mailpit (docker-compose.e2e.yml).
@@ -203,6 +210,41 @@ Bun, calling it from `'end'` returns `{}` even though the exact same call
 made earlier in the connection's lifetime (or at either point under real
 Node.js) returns the full certificate, including `issuer`. `fetchOverTls` in
 `src/lib/flows.ts` captures the certificate at connect time for this reason.
+
+### `dns01-wildcard-scenario` steps
+
+1. register a Pebble-backed DNS provider and add + verify a managed zone for
+   it — verification against Pebble always succeeds (`get_zone` is
+   unconditionally `Some`), so this never blocks on real DNS propagation
+2. create a wildcard domain (`*.<zone>`) with a `dns-01` challenge, which
+   auto-requests a real ACME order from Pebble
+3. push the order's TXT record(s) to the Pebble provider via `setup-dns`
+4. finalize the order — Pebble's real validator queries pebble-challtestsrv
+   (its own `-dnsserver`) for the TXT record and only issues if it actually
+   finds the value just pushed in step 3
+5. parse the returned certificate PEM directly (no live app to fetch — a bare
+   wildcard domain isn't routed to any project) and assert the issuer is
+   Pebble's test root and the SAN covers the exact wildcard
+6. tear everything down (domain, managed zone, DNS provider) unless `--keep`
+
+Verified passing (3x back-to-back): real DNS provider → real managed zone →
+real ACME DNS-01 order → real TXT records pushed to pebble-challtestsrv →
+real validation → certificate parsed and confirmed to cover the wildcard,
+issued by Pebble's test root.
+
+**Closes a real coverage gap, no code bug found**: `crates/temps-domains`'
+own DNS-01 test (`test_dns01_wildcard_with_pebble`) is `#[ignore]`d and sets
+`PEBBLE_VA_ALWAYS_VALID=1`, which skips Pebble's real validator entirely —
+so nothing before this scenario proved the actual DNS-01 pipeline (TXT
+record push → real DNS query → real validation → real issuance) works
+end-to-end. This scenario does not set that env var.
+
+Unlike `tls-scenario`, this needs no host-IP registration with
+pebble-challtestsrv and no dedicated fixed-port instance: DNS-01 validation
+never dials the host machine at all, only pebble-challtestsrv's DNS
+interface, which Pebble already points at via its own `-dnsserver` flag —
+any normal dev-slot instance works, as long as it's launched with
+`ACME_DIRECTORY_URL` / `ACME_INSECURE` / `TEMPS_ALLOW_PEBBLE_PROVIDER=1`.
 
 ### `email-scenario` steps
 
