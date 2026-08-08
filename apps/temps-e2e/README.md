@@ -558,6 +558,26 @@ runs natively on the host, `tls-scenario`'s setup step resolves
 via `POST /set-default-ipv4` before provisioning, so Pebble's validation
 request actually reaches the host.
 
+## Known gaps (not covered end-to-end)
+
+**Slack notifications** — deliberately not covered by any scenario command,
+and not expected to be: two independent guards stand between a real
+`POST /notification-providers/slack` → `.../test` flow and any local target,
+and neither should be worked around for test convenience.
+`crates/temps_core::url_validation::validate_external_url` (referenced from
+`crates/temps-notifications`) rejects loopback/private/link-local addresses
+as a deliberate SSRF boundary, and even if that were bypassed,
+`SlackProvider::initialize()` (`crates/temps-notifications/src/services.rs`)
+separately hard-requires `webhook_url.starts_with("https://hooks.slack.com/")`
+— a real Slack workspace is the only thing that satisfies both. `send()`
+itself has no such gate and is covered by a `wiremock`-based Rust unit test
+in the same file, which is the right layer for this: it proves the exact
+payload shape (channel, attachments, mrkdwn-escaping) without needing a live
+HTTP-driven e2e run. `vercel-labs/emulate` (used elsewhere in this repo for
+mocking third-party APIs test-harness-side) can't help here either, for the
+same reason — see `web/e2e/README.md`'s "Mocking third-party services"
+section, which documents the identical constraint for the console UI tests.
+
 ## Notes
 
 - The load engine is pure `fetch`, worker-pooled (exactly `--concurrency`
