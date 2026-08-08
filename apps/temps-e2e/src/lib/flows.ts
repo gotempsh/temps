@@ -29,6 +29,8 @@ import {
   sendEmail,
   getEmailLinks,
   getEmailEvents,
+  kvStatus,
+  kvEnable,
 } from '@temps-sdk/api'
 import type { Client } from '@temps-sdk/api/client'
 import tls, { type TLSSocket } from 'node:tls'
@@ -886,6 +888,44 @@ export async function waitForEmailEvent(
   throw new Error(
     `no "${eventType}" event recorded for email ${emailId} within ${Math.round(timeoutMs / 1000)}s`,
   )
+}
+
+export interface KvEnableResult {
+  alreadyEnabled: boolean
+}
+
+/**
+ * kv-storage is a platform-wide singleton (one shared Redis container for the
+ * whole instance), not a per-project resource — unlike every other flow in
+ * this file, callers must NOT disable it in teardown, since other concurrent
+ * e2e runs or real users on a shared instance may depend on it staying up.
+ *
+ * Enables it if not already enabled+healthy, then polls until the underlying
+ * container actually reports healthy. First-time enable pulls a Docker image
+ * and waits for container health (can be slow on a cold image cache), so
+ * `kvEnable`'s own response is not proof of usability — only a `healthy`
+ * status read is.
+ */
+export async function ensureKvEnabled(
+  client: Client,
+  opts: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<KvEnableResult> {
+  const initial = unwrap(await kvStatus({ client }), 'kvStatus')
+  if (initial.enabled && initial.healthy) {
+    return { alreadyEnabled: true }
+  }
+  if (!initial.enabled) {
+    await kvEnable({ client, body: { persistence: true } })
+  }
+  const timeoutMs = opts.timeoutMs ?? 120_000
+  const intervalMs = opts.intervalMs ?? 2000
+  const start = performance.now()
+  while (performance.now() - start < timeoutMs) {
+    const s = unwrap(await kvStatus({ client }), 'kvStatus')
+    if (s.enabled && s.healthy) return { alreadyEnabled: false }
+    await sleep(intervalMs)
+  }
+  throw new Error(`kv-storage did not become enabled+healthy within ${Math.round(timeoutMs / 1000)}s`)
 }
 
 /** Best-effort teardown of the email-provider/domain resources this flow created. Never throws. */
