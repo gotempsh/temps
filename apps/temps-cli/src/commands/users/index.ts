@@ -16,7 +16,12 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
-const AVAILABLE_ROLES = ['admin', 'developer', 'viewer']
+// Matches crates/temps-entities/src/types.rs's RoleType enum exactly --
+// the backend's FromStr only ever accepts "admin"/"user" and 400s
+// ("Unsupported role") on anything else, including the "developer"/"viewer"
+// values this list previously offered (those are TEAM roles, a distinct
+// concept -- see registerTeamsCommands -- not instance-wide user roles).
+const AVAILABLE_ROLES = ['admin', 'user']
 
 interface CreateOptions {
   username?: string
@@ -57,7 +62,7 @@ export function parseRolesInput(rolesOption: string | undefined): RolesInputResu
   }
 
   if (selectedRoles.length === 0) {
-    selectedRoles = ['viewer'] // Default role
+    selectedRoles = ['user'] // Default role
   }
 
   return { roles: selectedRoles }
@@ -82,7 +87,7 @@ export function registerUsersCommands(program: Command): void {
     .option('-u, --username <username>', 'Username')
     .option('-e, --email <email>', 'Email address')
     .option('-p, --password <password>', 'Password (if not provided, invite email will be sent)')
-    .option('-r, --roles <roles>', 'Comma-separated roles (admin, developer, viewer)')
+    .option('-r, --roles <roles>', 'Comma-separated roles (admin, user)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createUserAction)
 
