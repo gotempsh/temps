@@ -6,7 +6,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
-`examples`) drive the real
+`deploy-lifecycle-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -160,6 +160,14 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # real github.com (documented exception to this suite's "no real internet"
 # rule -- see "External-service test infra" below).
 bun run src/index.ts git-deploy-scenario
+
+# deploy-lifecycle: deploy version A, deploy version B, rollback to A, pause,
+# resume, and promote B into a second environment -- asserts the EXACT
+# response body served over the real proxied URL at every step (never just a
+# deployment row's status field). Needs a registry the Temps server can pull
+# from, same as `examples`/`logs-scenario`/etc.
+bun run src/index.ts deploy-lifecycle-scenario --registry localhost:5111
+bun run src/index.ts deploy-lifecycle-scenario --keep --json    # inspect afterward (CI)
 ```
 
 ### `examples`
@@ -739,6 +747,109 @@ strictly greater than it. Confirmed live 3x.
 This is deliberately the one scenario in this suite that hits real
 `github.com` -- see "External-service test infra" below for why the others
 don't.
+
+### `deploy-lifecycle-scenario` steps
+
+Rollback / pause / resume / promote are the platform's primary safety valve
+for a bad deploy on live traffic. Every other scenario in this suite only
+proves create -> health -> teardown; this one proves the actual
+traffic-affecting operations work, by asserting the EXACT response body
+served over the real proxied URL at each step -- never just "the deployment
+row's status field flipped".
+
+1. build + push two genuinely different images (`versioned-app.ts`, a
+   throwaway Go app whose entire response body is a string baked in at
+   `docker build --build-arg VERSION_TEXT=...` time via `-ldflags -X`) --
+   "version A" and "version B"
+2. deploy version A; assert live traffic serves `"version A"` byte-for-byte
+3. deploy version B to the SAME project/environment; assert live traffic now
+   serves `"version B"` byte-for-byte
+4. `POST .../deployments/{A}/rollback`; assert live traffic reverts to
+   `"version A"` byte-for-byte -- proves a real rollback, not just a state
+   transition
+5. `POST .../deployments/{current}/pause`; assert the live URL genuinely
+   stops serving the app -- see the real-bug note below for what "paused"
+   actually renders as and why
+6. `POST .../deployments/{current}/resume`; assert live traffic serves
+   `"version A"` again
+7. create a second environment, `POST .../deployments/{B}/promote` into it;
+   assert ITS live URL serves `"version B"` byte-for-byte, and that
+   production is unaffected (proves promote is a genuinely distinct
+   mechanism from rollback: an arbitrary historical deployment's image,
+   copied into a different environment -- not "restore a previous version in
+   place")
+8. teardown (deployments, project -- cascades the second environment)
+
+`cancel_deployment` is deliberately not covered: it aborts an in-flight
+(pending/deploying) job, a different lifecycle stage than the four
+"deployment is already live" operations above, and there's nothing serving
+yet to assert a body against.
+
+**Three real platform bugs found and fixed (`temps-deployments` +
+`temps-routes`)**:
+
+1. **Rollback/promote rejected their own primary use case.** Both validated
+   the source deployment's state against `["deployed", "completed"]` (promote
+   also allowed `"ready"`) -- but a deployment superseded by a newer one in
+   its own environment is `"stopped"` (see `cancel_previous_deployments` /
+   `teardown_deployment`), which is exactly the state any deployment you'd
+   actually want to roll back to or promote is in. Every realistic "rollback
+   to the previous version" or "promote that known-good build" call 400'd
+   with `Cannot rollback to deployment in 'stopped' state`. Reproduced live:
+   step 4 below 400'd on every run before this fix. Fixed by adding
+   `"stopped"` to both allow-lists.
+
+2. **Pause and resume used incompatible Docker operations.**
+   `pause_deployment` used to `docker stop` **and** force-`docker rm` each
+   container, but `resume_deployment` called `deployer.resume_container` --
+   Docker's `unpause` (the reverse of a cgroup-freeze `docker pause`), which
+   only ever undoes a *genuine* `docker pause`. Nothing in the real pause
+   path ever paused (froze) a container; it removed it outright, so resume
+   always failed against a real deployment ("no such container") the instant
+   pause had actually run. The existing unit tests never caught it because
+   neither one set up a real backing container to pause/resume. Fixed:
+   `pause_deployment` now only `docker stop`s (never removes) each
+   container, and `resume_deployment` now calls `deployer.start_container`
+   -- the correct reverse of `stop` -- instead of `resume_container`.
+
+3. **Even with (2) fixed, a paused container stayed live in the proxy
+   indefinitely.** `route_table::load_routes` filtered candidate upstream
+   containers ONLY on `deleted_at IS NULL`, never on `status` -- so a
+   stopped-but-not-removed container's row still looked routable. Worse,
+   neither `pause_deployment` nor `resume_deployment` ever requested a
+   route-table reload: the only DB triggers wired to the in-process
+   route-table listener are on `environments`/`projects`
+   (`m2025*_add_*_route_trigger.rs`), and a bare `deployment_containers`
+   status `UPDATE` fires neither. **Reproduced live**: after pause, the
+   proxy kept retrying the OLD (still "valid-looking") container address and
+   returned Pingora's own `503 Service Unavailable` ("Fail to connect ...
+   Connection refused") -- not a clean "paused" signal, just an accident of
+   a stale cached route; the "an untested guess would reach for a 503"
+   sentence that used to be here was itself exactly that untested guess,
+   and turned out to be the pre-fix bug, not the fixed behavior. Fixed by
+   (a) filtering `route_table::load_routes` to `status IS NULL OR status =
+   'running'`, so a stopped container's route is skipped once reloaded, and
+   (b) having pause/resume publish `Job::ForceRouteReload` (the same
+   in-process broadcast `mark_deployment_complete.rs` already uses after a
+   normal deploy) so the reload happens immediately. With both fixes,
+   pausing makes the route disappear entirely and the proxy falls through to
+   its existing unknown-host console-fallback response (HTTP 200,
+   `<title>Temps</title>`) -- that fallback is the real, asserted "paused"
+   behavior in step 5 above.
+
+Confirmed live 3x back to back (after the environment-flakiness note below),
+including that resume correctly restarts the SAME container (not a rebuild)
+and traffic recovers within ~1.5s of the resume call.
+
+Also worth noting for anyone re-running this: the local dev instance used to
+verify this crashed several times mid-run with no panic/error logged (just
+stops writing to its log) while this branch was being built, on a heavily
+loaded shared dev machine running many other agents' builds/containers
+concurrently -- unrelated to this scenario's own logic (it reproduced before
+any pause/resume traffic ran, e.g. mid-`docker pull`). Launching the server
+with the harness's `run_in_background` tool option (or
+`dangerouslyDisableSandbox` + `nohup ... &`) rather than a plain backgrounded
+shell command was what made it survive a full run.
 
 ## External-service test infra (TLS, DNS, email, backups)
 

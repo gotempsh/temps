@@ -517,6 +517,68 @@ export async function assertNotConsoleFallback(opts: {
 }
 
 /**
+ * Fetch a target and return its raw status/body. Used where a scenario needs
+ * to assert on the EXACT response body (e.g. "traffic is serving version A's
+ * distinguishable text, byte for byte") rather than just "not the console
+ * fallback".
+ */
+export async function fetchBody(
+  url: string,
+  headers?: Record<string, string>,
+  timeoutMs = 10_000,
+): Promise<{ status: number; body: string }> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal })
+    const body = await res.text()
+    return { status: res.status, body }
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+/**
+ * The mirror of `assertNotConsoleFallback`: poll a target until it DOES serve
+ * the Temps console SPA fallback (or times out still serving something else).
+ *
+ * Used to prove a deployment pause actually took live traffic offline: after
+ * pausing, `route_table::load_routes` finds no routable container for the
+ * environment (see the fix note there) and skips the route entirely, so the
+ * proxy falls through to its unknown-host console fallback. A real app
+ * response (or a hung/refused connection) here means pause did NOT actually
+ * stop traffic.
+ */
+export async function waitForConsoleFallback(opts: {
+  url: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  intervalMs?: number
+}): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 30_000
+  const intervalMs = opts.intervalMs ?? 1500
+  const start = performance.now()
+  let body = ''
+  let status = 0
+  while (performance.now() - start < timeoutMs) {
+    try {
+      const r = await fetchBody(opts.url, opts.headers, 10_000)
+      status = r.status
+      body = r.body
+      if (looksLikeConsoleFallback(body)) return
+    } catch {
+      // transient — retry
+    }
+    await sleep(intervalMs)
+  }
+  throw new Error(
+    `expected the paused deployment to serve the Temps console fallback, but got HTTP ${status} ` +
+      `with a non-fallback body after ${Math.round(timeoutMs / 1000)}s ` +
+      `(body starts: ${JSON.stringify(body.slice(0, 80))})`,
+  )
+}
+
+/**
  * A run id derived from a timestamp passed in by the caller, plus a random
  * suffix.
  *

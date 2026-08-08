@@ -1504,11 +1504,28 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Target deployment not found".to_string()))?;
 
-        // Validate that the deployment is in a valid state for rollback
-        let valid_rollback_states = ["deployed", "completed"];
+        // Validate that the deployment is in a valid state for rollback.
+        //
+        // "stopped" belongs here alongside "completed": once a LATER
+        // deployment supersedes this one, `cancel_previous_deployments`
+        // stops its containers and flips its state to "stopped" (see that
+        // function and `teardown_deployment`) -- that is the terminal state
+        // every successful-but-no-longer-current deployment actually ends up
+        // in. Rollback's whole purpose is reverting to an older deployment,
+        // so its target is virtually always going to be "stopped" in
+        // practice; excluding it made rollback reject its own primary use
+        // case ("Cannot rollback to deployment in 'stopped' state") for any
+        // deployment that had already been superseded -- which is every
+        // deployment a real user would ever actually want to roll back to.
+        // "deployed" is kept for the one other live path that sets it
+        // (`resume_deployment`); "failed"/"cancelled"/"paused" stay excluded
+        // -- a failed/cancelled deployment has no reliable image to reuse,
+        // and rolling back TO a paused deployment is a distinct, not yet
+        // supported, operation.
+        let valid_rollback_states = ["deployed", "completed", "stopped"];
         if !valid_rollback_states.contains(&target_deployment.state.as_str()) {
             return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Cannot rollback to deployment in '{}' state. Only deployed or completed deployments can be rolled back to.",
+                "Cannot rollback to deployment in '{}' state. Only deployed, completed, or stopped (superseded) deployments can be rolled back to.",
                 target_deployment.state
             )));
         }
@@ -2225,11 +2242,18 @@ impl DeploymentService {
                 ))
             })?;
 
-        // Validate state — only successful deployments can be promoted
-        let valid_states = ["deployed", "completed", "ready"];
+        // Validate state — only successful deployments can be promoted.
+        // "stopped" is included for the same reason `rollback_to_deployment`
+        // includes it (see the comment there): a source deployment that has
+        // since been superseded by a newer one in ITS OWN environment is
+        // "stopped", not "completed" -- and promoting an older, already-
+        // superseded deployment's image into a different environment is
+        // exactly the kind of thing a real user does (e.g. re-promote a
+        // known-good build after a bad one shipped on top of it).
+        let valid_states = ["deployed", "completed", "ready", "stopped"];
         if !valid_states.contains(&source.state.as_str()) {
             return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Cannot promote deployment in '{}' state. Only deployed/completed/ready deployments can be promoted.",
+                "Cannot promote deployment in '{}' state. Only deployed/completed/ready/stopped deployments can be promoted.",
                 source.state
             )));
         }
@@ -2857,8 +2881,17 @@ impl DeploymentService {
             .all(self.db.as_ref())
             .await?;
 
+        // Stop (but do not remove) each container. Keeping the Docker
+        // container object around — rather than force-removing it, as this
+        // used to do — is what makes `resume_deployment` able to bring the
+        // exact same containers back with a plain `docker start` instead of
+        // trying to "unpause" containers that no longer exist (see the fix
+        // note on `resume_deployment` below). The route table additionally
+        // stops sending live traffic to any container whose `status` isn't
+        // "running" (see `route_table::load_routes`), so a stopped-but-not-
+        // removed container is just as inert from the outside as a removed
+        // one, without sacrificing resumability.
         for container in containers {
-            // Stop the container first
             if let Err(e) = self.deployer.stop_container(&container.container_id).await {
                 warn!(
                     "Failed to stop container {} during deployment pause: {}",
@@ -2866,31 +2899,50 @@ impl DeploymentService {
                 );
             }
 
-            // Remove the container
-            if let Err(e) = self
-                .deployer
-                .remove_container(&container.container_id)
-                .await
-            {
-                warn!(
-                    "Failed to remove container {} during deployment pause: {}",
-                    container.container_id, e
-                );
-            }
-
-            // Update container status to removed
             let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("removed".to_string()));
+            active_container.status = Set(Some("stopped".to_string()));
             active_container.update(self.db.as_ref()).await?;
         }
+
+        let environment_id = deployment.environment_id;
 
         // Update deployment state to "paused"
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("paused".to_string());
         active_deployment.update(self.db.as_ref()).await?;
 
+        // Force an in-process route-table reload (same mechanism
+        // `mark_deployment_complete.rs` uses after a normal deploy — see its
+        // comment for why this is needed in addition to PG NOTIFY). Nothing
+        // else about a pause touches `environments` or `projects`, which are
+        // the only tables with a NOTIFY trigger wired up (see
+        // `m20251209_000001_add_environments_route_trigger.rs` /
+        // `m20250205_000003_add_projects_route_trigger.rs`) — a bare
+        // `deployment_containers` status UPDATE fires no trigger at all. So
+        // without this, the proxy's cached peer table keeps the container's
+        // OLD (still "valid-looking") address indefinitely and only
+        // discovers the pause when the next unrelated route change happens
+        // to reload it, in the meantime returning "upstream connection
+        // refused" instead of the intended "not currently serving" state.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after pausing deployment {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                deployment_id, e
+            );
+        }
+
         info!(
-            "Successfully paused deployment {}: removed all containers",
+            "Successfully paused deployment {}: stopped all containers",
             deployment_id
         );
         Ok(())
@@ -2918,9 +2970,17 @@ impl DeploymentService {
             .all(self.db.as_ref())
             .await?;
 
+        // `pause_deployment` stops (not removes) containers, so bring them
+        // back with a plain `docker start` on the same container id/name —
+        // not `resume_container` (Docker's `unpause`/cgroup-freeze reverse).
+        // `unpause` only undoes a genuine `docker pause`, which nothing in
+        // this codebase's real pause path ever calls; using it here against
+        // a merely-stopped container always failed ("container is not
+        // paused"), so resume could never actually succeed after a real
+        // pause.
         for container in containers {
             self.deployer
-                .resume_container(&container.container_id)
+                .start_container(&container.container_id)
                 .await
                 .map_err(|e| {
                     DeploymentError::Other(format!("Failed to resume container: {}", e))
@@ -2932,10 +2992,33 @@ impl DeploymentService {
             active_container.update(self.db.as_ref()).await?;
         }
 
+        let environment_id = deployment.environment_id;
+
         // Update deployment state to "deployed"
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("deployed".to_string());
         active_deployment.update(self.db.as_ref()).await?;
+
+        // See the matching comment in `pause_deployment`: a container-status
+        // UPDATE fires no DB trigger, so force an in-process reload rather
+        // than leaving the proxy's cached peer table to notice the resume
+        // only whenever some unrelated route change happens to trigger one.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after resuming deployment {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                deployment_id, e
+            );
+        }
 
         info!("Successfully resumed deployment: {}", deployment_id);
         Ok(())
