@@ -12,6 +12,7 @@ import { cliScenarioCommand } from './commands/cli-scenario.ts'
 import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { flagsScenarioCommand } from './commands/flags-scenario.ts'
+import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
@@ -170,6 +171,21 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await flagsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('backup-restore-scenario')
+  .description(
+    'Backup + restore a real postgres service via MinIO: real pg_dump, real S3 upload, real in-place restore proven by reverting post-backup writes',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await backupRestoreScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

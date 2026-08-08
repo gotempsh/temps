@@ -5,7 +5,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `kv-scenario`, `blob-scenario`, `flags-scenario`, `audit-scenario`,
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
-`session-replay-scenario`, `examples`) drive the real
+`session-replay-scenario`, `backup-restore-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -147,6 +147,11 @@ bun run src/index.ts analytics-scenario --registry localhost:5111
 # session-replay: real rrweb-shaped event batches (base64+zlib), ingest +
 # playback + list visibility + manual duration override + soft delete.
 bun run src/index.ts session-replay-scenario --registry localhost:5111
+
+# backup-restore: real postgres service backed up to a local MinIO (real
+# wal-g backup-push, real S3 upload), then in-place restored, proven by
+# reverting writes made after the backup. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts backup-restore-scenario --registry localhost:5111
 ```
 
 ### `examples`
@@ -643,14 +648,55 @@ recording, potentially containing DOM mutations/keystrokes, stayed fully
 visible in both list views and fetchable in full by ID. Both fixed;
 confirmed live that a deleted session's direct-by-ID playback now 404s.
 
-## External-service test infra (TLS, DNS, email)
+### `backup-restore-scenario` steps
 
-`tls-scenario` and `email-scenario` need real external services to test
-against — a live ACME CA to issue a real certificate, an SMTP target that
-actually receives mail. Hitting the real internet for these (real Let's
-Encrypt, a real inbox) would mean real rate limits, real credentials, and
-non-reproducible runs, so both point at local, purpose-built test servers
-instead:
+1. provision a real standalone postgres service, link it to a project,
+   deploy the same `db-probe` app `managed-services-scenario` uses, and
+   write 5 real rows through the real injected `POSTGRES_URL`
+2. create an S3 source pointed at the local MinIO
+3. trigger a real backup (`POST /backups/external-services/{id}/run`) --
+   202 + async job, per ADR-014 -- and poll `GET /backups/{backup_id}` to a
+   real `completed` state (a real `wal-g backup-push`, a real S3 upload --
+   the postgres backup engine is WAL-G, not pg_dump)
+4. write 2 MORE rows (count now 7) -- data the backup does NOT contain
+5. start an in-place restore from the backup taken at step 3
+   (`POST /external-services/{id}/restore`) and poll
+   `GET /restore-runs/{id}` to `completed`
+6. hit `/probe` once more and assert the count is 6 (5 backed-up rows +
+   this 1 new insert), NOT 8 -- proving the restore actually reverted the 2
+   post-backup rows, not just that the API calls returned 2xx
+7. teardown (deployment, project, service, S3 source)
+
+**Real bug found and fixed**: `PostgresWalgEngine::run`
+(`crates/temps-backup/src/engines/postgres_walg.rs`) ran `wal-g backup-push`
+without continuous WAL archiving ever having been enabled on the target
+container. The base backup's checkpoint LSN then had no archived WAL segment
+behind it, so every restore failed at Postgres startup with "could not
+locate required checkpoint record", the container crash-looped, and
+`wait_for_container_health` eventually timed out at 90s -- a genuinely
+unrestorable backup that reported `completed`. Fixed by adding
+`ExternalService::enable_continuous_archiving` (no-op default, implemented
+on `PostgresService` by reusing the existing `enable_wal_archiving`) and
+calling it **before** `wal-g backup-push`, not after: `pg_stop_backup()`
+force-completes the current WAL segment as part of finishing the backup, and
+Postgres only marks a completed segment `.ready` for archiving if
+`archive_mode` is already on at that moment -- enabling archiving
+afterward doesn't retroactively archive a segment that closed while
+archiving was off. Made a no-op after the first backup on a given service
+(checks `walg.env` presence first) so it doesn't recreate the container on
+every single backup. Confirmed live 3x, including that the second and third
+backups on the same service skip the archiving setup entirely (faster
+restore, no extra container recreate).
+
+## External-service test infra (TLS, DNS, email, backups)
+
+`tls-scenario`, `email-scenario`, and `backup-restore-scenario` need real
+external services to test against — a live ACME CA to issue a real
+certificate, an SMTP target that actually receives mail, an S3-compatible
+target that actually stores a backup. Hitting the real internet for these
+(real Let's Encrypt, a real inbox, a real cloud bucket) would mean real rate
+limits, real credentials, and non-reproducible runs, so all three point at
+local, purpose-built test servers instead:
 
 ```bash
 cd apps/temps-e2e
@@ -670,6 +716,16 @@ This starts:
   web UI + REST API (`GET /api/v1/messages`) on `http://localhost:8025`. Same
   image already proven for this in `crates/temps-notifications`'s Rust
   integration tests.
+- **MinIO** (`minio/minio`) — S3-compatible target for `backup-restore-scenario`.
+  S3 API on `http://localhost:9092` (not MinIO's own default of 9000 — see
+  the compose file comment for why), console on `http://localhost:9093`.
+  Same image + credentials (`minioadmin`/`minioadmin`) already proven in
+  `crates/temps-backup`'s own testcontainers-based Rust integration tests.
+  Create the bucket once before running the scenario:
+  `docker exec <minio-container> mc alias set local http://localhost:9000 minioadmin minioadmin && docker exec <minio-container> mc mb local/temps-e2e-backups`.
+  Since `temps serve` runs natively on the host (not in a container), point
+  `--minio-endpoint` at `http://localhost:9092` — the default — not
+  `host.docker.internal`, which only resolves from inside a container.
 
 The `temps serve` instance under test needs these env vars to actually talk
 to Pebble instead of real Let's Encrypt (already-existing hooks in

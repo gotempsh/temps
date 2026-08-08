@@ -799,6 +799,28 @@ pub trait ExternalService: Send + Sync {
         Ok(())
     }
 
+    /// Enable continuous WAL/log-shipping archiving into `walg_prefix` after
+    /// a successful base backup, so a subsequent restore isn't limited to
+    /// exactly the backup's snapshot moment.
+    ///
+    /// Without this, `wal-g backup-push` alone produces a base backup whose
+    /// `backup_label` references a stop LSN/checkpoint that no WAL segment
+    /// ever gets archived for — restore then fails at Postgres startup with
+    /// "could not locate required checkpoint record", because
+    /// `wal-g wal-fetch` has nothing to fetch. Callers should treat failure
+    /// here as non-fatal to the backup itself (log and continue): the base
+    /// backup already succeeded, only continuous archiving is missing.
+    ///
+    /// Default is a no-op; only Postgres (WAL-G) overrides it.
+    async fn enable_continuous_archiving(
+        &self,
+        _service_config: ServiceConfig,
+        _s3_credentials: &S3Credentials,
+        _walg_prefix: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 

@@ -108,3 +108,24 @@ services:
       # 8025: web UI + REST API (GET /api/v1/messages) used to assert receipt.
       - "1025:1025"
       - "8025:8025"
+
+  minio:
+    image: minio/minio:latest
+    # `backup-restore-scenario` needs a real S3-compatible target so the
+    # backup engine's actual upload (and the restore's actual download) get
+    # exercised, not just the API's bookkeeping rows -- same reasoning as
+    # Pebble/Mailpit above. This is the same image + credentials already
+    # proven in crates/temps-backup's own testcontainers-based Rust
+    # integration tests (`test_backup_to_minio_integration`).
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # Published as 9092/9093, not MinIO's own defaults of 9000/9001,
+      # because 9000-9004 are already in persistent use by unrelated
+      # containers on dev machines running other work -- same reasoning as
+      # pebble-challtestsrv's 8055->8056 remap above. The S3 source's
+      # `endpoint` is a plain config value, not a hardcoded port.
+      - "9092:9000" # S3 API
+      - "9093:9001" # web console, unused here but harmless to expose

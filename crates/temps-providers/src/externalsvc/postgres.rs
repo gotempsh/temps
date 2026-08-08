@@ -3311,6 +3311,45 @@ impl ExternalService for PostgresService {
         self.start().await
     }
 
+    async fn enable_continuous_archiving(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &super::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<()> {
+        // Already active from a prior backup on this service (truth source:
+        // `walg.env` on the volume, see `compute_desired_enable_archiving`).
+        // Skip the container-recreating dance entirely — this method is
+        // called before every backup, and archive_mode is postmaster-context
+        // (a live reload can't flip it), so redoing this would mean a brief
+        // outage on every single backup instead of just the first.
+        if self.compute_desired_enable_archiving().await {
+            return Ok(());
+        }
+
+        let postgres_config = self.get_postgres_config(service_config)?;
+        let container_name = self.get_live_container_name(&postgres_config);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+        ];
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+            .await
+    }
+
     async fn stop(&self) -> Result<()> {
         // Stop the container if Docker is available
         let container_name = self
