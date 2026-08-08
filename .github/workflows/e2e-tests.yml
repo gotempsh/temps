@@ -139,6 +139,24 @@ jobs:
           timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
           echo "TimescaleDB is ready"
 
+      # domain-tls-pebble.spec.ts and email-provider-mailpit.spec.ts (below)
+      # each document this requirement themselves ("Requires docker compose
+      # -f apps/temps-e2e/docker-compose.e2e.yml up -d") -- brought up here so
+      # it's ready before `temps serve` starts (it needs a live ACME
+      # directory to point ACME_DIRECTORY_URL at) and well before the
+      # Playwright run reaches those specs. minio isn't started: nothing in
+      # this job (console/API e2e, not apps/temps-e2e's own scenarios) needs it.
+      - name: Start Pebble + Mailpit test infra
+        run: |
+          docker compose -f apps/temps-e2e/docker-compose.e2e.yml up -d pebble pebble-challtestsrv mailpit
+          echo "Waiting for Pebble (ACME directory, :14000)..."
+          timeout 60 bash -c 'until nc -z localhost 14000; do sleep 1; done'
+          echo "Waiting for pebble-challtestsrv (management API, :8056)..."
+          timeout 60 bash -c 'until nc -z localhost 8056; do sleep 1; done'
+          echo "Waiting for Mailpit (SMTP :1025, API :8025)..."
+          timeout 60 bash -c 'until nc -z localhost 1025 && nc -z localhost 8025; do sleep 1; done'
+          echo "Pebble + Mailpit test infra ready"
+
       - name: Run temps setup
         run: |
           "$TEMPS_BIN" setup --non-interactive \
@@ -162,11 +180,21 @@ jobs:
           ln -sf "$TEMPS_DATA_DIR/GeoLite2-City.mmdb" ./GeoLite2-City.mmdb 2>/dev/null || true
 
       - name: Start temps serve
+        env:
+          # domain-tls-pebble.spec.ts needs a real ACME exchange against
+          # Pebble instead of real Let's Encrypt -- see
+          # crates/temps-domains/src/tls/providers.rs's get_acme_url (reads
+          # ACME_DIRECTORY_URL) and crates/temps-dns/src/providers/pebble.rs
+          # (gated behind TEMPS_ALLOW_PEBBLE_PROVIDER). ACME_INSECURE trusts
+          # Pebble's self-signed directory cert.
+          ACME_DIRECTORY_URL: https://localhost:14000/dir
+          ACME_INSECURE: "1"
+          TEMPS_ALLOW_PEBBLE_PROVIDER: "1"
         run: |
           "$TEMPS_BIN" serve \
             --database-url "$DATABASE_URL" \
             --data-dir "$TEMPS_DATA_DIR" \
-            --address 0.0.0.0:3000 \
+            --address 0.0.0.0:5002 \
             --tls-address 0.0.0.0:3443 \
             --console-address 0.0.0.0:8081 \
             --disable-https-redirect \
