@@ -16,6 +16,7 @@ import { monitoringScenarioCommand } from './commands/monitoring-scenario.ts'
 import { errorTrackingScenarioCommand } from './commands/error-tracking-scenario.ts'
 import { logsScenarioCommand } from './commands/logs-scenario.ts'
 import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
+import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
 
 const program = new Command()
 
@@ -220,6 +221,19 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await analyticsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('session-replay-scenario')
+  .description(
+    'Real session-replay lifecycle: deploy an HTML app so the proxy issues a visitor cookie, init a replay session (retrying past the visitor-upsert race), POST base64+zlib event batches, verify the project/visitor list surfaces it once duration is computed, playback returns all events with custom fields intact, a manual duration override sticks, and delete soft-removes it -- not just that the routes return 2xx',
+  )
+  .option('--registry <host>', 'registry to push the analytics-app image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await sessionReplayScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
