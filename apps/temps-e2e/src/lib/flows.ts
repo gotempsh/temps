@@ -38,6 +38,19 @@ import { unwrap, normalizeApiUrl } from './client.ts'
 const DEPLOY_SUCCESS = new Set(['completed', 'succeeded', 'running', 'active'])
 const DEPLOY_FAILED = new Set(['failed', 'cancelled', 'errored', 'error'])
 
+/**
+ * Shared with cli-exec-based flows (cli-scenario.ts) that poll
+ * `deployments status --json` through the real CLI subprocess instead of the
+ * SDK, so both paths classify the same DeploymentResponse.status strings
+ * identically.
+ */
+export function isTerminalDeployStatus(status: string): { terminal: boolean; ok: boolean } {
+  const s = status.toLowerCase()
+  const ok = DEPLOY_SUCCESS.has(s)
+  const failed = DEPLOY_FAILED.has(s)
+  return { terminal: ok || failed, ok }
+}
+
 export interface CreatedProject {
   id: number
   name: string

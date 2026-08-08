@@ -1,9 +1,15 @@
 # @temps-sdk/e2e
 
-End-to-end + load testing CLI for a **live** Temps instance. Drives the real
-control-plane API (via the shared [`@temps-sdk/api`](../../packages/api) client),
-deploys an app, generates traffic, verifies the proxy recorded it, and tears
-everything down.
+End-to-end + load testing CLI for a **live** Temps instance. Most commands
+(`scenario`, `tls-scenario`, `email-scenario`, `examples`) drive the real
+control-plane API directly via the shared
+[`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
+API itself works, but they never exercise `apps/temps-cli` at all.
+`cli-scenario` is different on purpose: it spawns the **real
+`@temps-sdk/cli` binary as a subprocess** for every step, so it also proves
+argv parsing, Commander's command wiring, and stdout/`--json` formatting
+actually work — exactly what breaks an agent running `bunx @temps-sdk/cli
+...` even when the underlying API is fine. See its section below.
 
 ## Setup
 
@@ -73,6 +79,11 @@ bun run src/index.ts tls-scenario --keep --json                 # inspect the is
 # real receipt + open/click tracking. Needs Mailpit (docker-compose.e2e.yml).
 bun run src/index.ts email-scenario
 bun run src/index.ts email-scenario --json                      # machine-readable (CI)
+
+# Genuine CLI e2e: spawns the real @temps-sdk/cli binary as a subprocess for
+# every step against the same live instance.
+bun run src/index.ts cli-scenario
+bun run src/index.ts cli-scenario --image traefik/whoami:latest --json  # machine-readable (CI)
 ```
 
 ### `examples`
@@ -160,6 +171,55 @@ Node.js) returns the full certificate, including `issuer`. `fetchOverTls` in
 
 Verified passing (3x back-to-back): real SMTP send → real receipt in Mailpit
 → real open/click tracking-pixel and redirect hits → real `email_events` rows.
+
+### `cli-scenario` steps
+
+Every step spawns `bun run <apps/temps-cli>/src/index.ts <args>` as a real
+child process (`src/lib/cli-exec.ts`) against a live instance — same source
+Commander registers as the published `bunx @temps-sdk/cli`, so this is
+genuinely testing the CLI binary, not the API:
+
+1. `projects create --manual -y` a project, resolve its slug via
+   `projects list --json`, confirm `projects show --json` reflects it
+2. `environments vars set/list/export/delete` an env var (see the "known
+   gaps" note in `cli-scenario.ts` for why `vars export`, not `vars get`, is
+   what actually proves the value round-trips)
+3. `services create -t postgres -y`, resolve via `services list --json`,
+   confirm `services show --json` reflects it
+4. `deploy:image --no-wait`, resolve the deployment via
+   `deployments list --json`, poll `deployments status --json` through the
+   CLI itself to a terminal state
+5. `domains add`, confirm it via `domains list --json`
+6. confirm `apikeys list`/`apikeys permissions --json` are reachable under
+   API-key auth (see below for why this doesn't also mint a new key)
+7. tear everything down via the CLI's own delete/remove commands (falling
+   back to the SDK-based teardown from `flows.ts` for anything the CLI
+   itself fails to remove) unless `--keep`
+
+Verified passing (3x back-to-back, `--image traefik/whoami:latest`).
+
+**Two real, pre-existing bugs found live while building this** (documented
+in `cli-scenario.ts`, not fixed there — both need backend changes out of
+scope for a CLI e2e suite):
+- `environments vars get` and `vars list --show-values` both read from the
+  list endpoint, which the server masks to the literal string `"***"` for
+  **every** variable regardless of `is_secret` — so "Use `--show-values` to
+  reveal actual values" never reveals anything for a plain variable either.
+  Only `vars export` genuinely resolves real values.
+- `domains status` 404s on a domain that hasn't finished ACME provisioning
+  yet — i.e. exactly the domain state you'd actually want to check status
+  on. Root cause: `check_domain_status` resolves via
+  `list_certificates(CertificateFilter::default())`, which only returns
+  domains that already have an issued certificate row.
+
+**One real, correct security boundary discovered live** (not a bug): minting
+a new API key is rejected when authenticated via an API key ("This
+authentication method cannot perform the requested sensitive action",
+`crates/temps-auth/src/sensitive_action.rs`) — a deliberate
+anti-privilege-escalation guard. Since API-key auth is this CLI's only
+non-interactive auth mode, `apikeys create` is structurally untestable from
+a pure CLI e2e run; the scenario exercises the read paths that are reachable
+under API-key auth instead.
 
 ## External-service test infra (TLS, DNS, email)
 

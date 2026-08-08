@@ -73,18 +73,24 @@ run concurrently with itself (retries) and with every other spec:
 ## Coverage vs. the feature catalog
 
 Tracks `temps/docs/feature-catalog/README.md`'s 6 subsystems. "CLI" refers to
-`apps/temps-e2e` API-parity scenarios, which also validate the paths
-`bunx @temps-sdk/cli` exercises. This table is the source of truth for gaps —
-update it whenever a spec or scenario is added, rather than letting coverage
-silently drift from the catalog.
+`apps/temps-e2e` scenarios. Most (`scenario`, `examples`, `tls-scenario`,
+`email-scenario`) drive `apps/temps-cli`'s underlying API directly via the
+SDK client — API-parity coverage, validating the same paths
+`bunx @temps-sdk/cli` would exercise, but not the CLI binary itself.
+`cli-scenario` is different: it spawns the **real `@temps-sdk/cli` binary as
+a subprocess** for every step, so it's genuine CLI coverage — argv parsing,
+command wiring, and stdout/`--json` formatting, not just the API underneath
+it. This table is the source of truth for gaps — update it whenever a spec
+or scenario is added, rather than letting coverage silently drift from the
+catalog.
 
 | Subsystem | UI (`web/e2e`) | CLI (`apps/temps-e2e`) |
 |---|---|---|
-| Deployment & Infrastructure | `project-create`, `navigation`, `drop-handoff`, `domain-tls-pebble` | `scenario`, `examples`, `tls-scenario` |
+| Deployment & Infrastructure | `project-create`, `navigation`, `drop-handoff`, `domain-tls-pebble` | `scenario`, `examples`, `tls-scenario`, `cli-scenario` |
 | Observability | — | — |
 | Data & Storage | `navigation` (databases page only) | — |
 | AI | `ai-chat-layout` | — |
-| Security & Auth | `auth`, `user-creation`, `api-key-create` | — |
+| Security & Auth | `auth`, `user-creation`, `api-key-create` | `cli-scenario` (apikeys read paths) |
 | Platform & Commerce | `command-palette`, `preview-share-link`, `email-provider-mailpit` | `email-scenario` |
 
 Rows with only a dash are not covered end-to-end yet — tracked gaps, not

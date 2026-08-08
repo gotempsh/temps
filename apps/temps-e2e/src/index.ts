@@ -7,6 +7,7 @@ import { scenarioCommand } from './commands/scenario.ts'
 import { examplesCommand } from './commands/examples.ts'
 import { tlsScenarioCommand } from './commands/tls-scenario.ts'
 import { emailScenarioCommand } from './commands/email-scenario.ts'
+import { cliScenarioCommand } from './commands/cli-scenario.ts'
 
 const program = new Command()
 
@@ -100,6 +101,18 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await emailScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('cli-scenario')
+  .description(
+    'Genuine CLI e2e: spawns the real @temps-sdk/cli binary as a subprocess for every step (create/list/show/delete a project, env vars, a service, a deploy polled to a terminal state, a domain, and a minted API key that is then used to authenticate a real call) -- proves argv parsing, command wiring, and stdout formatting, not just the API',
+  )
+  .option('--image <ref>', 'public Docker image to deploy', 'traefik/whoami:latest')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await cliScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
