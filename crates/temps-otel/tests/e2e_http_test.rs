@@ -230,6 +230,7 @@ async fn setup_e2e() -> Option<(
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        otel_relay_tx: None,
         project_access_checker: None,
     };
 
