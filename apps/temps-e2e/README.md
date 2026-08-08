@@ -1,7 +1,10 @@
 # @temps-sdk/e2e
 
 End-to-end + load testing CLI for a **live** Temps instance. Most commands
-(`scenario`, `tls-scenario`, `email-scenario`, `examples`) drive the real
+(`scenario`, `tls-scenario`, `email-scenario`, `kv-scenario`,
+`audit-scenario`, `managed-services-scenario`, `rbac-scenario`,
+`monitoring-scenario`, `error-tracking-scenario`, `logs-scenario`,
+`analytics-scenario`, `session-replay-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -10,6 +13,13 @@ API itself works, but they never exercise `apps/temps-cli` at all.
 argv parsing, Commander's command wiring, and stdout/`--json` formatting
 actually work — exactly what breaks an agent running `bunx @temps-sdk/cli
 ...` even when the underlying API is fine. See its section below.
+
+Every `*-scenario` command follows the same shape: build/deploy whatever
+real infrastructure the feature needs (never synthetic DB rows), drive it
+through the real HTTP surface, assert on genuine round-trip behavior (not
+just 2xx), and tear everything down unless `--keep` is passed. Each has its
+own "steps" section below documenting exactly what it proves and any real
+platform bugs found and fixed while building it.
 
 ## Setup
 
@@ -84,6 +94,44 @@ bun run src/index.ts email-scenario --json                      # machine-readab
 # every step against the same live instance.
 bun run src/index.ts cli-scenario
 bun run src/index.ts cli-scenario --image traefik/whoami:latest --json  # machine-readable (CI)
+
+# kv-storage: real Redis-backed data-plane round trip (no console UI exists
+# for this feature beyond an enabled/healthy badge).
+bun run src/index.ts kv-scenario
+
+# audit-logs: real PROJECT_CREATED/PROJECT_DELETED rows read back exactly,
+# plus an RBAC-gate check on the read endpoint itself.
+bun run src/index.ts audit-scenario
+
+# managed-services: provision + link a postgres service to a project BEFORE
+# deploying, deploy an app that writes through the injected POSTGRES_URL,
+# verify an exact row-count round trip, then unlink.
+bun run src/index.ts managed-services-scenario --registry localhost:5111
+
+# RBAC/teams: a second, independently-authenticated low-privilege user
+# escalated viewer -> deployer -> admin, asserting exact 200/403
+# transitions and the audit trail at each tier. Needs DB-direct access.
+bun run src/index.ts rbac-scenario --temps-root /path/to/temps --database-url postgres://...
+
+# monitoring/status-page: auto-provisioned + explicit monitors, a real 5xx
+# outage caught by the fixed 60s check cycle, incident lifecycle, recovery.
+bun run src/index.ts monitoring-scenario --registry localhost:5111
+
+# error-tracking (Sentry-compatible): real Sentry-shaped events authenticated
+# via DSN key, fingerprint-based grouping proven live.
+bun run src/index.ts error-tracking-scenario
+
+# logs: real container stdout/stderr through the Docker log collector --
+# full-text search, level filtering, JSONB fields passthrough, purge.
+bun run src/index.ts logs-scenario --registry localhost:5111
+
+# analytics: real visitor/session cookies issued by the proxy, replayed on
+# the public ingest endpoint, custom event_data + session stitching proven.
+bun run src/index.ts analytics-scenario --registry localhost:5111
+
+# session-replay: real rrweb-shaped event batches (base64+zlib), ingest +
+# playback + list visibility + manual duration override + soft delete.
+bun run src/index.ts session-replay-scenario --registry localhost:5111
 ```
 
 ### `examples`
@@ -228,6 +276,233 @@ anti-privilege-escalation guard. Since API-key auth is this CLI's only
 non-interactive auth mode, `apikeys create` is structurally untestable from
 a pure CLI e2e run; the scenario exercises the read paths that are reachable
 under API-key auth instead.
+
+### `kv-scenario` steps
+
+14-step round trip against the platform-wide kv-storage feature: enable KV,
+create 2 projects, set/get, `incr` (sequential + fresh-key-defaults-to-1),
+`keys` pattern exact-match, `nx`/`xx` conditional-write semantics, `ttl`
+sentinels (-1 no-expiry / -2 missing-key), `expire`, `del` (exact count +
+idempotent second call), cross-project isolation (the `kv:p{project_id}:`
+namespace), a `kv_status` read-back, and a 400 on a missing `project_id`.
+
+No console UI exists for this feature beyond an enabled/healthy status
+badge, so this is the only coverage that exists. kv-storage is a
+platform-wide singleton (one shared Redis container), not a per-project
+resource — the scenario never disables it in teardown, since other
+concurrent e2e runs or real users on a shared instance may depend on it
+staying up.
+
+### `audit-scenario` steps
+
+Create + delete a project, then read back the exact `PROJECT_CREATED`/
+`PROJECT_DELETED` rows via `GET /audit/logs` and `/audit/logs/{id}` —
+id/data/actor/timestamp match, not just "the list is non-empty" — and
+confirm the read endpoint itself is RBAC-gated (401/403 with no bearer
+token).
+
+### `managed-services-scenario` steps
+
+1. build + push a throwaway Go probe app
+2. provision a Postgres external service and link it to a project **before**
+   deploying (the injected `POSTGRES_URL` only exists if the link happens
+   first)
+3. deploy the probe; it writes through the injected connection string on
+   every `/probe` hit
+4. verify an exact row-count round trip through repeated `/probe` calls
+5. verify the resolved-env-vars reveal endpoint returns the real
+   (non-masked) connection string
+6. unlink the service and confirm it disappears from the resolved env vars
+
+**Real bug found and fixed**: `scenario --with-db` created its Postgres
+service with no parameters, but `PostgresParameterStrategy::validate_for_creation`
+requires `database`/`username` with no defaults — every `--with-db` run was
+400ing. Fixed alongside this scenario.
+
+### `rbac-scenario` steps
+
+Proves the actual permission **boundary**, not just that team/access CRUD
+returns 2xx: a second, independently-authenticated low-privilege user is
+granted team access to a project, then escalated viewer → deployer → admin,
+asserting the exact 200/403 transitions and `required_permission` strings
+the guard enforces at each tier, plus the exact audit trail
+(`PROJECT_ACCESS_GRANTED` / `TEAM_MEMBER_ROLE_UPDATED` /
+`PROJECT_ACCESS_REVOKED` / `TEAM_DELETED`).
+
+Needs DB-direct access (`crates/temps-cli`'s own `api-key` subcommand, via
+`--temps-root`/`--database-url`) to mint the second user's bearer key —
+minting a new key while already authenticated via API key is deliberately
+blocked (anti-privilege-escalation), and login only sets a session cookie.
+Uses a second "guard" team (granted and never revoked) so that revoking the
+primary team's grant at the end doesn't drop the project's total grant
+count to zero, which would (correctly, per documented platform behavior)
+reopen the project to everyone and defeat the revoke assertion for the
+wrong reason.
+
+**Real, pre-existing CLI bug found and fixed**: `apps/temps-cli`'s
+`AVAILABLE_ROLES` offered `developer`/`viewer` as instance-wide user
+roles — neither is valid; those are **team** roles, a separate concept.
+Fixed to `admin`/`user`.
+
+### `monitoring-scenario` steps
+
+1. create a project — confirm its production environment auto-gets a
+   default monitor (most projects never get an explicit one; this is the
+   path real users actually depend on)
+2. deploy a toggleable Go app (`lib/toggle-app.ts` — health flips over HTTP
+   via `POST /toggle?state=up|down`, so it works identically against a
+   remote instance)
+3. create a second, explicit monitor via the CRUD API
+4. confirm `MonitorCreated` triggers an immediate first check (not a 60s
+   wait)
+5. toggle the app down — wait for the next periodic check cycle (a fixed
+   60s global interval, no per-monitor on-demand trigger) and assert
+   current-status flips to `major_outage`, a real incident is created, the
+   bucketed chart reflects the outage, and the project-level overview
+   flips to `partial_outage`
+6. toggle back up — wait for recovery and assert the incident auto-resolves
+7. delete the explicit monitor; teardown cascades the auto-created one
+
+**Four real platform bugs found and fixed** (see the four commits preceding
+this scenario's own commit): `calculate_overall_status`/bucketed-status SQL
+only recognized the literal `"down"`/`"degraded"` strings, not the
+finer-grained `major_outage`/`partial_outage` `health_check_service.rs`
+actually writes; `CurrentStatusQuery`/`UptimeQuery`/`BucketedQuery` declared
+`start_time`/`end_time` as required despite documented defaults, so every
+default-range call 400'd; the synthetic bootstrap "unknown" check row
+counted toward every uptime denominator without ever counting as a success;
+and two divergent `MonitorService` instances meant API-created monitors
+skipped the immediate-check path the auto-provisioned ones got. Also fixed
+the `AVG(response_time_ms)` Postgres `NUMERIC`→`f64` cast bug that made
+`get_status_overview` silently report "unknown" for fully healthy monitors.
+
+The incident-auto-resolve step polls rather than asserting once:
+current-status reads `status_checks` directly and flips the instant a
+check commits, but incident resolution is a side effect of the *same*
+check processed asynchronously through the job queue, which can trail by
+anywhere from a few ms to most of another 60s cycle under load.
+
+### `error-tracking-scenario` steps
+
+1. create a DSN (not auto-provisioned, unlike monitoring's auto-monitor)
+2. send real Sentry-shaped events authenticated with the DSN's public key
+   via `X-Sentry-Auth` — the one route in the platform using a different
+   auth scheme than the normal bearer token
+3. prove fingerprint-based grouping: an identical repeat groups into the
+   same issue, a genuinely different exception creates its own issue
+4. confirm the computed group title (`"{type}: {value}"`), event-detail
+   round-tripping the stored exception data, error-stats splitting
+   resolved/unresolved after a status update, and the DSN auth boundary (a
+   garbage key gets a real 401)
+
+New `lib/sentry-events.ts` (payload builder + raw sender) exists because
+the ingest endpoint's generated SDK type (`SentryEventRequest`) only
+declares `event_id`/`message`/`platform`/`timestamp` — the real handler
+takes arbitrary JSON and expects a full exception/stacktrace shape, so the
+OpenAPI schema for this one route is decorative only.
+
+No platform bugs found — ran clean end-to-end on the first real attempt.
+(One assertion fix on the test's own end: stored event data is wrapped
+under a `sentry` key alongside a `source` discriminator, not at the top
+level, since this crate ingests from multiple SDK sources.)
+
+### `logs-scenario` steps
+
+1. deploy a throwaway Go app (`lib/log-emitter-app.ts`) whose `/emit`
+   endpoint prints a structured JSON line to stdout or stderr on demand —
+   the only way to get real lines through the real Docker log collector
+   instead of inserting synthetic rows into storage
+2. emit an info-level and an error-level (with a `code` field) log line
+3. poll full-text search for a run-unique marker — chunks flush on a
+   30s/1MB timer, so a fresh line is not immediately queryable
+4. assert both lines come back with the right computed `level` and that
+   the error line's extra `code` field survived into the searchable
+   `fields` JSONB
+5. assert a `levels: ["ERROR"]` filter narrows to just the error line, and
+   an `envs` filter on the production environment also narrows correctly
+6. fetch grep-style context around the error line via `chunk_id` +
+   `line_offset`
+7. purge everything before "now"; confirm the marker is gone from search
+   afterward
+
+No platform bugs found — ran clean 3x back-to-back on the first attempt.
+`GET /logs/tail` (SSE live-tail) is deliberately not covered: it needs the
+exact Docker-label `service`/`env` strings the collector stamped on the
+container, which no deploy response exposes.
+
+### `analytics-scenario` steps
+
+1. deploy a throwaway Go app (`lib/analytics-app.ts`) that serves a real
+   `text/html` page at `/` — required because `should_track_page`
+   (`temps-proxy`) only issues visitor/session cookies for HTML responses
+   (or 4xx/5xx); a plain-text "ok" response never triggers cookie issuance
+2. confirm a fresh project reports `has_events=false`
+3. `GET /` through the proxy and capture the real `_temps_visitor_id`/
+   `_temps_sid` `Set-Cookie` values the proxy issues — these are
+   encrypted, proxy-minted tokens with no way to synthesize them client-side
+4. `POST /api/_temps/event` twice with those same cookies (a pageview, then
+   a custom event carrying extra fields) — the unauthenticated public
+   ingest path a real browser tracking snippet uses
+5. poll `GET /analytics/event-entries` for the custom event and assert its
+   custom `event_data` round-tripped into the queryable `props` JSON, and
+   that it resolved to a numeric `visitor_id` (the visitor/session upsert
+   is a 500ms-batched background writer, so this genuinely polls)
+6. call `GET /analytics/visitors/{id}/journey` and assert
+   `total_sessions=1`, `total_events=2`, and both event names appear in the
+   same session — proving the two independent POSTs were stitched into one
+   session purely from the shared cookie pair
+7. confirm `has_events` is now `true`
+
+**Real gap found and fixed** (see `chore(sdk): regenerate @temps-sdk/api`):
+`packages/api/openapi.json` — the source for the SDK this entire suite
+depends on — had drifted to 590 of the live server's 674 paths. The whole
+`temps-analytics` query surface used by this scenario
+(`getEventEntries`/`checkAnalyticsHasEvents`/`getVisitorJourney`/etc.) was
+unreachable from any TypeScript consumer until the SDK was regenerated from
+a live spec. Not a Rust bug — every route was already fully wired and
+working, just unreachable from generated clients. Also added the missing
+`prettier` devDependency the regen's post-processor step needed.
+
+Not covered: server-side ingestion (`POST /projects/{id}/events/ingest`,
+used by app backends forwarding already-authenticated cookies) and the
+segment-filter/attribution query surface (referrer/UTM/country
+breakdowns) — both real, but better covered by the existing Rust unit
+tests than by another live HTTP round trip.
+
+### `session-replay-scenario` steps
+
+1. deploy the same HTML app used by `analytics-scenario` and `GET /` to
+   capture a real `_temps_visitor_id` cookie — `init_session_replay`
+   requires one and 400s without it
+2. `POST /api/_temps/session-replay/init` with a client-generated session
+   id, carrying that cookie — this genuinely retries rather than asserting
+   once: the visitor lookup races the proxy's own 500ms-batched background
+   writer, so the very first attempt can hit a visitor row that isn't
+   committed yet
+3. `POST /api/_temps/session-replay/events` twice with base64+zlib
+   -compressed rrweb-shaped event batches (3 events total, spanning 2000ms)
+4. poll `GET /session-replays` (project list) for the new session — this
+   list is filtered to `duration > 0`, only computed once events with
+   distinct timestamps land
+5. fetch the session's full event stream and assert all 3 events came back
+   with a custom marker field intact, and that `duration` reflects the
+   real timestamp span
+6. confirm the visitor-scoped list also surfaces it (a second,
+   independently-implemented read path)
+7. `PUT` a manual duration override and confirm it sticks
+8. `DELETE` the session (soft delete) and confirm it drops out of the
+   project list afterward
+
+**Two real bugs found and fixed**: the duration-override endpoint was
+registered as `POST` in `configure_routes()` but documented (and SDK'd) as
+`PUT` — any client following the documented contract got a 405. And
+`delete_session_replay` correctly soft-deletes a session (`is_active =
+false`), but none of the four read paths (`get_sessions_for_project`,
+`get_sessions_for_visitor`, `get_session_replay`,
+`get_session_replay_without_events`) ever checked the flag — a "deleted"
+recording, potentially containing DOM mutations/keystrokes, stayed fully
+visible in both list views and fetchable in full by ID. Both fixed;
+confirmed live that a deleted session's direct-by-ID playback now 404s.
 
 ## External-service test infra (TLS, DNS, email)
 
