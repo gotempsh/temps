@@ -6,7 +6,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
-`examples`) drive the real
+`db-ha-failover-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -160,6 +160,13 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # real github.com (documented exception to this suite's "no real internet"
 # rule -- see "External-service test infra" below).
 bun run src/index.ts git-deploy-scenario
+
+# db-ha-failover: real Postgres HA (pg_auto_failover) automatic-failover
+# proof -- provision a 1-monitor + 2-data-node cluster, deploy an app through
+# the injected multi-host POSTGRES_URL, `docker stop` the elected primary,
+# and assert a surviving replica gets promoted AND the same app (no
+# redeploy) resumes writing within a bounded window.
+bun run src/index.ts db-ha-failover-scenario --registry localhost:5111
 ```
 
 ### `examples`
@@ -739,6 +746,117 @@ strictly greater than it. Confirmed live 3x.
 This is deliberately the one scenario in this suite that hits real
 `github.com` -- see "External-service test infra" below for why the others
 don't.
+
+### `db-ha-failover-scenario` steps
+
+Closes a real gap: `PostgresClusterService`
+(`crates/temps-providers/src/externalsvc/postgres_cluster.rs`), the
+`cluster-health`/`members`/`promote` API surface
+(`crates/temps-providers/src/handlers/handlers.rs`), and the multi-host
+`POSTGRES_URL` env-var injection
+(`ExternalServiceManager::build_cluster_env_vars_for_resource`) are all real
+and wired end-to-end, but had zero e2e coverage before this. This is
+single-Docker-host HA (every member is `node_id: null`, placed on the
+control plane with unique container names/ports) -- distinct from
+multi-node/WireGuard clustering, which needs separate real hosts and is out
+of scope here.
+
+1. provision a real 1-monitor + 2-data-node Postgres HA cluster
+   (`topology: 'cluster'`) and poll until the service and all 3 members
+   report `status: 'running'`
+2. poll `GET /external-services/{id}/cluster-health` (reads
+   `pgautofailover.node` directly off the monitor) until the cluster
+   reaches a steady state: exactly one data node reporting a writable-primary
+   state, the other `secondary`
+3. independently confirm the elected primary's container is actually
+   running via `docker inspect` -- a side channel the platform API can't
+   fake
+4. link the cluster to a project **before** deploying (env vars resolve at
+   deploy-job-creation time), deploy a `db-probe` Go app built with the
+   `pgx` driver (not this suite's usual `lib/pq` probe -- see
+   `buildHaProbeImage`'s doc comment in `lib/probe-app.ts`: `lib/pq`'s
+   latest *released* version cannot parse a multi-host
+   `postgresql://host1:port1,host2:port2/db` connection string at all,
+   verified live), and confirm it got the cluster's multi-host
+   `POSTGRES_URL`
+5. write 5 real rows through `/probe`
+6. `docker stop` the primary's container -- a real, ungraceful outage, not
+   an API call. `docker stop`, not `kill`: every cluster member's
+   `HostConfig.RestartPolicy` is `unless-stopped`, so Docker itself would
+   silently resurrect a `kill`ed container before pg_auto_failover's
+   monitor ever declared it unhealthy, masking whether real failover
+   happened at all
+7. poll cluster-health until the surviving replica reports a
+   writable-primary state -- proves the monitor actually promoted it, not
+   just that the old primary's row went stale
+8. poll `/probe` (tolerating connection errors while pg_auto_failover
+   completes the promotion) until writes succeed again, bounded, proving
+   the app's existing connection string routes to the new primary with no
+   redeploy, config change, or app restart
+9. assert the post-failover row count is monotonic -- the write actually
+   landed, not just that the HTTP call returned 200
+10. teardown (`delete_service` removes cluster containers by name
+    regardless of running state, so the stopped ex-primary is cleaned up
+    too)
+
+**Two real platform bugs found and fixed, both in
+`crates/temps-providers/src/externalsvc/cluster_role.rs`'s
+`PgAutoFailoverState::is_primary()`** -- the single classifier the DNS
+reconciler, `member_is_live_primary`'s delete-protection gate, and (via a
+copy in this scenario) the e2e assertions all keyed off:
+
+- `is_primary()` excluded `WaitPrimary`, on the documented (but factually
+  wrong) theory that it meant "candidate primary, not yet writable."
+  Verified live against a real 2-data-node cluster: `docker stop` the
+  primary, and pg_auto_failover promotes the survivor straight to
+  `wait_primary` -- direct `psql` against that node the whole time showed
+  `pg_is_in_recovery() = false`, `default_transaction_read_only = off`, and
+  a real `INSERT` succeeding. With only one node left, there's no third
+  node to attach as a new standby, so `wait_primary` isn't a brief
+  transition here -- it's the cluster's **permanent, correct steady state**
+  after a 2-node failover (confirmed: it never left `wait_primary` even
+  after a 300s poll). `crates/temps-providers/src/services.rs`'s own
+  `cluster_states::WRITABLE` already modeled this correctly
+  (`&["primary", "wait_primary", "single", "apply_settings"]`) -- the two
+  had drifted apart. Consequence: `drafts_for_snapshot` (the DNS
+  reconciler) never republished `primary.<svc>.temps.local` after exactly
+  this failover, and `to_cluster_role()` never flipped `service_members.role`
+  either -- both would have gone stale forever on any 2-node cluster.
+- `member_is_live_primary` (`services.rs`) had its own, independent
+  `matches!(reported_state, "primary" | "single")` string check for the
+  same concept -- also missing `wait_primary`, and used to gate
+  `remove_cluster_member`'s "don't delete the writable node" safety check.
+  A `wait_primary` primary would have passed this check as "not the
+  primary," meaning an operator could have deleted the cluster's only
+  writable node while it was actively serving traffic. Fixed to call
+  `PgAutoFailoverState::is_primary()` instead of hand-rolling the match, so
+  this can't drift from the reconciler's definition again.
+
+Both fixes are behavioral, not cosmetic: before them, this scenario's
+`docker stop` step hung until the 90s failover-timeout expired on every
+run, even though the app's own `/probe` endpoint -- hit directly, out of
+band -- was already serving fresh writes against the promoted node the
+whole time. The platform was already treating the node as the real primary
+for actual traffic; only the status classification was wrong. Confirmed
+live 3x after the fix (`failoverDetectedMs` ~50-53s, `writesRecoveredMs`
+~11ms -- the app's connection string re-resolves to the new primary almost
+instantly once pg_auto_failover reports it, since `pgx`'s
+`target_session_attrs=read-write` just tries each host in the DSN).
+
+Also fixed along the way (not a platform bug, a startup-ordering bug in the
+reconciler's own shutdown path,
+`crates/temps-providers/src/externalsvc/postgres_role_reconciler.rs`):
+`ReconcilerShutdown` existed as a struct but was never actually wired into
+`spawn_role_reconciler`/`stop_role_reconciler`/`run()`, which still used a
+bare `tokio::sync::Notify` -- `notify_waiters()` only wakes a task that is
+*already* parked in `.notified()`, so a shutdown signal that arrived while
+`run()`'s loop was mid-`reconcile_once` (real monitor I/O) was silently
+lost forever, leaking one reconciler task per deleted cluster that logged
+"Monitor not found" every 5s for the rest of the process's life. Wired
+`ReconcilerShutdown`'s `AtomicBool` + `Notify` pair through end-to-end
+(`run()` checks `is_stopped()` at the top of every loop iteration, not just
+inside the tick `select!`), so a signal is caught within one tick even if
+it arrives mid-reconcile.
 
 ## External-service test infra (TLS, DNS, email, backups)
 

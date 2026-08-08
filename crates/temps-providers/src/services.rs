@@ -921,11 +921,17 @@ pub struct ExternalServiceManager {
     /// trivially.
     dns_registry: Arc<temps_dns::DnsRegistry>,
     /// Per-cluster role reconciler shutdown handles, keyed by service_id.
-    /// Notify-then-await pattern: `delete_service` fires the notifier and
-    /// the task observes it on its next select. Held inside a tokio mutex
+    /// `delete_service` calls `ReconcilerShutdown::signal` and the task
+    /// observes it — either on its next `select!` wakeup, or (if the
+    /// signal lands mid-tick) on its very next loop-top check; see
+    /// `ReconcilerShutdown`'s doc comment. Held inside a tokio mutex
     /// because the reconciler-spawn path is async and we want a Send
     /// MutexGuard across awaits.
-    reconciler_shutdowns: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Notify>>>>,
+    reconciler_shutdowns: Arc<
+        tokio::sync::Mutex<
+            HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
+        >,
+    >,
 }
 
 impl ExternalServiceManager {
@@ -2723,7 +2729,22 @@ impl ExternalServiceManager {
             .members
             .iter()
             .find(|h| h.nodename == member.container_name)
-            .map(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
+            .map(|h| {
+                // `PgAutoFailoverState::is_primary` (not a hand-rolled
+                // string match) so this gate can't drift from the DNS
+                // reconciler's definition of "writable primary" again --
+                // that exact drift previously let a `wait_primary` node
+                // (promotion complete, no standby attached -- genuinely
+                // writable, and the normal steady state a 2-node cluster
+                // settles into after failover) pass this check as "not the
+                // primary", which would have let `remove_cluster_member`
+                // delete the cluster's only writable node.
+                <crate::externalsvc::PgAutoFailoverState as std::str::FromStr>::from_str(
+                    &h.reported_state,
+                )
+                .expect("PgAutoFailoverState::from_str is Infallible")
+                .is_primary()
+            })
             .unwrap_or(false))
     }
 
@@ -4456,6 +4477,26 @@ echo "[restore] Pre-seed complete"
             return Ok(Some(env_vars));
         }
 
+        // Inline per-host ports (`host1:port1,host2:port2/db`) are the
+        // standard PostgreSQL multi-host URI form (libpq connection-string
+        // docs, "Specifying Multiple Hosts") and are what real libpq,
+        // psycopg2/3, tokio-postgres/sqlx, node-postgres, and Go's
+        // actively-maintained `jackc/pgx` all parse correctly -- verified
+        // live against this exact cluster's real hosts/ports with pgx's
+        // `stdlib` driver (`target_session_attrs=read-write` correctly
+        // landed on the primary). Go's OTHER popular driver, `lib/pq`,
+        // cannot parse this (or any multi-host DSN) at all in its latest
+        // *released* version (v1.10.9) -- multi-host/`target_session_attrs`
+        // support exists only on lib/pq's unreleased `master` branch, and
+        // the project itself has been in maintenance mode since 2022,
+        // pointing new users at `pgx` instead. That's a real gap for any
+        // app still on lib/pq, but it's a limitation of that specific,
+        // now-unmaintained driver, not a malformed connection string --
+        // reformatting the URI to work around lib/pq's parser (e.g. moving
+        // ports into a `?port=` query parameter) does not actually fix
+        // lib/pq (verified live: it fails identically either way) and
+        // would make the string non-standard for every driver that DOES
+        // support this correctly today.
         let hosts: Vec<String> = data_nodes
             .iter()
             .map(|n| {
@@ -5162,23 +5203,64 @@ echo "[restore] Pre-seed complete"
                         })?;
                 }
 
-                // Compute the FQDN for this member. Always populated post
-                // ADR-011 — overrides whatever placeholder hostname (IP or
-                // container name) the spec carried. Apps will resolve this
-                // via the per-node DNS resolver.
+                // Compute the FQDN for this member (ADR-011). Registered in the
+                // internal DNS registry below regardless of topology — cheap,
+                // and useful the moment an operator later flips
+                // `AppSettings.cluster_dns.enabled` on.
                 let member_fqdn = format!(
                     "{}-{}.{}.temps.local",
                     service.name, spec.ordinal, service.name
                 );
 
+                // What we actually persist as `service_members.hostname` --
+                // and therefore what `build_cluster_env_vars_for_resource`
+                // puts in the multi-host `POSTGRES_URL` every linked app
+                // gets -- must be something a *client container* can
+                // actually resolve today, not just something registered in
+                // a DNS zone.
+                //
+                // The `*.temps.local` FQDN only resolves through the
+                // per-host Hickory resolver wired into a container's
+                // `/etc/resolv.conf`, and that wiring is gated behind
+                // `AppSettings.cluster_dns.enabled` -- an experimental flag
+                // that defaults to OFF (crates/temps-deployer/src/plugin.rs,
+                // ADR-024's DNS-timeout-cascade guard). Unconditionally
+                // storing the FQDN here meant every single-host cluster --
+                // the exact "no worker nodes, one Docker daemon" topology
+                // `PostgresClusterService`'s own doc comment describes as
+                // supported -- injected a `POSTGRES_URL` whose hosts could
+                // never resolve, breaking the feature by default from a
+                // fresh install: a deployed app crash-looped forever on
+                // "no such host", even though the cluster itself formed
+                // correctly (member containers reach each other fine, via
+                // plain Docker container names on the shared
+                // `temps-app-network` bridge -- see `build_member_params`'s
+                // `NODE_HOSTNAME`, which already falls back to the
+                // container name for exactly this reason).
+                //
+                // Fix: only trust the FQDN once there's a remote member in
+                // the mix (`has_remote_members`) -- the one case where a
+                // container name can't cross the host boundary and FQDN
+                // resolution is actually required infrastructure, not an
+                // optional extra. Every local (single-Docker-host) member
+                // keeps the plain container name, which every other
+                // container on `temps-app-network` -- including a deployed
+                // app -- already resolves via Docker's own embedded DNS
+                // with zero extra infrastructure.
+                let member_hostname = if has_remote_members {
+                    member_fqdn.clone()
+                } else {
+                    result.container_name.clone()
+                };
+
                 // Update member record with container info and "running" status,
-                // plus the FQDN hostname and overlay IP (if any).
+                // plus the resolvable hostname and overlay IP (if any).
                 let member_id = member_model.id;
                 let mut member_update: service_members::ActiveModel = member_model.into();
                 member_update.container_id = Set(Some(container_id));
                 member_update.port = Set(host_port);
                 member_update.status = Set("running".to_string());
-                member_update.hostname = Set(Some(member_fqdn.clone()));
+                member_update.hostname = Set(Some(member_hostname));
                 member_update.compute_ip = Set(compute_ip.clone());
                 member_update.updated_at = Set(Utc::now());
                 member_update.update(self.db.as_ref()).await?;
@@ -5483,7 +5565,7 @@ echo "[restore] Pre-seed complete"
             debug!(service_id, "role reconciler already running");
             return;
         }
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown::new();
         shutdowns.insert(service_id, shutdown.clone());
         drop(shutdowns);
 
@@ -5562,10 +5644,20 @@ echo "[restore] Pre-seed complete"
                 }
 
                 // Backoff respects shutdown so a delete_service called
-                // mid-backoff doesn't have to wait the full 30s.
+                // mid-backoff doesn't have to wait the full 30s. Also
+                // re-checks `is_stopped()` after waking in case the signal
+                // landed just before this select armed (same race the loop
+                // in `run()` guards against — see `ReconcilerShutdown`).
+                if shutdown.is_stopped() {
+                    debug!(
+                        service_id,
+                        "role reconciler shutdown during restart backoff"
+                    );
+                    return;
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(RESTART_BACKOFF) => {}
-                    _ = shutdown.notified() => {
+                    _ = shutdown.wait() => {
                         debug!(service_id, "role reconciler shutdown during restart backoff");
                         return;
                     }
@@ -5581,7 +5673,7 @@ echo "[restore] Pre-seed complete"
     async fn stop_role_reconciler(&self, service_id: i32) {
         let mut shutdowns = self.reconciler_shutdowns.lock().await;
         if let Some(notifier) = shutdowns.remove(&service_id) {
-            notifier.notify_waiters();
+            notifier.signal();
             debug!(service_id, "role reconciler shutdown signalled");
         }
     }

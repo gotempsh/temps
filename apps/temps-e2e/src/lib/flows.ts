@@ -294,6 +294,52 @@ export async function createE2eService(
 }
 
 /**
+ * Provision an HA cluster service (currently only `postgres` supports
+ * `topology: 'cluster'` -- see `CLUSTER_SERVICE_TYPES` in
+ * `web/src/pages/CreateServiceNew.tsx`). Cluster creation is asynchronous
+ * server-side (`ExternalServiceManager::create_service` spawns a background
+ * task and returns immediately with `status: "creating"`) -- callers must
+ * poll `getService` for `status === 'running'` themselves, same as the
+ * console does.
+ *
+ * All members are placed on the control plane (`node_id: null`) --
+ * multi-container HA on a single Docker host, matching how
+ * `PostgresClusterService` names/ports members (`postgres-<name>-monitor`,
+ * `postgres-<name>-<ordinal>`, unique host ports per member) -- distinct
+ * from multi-node/WireGuard clustering, which needs real separate hosts.
+ * Per `DEFAULT_CLUSTER_ROLES` in the console, every data node is requested
+ * as `role: 'replica'`; pg_auto_failover elects whichever registers first
+ * as the actual primary (see `live_state` on `ServiceMemberInfo`), the
+ * client never picks one.
+ */
+export async function createE2eClusterService(
+  client: Client,
+  opts: {
+    name: string
+    serviceType: 'postgres'
+    dataNodes: number
+    parameters?: Record<string, unknown>
+  },
+): Promise<CreatedService> {
+  const members = [
+    { role: 'monitor', node_id: null },
+    ...Array.from({ length: opts.dataNodes }, () => ({ role: 'replica', node_id: null })),
+  ]
+  const res = await createService({
+    client,
+    body: {
+      name: opts.name,
+      service_type: opts.serviceType,
+      parameters: opts.parameters ?? {},
+      topology: 'cluster',
+      members,
+    },
+  })
+  const s = unwrap(res, 'createService') as { id: number; name: string }
+  return { id: s.id, name: s.name }
+}
+
+/**
  * Count proxy-log entries recorded for a host since a given time. Used to verify
  * that generated traffic actually landed on the proxy/ingest pipeline.
  */
@@ -1195,6 +1241,42 @@ export async function ensureBlobEnabled(
     await sleep(intervalMs)
   }
   throw new Error(`blob storage did not become enabled+healthy within ${Math.round(timeoutMs / 1000)}s`)
+}
+
+export interface DockerCommandResult {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+/**
+ * Run a `docker` subcommand against a container by name and collect its
+ * output. Used by HA/failover scenarios to simulate a real outage (`stop`/
+ * `kill`) and independently confirm container state (`inspect`) via a side
+ * channel the platform API can't fake -- Docker itself, not a DB row.
+ */
+export async function runDockerContainerCommand(
+  action: 'stop' | 'start' | 'kill' | 'inspect',
+  containerName: string,
+  extraArgs: string[] = [],
+): Promise<DockerCommandResult> {
+  const args = action === 'inspect' ? ['inspect', ...extraArgs, containerName] : [action, ...extraArgs, containerName]
+  const proc = Bun.spawn(['docker', ...args], { stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  return { code, stdout, stderr }
+}
+
+/** `docker inspect -f '{{.State.Status}}' <name>` -- 'running', 'exited', etc. Throws if the container doesn't exist. */
+export async function dockerContainerStatus(containerName: string): Promise<string> {
+  const res = await runDockerContainerCommand('inspect', containerName, ['-f', '{{.State.Status}}'])
+  if (res.code !== 0) {
+    throw new Error(`docker inspect ${containerName} failed: ${res.stderr.trim()}`)
+  }
+  return res.stdout.trim()
 }
 
 /** Best-effort teardown of the email-provider/domain resources this flow created. Never throws. */

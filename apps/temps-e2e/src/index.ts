@@ -22,6 +22,7 @@ import { logsScenarioCommand } from './commands/logs-scenario.ts'
 import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
 import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
+import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.ts'
 
 const program = new Command()
 
@@ -300,6 +301,21 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await sessionReplayScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('db-ha-failover-scenario')
+  .description(
+    'Real Postgres HA (pg_auto_failover) automatic-failover proof: provision a 1-monitor + 2-data-node cluster on a single Docker host, deploy an app through the injected multi-host POSTGRES_URL, write real rows, `docker stop` the elected primary container, and assert cluster-health promotes the surviving replica AND the same app (no redeploy) resumes writing within a bounded window -- not just that a status field flipped',
+  )
+  .option('--registry <host>', 'registry to push the probe image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--cluster-timeout <ms>', 'max wait for the cluster to reach a running/steady state', '180000')
+  .option('--failover-timeout <ms>', 'max wait for promotion + write recovery after stopping the primary', '90000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await dbHaFailoverScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
