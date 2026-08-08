@@ -8,6 +8,10 @@ import { examplesCommand } from './commands/examples.ts'
 import { tlsScenarioCommand } from './commands/tls-scenario.ts'
 import { emailScenarioCommand } from './commands/email-scenario.ts'
 import { cliScenarioCommand } from './commands/cli-scenario.ts'
+import { kvScenarioCommand } from './commands/kv-scenario.ts'
+import { auditScenarioCommand } from './commands/audit-scenario.ts'
+import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
+import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
 
 const program = new Command()
 
@@ -113,6 +117,55 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await cliScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('kv-scenario')
+  .description(
+    'Real kv-storage data-plane round trip: set/get/incr/expire/ttl/keys/del, nx/xx conditionals, and cross-project tenant isolation -- no console UI exists for this feature beyond an enabled/healthy status badge, so this is the only coverage that exists',
+  )
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await kvScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('audit-scenario')
+  .description(
+    'Real audit-log round trip: create + delete a project, then read back the exact PROJECT_CREATED/PROJECT_DELETED rows via GET /audit/logs and /audit/logs/{id} (id/data/actor/timestamp match, not just "the list is non-empty"), and confirm the read endpoint itself is RBAC-gated',
+  )
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await auditScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('managed-services-scenario')
+  .description(
+    'Real managed-database round trip: provision + link a postgres service to a project BEFORE deploying, deploy an app that writes through the injected POSTGRES_URL, verify an exact row-count round trip through /probe, verify the resolved-env-vars reveal endpoint, then unlink',
+  )
+  .option('--registry <host>', 'registry to push the probe image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--probe-requests <n>', 'number of /probe hits (== expected final row count)', '5')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await managedServicesScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('rbac-scenario')
+  .description(
+    'Real RBAC permission-boundary proof: a second, independently-authenticated low-privilege user is granted team access to a project at viewer/deployer/admin tiers, asserting the exact 200/403 transitions and permission strings the guard enforces -- not just that team/access CRUD returns 2xx',
+  )
+  .option('--temps-root <path>', 'checkout root (needs crates/temps-cli) to mint a second user\'s bearer key via DB-direct `temps api-key`; or $TEMPS_ROOT')
+  .option('--database-url <url>', 'Postgres URL the temps binary can reach directly; or $TEMPS_DATABASE_URL')
+  .option('--image <ref>', 'image to deploy for the deployer-role assertion', 'ghcr.io/temps-sh/e2e-hello:latest')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await rbacScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
