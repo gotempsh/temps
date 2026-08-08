@@ -470,8 +470,9 @@ async function getEnvVar(
     info(`Using project ${colors.bold(project)} (from ${resolved.source})`)
   }
 
+  let projectId!: number
   const [vars, environments] = await withSpinner(`Fetching ${key}...`, async () => {
-    const projectId = await getProjectId(project)
+    projectId = await getProjectId(project)
 
     const [varsResult, envsResult] = await Promise.all([
       getEnvironmentVariables({
@@ -498,6 +499,18 @@ async function getEnvVar(
     return
   }
 
+  // The list endpoint masks every value to "***" regardless of is_secret --
+  // resolve real plaintext for the non-secret rows we're about to print
+  // through the same audited per-key endpoint `vars export` uses, rather
+  // than echoing the masked placeholder for a command whose whole point is
+  // showing this one variable's value.
+  const { resolved: resolvedValues } = await resolveEnvVarValues(
+    projectId,
+    matchingVars.filter(v => !v.is_secret),
+  )
+  const displayValue = (v: EnvironmentVariableResponse): string =>
+    v.is_secret ? formatEnvVarValue(v) : (resolvedValues.get(v.id) ?? formatEnvVarValue(v))
+
   // If environment specified, filter to that environment
   if (options.environment) {
     const targetEnv = environments.find(
@@ -519,7 +532,7 @@ async function getEnvVar(
 
     newline()
     keyValue('Key', envVar.key)
-    keyValue('Value', formatEnvVarValue(envVar))
+    keyValue('Value', displayValue(envVar))
     keyValue('Environment', targetEnv.name)
     keyValue('Include in Preview', envVar.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -532,7 +545,7 @@ async function getEnvVar(
 
   for (const v of matchingVars) {
     keyValue('ID', String(v.id))
-    keyValue('Value', formatEnvVarValue(v))
+    keyValue('Value', displayValue(v))
     keyValue('Environments', v.environments.map(e => e.name).join(', ') || 'None')
     keyValue('Include in Preview', v.include_in_preview ? 'Yes' : 'No')
     newline()

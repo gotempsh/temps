@@ -21,20 +21,22 @@
  * teardown call itself fails, falls back to the SDK-based teardown() from
  * flows.ts so a broken `delete` command can't leak live resources.
  *
- * Known gaps found live while building this (both are real, pre-existing
- * backend/CLI bugs -- documented at their step below rather than fixed here,
- * since fixing either needs backend changes out of scope for a CLI e2e
- * suite, and the whole point of this suite is to surface exactly this kind
- * of thing):
- *  - `environments vars get` and `vars list --show-values` both read from
- *    the list endpoint, which the server masks to the literal string "***"
- *    for EVERY variable regardless of `is_secret` -- so "Use --show-values
- *    to reveal actual values" never actually reveals anything for a plain
- *    (non-secret) variable either. Only `vars export` genuinely resolves
- *    real values (a separate per-key endpoint).
- *  - `domains status` 404s on a domain that hasn't finished ACME
- *    provisioning yet (the state every domain is in immediately after
- *    `add`) -- exactly the state you'd actually want to check status on.
+ * Bugs found live while building this:
+ *  - FIXED: `environments vars get` used to read from the list endpoint,
+ *    which the server masks to the literal string "***" for EVERY variable
+ *    regardless of `is_secret` -- so it never actually showed a plain
+ *    variable's value despite that being the entire point of the command.
+ *    Fixed in apps/temps-cli/src/commands/environments/index.ts to resolve
+ *    real values through the same audited per-key endpoint `vars export`
+ *    already used (`getEnvironmentVariableValue`,
+ *    `GET /projects/{id}/env-vars/{key}/value`). Secrets are still
+ *    correctly withheld -- see the "environments vars get" step below,
+ *    which now asserts on the real revealed value for a non-secret var.
+ *  - NOT FIXED (out of scope -- needs tracing the certificate-listing
+ *    query, not a CLI change): `domains status` 404s on a domain that
+ *    hasn't finished ACME provisioning yet (the state every domain is in
+ *    immediately after `add`) -- exactly the state you'd actually want to
+ *    check status on. See the "domains status" note below.
  */
 import { runCliOk, runCliJson, type CliConfig } from '../lib/cli-exec.ts'
 import { makeClient, resolveConfig } from '../lib/client.ts'
@@ -163,17 +165,23 @@ export async function cliScenarioCommand(opts: CliScenarioOptions): Promise<void
       if (!found) throw new Error(`"${envVarKey}" not found in vars list: ${JSON.stringify(list)}`)
     })
 
-    // NOT `environments vars get` here -- discovered live while building this
-    // scenario: `vars get` and `vars list --show-values` both read from the
-    // list endpoint, which the server masks to the literal string "***" for
-    // EVERY variable regardless of `is_secret` (confirmed via raw --json:
-    // `"value": "***", "is_secret": false`) -- so "Use --show-values to
-    // reveal actual values" never actually reveals anything. `vars export`
-    // is the one command that genuinely resolves real values (an extra
-    // "Resolving values..." step calls a dedicated per-key endpoint), so
-    // it's the only reliable way to prove a set value round-trips. This is a
-    // real, pre-existing CLI/API inconsistency, not a test bug -- flagged in
-    // this file's header rather than silently worked around.
+    // `vars get` used to always print "***" for every variable regardless of
+    // is_secret (it read from the list endpoint, which deliberately masks
+    // bulk reads) -- fixed to resolve real values through the same audited
+    // per-key endpoint `vars export` uses. This asserts the fix directly.
+    await step('environments vars get reveals the real value (regression test for the fix)', async () => {
+      const result = await runCliOk(
+        ['environments', 'vars', 'get', envVarKey, '-p', projectSlug, '-e', 'production'],
+        cliCfg,
+      )
+      if (!result.stdout.includes(envVarValue)) {
+        throw new Error(`expected stdout to contain "${envVarValue}", got: ${result.stdout}`)
+      }
+      if (result.stdout.includes('***')) {
+        throw new Error(`"vars get" printed the masked placeholder instead of the real value: ${result.stdout}`)
+      }
+    })
+
     await step('environments vars export resolves the real value', async () => {
       const result = await runCliOk(
         ['environments', 'vars', 'export', '-p', projectSlug, '-e', 'production'],

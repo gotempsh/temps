@@ -181,9 +181,9 @@ genuinely testing the CLI binary, not the API:
 
 1. `projects create --manual -y` a project, resolve its slug via
    `projects list --json`, confirm `projects show --json` reflects it
-2. `environments vars set/list/export/delete` an env var (see the "known
-   gaps" note in `cli-scenario.ts` for why `vars export`, not `vars get`, is
-   what actually proves the value round-trips)
+2. `environments vars set/list/get/export/delete` an env var — `get`'s
+   assertion is a regression test for a real bug this suite found and fixed
+   (see below)
 3. `services create -t postgres -y`, resolve via `services list --json`,
    confirm `services show --json` reflects it
 4. `deploy:image --no-wait`, resolve the deployment via
@@ -198,19 +198,27 @@ genuinely testing the CLI binary, not the API:
 
 Verified passing (3x back-to-back, `--image traefik/whoami:latest`).
 
-**Two real, pre-existing bugs found live while building this** (documented
-in `cli-scenario.ts`, not fixed there — both need backend changes out of
-scope for a CLI e2e suite):
-- `environments vars get` and `vars list --show-values` both read from the
-  list endpoint, which the server masks to the literal string `"***"` for
-  **every** variable regardless of `is_secret` — so "Use `--show-values` to
-  reveal actual values" never reveals anything for a plain variable either.
-  Only `vars export` genuinely resolves real values.
-- `domains status` 404s on a domain that hasn't finished ACME provisioning
-  yet — i.e. exactly the domain state you'd actually want to check status
-  on. Root cause: `check_domain_status` resolves via
-  `list_certificates(CertificateFilter::default())`, which only returns
-  domains that already have an issued certificate row.
+**Two real, pre-existing bugs found live while building this:**
+- **FIXED**: `environments vars get` used to read from the list endpoint,
+  which the server masks to the literal string `"***"` for **every**
+  variable regardless of `is_secret` — so a command whose entire point is
+  showing one variable's value never actually showed it. Fixed in
+  `apps/temps-cli/src/commands/environments/index.ts` to resolve real
+  values through the same audited per-key endpoint `vars export` already
+  used (`getEnvironmentVariableValue`,
+  `GET /projects/{id}/env-vars/{key}/value`) — secrets are still correctly
+  withheld. `cli-scenario`'s "vars get" step is now a regression test for
+  this fix. (`vars list --show-values` still shows `"***"` for everything —
+  that one reads from the bulk list endpoint on purpose, per its own code
+  comment, to prevent a bulk read from ever becoming a credential dump; only
+  its help text — "Use `--show-values` to reveal actual values" — is a
+  little misleading, since it never actually does for anyone.)
+- **NOT FIXED** (out of scope — needs tracing the certificate-listing
+  query, not a CLI change): `domains status` 404s on a domain that hasn't
+  finished ACME provisioning yet — i.e. exactly the domain state you'd
+  actually want to check status on. Root cause: `check_domain_status`
+  resolves via `list_certificates(CertificateFilter::default())`, which
+  only returns domains that already have an issued certificate row.
 
 **One real, correct security boundary discovered live** (not a bug): minting
 a new API key is rejected when authenticated via an API key ("This
