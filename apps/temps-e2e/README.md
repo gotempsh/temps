@@ -62,6 +62,17 @@ bun run src/index.ts examples --only go-gin python-flask        # pick specific 
 bun run src/index.ts examples --all                             # every example (incl. heavy rust/vite builds)
 bun run src/index.ts examples --registry localhost:5111         # registry (or $TEMPS_E2E_REGISTRY)
 bun run src/index.ts examples --json                            # machine-readable (CI)
+
+# Deploy an app, provision a real TLS certificate via Pebble (HTTP-01), and
+# verify it's actually served. Needs the dedicated Pebble instance — see
+# "External-service test infra" below.
+bun run src/index.ts tls-scenario --image traefik/whoami:latest --port 80
+bun run src/index.ts tls-scenario --keep --json                 # inspect the issued cert/domain after
+
+# Create an SMTP provider pointed at Mailpit, send a tracked email, and verify
+# real receipt + open/click tracking. Needs Mailpit (docker-compose.e2e.yml).
+bun run src/index.ts email-scenario
+bun run src/index.ts email-scenario --json                      # machine-readable (CI)
 ```
 
 ### `examples`
@@ -101,6 +112,108 @@ Vite (React via nginx-unprivileged), Rust (Axum).
    the project — even on failure, unless `--keep`
 
 Exits non-zero if any step fails, so it's CI-gateable.
+
+### `tls-scenario` steps
+
+1. deploy an app the normal way (reuses the `scenario` deploy path)
+2. register the host's IP with pebble-challtestsrv so Pebble's HTTP-01
+   validation request actually reaches this machine
+3. create a throwaway custom domain + a standalone TLS-certificate record for
+   it, linked together
+4. finalize the ACME order — a real HTTP-01 exchange against Pebble
+5. dial the instance's TLS listener directly (SNI = the test domain) and
+   assert both that the real app answered (not the console fallback) *and*
+   that the served certificate's issuer is Pebble's test root, not a real CA
+6. tear everything down (domain, custom-domain route, deployment, project)
+   unless `--keep`
+
+Verified passing (3x back-to-back, `--image traefik/whoami:latest`): real
+project → real deploy → real ACME HTTP-01 exchange with Pebble → real HTTPS
+fetch of the deployed app → issuer parsed from the actually-served
+certificate and confirmed as Pebble's test root.
+
+The default `--image` (`ghcr.io/temps-sh/e2e-hello:latest`, matching
+`scenario`'s default) may be blocked by local registry/firewall policy on
+some machines — `traefik/whoami:latest` is a reliable public substitute with
+no registry-auth requirements.
+
+**Bun gotcha found while verifying this live**: `tls.TLSSocket.getPeerCertificate()`
+must be called right after the handshake completes (in the `connect`
+callback), not after the response finishes (in the `'end'` handler) — under
+Bun, calling it from `'end'` returns `{}` even though the exact same call
+made earlier in the connection's lifetime (or at either point under real
+Node.js) returns the full certificate, including `issuer`. `fetchOverTls` in
+`src/lib/flows.ts` captures the certificate at connect time for this reason.
+
+### `email-scenario` steps
+
+1. create an SMTP email provider pointed at Mailpit
+2. register + verify a throwaway sending domain against it (SMTP domains
+   verify immediately)
+3. send a real email with open + click tracking enabled
+4. confirm actual receipt via Mailpit's own REST API — `send_email` silently
+   falls back to a "captured, never sent" status on any provider/domain
+   problem and still returns 201, so this is the only real proof
+5. simulate a recipient opening the email and clicking its one tracked link,
+   and confirm both landed as real `email_events` rows
+6. tear everything down (provider, domain) unless `--keep`
+
+Verified passing (3x back-to-back): real SMTP send → real receipt in Mailpit
+→ real open/click tracking-pixel and redirect hits → real `email_events` rows.
+
+## External-service test infra (TLS, DNS, email)
+
+`tls-scenario` and `email-scenario` need real external services to test
+against — a live ACME CA to issue a real certificate, an SMTP target that
+actually receives mail. Hitting the real internet for these (real Let's
+Encrypt, a real inbox) would mean real rate limits, real credentials, and
+non-reproducible runs, so both point at local, purpose-built test servers
+instead:
+
+```bash
+cd apps/temps-e2e
+docker compose -f docker-compose.e2e.yml up -d
+```
+
+This starts:
+- **Pebble** (`ghcr.io/letsencrypt/pebble`) — Let's Encrypt's own ACME v2 test
+  server. Directory on `https://localhost:14000/dir`, self-signed test root,
+  no rate limits, validates for real (a genuine HTTP request against
+  whatever answers the challenge).
+- **pebble-challtestsrv** (`ghcr.io/letsencrypt/pebble-challtestsrv`) — the
+  companion mock-DNS server Pebble uses to resolve where to send HTTP-01/
+  DNS-01 validation requests. Management API on `http://localhost:8056`
+  (not its own default of 8055 — see the compose file comment for why).
+- **Mailpit** (`axllent/mailpit`) — SMTP catcher. SMTP on `localhost:1025`,
+  web UI + REST API (`GET /api/v1/messages`) on `http://localhost:8025`. Same
+  image already proven for this in `crates/temps-notifications`'s Rust
+  integration tests.
+
+The `temps serve` instance under test needs these env vars to actually talk
+to Pebble instead of real Let's Encrypt (already-existing hooks in
+`crates/temps-domains/src/tls/providers.rs` — nothing new to build there):
+
+```bash
+ACME_DIRECTORY_URL=https://localhost:14000/dir
+ACME_INSECURE=1                      # trust Pebble's self-signed test root
+TEMPS_ALLOW_PEBBLE_PROVIDER=1        # unlock the Pebble DNS-01 provider
+```
+
+**`tls-scenario` needs a dedicated instance on a fixed port, not a normal dev
+slot.** Pebble's baked-in config sends HTTP-01 validation requests to port
+`5002` (its own default `httpPort`, chosen so Pebble never needs root/
+privileged-port access) — so the target `temps serve` process's proxy must
+be listening on `--address=0.0.0.0:5002` for Pebble's validation request to
+land on temps' real HTTP-01 challenge responder. This is unrelated to the
+`start-temps` skill's per-checkout slot ports; run a one-off instance for
+this specific scenario rather than trying to fit it into the slot scheme.
+
+Because Pebble and pebble-challtestsrv run in Docker while `temps serve`
+runs natively on the host, `tls-scenario`'s setup step resolves
+`host.docker.internal` (from a throwaway container on the
+`docker-compose.e2e.yml` network) and registers it with pebble-challtestsrv
+via `POST /set-default-ipv4` before provisioning, so Pebble's validation
+request actually reaches the host.
 
 ## Notes
 

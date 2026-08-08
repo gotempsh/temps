@@ -10,7 +10,7 @@ import {
 } from '../../api/sdk.gen.js'
 import type { ProxyLogResponse, TimeBucketStats } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
+import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
 
@@ -102,6 +102,19 @@ export function registerProxyLogsCommands(program: Command): void {
     .description("Get today's request statistics")
     .option('--json', 'Output in JSON format')
     .action(todayAction)
+}
+
+/** Sums and averages a page of time-bucket stats into the printed summary line. */
+export function summarizeBucketStats(
+  stats: Array<{ request_count: number; error_count: number; avg_response_time_ms: number }>
+): { totalRequests: number; totalErrors: number; avgResponseTime: number; errorRatePercent: number } {
+  const totalRequests = stats.reduce((sum, s) => sum + s.request_count, 0)
+  const totalErrors = stats.reduce((sum, s) => sum + s.error_count, 0)
+  const avgResponseTime = stats.length > 0
+    ? stats.reduce((sum, s) => sum + s.avg_response_time_ms, 0) / stats.length
+    : 0
+  const errorRatePercent = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0
+  return { totalRequests, totalErrors, avgResponseTime, errorRatePercent }
 }
 
 function statusCodeColor(code: number): string {
@@ -302,17 +315,13 @@ async function statsAction(options: StatsOptions): Promise<void> {
   printTable(result.stats, columns, { style: 'minimal' })
 
   // Summary
-  const totalRequests = result.stats.reduce((sum, s) => sum + s.request_count, 0)
-  const totalErrors = result.stats.reduce((sum, s) => sum + s.error_count, 0)
-  const avgResponseTime = result.stats.length > 0
-    ? result.stats.reduce((sum, s) => sum + s.avg_response_time_ms, 0) / result.stats.length
-    : 0
+  const { totalRequests, totalErrors, avgResponseTime, errorRatePercent } = summarizeBucketStats(result.stats)
 
   newline()
   header('Summary')
   keyValue('Total Requests', totalRequests.toLocaleString())
   keyValue('Total Errors', totalErrors > 0 ? colors.error(totalErrors.toLocaleString()) : '0')
-  keyValue('Error Rate', totalRequests > 0 ? `${((totalErrors / totalRequests) * 100).toFixed(2)}%` : '0%')
+  keyValue('Error Rate', totalRequests > 0 ? `${errorRatePercent.toFixed(2)}%` : '0%')
   keyValue('Avg Response Time', `${Math.round(avgResponseTime)}ms`)
   newline()
 }
@@ -403,7 +412,7 @@ function printProxyLogDetail(log: ProxyLogResponse): void {
   newline()
 }
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))

@@ -305,23 +305,17 @@ async function showCustomDomain(options: ShowOptions): Promise<void> {
   newline()
 }
 
-async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
-
-  const domainId = parseInt(options.domainId, 10)
-  if (isNaN(domainId)) {
-    warning('Invalid domain ID')
-    return
-  }
-
-  // Build update body from provided options
+// Only includes a field when the caller actually passed the flag, so an
+// omitted option never overwrites existing state via a sparse PATCH. An
+// explicitly empty `--branch ''`/`--redirect-to ''` clears the field (sent as
+// `null`) rather than being dropped, which is the only way to unset it.
+export function buildCustomDomainUpdateBody(options: {
+  domain?: string
+  environmentId?: string
+  branch?: string
+  redirectTo?: string
+  statusCode?: string
+}): Record<string, unknown> {
   const body: Record<string, unknown> = {}
   if (options.domain) {
     body.domain = options.domain
@@ -338,6 +332,26 @@ async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
   if (options.statusCode) {
     body.status_code = parseInt(options.statusCode, 10)
   }
+  return body
+}
+
+async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const domainId = parseInt(options.domainId, 10)
+  if (isNaN(domainId)) {
+    warning('Invalid domain ID')
+    return
+  }
+
+  const body = buildCustomDomainUpdateBody(options)
 
   if (Object.keys(body).length === 0) {
     warning('No update options provided')

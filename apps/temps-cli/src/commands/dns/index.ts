@@ -15,6 +15,85 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
+// Field-name mapping from CLI options to the API's credential shape, one
+// function per provider type. Getting a snake_case key wrong here means the
+// server silently stores an incomplete credential, so this is worth pinning
+// down with tests rather than trusting the inline object literals.
+export function cloudflareCredentials(apiToken: string, accountId?: string): Record<string, unknown> {
+  return {
+    type: 'cloudflare',
+    api_token: apiToken,
+    ...(accountId && { account_id: accountId }),
+  }
+}
+
+export function route53Credentials(
+  accessKeyId: string,
+  secretAccessKey: string,
+  region: string,
+): Record<string, unknown> {
+  return {
+    type: 'route53',
+    access_key_id: accessKeyId,
+    secret_access_key: secretAccessKey,
+    region,
+  }
+}
+
+export function digitalOceanCredentials(apiToken: string): Record<string, unknown> {
+  return {
+    type: 'digitalocean',
+    api_token: apiToken,
+  }
+}
+
+export function namecheapCredentials(
+  apiUser: string,
+  apiKey: string,
+  username: string,
+  clientIp: string,
+): Record<string, unknown> {
+  return {
+    type: 'namecheap',
+    api_user: apiUser,
+    api_key: apiKey,
+    username,
+    client_ip: clientIp,
+  }
+}
+
+export function gcpCredentials(
+  projectId: string,
+  serviceAccountEmail: string,
+  privateKeyId: string,
+  privateKey: string,
+): Record<string, unknown> {
+  return {
+    type: 'gcp',
+    project_id: projectId,
+    service_account_email: serviceAccountEmail,
+    private_key_id: privateKeyId,
+    private_key: privateKey,
+  }
+}
+
+export function azureCredentials(
+  tenantId: string,
+  clientId: string,
+  clientSecret: string,
+  subscriptionId: string,
+  resourceGroup: string,
+): Record<string, unknown> {
+  return {
+    type: 'azure',
+    tenant_id: tenantId,
+    client_id: clientId,
+    client_secret: clientSecret,
+    subscription_id: subscriptionId,
+    resource_group: resourceGroup,
+  }
+}
+
 const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Cloudflare', value: 'cloudflare' },
   { name: 'Namecheap', value: 'namecheap' },
@@ -239,11 +318,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'cloudflare',
-        api_token: cfApiToken,
-        ...(cfAccountId && { account_id: cfAccountId }),
-      }
+      credentials = cloudflareCredentials(cfApiToken, cfAccountId)
       break
     }
 
@@ -276,12 +351,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'route53',
-        access_key_id: awsAccessKey,
-        secret_access_key: awsSecretKey,
-        region: awsRegion,
-      }
+      credentials = route53Credentials(awsAccessKey, awsSecretKey, awsRegion)
       break
     }
 
@@ -302,10 +372,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'digitalocean',
-        api_token: doApiToken,
-      }
+      credentials = digitalOceanCredentials(doApiToken)
       break
     }
 
@@ -347,13 +414,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'namecheap',
-        api_user: ncApiUser,
-        api_key: ncApiKey,
-        username: ncUsername,
-        client_ip: ncClientIp,
-      }
+      credentials = namecheapCredentials(ncApiUser, ncApiKey, ncUsername, ncClientIp)
       break
     }
 
@@ -395,13 +456,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'gcp',
-        project_id: gcpProject,
-        service_account_email: gcpServiceAccountEmail,
-        private_key_id: gcpPrivateKeyId,
-        private_key: gcpPrivateKey,
-      }
+      credentials = gcpCredentials(gcpProject, gcpServiceAccountEmail, gcpPrivateKeyId, gcpPrivateKey)
       break
     }
 
@@ -450,14 +505,7 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
         })
       }
 
-      credentials = {
-        type: 'azure',
-        tenant_id: azTenantId,
-        client_id: azClientId,
-        client_secret: azClientSecret,
-        subscription_id: azSubscriptionId,
-        resource_group: azResourceGroup,
-      }
+      credentials = azureCredentials(azTenantId, azClientId, azClientSecret, azSubscriptionId, azResourceGroup)
       break
     }
 

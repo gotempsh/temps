@@ -11,7 +11,7 @@ import { header, newline, keyValue, colors, icons, success, error as printError 
 import type { ExecuteImportResponse, StepResult } from '../../api/types.gen.js'
 import { getWebUrl } from '../../lib/api-client.js'
 
-function stepIcon(step: StepResult): string {
+export function stepIcon(step: StepResult): string {
   if (step.skipped) return chalk.gray('○')
   return step.success ? icons.check : icons.cross
 }

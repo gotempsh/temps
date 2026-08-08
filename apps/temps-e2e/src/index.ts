@@ -5,6 +5,8 @@ import { makeClient, resolveConfig, unwrap } from './lib/client.ts'
 import { loadCommand } from './commands/load.ts'
 import { scenarioCommand } from './commands/scenario.ts'
 import { examplesCommand } from './commands/examples.ts'
+import { tlsScenarioCommand } from './commands/tls-scenario.ts'
+import { emailScenarioCommand } from './commands/email-scenario.ts'
 
 const program = new Command()
 
@@ -66,6 +68,38 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await scenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('tls-scenario')
+  .description(
+    'Deploy an app, provision a real TLS certificate via Pebble (HTTP-01), and verify it is served correctly',
+  )
+  .option('--image <ref>', 'public Docker image to deploy', 'ghcr.io/temps-sh/e2e-hello:latest')
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--tls-port <port>', 'the target instance TLS listener port to dial', '8443')
+  .option('--tls-host <host>', 'the target instance TLS listener host to dial', '127.0.0.1')
+  .option('--pebble-network <name>', 'docker network pebble-challtestsrv is on', 'temps-e2e-pebble-net')
+  .option('--pebble-management-url <url>', 'pebble-challtestsrv management API URL', 'http://localhost:8056')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await tlsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('email-scenario')
+  .description(
+    'Create an SMTP provider pointed at Mailpit, send a tracked email, and verify real receipt + open/click tracking',
+  )
+  .option('--smtp-host <host>', 'Mailpit SMTP host, from the target instance\'s point of view', 'localhost')
+  .option('--smtp-port <port>', 'Mailpit SMTP port', '1025')
+  .option('--mailpit-url <url>', 'Mailpit web/REST API base URL', 'http://localhost:8025')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await emailScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

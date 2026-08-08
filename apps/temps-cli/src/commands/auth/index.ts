@@ -3,6 +3,20 @@ import { login } from './login.js'
 import { logout } from './logout.js'
 import { whoami } from './whoami.js'
 
+/**
+ * Forward the positional `url` argument as if it were `--url`. Commander
+ * doesn't surface positional args via `opts`, and an empty positional
+ * (`temps login ""`) must not shadow a real `--url` value.
+ */
+export function resolveLoginUrl(
+  positionalUrl: string | undefined,
+  opts: Record<string, unknown>,
+): string | undefined {
+  return typeof positionalUrl === 'string' && positionalUrl.length > 0
+    ? positionalUrl
+    : (opts.url as string | undefined)
+}
+
 export function registerAuthCommands(program: Command): void {
   program
     .command('login [url]')
@@ -11,11 +25,9 @@ export function registerAuthCommands(program: Command): void {
     .option('--context <name>', 'Save the credentials under this context name (defaults to URL host)')
     .option('--debug', 'Print every request/response (URL, status, headers, raw body) to stderr. Also enabled via TEMPS_DEBUG=1.')
     .action(async (url: string | undefined, opts: Record<string, unknown>) => {
-      // Forward the positional `url` as if it were `--url`. Commander
-      // doesn't surface positional args via opts.
       await login({
         ...opts,
-        url: typeof url === 'string' && url.length > 0 ? url : (opts.url as string | undefined),
+        url: resolveLoginUrl(url, opts),
       })
     })
 

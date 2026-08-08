@@ -107,7 +107,7 @@ async function apiRequest<T>(
   return (await response.json()) as T
 }
 
-async function readApiError(response: Response): Promise<Error> {
+export async function readApiError(response: Response): Promise<Error> {
   const text = await response.text().catch(() => '')
   try {
     const problem = JSON.parse(text) as { title?: string; detail?: string }
@@ -144,7 +144,7 @@ async function resolveProjectId(projectFlag: string | undefined): Promise<{
   return { id: data.id, slug: resolved.slug, source: resolved.source }
 }
 
-function statusColor(status: string): string {
+export function statusColor(status: string): string {
   const s = status.toLowerCase()
   if (s === 'completed') return colors.success(status)
   if (s === 'failed' || s === 'cancelled' || s === 'no_fix') {
@@ -154,7 +154,7 @@ function statusColor(status: string): string {
   return status
 }
 
-function levelColor(level: string): string {
+export function levelColor(level: string): string {
   const l = level.toLowerCase()
   if (l === 'error') return colors.error(level.padEnd(5))
   if (l === 'warn' || l === 'warning') return colors.warning(level.padEnd(5))
@@ -275,6 +275,58 @@ interface RunOptions {
   json?: boolean
 }
 
+/**
+ * The three argument-combination rules for `workflow run`: <slug> and
+ * --from-file are mutually exclusive, one of them is required, and
+ * --cpu/--memory only make sense for an ephemeral (--from-file) run.
+ * Returns the message to print, or null when the combination is valid.
+ */
+export function validateRunArgs(
+  slug: string | undefined,
+  options: Pick<RunOptions, 'fromFile' | 'cpu' | 'memory'>
+): string | null {
+  if (slug && options.fromFile) {
+    return 'Pass either <slug> or --from-file, not both.'
+  }
+  if (!slug && !options.fromFile) {
+    return 'Specify a workflow slug, or use --from-file <path> for an ephemeral run.'
+  }
+  if (!options.fromFile && (options.cpu || options.memory)) {
+    return '--cpu / --memory only apply to ephemeral runs (use --from-file).'
+  }
+  return null
+}
+
+/** Throws with the exact CLI-facing message when --error-group isn't a positive integer. */
+export function parseErrorGroupId(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid --error-group value (must be a positive integer): ${raw}`)
+  }
+  return parsed
+}
+
+/** Throws with the exact CLI-facing message when --cpu isn't a positive number. */
+export function parseCpuLimit(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  const cpu = Number(raw)
+  if (!Number.isFinite(cpu) || cpu <= 0) {
+    throw new Error(`Invalid --cpu value: ${raw}`)
+  }
+  return cpu
+}
+
+/** Throws with the exact CLI-facing message when --memory isn't a positive integer. */
+export function parseMemoryLimitMb(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  const mem = Number(raw)
+  if (!Number.isInteger(mem) || mem <= 0) {
+    throw new Error(`Invalid --memory value (must be a positive integer MB): ${raw}`)
+  }
+  return mem
+}
+
 async function runAction(slug: string | undefined, options: RunOptions): Promise<void> {
   // Two mutually-exclusive modes:
   //   1. `temps wf run <slug>`              — trigger a workflow already
@@ -282,30 +334,19 @@ async function runAction(slug: string | undefined, options: RunOptions): Promise
   //   2. `temps wf run --from-file foo.yaml` — ephemeral dry-run; the YAML is
   //                                            POSTed once and never persists
   //                                            in project_agents server-side.
-  if (slug && options.fromFile) {
-    errorOut('Pass either <slug> or --from-file, not both.')
-    process.exitCode = 2
-    return
-  }
-  if (!slug && !options.fromFile) {
-    errorOut('Specify a workflow slug, or use --from-file <path> for an ephemeral run.')
-    process.exitCode = 2
-    return
-  }
-  if (!options.fromFile && (options.cpu || options.memory)) {
-    errorOut('--cpu / --memory only apply to ephemeral runs (use --from-file).')
+  const argError = validateRunArgs(slug, options)
+  if (argError) {
+    errorOut(argError)
     process.exitCode = 2
     return
   }
   let errorGroupId: number | undefined
-  if (options.errorGroup) {
-    const parsed = Number(options.errorGroup)
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      errorOut(`Invalid --error-group value (must be a positive integer): ${options.errorGroup}`)
-      process.exitCode = 2
-      return
-    }
-    errorGroupId = parsed
+  try {
+    errorGroupId = parseErrorGroupId(options.errorGroup)
+  } catch (err) {
+    errorOut((err as Error).message)
+    process.exitCode = 2
+    return
   }
 
   const project = await resolveProjectId(options.project)
@@ -336,23 +377,15 @@ async function runAction(slug: string | undefined, options: RunOptions): Promise
 
     const body: Record<string, unknown> = { yaml }
     if (options.context) body.user_context = options.context
-    if (options.cpu) {
-      const cpu = Number(options.cpu)
-      if (!Number.isFinite(cpu) || cpu <= 0) {
-        errorOut(`Invalid --cpu value: ${options.cpu}`)
-        process.exitCode = 2
-        return
-      }
-      body.cpu_limit = cpu
-    }
-    if (options.memory) {
-      const mem = Number(options.memory)
-      if (!Number.isInteger(mem) || mem <= 0) {
-        errorOut(`Invalid --memory value (must be a positive integer MB): ${options.memory}`)
-        process.exitCode = 2
-        return
-      }
-      body.memory_limit_mb = mem
+    try {
+      const cpu = parseCpuLimit(options.cpu)
+      if (cpu !== undefined) body.cpu_limit = cpu
+      const memory = parseMemoryLimitMb(options.memory)
+      if (memory !== undefined) body.memory_limit_mb = memory
+    } catch (err) {
+      errorOut((err as Error).message)
+      process.exitCode = 2
+      return
     }
     if (errorGroupId !== undefined) {
       body.error_group_id = errorGroupId
@@ -558,12 +591,12 @@ interface ToolEvent {
 
 const TRUNC = 160
 
-function truncate(s: string, max = TRUNC): string {
+export function truncate(s: string, max = TRUNC): string {
   const t = s.replace(/\s+/g, ' ').trim()
   return t.length > max ? t.slice(0, max) + '…' : t
 }
 
-function summarizeToolInput(
+export function summarizeToolInput(
   name: string,
   input: Record<string, unknown> | undefined,
 ): string {
@@ -613,7 +646,7 @@ function summarizeToolInput(
   }
 }
 
-function extractAiEvent(message: string): ToolEvent | null {
+export function extractAiEvent(message: string): ToolEvent | null {
   let obj: Record<string, unknown>
   try {
     obj = JSON.parse(message)

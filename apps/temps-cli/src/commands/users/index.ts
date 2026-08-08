@@ -5,7 +5,6 @@ import {
   listUsers,
   createUser,
   deleteUser,
-  updateUser,
   restoreUser,
   assignRole,
   removeRole,
@@ -41,6 +40,27 @@ interface RoleOptions {
   id: string
   add?: string
   remove?: string
+}
+
+type RolesInputResult = { roles: string[] } | { error: string }
+
+export function parseRolesInput(rolesOption: string | undefined): RolesInputResult {
+  let selectedRoles: string[] = []
+
+  if (rolesOption) {
+    selectedRoles = rolesOption.split(',').map(r => r.trim().toLowerCase())
+    for (const role of selectedRoles) {
+      if (!AVAILABLE_ROLES.includes(role)) {
+        return { error: `Invalid role: ${role}. Available roles: ${AVAILABLE_ROLES.join(', ')}` }
+      }
+    }
+  }
+
+  if (selectedRoles.length === 0) {
+    selectedRoles = ['viewer'] // Default role
+  }
+
+  return { roles: selectedRoles }
 }
 
 export function registerUsersCommands(program: Command): void {
@@ -157,20 +177,12 @@ async function createUserAction(options: CreateOptions): Promise<void> {
     email = options.email || null
     password = options.password || null
 
-    if (options.roles) {
-      selectedRoles = options.roles.split(',').map(r => r.trim().toLowerCase())
-      // Validate roles
-      for (const role of selectedRoles) {
-        if (!AVAILABLE_ROLES.includes(role)) {
-          warning(`Invalid role: ${role}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
-          return
-        }
-      }
+    const rolesResult = parseRolesInput(options.roles)
+    if ('error' in rolesResult) {
+      warning(rolesResult.error)
+      return
     }
-
-    if (selectedRoles.length === 0) {
-      selectedRoles = ['viewer'] // Default role
-    }
+    selectedRoles = rolesResult.roles
   } else {
     // Interactive mode
     username = options.username || await promptText({

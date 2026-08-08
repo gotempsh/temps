@@ -61,14 +61,14 @@ const SPAN_STATUSES = ['ok', 'error', 'unset']
 
 /** Server-side caps, mirrored so the CLI can explain them before a round trip. */
 const MAX_PROJECTS = 50
-const MAX_WINDOW_DAYS = 31
+export const MAX_WINDOW_DAYS = 31
 
 /**
  * Parse a relative duration like `30m`, `24h`, `7d` into milliseconds.
  * Returns `null` for anything that isn't one of those shapes, so the caller can
  * complain with the actual input rather than silently defaulting.
  */
-function parseSince(since: string): number | null {
+export function parseSince(since: string): number | null {
   const match = /^(\d+)\s*([mhd])$/i.exec(since.trim())
   if (!match) return null
   const amount = parseInt(match[1]!, 10)
@@ -85,17 +85,64 @@ function parseSince(since: string): number | null {
 }
 
 /** Format a millisecond duration for a terminal column. */
-function formatMs(ms: number): string {
+export function formatMs(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
   if (ms >= 1) return `${ms.toFixed(1)}ms`
   return `${ms.toFixed(2)}ms`
 }
 
 /** Total wall-clock, which is often minutes or hours rather than milliseconds. */
-function formatTotal(ms: number): string {
+export function formatTotal(ms: number): string {
   if (ms >= 3_600_000) return `${(ms / 3_600_000).toFixed(2)}h`
   if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`
   return formatMs(ms)
+}
+
+export type TimeWindowResult =
+  | { ok: true; startTime: Date; endTime: Date }
+  | { ok: false; error: string }
+
+/**
+ * Resolve the query window from --since/--start-time/--end-time and enforce
+ * MAX_WINDOW_DAYS client-side, mirroring the server's own validation so a bad
+ * window is reported with a message that names the flag to fix, instead of a
+ * bare 400 after a round trip.
+ */
+export function resolveTimeWindow(options: {
+  since?: string
+  startTime?: string
+  endTime?: string
+}): TimeWindowResult {
+  const endTime = options.endTime ? new Date(options.endTime) : new Date()
+  if (Number.isNaN(endTime.getTime())) {
+    return { ok: false, error: `Invalid --end-time: ${options.endTime}` }
+  }
+
+  let startTime: Date
+  if (options.startTime) {
+    startTime = new Date(options.startTime)
+    if (Number.isNaN(startTime.getTime())) {
+      return { ok: false, error: `Invalid --start-time: ${options.startTime}` }
+    }
+  } else {
+    const sinceMs = parseSince(options.since ?? '24h')
+    if (sinceMs === null) {
+      return { ok: false, error: `Invalid --since: ${options.since}. Use a form like 30m, 24h or 7d` }
+    }
+    startTime = new Date(endTime.getTime() - sinceMs)
+  }
+
+  const windowDays = (endTime.getTime() - startTime.getTime()) / 86_400_000
+  if (windowDays > MAX_WINDOW_DAYS) {
+    return {
+      ok: false,
+      error:
+        `Window is ${windowDays.toFixed(1)} days; the maximum is ${MAX_WINDOW_DAYS}. ` +
+        `Narrow --since, or --start-time/--end-time.`,
+    }
+  }
+
+  return { ok: true, startTime, endTime }
 }
 
 export function registerTracesCommands(program: Command): void {
@@ -185,37 +232,12 @@ async function spanStatsAction(options: SpanStatsOptions): Promise<void> {
 
   // Resolve the window client-side so `--since` is a real convenience rather
   // than a second, subtly different defaulting rule on the server.
-  const endTime = options.endTime ? new Date(options.endTime) : new Date()
-  if (Number.isNaN(endTime.getTime())) {
-    warning(`Invalid --end-time: ${options.endTime}`)
+  const window = resolveTimeWindow(options)
+  if (!window.ok) {
+    warning(window.error)
     return
   }
-  let startTime: Date
-  if (options.startTime) {
-    startTime = new Date(options.startTime)
-    if (Number.isNaN(startTime.getTime())) {
-      warning(`Invalid --start-time: ${options.startTime}`)
-      return
-    }
-  } else {
-    const sinceMs = parseSince(options.since ?? '24h')
-    if (sinceMs === null) {
-      warning(`Invalid --since: ${options.since}. Use a form like 30m, 24h or 7d`)
-      return
-    }
-    startTime = new Date(endTime.getTime() - sinceMs)
-  }
-
-  // The server rejects an over-wide window rather than narrowing it, so catch
-  // it here and say which flag to change instead of surfacing a bare 400.
-  const windowDays = (endTime.getTime() - startTime.getTime()) / 86_400_000
-  if (windowDays > MAX_WINDOW_DAYS) {
-    warning(
-      `Window is ${windowDays.toFixed(1)} days; the maximum is ${MAX_WINDOW_DAYS}. ` +
-        `Narrow --since, or --start-time/--end-time.`,
-    )
-    return
-  }
+  const { startTime, endTime } = window
 
   const result = await withSpinner('Aggregating operation latency...', async () => {
     const { data, error } = await querySpanStats({

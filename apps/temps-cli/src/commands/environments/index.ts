@@ -7,7 +7,6 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { parseEnvFile } from '../../lib/env-file.js'
 import {
   getEnvironments,
-  getEnvironment,
   createEnvironment,
   deleteEnvironment,
   getEnvironmentVariables,
@@ -452,7 +451,7 @@ async function listEnvVars(
  * API never returns their plaintext — so they must read as deliberately
  * withheld rather than as an empty variable.
  */
-function formatEnvVarValue(v: EnvironmentVariableResponse): string {
+export function formatEnvVarValue(v: EnvironmentVariableResponse): string {
   if (v.is_secret) return colors.warning('(secret - write-only, never returned by the API)')
   return v.value ?? ''
 }
@@ -1072,6 +1071,68 @@ interface ResourcesOptions {
   json?: boolean
 }
 
+export interface ResourceUpdateBody {
+  cpu_limit?: number | null
+  cpu_request?: number | null
+  memory_limit?: number | null
+  memory_request?: number | null
+}
+
+/**
+ * Parse and validate the --cpu/--memory/--cpu-request/--memory-request flags
+ * into the API's update body. A request left unspecified defaults to the
+ * limit being set in the same call — otherwise a container could get a limit
+ * with no matching guaranteed minimum, which the scheduler would silently
+ * treat as "no request" rather than "same as limit".
+ */
+export function parseResourceUpdate(
+  options: Pick<ResourcesOptions, 'cpu' | 'memory' | 'cpuRequest' | 'memoryRequest'>
+): { body: ResourceUpdateBody } | { error: string } {
+  const updateBody: ResourceUpdateBody = {}
+
+  let cpuLimit: number | undefined
+  if (options.cpu) {
+    cpuLimit = parseInt(options.cpu, 10)
+    if (isNaN(cpuLimit) || cpuLimit <= 0) {
+      return { error: 'CPU must be a positive number (millicores)' }
+    }
+    updateBody.cpu_limit = cpuLimit
+  }
+
+  let memoryLimit: number | undefined
+  if (options.memory) {
+    memoryLimit = parseInt(options.memory, 10)
+    if (isNaN(memoryLimit) || memoryLimit <= 0) {
+      return { error: 'Memory must be a positive number (MB)' }
+    }
+    updateBody.memory_limit = memoryLimit
+  }
+
+  if (options.cpuRequest) {
+    const cpuRequest = parseInt(options.cpuRequest, 10)
+    if (isNaN(cpuRequest) || cpuRequest <= 0) {
+      return { error: 'CPU request must be a positive number (millicores)' }
+    }
+    updateBody.cpu_request = cpuRequest
+  } else if (cpuLimit !== undefined) {
+    // Default request to same as limit when setting limit
+    updateBody.cpu_request = cpuLimit
+  }
+
+  if (options.memoryRequest) {
+    const memoryRequest = parseInt(options.memoryRequest, 10)
+    if (isNaN(memoryRequest) || memoryRequest <= 0) {
+      return { error: 'Memory request must be a positive number (MB)' }
+    }
+    updateBody.memory_request = memoryRequest
+  } else if (memoryLimit !== undefined) {
+    // Default request to same as limit when setting limit
+    updateBody.memory_request = memoryLimit
+  }
+
+  return { body: updateBody }
+}
+
 async function resourcesCmd(environment: string, options: ResourcesOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -1104,60 +1165,12 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
 
   if (hasResourceOptions) {
     // Update resources
-    const updateBody: {
-      cpu_limit?: number | null
-      cpu_request?: number | null
-      memory_limit?: number | null
-      memory_request?: number | null
-    } = {}
-
-    // Parse CPU limit
-    let cpuLimit: number | undefined
-    if (options.cpu) {
-      cpuLimit = parseInt(options.cpu, 10)
-      if (isNaN(cpuLimit) || cpuLimit <= 0) {
-        errorOutput('CPU must be a positive number (millicores)')
-        return
-      }
-      updateBody.cpu_limit = cpuLimit
+    const parsed = parseResourceUpdate(options)
+    if ('error' in parsed) {
+      errorOutput(parsed.error)
+      return
     }
-
-    // Parse memory limit
-    let memoryLimit: number | undefined
-    if (options.memory) {
-      memoryLimit = parseInt(options.memory, 10)
-      if (isNaN(memoryLimit) || memoryLimit <= 0) {
-        errorOutput('Memory must be a positive number (MB)')
-        return
-      }
-      updateBody.memory_limit = memoryLimit
-    }
-
-    // Parse CPU request (or default to limit)
-    if (options.cpuRequest) {
-      const cpuRequest = parseInt(options.cpuRequest, 10)
-      if (isNaN(cpuRequest) || cpuRequest <= 0) {
-        errorOutput('CPU request must be a positive number (millicores)')
-        return
-      }
-      updateBody.cpu_request = cpuRequest
-    } else if (cpuLimit !== undefined) {
-      // Default request to same as limit when setting limit
-      updateBody.cpu_request = cpuLimit
-    }
-
-    // Parse memory request (or default to limit)
-    if (options.memoryRequest) {
-      const memoryRequest = parseInt(options.memoryRequest, 10)
-      if (isNaN(memoryRequest) || memoryRequest <= 0) {
-        errorOutput('Memory request must be a positive number (MB)')
-        return
-      }
-      updateBody.memory_request = memoryRequest
-    } else if (memoryLimit !== undefined) {
-      // Default request to same as limit when setting limit
-      updateBody.memory_request = memoryLimit
-    }
+    const updateBody = parsed.body
 
     const updatedEnv = await withSpinner('Updating resources...', async () => {
       const { data, error } = await updateEnvironmentSettings({
@@ -1206,24 +1219,24 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
   }
 }
 
+export function formatCpu(millicores: number | null | undefined): string {
+  if (millicores == null) return colors.muted('not set')
+  const cores = millicores / 1000
+  return `${millicores}m (${cores} CPU)`
+}
+
+export function formatMemory(mb: number | null | undefined): string {
+  if (mb == null) return colors.muted('not set')
+  if (mb >= 1024) {
+    return `${mb}MB (${(mb / 1024).toFixed(1)}GB)`
+  }
+  return `${mb}MB`
+}
+
 function displayResources(env: EnvironmentResponse | null | undefined): void {
   if (!env) return
 
   const config = env.deployment_config
-
-  const formatCpu = (millicores: number | null | undefined): string => {
-    if (millicores == null) return colors.muted('not set')
-    const cores = millicores / 1000
-    return `${millicores}m (${cores} CPU)`
-  }
-
-  const formatMemory = (mb: number | null | undefined): string => {
-    if (mb == null) return colors.muted('not set')
-    if (mb >= 1024) {
-      return `${mb}MB (${(mb / 1024).toFixed(1)}GB)`
-    }
-    return `${mb}MB`
-  }
 
   keyValue('CPU Limit', formatCpu(config?.cpuLimit))
   keyValue('CPU Request', formatCpu(config?.cpuRequest))
@@ -1252,7 +1265,7 @@ interface ForceHttpsOptions {
  * as "disabled": it means the proxy falls back to its default, which redirects
  * any host that has an active TLS certificate.
  */
-function describeForceHttps(value: boolean | null | undefined): string {
+export function describeForceHttps(value: boolean | null | undefined): string {
   if (value === true) return colors.success('always redirect')
   if (value === false) return colors.warning('never redirect')
   return colors.muted('inherit (redirect only when the host has a certificate)')
@@ -1359,6 +1372,24 @@ async function forceHttpsCmd(environment: string, options: ForceHttpsOptions): P
 
 // ============ Scale Command ============
 
+/** Validate a --replicas value. Zero is allowed (scale to nothing); negative
+ *  and non-numeric input are rejected before ever reaching the API. */
+export function parseReplicaCount(
+  value: string
+): { replicas: number; warning?: string } | { error: string } {
+  const replicaCount = parseInt(value, 10)
+  if (isNaN(replicaCount) || replicaCount < 0) {
+    return { error: 'Replicas must be a non-negative number' }
+  }
+  if (replicaCount > 10) {
+    return {
+      replicas: replicaCount,
+      warning: `Setting ${replicaCount} replicas. This may consume significant resources.`,
+    }
+  }
+  return { replicas: replicaCount }
+}
+
 async function scaleCmd(
   options: { project?: string; environment: string; replicas?: string; json?: boolean }
 ): Promise<void> {
@@ -1396,14 +1427,14 @@ async function scaleCmd(
 
   if (options.replicas !== undefined) {
     // Set replicas
-    const replicaCount = parseInt(options.replicas, 10)
-    if (isNaN(replicaCount) || replicaCount < 0) {
-      errorOutput('Replicas must be a non-negative number')
+    const parsedReplicas = parseReplicaCount(options.replicas)
+    if ('error' in parsedReplicas) {
+      errorOutput(parsedReplicas.error)
       return
     }
-
-    if (replicaCount > 10) {
-      warning(`Setting ${replicaCount} replicas. This may consume significant resources.`)
+    const replicaCount = parsedReplicas.replicas
+    if (parsedReplicas.warning) {
+      warning(parsedReplicas.warning)
     }
 
     const updatedEnv = await withSpinner(`Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {

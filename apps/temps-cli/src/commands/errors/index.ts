@@ -879,18 +879,11 @@ async function uploadSourceFileAction(options: SourceFileUploadOptions): Promise
     warning(`Directory does not exist: ${root}`)
     return
   }
-  const exts = new Set(
-    (options.ext ? options.ext.split(',') : DEFAULT_SOURCE_EXTS)
-      .map((e) => e.trim().replace(/^\./, '').toLowerCase())
-      .filter(Boolean)
-  )
+  const exts = parseSourceFileExtensions(options.ext)
 
   const entries = (await readdir(root, { recursive: true })) as string[]
   const relPaths = entries.filter((rel) => {
-    // Skip dependency/build/VCS directories at any depth.
-    if (rel.split(/[/\\]/).some((seg) => SKIP_DIRS.has(seg))) return false
-    const ext = rel.split('.').pop()?.toLowerCase() ?? ''
-    if (!exts.has(ext)) return false
+    if (!matchesSourceFileFilter(rel, exts)) return false
     // Recursive readdir returns directories too; keep only real files.
     try {
       return statSync(join(root, rel)).isFile()
@@ -1167,10 +1160,26 @@ async function deleteSourceMap(options: SourceMapDeleteOneOptions): Promise<void
   success(`Source map #${sourceMapId} deleted`)
 }
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/** Normalize a `--ext` CSV (or fall back to defaults) into a lookup set of bare, lowercased extensions. */
+export function parseSourceFileExtensions(extCsv: string | undefined): Set<string> {
+  return new Set(
+    (extCsv ? extCsv.split(',') : DEFAULT_SOURCE_EXTS)
+      .map((e) => e.trim().replace(/^\./, '').toLowerCase())
+      .filter(Boolean)
+  )
+}
+
+/** Whether a `--dir`-relative path should be uploaded: right extension, and not under a skipped directory at any depth. */
+export function matchesSourceFileFilter(rel: string, exts: Set<string>): boolean {
+  if (rel.split(/[/\\]/).some((seg) => SKIP_DIRS.has(seg))) return false
+  const ext = rel.split('.').pop()?.toLowerCase() ?? ''
+  return exts.has(ext)
 }
 
 async function getErrorDashboardAction(options: DashboardOptions): Promise<void> {

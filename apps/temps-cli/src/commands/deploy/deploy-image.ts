@@ -32,6 +32,41 @@ interface DeployImageOptions {
   timeout?: string
 }
 
+/**
+ * The environments API is expected to return an array, but has been observed
+ * wrapped in `{ data: [...] }` or `{ environments: [...] }`. Normalizing here
+ * means a wrapper-format response doesn't get silently treated as "no
+ * environments" (which would then force production-or-first fallback).
+ */
+export function normalizeEnvironmentsResponse(envData: unknown): EnvironmentResponse[] {
+  if (Array.isArray(envData)) {
+    return envData as EnvironmentResponse[]
+  }
+  if (envData && typeof envData === 'object') {
+    const wrapped = envData as Record<string, unknown>
+    if (Array.isArray(wrapped.data)) {
+      return wrapped.data as EnvironmentResponse[]
+    }
+    if (Array.isArray(wrapped.environments)) {
+      return wrapped.environments as EnvironmentResponse[]
+    }
+  }
+  return []
+}
+
+/**
+ * Trims and validates `--health-check-path`. Throws with the user-facing
+ * message when the path doesn't start with "/" — sending a relative path to
+ * the API would silently misconfigure the uptime monitor.
+ */
+export function validateHealthCheckPath(path: string): string {
+  const trimmed = path.trim()
+  if (!trimmed.startsWith('/')) {
+    throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
+  }
+  return trimmed
+}
+
 export async function deployImage(options: DeployImageOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -133,18 +168,7 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
       path: { project_id: projectData.id },
     })
 
-    // Handle different response formats - could be array directly or wrapped in object
-    if (Array.isArray(envData)) {
-      environments = envData
-    } else if (envData && typeof envData === 'object') {
-      // Try common wrapper properties
-      const wrapped = envData as Record<string, unknown>
-      if (Array.isArray(wrapped.data)) {
-        environments = wrapped.data as EnvironmentResponse[]
-      } else if (Array.isArray(wrapped.environments)) {
-        environments = wrapped.environments as EnvironmentResponse[]
-      }
-    }
+    environments = normalizeEnvironmentsResponse(envData)
   } catch (err) {
     failSpinner('Failed to fetch project')
     throw err
@@ -242,12 +266,12 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
     }
 
     if (options.healthCheckPath) {
-      const p = options.healthCheckPath.trim()
-      if (!p.startsWith('/')) {
-        failSpinner('--health-check-path must start with "/" (e.g. /api/healthz)')
+      try {
+        deployBody.health_check_path = validateHealthCheckPath(options.healthCheckPath)
+      } catch (err) {
+        failSpinner(err instanceof Error ? err.message : String(err))
         return
       }
-      deployBody.health_check_path = p
     }
 
     const deployResponse = await fetch(deployUrl, {

@@ -46,6 +46,36 @@ interface ValidateOptions {
   json?: boolean
 }
 
+export function emailStatusVariant(status: string): 'active' | 'error' | 'pending' {
+  if (status === 'delivered' || status === 'sent') return 'active'
+  if (status === 'failed') return 'error'
+  return 'pending'
+}
+
+export function sanitizeEmailBody(body: string): string {
+  // Email bodies are attacker-controlled (anything sent through the
+  // platform's send API) — strip ANSI/control escape sequences before
+  // printing so a crafted body can't manipulate the cursor, hide/spoof
+  // output, or set the terminal window title.
+  return body.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+}
+
+export function buildEmailListQuery(options: ListOptions): Record<string, unknown> {
+  const page = options.page ? parseInt(options.page, 10) : undefined
+  const pageSize = options.pageSize ? parseInt(options.pageSize, 10) : undefined
+  const domainId = options.domainId ? parseInt(options.domainId, 10) : undefined
+  const projectId = options.projectId ? parseInt(options.projectId, 10) : undefined
+
+  return {
+    ...(page && { page }),
+    ...(pageSize && { page_size: pageSize }),
+    ...(options.status && { status: options.status }),
+    ...(domainId && { domain_id: domainId }),
+    ...(projectId && { project_id: projectId }),
+    ...(options.fromAddress && { from_address: options.fromAddress }),
+  }
+}
+
 export function registerEmailsCommands(program: Command): void {
   const emails = program
     .command('emails')
@@ -100,22 +130,10 @@ async function listEmailsAction(options: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const page = options.page ? parseInt(options.page, 10) : undefined
-  const pageSize = options.pageSize ? parseInt(options.pageSize, 10) : undefined
-  const domainId = options.domainId ? parseInt(options.domainId, 10) : undefined
-  const projectId = options.projectId ? parseInt(options.projectId, 10) : undefined
-
   const response = await withSpinner('Fetching emails...', async () => {
     const { data, error } = await listEmails({
       client,
-      query: {
-        ...(page && { page }),
-        ...(pageSize && { page_size: pageSize }),
-        ...(options.status && { status: options.status }),
-        ...(domainId && { domain_id: domainId }),
-        ...(projectId && { project_id: projectId }),
-        ...(options.fromAddress && { from_address: options.fromAddress }),
-      },
+      query: buildEmailListQuery(options),
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -144,7 +162,7 @@ async function listEmailsAction(options: ListOptions): Promise<void> {
     { header: 'ID', key: 'id', width: 8 },
     { header: 'To', accessor: (e) => e.to_addresses.join(', '), color: (v) => colors.bold(v) },
     { header: 'Subject', key: 'subject', color: (v) => v.length > 40 ? v.slice(0, 40) + '...' : v },
-    { header: 'Status', key: 'status', color: (v) => statusBadge(v === 'delivered' || v === 'sent' ? 'active' : v === 'failed' ? 'error' : 'pending') },
+    { header: 'Status', key: 'status', color: (v) => statusBadge(emailStatusVariant(v)) },
     { header: 'Sent', accessor: (e) => e.sent_at ? new Date(e.sent_at).toLocaleDateString() : new Date(e.created_at).toLocaleDateString() },
   ]
 
@@ -259,10 +277,7 @@ async function showEmail(options: ShowOptions): Promise<void> {
     keyValue('BCC', email.bcc_addresses.join(', '))
   }
   keyValue('Subject', email.subject)
-  keyValue('Status', statusBadge(
-    email.status === 'delivered' || email.status === 'sent' ? 'active' :
-    email.status === 'failed' ? 'error' : 'pending'
-  ))
+  keyValue('Status', statusBadge(emailStatusVariant(email.status)))
   keyValue('Created', formatDate(email.created_at))
   if (email.sent_at) {
     keyValue('Sent', formatDate(email.sent_at))
@@ -294,11 +309,7 @@ async function showEmail(options: ShowOptions): Promise<void> {
   if (body) {
     newline()
     header('Body')
-    // Email bodies are attacker-controlled (anything sent through the
-    // platform's send API) — strip ANSI/control escape sequences before
-    // printing so a crafted body can't manipulate the cursor, hide/spoof
-    // output, or set the terminal window title.
-    console.log(`  ${body.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')}`)
+    console.log(`  ${sanitizeEmailBody(body)}`)
   }
 
   if (email.error_message) {

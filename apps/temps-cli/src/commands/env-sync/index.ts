@@ -23,6 +23,23 @@ import {
   error as errorOutput,
 } from '../../ui/output.js'
 
+export function findEnvironment<T extends { name: string; slug: string }>(
+  envs: T[],
+  query: string
+): T | undefined {
+  return envs.find(e => e.name.toLowerCase() === query.toLowerCase() || e.slug === query)
+}
+
+export function formatEnvLine(key: string, value: string): string {
+  const escapedValue =
+    value.includes('\n') || value.includes('"')
+      ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+      : value.includes(' ') || value.includes('#')
+        ? `"${value}"`
+        : value
+  return `${key}=${escapedValue}`
+}
+
 async function resolveProjectId(slug: string): Promise<number> {
   const { data, error } = await getProjectBySlug({
     client,
@@ -66,10 +83,7 @@ async function pull(
 
   // Filter by environment
   if (options.environment) {
-    const targetEnv = result.envs.find(
-      e => e.name.toLowerCase() === options.environment!.toLowerCase() ||
-           e.slug === options.environment
-    )
+    const targetEnv = findEnvironment(result.envs, options.environment)
     if (!targetEnv) {
       errorOutput(`Environment "${options.environment}" not found`)
       info(`Available: ${result.envs.map(e => e.name).join(', ')}`)
@@ -147,15 +161,7 @@ async function pull(
 
   // Generate .env content
   const envContent = exportableVars
-    .map(v => {
-      const value = resolvedValues.get(v.id) ?? ''
-      const escapedValue = value.includes('\n') || value.includes('"')
-        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : value.includes(' ') || value.includes('#')
-          ? `"${value}"`
-          : value
-      return `${v.key}=${escapedValue}`
-    })
+    .map(v => formatEnvLine(v.key, resolvedValues.get(v.id) ?? ''))
     .join('\n')
 
   const outputPath = path.isAbsolute(outputFile)
@@ -237,9 +243,7 @@ async function push(
     const envNames = options.environment.split(',').map(n => n.trim().toLowerCase())
     environmentIds = []
     for (const name of envNames) {
-      const env = result.envs.find(e =>
-        e.name.toLowerCase() === name || e.slug === name
-      )
+      const env = findEnvironment(result.envs, name)
       if (!env) {
         errorOutput(`Environment "${name}" not found`)
         info(`Available: ${result.envs.map(e => e.name).join(', ')}`)
@@ -301,7 +305,7 @@ async function push(
   }
 }
 
-function parseEnvFile(content: string): Record<string, string> {
+export function parseEnvFile(content: string): Record<string, string> {
   const variables: Record<string, string> = {}
 
   for (const line of content.split('\n')) {

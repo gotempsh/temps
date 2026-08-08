@@ -185,7 +185,7 @@ async function fetchTeams(): Promise<TeamResponse[]> {
   return data?.teams ?? []
 }
 
-async function resolveTeamId(teamRef: string): Promise<number> {
+export async function resolveTeamId(teamRef: string): Promise<number> {
   if (/^\d+$/.test(teamRef)) {
     return Number(teamRef)
   }
@@ -199,7 +199,7 @@ async function resolveTeamId(teamRef: string): Promise<number> {
   return match.id
 }
 
-async function resolveUserId(userRef: string): Promise<number> {
+export async function resolveUserId(userRef: string): Promise<number> {
   if (/^\d+$/.test(userRef)) {
     return Number(userRef)
   }
@@ -219,7 +219,7 @@ async function resolveUserId(userRef: string): Promise<number> {
  * The access endpoints take a numeric project id, so a slug has to be
  * resolved before the call rather than passed through.
  */
-async function resolveProjectId(flagValue?: string): Promise<number> {
+export async function resolveProjectId(flagValue?: string): Promise<number> {
   const { slug } = await requireProjectSlug(flagValue)
   if (/^\d+$/.test(slug)) {
     return Number(slug)
@@ -236,7 +236,7 @@ async function resolveProjectId(flagValue?: string): Promise<number> {
   return match.id
 }
 
-function parseRole(value: string): TeamRole {
+export function parseRole(value: string): TeamRole {
   const role = value.toLowerCase() as TeamRole
   if (!TEAM_ROLES.includes(role)) {
     throw new Error(`Invalid role '${value}'. Expected one of: ${TEAM_ROLES.join(', ')}`)
@@ -252,7 +252,7 @@ async function promptRole(message: string): Promise<TeamRole> {
   })) as TeamRole
 }
 
-function slugify(name: string): string {
+export function slugify(name: string): string {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')

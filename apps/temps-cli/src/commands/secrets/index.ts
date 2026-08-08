@@ -36,7 +36,7 @@ interface ListResponse {
 // --- Helpers ---
 
 /** Resolve value: if prefixed with @, read from file path */
-function resolveValue(value: string): string {
+export function resolveValue(value: string): string {
   if (value.startsWith('@')) {
     const filePath = value.slice(1)
     try {
@@ -135,6 +135,62 @@ export function registerSecretsCommands(program: Command): void {
     .action(deleteAction)
 }
 
+// --- Body builders ---
+
+export function buildCreateSecretBody(options: CreateOptions): Record<string, unknown> {
+  const secretType = (options.type ?? 'env').toLowerCase()
+  if (secretType !== 'env' && secretType !== 'file') {
+    throw new Error(`Invalid --type: must be "env" or "file"`)
+  }
+  if (secretType === 'file' && !options.mountPath) {
+    throw new Error('--mount-path is required when --type is "file"')
+  }
+
+  const value = resolveValue(options.value)
+
+  const body: Record<string, unknown> = {
+    name: options.name,
+    secret_type: secretType,
+    value,
+  }
+  if (options.mountPath) body.mount_path = options.mountPath
+  if (options.description) body.description = options.description
+  return body
+}
+
+export function buildUpdateSecretBody(
+  options: UpdateOptions & { name: string },
+  current: SecretResponse,
+): Record<string, unknown> {
+  // Value must always be supplied on upsert since the server doesn't return it.
+  if (options.value === undefined) {
+    throw new Error(
+      '--value is required when updating (the server does not echo the existing value). Re-provide it.',
+    )
+  }
+
+  const secretType = (options.type ?? current.secret_type).toLowerCase()
+  if (secretType !== 'env' && secretType !== 'file') {
+    throw new Error(`Invalid --type: must be "env" or "file"`)
+  }
+
+  const body: Record<string, unknown> = {
+    name: options.name,
+    secret_type: secretType,
+    value: resolveValue(options.value),
+  }
+  const mountPath = options.mountPath ?? current.mount_path ?? undefined
+  if (mountPath) body.mount_path = mountPath
+  const description = options.description ?? current.description ?? undefined
+  if (description) body.description = description
+
+  if (secretType === 'file' && !body.mount_path) {
+    throw new Error('--mount-path is required when type is "file"')
+  }
+
+  return body
+}
+
 // --- Actions ---
 
 async function listAction(options: ListOptions): Promise<void> {
@@ -199,23 +255,7 @@ async function createAction(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const secretType = (options.type ?? 'env').toLowerCase()
-  if (secretType !== 'env' && secretType !== 'file') {
-    throw new Error(`Invalid --type: must be "env" or "file"`)
-  }
-  if (secretType === 'file' && !options.mountPath) {
-    throw new Error('--mount-path is required when --type is "file"')
-  }
-
-  const value = resolveValue(options.value)
-
-  const body: Record<string, unknown> = {
-    name: options.name,
-    secret_type: secretType,
-    value,
-  }
-  if (options.mountPath) body.mount_path = options.mountPath
-  if (options.description) body.description = options.description
+  const body = buildCreateSecretBody(options)
 
   const secret = await withSpinner('Saving secret...', async () => {
     const { data, error } = await client.post({
@@ -272,31 +312,7 @@ async function updateAction(options: UpdateOptions & { name: string }): Promise<
     return found
   })
 
-  // Value must always be supplied on upsert since the server doesn't return it.
-  if (options.value === undefined) {
-    throw new Error(
-      '--value is required when updating (the server does not echo the existing value). Re-provide it.',
-    )
-  }
-
-  const secretType = (options.type ?? current.secret_type).toLowerCase()
-  if (secretType !== 'env' && secretType !== 'file') {
-    throw new Error(`Invalid --type: must be "env" or "file"`)
-  }
-
-  const body: Record<string, unknown> = {
-    name: options.name,
-    secret_type: secretType,
-    value: resolveValue(options.value),
-  }
-  const mountPath = options.mountPath ?? current.mount_path ?? undefined
-  if (mountPath) body.mount_path = mountPath
-  const description = options.description ?? current.description ?? undefined
-  if (description) body.description = description
-
-  if (secretType === 'file' && !body.mount_path) {
-    throw new Error('--mount-path is required when type is "file"')
-  }
+  const body = buildUpdateSecretBody(options, current)
 
   const secret = await withSpinner('Updating secret...', async () => {
     const { data, error } = await client.post({

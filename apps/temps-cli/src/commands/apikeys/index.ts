@@ -18,6 +18,31 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 
 const ROLE_TYPES = ['admin', 'developer', 'viewer', 'readonly']
 
+/** Days-from-now -> ISO expiry, or null if the input isn't a positive integer. */
+export function computeExpiryIso(daysInput: string, from: Date = new Date()): string | null {
+  const days = parseInt(daysInput, 10)
+  if (isNaN(days) || days <= 0) {
+    return null
+  }
+  const expiry = new Date(from)
+  expiry.setDate(expiry.getDate() + days)
+  return expiry.toISOString()
+}
+
+export function groupPermissionsByCategory<T extends { category?: string | null }>(
+  permissions: T[],
+): Map<string, T[]> {
+  const categories = new Map<string, T[]>()
+  for (const perm of permissions) {
+    const cat = perm.category || 'Other'
+    if (!categories.has(cat)) {
+      categories.set(cat, [])
+    }
+    categories.get(cat)!.push(perm)
+  }
+  return categories
+}
+
 interface CreateOptions {
   name?: string
   role?: string
@@ -167,14 +192,12 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
 
     // Handle expiration
     if (options.expiresIn) {
-      const days = parseInt(options.expiresIn, 10)
-      if (isNaN(days) || days <= 0) {
+      const iso = computeExpiryIso(options.expiresIn)
+      if (iso === null) {
         warning('Invalid expiration days')
         return
       }
-      const expiry = new Date()
-      expiry.setDate(expiry.getDate() + days)
-      expiresAt = expiry.toISOString()
+      expiresAt = iso
     }
 
     // Handle permissions
@@ -446,15 +469,7 @@ async function listPermissions(options: { json?: boolean }): Promise<void> {
     return
   }
 
-  // Group permissions by category
-  const categories = new Map<string, typeof permissions>()
-  for (const perm of permissions) {
-    const cat = perm.category || 'Other'
-    if (!categories.has(cat)) {
-      categories.set(cat, [])
-    }
-    categories.get(cat)!.push(perm)
-  }
+  const categories = groupPermissionsByCategory(permissions)
 
   for (const [category, perms] of categories) {
     console.log(`\n  ${colors.bold(category)}:`)

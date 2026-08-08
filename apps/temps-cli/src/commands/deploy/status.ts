@@ -1,5 +1,5 @@
 import { requireAuth } from '../../config/store.js'
-import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { setupClient, client } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { getDeployment, getProjectBySlug } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -93,7 +93,7 @@ export async function status(options: StatusOptions): Promise<void> {
   newline()
 }
 
-function calculateDuration(startMs: number, endMs: number): string {
+export function calculateDuration(startMs: number, endMs: number): string {
   const diffMs = (endMs - startMs) * 1000
   const seconds = Math.floor(diffMs / 1000)
   const minutes = Math.floor(seconds / 60)

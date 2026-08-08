@@ -66,7 +66,7 @@ interface DeleteBackupOptions {
   yes?: boolean
 }
 
-interface RetentionCleanupReport {
+export interface RetentionCleanupReport {
   dry_run: boolean
   schedule_id: number | null
   expired: number
@@ -130,6 +130,35 @@ interface RunServiceBackupOptions {
   id: string
   s3SourceId: string
   type?: string
+}
+
+type ScheduleAutomationInput = {
+  type: string
+  retention: string
+  s3SourceId: string
+}
+
+type ScheduleAutomationResult =
+  | { ok: true; backupType: string; retentionDays: number; s3SourceId: number }
+  | { ok: false; error: string }
+
+export function validateCreateScheduleAutomation(options: ScheduleAutomationInput): ScheduleAutomationResult {
+  const backupType = options.type
+  if (backupType !== 'full' && backupType !== 'incremental') {
+    return { ok: false, error: `Invalid backup type: ${backupType}. Supported: full, incremental` }
+  }
+
+  const retentionDays = parseInt(options.retention, 10)
+  if (isNaN(retentionDays) || retentionDays <= 0) {
+    return { ok: false, error: 'Invalid retention period' }
+  }
+
+  const s3SourceId = parseInt(options.s3SourceId, 10)
+  if (isNaN(s3SourceId)) {
+    return { ok: false, error: 'Invalid S3 Source ID' }
+  }
+
+  return { ok: true, backupType, retentionDays, s3SourceId }
 }
 
 export function registerBackupsCommands(program: Command): void {
@@ -358,27 +387,22 @@ async function createSchedule(options: CreateScheduleOptions): Promise<void> {
   const isAutomation = options.yes && options.name && options.type && options.schedule && options.retention && options.s3SourceId
 
   if (isAutomation) {
+    const validated = validateCreateScheduleAutomation({
+      type: options.type!,
+      retention: options.retention!,
+      s3SourceId: options.s3SourceId!,
+    })
+    if (!validated.ok) {
+      warning(validated.error)
+      return
+    }
+
     name = options.name!
-    backupType = options.type!
+    backupType = validated.backupType
     scheduleExpression = options.schedule!
-    retentionDays = parseInt(options.retention!, 10)
+    retentionDays = validated.retentionDays
     description = options.description || null
-    s3SourceId = parseInt(options.s3SourceId!, 10)
-
-    if (backupType !== 'full' && backupType !== 'incremental') {
-      warning(`Invalid backup type: ${backupType}. Supported: full, incremental`)
-      return
-    }
-
-    if (isNaN(retentionDays) || retentionDays <= 0) {
-      warning('Invalid retention period')
-      return
-    }
-
-    if (isNaN(s3SourceId)) {
-      warning('Invalid S3 Source ID')
-      return
-    }
+    s3SourceId = validated.s3SourceId
   } else {
     // Interactive mode
     name = options.name || await promptText({
@@ -1056,10 +1080,7 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const scheduleId = options.scheduleId ? Number.parseInt(options.scheduleId, 10) : undefined
-  if (options.scheduleId && (!Number.isInteger(scheduleId) || scheduleId! <= 0)) {
-    throw new Error('--schedule-id must be a positive integer')
-  }
+  const scheduleId = parseCleanupScheduleId(options.scheduleId)
 
   const preview = await withSpinner('Previewing expired backups...', async () => {
     const { data, error } = await client.post<RetentionCleanupReport>({
@@ -1126,14 +1147,7 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
         return data
       },
     )
-    report.expired += result.expired
-    report.deleted += result.deleted
-    report.failed += result.failed
-    report.failures.push(...result.failures)
-    const remainingSampleSlots = Math.max(0, 100 - report.candidate_backup_ids.length)
-    report.candidate_backup_ids.push(...result.candidate_backup_ids.slice(0, remainingSampleSlots))
-    report.candidate_backup_ids_truncated ||=
-      result.candidate_backup_ids_truncated || result.candidate_backup_ids.length > remainingSampleSlots
+    accumulateCleanupBatch(report, result)
     if (!current.candidate_backup_ids_truncated || result.failed > 0) break
     batch = await withSpinner('Previewing the next cleanup batch...', async () => {
       const { data, error } = await client.post<RetentionCleanupReport>({
@@ -1160,7 +1174,32 @@ async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
 
 // Helpers
 
-function formatBytes(bytes?: number | null): string {
+export function parseCleanupScheduleId(value?: string): number | undefined {
+  if (!value) return undefined
+  const scheduleId = Number.parseInt(value, 10)
+  if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+    throw new Error('--schedule-id must be a positive integer')
+  }
+  return scheduleId
+}
+
+/**
+ * Merges one cleanup batch's report into the running total, capping the
+ * sampled `candidate_backup_ids` at 100 entries (mirrors the server's own
+ * cap) and flagging truncation whenever a batch had more ids than fit.
+ */
+export function accumulateCleanupBatch(report: RetentionCleanupReport, result: RetentionCleanupReport): void {
+  report.expired += result.expired
+  report.deleted += result.deleted
+  report.failed += result.failed
+  report.failures.push(...result.failures)
+  const remainingSampleSlots = Math.max(0, 100 - report.candidate_backup_ids.length)
+  report.candidate_backup_ids.push(...result.candidate_backup_ids.slice(0, remainingSampleSlots))
+  report.candidate_backup_ids_truncated ||=
+    result.candidate_backup_ids_truncated || result.candidate_backup_ids.length > remainingSampleSlots
+}
+
+export function formatBytes(bytes?: number | null): string {
   if (bytes === undefined || bytes === null) return '-'
   if (bytes === 0) return '0 B'
 
@@ -1171,7 +1210,7 @@ function formatBytes(bytes?: number | null): string {
   return `${size.toFixed(1)} ${units[i]}`
 }
 
-function maskSecret(value: string): string {
+export function maskSecret(value: string): string {
   if (value.length <= 4) return '***'
   return value.slice(0, 4) + '***' + value.slice(-2)
 }

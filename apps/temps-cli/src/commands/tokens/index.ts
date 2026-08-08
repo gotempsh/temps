@@ -1,8 +1,8 @@
 import type { Command } from 'commander'
 import { requireAuth, config, credentials } from '../../config/store.js'
-import { setupClient, normalizeApiUrl, getWebUrl, getErrorMessage } from '../../lib/api-client.js'
+import { setupClient, normalizeApiUrl } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
-import { colors, header, icons, info, json, keyValue, newline, success, warning, error as errorOutput } from '../../ui/output.js'
+import { colors, header, icons, info, json, keyValue, newline, success, warning } from '../../ui/output.js'
 import { promptConfirm, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
@@ -103,7 +103,18 @@ async function makeRequest<T>(
   return response.json() as Promise<T>
 }
 
-async function resolveProjectId(projectSlug: string): Promise<number> {
+/** Days-from-now -> ISO expiry, or null if the input isn't a positive integer. */
+export function computeExpiryIso(daysInput: string, from: Date = new Date()): string | null {
+  const days = parseInt(daysInput, 10)
+  if (isNaN(days) || days <= 0) {
+    return null
+  }
+  const expiry = new Date(from)
+  expiry.setDate(expiry.getDate() + days)
+  return expiry.toISOString()
+}
+
+export async function resolveProjectId(projectSlug: string): Promise<number> {
   // Try to parse as number first
   const numId = parseInt(projectSlug, 10)
   if (!isNaN(numId)) {
@@ -258,14 +269,12 @@ async function createTokenAction(options: CreateOptions): Promise<void> {
     }
 
     if (options.expiresIn && options.expiresIn !== 'never') {
-      const days = parseInt(options.expiresIn, 10)
-      if (isNaN(days) || days <= 0) {
+      const iso = computeExpiryIso(options.expiresIn)
+      if (iso === null) {
         warning('Invalid expiration days')
         return
       }
-      const expiry = new Date()
-      expiry.setDate(expiry.getDate() + days)
-      expiresAt = expiry.toISOString()
+      expiresAt = iso
     }
   } else {
     // Interactive mode

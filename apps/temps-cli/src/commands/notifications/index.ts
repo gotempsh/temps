@@ -79,6 +79,124 @@ interface EnableDisableOptions {
   json?: boolean
 }
 
+interface CurrentSlackConfig {
+  webhook_url?: string
+  channel?: string | null
+}
+
+interface SlackProviderConfig {
+  webhook_url: string
+  channel?: string | null
+}
+
+interface CurrentEmailConfig {
+  smtp_host?: string
+  smtp_port?: number
+  username?: string
+  password?: string
+  from_address?: string
+  from_name?: string | null
+  to_addresses?: string[]
+}
+
+interface EmailProviderConfig {
+  smtp_host: string
+  smtp_port: number
+  username: string
+  password: string
+  from_address: string
+  from_name?: string | null
+  to_addresses: string[]
+}
+
+interface WebhookProviderConfig {
+  url?: string
+  method?: string
+  headers?: Record<string, string>
+  timeout_secs?: number
+}
+
+/** Parses --enabled; returns 'invalid' rather than throwing so the caller keeps its warn-and-exit UX. */
+export function parseEnabledFlag(value: string | undefined): boolean | undefined | 'invalid' {
+  if (value === undefined) return undefined
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return 'invalid'
+}
+
+export function hasSlackConfigChanges(options: { webhookUrl?: string; channel?: string }): boolean {
+  return options.webhookUrl !== undefined || options.channel !== undefined
+}
+
+export function hasEmailConfigChanges(options: {
+  smtpHost?: string
+  smtpPort?: string
+  username?: string
+  password?: string
+  fromAddress?: string
+  fromName?: string
+  toAddresses?: string
+}): boolean {
+  return options.smtpHost !== undefined || options.smtpPort !== undefined
+    || options.username !== undefined || options.password !== undefined
+    || options.fromAddress !== undefined || options.fromName !== undefined
+    || options.toAddresses !== undefined
+}
+
+export function hasWebhookConfigChanges(options: { url?: string; method?: string }): boolean {
+  return options.url !== undefined || options.method !== undefined
+}
+
+/** Merges --webhook-url/--channel over the provider's existing config so unspecified fields survive a partial update. */
+export function buildSlackConfigUpdate(
+  options: { webhookUrl?: string; channel?: string },
+  current: CurrentSlackConfig | null,
+): SlackProviderConfig {
+  return {
+    webhook_url: options.webhookUrl ?? current?.webhook_url ?? '',
+    channel: options.channel !== undefined ? (options.channel || null) : (current?.channel ?? null),
+  }
+}
+
+/** Merges SMTP flags over the provider's existing config so unspecified fields survive a partial update. */
+export function buildEmailConfigUpdate(
+  options: {
+    smtpHost?: string
+    smtpPort?: string
+    username?: string
+    password?: string
+    fromAddress?: string
+    fromName?: string
+    toAddresses?: string
+  },
+  current: CurrentEmailConfig | null,
+): EmailProviderConfig {
+  return {
+    smtp_host: options.smtpHost ?? current?.smtp_host ?? '',
+    smtp_port: options.smtpPort ? parseInt(options.smtpPort, 10) : (current?.smtp_port ?? 587),
+    username: options.username ?? current?.username ?? '',
+    password: options.password ?? current?.password ?? '',
+    from_address: options.fromAddress ?? current?.from_address ?? '',
+    from_name: options.fromName !== undefined ? (options.fromName || null) : (current?.from_name ?? null),
+    to_addresses: options.toAddresses
+      ? options.toAddresses.split(',').map((a) => a.trim())
+      : (current?.to_addresses ?? []),
+  }
+}
+
+/** Merges --url/--method over the provider's existing config so unspecified fields survive a partial update. */
+export function buildWebhookConfigUpdate(
+  options: { url?: string; method?: string },
+  current: WebhookProviderConfig | null,
+): WebhookProviderConfig {
+  return {
+    url: options.url ?? current?.url ?? '',
+    method: options.method ?? current?.method ?? 'POST',
+    headers: current?.headers ?? {},
+    timeout_secs: current?.timeout_secs ?? 30,
+  }
+}
+
 export function registerNotificationsCommands(program: Command): void {
   const notifications = program
     .command('notifications')
@@ -462,25 +580,17 @@ async function updateProvider(options: UpdateOptions): Promise<void> {
   const providerType = provider.provider_type
 
   // Parse enabled flag if provided
-  let enabled: boolean | undefined
-  if (options.enabled !== undefined) {
-    if (options.enabled === 'true') {
-      enabled = true
-    } else if (options.enabled === 'false') {
-      enabled = false
-    } else {
-      warning('Invalid value for --enabled. Use "true" or "false"')
-      return
-    }
+  const parsedEnabled = parseEnabledFlag(options.enabled)
+  if (parsedEnabled === 'invalid') {
+    warning('Invalid value for --enabled. Use "true" or "false"')
+    return
   }
+  const enabled = parsedEnabled
 
   // Check if any type-specific config options were provided
-  const hasSlackConfig = options.webhookUrl !== undefined || options.channel !== undefined
-  const hasEmailConfig = options.smtpHost !== undefined || options.smtpPort !== undefined
-    || options.username !== undefined || options.password !== undefined
-    || options.fromAddress !== undefined || options.fromName !== undefined
-    || options.toAddresses !== undefined
-  const hasWebhookConfig = options.url !== undefined || options.method !== undefined
+  const hasSlackConfig = hasSlackConfigChanges(options)
+  const hasEmailConfig = hasEmailConfigChanges(options)
+  const hasWebhookConfig = hasWebhookConfigChanges(options)
 
   // Route to type-specific update if config changes are provided
   if (providerType === 'slack' && hasSlackConfig) {
@@ -530,10 +640,7 @@ async function updateSlackProviderAction(
       body: {
         name: options.name ?? undefined,
         enabled: enabled ?? undefined,
-        config: {
-          webhook_url: options.webhookUrl ?? currentConfig?.webhook_url ?? '',
-          channel: options.channel !== undefined ? (options.channel || null) : (currentConfig?.channel ?? null),
-        },
+        config: buildSlackConfigUpdate(options, currentConfig),
       },
     })
     if (error) {
@@ -573,17 +680,7 @@ async function updateEmailProviderAction(
       body: {
         name: options.name ?? undefined,
         enabled: enabled ?? undefined,
-        config: {
-          smtp_host: options.smtpHost ?? currentConfig?.smtp_host ?? '',
-          smtp_port: options.smtpPort ? parseInt(options.smtpPort, 10) : (currentConfig?.smtp_port ?? 587),
-          username: options.username ?? currentConfig?.username ?? '',
-          password: options.password ?? currentConfig?.password ?? '',
-          from_address: options.fromAddress ?? currentConfig?.from_address ?? '',
-          from_name: options.fromName !== undefined ? (options.fromName || null) : (currentConfig?.from_name ?? null),
-          to_addresses: options.toAddresses
-            ? options.toAddresses.split(',').map((a) => a.trim())
-            : (currentConfig?.to_addresses ?? []),
-        },
+        config: buildEmailConfigUpdate(options, currentConfig),
       },
     })
     if (error) {
@@ -620,12 +717,7 @@ async function updateWebhookProviderAction(
       body: {
         name: options.name ?? undefined,
         enabled: enabled ?? undefined,
-        config: {
-          url: options.url ?? currentConfig?.url ?? '',
-          method: options.method ?? currentConfig?.method ?? 'POST',
-          headers: currentConfig?.headers ?? {},
-          timeout_secs: currentConfig?.timeout_secs ?? 30,
-        },
+        config: buildWebhookConfigUpdate(options, currentConfig),
       },
     })
     if (error) {

@@ -34,13 +34,7 @@ async function listTemplatesAction(options: { json?: boolean; type?: string }): 
     return data
   })
 
-  let presets = presetsData?.presets ?? []
-
-  if (options.type) {
-    presets = presets.filter(
-      (p) => p.project_type.toLowerCase() === options.type!.toLowerCase()
-    )
-  }
+  const presets = filterPresetsByType(presetsData?.presets ?? [], options.type)
 
   if (options.json) {
     json(presets)
@@ -62,7 +56,7 @@ async function listTemplatesAction(options: { json?: boolean; type?: string }): 
     { header: 'Type', key: 'project_type', color: (v) => colors.primary(v) },
     {
       header: 'Port',
-      accessor: (p) => (p.default_port != null ? String(p.default_port) : '-'),
+      accessor: (p) => formatPresetPort(p.default_port),
       color: (v) => (v === '-' ? colors.muted(v) : v),
     },
     { header: 'Description', key: 'description', color: (v) => colors.muted(v) },
@@ -70,4 +64,21 @@ async function listTemplatesAction(options: { json?: boolean; type?: string }): 
 
   printTable(presets, columns, { style: 'minimal' })
   newline()
+}
+
+/**
+ * --type is compared case-insensitively so `--type Server` matches presets
+ * whose project_type is stored as "server" — otherwise a script would get a
+ * silent empty result instead of the templates it expected.
+ */
+export function filterPresetsByType(
+  presets: PresetResponse[],
+  type: string | undefined
+): PresetResponse[] {
+  if (!type) return presets
+  return presets.filter((p) => p.project_type.toLowerCase() === type.toLowerCase())
+}
+
+export function formatPresetPort(port: number | null | undefined): string {
+  return port != null ? String(port) : '-'
 }

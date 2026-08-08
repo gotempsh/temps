@@ -77,6 +77,62 @@ interface DeliveriesRetryOptions {
   deliveryId: string
 }
 
+/** Resolves --events for non-interactive `create`: "all" or a validated comma list. */
+export function resolveCreateEvents(
+  input: string,
+  allEventTypes: string[],
+): { events: string[] } | { invalidEvent: string } {
+  if (input.toLowerCase() === 'all') {
+    return { events: allEventTypes }
+  }
+  const events = input.split(',').map((e) => e.trim())
+  const invalidEvent = events.find((event) => !allEventTypes.includes(event))
+  if (invalidEvent) {
+    return { invalidEvent }
+  }
+  return { events }
+}
+
+/** Resolves the interactive `create` prompt's 1-based index list, dropping out-of-range picks. */
+export function selectEventsByIndex(
+  input: string,
+  eventTypes: Array<{ event_type: string }>,
+): string[] {
+  const indices = input.split(',').map((s) => parseInt(s.trim(), 10) - 1)
+  return indices
+    .filter((i) => i >= 0 && i < eventTypes.length)
+    .map((i) => eventTypes[i]!.event_type)
+}
+
+/** Resolves --events for `update`: "all" or a comma list — unlike create, not validated against known types. */
+export function parseWebhookEventsList(input: string, allEventTypes: string[]): string[] {
+  return input.toLowerCase() === 'all'
+    ? allEventTypes
+    : input.split(',').map((e) => e.trim())
+}
+
+export function groupEventsByCategory<T extends { category?: string | null }>(
+  events: T[],
+): Map<string, T[]> {
+  const categories = new Map<string, T[]>()
+  for (const event of events) {
+    const cat = event.category || 'Other'
+    if (!categories.has(cat)) {
+      categories.set(cat, [])
+    }
+    categories.get(cat)!.push(event)
+  }
+  return categories
+}
+
+export function formatDeliveryPayload(payload: string): string {
+  try {
+    return JSON.stringify(JSON.parse(payload), null, 2)
+  } catch {
+    return payload
+  }
+}
+
 export function registerWebhooksCommands(program: Command): void {
   const webhooks = program
     .command('webhooks')
@@ -264,19 +320,13 @@ async function createWebhookAction(options: CreateOptions): Promise<void> {
     secret = options.secret || null
 
     // Parse events
-    if (options.events!.toLowerCase() === 'all') {
-      selectedEvents = eventTypeStrings
-    } else {
-      selectedEvents = options.events!.split(',').map(e => e.trim())
-      // Validate events
-      for (const event of selectedEvents) {
-        if (!eventTypeStrings.includes(event)) {
-          warning(`Invalid event type: ${event}`)
-          info(`Available events: ${eventTypeStrings.join(', ')}`)
-          return
-        }
-      }
+    const resolved = resolveCreateEvents(options.events!, eventTypeStrings)
+    if ('invalidEvent' in resolved) {
+      warning(`Invalid event type: ${resolved.invalidEvent}`)
+      info(`Available events: ${eventTypeStrings.join(', ')}`)
+      return
     }
+    selectedEvents = resolved.events
   } else {
     // Interactive mode
     url = options.url || await promptText({
@@ -296,10 +346,7 @@ async function createWebhookAction(options: CreateOptions): Promise<void> {
     if (eventInput.toLowerCase() === 'all') {
       selectedEvents = eventTypeStrings
     } else {
-      const indices = eventInput.split(',').map(s => parseInt(s.trim(), 10) - 1)
-      selectedEvents = indices
-        .filter(i => i >= 0 && i < eventTypesData.length)
-        .map(i => eventTypesData[i]!.event_type)
+      selectedEvents = selectEventsByIndex(eventInput, eventTypesData)
     }
 
     if (selectedEvents.length === 0) {
@@ -397,6 +444,7 @@ async function updateWebhookAction(options: UpdateOptions): Promise<void> {
   }
 
   if (options.events) {
+    let allEventTypes: string[] = []
     if (options.events.toLowerCase() === 'all') {
       // Fetch available event types to resolve "all"
       const { data: eventTypesData } = await listEventTypes({ client })
@@ -404,10 +452,9 @@ async function updateWebhookAction(options: UpdateOptions): Promise<void> {
         warning('No event types available')
         return
       }
-      body.events = eventTypesData.map(e => e.event_type)
-    } else {
-      body.events = options.events.split(',').map(e => e.trim())
+      allEventTypes = eventTypesData.map(e => e.event_type)
     }
+    body.events = parseWebhookEventsList(options.events, allEventTypes)
   }
 
   if (options.secret) {
@@ -535,14 +582,7 @@ async function listEvents(options: { json?: boolean }): Promise<void> {
   }
 
   // Group events by category
-  const categories = new Map<string, typeof events>()
-  for (const event of events) {
-    const cat = event.category || 'Other'
-    if (!categories.has(cat)) {
-      categories.set(cat, [])
-    }
-    categories.get(cat)!.push(event)
-  }
+  const categories = groupEventsByCategory(events)
 
   for (const [category, categoryEvents] of categories) {
     console.log(`\n  ${colors.bold(category)}:`)
@@ -654,12 +694,7 @@ async function showDeliveryAction(options: DeliveriesShowOptions): Promise<void>
 
   newline()
   header('Payload')
-  try {
-    const parsed = JSON.parse(delivery.payload)
-    console.log(JSON.stringify(parsed, null, 2))
-  } catch {
-    console.log(delivery.payload)
-  }
+  console.log(formatDeliveryPayload(delivery.payload))
   newline()
 }
 

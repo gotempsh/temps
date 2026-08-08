@@ -31,7 +31,7 @@ const DEPLOY_YML_KEY = 'deploy_yml'
  */
 const TOKEN_AND_URL_SOURCES = new Set<ImportSource>(['coolify', 'dokploy', 'caprover', 'portainer'])
 
-function tokenLabel(source: ImportSource): string {
+export function tokenLabel(source: ImportSource): string {
   switch (source) {
     case 'caprover':
     case 'portainer':

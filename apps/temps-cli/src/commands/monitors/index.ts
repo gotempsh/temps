@@ -26,6 +26,40 @@ const CHECK_INTERVALS = [
   { name: '30 minutes', value: 1800 },
 ]
 
+export function isValidMonitorType(type: string): boolean {
+  return MONITOR_TYPES.includes(type)
+}
+
+export function isValidCheckInterval(interval: number): boolean {
+  return CHECK_INTERVALS.some((c) => c.value === interval)
+}
+
+/**
+ * Validates and normalizes `--check-path`. The backend validates too, but we
+ * fail fast here with a friendly message so a malformed path never leaves the
+ * client (e.g. an agent forgetting the leading "/").
+ */
+export function normalizeCheckPath(rawCheckPath: string | undefined): string | undefined {
+  const checkPath = rawCheckPath?.trim()
+  if (checkPath && !checkPath.startsWith('/')) {
+    throw new Error(`--check-path must start with "/" (got "${checkPath}")`)
+  }
+  return checkPath
+}
+
+export function uptimeColor(percentage: number): (text: string) => string {
+  if (percentage >= 99) return colors.success
+  if (percentage >= 95) return colors.warning
+  return colors.error
+}
+
+export function historyTimeRange(days: number, now: Date = new Date()): { startTime: string; endTime: string } {
+  const endTime = new Date(now)
+  const startTime = new Date(now)
+  startTime.setDate(startTime.getDate() - days)
+  return { startTime: startTime.toISOString(), endTime: endTime.toISOString() }
+}
+
 interface ListOptions {
   projectId: string
   json?: boolean
@@ -200,14 +234,14 @@ async function createMonitorAction(options: CreateOptions): Promise<void> {
     environmentId = options.environmentId ? parseInt(options.environmentId, 10) : 0
 
     // Validate monitor type
-    if (!MONITOR_TYPES.includes(monitorType)) {
+    if (!isValidMonitorType(monitorType)) {
       warning(`Invalid monitor type: ${monitorType}. Available: ${MONITOR_TYPES.join(', ')}`)
       return
     }
 
     // Validate check interval
-    const validIntervals = CHECK_INTERVALS.map(c => c.value)
-    if (!validIntervals.includes(checkInterval)) {
+    if (!isValidCheckInterval(checkInterval)) {
+      const validIntervals = CHECK_INTERVALS.map(c => c.value)
       warning(`Invalid interval: ${checkInterval}. Available: ${validIntervals.join(', ')}`)
       return
     }
@@ -237,12 +271,8 @@ async function createMonitorAction(options: CreateOptions): Promise<void> {
     environmentId = options.environmentId ? parseInt(options.environmentId, 10) : 0
   }
 
-  // Optional custom health-check path (e.g. /api/healthz). The backend validates
-  // too, but fail fast here with a friendly message.
-  const checkPath = options.checkPath?.trim()
-  if (checkPath && !checkPath.startsWith('/')) {
-    throw new Error(`--check-path must start with "/" (got "${checkPath}")`)
-  }
+  // Optional custom health-check path (e.g. /api/healthz).
+  const checkPath = normalizeCheckPath(options.checkPath)
 
   await withSpinner('Creating monitor...', async () => {
     const { error } = await createMonitor({
@@ -402,8 +432,7 @@ async function getMonitorStatusAction(options: StatusOptions & { project?: strin
       keyValue('Avg Response Time', `${Math.round(status.avg_response_time_ms)}ms`)
     }
     if (status.uptime_percentage !== null && status.uptime_percentage !== undefined) {
-      const uptimeColor = status.uptime_percentage >= 99 ? colors.success : status.uptime_percentage >= 95 ? colors.warning : colors.error
-      keyValue('Uptime', uptimeColor(`${status.uptime_percentage.toFixed(2)}%`))
+      keyValue('Uptime', uptimeColor(status.uptime_percentage)(`${status.uptime_percentage.toFixed(2)}%`))
     }
     if (status.last_check_at) {
       keyValue('Last Check', new Date(status.last_check_at).toLocaleString())
@@ -497,9 +526,7 @@ async function getMonitorHistory(options: HistoryOptions): Promise<void> {
   const days = parseInt(options.days || '7', 10)
 
   // Calculate start_time and end_time based on days
-  const endTime = new Date()
-  const startTime = new Date()
-  startTime.setDate(startTime.getDate() - days)
+  const { startTime, endTime } = historyTimeRange(days)
 
   const history = await withSpinner('Fetching history...', async () => {
     const { data, error } = await getUptimeHistory({
@@ -507,8 +534,8 @@ async function getMonitorHistory(options: HistoryOptions): Promise<void> {
       path: { monitor_id: id },
       query: {
         days,
-        start_time: startTime.toISOString(),
-        end_time: endTime.toISOString(),
+        start_time: startTime,
+        end_time: endTime,
       },
     })
     if (error) {

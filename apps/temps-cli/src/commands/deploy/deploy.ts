@@ -71,7 +71,7 @@ async function getRepositoryId(
   }
 }
 
-function getRelativeTime(date: Date): string {
+export function getRelativeTime(date: Date): string {
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000)
   if (seconds < 60) return 'just now'
   const minutes = Math.floor(seconds / 60)

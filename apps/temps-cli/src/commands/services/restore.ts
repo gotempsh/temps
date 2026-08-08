@@ -258,14 +258,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
 
   // Step 4: confirmation.
   if (!options.yes) {
-    const modeLabel =
-      mode.mode === 'in_place'
-        ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
-        : mode.mode === 'new_service'
-          ? `Clone into new service '${targetName}'`
-          : mode.to_new_service
-            ? `Point-in-time recovery → new service '${targetName}'`
-            : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+    const modeLabel = describeRestoreMode(mode, serviceName, targetName)
     newline()
     header(`${icons.arrow} ${modeLabel}`)
     keyValue('Source service', `${serviceName} (id ${serviceId}, ${serviceType})`)
@@ -275,10 +268,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     }
     newline()
     const go = await promptConfirm({
-      message:
-        mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
-          ? `This will OVERWRITE data on '${serviceName}'. Continue?`
-          : `Proceed with restore?`,
+      message: describeRestoreConfirmPrompt(mode, serviceName),
       default: false,
     })
     if (!go) {
@@ -423,6 +413,33 @@ async function showRunAction(options: RestoreRunShowOptions): Promise<void> {
 
 // ---- Helpers -------------------------------------------------------------
 
+/**
+ * Describe the confirmation header shown before a restore runs. Getting the
+ * DESTRUCTIVE/OVERWRITE wording right matters: it's the only warning a human
+ * operator sees before data on the source service is replaced in place.
+ */
+export function describeRestoreMode(
+  mode: RestoreRequestMode,
+  serviceName: string,
+  targetName?: string,
+): string {
+  return mode.mode === 'in_place'
+    ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
+    : mode.mode === 'new_service'
+      ? `Clone into new service '${targetName}'`
+      : mode.to_new_service
+        ? `Point-in-time recovery → new service '${targetName}'`
+        : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+}
+
+/** Only in-place restores (or PITR that stays in place) overwrite the source
+ *  service, so only those get the OVERWRITE warning in the confirm prompt. */
+export function describeRestoreConfirmPrompt(mode: RestoreRequestMode, serviceName: string): string {
+  return mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
+    ? `This will OVERWRITE data on '${serviceName}'. Continue?`
+    : `Proceed with restore?`
+}
+
 async function askForBackupId(): Promise<number> {
   const value = await promptText({
     message: 'Backup ID to restore from:',
@@ -485,7 +502,7 @@ async function pollRestoreRun(runId: number): Promise<RestoreRunView> {
   throw new Error('Restore poll timeout')
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let v = n

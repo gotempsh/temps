@@ -12,7 +12,7 @@ import {
 import type { IncidentResponse, IncidentUpdateResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
+import { promptText, promptSelect } from '../../ui/prompts.js'
 import {
   newline, header, icons, json, colors, success, info, warning,
   keyValue, formatDate,
@@ -136,7 +136,7 @@ export function registerIncidentsCommands(program: Command): void {
     .action(bucketedAction)
 }
 
-function severityColor(severity: string): string {
+export function severityColor(severity: string): string {
   switch (severity) {
     case 'critical':
       return colors.error(severity)
@@ -149,7 +149,7 @@ function severityColor(severity: string): string {
   }
 }
 
-function incidentStatusBadge(status: string): string {
+export function incidentStatusBadge(status: string): string {
   switch (status) {
     case 'resolved':
       return statusBadge('active')
@@ -162,6 +162,49 @@ function incidentStatusBadge(status: string): string {
     default:
       return status
   }
+}
+
+export function isValidSeverity(severity: string): boolean {
+  return SEVERITY_LEVELS.some((s) => s.value === severity)
+}
+
+export function isValidIncidentStatus(status: string): boolean {
+  return INCIDENT_STATUSES.some((s) => s.value === status)
+}
+
+/**
+ * The list endpoint may return a bare array or a paginated `{ data: [...] }`
+ * envelope. Typed `unknown` because the SDK's generated response type for
+ * this endpoint is `unknown` (no response body schema in the OpenAPI spec).
+ */
+export function extractIncidentsList(data: unknown): IncidentResponse[] {
+  if (Array.isArray(data)) return data as IncidentResponse[]
+  return (data as { data?: IncidentResponse[] } | undefined)?.data ?? []
+}
+
+export function buildBucketedQuery(options: {
+  interval?: string
+  startTime?: string
+  endTime?: string
+  environmentId?: string
+}): Record<string, string | number> {
+  const query: Record<string, string | number> = {}
+  if (options.interval) {
+    query.interval = options.interval
+  }
+  if (options.startTime) {
+    query.start_time = options.startTime
+  }
+  if (options.endTime) {
+    query.end_time = options.endTime
+  }
+  if (options.environmentId) {
+    const envId = parseInt(options.environmentId, 10)
+    if (!isNaN(envId)) {
+      query.environment_id = envId
+    }
+  }
+  return query
 }
 
 async function listIncidentsAction(options: ListOptions): Promise<void> {
@@ -193,8 +236,7 @@ async function listIncidentsAction(options: ListOptions): Promise<void> {
       throw new Error(getErrorMessage(error))
     }
     // data may be an array or a paginated response
-    if (Array.isArray(data)) return data
-    return (data as { data?: IncidentResponse[] })?.data ?? []
+    return extractIncidentsList(data)
   })
 
   if (options.json) {
@@ -246,8 +288,8 @@ async function createIncidentAction(options: CreateOptions): Promise<void> {
     description = options.description || null
     severity = options.severity!
 
-    const validSeverities = SEVERITY_LEVELS.map(s => s.value)
-    if (!validSeverities.includes(severity)) {
+    if (!isValidSeverity(severity)) {
+      const validSeverities = SEVERITY_LEVELS.map(s => s.value)
       warning(`Invalid severity: ${severity}. Available: ${validSeverities.join(', ')}`)
       return
     }
@@ -375,8 +417,8 @@ async function updateStatusAction(options: UpdateStatusOptions): Promise<void> {
     })
   }
 
-  const validStatuses = INCIDENT_STATUSES.map(s => s.value)
-  if (!validStatuses.includes(status)) {
+  if (!isValidIncidentStatus(status)) {
+    const validStatuses = INCIDENT_STATUSES.map(s => s.value)
     warning(`Invalid status: ${status}. Available: ${validStatuses.join(', ')}`)
     return
   }
@@ -462,22 +504,7 @@ async function bucketedAction(options: BucketedOptions): Promise<void> {
     return
   }
 
-  const query: Record<string, string | number> = {}
-  if (options.interval) {
-    query.interval = options.interval
-  }
-  if (options.startTime) {
-    query.start_time = options.startTime
-  }
-  if (options.endTime) {
-    query.end_time = options.endTime
-  }
-  if (options.environmentId) {
-    const envId = parseInt(options.environmentId, 10)
-    if (!isNaN(envId)) {
-      query.environment_id = envId
-    }
-  }
+  const query = buildBucketedQuery(options)
 
   const result = await withSpinner('Fetching bucketed incident data...', async () => {
     const { data, error } = await getBucketedIncidents({

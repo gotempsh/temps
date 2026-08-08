@@ -83,7 +83,7 @@ const MANUAL_SOURCE_TYPES: {
  * Requiring exactly two segments rejected every repo in a subgroup, even
  * though the backend supported them.
  */
-function parseRepoPath(repo: string): { owner: string; name: string } | null {
+export function parseRepoPath(repo: string): { owner: string; name: string } | null {
   const lastSlash = repo.lastIndexOf('/')
   if (lastSlash <= 0 || lastSlash === repo.length - 1) return null
   return { owner: repo.slice(0, lastSlash), name: repo.slice(lastSlash + 1) }

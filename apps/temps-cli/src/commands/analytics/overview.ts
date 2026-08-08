@@ -26,7 +26,7 @@ interface LocationCount {
   percentage: number
 }
 
-const SPARKLINE_WIDTH = 48
+export const SPARKLINE_WIDTH = 48
 
 /**
  * Pick a server-side bucket size that renders the *whole* requested period in
@@ -36,7 +36,7 @@ const SPARKLINE_WIDTH = 48
  * last 48 of them, so `--period 7d` and `--period 30d` both silently drew the
  * same last-two-days sparkline under a header claiming a much longer range.
  */
-function bucketSizeForRange(startDate: string, endDate: string): string {
+export function bucketSizeForRange(startDate: string, endDate: string): string {
   const hours = (Date.parse(endDate) - Date.parse(startDate)) / 3_600_000
 
   if (hours <= SPARKLINE_WIDTH) return '1 hour'
@@ -50,7 +50,7 @@ function formatNumber(n: number): string {
   return n.toLocaleString('en-US')
 }
 
-function renderSparkline(data: { count: number }[]): string {
+export function renderSparkline(data: { count: number }[]): string {
   const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
   const max = Math.max(...data.map((d) => d.count), 1)
 

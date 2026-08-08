@@ -305,6 +305,29 @@ async function listProviders(options: { json?: boolean }): Promise<void> {
 
 const SUPPORTED_PROVIDERS = ['github', 'gitlab', 'bitbucket', 'gitea', 'generic']
 
+export type BitbucketAuth =
+  | { type: 'access_token'; token: string }
+  | { type: 'app_password'; username: string; password: string }
+
+/**
+ * Resolves Bitbucket auth from flags alone (no prompts) — this is exactly the
+ * path agent-driven `--yes` invocations take, so a wrong branch here sends a
+ * malformed `auth` body to the API instead of failing loudly beforehand.
+ */
+export function resolveBitbucketAuthNonInteractive(
+  options: Pick<AddOptions, 'username' | 'password' | 'token'>,
+): BitbucketAuth {
+  if (options.username) {
+    const password = options.password || options.token || ''
+    if (!password) throw new Error('Bitbucket app password is required (use --password or -t/--token)')
+    return { type: 'app_password', username: options.username, password }
+  }
+  if (options.token) {
+    return { type: 'access_token', token: options.token }
+  }
+  throw new Error('Bitbucket access token is required (use -t/--token), or --username for app-password auth')
+}
+
 async function addProvider(options: AddOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -370,13 +393,14 @@ async function addProvider(options: AddOptions): Promise<void> {
       if (error) throw new Error(getErrorMessage(error))
     } else if (provider === 'bitbucket') {
       // Access token, or app password (username + password). --username selects app-password auth.
-      let auth: { type: 'access_token'; token: string } | { type: 'app_password'; username: string; password: string }
-      if (options.username) {
-        const password = options.password || options.token || (interactive ? await promptPassword({ message: 'Bitbucket app password' }) : '')
+      let auth: BitbucketAuth
+      if (!interactive) {
+        auth = resolveBitbucketAuthNonInteractive(options)
+      } else if (options.username) {
+        const password = options.password || options.token || await promptPassword({ message: 'Bitbucket app password' })
         if (!password) throw new Error('Bitbucket app password is required (use --password or -t/--token)')
         auth = { type: 'app_password', username: options.username, password }
-      } else if (options.token || !interactive) {
-        if (!options.token) throw new Error('Bitbucket access token is required (use -t/--token), or --username for app-password auth')
+      } else if (options.token) {
         auth = { type: 'access_token', token: options.token }
       } else {
         const method = await promptSelect({

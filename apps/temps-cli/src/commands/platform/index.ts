@@ -154,10 +154,9 @@ async function privateIpAction(): Promise<void> {
     return data
   })
 
-  if (result && typeof result === 'object' && 'ip' in result) {
-    success(String((result as { ip: string }).ip))
-  } else if (typeof result === 'string') {
-    success(result)
+  const ip = extractIpValue(result)
+  if (ip !== null) {
+    success(ip)
   } else {
     json(result)
   }
@@ -175,13 +174,27 @@ async function publicIpAction(): Promise<void> {
     return data
   })
 
-  if (result && typeof result === 'object' && 'ip' in result) {
-    success(String((result as { ip: string }).ip))
-  } else if (typeof result === 'string') {
-    success(result)
+  const ip = extractIpValue(result)
+  if (ip !== null) {
+    success(ip)
   } else {
     json(result)
   }
+}
+
+/**
+ * The IP endpoints return either `{ ip: "..." }`, a bare string, or (rarely)
+ * something else entirely. Returning null tells the caller to fall back to
+ * printing raw JSON instead of guessing at a shape that isn't there.
+ */
+export function extractIpValue(result: unknown): string | null {
+  if (result && typeof result === 'object' && 'ip' in result) {
+    return String((result as { ip: string }).ip)
+  }
+  if (typeof result === 'string') {
+    return result
+  }
+  return null
 }
 
 /**
@@ -394,12 +407,8 @@ async function waitForUpdateOutcome(
     try {
       const { data } = await getUpdateCapability({ client })
       const attempt = data?.last_attempt
-      if (
-        attempt &&
-        attempt.status !== 'pending' &&
-        attempt.started_at !== baselineStartedAt
-      ) {
-        return attempt
+      if (isTerminalUpdateAttempt(attempt, baselineStartedAt)) {
+        return attempt as NonNullable<typeof attempt>
       }
     } catch {
       // Server is down mid-restart; keep waiting.
@@ -408,9 +417,59 @@ async function waitForUpdateOutcome(
   return null
 }
 
+/**
+ * True when `attempt` is both terminal (not "pending") and belongs to the
+ * attempt we just kicked off, not a stale one left over from before this
+ * poll started. Guards against reporting a leftover failed/succeeded attempt
+ * as if it were the outcome of the update we're currently waiting on.
+ */
+export function isTerminalUpdateAttempt(
+  attempt: { status: string; started_at: string } | null | undefined,
+  baselineStartedAt: string | null
+): boolean {
+  return Boolean(
+    attempt && attempt.status !== 'pending' && attempt.started_at !== baselineStartedAt
+  )
+}
+
 /** Valid channels, plus the sentinel that clears an explicit pin. */
 const UPDATE_CHANNELS = ['stable', 'beta', 'nightly'] as const
 const CHANNEL_AUTO = 'auto'
+
+/**
+ * Normalizes and validates a requested channel. Returns `{ error }` instead
+ * of throwing so the caller can print the exact same message via the CLI's
+ * error() helper and set the conventional exit code, unchanged from before
+ * this was extracted.
+ */
+export function parseUpdateChannel(
+  channel: string
+): { requested: string; isAuto: boolean } | { error: string } {
+  const requested = channel.trim().toLowerCase()
+  const isAuto = requested === CHANNEL_AUTO
+  if (!isAuto && !UPDATE_CHANNELS.includes(requested as (typeof UPDATE_CHANNELS)[number])) {
+    return {
+      error: `Unknown channel '${channel}'. Use one of: ${UPDATE_CHANNELS.join(', ')}, or ${CHANNEL_AUTO}.`,
+    }
+  }
+  return { requested, isAuto }
+}
+
+/**
+ * Settings PUT replaces the whole document. Defaulting `enabled` to `true`
+ * when it's missing means switching channel never silently disables
+ * self-update as a side effect.
+ */
+export function buildSelfUpdateSettings(
+  current: { self_update?: { enabled?: boolean | null } | null },
+  requested: string,
+  isAuto: boolean
+): { enabled: boolean; channel: string | null } {
+  return {
+    enabled: current.self_update?.enabled ?? true,
+    channel: isAuto ? null : requested,
+  }
+}
 
 /** Force a release check instead of waiting for the server's periodic one. */
 async function updateCheckAction(options: { json?: boolean }): Promise<void> {
@@ -483,15 +542,13 @@ async function updateChannelAction(
     return
   }
 
-  const requested = channel.trim().toLowerCase()
-  const isAuto = requested === CHANNEL_AUTO
-  if (!isAuto && !UPDATE_CHANNELS.includes(requested as (typeof UPDATE_CHANNELS)[number])) {
-    error(
-      `Unknown channel '${channel}'. Use one of: ${UPDATE_CHANNELS.join(', ')}, or ${CHANNEL_AUTO}.`
-    )
+  const parsedChannel = parseUpdateChannel(channel)
+  if ('error' in parsedChannel) {
+    error(parsedChannel.error)
     process.exitCode = 1
     return
   }
+  const { requested, isAuto } = parsedChannel
 
   await withSpinner('Updating channel...', async () => {
     // The settings PUT replaces the whole document, so read-modify-write is
@@ -504,10 +561,7 @@ async function updateChannelAction(
       client,
       body: {
         ...current,
-        self_update: {
-          enabled: current.self_update?.enabled ?? true,
-          channel: isAuto ? null : requested,
-        },
+        self_update: buildSelfUpdateSettings(current, requested, isAuto),
       } as never,
     })
     if (writeErr) {

@@ -80,17 +80,34 @@ silently drift from the catalog.
 
 | Subsystem | UI (`web/e2e`) | CLI (`apps/temps-e2e`) |
 |---|---|---|
-| Deployment & Infrastructure | `project-create`, `navigation`, `drop-handoff` | `scenario`, `examples` |
+| Deployment & Infrastructure | `project-create`, `navigation`, `drop-handoff`, `domain-tls-pebble` | `scenario`, `examples`, `tls-scenario` |
 | Observability | — | — |
 | Data & Storage | `navigation` (databases page only) | — |
 | AI | `ai-chat-layout` | — |
 | Security & Auth | `auth`, `user-creation`, `api-key-create` | — |
-| Platform & Commerce | `command-palette`, `preview-share-link` | — |
+| Platform & Commerce | `command-palette`, `preview-share-link`, `email-provider-mailpit` | `email-scenario` |
 
 Rows with only a dash are not covered end-to-end yet — tracked gaps, not
 silently-assumed coverage. Observability, data-storage (beyond the page
-rendering), security-auth (API keys/RBAC, audit logs), and platform-commerce
-(webhooks, notifications, plugins) are the priority next additions.
+rendering), and security-auth (RBAC, audit logs) are the priority next
+additions.
+
+`domain-tls-pebble` and `email-provider-mailpit` need the local Pebble +
+Mailpit test infra from `apps/temps-e2e/docker-compose.e2e.yml` and a target
+instance actually configured to talk to Pebble (see that package's README —
+`## External-service test infra`). They're a genuine ACME HTTP-01 exchange
+and a genuine SMTP send, not mocked: `domain-tls-pebble` parses the certificate
+the console displays and asserts the issuer is Pebble's test root, and
+`email-provider-mailpit` queries Mailpit's own REST API to confirm the test
+email actually arrived, rather than trusting that the send call returned 200.
+
+**Known gap found while building this coverage**: the console has no UI path
+to attach a provisioned certificate (`/domains`) to a project's custom-domain
+route (`POST /projects/{id}/custom-domains/{domain_id}/link-certificate/{cert_id}`
+is API-only) — so "deploy an app and actually serve it over a custom HTTPS
+domain" isn't reachable through the UI today. `domain-tls-pebble` covers what
+the UI does offer (standalone certificate provisioning); the full
+app-serving path is covered via the API in `tls-scenario`.
 
 ## Mocking third-party services
 
@@ -130,6 +147,15 @@ bun run e2e:report                # open the HTML report after a run
 ```
 
 First run only: `bunx playwright install chromium`.
+
+`domain-tls-pebble` and `email-provider-mailpit` need a **dedicated** instance,
+not a normal `start-temps` slot: `--address` must be `0.0.0.0:5002` specifically
+(Pebble's fixed HTTP-01 validation port), plus `ACME_DIRECTORY_URL`/
+`ACME_INSECURE`/`TEMPS_TELEMETRY=0` and the Pebble/Mailpit containers from
+`apps/temps-e2e/docker-compose.e2e.yml` — see that package's README for the
+full setup. Run them on their own (`bun run e2e -- domain-tls-pebble
+email-provider-mailpit`) against that instance rather than as part of a normal
+slot run.
 
 | Variable | Default | Notes |
 |---|---|---|

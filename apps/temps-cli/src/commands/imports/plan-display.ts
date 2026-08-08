@@ -21,7 +21,7 @@ import type {
   CostAnalysis,
 } from '../../api/types.gen.js'
 
-function riskBadge(risk: RiskLevel): string {
+export function riskBadge(risk: RiskLevel): string {
   switch (risk) {
     case 'none':
       return chalk.gray('NONE')

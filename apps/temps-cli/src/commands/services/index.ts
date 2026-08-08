@@ -78,7 +78,7 @@ interface PromptParam {
   param_type: string
 }
 
-function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
+export function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
   if (!schema?.properties) return []
   const required = new Set(schema.required ?? [])
   const readonly = new Set(schema.readonly ?? [])
@@ -98,7 +98,7 @@ function schemaToPromptParams(schema: JsonSchema): PromptParam[] {
  * Parse repeatable --set key=value pairs into a Record.
  * Supports type coercion: numbers → number, true/false → boolean, rest → string.
  */
-function parseSetPairs(pairs: string[]): Record<string, unknown> {
+export function parseSetPairs(pairs: string[]): Record<string, unknown> {
   const result: Record<string, unknown> = {}
   for (const pair of pairs) {
     const eqIdx = pair.indexOf('=')
@@ -767,7 +767,7 @@ async function listServiceTypes(options: { json?: boolean }): Promise<void> {
 }
 
 /** Build an example `services create` command using --set flags with all schema defaults */
-function buildExampleCommand(type: string, schema?: JsonSchema): string {
+export function buildExampleCommand(type: string, schema?: JsonSchema): string {
   const setParts: string[] = []
   if (schema?.properties) {
     for (const [key, prop] of Object.entries(schema.properties)) {
@@ -1317,7 +1317,7 @@ interface ServiceLogsOptions {
 /** Parse a relative duration string ("15m", "1h", "24h", "7d") into the
  *  equivalent Date in the past, or return null if it is not a recognised
  *  relative format (assumed to be an ISO 8601 string instead). */
-function parseFromFlag(value: string): Date | null {
+export function parseFromFlag(value: string): Date | null {
   const match = value.match(/^(\d+)(m|h|d)$/)
   if (!match || !match[1] || !match[2]) return null
   const n = parseInt(match[1], 10)
@@ -1351,7 +1351,7 @@ const LEVEL_COLORS: Record<string, (s: string) => string> = {
   TRACE: (s: string) => colors.muted(s),
 }
 
-function formatLogTs(ts: string): string {
+export function formatLogTs(ts: string): string {
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return ts
   return d.toISOString().replace('T', ' ').slice(0, 19)
@@ -1474,6 +1474,26 @@ interface ServiceSlowQueriesOptions {
   json?: boolean
 }
 
+/** Wrap the raw API error with actionable setup steps when the cause is a
+ *  missing extension, rather than surfacing a bare Postgres error string. */
+export function buildSlowQueriesErrorMessage(msg: string): string {
+  if (msg.includes('pg_stat_statements')) {
+    return (
+      `pg_stat_statements is not loaded on this service.\n` +
+      `Add it to shared_preload_libraries and restart the service, then try again.\n` +
+      `Detail: ${msg}`
+    )
+  }
+  return msg
+}
+
+/** Collapse whitespace and cap a query string so one long statement cannot
+ *  blow out the table layout. */
+export function truncateQuery(query: string, maxLen = 60): string {
+  const collapsed = query.replace(/\s+/g, ' ').trim()
+  return collapsed.length > maxLen ? collapsed.slice(0, maxLen - 1) + '…' : collapsed
+}
+
 async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -1498,16 +1518,8 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
       },
     })
     if (error) {
-      const msg = getErrorMessage(error)
       // Surface the pg_stat_statements not-loaded error cleanly.
-      if (msg.includes('pg_stat_statements')) {
-        throw new Error(
-          `pg_stat_statements is not loaded on this service.\n` +
-            `Add it to shared_preload_libraries and restart the service, then try again.\n` +
-            `Detail: ${msg}`,
-        )
-      }
-      throw new Error(msg)
+      throw new Error(buildSlowQueriesErrorMessage(getErrorMessage(error)))
     }
     return data
   })
@@ -1528,14 +1540,10 @@ async function serviceSlowQueriesAction(options: ServiceSlowQueriesOptions): Pro
     return
   }
 
-  const MAX_QUERY_LEN = 60
   const columns: TableColumn<SlowQueryRow>[] = [
     {
       header: 'Query',
-      accessor: (row) => {
-        const q = row.query.replace(/\s+/g, ' ').trim()
-        return q.length > MAX_QUERY_LEN ? q.slice(0, MAX_QUERY_LEN - 1) + '…' : q
-      },
+      accessor: (row) => truncateQuery(row.query),
     },
     {
       header: 'Database',
@@ -1584,6 +1592,19 @@ interface ServiceEnablePgStatStatementsOptions {
   yes?: boolean
 }
 
+/** Wrap the raw API error with the manual-restart instructions when a
+ *  clustered Postgres service rejects the self-service restart. */
+export function buildEnablePgStatStatementsErrorMessage(msg: string): string {
+  if (msg.toLowerCase().includes('cluster')) {
+    return (
+      `Self-service restart is not available for clustered Postgres services.\n` +
+      `A rolling restart across all cluster nodes is required — perform it manually.\n` +
+      `Detail: ${msg}`
+    )
+  }
+  return msg
+}
+
 async function serviceEnablePgStatStatementsAction(
   options: ServiceEnablePgStatStatementsOptions,
 ): Promise<void> {
@@ -1615,15 +1636,7 @@ async function serviceEnablePgStatStatementsAction(
       url: `/external-services/${id}/pg-stat-statements/enable`,
     })
     if (error) {
-      const msg = getErrorMessage(error)
-      if (msg.toLowerCase().includes('cluster')) {
-        throw new Error(
-          `Self-service restart is not available for clustered Postgres services.\n` +
-            `A rolling restart across all cluster nodes is required — perform it manually.\n` +
-            `Detail: ${msg}`,
-        )
-      }
-      throw new Error(msg)
+      throw new Error(buildEnablePgStatStatementsErrorMessage(getErrorMessage(error)))
     }
   })
 

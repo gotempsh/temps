@@ -113,7 +113,7 @@ export function registerFunnelsCommands(program: Command): void {
     .action(previewFunnelMetricsAction)
 }
 
-function parseStepsJson(stepsStr: string): CreateFunnelStep[] | null {
+export function parseStepsJson(stepsStr: string): CreateFunnelStep[] | null {
   try {
     const parsed = JSON.parse(stepsStr)
     if (!Array.isArray(parsed)) {

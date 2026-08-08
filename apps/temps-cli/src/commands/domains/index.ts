@@ -16,7 +16,7 @@ import {
   setupDnsChallenge as setupDnsChallengeApi,
   getHttpChallengeDebug,
 } from '../../api/sdk.gen.js'
-import type { DomainResponse, AcmeOrderResponse, HttpChallengeDebugResponse } from '../../api/types.gen.js'
+import type { DomainResponse, AcmeOrderResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -25,13 +25,29 @@ import {
   keyValue, formatDate, box
 } from '../../ui/output.js'
 
+// Exact match only — a case-insensitive or partial match here would let
+// `domains ssl`/`domains status` silently target the wrong domain.
+export function findDomainByName(domains: DomainResponse[], domainName: string): number | null {
+  const domain = domains.find((d) => d.domain === domainName)
+  return domain?.id ?? null
+}
+
 // Helper function to find domain ID by domain name
 async function findDomainIdByName(domainName: string): Promise<number | null> {
   const { data, error } = await listDomainsApi({ client })
   if (error || !data?.domains) return null
 
-  const domain = data.domains.find((d: DomainResponse) => d.domain === domainName)
-  return domain?.id ?? null
+  return findDomainByName(data.domains, domainName)
+}
+
+// The ACME TXT record for a wildcard domain (`*.example.com`) is always
+// scoped to the base domain, never the literal `*.` name.
+export function wildcardBaseDomain(domain: string): string {
+  return domain.startsWith('*.') ? domain.slice(2) : domain
+}
+
+export function isProvisionedStatus(status: string): boolean {
+  return status === 'active' || status === 'provisioned'
 }
 
 interface AddOptions {
@@ -252,7 +268,7 @@ async function addDomain(options: AddOptions): Promise<void> {
   success(`Domain ${domain} added`)
 
   if (result?.dns_challenge_token && result?.dns_challenge_value) {
-    const baseDomain = domain.startsWith('*.') ? domain.slice(2) : domain
+    const baseDomain = wildcardBaseDomain(domain)
     newline()
     box(
       `Type: TXT\n` +
@@ -293,7 +309,7 @@ async function verifyDomain(options: VerifyOptions): Promise<void> {
   // Handle union type based on 'type' discriminator
   if (result.type === 'complete') {
     const domainData = result
-    if (domainData.status === 'active' || domainData.status === 'provisioned') {
+    if (isProvisionedStatus(domainData.status)) {
       success(`Domain ${domain} verified and SSL certificate provisioned`)
     } else {
       warning(`Domain status: ${domainData.status}`)
@@ -636,7 +652,7 @@ async function finalizeOrder(options: OrderFinalizeOptions): Promise<void> {
   }
 
   newline()
-  if (result.status === 'active' || result.status === 'provisioned') {
+  if (isProvisionedStatus(result.status)) {
     success(`ACME order finalized for ${result.domain}`)
     keyValue('Status', statusBadge(result.status))
     if (result.expiration_time) {

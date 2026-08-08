@@ -31,6 +31,75 @@ interface SetPreviewDomainOptions {
   domain: string
 }
 
+/**
+ * Slice of settings this function actually reads back, kept structural
+ * rather than `AppSettings`/`AppSettingsResponse` so it accepts either (the
+ * response type masks some unrelated fields, e.g. dns_provider).
+ */
+interface CurrentSettingsSnapshot {
+  letsencrypt?: { email?: string | null; environment?: string } | null
+  rate_limiting?: { max_requests_per_minute?: number } | null
+}
+
+/**
+ * Builds the settings patch for non-interactive (`-y`) updates. Falls back to
+ * the currently-configured value for fields that share a nested object (e.g.
+ * letsencrypt, rate_limiting) so a partial flag like --letsencrypt-mode alone
+ * doesn't blow away an existing email. Returns an error instead of throwing
+ * so the caller can warn and abort without making an API call.
+ */
+export function buildAutomationSettingsUpdate(
+  options: UpdateOptions,
+  currentSettings: CurrentSettingsSnapshot | undefined,
+): { updates: Partial<AppSettings> } | { error: string } {
+  const updates: Partial<AppSettings> = {}
+
+  if (options.externalUrl) {
+    updates.external_url = options.externalUrl
+  }
+  if (options.previewDomain) {
+    updates.preview_domain = options.previewDomain
+  }
+  if (options.letsencryptEmail || options.letsencryptMode) {
+    updates.letsencrypt = {
+      email: options.letsencryptEmail || currentSettings?.letsencrypt?.email || '',
+      environment: options.letsencryptMode || currentSettings?.letsencrypt?.environment || 'staging',
+    }
+  }
+  if (options.rateLimitingEnabled !== undefined) {
+    const enabled = options.rateLimitingEnabled === 'true'
+    updates.rate_limiting = {
+      enabled,
+      max_requests_per_minute: options.rateLimitingRpm ? parseInt(options.rateLimitingRpm, 10) : (currentSettings?.rate_limiting?.max_requests_per_minute || 60),
+    }
+  }
+  if (options.screenshotsEnabled !== undefined) {
+    const enabled = options.screenshotsEnabled === 'true'
+    updates.screenshots = {
+      enabled,
+    }
+  }
+
+  if (options.setting && options.value) {
+    switch (options.setting) {
+      case 'external_url':
+        updates.external_url = options.value
+        break
+      case 'preview_domain':
+        updates.preview_domain = options.value
+        break
+      default:
+        return { error: `Unknown setting: ${options.setting}` }
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return { error: 'No settings to update' }
+  }
+
+  return { updates }
+}
+
 export function registerSettingsCommands(program: Command): void {
   const settings = program
     .command('settings')
@@ -192,52 +261,12 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
   )
 
   if (isAutomation) {
-    // Handle specific flags
-    if (options.externalUrl) {
-      updates.external_url = options.externalUrl
-    }
-    if (options.previewDomain) {
-      updates.preview_domain = options.previewDomain
-    }
-    if (options.letsencryptEmail || options.letsencryptMode) {
-      updates.letsencrypt = {
-        email: options.letsencryptEmail || currentSettings?.letsencrypt?.email || '',
-        environment: options.letsencryptMode || currentSettings?.letsencrypt?.environment || 'staging',
-      }
-    }
-    if (options.rateLimitingEnabled !== undefined) {
-      const enabled = options.rateLimitingEnabled === 'true'
-      updates.rate_limiting = {
-        enabled,
-        max_requests_per_minute: options.rateLimitingRpm ? parseInt(options.rateLimitingRpm, 10) : (currentSettings?.rate_limiting?.max_requests_per_minute || 60),
-      }
-    }
-    if (options.screenshotsEnabled !== undefined) {
-      const enabled = options.screenshotsEnabled === 'true'
-      updates.screenshots = {
-        enabled,
-      }
-    }
-
-    // Handle generic setting/value pair
-    if (options.setting && options.value) {
-      switch (options.setting) {
-        case 'external_url':
-          updates.external_url = options.value
-          break
-        case 'preview_domain':
-          updates.preview_domain = options.value
-          break
-        default:
-          warning(`Unknown setting: ${options.setting}`)
-          return
-      }
-    }
-
-    if (Object.keys(updates).length === 0) {
-      warning('No settings to update')
+    const result = buildAutomationSettingsUpdate(options, currentSettings ?? undefined)
+    if ('error' in result) {
+      warning(result.error)
       return
     }
+    Object.assign(updates, result.updates)
   } else {
     // Interactive mode
     const settingToUpdate = await promptSelect({

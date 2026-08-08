@@ -18,6 +18,37 @@ import {
 import type { ProjectResponse, EnvironmentResponse } from '../../api/types.gen.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
 
+export interface EnvironmentSelection {
+  environmentId: number | undefined
+  environmentName: string
+}
+
+/**
+ * Resolve `--environment <name>` against the project's real environments.
+ * A typo/stale name must NOT silently fall back to some other environment —
+ * it leaves environmentId undefined (so the caller can decide how to fail)
+ * while environmentName still reflects what the user actually asked for.
+ */
+export function resolveExplicitEnvironment(
+  environments: Pick<EnvironmentResponse, 'id' | 'name'>[],
+  name: string
+): EnvironmentSelection {
+  const env = environments.find(e => e.name === name)
+  return env
+    ? { environmentId: env.id, environmentName: env.name }
+    : { environmentId: undefined, environmentName: name }
+}
+
+/** Non-interactive (`--yes`) default: prefer `production`, else the first environment. */
+export function resolveDefaultEnvironment(
+  environments: Pick<EnvironmentResponse, 'id' | 'name'>[]
+): EnvironmentSelection {
+  const prodEnv = environments.find(e => e.name === 'production')
+  if (prodEnv) return { environmentId: prodEnv.id, environmentName: prodEnv.name }
+  if (environments[0]) return { environmentId: environments[0].id, environmentName: environments[0].name }
+  return { environmentId: undefined, environmentName: 'production' }
+}
+
 interface UpOptions {
   project?: string
   environment?: string
@@ -156,11 +187,7 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
 
   if (environments.length > 0) {
     if (options.environment) {
-      const env = environments.find(e => e.name === options.environment)
-      if (env) {
-        environmentId = env.id
-        environmentName = env.name
-      }
+      ;({ environmentId, environmentName } = resolveExplicitEnvironment(environments, options.environment))
     } else if (!options.yes) {
       const selectedEnv = await promptSelect({
         message: 'Select environment',
@@ -174,14 +201,7 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
       environmentId = parseInt(selectedEnv, 10)
       environmentName = environments.find(e => e.id === environmentId)?.name ?? 'production'
     } else {
-      const prodEnv = environments.find(e => e.name === 'production')
-      if (prodEnv) {
-        environmentId = prodEnv.id
-        environmentName = prodEnv.name
-      } else if (environments[0]) {
-        environmentId = environments[0].id
-        environmentName = environments[0].name
-      }
+      ;({ environmentId, environmentName } = resolveDefaultEnvironment(environments))
     }
   }
 

@@ -55,7 +55,7 @@ function collect(value: string, previous: string[]): string[] {
 }
 
 /** Resolve value: if prefixed with @, read from a local file path. */
-function resolveValue(value: string): string {
+export function resolveValue(value: string): string {
   if (value.startsWith('@')) {
     const filePath = value.slice(1)
     try {
