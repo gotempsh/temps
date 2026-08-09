@@ -211,11 +211,14 @@ export async function pgUpgradeScenarioCommand(opts: PgUpgradeScenarioOptions): 
     )
 
     // Provision a postgres service explicitly pinned to the older major version.
-    // The `docker_image` parameter overrides the platform default
-    // (`gotempsh/postgres-walg:18-bookworm`) so the service actually runs
-    // Postgres 16. The upgrade's `from_image` must match the running container's
-    // image; using the gotempsh/postgres-walg variant ensures wal-g is available
-    // inside the container so the pre-upgrade backup can run.
+    // The `docker_image` parameter overrides the platform default so the service
+    // actually runs Postgres 16. We use the standard `postgres:16-bookworm`
+    // (same OS family as `postgres:17-bookworm`) rather than a custom image
+    // because `validate_os_family` in postgres_upgrade.rs requires matching OS
+    // families, and the plain bookworm images are widely available without any
+    // registry auth. These images don't bundle wal-g, so the pre-upgrade backup
+    // falls back to the pg_dump sidecar path -- the same fallback documented at
+    // the top of this file and in the FROM_IMAGE/TO_IMAGE block above.
     const service = await step(`provision postgres service pinned to ${FROM_IMAGE}`, () =>
       createE2eService(client, {
         name: `${runId}-pg`,
@@ -452,10 +455,11 @@ export async function pgUpgradeScenarioCommand(opts: PgUpgradeScenarioOptions): 
         // field set by PostgresConfig / PostgresInputConfig.
         const dockerImage = svcDetails.current_parameters?.docker_image
         if (!dockerImage) {
-          // The field may not be surfaced if the platform masks it or the
-          // response omits it. Treat it as a non-fatal observation.
-          log(`  WARN: current_parameters.docker_image not returned by GET /external-services/${service.id}`)
-          return
+          throw new Error(
+            `current_parameters.docker_image is absent from GET /external-services/${service.id} -- ` +
+              'phase_swap must persist the new image via lifecycle.set_docker_image; ' +
+              'a missing field means the assertion cannot be made and the upgrade is unverified',
+          )
         }
         if (dockerImage !== TO_IMAGE) {
           throw new Error(
