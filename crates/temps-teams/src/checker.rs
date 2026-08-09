@@ -625,6 +625,10 @@ impl ProjectAccessChecker for TeamProjectAccessChecker {
 
         Ok(resolved)
     }
+
+    fn invalidate_permissions_cache(&self) {
+        self.invalidate_all();
+    }
 }
 
 #[cfg(test)]
@@ -1237,6 +1241,35 @@ mod tests {
 
         // If the permissions cache weren't cleared, this would panic on
         // exhausted MockDatabase results instead of re-querying.
+        assert_eq!(
+            checker.effective_project_permissions(1, 42).await.unwrap(),
+            None
+        );
+    }
+
+    /// `invalidate_permissions_cache` (the `ProjectAccessChecker` trait
+    /// method) must reach the same cache `invalidate_all` does — this is
+    /// the only path a `MembershipPermissionResolver` plugin has back into
+    /// this checker's cache, since it holds `Arc<dyn ProjectAccessChecker>`
+    /// (the trait), never this concrete type.
+    #[tokio::test]
+    async fn invalidate_permissions_cache_trait_method_clears_permissions_cache() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_team_access::Model>::new()])
+            .append_query_results(vec![Vec::<project_team_access::Model>::new()])
+            .into_connection();
+        let checker: Arc<dyn ProjectAccessChecker> = Arc::new(new_checker(db));
+
+        assert_eq!(
+            checker.effective_project_permissions(1, 42).await.unwrap(),
+            None
+        );
+
+        checker.invalidate_permissions_cache();
+
+        // Same assertion as `invalidate_all_clears_permissions_cache_too`,
+        // but called through the trait object a resolver plugin actually
+        // holds, not the concrete type.
         assert_eq!(
             checker.effective_project_permissions(1, 42).await.unwrap(),
             None

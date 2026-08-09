@@ -2472,21 +2472,45 @@ impl OtelStorage for TimescaleDbStorage {
         // `COUNT(*)` scans every chunk, and this runs three times per call on
         // the ingest hot path (`check_quota`), so the denominator uses
         // TimescaleDB's `approximate_row_count` (planner stats, microseconds).
-        // `GREATEST(.., 1)` still guards against a zero/negative estimate on a
-        // freshly-created, never-analyzed table.
+        // `GREATEST(.., 1)` guards against a zero/negative estimate on a
+        // freshly-created, never-analyzed table; `LEAST(1.0, ..)` around the
+        // ratio guards the other direction -- a project's share of a table
+        // can never exceed 100% of that table, but `approximate_row_count`
+        // can UNDER-count right after a write burst (autovacuum/ANALYZE
+        // hasn't caught up yet -- the exact scenario this quota exists to
+        // catch), which without the clamp would inflate the computed
+        // `total_bytes` past what `table_size` itself reports. With the
+        // clamp, a lagging denominator can only make the estimate MORE
+        // conservative (trip earlier), never silently let a flood through.
+        //
+        // CORRECTNESS: `table_size` MUST be the whole hypertable's storage,
+        // not just its root. A hypertable's "root" relation (the name you
+        // create it under, e.g. `otel_spans`) holds no rows and almost no
+        // bytes itself -- TimescaleDB partitions all actual data into child
+        // "chunk" tables under `_timescaledb_internal`. `pg_total_relation_size`
+        // on the root name (the previous query here) therefore measures only
+        // the root's own tiny catalog/index footprint and NEVER grows with
+        // real ingest volume, so `total_bytes` stayed near-zero regardless of
+        // how much data a project actually stored and `usage_pct` could
+        // never reach 100 -- quota enforcement was silently inert for every
+        // project, the exact 160GB/day-flood failure mode this quota exists
+        // to prevent. `hypertable_size()` is TimescaleDB's chunk-aware
+        // equivalent: it sums every chunk's `pg_total_relation_size` (plus
+        // the negligible root), which is still cheap (proportional to chunk
+        // count, not row count) and gives the real total.
         let sql = r#"
             SELECT
-                COALESCE((SELECT pg_total_relation_size('otel_metrics') *
-                    (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_metrics'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_spans') *
-                    (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_spans'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_log_events') *
-                    (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_log_events'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float)
                 ), 0)::bigint as total_bytes
         "#;
 
@@ -3282,6 +3306,67 @@ impl TimescaleDbStorage {
         }
 
         (where_clauses.join(" AND "), values, param_idx)
+    }
+
+    // ── Cross-backend quota helpers ──────────────────────────────────────
+    //
+    // Used by `ClickHouseOtelStorage::get_storage_quota`
+    // (`storage/clickhouse/mod.rs`) to combine ClickHouse-native span/metric
+    // byte accounting with the Postgres-native log volume it still
+    // delegates here. Kept separate from `get_storage_quota` above (which
+    // stays a single three-table round trip, unchanged) so the all-Postgres
+    // path taken by every non-ClickHouse install pays no extra query.
+
+    /// Compute the proportional byte estimate for a single OTel hypertable
+    /// attributed to `project_id`, using the same chunk-aware
+    /// `hypertable_size()` formula as `get_storage_quota` — see that
+    /// method's CORRECTNESS comment for why `pg_total_relation_size` on the
+    /// hypertable root would be wrong here.
+    ///
+    /// `table` must be a fixed, code-controlled literal — one of
+    /// `"otel_metrics"`, `"otel_spans"`, `"otel_log_events"` — never
+    /// request/user input. Postgres cannot bind identifiers as query
+    /// parameters (only values), so it is interpolated via `format!`; every
+    /// call site in this crate passes a hardcoded string, so this is safe.
+    pub(crate) async fn hypertable_bytes_for_project(
+        &self,
+        table: &str,
+        project_id: i32,
+    ) -> StorageResult<u64> {
+        let sql = format!(
+            r#"
+            SELECT COALESCE((SELECT hypertable_size('{table}'::regclass) *
+                LEAST(1.0, (SELECT COUNT(*) FROM {table} WHERE project_id = $1)::float /
+                GREATEST(approximate_row_count('{table}'::regclass), 1)::float)
+            ), 0)::bigint as total_bytes
+            "#
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![project_id.into()],
+            ))
+            .await?;
+
+        Ok(match result {
+            Some(row) => row.try_get::<i64>("", "total_bytes").unwrap_or(0) as u64,
+            None => 0,
+        })
+    }
+
+    /// The configured per-project quota limit in bytes, if quota
+    /// enforcement is enabled (`TEMPS_OTEL_QUOTA_GB` set). `None` means
+    /// quota enforcement is off.
+    ///
+    /// Exposed so `ClickHouseOtelStorage` — which shares this same
+    /// `TimescaleDbStorage` as its inner delegate — reads the one
+    /// configured limit instead of parsing `TEMPS_OTEL_QUOTA_GB` a second
+    /// time in a second place.
+    pub(crate) fn quota_bytes_per_project(&self) -> Option<u64> {
+        self.quota_bytes_per_project
     }
 }
 

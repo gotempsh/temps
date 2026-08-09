@@ -13,6 +13,7 @@ import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { flagsScenarioCommand } from './commands/flags-scenario.ts'
 import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
+import { pitrScenarioCommand } from './commands/pitr-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
@@ -23,6 +24,7 @@ import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
 import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
 import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
+import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
 
 const program = new Command()
 
@@ -191,6 +193,21 @@ program
   })
 
 program
+  .command('pitr-scenario')
+  .description(
+    'Point-in-time recovery of a real postgres service via MinIO: real wal-g backup-push, write T1 rows, wait for their WAL to archive, capture a recovery-target timestamp, write T2 rows, PITR-restore to T1, and prove via the read-only data-browser API (not /probe) that exactly T1s rows survive',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await pitrScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
   .command('git-deploy-scenario')
   .description(
     'Real git-triggered deploy against a public repo (github.com/gotempsh/temps-examples): clone + build a language-preset subdirectory, trigger-pipeline, verify the exact response body baked into the real repo source',
@@ -301,6 +318,18 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await sessionReplayScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('otel-quota-scenario')
+  .description(
+    'Real OTLP/HTTP protobuf ingestion (traces/metrics/logs, hand-encoded, no @opentelemetry/* SDK) round-tripped through the real query API and the unified Observe feed, then real storage-quota enforcement: push volume past a configured TEMPS_OTEL_QUOTA_GB until GET /otel/quota crosses 100%, and assert ingestion is actually rejected with 413 (and the rejected data never lands) once the ingest-time quota cache re-checks -- not just that the config knob exists',
+  )
+  .option('--max-quota-batches <n>', 'safety cap on ~9MB batches pushed while hunting for the quota cutoff', '250')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await otelQuotaScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
