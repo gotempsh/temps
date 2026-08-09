@@ -205,6 +205,8 @@ export function ImportProject() {
                 selectedRepository.updated_at || new Date().toISOString(),
               git_provider_connection_id:
                 selectedRepository.git_provider_connection_id,
+              clone_url: selectedRepository.clone_url,
+              ssh_url: selectedRepository.ssh_url,
             }}
             connectionId={selectedConnectionId!}
             branches={branchesData?.branches}

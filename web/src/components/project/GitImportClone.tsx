@@ -380,7 +380,10 @@ export function GitImportClone({
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
   // Query for presets from authenticated connection
-  const { data: authenticatedPresetData } = useQuery({
+  const {
+    data: authenticatedPresetData,
+    refetch: refetchAuthenticatedPresetData,
+  } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: {
         repository_id: selectedRepository?.id || 0,
@@ -390,19 +393,20 @@ export function GitImportClone({
   })
 
   // Query for presets from public repository
-  const { data: publicPresetData } = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: parsedPublicRepo?.provider || 'github',
-        owner: parsedPublicRepo?.owner || '',
-        repo: parsedPublicRepo?.repo || '',
-      },
-      query: {
-        branch: selectedRepository?.default_branch,
-      },
-    }),
-    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-  })
+  const { data: publicPresetData, refetch: refetchPublicPresetData } =
+    useQuery({
+      ...detectPublicPresetsOptions({
+        path: {
+          provider: parsedPublicRepo?.provider || 'github',
+          owner: parsedPublicRepo?.owner || '',
+          repo: parsedPublicRepo?.repo || '',
+        },
+        query: {
+          branch: selectedRepository?.default_branch,
+        },
+      }),
+      enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+    })
 
   // Transform public preset data to match ProjectPresetResponse format (camelCase)
   const presetData = useGitUrl
@@ -626,9 +630,16 @@ export function GitImportClone({
               selectedRepository.git_provider_connection_id ??
               Number(selectedConnection) ??
               0,
+            clone_url: selectedRepository.clone_url,
+            ssh_url: selectedRepository.ssh_url,
           }}
           connectionId={useGitUrl ? undefined : Number(selectedConnection)}
           presetData={presetData}
+          onRefreshPresets={() =>
+            useGitUrl
+              ? refetchPublicPresetData()
+              : refetchAuthenticatedPresetData()
+          }
           branches={branches?.branches}
           mode="wizard"
           onSubmit={async (data) => {

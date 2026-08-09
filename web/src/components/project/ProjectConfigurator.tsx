@@ -41,7 +41,7 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { ServiceLogo } from '@/components/ui/service-logo'
-import { cn } from '@/lib/utils'
+import { cn, withMinDuration } from '@/lib/utils'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -50,6 +50,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Database,
+  ExternalLink,
   Eye,
   EyeOff,
   Folder,
@@ -67,6 +68,21 @@ import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import { ServiceEnvPreview } from './ServiceEnvPreview'
 import { FrameworkSelector } from './FrameworkSelector'
+
+// Derives a browsable repo URL from whatever the API gave us. clone_url is an
+// HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
+// "continue with git URL" flow it's the raw string the user typed, which may
+// be SSH shorthand (git@host:owner/repo) — normalize both to https://host/owner/repo.
+function getRepositoryUrl(repository: RepositoryResponse): string | null {
+  const raw = repository.clone_url || repository.ssh_url
+  if (!raw) return null
+  let url = raw.trim().replace(/\.git$/, '')
+  const sshMatch = url.match(/^git@([^:]+):(.+)$/)
+  if (sshMatch) {
+    url = `https://${sshMatch[1]}/${sshMatch[2]}`
+  }
+  return url.startsWith('http://') || url.startsWith('https://') ? url : null
+}
 
 // Helper function to normalize path for consistent comparison
 // Normalizes '.', './', and empty strings to 'root'
@@ -287,6 +303,17 @@ interface ProjectConfiguratorProps {
   branches?: BranchInfo[]
   /** Pre-loaded preset data (for public repos or when already fetched) */
   presetData?: ProjectPresetResponse[]
+  /**
+   * Overrides the "Refresh" button's default behavior of refetching this
+   * component's own `getRepositoryPresetLive` query. Required whenever
+   * `presetData` is supplied: that internal query is keyed on `repository.id`,
+   * which is a real value only when the repo comes from `getRepositoryById`.
+   * Callers that source presets another way (e.g. `detectPublicPresets` for a
+   * public "git URL" import, where `repository.id` is a synthetic `0`) must
+   * pass their own refetch here, or the button will hit a nonexistent
+   * `repositories/0` route.
+   */
+  onRefreshPresets?: () => Promise<unknown>
 
   // Display modes
   mode?: 'wizard' | 'inline' | 'compact'
@@ -311,6 +338,7 @@ export function ProjectConfigurator({
   connectionId,
   branches,
   presetData: providedPresetData,
+  onRefreshPresets,
   mode: _mode = 'wizard',
   onSubmit,
   onCancel,
@@ -393,6 +421,7 @@ export function ProjectConfigurator({
   const {
     data: fetchedPresetData,
     isLoading: presetLoading,
+    isFetching: presetFetching,
     error: presetError,
     refetch: refetchPresets,
   } = useQuery({
@@ -403,6 +432,21 @@ export function ProjectConfigurator({
     enabled: !providedPresetData && !!repository.id && !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
+
+  // Holds the manual "Refresh" click for a minimum visible duration so a
+  // fast response doesn't cut the spin icon off before it completes a turn.
+  const [isManuallyRefreshingPresets, setIsManuallyRefreshingPresets] =
+    useState(false)
+  const handleRefreshPresets = async () => {
+    setIsManuallyRefreshingPresets(true)
+    try {
+      await withMinDuration(() =>
+        onRefreshPresets ? onRefreshPresets() : refetchPresets()
+      )
+    } finally {
+      setIsManuallyRefreshingPresets(false)
+    }
+  }
 
   // Use provided presets or fetched presets
   // Transform providedPresetData to match the expected structure { presets: [...] }
@@ -635,12 +679,26 @@ export function ProjectConfigurator({
   // Render repository config step. The repository summary card is skipped
   // when the surrounding page already shows the repo (e.g. the import page's
   // context bar) so the name isn't printed twice.
+  const repositoryUrl = getRepositoryUrl(repository)
+
   const renderRepoConfig = () => (
     <div className="space-y-4">
       {showRepositoryCard && (
         <div className="flex items-center gap-3 p-4 bg-muted/50 rounded-lg">
           <GitBranch className="h-5 w-5 text-muted-foreground" />
-          <div className="font-medium">{repository.full_name}</div>
+          {repositoryUrl ? (
+            <a
+              href={repositoryUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-medium hover:underline inline-flex items-center gap-1.5"
+            >
+              {repository.full_name}
+              <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+            </a>
+          ) : (
+            <div className="font-medium">{repository.full_name}</div>
+          )}
         </div>
       )}
 
@@ -711,9 +769,10 @@ export function ProjectConfigurator({
                 <FrameworkSelector
                   presetData={presetData}
                   isLoading={presetLoading}
+                  isRefreshing={presetFetching || isManuallyRefreshingPresets}
                   error={presetError}
                   selectedPreset={selectValue}
-                  onRefresh={() => refetchPresets()}
+                  onRefresh={handleRefreshPresets}
                   onSelectPreset={(value) => {
                     if (value === 'custom') {
                       field.onChange('custom')

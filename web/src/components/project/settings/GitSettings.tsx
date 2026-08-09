@@ -35,7 +35,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
-import { cn } from '@/lib/utils'
+import { cn, withMinDuration } from '@/lib/utils'
 import {
   normalizePresetPath,
   presetConfigForSelection,
@@ -260,10 +260,25 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
     | 'framework'
     | 'directory'
     | 'dockerfile'
+    | 'buildContext'
     | 'composePath'
     | 'composeOverride'
   >(null)
   const close = () => setEditing(null)
+
+  // Tracks the branch-refresh button separately from `isLoadingBranches`
+  // (React Query only flags that for the *first* fetch) so a manual refetch
+  // spins the icon, and holds it for a minimum duration so a fast response
+  // doesn't cut the spin off before it's visible.
+  const [isRefreshingBranches, setIsRefreshingBranches] = useState(false)
+  const handleRefreshBranches = async () => {
+    setIsRefreshingBranches(true)
+    try {
+      await withMinDuration(() => refetchBranches())
+    } finally {
+      setIsRefreshingBranches(false)
+    }
+  }
 
   // Branch editor
   const [branchDraft, setBranchDraft] = useState('')
@@ -285,6 +300,15 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
     setDockerfileDraft(
       (project?.preset_config as any)?.dockerfilePath || 'Dockerfile'
     )
+  }, [project?.preset_config])
+
+  // Dockerfile build context editor (overrides the root directory as the
+  // `docker build` context -- only needed when it must differ from where
+  // the Dockerfile itself is discovered, e.g. a monorepo build that needs
+  // sibling package sources outside the Dockerfile's own directory)
+  const [buildContextDraft, setBuildContextDraft] = useState('')
+  useEffect(() => {
+    setBuildContextDraft((project?.preset_config as any)?.buildContext || '')
   }, [project?.preset_config])
 
   // Compose path editor
@@ -383,7 +407,12 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
   // Helper for displaying short SHA
   const shortSha = (sha: string) => sha?.slice(0, 7)
 
-  const autoDeployOn = project.deployment_config?.automaticDeploy ?? true
+  // Matches the backend's resolved default (`unwrap_or(false)` in
+  // temps-entities/deployment_config.rs) -- GeneralSettings.tsx reads the
+  // same field with the same default. This page previously defaulted to
+  // `true`, which showed auto-deploy as ON for any project with the field
+  // unset even though the backend treats it as OFF.
+  const autoDeployOn = project.deployment_config?.automaticDeploy ?? false
 
   return (
     <div className="space-y-6">
@@ -598,11 +627,11 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     type="button"
                     variant="ghost"
                     size="sm"
-                    onClick={() => refetchBranches()}
-                    disabled={isLoadingBranches}
+                    onClick={handleRefreshBranches}
+                    disabled={isLoadingBranches || isRefreshingBranches}
                     title="Refresh branches"
                   >
-                    {isLoadingBranches ? (
+                    {isLoadingBranches || isRefreshingBranches ? (
                       <Loader2 className="size-3.5 animate-spin" />
                     ) : (
                       <RefreshCw className="size-3.5" />
@@ -740,6 +769,63 @@ function GitSettingsInline({ project, refetch }: GitSettingsProps) {
                     value={dockerfileDraft}
                     onChange={(e) => setDockerfileDraft(e.target.value)}
                     placeholder="Dockerfile"
+                    className="flex-1 font-mono text-sm"
+                    autoFocus
+                  />
+                }
+              />
+            )}
+
+            {/* Build context — only when dockerfile preset. Overrides the
+                docker build context (defaults to root directory above) for
+                monorepos where the Dockerfile needs sibling package sources
+                outside its own directory. */}
+            {isDockerfilePreset && (
+              <InlineRow
+                label="Build context"
+                editing={editing === 'buildContext'}
+                onStartEdit={() => {
+                  setBuildContextDraft(
+                    (project?.preset_config as any)?.buildContext || ''
+                  )
+                  setEditing('buildContext')
+                }}
+                onCancel={close}
+                onSave={async () => {
+                  const cfg = (project.preset_config as any) || {}
+                  const next = buildContextDraft.trim()
+                  if (next === (cfg.buildContext || '')) {
+                    close()
+                    return
+                  }
+                  await saveGitField({
+                    preset_config: {
+                      ...cfg,
+                      preset: 'dockerfile',
+                      buildContext: next || undefined,
+                    },
+                  })
+                  toast.success('Build context updated')
+                  close()
+                }}
+                isPending={updateGitSettings.isPending}
+                display={
+                  <div className="flex items-center gap-2 min-w-0">
+                    <FolderIcon className="size-4 text-muted-foreground shrink-0" />
+                    <span className="font-mono text-sm truncate">
+                      {(project.preset_config as any)?.buildContext || (
+                        <span className="text-muted-foreground italic">
+                          same as root directory
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                }
+                editor={
+                  <Input
+                    value={buildContextDraft}
+                    onChange={(e) => setBuildContextDraft(e.target.value)}
+                    placeholder={project.directory || './'}
                     className="flex-1 font-mono text-sm"
                     autoFocus
                   />
@@ -1069,6 +1155,7 @@ function PublicPortsInline({
     cfg.publicPorts || cfg.public_ports || []
   const [draft, setDraft] = useState<{ service: string; port: number }[]>(ports)
   const [dirty, setDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
   useEffect(() => {
     setDraft(cfg.publicPorts || cfg.public_ports || [])
     setDirty(false)
@@ -1160,19 +1247,26 @@ function PublicPortsInline({
           <Button
             type="button"
             size="sm"
+            disabled={saving}
             onClick={async () => {
-              const filtered = draft.filter((p) => p.service && p.port > 0)
-              await saveGitField({
-                preset_config: {
-                  ...cfg,
-                  preset: 'docker-compose',
-                  publicPorts: filtered.length ? filtered : undefined,
-                },
-              })
-              toast.success('Public ports saved')
-              setDirty(false)
+              setSaving(true)
+              try {
+                const filtered = draft.filter((p) => p.service && p.port > 0)
+                await saveGitField({
+                  preset_config: {
+                    ...cfg,
+                    preset: 'docker-compose',
+                    publicPorts: filtered.length ? filtered : undefined,
+                  },
+                })
+                toast.success('Public ports saved')
+                setDirty(false)
+              } finally {
+                setSaving(false)
+              }
             }}
           >
+            {saving && <Loader2 className="size-3 mr-1 animate-spin" />}
             Save ports
           </Button>
         </div>

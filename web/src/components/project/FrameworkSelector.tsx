@@ -27,6 +27,11 @@ type PresetDataType = { presets: ProjectPresetResponse[] } | undefined
 interface FrameworkSelectorProps {
   presetData: PresetDataType
   isLoading: boolean
+  /** True while a refetch (e.g. triggered by the Refresh button) is in flight
+   * on top of already-loaded data. Distinct from `isLoading`, which React
+   * Query only sets true for the *initial* fetch — without this, clicking
+   * Refresh after data has loaded once gives no visual feedback at all. */
+  isRefreshing?: boolean
   error?: Error | null
   selectedPreset: string
   onSelectPreset: (value: string) => void
@@ -37,6 +42,7 @@ interface FrameworkSelectorProps {
 export function FrameworkSelector({
   presetData,
   isLoading,
+  isRefreshing = false,
   error,
   selectedPreset,
   onSelectPreset,
@@ -149,11 +155,11 @@ export function FrameworkSelector({
               variant="outline"
               size="sm"
               onClick={onRefresh}
-              disabled={isLoading}
+              disabled={isLoading || isRefreshing}
               className="text-xs"
             >
               <RefreshCw
-                className={`h-3 w-3 mr-1 ${isLoading ? 'animate-spin' : ''}`}
+                className={`h-3 w-3 mr-1 ${isLoading || isRefreshing ? 'animate-spin' : ''}`}
               />
               Refresh
             </Button>
