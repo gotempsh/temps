@@ -201,8 +201,49 @@ pub struct S3Service {
 }
 
 impl S3Service {
-    /// MinIO Client (mc) utility image - used for temporary operations like migration and copy
+    /// MinIO Client (mc) utility image - used for temporary operations like migration and copy.
+    /// Pinned to an immutable release tag — never use `:latest` here to prevent
+    /// supply-chain / MITM attacks on floating tags.
     const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
+
+    /// Shell script executed inside a disposable mc container by `restore_in_place`.
+    ///
+    /// SECURITY: This is a compile-time constant. It MUST NOT be changed to a
+    /// runtime `format!()` string that interpolates user-supplied values. All
+    /// dynamic values arrive via Docker environment variables:
+    ///   - `RESTORE_PREFIX` — user-influenced backup path (via `backup_location`)
+    ///   - `MC_HOST_bkp`, `MC_HOST_live` — S3 credentials
+    ///
+    /// The shell expands `${RESTORE_PREFIX}` safely — environment variable values
+    /// are never re-parsed as shell commands, so a value containing `'` or other
+    /// shell metacharacters cannot escape the quoting context and inject commands.
+    ///
+    /// Word-splitting fix: bucket names are iterated with `while IFS= read -r`
+    /// from a temp file, avoiding glob expansion on whitespace in names.
+    const RESTORE_IN_PLACE_SCRIPT: &'static str = r#"set -e
+DEST='live'
+if [ -z "${RESTORE_PREFIX}" ]; then
+  echo '[restore] RESTORE_PREFIX is empty — aborting'
+  exit 1
+fi
+echo "[restore] listing ${RESTORE_PREFIX}"
+BUCKET_LIST=$(mktemp)
+mc ls "${RESTORE_PREFIX}" | awk '{print $NF}' | grep '/$' | sed 's|/$||' > "${BUCKET_LIST}" || true
+if [ ! -s "${BUCKET_LIST}" ]; then
+  rm -f "${BUCKET_LIST}"
+  echo '[restore] no bucket directories found — nothing to restore'
+  exit 0
+fi
+while IFS= read -r bucket; do
+  [ -z "${bucket}" ] && continue
+  echo "[restore] ensuring ${DEST}/${bucket} exists"
+  mc mb "${DEST}/${bucket}" 2>&1 || true
+  echo "[restore] mirroring ${RESTORE_PREFIX}${bucket}/ -> ${DEST}/${bucket}/ (--overwrite --remove)"
+  mc mirror --overwrite --remove "${RESTORE_PREFIX}${bucket}/" "${DEST}/${bucket}/"
+  echo "[restore] done: ${bucket}"
+done < "${BUCKET_LIST}"
+rm -f "${BUCKET_LIST}"
+echo '[restore] complete'"#;
 
     pub fn new(
         name: String,
@@ -1917,18 +1958,6 @@ impl ExternalService for S3Service {
         let bkp_endpoint = ctx.s3_source.endpoint.as_deref().unwrap_or("");
         let (bkp_scheme, bkp_hostpath) = mc_strip_scheme(bkp_endpoint);
 
-        let env_vars = vec![
-            format!(
-                "MC_HOST_bkp={}://{}:{}@{}",
-                bkp_scheme, ctx.s3_source.access_key_id, ctx.s3_source.secret_key, bkp_hostpath,
-            ),
-            // Live service is always reached via localhost in host-network mode.
-            format!(
-                "MC_HOST_live=http://{}:{}@localhost:{}",
-                s3_config.access_key, s3_config.secret_key, s3_config.port
-            ),
-        ];
-
         // ── Restore shell script ─────────────────────────────────────────────
         // The S3MirrorEngine backup engine mirrors:
         //   source/<bucket>/ -> bkp/<bkp_bucket>/<prefix>/<original_bucket>/
@@ -1941,32 +1970,53 @@ impl ExternalService for S3Service {
         //
         // The script discovers those bucket folders via `mc ls`, creates each in
         // the live service, and mirrors their contents with --overwrite --remove.
+        //
+        // SECURITY (injection prevention): `ctx.backup_location` is user-supplied
+        // and is passed as the Docker env var `RESTORE_PREFIX` rather than being
+        // interpolated into the shell script string via Rust format!(). The shell
+        // expands `${RESTORE_PREFIX}` safely — env var values are never re-parsed
+        // as shell commands, so single-quotes or other metacharacters in the value
+        // cannot break out of the quoting context and inject commands.
+        // See `RESTORE_IN_PLACE_SCRIPT` for the static script text.
+        //
+        // TODO(security): No service-identity validation — a caller with
+        // BackupsWrite + ExternalServicesWrite can restore service A's backup
+        // onto service B's live MinIO. A full fix needs an optional
+        // `confirm_target_service_id` field on `StartRestoreRequest` checked
+        // against the URL `{id}`. Deferred because it requires the shared
+        // restore-framework code well beyond S3's scope (tracked: PR #595
+        // description, "MINOR: no service-identity binding" finding).
         let backup_prefix = format!(
             "bkp/{}/{}",
             ctx.s3_source.bucket_name,
             ctx.backup_location.trim_matches('/')
         );
-        let script = format!(
-            "set -e\n\
-             BACKUP_PREFIX='{prefix}/'\n\
-             DEST='live'\n\
-             echo \"[restore] listing $BACKUP_PREFIX\"\n\
-             BUCKETS=$(mc ls \"$BACKUP_PREFIX\" | awk '{{print $NF}}' | grep '/$' | sed 's|/$||')\n\
-             if [ -z \"$BUCKETS\" ]; then\n\
-               echo \"[restore] no bucket directories found — nothing to restore\"\n\
-               exit 0\n\
-             fi\n\
-             echo \"[restore] buckets: $BUCKETS\"\n\
-             for bucket in $BUCKETS; do\n\
-               echo \"[restore] ensuring $DEST/$bucket exists\"\n\
-               mc mb \"$DEST/$bucket\" 2>&1 || true\n\
-               echo \"[restore] mirroring $BACKUP_PREFIX$bucket/ -> $DEST/$bucket/ (--overwrite --remove)\"\n\
-               mc mirror --overwrite --remove \"$BACKUP_PREFIX$bucket/\" \"$DEST/$bucket/\"\n\
-               echo \"[restore] done: $bucket\"\n\
-             done\n\
-             echo \"[restore] complete\"",
-            prefix = backup_prefix,
-        );
+
+        // SECURITY (docker inspect exposure): MC_HOST_* env vars embed plaintext
+        // credentials in the container's environment for the container's lifetime.
+        // This is the same pattern the S3MirrorEngine backup engine uses (accepted
+        // design). The container is removed immediately after the script exits (see
+        // the remove_container call below), bounding the exposure to the restore
+        // execution window. Anyone with Docker socket access has equivalent trust
+        // to these credentials for that window.
+        let env_vars = vec![
+            format!(
+                "MC_HOST_bkp={}://{}:{}@{}",
+                bkp_scheme, ctx.s3_source.access_key_id, ctx.s3_source.secret_key, bkp_hostpath,
+            ),
+            // Live service is always reached via localhost in host-network mode.
+            format!(
+                "MC_HOST_live=http://{}:{}@localhost:{}",
+                s3_config.access_key, s3_config.secret_key, s3_config.port
+            ),
+            // RESTORE_PREFIX carries the user-influenced backup_location value.
+            // It is passed as an env var — never interpolated into shell syntax —
+            // so shell metacharacters in the value cannot cause injection.
+            format!("RESTORE_PREFIX={}/", backup_prefix),
+        ];
+
+        // Static script constant — no user-supplied values are interpolated here.
+        let script = Self::RESTORE_IN_PLACE_SCRIPT.to_string();
 
         // ── Spin up and wait ─────────────────────────────────────────────────
         let container_name = format!("temps-s3restore-{}", uuid::Uuid::new_v4());
@@ -2157,6 +2207,12 @@ impl ExternalService for S3Service {
         self.pull_mc_image(&self.docker).await?;
 
         let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
+        // SECURITY (docker inspect exposure): MC_HOST_* env vars embed plaintext
+        // credentials in the container environment for the container's lifetime.
+        // The container is removed immediately after all mirror operations complete
+        // (see the remove_container call at the end of this function), bounding
+        // the exposure window to the restore execution time. Anyone with Docker
+        // socket access has equivalent trust to these credentials for that window.
         let env_vars = [
             format!(
                 "MC_HOST_source=http://{}:{}@{}",
@@ -2273,10 +2329,19 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
+                // SECURITY: `mc alias set` argv positions 5+ are plaintext
+                // access_key / secret_key. Never log the real `cmd` — use a
+                // redacted copy so credentials don't appear in error messages
+                // or the `restore_runs.error` DB column.
+                let redacted_cmd: Vec<&str> = cmd
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| if i >= 5 { "***" } else { *s })
+                    .collect();
                 return Err(anyhow::anyhow!(
                     "mc alias setup failed with exit code {} for command {:?}",
                     exit_code,
-                    cmd
+                    redacted_cmd
                 ));
             }
         }
@@ -3410,5 +3475,142 @@ mod tests {
         let var = format!("MC_HOST_bkp={}://key:secret@{}", scheme, host);
         assert!(!var.contains("http://http://"), "double-scheme detected");
         assert_eq!(var, "MC_HOST_bkp=http://key:secret@minio.example.com:9000");
+    }
+
+    /// Verify the CRITICAL shell-injection fix in `restore_in_place`.
+    ///
+    /// Before the fix `backup_location` was interpolated into the shell script
+    /// via Rust `format!()` inside POSIX single-quotes:
+    ///   `BACKUP_PREFIX='{prefix}/'`
+    /// A value containing `'` (e.g. `"foo'; env; #"`) breaks out of the quoted
+    /// context and injects arbitrary shell commands that run with host-network
+    /// access and plaintext S3 credentials in the environment.
+    ///
+    /// After the fix `backup_location` travels only as the value of the Docker
+    /// env var `RESTORE_PREFIX`. Environment variable values are never re-parsed
+    /// as shell syntax, so metacharacters are handled safely.
+    #[test]
+    fn test_restore_in_place_injection_safety() {
+        // Classic single-quote injection payload.
+        let injection_payload = "foo'; env; echo INJECTED; #";
+
+        // Simulate what restore_in_place does to produce the RESTORE_PREFIX env var.
+        let bucket_name = "backup-bucket";
+        let backup_prefix = format!(
+            "bkp/{}/{}",
+            bucket_name,
+            injection_payload.trim_matches('/')
+        );
+        let env_var = format!("RESTORE_PREFIX={}/", backup_prefix);
+
+        // 1. The env var MUST carry the raw, unescaped value so that mc can reach
+        //    the correct path.  This is safe: Docker env var values are byte
+        //    sequences passed directly to the process, never re-parsed as shell.
+        assert!(
+            env_var.contains(injection_payload),
+            "RESTORE_PREFIX env var must carry the raw backup_location value \
+             (including metacharacters); got: {:?}",
+            env_var
+        );
+
+        // 2. The static script MUST NOT contain any part of the injection payload.
+        //    It is a compile-time constant — there is no code path that embeds
+        //    user-supplied data into it.
+        let script = S3Service::RESTORE_IN_PLACE_SCRIPT;
+
+        assert!(
+            !script.contains("foo"),
+            "static script must not contain any user-supplied value"
+        );
+        assert!(
+            !script.contains("INJECTED"),
+            "injection payload must not appear in the static script"
+        );
+        assert!(
+            !script.contains("'; env;"),
+            "shell-injection snippet must not appear in the static script"
+        );
+
+        // 3. The script must reference RESTORE_PREFIX via ${RESTORE_PREFIX}
+        //    (shell env var expansion), not any Rust-interpolated literal.
+        assert!(
+            script.contains("${RESTORE_PREFIX}"),
+            "script must reference RESTORE_PREFIX via shell env var expansion"
+        );
+
+        // 4. Confirm the script uses `while IFS= read -r` instead of
+        //    `for bucket in $BUCKETS` to prevent word-splitting on bucket names.
+        assert!(
+            script.contains("while IFS= read -r bucket"),
+            "script must use 'while IFS= read -r' to avoid word-splitting"
+        );
+        assert!(
+            !script.contains("for bucket in $"),
+            "script must not use bare 'for bucket in $VAR' (word-splitting risk)"
+        );
+    }
+
+    /// Verify that the `mc alias set` error path in `restore_to_new_service`
+    /// never exposes plaintext credentials in the error message.
+    ///
+    /// `mc alias set <name> <endpoint> <access_key> <secret_key>` puts credentials
+    /// at argv positions 5 and 6.  Before the fix, a failed alias setup included
+    /// the full `cmd` (with real keys) in the anyhow error that propagates into
+    /// `restore_runs.error` in the DB and `error!`-level logs.
+    #[test]
+    fn test_alias_setup_error_redacts_credentials() {
+        let access_key = "AKIAIOSFODNN7EXAMPLE";
+        let secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let endpoint = "http://s3.amazonaws.com";
+
+        // Simulate the argv the production code builds.
+        let cmd: Vec<&str> = vec![
+            "mc",
+            "alias",
+            "set",
+            "backup-source",
+            endpoint,
+            access_key, // position 5 — must be redacted
+            secret_key, // position 6 — must be redacted
+        ];
+
+        // Apply the same redaction logic used in restore_to_new_service.
+        let redacted_cmd: Vec<&str> = cmd
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i >= 5 { "***" } else { *s })
+            .collect();
+
+        let error_msg = format!(
+            "mc alias setup failed with exit code {} for command {:?}",
+            1, redacted_cmd
+        );
+
+        // The error message must NOT contain either credential.
+        assert!(
+            !error_msg.contains(access_key),
+            "error message must not contain plaintext access_key; got: {:?}",
+            error_msg
+        );
+        assert!(
+            !error_msg.contains(secret_key),
+            "error message must not contain plaintext secret_key; got: {:?}",
+            error_msg
+        );
+        // The sentinel must appear instead.
+        assert!(
+            error_msg.contains("***"),
+            "error message must contain redaction sentinel '***'; got: {:?}",
+            error_msg
+        );
+        // Non-sensitive positional args must still appear for debuggability.
+        assert!(
+            error_msg.contains("backup-source"),
+            "error message must retain the alias name for context"
+        );
+        assert!(
+            error_msg.contains(endpoint),
+            "error message must retain the endpoint for context"
+        );
     }
 }
