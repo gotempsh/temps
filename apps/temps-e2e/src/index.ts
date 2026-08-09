@@ -27,6 +27,7 @@ import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.
 import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
 import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
 import { redisRestoreScenarioCommand } from './commands/redis-restore-scenario.ts'
+import { mongodbRestoreScenarioCommand } from './commands/mongodb-restore-scenario.ts'
 import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
 
 const program = new Command()
@@ -208,6 +209,21 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await pitrScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('mongodb-restore-scenario')
+  .description(
+    'MongoDB backup + in-place restore: provision a MongoDB service, insert pre-backup docs via docker exec mongosh, ' +
+      'run a real mongodump backup (MongodbEngine sidecar → MinIO), insert post-backup docs, restore in place, ' +
+      'and verify via the data-browser API that pre-backup docs are present and post-backup docs are absent',
+  )
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await mongodbRestoreScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

@@ -99,7 +99,7 @@ members = [
 [workspace.package]
 version = "0.1.0-beta.55"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
