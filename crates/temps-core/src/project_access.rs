@@ -119,6 +119,35 @@ pub trait ProjectAccessChecker: Send + Sync {
     ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
     }
+
+    /// Flushes any cache this checker keeps for `effective_project_permissions`
+    /// (and, transitively, for whatever a registered
+    /// [`MembershipPermissionResolver`] answers).
+    ///
+    /// A checker that caches per-`(user, project)` permission sets — as the
+    /// recommended implementation does, since `effective_project_permissions`
+    /// is on the hot path of every `project_permission_guard!` call — becomes
+    /// a second cache layer sitting in front of a
+    /// [`MembershipPermissionResolver`] plugin's own cache. When that plugin's
+    /// answer for a membership changes (a role definition is edited, a
+    /// membership's role assignment is created/updated/deleted), the plugin
+    /// can invalidate its own cache, but it holds only `Arc<dyn
+    /// ProjectAccessChecker>` — the trait, not this checker's concrete type —
+    /// so it has no way to reach this cache without this method.
+    ///
+    /// Defaults to a no-op so existing implementations of this trait
+    /// (compiled against an older version of it, or a checker that caches
+    /// nothing) keep behaving exactly as they do today.
+    ///
+    /// Deliberately synchronous and coarse (whole-cache flush, no
+    /// per-project or per-user granularity): the moka-backed reference
+    /// implementation's own `invalidate_all` is lazy and cheap to call from a
+    /// resolver plugin's write path without needing `.await` there, and a
+    /// resolver plugin has no way to know which `(user, project)` pairs are
+    /// affected by e.g. a role permission-set edit — that set is unbounded
+    /// from the resolver's point of view, so a full flush is the only
+    /// correct granularity available to it.
+    fn invalidate_permissions_cache(&self) {}
 }
 
 /// Optional extension point for overriding what a single team membership
