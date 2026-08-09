@@ -3307,6 +3307,67 @@ impl TimescaleDbStorage {
 
         (where_clauses.join(" AND "), values, param_idx)
     }
+
+    // ── Cross-backend quota helpers ──────────────────────────────────────
+    //
+    // Used by `ClickHouseOtelStorage::get_storage_quota`
+    // (`storage/clickhouse/mod.rs`) to combine ClickHouse-native span/metric
+    // byte accounting with the Postgres-native log volume it still
+    // delegates here. Kept separate from `get_storage_quota` above (which
+    // stays a single three-table round trip, unchanged) so the all-Postgres
+    // path taken by every non-ClickHouse install pays no extra query.
+
+    /// Compute the proportional byte estimate for a single OTel hypertable
+    /// attributed to `project_id`, using the same chunk-aware
+    /// `hypertable_size()` formula as `get_storage_quota` — see that
+    /// method's CORRECTNESS comment for why `pg_total_relation_size` on the
+    /// hypertable root would be wrong here.
+    ///
+    /// `table` must be a fixed, code-controlled literal — one of
+    /// `"otel_metrics"`, `"otel_spans"`, `"otel_log_events"` — never
+    /// request/user input. Postgres cannot bind identifiers as query
+    /// parameters (only values), so it is interpolated via `format!`; every
+    /// call site in this crate passes a hardcoded string, so this is safe.
+    pub(crate) async fn hypertable_bytes_for_project(
+        &self,
+        table: &str,
+        project_id: i32,
+    ) -> StorageResult<u64> {
+        let sql = format!(
+            r#"
+            SELECT COALESCE((SELECT hypertable_size('{table}'::regclass) *
+                LEAST(1.0, (SELECT COUNT(*) FROM {table} WHERE project_id = $1)::float /
+                GREATEST(approximate_row_count('{table}'::regclass), 1)::float)
+            ), 0)::bigint as total_bytes
+            "#
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![project_id.into()],
+            ))
+            .await?;
+
+        Ok(match result {
+            Some(row) => row.try_get::<i64>("", "total_bytes").unwrap_or(0) as u64,
+            None => 0,
+        })
+    }
+
+    /// The configured per-project quota limit in bytes, if quota
+    /// enforcement is enabled (`TEMPS_OTEL_QUOTA_GB` set). `None` means
+    /// quota enforcement is off.
+    ///
+    /// Exposed so `ClickHouseOtelStorage` — which shares this same
+    /// `TimescaleDbStorage` as its inner delegate — reads the one
+    /// configured limit instead of parsing `TEMPS_OTEL_QUOTA_GB` a second
+    /// time in a second place.
+    pub(crate) fn quota_bytes_per_project(&self) -> Option<u64> {
+        self.quota_bytes_per_project
+    }
 }
 
 // ── LIKE pattern helpers ─────────────────────────────────────────────

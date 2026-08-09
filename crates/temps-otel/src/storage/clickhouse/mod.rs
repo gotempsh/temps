@@ -10,10 +10,21 @@
 //! - **Span-domain reads** (`query_trace_summaries`, `count_traces`,
 //!   `query_spans`, `get_trace`, GenAI reads) run natively against ClickHouse
 //!   as of Phase 1.
-//! - **Non-span methods** (metrics, logs, anomaly helpers, retention) and
-//!   **control-row methods** (insights, health summaries, quota) are delegated
-//!   to the inner [`Arc<TimescaleDbStorage>`] unconditionally. These are
-//!   ADR-016 Phases 2–4.
+//! - **Metric writes and reads** (`store_metrics`, `query_metrics`,
+//!   `list_metric_names`, anomaly-detection helpers) also run natively
+//!   against ClickHouse — `store_metrics` writes only to CH, never to the
+//!   inner Postgres store (see the comment above `store_metrics`).
+//! - **Logs** (`store_logs`, `archive_logs`, `query_logs`) and
+//!   **control-row methods** (insights, health summaries) are delegated to
+//!   the inner [`Arc<TimescaleDbStorage>`] unconditionally.
+//! - **Storage quota** (`get_storage_quota`, `check_quota`) is NOT a plain
+//!   delegation: it combines ClickHouse-native byte accounting for
+//!   `spans`/`metrics` (via `system.parts`) with the inner store's
+//!   single-table share of `otel_log_events` — see `get_storage_quota`'s
+//!   doc comment for why summing the inner store's own 3-table
+//!   `get_storage_quota` would be wrong here (it would measure
+//!   near-empty Postgres `otel_spans`/`otel_metrics` tables that a
+//!   ClickHouse-enabled install never writes span/metric rows into).
 //!
 //! ## Activation
 //!
@@ -3170,7 +3181,10 @@ impl OtelStorage for ClickHouseOtelStorage {
         Ok(merge_trace_ref_projects(ch_refs, pg_refs))
     }
 
-    // ── Control-row methods — always Postgres (insights, health, quota) ──────
+    // ── Control-row methods — always Postgres (insights, health) ─────────────
+    //
+    // Storage quota is handled separately below: it is NOT purely
+    // Postgres-delegated. See `get_storage_quota`'s doc comment.
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
         self.inner.upsert_insight(insight).await
@@ -3206,12 +3220,134 @@ impl OtelStorage for ClickHouseOtelStorage {
             .await
     }
 
+    /// Real per-project storage-quota accounting for a ClickHouse-backed
+    /// install.
+    ///
+    /// This does NOT delegate wholesale to `self.inner` — `spans` and
+    /// `metrics` are ClickHouse-native (see module doc: `store_spans` /
+    /// `store_metrics` write only to CH), so `self.inner`'s three-table sum
+    /// would measure Postgres tables that ClickHouse-enabled installs never
+    /// write span/metric rows into and silently under-report the real
+    /// volume — the exact "quota inert for CH-backed installs" gap tracked
+    /// as a known limitation until this fix.
+    ///
+    /// Instead: ClickHouse's own `spans`/`metrics` byte volume is computed
+    /// natively here (proportional estimate using `system.parts`, CH's
+    /// chunk-aware equivalent of TimescaleDB's `hypertable_size()`), and
+    /// combined with the ONE domain still genuinely Postgres-owned even
+    /// with CH enabled: `otel_log_events` (`store_logs` / `archive_logs`
+    /// always delegate to `self.inner` — see module doc). That single-table
+    /// share is read via `TimescaleDbStorage::hypertable_bytes_for_project`
+    /// rather than `get_storage_quota`'s 3-table sum, which would double
+    /// count against near-empty `otel_spans`/`otel_metrics` Postgres tables.
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
-        self.inner.get_storage_quota(project_id).await
+        // Quota is opt-in. Mirrors the early-exit in
+        // `TimescaleDbStorage::get_storage_quota`: this sits on the ingest
+        // hot path (`OtelService::check_quota` on every quota-cache miss),
+        // so a disabled quota must never touch ClickHouse or Postgres.
+        let Some(limit_bytes) = self.inner.quota_bytes_per_project() else {
+            return Ok(StorageQuota {
+                project_id,
+                metrics_bytes: 0,
+                traces_bytes: 0,
+                logs_bytes: 0,
+                total_bytes: 0,
+                limit_bytes: 0,
+                usage_pct: 0.0,
+            });
+        };
+
+        // `total_bytes` comes back as `Nullable(UInt64)`: ClickHouse's type
+        // inference marks the `toUInt64(...) + toUInt64(...)` expression
+        // nullable because it is built from `least`/`greatest` over
+        // aggregate subqueries, even though the `COALESCE(..., 0)`s make a
+        // real NULL impossible here. Modeling it as `Option<u64>` (defaulting
+        // to 0) sidesteps relying on that inference rather than fighting it
+        // with more SQL-side casts.
+        #[derive(::clickhouse::Row, Deserialize, Debug)]
+        struct ChQuotaBytesRow {
+            total_bytes: Option<u64>,
+        }
+
+        // Per-table proportional estimate, ClickHouse-native:
+        //   table_bytes(active parts) * min(1.0, project_rows / total_rows)
+        //
+        // `system.parts` is metadata (no data scan): `bytes_on_disk` sums
+        // real compressed on-disk size of active parts (ClickHouse's
+        // equivalent of `hypertable_size()`'s chunk sum — MERGED-away parts
+        // are excluded via `active = 1` so dropped/superseded data is never
+        // double counted), and `rows` sums the row-count denominator the
+        // same way. The per-project numerator (`count() WHERE project_id =
+        // ?`) does scan, but `ORDER BY (project_id, ...)` on both `spans`
+        // and `metrics` (see the migration DDL) makes it a primary-index
+        // read bounded to this project's granules, not a full table scan.
+        const CH_QUOTA_BYTES_SQL: &str = r#"
+            SELECT toUInt64(
+                COALESCE((
+                    SELECT sum(bytes_on_disk) FROM system.parts
+                    WHERE database = currentDatabase() AND table = 'spans' AND active = 1
+                ), 0) *
+                least(1.0, toFloat64((SELECT count() FROM spans WHERE project_id = ?)) /
+                    greatest(toFloat64(COALESCE((
+                        SELECT sum(rows) FROM system.parts
+                        WHERE database = currentDatabase() AND table = 'spans' AND active = 1
+                    ), 0)), 1.0))
+            ) +
+            toUInt64(
+                COALESCE((
+                    SELECT sum(bytes_on_disk) FROM system.parts
+                    WHERE database = currentDatabase() AND table = 'metrics' AND active = 1
+                ), 0) *
+                least(1.0, toFloat64((SELECT count() FROM metrics WHERE project_id = ?)) /
+                    greatest(toFloat64(COALESCE((
+                        SELECT sum(rows) FROM system.parts
+                        WHERE database = currentDatabase() AND table = 'metrics' AND active = 1
+                    ), 0)), 1.0))
+            ) AS total_bytes
+        "#;
+
+        let ch_bytes = self
+            .ch
+            .query(CH_QUOTA_BYTES_SQL)
+            .bind(project_id)
+            .bind(project_id)
+            .fetch_one::<ChQuotaBytesRow>()
+            .await
+            .map_err(|e| ch_query_err("get_storage_quota", e))?
+            .total_bytes
+            .unwrap_or(0);
+
+        // otel_log_events is the one domain still genuinely Postgres-owned
+        // (logs are never dual-written or CH-native — see module doc).
+        let logs_bytes = self
+            .inner
+            .hypertable_bytes_for_project("otel_log_events", project_id)
+            .await?;
+
+        let total_bytes = ch_bytes.saturating_add(logs_bytes);
+        let usage_pct = if limit_bytes > 0 {
+            (total_bytes as f64 / limit_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(StorageQuota {
+            project_id,
+            metrics_bytes: 0, // Approximate breakdown not available cheaply
+            traces_bytes: 0,
+            logs_bytes: 0,
+            total_bytes,
+            limit_bytes,
+            usage_pct,
+        })
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
-        self.inner.check_quota(project_id).await
+        // With no quota configured, get_storage_quota short-circuits to
+        // zeros without touching ClickHouse or Postgres, so this is always
+        // "not exceeded".
+        let quota = self.get_storage_quota(project_id).await?;
+        Ok(quota.usage_pct >= 100.0)
     }
 
     // ── Anomaly-detection helpers (ClickHouse — native) ──────────────────────
