@@ -7,7 +7,7 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `pitr-scenario`,
 `git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
-`db-ha-failover-scenario`, `examples`) drive the real
+`db-ha-failover-scenario`, `pg-upgrade-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -162,6 +162,14 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # survive. Needs MinIO (docker-compose.e2e.yml). Runs ~90s of real wall-clock
 # wait time so a WAL segment actually archives -- see the steps section below.
 bun run src/index.ts pitr-scenario --registry localhost:5111
+
+# pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
+# pinned to postgres:16-bookworm, write 5 marker rows, trigger the upgrade
+# (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
+# and prove via the read-only data-browser API that the marker rows survived
+# the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111 --upgrade-timeout 900000  # generous timeout for slow hosts
 
 # git-deploy: real clone + build of a public GitHub repo
 # (github.com/gotempsh/temps-examples) via trigger-pipeline -- proves the
@@ -791,6 +799,79 @@ platform/Postgres behavior that this scenario's first draft got wrong:
   count and the restored ids' exact identity instead of the new row's
   specific id.
 
+### `pg-upgrade-scenario` steps
+
+Closes the real coverage gap noted in the former "Known gaps" section: the
+`PostgresUpgradeOrchestrator`
+(`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) and its
+`POST /external-services/{service_id}/upgrades` HTTP surface were fully wired
+and real, but zero e2e coverage existed for the actual dump+restore data
+path -- the only honest proof that a major-version upgrade preserves data is
+reading the rows back after it finishes, not just watching a status field flip.
+
+1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
+   `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
+   it inserts a row into `e2e_probe` and returns the total count
+2. provision a real standalone Postgres service pinned to `postgres:16-bookworm`
+   via `parameters.docker_image` at creation time. Standard official postgres
+   images are used; `extract_postgres_version("postgres:16-bookworm")` returns
+   `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
+   pin is required because the upgrade API validates that `to_version > from_version`
+   and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
+   -- using the platform default 18-bookworm image would leave nowhere to
+   upgrade to in an e2e test
+3. create a **default** S3 source (`is_default: true`) pointed at the local
+   MinIO. `phase_pre_backup` in the orchestrator calls
+   `BackupService::default_s3_source_id` (`WHERE is_default = true`) to find
+   the backup target; the upgrade API returns 412 immediately if no default
+   source is configured -- this is a hard precondition, not an optional step
+4. link the service to a project, deploy the db-probe app, wait for it to be
+   healthy, and confirm `/health` succeeds (real DB ping)
+5. write 5 real rows through `/probe` (the T1 marker set). These land in the
+   per-project auto-provisioned database (NOT the service's own `database`
+   parameter -- see `PostgresService::get_runtime_env_vars`), named
+   `normalize_database_name("{project_slug}_{env_slug}")` as computed by
+   `normalizePostgresDatabaseName` in `flows.ts`
+6. `POST /external-services/{service_id}/upgrades` with
+   from_version="16" / to_version="17" / from_image="postgres:16-bookworm" /
+   to_image="postgres:17-bookworm". The orchestrator spawns a
+   tokio task and returns immediately with status="pending". It then runs
+   seven real phases synchronously:
+     - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
+     - `snapshot`: stop old container, `docker cp`-style volume copy to a
+       rollback volume, remove the original volume
+     - `dump`: boot throwaway old-version container with rollback volume
+       mounted, run `pg_dumpall`, write dump to a separate volume
+     - `new_container`: `lifecycle.create_and_start(service_id, to_image)` --
+       boots a fresh 17-bookworm container (empty data volume → initdb)
+     - `restore`: boot a psql container with the dump volume, run
+       `psql < data.sql` against the new container
+     - `swap`: persist `to_image` onto the service's `parameters.docker_image`
+       column via `lifecycle.set_docker_image`, restart the container
+     - `analyze`: run `ANALYZE` so the planner sees the new-version stats
+7. poll `GET /external-services/{service_id}/upgrades/{id}` every 5s until
+   `status === "completed"` or `status === "failed"`, up to `--upgrade-timeout`
+   (default 600s). On failure, the error includes the last-seen phase and
+   `error_message` from the upgrade row so the cause is always visible
+8. assert the 5 T1 marker rows survived: read them via the read-only
+   data-browser API (`GET /external-services/{id}/query/containers/{path}/entities/{entity}/data`
+   -- same endpoint `pitr-scenario` uses) and assert `total_count=5` and
+   `ids=[1,2,3,4,5]` exactly. This is the only honest proof: the dump captured
+   those rows and psql restored them. A status=completed without this
+   check would pass even if the restore loaded into the wrong database or no
+   database at all
+9. assert the service is fully writable on the new version: hit `/probe` once
+   more and confirm a 6th row landed, read back via data-browser and assert
+   `total_count=6`, first 5 ids exactly `[1,2,3,4,5]`, new id > 5. The
+   sequence jumps past the pre-dump high-water mark for the same reason
+   PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
+   monotonicity, not the exact new id
+10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
+    now equals `postgres:17-bookworm`. `phase_swap` calls
+    `lifecycle.set_docker_image` which persists the new image into
+    `external_services.parameters`; this checks the API-visible result
+11. teardown (deployment, project, service, S3 source)
+
 ### `git-deploy-scenario` steps
 
 1. create a project pointed at a real public repo
@@ -1281,36 +1362,6 @@ via `POST /set-default-ipv4` before provisioning, so Pebble's validation
 request actually reaches the host.
 
 ## Known gaps (not covered end-to-end)
-
-**Postgres major-version upgrade** — deliberately scoped out of
-`pitr-scenario` (and not covered by any other scenario), unlike PITR which
-IS fully covered. `POST /external-services/{id}/upgrades`
-(`crates/temps-backup/src/handlers/pg_upgrade_handler.rs`,
-`PostgresUpgradeOrchestrator` in
-`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) is real and
-reachable — a multi-phase `pre_backup -> snapshot -> dump -> new_container
--> restore -> swap -> analyze` workflow that dumps the live cluster,
-provisions a fresh container on the target major version, restores into it,
-and swaps traffic over — but exercising it live needs meaningfully more
-setup than PITR: (1) the source service must be pinned to an explicit older
-major version at creation time (`version: "16"` or similar) compatible with
-`validate_os_family`'s from/to image check, not the platform default; (2)
-`phase_pre_backup` requires a **default** S3 source
-(`ExternalService::default_s3_source_id`, `is_default: true`) rather than
-the ad-hoc, non-default source `pitr-scenario`'s S3 setup uses; (3) the
-workflow pulls TWO postgres major-version images and does a real
-dump+restore, meaningfully longer and higher-blast-radius than PITR's
-WAL-replay. Given the severe background-process instability hit while
-building `pitr-scenario` on this shared dev host (the target `temps serve`
-instance died unpredictably — no panic, no OOM, no crash report — multiple
-times across an otherwise-successful run, requiring repeated restarts to
-get 3 clean end-to-end passes), there wasn't a reliable enough window left
-to also stand up and live-verify the upgrade path in the same session. A
-future pass should build `pg-upgrade-scenario` as its own command following
-this same pattern (base backup via a **default** S3 source, provision on an
-explicit older `version`, write a marker row, trigger the upgrade, poll to
-`completed`, assert the marker row survived via the data-browser API, and
-assert the service is reachable on the new major version).
 
 **Slack notifications** — deliberately not covered by any scenario command,
 and not expected to be: two independent guards stand between a real
