@@ -3853,6 +3853,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         // Route to the worker that owns this container — calling the local
         // CP dockerd for a remote container would 404 silently, leaving the
@@ -3868,6 +3869,27 @@ impl DeploymentService {
         active_container.status = Set(Some("stopped".to_string()));
         active_container.update(self.db.as_ref()).await?;
 
+        // Same reasoning as `pause_deployment`: this status UPDATE fires no
+        // DB trigger, so force an in-process route-table reload or the
+        // proxy keeps routing to a container we just told the UI is
+        // stopped until some unrelated route change happens to reload it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after stopping container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
+
         info!("Successfully stopped container: {}", container_id);
         Ok(())
     }
@@ -3882,6 +3904,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer
@@ -3893,6 +3916,27 @@ impl DeploymentService {
         let mut active_container: deployment_containers::ActiveModel = container.into();
         active_container.status = Set(Some("running".to_string()));
         active_container.update(self.db.as_ref()).await?;
+
+        // Same reasoning as `resume_deployment`: this status UPDATE fires no
+        // DB trigger, so force an in-process route-table reload or the
+        // proxy keeps treating this container as not-routable until some
+        // unrelated route change happens to reload it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after starting container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
 
         info!("Successfully started container: {}", container_id);
         Ok(())
@@ -3908,6 +3952,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer
@@ -3924,6 +3969,27 @@ impl DeploymentService {
         let mut active_container: deployment_containers::ActiveModel = container.into();
         active_container.status = Set(Some("running".to_string()));
         active_container.update(self.db.as_ref()).await?;
+
+        // Same reasoning as `pause_deployment`/`resume_deployment`: this
+        // status UPDATE fires no DB trigger, so force an in-process
+        // route-table reload or the proxy's cached peer table doesn't
+        // notice the restart until some unrelated route change reloads it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after restarting container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
 
         info!("Successfully restarted container: {}", container_id);
         Ok(())
@@ -5053,6 +5119,113 @@ mod tests {
         Ok(())
     }
 
+    // Regression coverage for the pause/resume Docker-op mismatch bug: the
+    // two tests above use `setup_test_data`, which never inserts a
+    // `deployment_containers` row, so the container loop inside
+    // `pause_deployment`/`resume_deployment` never actually executes and
+    // neither test can observe which Docker operation gets called. These
+    // two variants use `setup_test_deployment` (which inserts one real
+    // container) and pin down the *exact* deployer method invoked via a
+    // narrowly-scoped mock, so a regression back to `pause_container`/
+    // `resume_container` (the old, broken ops) — or simply forgetting to
+    // touch the container at all — fails the test instead of passing it
+    // silently.
+    #[tokio::test]
+    async fn test_pause_deployment_stops_real_container() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+        assert_eq!(container.status.as_deref(), Some("running"));
+
+        // Only `stop_container` is wired up on this mock. If pause
+        // regressed to calling `pause_container`/`resume_container`
+        // instead, the mock has no expectation for that method and panics.
+        let expected_container_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_stop_container()
+            .withf(move |id| id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let deployment_service = create_cleanup_service_for_test(db.clone(), deployer);
+
+        deployment_service
+            .pause_deployment(deployment.project_id, deployment.id)
+            .await?;
+
+        let updated_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_deployment.state, "paused");
+
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_container.status.as_deref(), Some("stopped"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resume_deployment_starts_real_container() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+
+        // Simulate the post-pause state: deployment "paused", container
+        // "stopped" but not removed (pause_deployment keeps the Docker
+        // container object around rather than force-removing it).
+        let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+        active_deployment.state = Set("paused".to_string());
+        let deployment = active_deployment.update(db.as_ref()).await?;
+
+        let mut active_container: deployment_containers::ActiveModel = container.clone().into();
+        active_container.status = Set(Some("stopped".to_string()));
+        let container = active_container.update(db.as_ref()).await?;
+
+        // Only `start_container` (a plain `docker start`) is wired up. If
+        // resume regressed to calling `resume_container` (Docker's
+        // unpause/cgroup-freeze reverse, which always fails against a
+        // container that was merely stopped, not paused), the mock has no
+        // expectation for that method and panics.
+        let expected_container_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_start_container()
+            .withf(move |id| id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let deployment_service = create_cleanup_service_for_test(db.clone(), deployer);
+
+        deployment_service
+            .resume_deployment(deployment.project_id, deployment.id)
+            .await?;
+
+        let updated_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_deployment.state, "deployed");
+
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_container.status.as_deref(), Some("running"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_rollback_to_deployment() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -5261,7 +5434,7 @@ mod tests {
         let db = test_db.connection_arc();
 
         // Setup test data
-        let (_project, _environment, mut target_deployment) = setup_test_data(&db).await?;
+        let (_project, environment, mut target_deployment) = setup_test_data(&db).await?;
 
         // Update the deployment state to "failed" to make it invalid for rollback
         let mut active_deployment: deployments::ActiveModel = target_deployment.into();
@@ -5284,6 +5457,128 @@ mod tests {
             }
             e => panic!("Expected InvalidDeploymentState error, got: {:?}", e),
         }
+
+        // A second, distinct invalid state must still be rejected too --
+        // this isn't just re-asserting "failed" from above. Reuse the same
+        // project/environment (rather than calling `setup_test_data` again,
+        // which would collide on its hard-coded project slug) with a fresh
+        // deployment row.
+        let other_target = deployments::ActiveModel {
+            project_id: Set(target_deployment.project_id),
+            environment_id: Set(environment.id),
+            slug: Set("test-deployment-creating".to_string()),
+            state: Set("creating".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_target = other_target.insert(db.as_ref()).await?;
+
+        let result = deployment_service
+            .rollback_to_deployment(other_target.project_id, other_target.id)
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DeploymentError::InvalidDeploymentState(msg) => {
+                assert!(msg.contains("creating"));
+            }
+            e => panic!("Expected InvalidDeploymentState error, got: {:?}", e),
+        }
+
+        Ok(())
+    }
+
+    // Regression coverage for `valid_rollback_states` gaining "stopped":
+    // the only pre-existing invalid-state test above only ever asserted on
+    // "failed" being rejected, so a regression that dropped "stopped" from
+    // the allow-list (reintroducing "Cannot rollback to deployment in
+    // 'stopped' state" for the primary real-world rollback target -- a
+    // superseded, previously-successful deployment) would pass every
+    // existing test in this file.
+    #[tokio::test]
+    async fn test_rollback_to_deployment_accepts_stopped_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup test data
+        let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
+        setup_test_environment_variables(&db, target_deployment.project_id, environment.id).await?;
+
+        // Create container for target deployment (required for rollback)
+        let now = Utc::now();
+        let target_container = deployment_containers::ActiveModel {
+            deployment_id: Set(target_deployment.id),
+            container_id: Set("container-rollback-stopped-target".to_string()),
+            container_name: Set("app-rollback-stopped-target".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:target".to_string())),
+            status: Set(Some("stopped".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        target_container.insert(db.as_ref()).await?;
+
+        // This is the state `cancel_previous_deployments`/`teardown_deployment`
+        // actually leave a superseded-but-successful deployment in -- the
+        // primary real-world rollback target.
+        let mut active_target: deployments::ActiveModel = target_deployment.into();
+        active_target.state = Set("stopped".to_string());
+        let target_deployment = active_target.update(db.as_ref()).await?;
+
+        // Create current deployment that will be stopped by the rollback
+        let current_deployment = deployments::ActiveModel {
+            project_id: Set(target_deployment.project_id),
+            environment_id: Set(environment.id),
+            slug: Set("current-deployment-for-stopped-rollback".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            image_name: Set(Some("nginx:current".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let current_deployment = current_deployment.insert(db.as_ref()).await?;
+
+        let current_container = deployment_containers::ActiveModel {
+            deployment_id: Set(current_deployment.id),
+            container_id: Set("container-rollback-stopped-current".to_string()),
+            container_name: Set("app-rollback-stopped-current".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:current".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        current_container.insert(db.as_ref()).await?;
+
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        environment = active_environment.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Rollback to a "stopped" target must succeed, not bounce off the
+        // InvalidDeploymentState guard.
+        let result = deployment_service
+            .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
+            .await?;
+
+        assert_ne!(result.id, target_deployment.id);
+        assert!(result.is_current);
+
+        let updated_environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_environment.current_deployment_id, Some(result.id));
 
         Ok(())
     }
