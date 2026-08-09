@@ -54,7 +54,6 @@ import {
   Eye,
   EyeOff,
   Folder,
-  GitBranch,
   Loader2,
   Plus,
   Settings,
@@ -68,6 +67,7 @@ import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import { ServiceEnvPreview } from './ServiceEnvPreview'
 import { FrameworkSelector } from './FrameworkSelector'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -82,6 +82,22 @@ function getRepositoryUrl(repository: RepositoryResponse): string | null {
     url = `https://${sshMatch[1]}/${sshMatch[2]}`
   }
   return url.startsWith('http://') || url.startsWith('https://') ? url : null
+}
+
+// Best-effort provider detection from the repo URL's hostname, for the brand
+// logo next to the repo name. `RepositoryResponse` doesn't carry a provider
+// type field directly (only `git_provider_connection_id`), so this mirrors
+// the hostname-sniffing already used in BranchSelector.tsx's
+// `detectProviderFromUrl`. Falls back to ProviderLogo's generic branch icon
+// when the host doesn't match a known provider (e.g. self-hosted Gitea).
+function detectProviderType(url: string | null): string | null {
+  if (!url) return null
+  const hostname = url.toLowerCase()
+  if (hostname.includes('github')) return 'github'
+  if (hostname.includes('gitlab')) return 'gitlab'
+  if (hostname.includes('bitbucket')) return 'bitbucket'
+  if (hostname.includes('gitea')) return 'gitea'
+  return null
 }
 
 // Helper function to normalize path for consistent comparison
@@ -680,24 +696,28 @@ export function ProjectConfigurator({
   // when the surrounding page already shows the repo (e.g. the import page's
   // context bar) so the name isn't printed twice.
   const repositoryUrl = getRepositoryUrl(repository)
+  const repositoryProviderType = detectProviderType(repositoryUrl)
 
   const renderRepoConfig = () => (
     <div className="space-y-4">
       {showRepositoryCard && (
-        <div className="flex items-center gap-3 p-4 bg-muted/50 rounded-lg">
-          <GitBranch className="h-5 w-5 text-muted-foreground" />
+        <div className="flex items-center gap-2 px-3 py-2 bg-muted/50 rounded-md text-sm">
+          <ProviderLogo
+            providerType={repositoryProviderType}
+            className="h-4 w-4 shrink-0 text-muted-foreground"
+          />
           {repositoryUrl ? (
             <a
               href={repositoryUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="font-medium hover:underline inline-flex items-center gap-1.5"
+              className="font-medium hover:underline inline-flex items-center gap-1.5 truncate"
             >
               {repository.full_name}
-              <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+              <ExternalLink className="h-3 w-3 text-muted-foreground shrink-0" />
             </a>
           ) : (
-            <div className="font-medium">{repository.full_name}</div>
+            <div className="font-medium truncate">{repository.full_name}</div>
           )}
         </div>
       )}
