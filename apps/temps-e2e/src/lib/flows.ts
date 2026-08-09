@@ -515,9 +515,12 @@ export async function waitForHttpReady(opts: {
  */
 export function looksLikeConsoleFallback(body: string): boolean {
   if (!/<!doctype html>/i.test(body)) return false
-  // The Temps console index.html sets `<title>Temps</title>`. A static SPA
-  // example sets its own title (e.g. "react-basic"), so this stays specific.
-  return /<title>\s*Temps\s*<\/title>/i.test(body)
+  // The Temps console index.html sets `<title>Temps</title>` in production
+  // builds and `<title>Temps - Development Build</title>` in dev builds.
+  // A deployed app never starts its page title with "Temps" (they use their
+  // own names), so matching the prefix is sufficient and avoids brittleness
+  // against the exact suffix used in each build mode.
+  return /<title>\s*Temps[\s\-<]/i.test(body)
 }
 
 /**
