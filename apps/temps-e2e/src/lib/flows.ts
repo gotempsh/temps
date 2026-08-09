@@ -190,12 +190,12 @@ export async function triggerPipelineAndGetDeploymentId(
 export async function getProductionEnvironment(
   client: Client,
   projectId: number,
-): Promise<{ id: number; mainUrl: string; name: string }> {
+): Promise<{ id: number; mainUrl: string; name: string; slug: string }> {
   const res = await getEnvironments({ client, path: { project_id: projectId } })
   const envs = unwrap(res, 'getEnvironments')
   const prod = envs.find((e) => e.is_preview === false) ?? envs[0]
   if (!prod) throw new Error(`No environment found for project ${projectId}`)
-  return { id: prod.id, mainUrl: prod.main_url, name: prod.name }
+  return { id: prod.id, mainUrl: prod.main_url, name: prod.name, slug: prod.slug }
 }
 
 /** Trigger a deploy from a prebuilt public image; returns the deployment id. */

@@ -227,8 +227,10 @@ export async function pitrScenarioCommand(opts: PitrScenarioOptions): Promise<vo
     // pointed at THAT (see `PostgresService::get_runtime_env_vars` /
     // `normalizePostgresDatabaseName`'s doc comment). Reading the actual
     // table back through the data-browser API needs this computed name,
-    // not the service's own `database` parameter.
-    const dbContainerPath = `${normalizePostgresDatabaseName(`${project.slug}_${env.name}`)}/public`
+    // not the service's own `database` parameter. `get_runtime_env_vars`
+    // keys off `environment.slug`, NOT the display `name` -- they're only
+    // coincidentally identical for the default "production" environment.
+    const dbContainerPath = `${normalizePostgresDatabaseName(`${project.slug}_${env.slug}`)}/public`
     log(`  db container path: ${dbContainerPath}`)
 
     const deploymentId = await step('deploy the db-probe app', () =>
@@ -328,6 +330,53 @@ export async function pitrScenarioCommand(opts: PitrScenarioOptions): Promise<vo
       return entry
     })
     log(`  backup #${backupEntry.id} (${backupEntry.backup_id})`)
+
+    // Negative path: a recovery target from before this backup even started
+    // is out of range -- no WAL this backup covers can ever satisfy it.
+    // Root-cause note (why this is checked at the API layer, not just
+    // asserted here): PostgreSQL itself does NOT error on a too-early
+    // `recovery_target_time`. It silently stops recovery at the earliest
+    // point it CAN reach (right after the base backup's own consistency
+    // checkpoint) and carries on -- no FATAL, no warning. Verified live
+    // against a real WAL-G backup before `RestoreService::start_restore`
+    // gained this check: the API returned 202, the restore run reached
+    // `status: "completed"`, and the "restored" table silently ended up
+    // holding NONE of the data the backup covered -- a wrong state
+    // reported as success, not a rejection. `start_restore` now range-checks
+    // `RecoveryTarget::Time` against the backup's own `started_at` BEFORE a
+    // restore run row is even created or any container is touched, so this
+    // must come back as an immediate 400, not a run that completes into a
+    // silently-wrong state.
+    await step('PITR to a target before the backup started is rejected (400), not silently accepted', async () => {
+      const outOfRangeTarget = '2000-01-01T00:00:00.000Z'
+      const res = await startRestore({
+        client,
+        path: { id: service.id },
+        body: {
+          backup_id: backupEntry.id,
+          mode: 'pitr',
+          to_new_service: false,
+          target: { kind: 'time', time: outOfRangeTarget },
+        },
+      })
+      if (!res.error) {
+        throw new Error(
+          `PITR restore to ${outOfRangeTarget} (years before the backup started) succeeded ` +
+            `(run #${res.data?.id}, status "${res.data?.status}") instead of being rejected -- ` +
+            'an out-of-range PITR target must be REJECTED up front, not accepted into a restore ' +
+            'run that can silently complete without honoring the requested target',
+        )
+      }
+      const status = res.response?.status
+      if (status !== 400) {
+        throw new Error(`PITR restore to an out-of-range target returned HTTP ${status}, expected 400`)
+      }
+      const detail = (res.error as { detail?: string } | undefined)?.detail ?? ''
+      if (!detail.toLowerCase().includes('before this backup started')) {
+        throw new Error(`400 response did not explain the out-of-range target as expected; detail was: "${detail}"`)
+      }
+      log(`  rejected as expected: ${detail}`)
+    })
 
     await step('write 5 real rows (T1 marker) through the injected POSTGRES_URL', async () => {
       let last = 0
