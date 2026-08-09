@@ -800,7 +800,16 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
 
-        let helper_name = format!("{}-restore-helper", target_container_name);
+        // Include a random suffix so two concurrent restores of the same service
+        // don't collide on `create_container` with an opaque "name already in use"
+        // error. `restore_from_legacy` uses the same pattern.
+        let helper_suffix = uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("rr")
+            .to_string();
+        let helper_name = format!("{}-restore-helper-{}", target_container_name, helper_suffix);
         use bollard::models::{ContainerCreateBody, HostConfig};
         let helper_config = ContainerCreateBody {
             image: Some(redis_image.to_string()),
@@ -836,13 +845,33 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
 
-        self.docker
+        // If `start_container` fails, the created container persists in Docker
+        // with its S3 credentials visible via `docker inspect`. Always force-remove
+        // the container on this path to avoid credential leaks.
+        if let Err(e) = self
+            .docker
             .start_container(
                 &helper.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "Failed to start restore helper container: {}",
+                e
+            ));
+        }
 
         // Wait for the helper to finish — bounded to avoid an indefinitely stuck
         // helper blocking the restore run forever.
@@ -1008,8 +1037,15 @@ impl RedisService {
 
         // Step 3: Re-enable restart policy and start the original Redis container.
         // Redis will load the restored dump.rdb on startup.
+        //
+        // Re-enable restart policy regardless of the restore outcome — a transient
+        // Docker API error here must NOT propagate via `?` and strand the container
+        // with restart_policy=NO (which prevents auto-recovery from crashes or
+        // daemon restarts). Both sibling functions (`restore_from_legacy`,
+        // `restore_to_new_service`) use `let _ =` here for the same reason.
         info!("Starting Redis with restored data");
-        self.docker
+        let _ = self
+            .docker
             .update_container(
                 &container_name,
                 bollard::models::ContainerUpdateBody {
@@ -1020,8 +1056,7 @@ impl RedisService {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to re-enable restart policy: {}", e))?;
+            .await;
 
         restore_result?;
 
