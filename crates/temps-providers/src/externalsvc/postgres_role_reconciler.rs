@@ -559,6 +559,10 @@ async fn query_monitor(
 /// still stops the loop on the very next check instead of being lost. See
 /// [`ReconcilerShutdown`]'s doc comment for why a bare `Notify` isn't
 /// enough on its own.
+///
+/// Thin wrapper over [`run_loop`], which owns the actual shutdown-aware
+/// loop shape and is generic over the tick body so it can be exercised
+/// directly in tests without a real monitor connection.
 pub async fn run(
     db: Arc<DatabaseConnection>,
     registry: Arc<DnsRegistry>,
@@ -566,22 +570,44 @@ pub async fn run(
     service_name: String,
     shutdown: Arc<ReconcilerShutdown>,
 ) {
+    run_loop(&shutdown, service_id, &service_name, || async {
+        if let Err(e) = reconcile_once(&db, &registry, service_id, &service_name).await {
+            // All errors are transient retries. Log at WARN, sleep, try
+            // again. The only thing that stops the loop is shutdown.
+            warn!(
+                service_id,
+                service_name = %service_name,
+                error = %e,
+                "reconciler tick failed; will retry"
+            );
+        }
+    })
+    .await;
+}
+
+/// Shutdown-aware tick loop shared by `run()` and its tests. Runs `tick`
+/// once per iteration, checking `shutdown.is_stopped()` both before and
+/// after `tick` completes — not just inside the sleep `select!` — so a
+/// signal that arrives while `tick` is in flight still stops the loop the
+/// moment `tick` returns, rather than after an additional `TICK_INTERVAL`
+/// sleep or a whole extra tick. This exact double-check is the race fix
+/// [`ReconcilerShutdown`]'s doc comment describes.
+async fn run_loop<F, Fut>(
+    shutdown: &Arc<ReconcilerShutdown>,
+    service_id: i32,
+    service_name: &str,
+    mut tick: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     info!(service_id, service_name, "starting role reconciler");
     loop {
         if shutdown.is_stopped() {
             info!(service_id, service_name, "role reconciler shutting down");
             return;
         }
-        if let Err(e) = reconcile_once(&db, &registry, service_id, &service_name).await {
-            // All errors are transient retries. Log at WARN, sleep, try
-            // again. The only thing that stops the loop is shutdown.
-            warn!(
-                service_id,
-                service_name,
-                error = %e,
-                "reconciler tick failed; will retry"
-            );
-        }
+        tick().await;
         if shutdown.is_stopped() {
             info!(service_id, service_name, "role reconciler shutting down");
             return;
@@ -789,5 +815,61 @@ mod tests {
         assert!(node(1, "h", 1, "catchingup").is_secondary());
         assert!(node(1, "h", 1, "apply_settings").is_secondary());
         assert!(!node(1, "h", 1, "primary").is_secondary());
+    }
+
+    /// Exercises the actual race `ReconcilerShutdown`'s AtomicBool + Notify
+    /// pair exists to close: a shutdown signal arriving *while a tick is
+    /// in flight* (real network I/O in production; simulated here with a
+    /// sleep standing in for that I/O). A bare `Notify` alone would lose
+    /// this signal (`notify_waiters()` only wakes tasks already parked in
+    /// `.notified()`, and the loop isn't parked there while a tick runs) —
+    /// the task would then fall through to the post-tick `select!`, see no
+    /// buffered wakeup, and sleep the *entire* next `TICK_INTERVAL` before
+    /// running a second full tick and only then noticing shutdown.
+    ///
+    /// Asserts both halves of "still observes it and exits promptly rather
+    /// than running one more full tick cycle first": (1) the loop returns
+    /// well under `TICK_INTERVAL` after the in-flight tick finishes, and
+    /// (2) the tick body is never invoked a second time.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signalled_mid_tick_stops_promptly_not_after_a_full_next_tick() {
+        let shutdown = ReconcilerShutdown::new();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let start = tokio::time::Instant::now();
+        {
+            let call_count = call_count.clone();
+            let shutdown_for_tick = shutdown.clone();
+            run_loop(&shutdown, 1, "race-test-svc", move || {
+                let call_count = call_count.clone();
+                let shutdown = shutdown_for_tick.clone();
+                async move {
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Stand in for reconcile_once's real monitor I/O:
+                        // the signal arrives partway through this "tick",
+                        // well before it returns.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        shutdown.signal();
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            })
+            .await;
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "the loop must not start a second tick after shutdown was \
+             signalled mid-first-tick"
+        );
+        assert!(
+            elapsed < TICK_INTERVAL,
+            "loop must exit promptly once the in-flight tick completes, \
+             not after sleeping a full TICK_INTERVAL first: elapsed={:?}",
+            elapsed
+        );
     }
 }

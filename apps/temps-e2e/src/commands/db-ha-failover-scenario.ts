@@ -44,6 +44,13 @@
  *   7. poll cluster-health until a DIFFERENT node reports a writable-primary
  *      state -- proves the monitor actually promoted the surviving replica,
  *      not just that the old primary's row went stale
+ *   7.5. confirm the console/CLI-facing API (`GET /external-services/{id}`,
+ *      via `get_service_members_with_live_state`) also reflects the
+ *      promotion through `ServiceMemberInfo.live_state` -- a different code
+ *      path than step 7's raw cluster-health probe. `service_members.role`
+ *      itself is intentionally NOT the live signal in the current design
+ *      (see README for why); DNS-record republishing was investigated and
+ *      skipped as impractical this round -- see README for the reasoning.
  *   8. poll `/probe` (tolerating connection errors while pg_auto_failover
  *      completes the promotion) until writes succeed again, and assert this
  *      happens within a bounded window -- proving the app's existing
@@ -406,6 +413,53 @@ export async function dbHaFailoverScenarioCommand(opts: DbHaFailoverScenarioOpti
         throw new Error(`docker reports new primary container ${newPrimary} status="${status}", expected "running"`)
       }
     })
+
+    // Platform-level symptom check #1 from the PR's own root-cause
+    // narrative: does the CONSOLE-FACING API also reflect the promotion,
+    // not just the raw cluster-health probe already checked above? This
+    // exercises a genuinely different code path --
+    // `get_service_members_with_live_state` (called from `get_service_info`
+    // / `GET /external-services/{id}`), which is what the console's role
+    // badge and the CLI actually read. Note: `service_members.role` itself
+    // is NOT the live signal in the current design (it's intentionally
+    // config-only -- `monitor`/`replica` -- per `get_service_info`'s doc
+    // comment: "The UI uses `live_state` for the role badge ... instead of
+    // being gated on the `service_members.role` reconciler"; confirmed by
+    // reading the code that nothing ever writes `role="primary"` at
+    // runtime), so `live_state` is the correct, current equivalent of the
+    // "role failing to flip" symptom the PR's commit message describes.
+    await step(
+      'confirm the console-facing API (GET /external-services/{id}) reflects the promotion via live_state',
+      async () => {
+        const d = unwrap(await getService({ client, path: { id: service.id } }), 'getService')
+        const members = d.service.members ?? []
+        const promoted = members.find((m) => m.container_name === newPrimary)
+        if (!promoted) {
+          throw new Error(`getService did not return a member for the promoted node ${newPrimary}`)
+        }
+        if (!promoted.live_state || !PRIMARY_STATES.has(promoted.live_state)) {
+          throw new Error(
+            `promoted node ${newPrimary}'s ServiceMemberInfo.live_state="${promoted.live_state}" is not a ` +
+              `primary state -- the console/CLI-facing API (get_service_members_with_live_state) has not ` +
+              `caught up with the failover the raw cluster-health probe already detected`,
+          )
+        }
+        // NOT asserted: that the OLD primary's live_state stops reading a
+        // primary state. Verified live that it doesn't -- `reported_state`
+        // is the monitor's last-heard-from value for that node
+        // (`ClusterMemberHealth.reported_state`'s own doc comment: "Doesn't
+        // change when the node stops phoning home"), and a `docker stop`ped
+        // node can't un-report itself. The monitor has nothing further to
+        // do with a dead node's OWN row once it has promoted the survivor,
+        // so it can legitimately sit at a stale `primary` indefinitely.
+        // `ServiceMemberInfo` (unlike `ClusterMemberHealth`) carries no
+        // `health` field to disambiguate "stale dead primary" from "a
+        // second live primary" -- a real console-facing gap, but a
+        // separate one from this PR's fix, and out of scope here.
+        const demoted = members.find((m) => m.container_name === originalPrimary)
+        log(`  console-facing API: ${newPrimary}=${promoted.live_state}, ${originalPrimary}=${demoted?.live_state ?? 'n/a'} (may be stale -- see comment above)`)
+      },
+    )
 
     const recoveryStart = performance.now()
     let postFailoverCount = 0

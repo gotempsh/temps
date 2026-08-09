@@ -799,6 +799,41 @@ of scope here.
     regardless of running state, so the stopped ex-primary is cleaned up
     too)
 
+Between steps 7 and 8, the scenario also asserts a platform-level symptom
+the PR's own root-cause narrative below cites: that the **console/CLI-facing
+API** (`GET /external-services/{id}`, backed by
+`get_service_members_with_live_state`) reflects the promotion via
+`ServiceMemberInfo.live_state` — not just the raw `cluster-health` probe
+already checked in step 7. This exercises a genuinely different code path
+than step 2/7's polling: `get_service_info`'s own doc comment explains why
+`live_state` (not `service_members.role`) is the field to check —
+`service_members.role` is intentionally config-only (`monitor`/`replica`)
+in the current design and is never written to `"primary"` at runtime
+(confirmed by reading the code: `PgAutoFailoverState::to_cluster_role()`,
+which maps to a `Primary` role, is defined and unit-tested but not called
+from any production code path — `sync_member_roles` only ever demotes
+legacy `"primary"` rows to `"replica"` once). Asserting a `role` flip would
+therefore assert something that doesn't happen by design; `live_state` is
+the faithful, current equivalent.
+
+The PR's narrative also cites the DNS reconciler failing to republish
+`primary.<svc>.temps.local`. That assertion was investigated and **skipped
+as impractical for this round**: the only HTTP surface that exposes the
+internal DNS zone content is `GET /internal/nodes/{node_id}/dns/changes`
+(`crates/temps-dns/src/handlers/dns_sync.rs`), gated behind per-node
+bearer-token auth (`nodes.token_hash`), not the user/API-key auth this
+suite otherwise uses end-to-end — and this scenario deliberately stays
+single-Docker-host with no worker node registered, so there is no node
+token to present. Reaching the DNS row from the e2e script would mean
+either registering a throwaway worker node purely to mint a token (a
+disproportionate amount of new surface for one assertion) or querying the
+control-plane's own Postgres directly (breaking this suite's API-only
+testing philosophy, and requiring connection details this scenario file
+otherwise has no reason to know). A cheaper, non-API path would be adding a
+narrow admin/debug endpoint that returns a service's internal DNS records —
+worth doing if this assertion becomes a priority, but out of scope for this
+round.
+
 **Two real platform bugs found and fixed, both in
 `crates/temps-providers/src/externalsvc/cluster_role.rs`'s
 `PgAutoFailoverState::is_primary()`** -- the single classifier the DNS
