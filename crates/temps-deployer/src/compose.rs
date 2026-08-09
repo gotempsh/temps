@@ -12,7 +12,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+/// How long `deploy()` waits for every Compose service to report `running`
+/// (and `healthy`, if it defines a healthcheck) before failing the
+/// deployment. Mirrors the single-container deploy path's
+/// `health_check_timeout_secs` default.
+const COMPOSE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Interval between `docker compose ps` polls while waiting for readiness.
+const COMPOSE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Docker label Compose attaches to every network/volume/container it
+/// manages, set to the `-p <project_name>` value.
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 
 #[derive(Error, Debug)]
 pub enum ComposeError {
@@ -48,6 +61,13 @@ pub enum ComposeError {
     InvalidComposePath {
         field: String,
         path: String,
+        reason: String,
+    },
+
+    #[error("Compose stack '{project}' did not become ready within {timeout_secs}s: {reason}")]
+    ServicesNotReady {
+        project: String,
+        timeout_secs: u64,
         reason: String,
     },
 
@@ -154,7 +174,10 @@ impl ComposeExecutor {
     }
 
     /// Deploy a compose stack: write files, pull images, start containers,
-    /// discover and label them. Returns one result per service.
+    /// wait for every service to become ready, then discover and label them.
+    /// Returns one result per service. Fails (rather than reporting a false
+    /// success) if a service never reaches `running`/`healthy` within
+    /// [`COMPOSE_READY_TIMEOUT`].
     pub async fn deploy(
         &self,
         request: ComposeDeployRequest,
@@ -231,6 +254,19 @@ impl ComposeExecutor {
             &project_name,
             compose_file,
             &request.environment_vars,
+        )
+        .await?;
+
+        // 3b. `up -d` returns as soon as containers are created/started, not
+        // once they're actually ready. Wait for every service to reach
+        // `running` (and `healthy`, for services that define a healthcheck)
+        // so a crash-looping or slow-starting service surfaces as a failed
+        // deployment instead of a false "success".
+        self.wait_for_services_ready(
+            &effective_dir,
+            &project_name,
+            compose_file,
+            COMPOSE_READY_TIMEOUT,
         )
         .await?;
 
@@ -351,33 +387,107 @@ impl ComposeExecutor {
     pub async fn destroy(&self, project_name: &str) -> Result<(), ComposeError> {
         let project_dir = self.project_dir(project_name);
 
-        if !project_dir.exists() {
-            debug!(project = %project_name, "Project directory does not exist, nothing to destroy");
-            return Ok(());
+        // `docker compose down` only works from the exact directory/file the
+        // stack was `up`'d from. Git-backed deployments run Compose from an
+        // ephemeral checkout under a per-deployment temp dir (cleaned up as
+        // soon as the deploy job finishes) rather than `project_dir`, so this
+        // directory-based teardown is frequently a no-op for them -- it must
+        // never be the only cleanup path. Volumes/networks/containers Compose
+        // creates always carry the `com.docker.compose.project` label
+        // regardless of which directory `up` ran from, so the label-based
+        // sweep below is the one step that's reliable independent of
+        // compose_path/repo_dir.
+        if project_dir.exists() {
+            let compose_file = self.find_compose_file(&project_dir);
+
+            // down WITH --volumes: removes everything including persistent data
+            let output = tokio::process::Command::new("docker")
+                .args(["compose", "-p", project_name])
+                .args(["-f", &compose_file])
+                .args(["down", "--remove-orphans", "--volumes"])
+                .current_dir(&project_dir)
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(project = %project_name, stderr = %stderr, "docker compose down failed (falling back to label-based cleanup)");
+            }
+
+            // Clean up work directory
+            if let Err(e) = tokio::fs::remove_dir_all(&project_dir).await {
+                warn!(project = %project_name, error = %e, "Failed to clean up project directory");
+            }
+        } else {
+            debug!(project = %project_name, "Project directory does not exist, relying on label-based cleanup");
         }
 
-        let compose_file = self.find_compose_file(&project_dir);
-
-        // down WITH --volumes: removes everything including persistent data
-        let output = tokio::process::Command::new("docker")
-            .args(["compose", "-p", project_name])
-            .args(["-f", &compose_file])
-            .args(["down", "--remove-orphans", "--volumes"])
-            .current_dir(&project_dir)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(project = %project_name, stderr = %stderr, "docker compose down failed");
-        }
-
-        // Clean up work directory
-        if let Err(e) = tokio::fs::remove_dir_all(&project_dir).await {
-            warn!(project = %project_name, error = %e, "Failed to clean up project directory");
-        }
+        self.destroy_labeled_resources(project_name).await?;
 
         info!(project = %project_name, "Compose stack destroyed (volumes removed)");
+        Ok(())
+    }
+
+    /// Remove every Docker network and volume Compose labeled with
+    /// `com.docker.compose.project=<project_name>`. Unlike `docker compose
+    /// down`, this needs no compose file or working directory -- Compose
+    /// attaches this label to every resource it creates regardless of which
+    /// directory `up` ran from, so it is the only cleanup step that reliably
+    /// works for git-backed deployments whose checkout directory is long gone
+    /// by the time a project/environment is deleted. Containers are expected
+    /// to already be removed by the caller (deployment_containers-driven
+    /// cleanup); this only sweeps what that leaves behind.
+    async fn destroy_labeled_resources(&self, project_name: &str) -> Result<(), ComposeError> {
+        let label_filter = format!("{COMPOSE_PROJECT_LABEL}={project_name}");
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![label_filter]);
+
+        let networks = self
+            .docker
+            .list_networks(Some(
+                bollard::query_parameters::ListNetworksOptionsBuilder::new()
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .map_err(|e| {
+                ComposeError::Docker(format!("list_networks for '{project_name}': {e}"))
+            })?;
+        for network in networks {
+            let Some(id) = network.id.or(network.name) else {
+                continue;
+            };
+            if let Err(e) = self.docker.remove_network(&id).await {
+                warn!(project = %project_name, network = %id, error = %e, "Failed to remove Compose-managed network");
+            }
+        }
+
+        let volumes = self
+            .docker
+            .list_volumes(Some(
+                bollard::query_parameters::ListVolumesOptionsBuilder::new()
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .map_err(|e| ComposeError::Docker(format!("list_volumes for '{project_name}': {e}")))?;
+        for volume in volumes.volumes.unwrap_or_default() {
+            if let Err(e) = self
+                .docker
+                .remove_volume(
+                    &volume.name,
+                    Some(
+                        bollard::query_parameters::RemoveVolumeOptionsBuilder::new()
+                            .force(true)
+                            .build(),
+                    ),
+                )
+                .await
+            {
+                warn!(project = %project_name, volume = %volume.name, error = %e, "Failed to remove Compose-managed volume");
+            }
+        }
+
         Ok(())
     }
 
@@ -2254,13 +2364,15 @@ impl ComposeExecutor {
         Ok(())
     }
 
-    async fn discover_containers(
+    /// Run `docker compose ps --format json --all` and parse its output.
+    /// Shared by `discover_containers` (final result assembly) and
+    /// `wait_for_services_ready` (readiness polling).
+    async fn compose_ps(
         &self,
         project_dir: &Path,
         project_name: &str,
         compose_file: &str,
-    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
-        // Use docker compose ps to list containers
+    ) -> Result<Vec<ComposePsEntry>, ComposeError> {
         let output = tokio::process::Command::new("docker")
             .args(["compose", "-p", project_name])
             .args(["-f", compose_file])
@@ -2278,7 +2390,7 @@ impl ComposeExecutor {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut results = Vec::new();
+        let mut entries = Vec::new();
 
         // docker compose ps --format json outputs one JSON object per line
         for line in stdout.lines() {
@@ -2287,12 +2399,105 @@ impl ComposeExecutor {
                 continue;
             }
 
-            let ps_entry: ComposePsEntry =
+            let entry: ComposePsEntry =
                 serde_json::from_str(line).map_err(|e| ComposeError::DiscoveryFailed {
                     project: project_name.to_string(),
                     reason: format!("Failed to parse compose ps output: {} (line: {})", e, line),
                 })?;
+            entries.push(entry);
+        }
 
+        Ok(entries)
+    }
+
+    /// Poll `docker compose ps` until every service is `running` (and
+    /// `healthy`, for services that declare a healthcheck) or `timeout`
+    /// elapses. A service stuck `exited`/`dead`/`restarting` fails fast
+    /// instead of waiting out the full timeout.
+    async fn wait_for_services_ready(
+        &self,
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), ComposeError> {
+        let start = std::time::Instant::now();
+        loop {
+            let entries = self
+                .compose_ps(project_dir, project_name, compose_file)
+                .await?;
+            match Self::classify_readiness(&entries) {
+                ComposeReadiness::Ready => return Ok(()),
+                ComposeReadiness::Failed(reasons) => {
+                    return Err(ComposeError::ServicesNotReady {
+                        project: project_name.to_string(),
+                        timeout_secs: timeout.as_secs(),
+                        reason: reasons.join(", "),
+                    })
+                }
+                ComposeReadiness::Pending(reasons) => {
+                    if start.elapsed() >= timeout {
+                        return Err(ComposeError::ServicesNotReady {
+                            project: project_name.to_string(),
+                            timeout_secs: timeout.as_secs(),
+                            reason: reasons.join(", "),
+                        });
+                    }
+                    tokio::time::sleep(COMPOSE_READY_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+
+    /// Classify a `docker compose ps` snapshot into ready/pending/failed.
+    /// A service is ready once it's `running` and, if it declares a
+    /// healthcheck, `healthy`. `exited`/`dead` fail fast rather than waiting
+    /// out the full timeout; any other state (`created`, `restarting`,
+    /// `starting` health) is still pending.
+    fn classify_readiness(entries: &[ComposePsEntry]) -> ComposeReadiness {
+        if entries.is_empty() {
+            return ComposeReadiness::Pending(vec![
+                "no containers found after 'docker compose up'".to_string(),
+            ]);
+        }
+
+        let mut failed = Vec::new();
+        let mut pending = Vec::new();
+        for entry in entries {
+            match entry.state.as_str() {
+                "running" => match entry.health.as_str() {
+                    "" | "healthy" => {}
+                    "unhealthy" => failed.push(format!("service '{}' is unhealthy", entry.service)),
+                    other => pending.push(format!("service '{}' is {other}", entry.service)),
+                },
+                "exited" | "dead" => {
+                    failed.push(format!("service '{}' {}", entry.service, entry.state))
+                }
+                other => pending.push(format!("service '{}' is {other}", entry.service)),
+            }
+        }
+
+        if !failed.is_empty() {
+            ComposeReadiness::Failed(failed)
+        } else if !pending.is_empty() {
+            ComposeReadiness::Pending(pending)
+        } else {
+            ComposeReadiness::Ready
+        }
+    }
+
+    async fn discover_containers(
+        &self,
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
+        let ps_entries = self
+            .compose_ps(project_dir, project_name, compose_file)
+            .await?;
+        let mut results = Vec::new();
+
+        for ps_entry in ps_entries {
             // Parse published ports
             let ports = self.parse_publishers(&ps_entry.publishers);
 
@@ -2823,6 +3028,17 @@ impl ComposeExecutor {
     }
 }
 
+/// Result of classifying a `docker compose ps` snapshot for readiness.
+#[derive(Debug, PartialEq)]
+enum ComposeReadiness {
+    Ready,
+    /// Still starting; each entry is a human-readable reason, e.g.
+    /// `"service 'web' is starting"`.
+    Pending(Vec<String>),
+    /// Reached a terminal failure state (`exited`, `dead`, `unhealthy`).
+    Failed(Vec<String>),
+}
+
 /// JSON output from `docker compose ps --format json`
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -2833,6 +3049,10 @@ struct ComposePsEntry {
     service: String,
     image: String,
     state: String,
+    /// "healthy"/"unhealthy"/"starting", or "" when the service defines no
+    /// healthcheck (older Compose CLI versions omit the field entirely).
+    #[serde(default)]
+    health: String,
     #[serde(default)]
     publishers: Vec<ComposePsPublisher>,
 }
@@ -2861,9 +3081,113 @@ mod tests {
         assert_eq!(entry.id, "abc123");
         assert_eq!(entry.service, "web");
         assert_eq!(entry.state, "running");
+        assert_eq!(entry.health, "");
         assert_eq!(entry.publishers.len(), 1);
         assert_eq!(entry.publishers[0].published_port, 8080);
         assert_eq!(entry.publishers[0].target_port, 80);
+    }
+
+    #[test]
+    fn test_parse_compose_ps_json_with_health() {
+        let json = r#"{"ID":"abc123","Name":"myapp-web-1","Service":"web","Image":"nginx:latest","State":"running","Health":"healthy","Publishers":[]}"#;
+        let entry: ComposePsEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.health, "healthy");
+    }
+
+    fn entry(service: &str, state: &str, health: &str) -> ComposePsEntry {
+        ComposePsEntry {
+            id: format!("{service}-id"),
+            name: format!("{service}-1"),
+            service: service.to_string(),
+            image: "img:latest".to_string(),
+            state: state.to_string(),
+            health: health.to_string(),
+            publishers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn classify_readiness_no_containers_is_pending() {
+        let result = ComposeExecutor::classify_readiness(&[]);
+        assert!(matches!(result, ComposeReadiness::Pending(_)));
+    }
+
+    #[test]
+    fn classify_readiness_running_no_healthcheck_is_ready() {
+        let entries = [entry("web", "running", "")];
+        assert_eq!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn classify_readiness_running_healthy_is_ready() {
+        let entries = [entry("web", "running", "healthy")];
+        assert_eq!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn classify_readiness_running_starting_health_is_pending() {
+        let entries = [entry("web", "running", "starting")];
+        assert!(matches!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn classify_readiness_created_is_pending() {
+        let entries = [entry("web", "created", "")];
+        assert!(matches!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn classify_readiness_unhealthy_fails_fast() {
+        let entries = [entry("web", "running", "unhealthy")];
+        assert!(matches!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_readiness_exited_fails_fast() {
+        let entries = [entry("web", "exited", "")];
+        assert!(matches!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_readiness_one_failed_service_fails_whole_stack() {
+        let entries = [
+            entry("web", "running", "healthy"),
+            entry("db", "exited", ""),
+        ];
+        assert!(matches!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_readiness_all_services_must_be_ready() {
+        let entries = [
+            entry("web", "running", "healthy"),
+            entry("worker", "running", ""),
+        ];
+        assert_eq!(
+            ComposeExecutor::classify_readiness(&entries),
+            ComposeReadiness::Ready
+        );
     }
 
     #[test]

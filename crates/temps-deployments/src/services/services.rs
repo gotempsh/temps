@@ -1,7 +1,7 @@
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    Set,
+    QuerySelect, Set,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -130,6 +130,13 @@ pub struct DeploymentService {
     /// SAME resolved env (user vars, external-service vars, Sentry/OTel, API
     /// token) as a normal deploy — see [`crate::services::env_resolver`].
     env_resolver: std::sync::OnceLock<Arc<crate::services::env_resolver::DeploymentEnvResolver>>,
+    /// Late-bound Compose executor (the `Arc<bollard::Docker>` client it needs
+    /// is only constructed later in plugin init, after `DeploymentService`
+    /// itself). Set via [`Self::set_compose_executor`]. Used by
+    /// `cleanup_containers` to sweep Compose-managed volumes/networks -- which
+    /// individual `deployer.remove_container` calls never touch -- when a
+    /// project/environment that deployed via Docker Compose is deleted.
+    compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
 }
 
 impl DeploymentService {
@@ -382,6 +389,45 @@ impl DeploymentService {
             }
         }
 
+        // Individual `deployer.remove_container` calls above remove Compose
+        // containers themselves, but never the volumes/networks `docker
+        // compose up` also creates for the stack -- those only carry the
+        // `com.docker.compose.project` label. Sweep them per environment
+        // (compose project names are `temps-{project_id}-{environment_id}`,
+        // see `DeployComposeJob`). Best-effort: a stuck volume/network must
+        // not block the deletion the caller is otherwise done with.
+        if let Some(compose_executor) = self.compose_executor.get() {
+            let compose_environment_ids: Vec<i32> = match environment_id {
+                Some(id) => vec![id],
+                None => environments::Entity::find()
+                    .filter(environments::Column::ProjectId.eq(project_id))
+                    .select_only()
+                    .column(environments::Column::Id)
+                    .into_tuple()
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(|error| temps_core::ContainerCleanupError::Discovery {
+                        project_id,
+                        environment_id,
+                        reason: format!(
+                            "failed to enumerate environments for Compose resource cleanup: {error}"
+                        ),
+                    })?,
+            };
+            for env_id in compose_environment_ids {
+                let compose_project_name = format!("temps-{project_id}-{env_id}");
+                if let Err(error) = compose_executor.destroy(&compose_project_name).await {
+                    warn!(
+                        project_id,
+                        environment_id = env_id,
+                        compose_project = %compose_project_name,
+                        %error,
+                        "Failed to clean up Compose-managed volumes/networks (best-effort)"
+                    );
+                }
+            }
+        }
+
         Ok(removed)
     }
 
@@ -446,6 +492,7 @@ impl DeploymentService {
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -456,6 +503,12 @@ impl DeploymentService {
         resolver: Arc<crate::services::env_resolver::DeploymentEnvResolver>,
     ) {
         let _ = self.env_resolver.set(resolver);
+    }
+
+    /// Late-bind the Compose executor (see the field docs). Called once
+    /// during plugin init after the `Arc<bollard::Docker>` client exists.
+    pub fn set_compose_executor(&self, executor: Arc<temps_deployer::compose::ComposeExecutor>) {
+        let _ = self.compose_executor.set(executor);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events
@@ -4554,6 +4607,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -4623,6 +4677,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -5258,6 +5313,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -6719,6 +6775,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         };
 
         service
