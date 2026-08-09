@@ -24,6 +24,7 @@ import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
 import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
 import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.ts'
+import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
 import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
 
 const program = new Command()
@@ -362,6 +363,19 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await examplesCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('deploy-lifecycle-scenario')
+  .description(
+    'Real deployment lifecycle: deploy version A, deploy version B, rollback to A, pause, resume, and promote B into a second environment -- asserting the EXACT response body served over the real proxied URL at each step, not just a deployment row\'s status field',
+  )
+  .option('--registry <host>', 'registry to push the versioned-app images to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for each deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await deployLifecycleScenarioCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {
