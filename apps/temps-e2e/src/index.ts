@@ -26,6 +26,7 @@ import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
 import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.ts'
 import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
 import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
+import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
 
 const program = new Command()
 
@@ -346,6 +347,22 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await otelQuotaScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('pg-upgrade-scenario')
+  .description(
+    'Real Postgres major-version upgrade (16 → 17): provision a service pinned to postgres:16-bookworm, deploy a db-probe app, write 5 marker rows, trigger the upgrade, poll through all phases to completed, and assert the marker rows survived via the read-only data-browser API (not /probe) -- proves the actual pg_dumpall → psql restore path, not just that the status field flipped',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--upgrade-timeout <ms>', 'max wait for the upgrade to complete (real wal-g backup + pg_dumpall + psql restore)', '600000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await pgUpgradeScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
