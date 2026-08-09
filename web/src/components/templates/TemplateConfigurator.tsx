@@ -60,6 +60,7 @@ import {
 import { useSettings } from '@/hooks/useSettings'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { cn } from '@/lib/utils'
+import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
 import {
   AlertCircle,
   Building2,
@@ -102,15 +103,6 @@ function ProviderIcon({
   }
   return <GitBranch className={className} />
 }
-
-// Common service types
-const SERVICE_TYPES = [
-  { id: 'postgres' as ServiceTypeRoute, name: 'PostgreSQL', description: 'Reliable Relational Database' },
-  { id: 'mariadb' as ServiceTypeRoute, name: 'MariaDB', description: 'Shared MySQL-compatible Database' },
-  { id: 'redis' as ServiceTypeRoute, name: 'Redis', description: 'In-Memory Data Store' },
-  { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
-  { id: 'libsql' as ServiceTypeRoute, name: 'LibSQL', description: 'SQLite-compatible Database' },
-]
 
 // Form schema
 const formSchema = z.object({
@@ -887,17 +879,17 @@ export function TemplateConfigurator({
                       <ChevronDown className="h-4 w-4 ml-1" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-[240px]">
-                    {SERVICE_TYPES.map((type) => (
+                  <DropdownMenuContent align="end" className="w-64">
+                    {ADD_SERVICE_TYPES.map((type) => (
                       <DropdownMenuItem
                         key={type.id}
                         onClick={() => {
                           setSelectedServiceType(type.id)
                           setIsCreateServiceDialogOpen(true)
                         }}
-                        className="flex items-start gap-3 py-3"
+                        className="flex items-center gap-3 py-2.5"
                       >
-                        <ServiceLogo service={type.id} />
+                        <ServiceLogo service={type.id} className="h-6 w-6" />
                         <div className="flex flex-col">
                           <span className="font-medium">{type.name}</span>
                           <span className="text-xs text-muted-foreground">{type.description}</span>

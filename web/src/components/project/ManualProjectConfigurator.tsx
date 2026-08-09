@@ -54,31 +54,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import { ServiceEnvPreview } from './ServiceEnvPreview'
-
-// Common service types
-const SERVICE_TYPES = [
-  {
-    id: 'postgres' as ServiceTypeRoute,
-    name: 'PostgreSQL',
-    description: 'Reliable Relational Database',
-  },
-  {
-    id: 'mariadb' as ServiceTypeRoute,
-    name: 'MariaDB',
-    description: 'Shared MySQL-compatible Database',
-  },
-  {
-    id: 'redis' as ServiceTypeRoute,
-    name: 'Redis',
-    description: 'In-Memory Data Store',
-  },
-  { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
-  {
-    id: 'libsql' as ServiceTypeRoute,
-    name: 'LibSQL',
-    description: 'SQLite-compatible Database',
-  },
-]
+import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
 
 // Source type options
 const SOURCE_TYPE_OPTIONS: {
@@ -516,8 +492,8 @@ export function ManualProjectConfigurator({
                 <ChevronDown className="h-4 w-4 ml-1" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[240px]">
-              {SERVICE_TYPES.map((type) => {
+            <DropdownMenuContent align="end" className="w-64">
+              {ADD_SERVICE_TYPES.map((type) => {
                 const selectedTypes = getSelectedServiceTypes()
                 const isTypeAlreadySelected = selectedTypes.has(type.id)
                 return (
@@ -535,11 +511,11 @@ export function ManualProjectConfigurator({
                       setIsCreateServiceDialogOpen(true)
                     }}
                     className={cn(
-                      'flex items-start gap-3 py-3',
+                      'flex items-center gap-3 py-2.5',
                       isTypeAlreadySelected && 'opacity-50 cursor-not-allowed'
                     )}
                   >
-                    <ServiceLogo service={type.id} />
+                    <ServiceLogo service={type.id} className="h-6 w-6" />
                     <div className="flex flex-col">
                       <span className="font-medium">
                         {type.name}

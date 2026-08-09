@@ -68,6 +68,7 @@ import * as z from 'zod/v4'
 import { ServiceEnvPreview } from './ServiceEnvPreview'
 import { FrameworkSelector } from './FrameworkSelector'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
+import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -108,31 +109,6 @@ function normalizePath(path: string | undefined | null): string {
   }
   return path
 }
-
-// Common service types
-const SERVICE_TYPES = [
-  {
-    id: 'postgres' as ServiceTypeRoute,
-    name: 'PostgreSQL',
-    description: 'Reliable Relational Database',
-  },
-  {
-    id: 'mariadb' as ServiceTypeRoute,
-    name: 'MariaDB',
-    description: 'Shared MySQL-compatible Database',
-  },
-  {
-    id: 'redis' as ServiceTypeRoute,
-    name: 'Redis',
-    description: 'In-Memory Data Store',
-  },
-  { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
-  {
-    id: 'libsql' as ServiceTypeRoute,
-    name: 'LibSQL',
-    description: 'SQLite-compatible Database',
-  },
-]
 
 // Helper function to slugify path for project name
 const slugifyPath = (path: string): string => {
@@ -1013,17 +989,17 @@ export function ProjectConfigurator({
                 <ChevronDown className="h-4 w-4 ml-1" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[240px]">
-              {SERVICE_TYPES.map((type) => (
+            <DropdownMenuContent align="end" className="w-64">
+              {ADD_SERVICE_TYPES.map((type) => (
                 <DropdownMenuItem
                   key={type.id}
                   onClick={() => {
                     setSelectedServiceType(type.id)
                     setIsCreateServiceDialogOpen(true)
                   }}
-                  className="flex items-start gap-3 py-3"
+                  className="flex items-center gap-3 py-2.5"
                 >
-                  <ServiceLogo service={type.id} />
+                  <ServiceLogo service={type.id} className="h-6 w-6" />
                   <div className="flex flex-col">
                     <span className="font-medium">{type.name}</span>
                     <span className="text-xs text-muted-foreground">
