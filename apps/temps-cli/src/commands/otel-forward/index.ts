@@ -16,9 +16,10 @@ import {
 //
 // This feature is implemented by a plugin crate that is not part of this
 // repository, so its schema does not exist in `openapi.json` and must never
-// be added there (see apps/temps-cli/CLAUDE.md). These interfaces are
-// hand-maintained to mirror the plugin's serde structs exactly — keep them in
-// sync by hand if that shape ever changes.
+// be added there (see "Regenerating the OpenAPI clients" in the root
+// CLAUDE.md). These interfaces are hand-maintained to mirror the plugin's
+// serde structs exactly — keep them in sync by hand if that shape ever
+// changes.
 
 export interface CreateDestinationBody {
   project_id: number
@@ -81,6 +82,19 @@ export interface TestDeliveryResponse {
 
 const VENDOR_PRESET_HINT = 'datadog, honeycomb, new_relic, grafana_cloud, generic_otlp'
 
+/**
+ * The server masks sensitive header values as `"***"` in every response, so
+ * this shouldn't ever see a real secret — but the human-readable display
+ * path doesn't rely on that alone. Any header whose name looks like it
+ * carries a credential is always shown as `***` here regardless of what the
+ * response actually contained, so a server-side regression in masking can't
+ * turn into a secret printed to a terminal / CI log. `--json` output is a
+ * deliberate raw passthrough for scripting and isn't redacted here.
+ */
+function isSensitiveHeaderName(name: string): boolean {
+  return /token|secret|key|password|authorization/i.test(name)
+}
+
 // ============================================================================
 // 404 handling
 // ============================================================================
@@ -124,7 +138,13 @@ export function parseHeaderPairs(pairs: string[] | undefined): Record<string, st
   for (const pair of pairs) {
     const idx = pair.indexOf('=')
     if (idx <= 0) {
-      throw new Error(`Invalid --header '${pair}': expected KEY=VALUE`)
+      // Deliberately doesn't echo the malformed value back: the most likely
+      // way to hit this is pasting a bare credential with no `=` (or a
+      // leading `=`) into --header, and printing it back would put that
+      // credential in the terminal/CI log we're trying to avoid it landing in.
+      throw new Error(
+        "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
+      )
     }
     const key = pair.slice(0, idx)
     const value = pair.slice(idx + 1)
@@ -243,7 +263,12 @@ function printDestinationDetails(destination: DestinationResponse): void {
 
   const headerEntries = Object.entries(destination.headers)
   if (headerEntries.length > 0) {
-    keyValue('Headers', headerEntries.map(([k, v]) => `${k}=${v}`).join(', '))
+    keyValue(
+      'Headers',
+      headerEntries
+        .map(([k, v]) => `${k}=${isSensitiveHeaderName(k) ? '***' : v}`)
+        .join(', ')
+    )
   }
 
   keyValue('Consecutive failures', destination.consecutive_failures)

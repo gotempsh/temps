@@ -29,15 +29,15 @@ describe('parseHeaderPairs', () => {
     expect(parseHeaderPairs([])).toEqual({})
   })
 
-  test('throws on a pair with no "="', () => {
+  test('throws on a pair with no "=", without echoing the raw value', () => {
     expect(() => parseHeaderPairs(['not-a-pair'])).toThrow(
-      "Invalid --header 'not-a-pair': expected KEY=VALUE"
+      "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
     )
   })
 
-  test('throws on a pair with an empty key (leading "=")', () => {
+  test('throws on a pair with an empty key (leading "="), without echoing the raw value', () => {
     expect(() => parseHeaderPairs(['=value'])).toThrow(
-      "Invalid --header '=value': expected KEY=VALUE"
+      "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
     )
   })
 
