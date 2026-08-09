@@ -1699,15 +1699,19 @@ impl MongodbService {
         // mongorestore has supported `--config` since mongo-tools 100.5.0,
         // which shipped with MongoDB 6.0+; mongo:7.0 is well above that floor.
         //
+        // mongorestore's --config YAML schema only recognises a small set of
+        // fields: `password`, `uri`, `sslPEMKeyPassword`, `destinationPassword`.
+        // `username` and `authenticationDatabase` are NOT valid config-file
+        // fields (verified against the mongo-tools source struct); they must be
+        // supplied as CLI flags.  We put only the password in the config file
+        // (mode 0600) to keep it out of `docker inspect`'s Cmd array, and pass
+        // the non-sensitive username/authdb as plain CLI arguments.
+        //
         // YAML single-quoted strings: only `'` needs to be escaped (as `''`).
         // Generated passwords are alphanumeric (see `generate_password`), so
         // no escaping will be needed in practice, but we escape defensively.
-        let username_safe = username.replace('\'', "''");
         let password_safe = password.replace('\'', "''");
-        let config_content = format!(
-            "username: '{}'\npassword: '{}'\nauthenticationDatabase: 'admin'\n",
-            username_safe, password_safe,
-        );
+        let config_content = format!("password: '{}'\n", password_safe);
         let host_config_file = archive_dir.join("restore.yaml");
         tokio::fs::write(&host_config_file, config_content.as_bytes())
             .await
@@ -1727,24 +1731,36 @@ impl MongodbService {
         }
 
         // Build the command as a vector of argv tokens (no shell, no injection).
-        // Credentials are in /backup/restore.yaml (bind-mounted, mode 0600) so
-        // they do not appear in the Docker Cmd metadata visible via inspect.
+        // The password is in /backup/restore.yaml (bind-mounted, mode 0600) so
+        // it does not appear in the Docker Cmd array visible via `docker inspect`.
+        // Username and authenticationDatabase are not sensitive and are passed as
+        // plain CLI flags (mongorestore's YAML config schema does not support them).
         // mongorestore flags:
-        //   --config   : YAML file supplying username/password/authenticationDatabase
-        //   --host     : target MongoDB container name (reachable on bridge network)
-        //   --archive  : path inside the sidecar (bind-mounted from host)
-        //   --gzip     : the archive was created with mongodump --gzip
-        //   --drop     : drop each collection before restoring (true revert, not merge)
+        //   --config               : YAML file supplying password only (mode 0600)
+        //   --username             : MongoDB user (non-sensitive, fine on argv)
+        //   --authenticationDatabase : always 'admin' for root-level users
+        //   --host                 : target MongoDB container name (bridge network)
+        //   --archive              : path inside the sidecar (bind-mounted from host)
+        //   --gzip                 : the archive was created with mongodump --gzip
+        //   --drop                 : drop each collection before restoring (true revert)
         let cmd_args: Vec<String> = vec![
             "--config=/backup/restore.yaml".to_string(),
+            format!("--username={}", username),
+            "--authenticationDatabase=admin".to_string(),
             format!("--host={}", target_container),
             format!("--archive={}", container_archive_path),
             "--gzip".to_string(),
             "--drop".to_string(),
         ];
 
+        // auto_remove is intentionally NOT set here.  If it were true, Docker
+        // would reap the container the moment mongorestore exits — for a small
+        // archive that can happen before our wait_container call lands, causing
+        // bollard to return an error even though the restore succeeded.  We
+        // manage the container lifecycle explicitly: wait_container then an
+        // unconditional remove_container, matching the mariadb/redis helper
+        // pattern used elsewhere in this file.
         let host_config = bollard::models::HostConfig {
-            auto_remove: Some(true),
             binds: Some(vec![format!("{}:/backup:ro", archive_dir.display())]),
             ..Default::default()
         };
@@ -1876,29 +1892,17 @@ impl MongodbService {
             }
         };
 
-        // Wait for the container to exit.
+        // Wait for the container to exit.  We collect the result without
+        // returning early so the explicit remove_container below always runs —
+        // the same pattern used by the mariadb and redis helper containers in
+        // this crate.
         let mut wait_stream = self.docker.wait_container(
             &sidecar_name,
             Some(WaitContainerOptionsBuilder::new().build()),
         );
-        let exit_code = match wait_stream.next().await {
-            Some(Ok(resp)) => resp.status_code,
-            Some(Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "Docker wait failed for mongorestore sidecar '{}': {}",
-                    sidecar_name,
-                    e
-                ))
-            }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "No exit code received for mongorestore sidecar '{}'",
-                    sidecar_name
-                ))
-            }
-        };
+        let wait_result = wait_stream.next().await;
 
-        // Collect captured output for diagnostics.
+        // Collect captured output for diagnostics before removing the container.
         let captured_output = if let Some(handle) = log_handle {
             match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
                 Ok(Ok(s)) => s,
@@ -1906,6 +1910,48 @@ impl MongodbService {
             }
         } else {
             String::new()
+        };
+
+        // Always remove the sidecar container regardless of outcome.  Because
+        // auto_remove is not set, the container persists after exit and must be
+        // cleaned up explicitly — see the comment on host_config above.
+        let _ = self
+            .docker
+            .remove_container(
+                &sidecar_name,
+                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+            )
+            .await;
+
+        // Bollard converts a non-zero container exit code into
+        // Err(DockerContainerWaitError { code, error }).  We must treat that
+        // the same as Ok with a non-zero status_code so that the salvage
+        // check below (which looks for "done restoring" / "0 document(s)
+        // failed") can still recover on spurious mongorestore exit-1.  Any
+        // other error variant (e.g. 404 "no such container") is a genuine
+        // infrastructure failure and we surface it directly.
+        let exit_code: i64 = match wait_result {
+            Some(Ok(resp)) => resp.status_code,
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+            Some(Err(e)) => {
+                let tail = captured_output.trim();
+                return Err(anyhow::anyhow!(
+                    "Docker wait failed for mongorestore sidecar '{}': {}{}",
+                    sidecar_name,
+                    e,
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nContainer output:\n{}", tail)
+                    }
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "No exit code received for mongorestore sidecar '{}'",
+                    sidecar_name
+                ))
+            }
         };
 
         if exit_code != 0 {
