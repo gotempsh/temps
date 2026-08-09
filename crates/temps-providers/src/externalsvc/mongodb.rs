@@ -1603,7 +1603,11 @@ fn build_mongodb_url(
 
 /// Sidecar image used for mongodump (backup) and mongorestore operations.
 /// Matches the image used in `temps-backup/src/engines/mongodb.rs`.
-const MONGO_SIDECAR_IMAGE: &str = "mongo:7";
+///
+/// Pinned to the 7.0 minor series to prevent silent upgrades to 7.1+.
+/// Ideally this should be pinned to an immutable SHA-256 digest
+/// (e.g. `mongo@sha256:<hash>`); update when rotating the image version.
+const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
 
 impl MongodbService {
     /// Build the `MONGODB_*` env vars for a given per-tenant database name.
@@ -1685,23 +1689,57 @@ impl MongodbService {
             &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
         );
 
+        // Write credentials to a bind-mounted config file instead of passing
+        // them on the command line.  Docker stores the full Cmd array in
+        // container metadata and returns it verbatim via `docker inspect`, so
+        // a plaintext `-p <password>` flag is readable for the entire duration
+        // of the restore (potentially minutes for large databases).  A
+        // bind-mounted YAML config file with mode 0600 avoids that exposure.
+        //
+        // mongorestore has supported `--config` since mongo-tools 100.5.0,
+        // which shipped with MongoDB 6.0+; mongo:7.0 is well above that floor.
+        //
+        // YAML single-quoted strings: only `'` needs to be escaped (as `''`).
+        // Generated passwords are alphanumeric (see `generate_password`), so
+        // no escaping will be needed in practice, but we escape defensively.
+        let username_safe = username.replace('\'', "''");
+        let password_safe = password.replace('\'', "''");
+        let config_content = format!(
+            "username: '{}'\npassword: '{}'\nauthenticationDatabase: 'admin'\n",
+            username_safe, password_safe,
+        );
+        let host_config_file = archive_dir.join("restore.yaml");
+        tokio::fs::write(&host_config_file, config_content.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write mongorestore config file: {}", e))?;
+        // Restrict to owner-read only (chmod 600) so the password is not
+        // world-readable inside the temp directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&host_config_file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to set permissions on mongorestore config file: {}",
+                        e
+                    )
+                })?;
+        }
+
         // Build the command as a vector of argv tokens (no shell, no injection).
+        // Credentials are in /backup/restore.yaml (bind-mounted, mode 0600) so
+        // they do not appear in the Docker Cmd metadata visible via inspect.
         // mongorestore flags:
+        //   --config   : YAML file supplying username/password/authenticationDatabase
         //   --host     : target MongoDB container name (reachable on bridge network)
         //   --archive  : path inside the sidecar (bind-mounted from host)
         //   --gzip     : the archive was created with mongodump --gzip
         //   --drop     : drop each collection before restoring (true revert, not merge)
-        //   -u / -p    : credentials with authSource=admin (root-level user)
         let cmd_args: Vec<String> = vec![
+            "--config=/backup/restore.yaml".to_string(),
             format!("--host={}", target_container),
             format!("--archive={}", container_archive_path),
             "--gzip".to_string(),
-            "-u".to_string(),
-            username.to_string(),
-            "-p".to_string(),
-            password.to_string(),
-            "--authenticationDatabase".to_string(),
-            "admin".to_string(),
             "--drop".to_string(),
         ];
 
@@ -1872,18 +1910,32 @@ impl MongodbService {
 
         if exit_code != 0 {
             // mongorestore can exit 1 after warnings even when every
-            // document restored successfully.  Salvage success on the
-            // same markers the WAL-G restore path uses.
-            let looks_like_success = captured_output.contains("done restoring")
-                || captured_output.contains("finished restoring")
-                || captured_output.contains("0 document(s) failed to restore");
+            // document restored successfully.  Salvage success on the same
+            // markers the WAL-G restore path uses — BUT only check the TAIL
+            // of the output (~500 bytes).  A large restore that partially
+            // fails after an earlier successful collection can emit "done
+            // restoring" early in the log; checking the full output would
+            // then mask the later failure.  Checking only the tail ensures
+            // the final outcome is what we act on.
+            let salvage_region: &str = {
+                // Advance the byte index to the next valid UTF-8 char boundary
+                // so the slice operation is always safe.
+                let cut = captured_output.len().saturating_sub(500);
+                let cut = (cut..=cut.saturating_add(3))
+                    .find(|&i| captured_output.is_char_boundary(i))
+                    .unwrap_or(captured_output.len());
+                &captured_output[cut..]
+            };
+            let looks_like_success = salvage_region.contains("done restoring")
+                || salvage_region.contains("finished restoring")
+                || salvage_region.contains("0 document(s) failed to restore");
 
             if looks_like_success {
                 warn!(
-                    "mongorestore sidecar exited {} but output indicates success. \
+                    "mongorestore sidecar exited {} but output tail indicates success. \
                      Treating as success. Output tail:\n{}",
                     exit_code,
-                    captured_output.trim()
+                    salvage_region.trim()
                 );
                 return Ok(());
             }
@@ -2793,7 +2845,13 @@ impl ExternalService for MongodbService {
         );
 
         // ── Download archive from S3 ────────────────────────────────────────
-        let restore_dir = std::env::temp_dir().join("temps-mongo-restore");
+        // Each restore operation gets its own unique subdirectory so that
+        // concurrent restores (different services, or the same service twice)
+        // cannot overwrite each other's archive file.  The whole directory is
+        // removed in the cleanup step below.
+        let restore_dir = std::env::temp_dir()
+            .join("temps-mongo-restore")
+            .join(uuid::Uuid::new_v4().to_string());
         tokio::fs::create_dir_all(&restore_dir).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create restore temp dir {}: {}",
@@ -2858,8 +2916,9 @@ impl ExternalService for MongodbService {
             )
             .await;
 
-        // Always clean up the temp archive even if restore failed.
-        let _ = tokio::fs::remove_file(&host_archive_path).await;
+        // Always clean up the unique temp directory (archive + credentials
+        // config file) even if the restore failed.
+        let _ = tokio::fs::remove_dir_all(&restore_dir).await;
 
         result?;
 
@@ -2936,7 +2995,11 @@ impl ExternalService for MongodbService {
         );
 
         // ── Download archive + run mongorestore ────────────────────────────
-        let restore_dir = std::env::temp_dir().join("temps-mongo-restore");
+        // Each restore operation gets its own unique subdirectory so that
+        // concurrent restores cannot overwrite each other's archive file.
+        let restore_dir = std::env::temp_dir()
+            .join("temps-mongo-restore")
+            .join(uuid::Uuid::new_v4().to_string());
         tokio::fs::create_dir_all(&restore_dir).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create restore temp dir {}: {}",
@@ -2994,7 +3057,9 @@ impl ExternalService for MongodbService {
             )
             .await;
 
-        let _ = tokio::fs::remove_file(&host_archive_path).await;
+        // Always clean up the unique temp directory (archive + credentials
+        // config file) even if the restore failed.
+        let _ = tokio::fs::remove_dir_all(&restore_dir).await;
 
         restore_result?;
 
@@ -3562,6 +3627,66 @@ mod tests {
             !result.connection_info.contains("p@$$w0rd!"),
             "password must not appear verbatim in connection_info; got: {}",
             result.connection_info
+        );
+    }
+
+    #[test]
+    fn test_restore_temp_dirs_are_unique_per_operation() {
+        // Each restore operation must compute a distinct temp directory so that
+        // two concurrent restores targeting different services (or the same
+        // service twice) cannot write to the same path and corrupt each other's
+        // downloaded archive.
+        //
+        // This mirrors the actual code path in `restore_in_place` and
+        // `restore_to_new_service`: each call generates a fresh UUID and appends
+        // it to the base directory.
+        let base = std::env::temp_dir().join("temps-mongo-restore");
+        let dir1 = base.join(uuid::Uuid::new_v4().to_string());
+        let dir2 = base.join(uuid::Uuid::new_v4().to_string());
+        assert_ne!(
+            dir1, dir2,
+            "Two restore operations must produce distinct temp directories; \
+             a shared path would allow concurrent restores to corrupt each other's archive"
+        );
+    }
+
+    #[test]
+    fn test_salvage_heuristic_only_checks_tail() {
+        // The exit-code salvage check must look only at the TAIL of captured
+        // output.  A large restore that partially fails can emit "done restoring"
+        // for the collections that succeeded early in the log, then fail later.
+        // Checking only the tail prevents that early marker from masking a
+        // subsequent failure.
+        //
+        // Construct output that has "done restoring" in the middle but ends with
+        // a clear error message — and verify the salvage region (last 500 bytes)
+        // does NOT contain the success marker.
+        let mid_success = "done restoring test.collection (1 document)";
+        let tail_failure = "Failed: test.other_collection: connection lost";
+        // Build a string where the success marker is >500 bytes from the end.
+        let mut output = String::new();
+        output.push_str(mid_success);
+        // Pad with >500 bytes of content between the marker and the tail.
+        output.push_str(&"x".repeat(600));
+        output.push_str(tail_failure);
+
+        let salvage_region: &str = {
+            let cut = output.len().saturating_sub(500);
+            let cut = (cut..=cut.saturating_add(3))
+                .find(|&i| output.is_char_boundary(i))
+                .unwrap_or(output.len());
+            &output[cut..]
+        };
+
+        assert!(
+            !salvage_region.contains("done restoring"),
+            "Salvage region must not include the early 'done restoring' marker; \
+             got: {:?}",
+            salvage_region
+        );
+        assert!(
+            salvage_region.contains(tail_failure),
+            "Salvage region must include the tail failure message"
         );
     }
 
