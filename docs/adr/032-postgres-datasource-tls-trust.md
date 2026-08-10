@@ -72,6 +72,19 @@ string that overrides this setting. For either TLS mode, a server response that
 declines TLS is a terminal connection error before a PostgreSQL startup message,
 credentials, or queries are sent.
 
+This closes a second, independent downgrade path. The current connector builds
+a libpq-style DSN string with `format!()`, embedding host, username, password,
+and database directly. A credential value containing whitespace followed by a
+`key=value` token — for example a password containing `sslmode=disable` — can
+be parsed by `tokio-postgres` as a separate connection parameter, silently
+overriding a mode that was set correctly elsewhere. The connector must
+therefore stop building a DSN string entirely and construct
+`tokio_postgres::Config` exclusively through its builder methods (`.host()`,
+`.user()`, `.password()`, `.dbname()`, `.ssl_mode()`), so no credential or
+configuration value is ever parsed as a connection-parameter token. This
+requirement applies to every new connection path introduced by this ADR, with
+no DSN-string fallback for any mode.
+
 The value `require` deliberately follows libpq semantics: it guarantees encryption but not server identity. The API schema and UI must label this clearly as “TLS, certificate not verified,” not as fully secure TLS. `verify-full` is the recommended choice whenever the server has a certificate rooted in a public or platform-trusted CA.
 
 The legacy values `allow` and `prefer` are not retained because both permit downgrade. Parsing is deliberately split into two entry points so compatibility cannot leak into new writes:
@@ -92,6 +105,8 @@ New service creation must persist a value rather than relying on deserialization
 - every user-supplied, imported, or otherwise non-managed datasource must include an explicit `ssl_mode`; the UI recommends `verify-full` and does not pre-authorize a weaker mode.
 
 Internal provisioning code identifies a Temps-managed service through a server-owned creation path, not a client-writable parameter. The public create API cannot claim managed provenance. Imported-container metadata such as `container_name` also does not imply a safe network or a TLS posture.
+
+The provenance boundary must be a type-level distinction, not a boolean or optional field threaded through one shared constructor. Managed provisioning and user-facing creation call separate internal functions taking separate input types — for example `ManagedPostgresCreate`, constructed only by internal provisioning code, and `UserPostgresCreate`, the only type the external API handler can construct. The external handler must have no code path capable of producing a `ManagedPostgresCreate` value, so managed-mode defaulting cannot be reached by a client request regardless of what fields that request supplies. This mirrors the project's existing permission-guard boundary pattern rather than relying on a runtime flag that a future edit could route through the wrong path.
 
 The service details API and dashboard must display the effective mode. Selecting `disable` or `require` must show a warning describing the missing protection. The update remains an audited write through the existing external-service update path.
 
@@ -120,6 +135,8 @@ The replacement encryption-only verifier skips certificate-chain and hostname tr
 `verify-full` uses `rustls-platform-verifier`, already available in the workspace, as the single trust source. It validates the certificate chain against platform trust and verifies the requested DNS name or IP address. Failure to initialize or load platform trust is a connection failure; it must not fall back to bundled roots or the encryption-only verifier. IP-address connections must verify an IP subject alternative name and must not disable identity verification as a convenience.
 
 Custom private CA bundles are deferred. A future addition may add an optional CA bundle to the same encrypted service configuration and extend `verify-full`; it must not introduce a process-wide environment variable or weaken verification when parsing the bundle fails.
+
+`connect_with_self_signed_tls`, the function underlying the current accept-all verifier, is called directly today by the admin role-reconciliation path (`postgres_role_reconciler.rs`) and by cluster health probes. Hardening those call sites to use the typed mode system is deferred (see Deferred work), but leaving the function `pub` is not: as part of this ADR, `connect_with_self_signed_tls` is reduced to `pub(crate)` within `temps-query-postgres`, with a doc comment marking it as the legacy unauthenticated-trust path pending the health-probe follow-up. This is a mechanical, non-behavioral change scoped to this PR — it prevents new external callers from reaching the old accept-all behavior through a still-public function while the typed `PostgresTlsMode` API is the only path exposed to `temps-providers` and beyond.
 
 ### 5. Make policy changes generation-gated and terminate stale transports
 
@@ -165,6 +182,8 @@ The latter two errors must suggest changing configuration only when appropriate.
 
 Audit data for a persisted mode change includes the service ID, previous and applied modes, policy generation, whether reinitialization succeeded, and whether stale-transport invalidation completed. It excludes credentials, certificate contents, and connection strings. Audit creation is part of completing the write path; an audit-storage failure returns a contextual server error and emits a structured security log rather than silently dropping the record.
 
+This is a deliberate deviation from the codebase's general handler pattern, where an audit-write failure is logged but does not fail the primary operation. TLS-policy changes are the exception: an unrecorded transport-security downgrade or upgrade is itself a security-relevant gap, so for this write path specifically, an operator must be able to trust that "the update succeeded" implies "the change is audited." Implementers must not default to the general log-and-continue pattern here.
+
 ---
 
 ## Validation and Tests
@@ -187,6 +206,8 @@ Implementation is incomplete until the following tests pass.
 - Prove failure to initialize platform trust fails closed without switching trust sources or modes.
 - Prove transport shutdown terminates the connection task and makes outstanding source clones unusable.
 - Verify errors contain endpoint and mode context and never contain the password.
+- Verify no connection path constructs a libpq DSN string; a credential value containing an embedded `key=value` token (e.g. a password containing `sslmode=disable`) must not change the effective TLS mode.
+- Verify `connect_with_self_signed_tls` is not reachable outside `temps-query-postgres` (compile-time visibility, not a runtime check).
 
 TLS integration tests may use a local test server or a Docker-backed PostgreSQL fixture. Docker-dependent tests must skip gracefully at runtime when Docker is unavailable; they must not use `#[ignore]`.
 
@@ -203,6 +224,7 @@ TLS integration tests may use a local test server or a Docker-backed PostgreSQL 
 - Verify the HTTP error for a persisted-but-failed update says that configuration changed and never claims rollback.
 - Verify an in-flight operation drains within the bound or is interrupted, and its stale source cannot re-enter the cache.
 - Verify the generated parameter schema exposes the enum, descriptions, default behavior, and warnings.
+- Verify the external API handler has no code path that can construct a `ManagedPostgresCreate` value; only internal provisioning code can.
 
 Security-sensitive implementation requires `security-auditor` sign-off. Rust changes must pass `cargo test --lib -p temps-query-postgres`, `cargo test --lib -p temps-providers`, and `cargo check --lib` without warnings.
 
@@ -229,7 +251,7 @@ Security-sensitive implementation requires `security-auditor` sign-off. Rust cha
 
 - Provisioning server-side TLS for every Temps-managed standalone PostgreSQL service.
 - Per-service custom CA bundle support for private PKI.
-- Applying the same typed trust model to PostgreSQL health probes and cluster-control connections that currently call `connect_with_self_signed_tls` directly. Those paths do not perform plaintext fallback, but their certificate trust remains intentionally unauthenticated and should be audited separately.
+- Applying the same typed trust model to PostgreSQL health probes and cluster-control connections that currently call `connect_with_self_signed_tls` directly. Those paths do not perform plaintext fallback, but their certificate trust remains intentionally unauthenticated and should be audited separately. Restricting the function's visibility to `pub(crate)` is in scope for this ADR (see Decision, section 4); only rewriting those callers onto the typed mode system is deferred.
 
 ---
 
@@ -270,4 +292,4 @@ Rejected because encryption without identity verification does not prevent an ac
 
 ---
 
-<!-- Maintenance: Review when PostgreSQL connection setup, provider parameters, rustls trust roots, or explorer caching changes. Owner: temps security/providers. Last reviewed: 2026-07-13. -->
+<!-- Maintenance: Review when PostgreSQL connection setup, provider parameters, rustls trust roots, or explorer caching changes. Owner: temps security/providers. Last reviewed: 2026-08-10. -->
