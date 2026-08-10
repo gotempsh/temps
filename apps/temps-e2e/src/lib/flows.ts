@@ -275,7 +275,7 @@ export async function createE2eService(
   client: Client,
   opts: {
     name: string
-    serviceType: 'postgres' | 'redis' | 'mongodb' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio'
+    serviceType: 'postgres' | 'redis' | 'mongodb' | 'mariadb' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio'
     version?: string
     parameters?: Record<string, unknown>
   },
