@@ -33,6 +33,7 @@ import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
 import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenario.ts'
 import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
+import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
 
 const program = new Command()
 
@@ -488,6 +489,25 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await apiKeyScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('multinode-join-scenario')
+  .description(
+    'Real multi-node/WireGuard clustering proof: brings up its OWN dedicated 2-node DinD cluster ' +
+      '(tools/e2e-multinode-cluster/, not the shared instance -- no --url/--api-key), waits for a real ' +
+      'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
+      'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
+      'channel, drains the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
+      'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
+  )
+  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
+  .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await multinodeJoinScenarioCommand(opts)
   })
 
 program.parseAsync().catch((err: unknown) => {

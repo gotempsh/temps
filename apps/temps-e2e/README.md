@@ -1179,6 +1179,108 @@ lost forever, leaking one reconciler task per deleted cluster that logged
 inside the tick `select!`), so a signal is caught within one tick even if
 it arrives mid-reconcile.
 
+### `multinode-join-scenario` steps
+
+The first-ever e2e coverage for temps's multi-node/WireGuard clustering
+feature. Before this, the only coverage anywhere was Rust unit tests
+against a `MockDatabase`
+(`crates/temps-deployments/tests/multinode_integration_test.rs`) and a
+manual, non-automated dev tool (`tools/dev-cluster/`) a human has to run
+and eyeball. Nothing asserted that a second real node actually joins the
+mesh, that a deployment pinned to it actually lands there, or that drain/
+removal actually work.
+
+**Why this scenario owns its entire cluster instead of using the shared
+instance.** Every other scenario in this suite points `--url`/`--api-key`
+at an already-running `temps serve` (started via the `start-temps` skill)
+and drives it over HTTP. Multi-node clustering can't be proven that way:
+it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
+its own network identity — registering into the first node's mesh over
+real mTLS. `tls-scenario` already established the precedent that a
+scenario can need "a dedicated instance on a fixed port, not a normal dev
+slot" (see that section above) because of Pebble's hardcoded port; this
+scenario takes the same idea further: it brings up its own 2-node
+Docker-in-Docker cluster (`tools/e2e-multinode-cluster/docker-compose.yml`
+— a trimmed, re-subnetted clone of `tools/dev-cluster/`'s topology, safe to
+run alongside a developer's own dev-cluster instance or any other local
+service; see that compose file's header comment for the exact isolation
+guarantees), mints its own admin credential once the cluster is up, and
+tears the whole thing down at the end. It does NOT accept `--url`/
+`--api-key` — there is no "target instance" to point at.
+
+1. `docker compose up -d --build` the 2-node cluster. First run compiles
+   the full `temps` binary from source TWICE (once per DinD container) —
+   budget 15-20+ minutes; this is streamed to the scenario's own log output
+   line-by-line (prefixed `[compose]`) specifically so a long first build
+   is visibly progressing, not indistinguishable from a hang. Bounded by
+   `--build-timeout` (default 30 min).
+2. poll `docker inspect --format '{{.State.Health.Status}}'` on the
+   control-plane container until `healthy`.
+3. mint an admin API key directly from the DB: `docker exec ... temps
+   api-key --database-url=... --name=e2e-multinode --role=admin
+   --user-email=admin@local.dev --output-format=json` — the same DB-direct
+   pattern this README documents under "Auth" and `db-apikey.ts`/
+   `rbac-scenario` already use elsewhere in this suite. Works because
+   `role-control-plane.sh`'s `temps setup --auto` guarantees
+   `admin@local.dev` exists by the time the healthcheck passes.
+4. from here on, drive everything through the normal `@temps-sdk/api`
+   client against `http://localhost:18180`, same as every other scenario.
+5. poll `GET /internal/nodes` until a node named `worker-1` reports
+   `status: "active"` — the real proof `POST /internal/nodes/register`
+   completed a genuine registration, not a mocked one. Bounded by the same
+   generous timeout: the worker also compiles its own binary from scratch.
+6. create a throwaway project, resolve its production environment.
+7. `PUT /projects/{id}/environments/{id}/settings` with
+   `target_nodes: [worker_node_id]` — pins every future deploy in this
+   environment to the worker, never the control plane.
+8. deploy `traefik/whoami:latest` (same image other scenarios in this repo
+   already use for basic deploys) and poll it to a terminal state.
+9. the core assertion: `docker exec temps-e2e-mn-worker-1 docker ps` shows
+   the deployed container; `docker exec temps-e2e-mn-control-plane docker
+   ps` does not — a side channel the platform API can't fake, mirroring how
+   `db-ha-failover-scenario` proves promotion via `docker inspect`.
+10. real HTTP proof of life: hit the deployed app through the
+    control-plane's proxy (`localhost:18180`) with the app's `Host` header
+    and assert the actual `traefik/whoami` response body, not just a
+    healthy status field.
+11. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+    `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
+    same `docker ps` side-channel check on both containers to confirm the
+    container migrated off the worker. In this 2-node cluster it has
+    nowhere to go but the control plane, so this step also implicitly
+    re-tests the `Local` scheduling fallback path.
+12. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+    gone from `GET /internal/nodes`.
+13. teardown (in a `finally`, same discipline as every other scenario):
+    `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
+    workspace-target cache volumes survive for a near-instant re-run), then
+    explicitly `docker volume rm` the identity/state volumes (postgres
+    data, both containers' `/var/lib/docker` + `/var/lib/temps`, the
+    worker's `/root`) so the next run proves a genuinely fresh
+    registration/join rather than silently skipping it via one of the role
+    scripts' own idempotency marker files. `--keep` skips all of this —
+    unlike every other scenario's `--keep`, this leaves an entire running
+    2-node cluster behind, not just one container.
+
+**What makes step 9 work without a registry.** Unlike most `--registry`-
+requiring scenarios in this suite, deploying a bare public image tag to a
+remote node needs no registry at all: `ensure_image_on_remote` in
+`crates/temps-deployments/src/jobs/deploy_image.rs` has the control plane's
+own `DockerImageBuilder` pull (if needed) and `docker save` the image to a
+tar, stream it to the worker agent's `POST /agent/images/import`, and the
+agent `docker load`s it there. `image_builder` is injected into the deploy
+job per `workflow_execution_service.rs` (`builder.image_builder(...)`,
+around the node-scheduler wiring) specifically for this transfer path. So
+`traefik/whoami:latest` works exactly as described in this section's
+design with zero extra image-transfer complexity — this was verified by
+reading the actual remote-deploy code path, not assumed.
+
+```bash
+bun run src/index.ts multinode-join-scenario
+bun run src/index.ts multinode-join-scenario --keep --json    # inspect the running cluster after (CI)
+bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
+```
+
 ### `deploy-lifecycle-scenario` steps
 
 Rollback / pause / resume / promote are the platform's primary safety valve

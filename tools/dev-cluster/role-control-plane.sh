@@ -99,10 +99,24 @@ if [[ ! -f "$MARKER" ]]; then
   JOIN_TOKEN_HASH="$(printf '%s' "$JOIN_TOKEN" | sha256sum | awk '{print $1}')"
   log "minting join token (hash $(echo "$JOIN_TOKEN_HASH" | cut -c1-12)…)"
 
+  # Derive psql connection args from TEMPS_DATABASE_URL rather than a
+  # hardcoded IP, so this script stays reusable by any compose topology
+  # that re-subnets this cluster (e.g. apps/temps-e2e's
+  # multinode-join-scenario, which clones this compose file onto
+  # 10.52.0.0/24 instead of 10.42.0.0/24).
+  DB_URL_NO_SCHEME="${TEMPS_DATABASE_URL#postgres://}"
+  DB_USER="${DB_URL_NO_SCHEME%%:*}"
+  DB_REST="${DB_URL_NO_SCHEME#*:}"
+  DB_PASS="${DB_REST%%@*}"
+  DB_HOSTPORT_DB="${DB_REST#*@}"
+  DB_HOSTPORT="${DB_HOSTPORT_DB%%/*}"
+  DB_HOST="${DB_HOSTPORT%%:*}"
+  DB_NAME="${DB_HOSTPORT_DB#*/}"
+
   # The settings.data column is plain JSON (not JSONB). Cast to jsonb for
   # the merge, cast back when writing — same effect as
   # POST /settings/join-token/generate but without needing an admin login.
-  PGPASSWORD=temps psql -h 10.42.0.5 -U temps -d temps -v ON_ERROR_STOP=1 -c "
+  PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
     UPDATE settings
        SET data = jsonb_set(
                     COALESCE(data::jsonb, '{}'::jsonb),
@@ -123,5 +137,5 @@ fi
 # 4. Run the API server. This is the long-running command compose
 #    keeps alive.
 # ---------------------------------------------------------------------------
-log "starting temps serve on $TEMPS_ADDRESS (TLS on $TEMPS_TLS_ADDRESS)"
+log "starting temps serve on $TEMPS_ADDRESS (TLS on ${TEMPS_TLS_ADDRESS:-none})"
 exec "$BIN" serve

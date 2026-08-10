@@ -1460,15 +1460,37 @@ impl DeploymentService {
         project_id: i32,
         environment_id: i32,
     ) -> Result<(), DeploymentError> {
-        // Find the latest successful deployment for this environment
+        // Find the most recent deployment for this environment regardless of
+        // state. Node drain/failover can fire seconds after a deploy reports
+        // "running" at the proxy — well before its `deployments.state` row
+        // settles into a terminal value ("deployed"/"completed"/"ready") —
+        // so filtering on terminal states here made this query race the
+        // deployment pipeline's own state transition and silently see no
+        // rows, which fell through to the git-only path below.
         let latest = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(vec!["deployed", "completed", "ready"]))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await
             .map_err(|e| DeploymentError::Other(e.to_string()))?;
+
+        // Git-less deployments (docker_image source, e.g. imports or
+        // `deployFromImage`) have no branch/tag/commit to rebuild from —
+        // `trigger_pipeline` requires `repo_owner`/`repo_name` and fails with
+        // "Project repo_owner is missing" for these. Redeploy them from the
+        // same image instead, mirroring `trigger_image_deployment`.
+        if let Some(ref deploy) = latest {
+            if let Some(image_ref) = deploy
+                .metadata
+                .as_ref()
+                .and_then(|m| m.external_image_ref.clone())
+            {
+                return self
+                    .trigger_image_deployment(project_id, image_ref, None)
+                    .await;
+            }
+        }
 
         let (branch, tag, commit) = if let Some(ref deploy) = latest {
             (

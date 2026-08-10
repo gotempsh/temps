@@ -184,6 +184,35 @@ pub enum GeoIpService {
     Mock(MockGeoIpService),
 }
 
+/// Resolves an mmdb filename the same way `validate_geolite2_database`
+/// (temps-cli's serve startup check) does: current working directory first,
+/// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
+/// two resolution orders must stay in sync -- when they diverged (this
+/// function previously only checked CWD), `temps serve` could pass its own
+/// startup validation (which checks + downloads to `TEMPS_DATA_DIR`) and
+/// then fail to actually open the database here, because a process whose
+/// working directory isn't its data directory (e.g. any Docker/systemd
+/// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
+/// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_path = cwd.join(filename);
+        if cwd_path.exists() {
+            return cwd_path;
+        }
+    }
+    if let Ok(data_dir) = std::env::var("TEMPS_DATA_DIR") {
+        let data_dir_path = std::path::PathBuf::from(data_dir).join(filename);
+        if data_dir_path.exists() {
+            return data_dir_path;
+        }
+    }
+    // Neither exists -- fall back to the CWD path so the resulting error
+    // message names a location relative to where the process was started
+    // (unchanged behavior for the common case of no TEMPS_DATA_DIR set).
+    std::env::current_dir().unwrap_or_default().join(filename)
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
@@ -196,7 +225,7 @@ impl GeoIpService {
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
 
-        let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
+        let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         debug!("Loading MaxMind database from: {:?}", db_path);
         let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
             GeoIpError::Other(format!(
@@ -210,7 +239,7 @@ impl GeoIpService {
         // (asn_org/is_hosting_provider stay None) rather than failing startup when
         // the operator hasn't provisioned it, same as the City database's own
         // optional-file convention in Dockerfile/docker-compose.
-        let asn_db_path = std::env::current_dir()?.join("GeoLite2-ASN.mmdb");
+        let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
         let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
             Ok(reader) => {
                 info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
