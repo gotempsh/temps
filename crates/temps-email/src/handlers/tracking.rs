@@ -131,7 +131,7 @@ pub async fn track_open(
     get,
     path = "/emails/{email_id}/track/click/{link_index}",
     responses(
-        (status = 302, description = "Redirect to original URL"),
+        (status = 307, description = "Redirect to original URL"),
         (status = 404, description = "Link not found")
     ),
     params(
