@@ -4886,7 +4886,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -4910,7 +4910,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -6578,6 +6578,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.0",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7828,7 +7838,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
  "aws-lc-rs",
- "pem",
+ "pem 3.0.6",
  "ring",
  "rustls-pki-types",
  "time",
@@ -10486,7 +10496,7 @@ dependencies = [
  "cron",
  "flate2",
  "futures",
- "pem",
+ "pem 4.0.0",
  "sea-orm",
  "serde",
  "serde_derive",
@@ -11822,7 +11832,7 @@ dependencies = [
  "clickhouse",
  "libc",
  "mongodb",
- "pem",
+ "pem 4.0.0",
  "redis",
  "reqwest 0.12.28",
  "sea-orm",

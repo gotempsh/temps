@@ -30,7 +30,7 @@ aws-sdk-s3 = { workspace = true }
 # /etc/ssl/certs, and keeps test runs hermetic.
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
 webpki-root-certs = "1.0"
-pem = "3"
+pem = "4"
 sea-orm = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
