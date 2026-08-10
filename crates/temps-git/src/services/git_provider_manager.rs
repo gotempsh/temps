@@ -177,6 +177,57 @@ pub struct GitProviderManager {
 }
 
 impl GitProviderManager {
+    fn url_has_origin(url: &str, expected_host: &str) -> bool {
+        let Ok(url) = Url::parse(url) else {
+            return false;
+        };
+
+        url.scheme() == "https"
+            && url.host_str() == Some(expected_host)
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+
+    /// Public-repository requests below are sent to github.com. A credential
+    /// configured for GitHub Enterprise must never cross that provider origin.
+    fn is_github_dot_com_provider(provider: &git_providers::Model) -> bool {
+        if provider.provider_type != "github" && provider.provider_type != "github_app" {
+            return false;
+        }
+
+        let api_is_public = provider
+            .api_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "api.github.com"))
+            .unwrap_or_else(|| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .map(|url| Self::url_has_origin(url, "github.com"))
+                    .unwrap_or(true)
+            });
+        let web_is_public = provider
+            .base_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "github.com"))
+            .unwrap_or(true);
+
+        api_is_public && web_is_public
+    }
+
+    async fn get_active_connections_for_user(
+        &self,
+        user_id: i32,
+    ) -> Result<Vec<git_provider_connections::Model>, sea_orm::DbErr> {
+        git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
+            .order_by_desc(git_provider_connections::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<temps_core::EncryptionService>,
@@ -220,13 +271,7 @@ impl GitProviderManager {
     /// user's connection would let the caller spend that user's API quota and
     /// could expose repositories only that credential can access.
     pub async fn get_github_token_for_user(&self, user_id: i32) -> Option<String> {
-        let connections = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true))
-            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
-            .order_by_desc(git_provider_connections::Column::CreatedAt)
-            .all(self.db.as_ref())
-            .await
-            .ok()?;
+        let connections = self.get_active_connections_for_user(user_id).await.ok()?;
 
         self.get_github_token_from_connections(connections).await
     }
@@ -249,12 +294,11 @@ impl GitProviderManager {
                 .ok()
                 .flatten();
 
-            let is_github = provider
-                .as_ref()
-                .map(|p| p.provider_type == "github" || p.provider_type == "github_app")
-                .unwrap_or(false);
+            let Some(provider) = provider else {
+                continue;
+            };
 
-            if !is_github {
+            if !Self::is_github_dot_com_provider(&provider) {
                 continue;
             }
 
@@ -5559,6 +5603,160 @@ mod tests {
     use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{git_provider_connections, git_providers};
+
+    fn provider_model(
+        provider_type: &str,
+        base_url: Option<&str>,
+        api_url: Option<&str>,
+    ) -> git_providers::Model {
+        let now = chrono::Utc::now();
+        git_providers::Model {
+            id: 1,
+            name: "test-provider".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_url: api_url.map(str::to_string),
+            auth_method: "pat".to_string(),
+            auth_config: serde_json::json!({}),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_github_token_selection_rejects_enterprise_origins() {
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model(
+                "github",
+                Some("https://github.com/acme"),
+                Some("https://api.github.com")
+            )
+        ));
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model("github_app", None, None)
+        ));
+
+        for provider in [
+            provider_model(
+                "github",
+                Some("https://github.enterprise.example"),
+                Some("https://github.enterprise.example/api/v3"),
+            ),
+            provider_model(
+                "github_app",
+                Some("https://github.enterprise.example"),
+                Some("https://api.github.com"),
+            ),
+            provider_model(
+                "github",
+                Some("https://github.com.evil.example"),
+                Some("https://api.github.com.evil.example"),
+            ),
+        ] {
+            assert!(
+                !GitProviderManager::is_github_dot_com_provider(&provider),
+                "a non-GitHub.com credential must be rejected before token decryption or validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_scoped_connection_lookup_isolates_users_and_inactive_rows() {
+        use temps_entities::users;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Postgres unavailable; skipping connection-isolation test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+
+        let make_user = |email: &str| users::ActiveModel {
+            email: Set(email.to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set(email.to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let user_a = make_user("github-token-a@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        let user_b = make_user("github-token-b@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("GitHub.com".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(Some("https://github.com".to_string())),
+            api_url: Set(Some("https://api.github.com".to_string())),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        for (user_id, account_name, is_active) in [
+            (Some(user_a.id), "user-a-active", true),
+            (Some(user_a.id), "user-a-inactive", false),
+            (Some(user_b.id), "user-b-active", true),
+            (None, "ownerless-active", true),
+        ] {
+            git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(user_id),
+                account_name: Set(account_name.to_string()),
+                account_type: Set("User".to_string()),
+                access_token: Set(None),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(is_active),
+                is_expired: Set(false),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let connections = manager
+            .get_active_connections_for_user(user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].account_name, "user-a-active");
+    }
 
     #[test]
     fn is_auth_failure_recognizes_common_messages() {
