@@ -185,7 +185,7 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
     // crawler and its access directly controls how content can appear in
     // Copilot's Bing-grounded answers, not just classic search results.
     (
-        r"(?i)\bbingbot\b",
+        r"(?i)\bBingbot\b",
         AiAgentMatch {
             provider: "Microsoft",
             agent: "Bingbot",
