@@ -277,7 +277,7 @@ redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager"] }
 lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "tokio1-native-tls"] }
 
 # Git Providers (GitHub, GitLab)
-octocrab = "0.49.5"
+octocrab = "0.54.1"
 
 # ============================================================================
 # Container Management (Docker)
