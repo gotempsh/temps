@@ -6,7 +6,8 @@ use super::{
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
-use bollard::{body_full, Docker};
+use bollard::Docker;
+use flate2::read::GzDecoder;
 use futures::TryStreamExt;
 use redis::{aio::ConnectionManager, Client};
 use schemars::JsonSchema;
@@ -728,42 +729,22 @@ impl RedisService {
         .map(|_| ())
     }
 
-    /// Restore from a WAL-G backup stored in S3.
+    /// Run a one-shot WAL-G restore helper container that writes the LATEST
+    /// backup from `walg_s3_prefix` into the data volume of
+    /// `target_container_name` (via `volumes_from`).
     ///
-    /// WAL-G restore requires stopping Redis, fetching the backup (which writes
-    /// dump.rdb via WALG_STREAM_RESTORE_COMMAND), and restarting.
-    async fn restore_from_walg(
+    /// The caller must ensure the target container is STOPPED and its restart
+    /// policy is disabled before calling this method, and is responsible for
+    /// re-enabling the restart policy and starting the container afterwards.
+    ///
+    /// Returns Ok(()) when the helper exits with code 0, Err otherwise.
+    async fn run_walg_restore_helper(
         &self,
-        s3_credentials: &super::S3Credentials,
+        target_container_name: &str,
+        redis_image: &str,
         walg_s3_prefix: &str,
+        s3_credentials: &super::S3Credentials,
     ) -> Result<()> {
-        let container_name = self
-            .config
-            .read()
-            .await
-            .as_ref()
-            .map(|config| self.get_live_container_name(config))
-            .unwrap_or_else(|| self.get_container_name());
-
-        info!(
-            "Restoring Redis from WAL-G backup (prefix: {}) in container '{}'",
-            walg_s3_prefix, container_name
-        );
-
-        // Get the Redis image from the running container for the helper
-        let container_info = self
-            .docker
-            .inspect_container(
-                &container_name,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await?;
-        let redis_image = container_info
-            .config
-            .as_ref()
-            .and_then(|c| c.image.clone())
-            .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
-
         // Build WAL-G environment variables for the helper container.
         // WALG_STREAM_RESTORE_COMMAND tells WAL-G how to write the restored data.
         let mut walg_env: Vec<String> = vec![
@@ -778,7 +759,7 @@ impl RedisService {
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
-            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .resolve_endpoint_for_container(&self.docker, target_container_name)
             .await
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
@@ -787,44 +768,11 @@ impl RedisService {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
-        // Step 1: Stop the Redis container so it's not using the data volume.
-        // Redis is PID 1, so stopping the container cleanly shuts down Redis and
-        // ensures no autosave can overwrite the dump.rdb we're about to write.
-        //
-        // IMPORTANT: Disable the restart policy first. The container has
-        // restart_policy=always, so Docker would immediately restart it after stop,
-        // preventing the helper container from writing to the shared volume.
-        info!("Disabling restart policy and stopping Redis container for restore");
-        self.docker
-            .update_container(
-                &container_name,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
-
-        self.docker
-            .stop_container(&container_name, None::<StopContainerOptions>)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
-
-        // Step 2: Use an ephemeral helper container with volumes_from to run WAL-G fetch.
-        // We can't exec into a stopped container, so we create a helper that shares
-        // the same data volume and runs WAL-G backup-fetch there.
-        info!("Fetching WAL-G backup via helper container");
-        let helper_name = format!("{}-restore-helper", container_name);
-
-        use bollard::models::{ContainerCreateBody, HostConfig};
-        // The helper runs WAL-G fetch (which writes dump.rdb) and then replaces the AOF
-        // base file with the restored RDB. Redis 7+ with --appendonly yes loads from the
-        // multi-part AOF in appendonlydir/ (base RDB + incremental AOF files). If we just
-        // delete appendonlydir, Redis recreates an EMPTY one on startup and ignores dump.rdb.
+        // The helper runs WAL-G fetch (which writes dump.rdb) and then replaces
+        // the AOF base file with the restored RDB. Redis 7+ with --appendonly yes
+        // loads from the multi-part AOF in appendonlydir/ (base RDB + incremental
+        // AOF files). If we just delete appendonlydir, Redis recreates an EMPTY
+        // one on startup and ignores dump.rdb.
         //
         // Fix: After fetching the backup to dump.rdb, we:
         // 1. Remove the old appendonlydir contents
@@ -841,18 +789,30 @@ impl RedisService {
             "chown -R redis:redis /data/appendonlydir && ",
             "echo 'Restore helper completed successfully'"
         );
+
         // Join the same app network the original Redis container uses (see
         // `create_container_once`/`ensure_network_exists`). Without this the
         // helper only gets Docker's default bridge network, so the S3
         // endpoint we just resolved via `resolve_endpoint_for_container`
-        // (relative to the *original* container's network) is unreachable
-        // from inside it — wal-g's fetch then hangs indefinitely trying to
-        // resolve/connect to a host it has no network path to.
+        // (relative to the original container's network) is unreachable
+        // from inside it.
         ensure_network_exists(&self.docker)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+
+        // Include a random suffix so two concurrent restores of the same service
+        // don't collide on `create_container` with an opaque "name already in use"
+        // error. `restore_from_legacy` uses the same pattern.
+        let helper_suffix = uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("rr")
+            .to_string();
+        let helper_name = format!("{}-restore-helper-{}", target_container_name, helper_suffix);
+        use bollard::models::{ContainerCreateBody, HostConfig};
         let helper_config = ContainerCreateBody {
-            image: Some(redis_image),
+            image: Some(redis_image.to_string()),
             cmd: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -860,7 +820,7 @@ impl RedisService {
             ]),
             env: Some(walg_env),
             host_config: Some(HostConfig {
-                volumes_from: Some(vec![container_name.clone()]),
+                volumes_from: Some(vec![target_container_name.to_string()]),
                 ..Default::default()
             }),
             networking_config: Some(bollard::models::NetworkingConfig {
@@ -885,19 +845,36 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
 
-        self.docker
+        // If `start_container` fails, the created container persists in Docker
+        // with its S3 credentials visible via `docker inspect`. Always force-remove
+        // the container on this path to avoid credential leaks.
+        if let Err(e) = self
+            .docker
             .start_container(
                 &helper.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "Failed to start restore helper container: {}",
+                e
+            ));
+        }
 
-        // Wait for helper to finish. Bounded — unlike `run_exec`'s exec-based
-        // path, this waits on the container-level Docker API directly with no
-        // other timeout backstop; leaving it unbounded means a stuck helper
-        // container hangs until the *caller's* outer timeout eventually
-        // fires, with none of the diagnostics `run_exec` provides.
+        // Wait for the helper to finish — bounded to avoid an indefinitely stuck
+        // helper blocking the restore run forever.
         use futures::StreamExt;
         let wait_result = match tokio::time::timeout(
             REDIS_BACKUP_EXEC_TIMEOUT,
@@ -925,13 +902,13 @@ impl RedisService {
                     .await;
                 return Err(anyhow::anyhow!(
                     "WAL-G backup-fetch helper for container '{}' did not exit within {:?}",
-                    container_name,
+                    target_container_name,
                     REDIS_BACKUP_EXEC_TIMEOUT
                 ));
             }
         };
 
-        // Capture helper container logs before cleanup for diagnostics
+        // Capture helper logs before cleanup for diagnostics.
         let log_output = {
             use bollard::query_parameters::LogsOptions;
             let mut log_stream = self.docker.logs(
@@ -953,17 +930,17 @@ impl RedisService {
         if log_output.is_empty() {
             info!(
                 "WAL-G restore helper produced no output for '{}'",
-                container_name
+                target_container_name
             );
         } else {
             info!(
                 "WAL-G restore helper logs for '{}': {}",
-                container_name,
+                target_container_name,
                 log_output.trim()
             );
         }
 
-        // Clean up helper container
+        // Clean up the helper container.
         let _ = self
             .docker
             .remove_container(
@@ -981,16 +958,94 @@ impl RedisService {
                 return Err(anyhow::anyhow!(
                     "WAL-G backup-fetch helper exited with code {} for container '{}'. Logs: {}",
                     wait_response.status_code,
-                    container_name,
+                    target_container_name,
                     log_output.trim()
                 ));
             }
         }
 
+        Ok(())
+    }
+
+    /// Restore from a WAL-G backup stored in S3.
+    ///
+    /// WAL-G restore requires stopping Redis, fetching the backup (which writes
+    /// dump.rdb via WALG_STREAM_RESTORE_COMMAND), and restarting.
+    async fn restore_from_walg(
+        &self,
+        s3_credentials: &super::S3Credentials,
+        walg_s3_prefix: &str,
+    ) -> Result<()> {
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
+
+        info!(
+            "Restoring Redis from WAL-G backup (prefix: {}) in container '{}'",
+            walg_s3_prefix, container_name
+        );
+
+        // Get the Redis image from the running container for the helper.
+        let container_info = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        let redis_image = container_info
+            .config
+            .as_ref()
+            .and_then(|c| c.image.clone())
+            .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
+
+        // Step 1: Disable the restart policy and stop the container so it releases
+        // the data volume exclusively to the restore helper.
+        info!("Disabling restart policy and stopping Redis container for restore");
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+
+        self.docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
+
+        // Step 2: Run the WAL-G restore helper.
+        let restore_result = self
+            .run_walg_restore_helper(
+                &container_name,
+                &redis_image,
+                walg_s3_prefix,
+                s3_credentials,
+            )
+            .await;
+
         // Step 3: Re-enable restart policy and start the original Redis container.
         // Redis will load the restored dump.rdb on startup.
+        //
+        // Re-enable restart policy regardless of the restore outcome — a transient
+        // Docker API error here must NOT propagate via `?` and strand the container
+        // with restart_policy=NO (which prevents auto-recovery from crashes or
+        // daemon restarts). Both sibling functions (`restore_from_legacy`,
+        // `restore_to_new_service`) use `let _ =` here for the same reason.
         info!("Starting Redis with restored data");
-        self.docker
+        let _ = self
+            .docker
             .update_container(
                 &container_name,
                 bollard::models::ContainerUpdateBody {
@@ -1001,8 +1056,9 @@ impl RedisService {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to re-enable restart policy: {}", e))?;
+            .await;
+
+        restore_result?;
 
         self.docker
             .start_container(
@@ -1012,7 +1068,7 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start Redis after restore: {}", e))?;
 
-        // Wait for container to be healthy
+        // Wait for container to be healthy.
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
 
@@ -1020,30 +1076,73 @@ impl RedisService {
         Ok(())
     }
 
-    /// Restore from a legacy backup (pre-WAL-G .tar files containing dump.rdb/appendonly.aof).
-    /// Falls back to the old approach: download from S3, extract, upload to container.
+    /// Restore from the current RedisEngine backup format: a gzip-compressed
+    /// RDB snapshot (`.rdb.gz`) stored on S3.
+    ///
+    /// The previous implementation mistakenly treated the gzip as a tar
+    /// archive, so `tar::Archive::new()` failed immediately with "failed to
+    /// iterate over archive". This version:
+    ///
+    /// 1. Downloads and gzip-decodes the backup to a host temp file.
+    /// 2. Disables the container's restart policy then stops it (prevents
+    ///    Docker from auto-restarting before the helper can write the volume).
+    /// 3. Runs a short-lived helper container with `volumes_from` on the
+    ///    stopped container. The helper copies the RDB, rebuilds the Redis 7+
+    ///    multi-part AOF directory (`appendonlydir/`) with a manifest pointing
+    ///    to the RDB as the base, and chowns everything to `redis:redis`.
+    ///    A bare `dump.rdb` is ignored on startup by Redis 7 when AOF is
+    ///    enabled; the manifest-based directory is required.
+    /// 4. Re-enables the restart policy (always) regardless of outcome.
+    /// 5. Starts the container and waits for the healthcheck.
     async fn restore_from_legacy(
         &self,
         s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
     ) -> Result<()> {
-        info!(
-            "Restoring Redis from legacy backup format: {}",
-            backup_location
-        );
+        info!("Restoring Redis from rdb.gz backup: {}", backup_location);
 
-        // Get the backup object from S3
+        // ── 1. Download the .rdb.gz from S3 ─────────────────────────────────
         let get_obj = s3_client
             .get_object()
             .bucket(&s3_source.bucket_name)
             .key(backup_location)
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 GetObject failed for {}: {}", backup_location, e))?;
 
-        // Read the backup data
-        let backup_data = get_obj.body.collect().await?.to_vec();
+        let gz_bytes = get_obj
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read S3 body: {}", e))?
+            .to_vec();
 
+        // Decompress the gzip to raw RDB bytes.
+        let rdb_bytes = {
+            use std::io::Read;
+            let mut decoder = GzDecoder::new(gz_bytes.as_slice());
+            let mut buf = Vec::new();
+            decoder
+                .read_to_end(&mut buf)
+                .map_err(|e| anyhow::anyhow!("Failed to gunzip Redis backup: {}", e))?;
+            buf
+        };
+
+        // ── 2. Write RDB to a host temp dir (bind-mounted into the helper) ──
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| anyhow::anyhow!("Failed to create temp dir: {}", e))?;
+        let rdb_host_path = temp_dir.path().join("restore.rdb");
+        tokio::fs::write(&rdb_host_path, &rdb_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write RDB to temp dir: {}", e))?;
+        let temp_dir_str = temp_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("temp dir path is not valid UTF-8"))?
+            .to_string();
+
+        // ── 3. Resolve the target container name ─────────────────────────────
         let container_name = self
             .config
             .read()
@@ -1052,47 +1151,231 @@ impl RedisService {
             .map(|config| self.get_live_container_name(config))
             .unwrap_or_else(|| self.get_container_name());
 
+        // ── 4. Inspect the container to find the Redis image ─────────────────
+        let inspect = self
+            .docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container {}: {}", container_name, e)
+            })?;
+        let redis_image = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.image.as_deref())
+            .unwrap_or("redis:7-alpine")
+            .to_string();
+
+        // ── 5. Disable restart policy then stop the container ─────────────────
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| {
+                warn!(
+                    "Could not disable restart policy on {}: {}",
+                    container_name, e
+                )
+            })
+            .ok();
+
         self.docker
             .stop_container(&container_name, None::<StopContainerOptions>)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to stop Redis container {}: {}", container_name, e)
+            })?;
 
-        // Create a temporary directory
-        let temp_dir = tempfile::tempdir()?;
-        let tar_path = temp_dir.path().join("backup.tar");
+        // ── 6. Run helper container to write RDB and rebuild AOF directory ───
+        // The restore script:
+        //   a. Copies the bind-mounted RDB to /data/dump.rdb
+        //   b. Removes any stale appendonlydir
+        //   c. Creates appendonlydir/ with the RDB as the AOF base file
+        //   d. Writes the AOF manifest pointing to the base file
+        //   e. Chowns everything to redis:redis so Redis can read on startup
+        let restore_script = "cp /restore/restore.rdb /data/dump.rdb && \
+             rm -rf /data/appendonlydir && \
+             mkdir -p /data/appendonlydir && \
+             cp /data/dump.rdb /data/appendonlydir/appendonly.aof.1.base.rdb && \
+             printf 'file appendonly.aof.1.base.rdb seq 1 type b\\n' > /data/appendonlydir/appendonly.aof.manifest && \
+             chown -R redis:redis /data/dump.rdb /data/appendonlydir && \
+             echo 'Legacy restore helper completed successfully'"
+            .to_string();
 
-        // Write the tar file
-        tokio::fs::write(&tar_path, backup_data).await?;
+        let helper_id = uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("rr")
+            .to_string();
+        let helper_name = format!("temps-redis-rdb-restore-{}", helper_id);
 
-        // Extract the tar file
-        let tar_file = std::fs::File::open(&tar_path)?;
-        let mut archive = tar::Archive::new(tar_file);
-        archive.unpack(temp_dir.path())?;
+        use bollard::models::{ContainerCreateBody, HostConfig};
+        let helper_config = ContainerCreateBody {
+            image: Some(redis_image.clone()),
+            cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
+            user: Some("root".to_string()),
+            host_config: Some(HostConfig {
+                volumes_from: Some(vec![container_name.clone()]),
+                binds: Some(vec![format!("{}:/restore:ro", temp_dir_str)]),
+                network_mode: Some("none".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
-        // Create a new tar archive with the extracted files in the correct structure
-        let mut tar = tar::Builder::new(Vec::new());
-        for file in &["dump.rdb", "appendonly.aof"] {
-            let file_path = temp_dir.path().join(file);
-            if file_path.exists() {
-                tar.append_path_with_name(&file_path, file)?;
-            }
-        }
-        let tar_data = tar.into_inner()?;
-
-        // Copy both files into the container's data directory
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/data".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                helper_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload backup files to container: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create rdb restore helper container: {}", e))?;
 
-        // Start Redis server again
+        self.docker
+            .start_container(
+                &helper.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start rdb restore helper container: {}", e))?;
+
+        // Wait for the helper to finish.
+        use futures::StreamExt;
+        let wait_result = match tokio::time::timeout(
+            REDIS_BACKUP_EXEC_TIMEOUT,
+            self.docker
+                .wait_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::WaitContainerOptions>,
+                )
+                .next(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &helper.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            v: false,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                // Re-enable restart policy even on timeout.
+                let _ = self
+                    .docker
+                    .update_container(
+                        &container_name,
+                        bollard::models::ContainerUpdateBody {
+                            restart_policy: Some(bollard::models::RestartPolicy {
+                                name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                                maximum_retry_count: None,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "RDB restore helper for container '{}' did not exit within {:?}",
+                    container_name,
+                    REDIS_BACKUP_EXEC_TIMEOUT
+                ));
+            }
+        };
+
+        // Capture helper logs before cleanup.
+        let log_output = {
+            use bollard::query_parameters::LogsOptions;
+            let mut log_stream = self.docker.logs(
+                &helper.id,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    follow: false,
+                    ..Default::default()
+                }),
+            );
+            let mut logs = String::new();
+            while let Some(Ok(chunk)) = log_stream.next().await {
+                logs.push_str(&chunk.to_string());
+            }
+            logs
+        };
+
+        // Clean up the helper container.
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let restore_result = if let Some(Ok(wait_response)) = wait_result {
+            if wait_response.status_code != 0 {
+                Err(anyhow::anyhow!(
+                    "RDB restore helper exited with code {} for container '{}'. Logs: {}",
+                    wait_response.status_code,
+                    container_name,
+                    log_output.trim()
+                ))
+            } else {
+                info!(
+                    "RDB restore helper logs for '{}': {}",
+                    container_name,
+                    log_output.trim()
+                );
+                Ok(())
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "RDB restore helper for '{}' produced no wait status. Logs: {}",
+                container_name,
+                log_output.trim()
+            ))
+        };
+
+        // ── 7. Re-enable restart policy (always, even on error) ──────────────
+        let _ = self
+            .docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // Propagate restore failure after re-enabling restart policy.
+        restore_result?;
+
+        // ── 8. Start the container and wait for it to be healthy ─────────────
         self.docker
             .start_container(
                 &container_name,
@@ -1101,11 +1384,10 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start Redis container after restore: {}", e))?;
 
-        // Wait for container to be healthy
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
 
-        info!("Redis legacy restore completed successfully");
+        info!("Redis rdb.gz restore completed successfully");
         Ok(())
     }
 
@@ -2050,6 +2332,254 @@ impl ExternalService for RedisService {
         }
     }
 
+    /// Redis supports in-place restore and restore-to-new-service for WAL-G
+    /// backups. PITR is not supported — Redis has no continuous WAL archive
+    /// that would allow recovering to an arbitrary point in time.
+    async fn restore_capabilities(
+        &self,
+        _service_config: super::ServiceConfig,
+    ) -> Result<super::RestoreCapabilities> {
+        Ok(super::RestoreCapabilities {
+            restore_in_place: true,
+            restore_to_new_service: true,
+            pitr: false,
+            earliest_pitr_time: None,
+            latest_pitr_time: None,
+        })
+    }
+
+    /// Provision a new Redis service and restore the given WAL-G backup into it.
+    ///
+    /// Only WAL-G backups (s3:// locations) are supported. Legacy .tar backups
+    /// cannot be restored to a new service because the archive format does not
+    /// include enough metadata to reconstruct a fresh container reliably.
+    ///
+    /// Steps:
+    /// 1. Clone the source config, pick a free port (or honour `parameter_overrides`).
+    /// 2. Create and start the new Redis container (gets an empty data volume).
+    /// 3. Disable restart policy and stop the container.
+    /// 4. Run the WAL-G restore helper that writes the backup into the volume.
+    /// 5. Re-enable restart policy and start the container.
+    /// 6. Wait for the healthcheck to pass.
+    /// 7. Return the new service's parameters and connection string.
+    async fn restore_to_new_service(
+        &self,
+        ctx: super::RestoreContext<'_>,
+        new_service_name: String,
+        parameter_overrides: serde_json::Value,
+    ) -> Result<super::NewServiceRestoreResult> {
+        info!(
+            "Provisioning new Redis service '{}' from backup at {}",
+            new_service_name, ctx.backup_location
+        );
+
+        // Only WAL-G backups can be restored to a new service.
+        if !ctx.backup_location.starts_with("s3://") {
+            return Err(anyhow::anyhow!(
+                "restore_to_new_service requires a WAL-G backup (s3:// location); \
+                 '{}' is a legacy tar backup and cannot be restored to a new service",
+                ctx.backup_location
+            ));
+        }
+
+        // Parse the source config and apply parameter overrides.
+        let mut new_redis_config = self.get_redis_config(ctx.source_config)?;
+
+        // Honour explicit port override; otherwise find a free port to avoid
+        // colliding with the source service that's still running.
+        if let Some(port_str) = parameter_overrides.get("port").and_then(|v| v.as_str()) {
+            new_redis_config.port = port_str.to_string();
+        } else {
+            let base: u16 = new_redis_config.port.parse().unwrap_or(6379);
+            new_redis_config.port = find_available_port(base.wrapping_add(1))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No free port found for new Redis service '{}' (searched from {}+1)",
+                        new_service_name,
+                        base
+                    )
+                })?
+                .to_string();
+        }
+
+        // Apply docker_image override if requested.
+        if let Some(img) = parameter_overrides
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+        {
+            new_redis_config.docker_image = img.to_string();
+        }
+
+        // This is a brand-new container — clear any imported-container override
+        // so the derived `redis-{name}` naming takes effect.
+        new_redis_config.container_name = None;
+
+        let new_service = RedisService::new(new_service_name.clone(), self.docker.clone());
+        let password = new_redis_config.password.clone();
+        let resource_limits = super::super::externalsvc::ServiceResourceLimits::default();
+
+        // `create_container` creates AND starts the container. It writes the
+        // final port (which may differ from our pick if there was a race) back
+        // into `new_redis_config`.
+        new_service
+            .create_container(
+                &self.docker,
+                &mut new_redis_config,
+                &password,
+                &resource_limits,
+            )
+            .await?;
+
+        let new_container_name = new_service.get_container_name();
+        let redis_image = new_redis_config.docker_image.clone();
+
+        // Disable restart policy and stop so the helper can write to the volume.
+        info!(
+            "Disabling restart policy and stopping new container '{}' for restore",
+            new_container_name
+        );
+        self.docker
+            .update_container(
+                &new_container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to disable restart policy on new container '{}': {}",
+                    new_container_name,
+                    e
+                )
+            })?;
+
+        self.docker
+            .stop_container(
+                &new_container_name,
+                None::<bollard::query_parameters::StopContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to stop new Redis container '{}' for restore: {}",
+                    new_container_name,
+                    e
+                )
+            })?;
+
+        // Run the WAL-G restore helper into the new container's volume.
+        let restore_result = self
+            .run_walg_restore_helper(
+                &new_container_name,
+                &redis_image,
+                ctx.backup_location,
+                ctx.s3_credentials,
+            )
+            .await;
+
+        // Re-enable restart policy regardless of outcome.
+        let _ = self
+            .docker
+            .update_container(
+                &new_container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        if let Err(e) = restore_result {
+            // Clean up the new container since the restore failed.
+            let _ = self
+                .docker
+                .remove_container(
+                    &new_container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "WAL-G restore into new Redis container '{}' failed, container removed: {}",
+                new_container_name,
+                e
+            ));
+        }
+
+        // Start the new container with restored data.
+        self.docker
+            .start_container(
+                &new_container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to start new Redis container '{}' after restore: {}",
+                    new_container_name,
+                    e
+                )
+            })?;
+
+        // Wait for the healthcheck to pass.
+        new_service
+            .wait_for_container_health(&self.docker, &new_container_name)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "New Redis container '{}' did not become healthy after restore: {}",
+                    new_container_name,
+                    e
+                )
+            })?;
+
+        info!(
+            "New Redis service '{}' provisioned and restored successfully \
+             (container: {}, port: {})",
+            new_service_name, new_container_name, new_redis_config.port
+        );
+
+        // Serialise the final config so every field is persisted to
+        // `external_service_params` by the orchestrator.
+        let config_json = serde_json::to_value(&new_redis_config)
+            .map_err(|e| anyhow::anyhow!("Failed to serialise new Redis config: {}", e))?;
+
+        let parameters: HashMap<String, String> = config_json
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let connection_info = if new_redis_config.password.is_empty() {
+            format!("redis://localhost:{}", new_redis_config.port)
+        } else {
+            format!(
+                "redis://:{}@localhost:{}",
+                urlencoding::encode(&new_redis_config.password),
+                new_redis_config.port
+            )
+        };
+
+        Ok(super::NewServiceRestoreResult {
+            parameters,
+            connection_info,
+        })
+    }
+
     fn get_default_docker_image(&self) -> (String, String) {
         // Return (image_name, version)
         ("gotempsh/redis-walg".to_string(), "8-bookworm".to_string())
@@ -2269,6 +2799,45 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    /// `restore_capabilities` must declare in-place and new-service restore as
+    /// supported, and explicitly NOT claim PITR (Redis has no WAL archive).
+    #[tokio::test]
+    async fn test_restore_capabilities_in_place_and_new_service_no_pitr() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-caps".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "test-caps".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "6379",
+                "password": "testpass1"
+            }),
+        };
+
+        let caps = service
+            .restore_capabilities(config)
+            .await
+            .expect("restore_capabilities must not fail");
+
+        assert!(caps.restore_in_place, "Redis must support in-place restore");
+        assert!(
+            caps.restore_to_new_service,
+            "Redis must support restore-to-new-service"
+        );
+        assert!(!caps.pitr, "Redis must NOT claim PITR support");
+        assert!(
+            caps.earliest_pitr_time.is_none(),
+            "earliest_pitr_time must be None"
+        );
+        assert!(
+            caps.latest_pitr_time.is_none(),
+            "latest_pitr_time must be None"
+        );
+    }
 
     #[test]
     fn test_parameter_schema_editable_fields() {

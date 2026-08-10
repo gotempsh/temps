@@ -27,6 +27,7 @@ import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.
 import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
 import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
 import { s3RestoreScenarioCommand } from './commands/s3-restore-scenario.ts'
+import { redisRestoreScenarioCommand } from './commands/redis-restore-scenario.ts'
 import { mongodbRestoreScenarioCommand } from './commands/mongodb-restore-scenario.ts'
 import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
 
@@ -352,6 +353,21 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await dbHaFailoverScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('redis-restore-scenario')
+  .description(
+    'Backup + restore a real Redis service via MinIO: real wal-g backup-push into a helper container, real S3 upload, real in-place restore proven by verifying pre-backup keys survive (HTTP 200 from data-browser) and post-backup keys are erased (HTTP 404) -- not just that the API calls returned 2xx',
+  )
+  .option('--registry <host:port>', 'registry to push the redis-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await redisRestoreScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
