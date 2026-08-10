@@ -4,6 +4,8 @@ import {
   resolveEnabledFlag,
   buildCreateDestinationBody,
   buildUpdateDestinationBody,
+  buildCreateInstanceDefaultBody,
+  buildUpdateInstanceDefaultBody,
 } from './index.js'
 
 describe('parseHeaderPairs', () => {
@@ -178,6 +180,91 @@ describe('buildUpdateDestinationBody', () => {
       forward_logs: false,
       enabled: false,
       allow_private_network: true,
+    })
+  })
+})
+
+describe('buildCreateInstanceDefaultBody', () => {
+  const baseOptions = {
+    name: 'instance-openobserve',
+    vendor: 'generic_otlp',
+    endpointUrl: 'https://openobserve.internal',
+  }
+
+  test('includes only the required fields when nothing else is passed, with no project_id', () => {
+    const body = buildCreateInstanceDefaultBody(baseOptions)
+    expect(body).toEqual({
+      name: 'instance-openobserve',
+      vendor_preset: 'generic_otlp',
+      endpoint_url: 'https://openobserve.internal',
+    })
+    expect('project_id' in body).toBe(false)
+  })
+
+  test('includes headers only when at least one --header was passed', () => {
+    const body = buildCreateInstanceDefaultBody({
+      ...baseOptions,
+      header: ['X-Org=acme', 'Authorization=Bearer abc'],
+    })
+    expect(body.headers).toEqual({
+      'X-Org': 'acme',
+      Authorization: 'Bearer abc',
+    })
+  })
+
+  test('includes forward_traces/metrics/logs only when explicitly set', () => {
+    const body = buildCreateInstanceDefaultBody({ ...baseOptions, metrics: false })
+    expect(body.forward_metrics).toBe(false)
+    expect(body.forward_traces).toBeUndefined()
+    expect(body.forward_logs).toBeUndefined()
+  })
+
+  test('sets enabled from --disabled', () => {
+    expect(buildCreateInstanceDefaultBody({ ...baseOptions, disabled: true }).enabled).toBe(false)
+  })
+
+  test('sets allow_private_network only when the flag is passed', () => {
+    expect(buildCreateInstanceDefaultBody(baseOptions).allow_private_network).toBeUndefined()
+    expect(
+      buildCreateInstanceDefaultBody({ ...baseOptions, allowPrivateNetwork: true }).allow_private_network
+    ).toBe(true)
+  })
+})
+
+describe('buildUpdateInstanceDefaultBody', () => {
+  test('returns an empty object when no fields are passed', () => {
+    expect(buildUpdateInstanceDefaultBody({})).toEqual({})
+  })
+
+  test('includes only the fields that were actually passed, with no project_id ever present', () => {
+    const body = buildUpdateInstanceDefaultBody({ endpointUrl: 'https://example.com' })
+    expect(body).toEqual({ endpoint_url: 'https://example.com' })
+    expect('project_id' in body).toBe(false)
+  })
+
+  test('a header value of exactly "***" round-trips as a literal value (server interprets the sentinel)', () => {
+    expect(buildUpdateInstanceDefaultBody({ header: ['x-api-key=***'] }).headers).toEqual({
+      'x-api-key': '***',
+    })
+  })
+
+  test('includes allow_private_network only when explicitly set (true or false)', () => {
+    expect(buildUpdateInstanceDefaultBody({}).allow_private_network).toBeUndefined()
+    expect(buildUpdateInstanceDefaultBody({ allowPrivateNetwork: false }).allow_private_network).toBe(false)
+  })
+
+  test('builds a full partial body with every kind of field mixed', () => {
+    const body = buildUpdateInstanceDefaultBody({
+      name: 'renamed-default',
+      header: ['a=1'],
+      traces: false,
+      enabled: true,
+    })
+    expect(body).toEqual({
+      name: 'renamed-default',
+      headers: { a: '1' },
+      forward_traces: false,
+      enabled: true,
     })
   })
 })

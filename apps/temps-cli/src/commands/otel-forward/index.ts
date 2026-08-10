@@ -80,6 +80,59 @@ export interface TestDeliveryResponse {
   error: string | null
 }
 
+// Instance-level default destinations. Same shape as a project destination
+// minus project_id — the relay engine falls back to these for any project
+// with zero enabled destinations of its own.
+
+export interface CreateInstanceDefaultBody {
+  name: string
+  vendor_preset: string
+  endpoint_url: string
+  headers?: Record<string, string>
+  forward_traces?: boolean
+  forward_metrics?: boolean
+  forward_logs?: boolean
+  enabled?: boolean
+  allow_private_network?: boolean
+}
+
+export interface UpdateInstanceDefaultBody {
+  name?: string
+  vendor_preset?: string
+  endpoint_url?: string
+  headers?: Record<string, string>
+  forward_traces?: boolean
+  forward_metrics?: boolean
+  forward_logs?: boolean
+  enabled?: boolean
+  allow_private_network?: boolean
+}
+
+export interface InstanceDefaultResponse {
+  id: number
+  name: string
+  vendor_preset: string
+  endpoint_url: string
+  headers: Record<string, string>
+  forward_traces: boolean
+  forward_metrics: boolean
+  forward_logs: boolean
+  enabled: boolean
+  allow_private_network: boolean
+  last_success_at: string | null
+  last_error_at: string | null
+  last_error: string | null
+  consecutive_failures: number
+  status: DestinationStatus
+  created_at: string
+  updated_at: string
+}
+
+export interface InstanceDefaultListResponse {
+  items: InstanceDefaultResponse[]
+  total: number
+}
+
 const VENDOR_PRESET_HINT = 'datadog, honeycomb, new_relic, grafana_cloud, generic_otlp'
 
 /**
@@ -243,6 +296,83 @@ export function buildUpdateDestinationBody(options: UpdateOptions): UpdateDestin
   return body
 }
 
+interface CreateInstanceDefaultOptions {
+  name: string
+  vendor: string
+  endpointUrl: string
+  header?: string[]
+  traces?: boolean
+  metrics?: boolean
+  logs?: boolean
+  enabled?: boolean
+  disabled?: boolean
+  allowPrivateNetwork?: boolean
+  json?: boolean
+}
+
+interface UpdateInstanceDefaultOptions {
+  name?: string
+  vendor?: string
+  endpointUrl?: string
+  header?: string[]
+  traces?: boolean
+  metrics?: boolean
+  logs?: boolean
+  enabled?: boolean
+  disabled?: boolean
+  allowPrivateNetwork?: boolean
+  json?: boolean
+}
+
+/** Build the POST body from `instance-default create`'s options. Omitted flags are left out entirely so the server applies its own defaults. */
+export function buildCreateInstanceDefaultBody(options: CreateInstanceDefaultOptions): CreateInstanceDefaultBody {
+  const body: CreateInstanceDefaultBody = {
+    name: options.name,
+    vendor_preset: options.vendor,
+    endpoint_url: options.endpointUrl,
+  }
+
+  const headers = parseHeaderPairs(options.header)
+  if (Object.keys(headers).length > 0) {
+    body.headers = headers
+  }
+
+  if (options.traces !== undefined) body.forward_traces = options.traces
+  if (options.metrics !== undefined) body.forward_metrics = options.metrics
+  if (options.logs !== undefined) body.forward_logs = options.logs
+
+  const enabled = resolveEnabledFlag(options)
+  if (enabled !== undefined) body.enabled = enabled
+
+  if (options.allowPrivateNetwork) body.allow_private_network = true
+
+  return body
+}
+
+/** Build the PATCH body from `instance-default update`'s options — only fields the user actually passed are included. */
+export function buildUpdateInstanceDefaultBody(options: UpdateInstanceDefaultOptions): UpdateInstanceDefaultBody {
+  const body: UpdateInstanceDefaultBody = {}
+
+  if (options.name !== undefined) body.name = options.name
+  if (options.vendor !== undefined) body.vendor_preset = options.vendor
+  if (options.endpointUrl !== undefined) body.endpoint_url = options.endpointUrl
+
+  if (options.header && options.header.length > 0) {
+    body.headers = parseHeaderPairs(options.header)
+  }
+
+  if (options.traces !== undefined) body.forward_traces = options.traces
+  if (options.metrics !== undefined) body.forward_metrics = options.metrics
+  if (options.logs !== undefined) body.forward_logs = options.logs
+
+  const enabled = resolveEnabledFlag(options)
+  if (enabled !== undefined) body.enabled = enabled
+
+  if (options.allowPrivateNetwork !== undefined) body.allow_private_network = options.allowPrivateNetwork
+
+  return body
+}
+
 // ============================================================================
 // Display helpers
 // ============================================================================
@@ -279,6 +409,40 @@ function printDestinationDetails(destination: DestinationResponse): void {
   }
   keyValue('Created', formatDate(destination.created_at))
   keyValue('Updated', formatDate(destination.updated_at))
+  newline()
+}
+
+function printInstanceDefaultDetails(instanceDefault: InstanceDefaultResponse): void {
+  newline()
+  header(`${icons.info} ${instanceDefault.name} (instance default)`)
+  keyValue('ID', instanceDefault.id)
+  keyValue('Vendor', instanceDefault.vendor_preset)
+  keyValue('Endpoint', instanceDefault.endpoint_url)
+  keyValue('Status', statusBadge(instanceDefault.status))
+  keyValue('Enabled', instanceDefault.enabled ? colors.success('yes') : colors.muted('no'))
+  keyValue('Forward traces', instanceDefault.forward_traces ? 'yes' : 'no')
+  keyValue('Forward metrics', instanceDefault.forward_metrics ? 'yes' : 'no')
+  keyValue('Forward logs', instanceDefault.forward_logs ? 'yes' : 'no')
+  keyValue('Allow private network', instanceDefault.allow_private_network ? 'yes' : 'no')
+
+  const headerEntries = Object.entries(instanceDefault.headers)
+  if (headerEntries.length > 0) {
+    keyValue(
+      'Headers',
+      headerEntries
+        .map(([k, v]) => `${k}=${isSensitiveHeaderName(k) ? '***' : v}`)
+        .join(', ')
+    )
+  }
+
+  keyValue('Consecutive failures', instanceDefault.consecutive_failures)
+  keyValue('Last success', instanceDefault.last_success_at ? formatDate(instanceDefault.last_success_at) : colors.muted('never'))
+  keyValue('Last error', instanceDefault.last_error_at ? formatDate(instanceDefault.last_error_at) : colors.muted('never'))
+  if (instanceDefault.last_error) {
+    keyValue('Last error detail', instanceDefault.last_error)
+  }
+  keyValue('Created', formatDate(instanceDefault.created_at))
+  keyValue('Updated', formatDate(instanceDefault.updated_at))
   newline()
 }
 
@@ -362,6 +526,84 @@ export function registerOtelForwardCommands(program: Command): void {
     .description('Send a test delivery to an OTel forwarding destination')
     .option('--json', 'Output in JSON format')
     .action(testDestinationAction)
+
+  const instanceDefault = otelForward
+    .command('instance-default')
+    .description(
+      'Manage instance-wide default forwarding destinations — applied automatically to any ' +
+        'project with zero enabled destinations of its own. As soon as a project has one of its ' +
+        'own destinations, instance defaults stop applying to that project.'
+    )
+
+  instanceDefault
+    .command('list')
+    .alias('ls')
+    .description('List instance-wide default forwarding destinations')
+    .option('--json', 'Output in JSON format')
+    .action(listInstanceDefaultsAction)
+
+  instanceDefault
+    .command('create')
+    .description('Create a new instance-wide default forwarding destination')
+    .requiredOption('--name <name>', 'Destination name')
+    .requiredOption('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
+    .requiredOption('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
+    .option('--header <k=v>', 'HTTP header sent with every export (repeatable)', collectHeader, [] as string[])
+    .option('--traces', 'Forward traces (default: true)')
+    .option('--no-traces', 'Do not forward traces')
+    .option('--metrics', 'Forward metrics (default: true)')
+    .option('--no-metrics', 'Do not forward metrics')
+    .option('--logs', 'Forward logs (default: true)')
+    .option('--no-logs', 'Do not forward logs')
+    .option('--enabled', 'Create the destination enabled (default)')
+    .option('--disabled', 'Create the destination disabled')
+    .option('--allow-private-network', 'Allow the endpoint URL to resolve to private/loopback/link-local IPs')
+    .option('--json', 'Output in JSON format')
+    .action(createInstanceDefaultAction)
+
+  instanceDefault
+    .command('show <id>')
+    .description('Show instance default destination details')
+    .option('--json', 'Output in JSON format')
+    .action(showInstanceDefaultAction)
+
+  instanceDefault
+    .command('update <id>')
+    .description('Update an instance default forwarding destination')
+    .option('--name <name>', 'Destination name')
+    .option('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
+    .option('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
+    .option(
+      '--header <k=v>',
+      'HTTP header sent with every export (repeatable); a value of exactly "***" keeps that header\'s existing value',
+      collectHeader,
+      [] as string[]
+    )
+    .option('--traces', 'Forward traces')
+    .option('--no-traces', 'Do not forward traces')
+    .option('--metrics', 'Forward metrics')
+    .option('--no-metrics', 'Do not forward metrics')
+    .option('--logs', 'Forward logs')
+    .option('--no-logs', 'Do not forward logs')
+    .option('--enabled', 'Enable the destination')
+    .option('--disabled', 'Disable the destination')
+    .option('--allow-private-network', 'Allow the endpoint URL to resolve to private/loopback/link-local IPs')
+    .option('--no-allow-private-network', 'Disallow private/loopback/link-local endpoint URLs')
+    .option('--json', 'Output in JSON format')
+    .action(updateInstanceDefaultAction)
+
+  instanceDefault
+    .command('remove <id>')
+    .description('Remove an instance default forwarding destination')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
+    .action(removeInstanceDefaultAction)
+
+  instanceDefault
+    .command('test <id>')
+    .description('Send a test delivery to an instance default forwarding destination')
+    .option('--json', 'Output in JSON format')
+    .action(testInstanceDefaultAction)
 }
 
 // ============================================================================
@@ -592,6 +834,256 @@ async function testDestinationAction(id: string, options: { json?: boolean }): P
     const { data, error, response } = await client.post<TestDeliveryResponse, ProblemDetails>({
       url: 'ee/otel-forward/destinations/{id}/test',
       path: { id: destinationId },
+    })
+    if (error || !data) {
+      throwDestinationError(response, error)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  const statusSuffix = result.http_status !== null ? ` (HTTP ${result.http_status})` : ''
+  if (result.success) {
+    success(`Test delivery succeeded${statusSuffix}`)
+  } else {
+    warning(`Test delivery failed${statusSuffix}`)
+    if (result.error) {
+      warning(result.error)
+    }
+  }
+  newline()
+}
+
+// ============================================================================
+// Instance default actions
+// ============================================================================
+
+async function listInstanceDefaultsAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const result = await withSpinner('Fetching instance default forwarding destinations...', async () => {
+    const { data, error, response } = await client.get<InstanceDefaultListResponse, ProblemDetails>({
+      url: 'ee/otel-forward/instance-defaults',
+    })
+    if (error || !data) {
+      throwDestinationError(response, error)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Instance Default Forwarding Destinations (${result.total})`)
+
+  if (result.items.length === 0) {
+    info('No instance default forwarding destinations configured')
+    info(
+      'Run: temps otel-forward instance-default create --name <name> --vendor <preset> --endpoint-url <url>'
+    )
+    newline()
+    return
+  }
+
+  const columns: TableColumn<InstanceDefaultResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Vendor', key: 'vendor_preset' },
+    { header: 'Endpoint', key: 'endpoint_url', color: (v) => colors.muted(v) },
+    { header: 'Status', accessor: (d) => d.status, color: (v) => statusBadge(v) },
+    {
+      header: 'Failures',
+      accessor: (d) => d.consecutive_failures.toString(),
+      color: (v) => (parseInt(v, 10) > 0 ? colors.error(v) : colors.muted(v)),
+    },
+  ]
+
+  printTable(result.items, columns, { style: 'minimal' })
+  newline()
+}
+
+async function createInstanceDefaultAction(options: CreateInstanceDefaultOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  let body: CreateInstanceDefaultBody
+  try {
+    body = buildCreateInstanceDefaultBody(options)
+  } catch (err) {
+    warning(getErrorMessage(err))
+    return
+  }
+
+  const instanceDefault = await withSpinner(
+    `Creating instance default forwarding destination "${options.name}"...`,
+    async () => {
+      const { data, error, response } = await client.post<InstanceDefaultResponse, ProblemDetails>({
+        url: 'ee/otel-forward/instance-defaults',
+        body,
+      })
+      if (error || !data) {
+        throwDestinationError(response, error)
+      }
+      return data
+    }
+  )
+
+  if (options.json) {
+    json(instanceDefault)
+    return
+  }
+
+  success(`Instance default forwarding destination "${instanceDefault.name}" created`)
+  printInstanceDefaultDetails(instanceDefault)
+}
+
+async function showInstanceDefaultAction(id: string, options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const instanceDefaultId = parseInt(id, 10)
+  if (isNaN(instanceDefaultId)) {
+    warning('Invalid instance default ID')
+    return
+  }
+
+  const instanceDefault = await withSpinner('Fetching instance default forwarding destination...', async () => {
+    const { data, error, response } = await client.get<InstanceDefaultResponse, ProblemDetails>({
+      url: 'ee/otel-forward/instance-defaults/{id}',
+      path: { id: instanceDefaultId },
+    })
+    if (error || !data) {
+      throwDestinationError(response, error)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(instanceDefault)
+    return
+  }
+
+  printInstanceDefaultDetails(instanceDefault)
+}
+
+async function updateInstanceDefaultAction(id: string, options: UpdateInstanceDefaultOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const instanceDefaultId = parseInt(id, 10)
+  if (isNaN(instanceDefaultId)) {
+    warning('Invalid instance default ID')
+    return
+  }
+
+  let body: UpdateInstanceDefaultBody
+  try {
+    body = buildUpdateInstanceDefaultBody(options)
+  } catch (err) {
+    warning(getErrorMessage(err))
+    return
+  }
+
+  if (Object.keys(body).length === 0) {
+    warning('No fields to update — pass at least one option (e.g. --name, --endpoint-url, --enabled)')
+    return
+  }
+
+  const instanceDefault = await withSpinner('Updating instance default forwarding destination...', async () => {
+    const { data, error, response } = await client.patch<InstanceDefaultResponse, ProblemDetails>({
+      url: 'ee/otel-forward/instance-defaults/{id}',
+      path: { id: instanceDefaultId },
+      body,
+    })
+    if (error || !data) {
+      throwDestinationError(response, error)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(instanceDefault)
+    return
+  }
+
+  success(`Instance default forwarding destination #${instanceDefaultId} updated`)
+  printInstanceDefaultDetails(instanceDefault)
+}
+
+async function removeInstanceDefaultAction(id: string, options: { force?: boolean; yes?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const instanceDefaultId = parseInt(id, 10)
+  if (isNaN(instanceDefaultId)) {
+    warning('Invalid instance default ID')
+    return
+  }
+
+  const { data: instanceDefault, error: getError, response: getResponse } = await client.get<
+    InstanceDefaultResponse,
+    ProblemDetails
+  >({
+    url: 'ee/otel-forward/instance-defaults/{id}',
+    path: { id: instanceDefaultId },
+  })
+
+  if (getError || !instanceDefault) {
+    warning(destinationErrorMessage(getResponse, getError))
+    return
+  }
+
+  const skipConfirmation = options.force || options.yes
+
+  if (!skipConfirmation) {
+    const confirmed = await promptConfirm({
+      message:
+        `Remove instance default "${instanceDefault.name}" (${instanceDefault.vendor_preset})? ` +
+        'Any project with no destinations of its own will stop receiving forwarded telemetry.',
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Removing instance default forwarding destination...', async () => {
+    const { error, response } = await client.delete<void, ProblemDetails>({
+      url: 'ee/otel-forward/instance-defaults/{id}',
+      path: { id: instanceDefaultId },
+    })
+    if (error) {
+      throwDestinationError(response, error)
+    }
+  })
+
+  success('Instance default forwarding destination removed')
+}
+
+async function testInstanceDefaultAction(id: string, options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const instanceDefaultId = parseInt(id, 10)
+  if (isNaN(instanceDefaultId)) {
+    warning('Invalid instance default ID')
+    return
+  }
+
+  const result = await withSpinner('Sending test delivery...', async () => {
+    const { data, error, response } = await client.post<TestDeliveryResponse, ProblemDetails>({
+      url: 'ee/otel-forward/instance-defaults/{id}/test',
+      path: { id: instanceDefaultId },
     })
     if (error || !data) {
       throwDestinationError(response, error)
