@@ -13,8 +13,19 @@ pub enum PublicRepoError {
     #[error("Repository not found: {0}")]
     NotFound(String),
 
+    #[error("Repository is not public: {0}")]
+    RepositoryNotPublic(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
+
+    #[error(
+        "Permission denied while trying to {operation}. Required permission: {required_permission}"
+    )]
+    PermissionDenied {
+        operation: String,
+        required_permission: String,
+    },
 
     #[error("API error: {0}")]
     ApiError(String),
@@ -98,6 +109,29 @@ pub struct GitHubPublicProvider {
     token: Option<String>,
 }
 
+fn github_rate_limit_remaining(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn ensure_repository_is_public(
+    is_public: bool,
+    owner: &str,
+    repo: &str,
+) -> Result<(), PublicRepoError> {
+    if is_public {
+        Ok(())
+    } else {
+        Err(PublicRepoError::RepositoryNotPublic(format!(
+            "{}/{}",
+            owner, repo
+        )))
+    }
+}
+
 impl GitHubPublicProvider {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
@@ -179,12 +213,24 @@ impl GitHubPublicProvider {
 
     fn check_response_status(
         status: reqwest::StatusCode,
+        rate_limit_remaining: Option<u64>,
+        authenticated: bool,
         context: &str,
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            429 => Err(PublicRepoError::RateLimitExceeded),
+            403 if rate_limit_remaining == Some(0) => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: if authenticated {
+                    "Contents: read and access to the target repository".to_string()
+                } else {
+                    "authenticate with a token that has Contents: read and access to the target repository"
+                        .to_string()
+                },
+            }),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -214,7 +260,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
 
         let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
-        Self::check_response_status(response.status(), &format!("Repository {}/{}", owner, repo))?;
+        Self::check_response_status(
+            response.status(),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read repository {}/{}", owner, repo),
+        )?;
 
         #[derive(Deserialize)]
         struct GitHubRepo {
@@ -226,6 +277,7 @@ impl PublicRepoProvider for GitHubPublicProvider {
             stargazers_count: Option<u32>,
             forks_count: Option<u32>,
             owner: Option<GitHubOwner>,
+            private: bool,
         }
 
         #[derive(Deserialize)]
@@ -237,6 +289,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .json()
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        ensure_repository_is_public(!repo_data.private, owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: repo_data
@@ -288,7 +342,9 @@ impl PublicRepoProvider for GitHubPublicProvider {
 
             Self::check_response_status(
                 response.status(),
-                &format!("Branches for {}/{}", owner, repo),
+                github_rate_limit_remaining(&response),
+                self.token.is_some(),
+                &format!("list branches for {}/{}", owner, repo),
             )?;
 
             let branches: Vec<GitHubBranch> = response.json().await.map_err(|e| {
@@ -327,7 +383,9 @@ impl PublicRepoProvider for GitHubPublicProvider {
 
         Self::check_response_status(
             response.status(),
-            &format!("File tree for {}/{} at {}", owner, repo, reference),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read the file tree for {}/{} at {}", owner, repo, reference),
         )?;
 
         #[derive(Deserialize)]
@@ -429,7 +487,11 @@ impl GitLabPublicProvider {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: "read_api and read_repository".to_string(),
+            }),
+            429 => Err(PublicRepoError::RateLimitExceeded),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -475,6 +537,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
             star_count: Option<i32>,
             forks_count: Option<i32>,
             namespace: Option<GitLabNamespace>,
+            visibility: String,
         }
 
         #[derive(Deserialize)]
@@ -486,6 +549,8 @@ impl PublicRepoProvider for GitLabPublicProvider {
             .json()
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        ensure_repository_is_public(project.visibility == "public", owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: project
@@ -708,6 +773,43 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_public_provider_rejects_private_repository_metadata() {
+        let error = ensure_repository_is_public(false, "owner", "private")
+            .expect_err("private repositories must never pass through public endpoints");
+        assert!(matches!(
+            error,
+            PublicRepoError::RepositoryNotPublic(name) if name == "owner/private"
+        ));
+    }
+
+    #[test]
+    fn github_forbidden_response_is_not_misreported_as_rate_limit() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(4_999),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("a non-rate-limited 403 must report the missing permission");
+
+        assert!(matches!(error, PublicRepoError::PermissionDenied { .. }));
+        assert!(error.to_string().contains("Contents: read"));
+    }
+
+    #[test]
+    fn github_exhausted_rate_limit_remains_rate_limit_error() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(0),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("an exhausted GitHub limit must report rate limiting");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+    }
 
     // =============================================================================
     // Unit Tests - Provider Factory

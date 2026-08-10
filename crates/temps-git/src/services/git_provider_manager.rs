@@ -209,9 +209,33 @@ impl GitProviderManager {
     /// Used for public repo API calls to avoid unauthenticated rate limits (60 → 5000 req/hr).
     /// Validates the token against GitHub's API before returning it.
     pub async fn get_any_github_token(&self) -> Option<String> {
-        use temps_entities::git_providers;
-
         let connections = self.get_user_connections().await.ok()?;
+
+        self.get_github_token_from_connections(connections).await
+    }
+
+    /// Get an access token from an active GitHub connection owned by `user_id`.
+    ///
+    /// This must be used for request-scoped operations. Falling back to another
+    /// user's connection would let the caller spend that user's API quota and
+    /// could expose repositories only that credential can access.
+    pub async fn get_github_token_for_user(&self, user_id: i32) -> Option<String> {
+        let connections = git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
+            .order_by_desc(git_provider_connections::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await
+            .ok()?;
+
+        self.get_github_token_from_connections(connections).await
+    }
+
+    async fn get_github_token_from_connections(
+        &self,
+        connections: Vec<git_provider_connections::Model>,
+    ) -> Option<String> {
+        use temps_entities::git_providers;
 
         for conn in connections {
             if !conn.is_active {
@@ -1860,11 +1884,18 @@ impl GitProviderManager {
         status: reqwest::StatusCode,
         operation: &str,
     ) -> GitProviderError {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             GitProviderError::AuthenticationFailed(format!(
                 "provider rejected the stored credential while trying to {}: HTTP {}",
                 operation, status
             ))
+        } else if status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::PermissionDenied {
+                operation: operation.to_string(),
+                required_permission:
+                    "repository access with the permission required by this operation".to_string(),
+                provider_message: format!("HTTP {}", status),
+            }
         } else {
             GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
         }
@@ -3473,7 +3504,9 @@ impl GitProviderManager {
         // This allows users to update a GitHub App installation connection to use a PAT
         let provider = self.get_provider(connection.provider_id).await?;
 
-        // Validate the new access token as a PAT (using /user endpoint)
+        // Validate the new access token as a PAT. GitHub's `/rate_limit`
+        // authenticates repository-scoped and Actions credentials without
+        // requiring user-profile access; GitLab still uses `/user`.
         let client = reqwest::Client::new();
         let api_url = provider
             .api_url
@@ -3481,7 +3514,11 @@ impl GitProviderManager {
             .unwrap_or("https://api.github.com");
         let validation_endpoint =
             if provider.provider_type == "github" || provider.provider_type == "gitlab" {
-                format!("{}/user", api_url)
+                if provider.provider_type == "github" {
+                    format!("{}/rate_limit", api_url)
+                } else {
+                    format!("{}/user", api_url)
+                }
             } else {
                 // For other providers, use the provider service's validate_token
                 let provider_service = self.get_provider_service(connection.provider_id).await?;
@@ -3549,20 +3586,39 @@ impl GitProviderManager {
                 ));
             }
             status => {
-                let error_text = response
-                    .text()
+                let provider_message = response
+                    .json::<serde_json::Value>()
                     .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
+                    .ok()
+                    .and_then(|body| {
+                        body.get("message")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("HTTP {}", status));
                 tracing::warn!(
                     "Error validating new access token for connection {}: {} - {}",
                     connection_id,
                     status,
-                    error_text
+                    provider_message
                 );
-                return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                    "Failed to validate the provided access token: {} - {}",
-                    status, error_text
-                )));
+                let error = match status {
+                    reqwest::StatusCode::FORBIDDEN => GitProviderError::PermissionDenied {
+                        operation: "validate the replacement credential".to_string(),
+                        required_permission: if provider.provider_type == "github" {
+                            "Metadata: read".to_string()
+                        } else {
+                            "read_user".to_string()
+                        },
+                        provider_message,
+                    },
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => GitProviderError::RateLimitExceeded,
+                    _ => GitProviderError::ApiError(format!(
+                        "{} returned HTTP {} while validating the replacement credential: {}",
+                        provider.provider_type, status, provider_message
+                    )),
+                };
+                return Err(error.into());
             }
         }
 
@@ -3747,14 +3803,17 @@ impl GitProviderManager {
             return Ok(false);
         };
 
-        // Try to get user info to validate the token
-        match provider_service.get_user(&access_token).await {
-            Ok(_) => Ok(true),
-            Err(_) => {
+        match provider_service.validate_token(&access_token).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
                 // Token is invalid, mark connection as inactive
                 self.deactivate_connection(connection_id).await?;
                 Ok(false)
             }
+            // A provider outage, rate limit, or missing operation permission
+            // does not prove that the credential is invalid. Preserve the
+            // typed error and keep the connection active.
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5434,18 +5493,20 @@ mod classify_provider_response_error_tests {
         );
     }
 
-    /// 403 is the other shape a revoked/insufficient credential takes
-    /// (GitHub returns it for token scope problems and some rate limits).
+    /// A valid credential that lacks a repository capability is not an
+    /// authentication failure: clients must tell the operator which grant to
+    /// add instead of asking them to reconnect the same credential.
     #[test]
-    fn forbidden_is_classified_as_authentication_failure() {
+    fn forbidden_is_classified_as_permission_denied() {
         let err = GitProviderManager::classify_provider_response_error(
             reqwest::StatusCode::FORBIDDEN,
             "get tree for owner/repo@main",
         );
         assert!(
-            matches!(err, GitProviderError::AuthenticationFailed(_)),
-            "403 must map to AuthenticationFailed, got {err:?}"
+            matches!(err, GitProviderError::PermissionDenied { .. }),
+            "403 must map to PermissionDenied, got {err:?}"
         );
+        assert!(err.to_string().contains("owner/repo@main"));
     }
 
     /// Everything else stays a generic API error — a provider outage is not

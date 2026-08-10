@@ -124,6 +124,7 @@ fn provider_lookup_principal(auth: &AuthContext) -> String {
     responses(
         (status = 200, description = "List of branches", body = BranchListResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -231,6 +232,7 @@ pub async fn get_repository_branches(
     responses(
         (status = 200, description = "List of tags", body = TagListResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "Fresh tag lookup rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -330,12 +332,7 @@ pub async fn get_repository_tags(
     let tags = provider_service
         .list_tags(&access_token, &owner, &repo)
         .await
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to fetch tags")
-                .detail(format!("Error fetching tags from git provider: {}", e))
-                .build()
-        })?;
+        .map_err(Problem::from)?;
 
     // Cache the result
     state.cache_manager.tags.set(cache_key, tags.clone()).await;
@@ -362,6 +359,7 @@ pub async fn get_repository_tags(
     responses(
         (status = 200, description = "List of branches", body = BranchListResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -450,12 +448,7 @@ pub async fn get_branches_by_repository_id(
     let branches = provider_service
         .list_branches(&access_token, &repository.owner, &repository.name)
         .await
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to fetch branches")
-                .detail(format!("Error fetching branches from git provider: {}", e))
-                .build()
-        })?;
+        .map_err(Problem::from)?;
 
     // Cache the result
     state
@@ -489,6 +482,7 @@ pub async fn get_branches_by_repository_id(
     responses(
         (status = 200, description = "List of tags", body = TagListResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "Fresh tag lookup rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -591,12 +585,7 @@ pub async fn get_tags_by_repository_id(
     let tags = provider_service
         .list_tags(&access_token, &repository.owner, &repository.name)
         .await
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to fetch tags")
-                .detail(format!("Error fetching tags from git provider: {}", e))
-                .build()
-        })?;
+        .map_err(Problem::from)?;
 
     // Cache the result
     state.cache_manager.tags.set(cache_key, tags.clone()).await;
@@ -741,7 +730,9 @@ pub async fn check_commit_exists(
             state.cache_manager.commits.set(cache_key, None).await;
             Ok(Json(CommitExistsResponse::missing()))
         }
-        Err(error @ GitProviderError::RateLimitExceeded) => Err(error.into()),
+        Err(error @ GitProviderError::RateLimitExceeded)
+        | Err(error @ GitProviderError::PermissionDenied { .. })
+        | Err(error @ GitProviderError::AuthenticationFailed(_)) => Err(error.into()),
         Err(error) => {
             warn!(
                 repository_id,
@@ -811,6 +802,7 @@ pub struct CommitListResponse {
     responses(
         (status = 200, description = "List of commits", body = CommitListResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -882,12 +874,7 @@ pub async fn list_commits_by_repository_id(
             per_page,
         )
         .await
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to fetch commits")
-                .detail(format!("Error fetching commits from git provider: {}", e))
-                .build()
-        })?;
+        .map_err(Problem::from)?;
 
     let commit_infos: Vec<CommitInfo> = commits
         .into_iter()

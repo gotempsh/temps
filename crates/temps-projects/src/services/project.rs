@@ -3066,6 +3066,19 @@ impl ProjectService {
                     ))
                 })?;
 
+            // A shared credential may be able to see private repositories.
+            // `is_public_repo` must never turn that credential into a private
+            // repository oracle, so verify visibility before reading branches.
+            provider
+                .get_repository(&project.repo_owner, &project.repo_name)
+                .await
+                .map_err(|e| {
+                    ProjectError::Other(format!(
+                        "Failed to verify that repository {}/{} is public: {}",
+                        project.repo_owner, project.repo_name, e
+                    ))
+                })?;
+
             let branches = provider
                 .list_branches(&project.repo_owner, &project.repo_name)
                 .await

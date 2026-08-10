@@ -151,6 +151,19 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/authentication_failed")
                 .with_title("Authentication Failed")
                 .with_detail(msg),
+            GitProviderError::PermissionDenied {
+                operation,
+                required_permission,
+                provider_message,
+            } => problem_new(StatusCode::FORBIDDEN)
+                .with_type("https://docs.temps.sh/errors/git_provider_permission_required")
+                .with_title("Git Provider Permission Required")
+                .with_detail(format!(
+                    "The git provider denied permission to {}. Grant '{}' to the credential for the target repository. Provider response: {}",
+                    operation, required_permission, provider_message
+                ))
+                .with_value("operation", operation)
+                .with_value("required_permission", required_permission),
             GitProviderError::ApiError(msg) => problem_new(StatusCode::BAD_GATEWAY)
                 .with_type("https://docs.temps.sh/errors/api_error")
                 .with_title("API Error")
@@ -2786,6 +2799,9 @@ pub struct ValidationResponse {
     request_body = UpdateTokenRequest,
     responses(
         (status = 200, description = "Token updated successfully", body = UpdateTokenResponse),
+        (status = 400, description = "Invalid token configuration"),
+        (status = 403, description = "Git provider permission required"),
+        (status = 429, description = "Git provider rate limit exceeded"),
         (status = 404, description = "Connection not found"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
@@ -2823,6 +2839,8 @@ pub async fn update_connection_token(
     ),
     responses(
         (status = 200, description = "Connection validation result", body = ValidationResponse),
+        (status = 403, description = "Git provider permission required"),
+        (status = 429, description = "Git provider rate limit exceeded"),
         (status = 404, description = "Connection not found"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
@@ -2896,4 +2914,34 @@ pub async fn run_connection_health_check(
         .await?;
 
     Ok(Json(ConnectionResponse::from(connection)))
+}
+
+#[cfg(test)]
+mod permission_error_tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_becomes_human_readable_forbidden_problem() {
+        let problem = Problem::from(GitProviderError::PermissionDenied {
+            operation: "list branches for owner/repo".to_string(),
+            required_permission: "Contents: read".to_string(),
+            provider_message: "Resource not accessible by integration".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Git Provider Permission Required")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Contents: read")));
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
+    }
 }
