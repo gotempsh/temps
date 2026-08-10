@@ -43,6 +43,7 @@ const AGENT_TO_LOGO: Record<string, string> = {
   'Perplexity-User': 'perplexity.svg',
   GoogleOther: 'google.svg',
   Googlebot: 'google.svg',
+  'Gemini-Deep-Research': 'google.svg',
   Applebot: 'apple.svg',
   'Applebot-Extended': 'apple.svg',
   'Meta-ExternalAgent': 'meta.svg',
@@ -55,7 +56,7 @@ const AGENT_TO_LOGO: Record<string, string> = {
   Diffbot: 'diffbot.svg',
   YouBot: 'you.svg',
   DuckAssistBot: 'duckduckgo.svg',
-  Bravebot: 'brave.svg',
+  BraveBot: 'brave.svg',
   Andibot: 'andi.svg',
   Omgilibot: 'omgili.svg',
   Omgili: 'omgili.svg',
@@ -64,6 +65,10 @@ const AGENT_TO_LOGO: Record<string, string> = {
   'Kangaroo Bot': 'kangaroo.svg',
   'MistralAI-User': 'mistral.svg',
   GrokBot: 'xai.svg',
+  'xAI-Grok': 'xai.svg',
+  // Bingbot (Microsoft) and DeepSeekBot (DeepSeek) have no brand SVG in
+  // public/ai-agents/ yet, so they fall through to the generic <Bot> icon
+  // in AiAgentLogo rather than reference a file that doesn't exist.
 }
 
 interface AiAgentLogoProps {
