@@ -247,7 +247,10 @@ export async function apiKeyScenarioCommand(opts: ApiKeyScenarioOptions): Promis
         }
         const body = (await res.json()) as CreateApiKeyHttpResponse
         if (!body.api_key || !body.api_key.startsWith('tk_')) {
-          throw new Error(`POST /api-keys returned no usable plaintext secret: ${JSON.stringify(body)}`)
+          const preview = body.api_key ? `${body.api_key.slice(0, 6)}...` : '(missing)'
+          throw new Error(
+            `POST /api-keys returned api_key ${preview}, expected a 'tk_'-prefixed plaintext secret`,
+          )
         }
         return body
       },
