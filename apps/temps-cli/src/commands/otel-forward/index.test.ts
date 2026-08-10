@@ -1,50 +1,82 @@
-import { test, expect, describe } from 'bun:test'
+import { afterAll, beforeAll, test, expect, describe } from 'bun:test'
 import {
-  parseHeaderPairs,
+  parseHeaderEnvPairs,
+  maskHeaders,
+  sanitizeDestinationForOutput,
+  sanitizeTextForOutput,
+  sanitizeUrlForOutput,
+  validateEndpointUrl,
   resolveEnabledFlag,
   buildCreateDestinationBody,
   buildUpdateDestinationBody,
   buildCreateInstanceDefaultBody,
   buildUpdateInstanceDefaultBody,
+  type DestinationResponse,
 } from './index.js'
 
-describe('parseHeaderPairs', () => {
-  test('parses a single KEY=VALUE pair', () => {
-    expect(parseHeaderPairs(['DD-API-KEY=abc123'])).toEqual({ 'DD-API-KEY': 'abc123' })
+const TEST_ENVIRONMENT = {
+  TEMPS_OTEL_TEST_A: '1',
+  TEMPS_OTEL_TEST_B: '2',
+  TEMPS_OTEL_TEST_DD_KEY: 'synthetic-dd-secret',
+  TEMPS_OTEL_TEST_CUSTOM: 'Value=With=Equals',
+  TEMPS_OTEL_TEST_ORG: 'synthetic-org',
+  TEMPS_OTEL_TEST_AUTH: 'Bearer synthetic-auth-secret',
+  TEMPS_OTEL_TEST_SENTINEL: '***',
+}
+
+beforeAll(() => Object.assign(process.env, TEST_ENVIRONMENT))
+afterAll(() => {
+  for (const name of Object.keys(TEST_ENVIRONMENT)) delete process.env[name]
+})
+
+describe('parseHeaderEnvPairs', () => {
+  const environment = {
+    DD_KEY: 'synthetic-dd-secret',
+    AUTH_VALUE: 'Bearer synthetic-auth-secret',
+    FIRST_VALUE: 'one',
+    SECOND_VALUE: 'two',
+  }
+
+  test('resolves a single KEY=ENV_VAR pair', () => {
+    expect(parseHeaderEnvPairs(['DD-API-KEY=DD_KEY'], environment)).toEqual({
+      'DD-API-KEY': 'synthetic-dd-secret',
+    })
   })
 
   test('parses multiple pairs', () => {
-    expect(parseHeaderPairs(['a=1', 'b=2'])).toEqual({ a: '1', b: '2' })
-  })
-
-  test('only splits on the first "=" — values may contain "="', () => {
-    expect(parseHeaderPairs(['Authorization=Bearer abc=def'])).toEqual({
-      Authorization: 'Bearer abc=def',
+    expect(parseHeaderEnvPairs(['a=FIRST_VALUE', 'b=SECOND_VALUE'], environment)).toEqual({
+      a: 'one',
+      b: 'two',
     })
   })
 
   test('returns an empty object for undefined input', () => {
-    expect(parseHeaderPairs(undefined)).toEqual({})
+    expect(parseHeaderEnvPairs(undefined, environment)).toEqual({})
   })
 
   test('returns an empty object for an empty array', () => {
-    expect(parseHeaderPairs([])).toEqual({})
+    expect(parseHeaderEnvPairs([], environment)).toEqual({})
   })
 
-  test('throws on a pair with no "=", without echoing the raw value', () => {
-    expect(() => parseHeaderPairs(['not-a-pair'])).toThrow(
-      "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
+  test('throws on a pair with no "="', () => {
+    expect(() => parseHeaderEnvPairs(['not-a-pair'], environment)).toThrow(
+      'Invalid --header-env: expected KEY=ENV_VAR'
     )
   })
 
-  test('throws on a pair with an empty key (leading "="), without echoing the raw value', () => {
-    expect(() => parseHeaderPairs(['=value'])).toThrow(
-      "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
+  test('throws on an empty header or environment name', () => {
+    expect(() => parseHeaderEnvPairs(['=DD_KEY'], environment)).toThrow(
+      'Invalid --header-env: expected KEY=ENV_VAR'
+    )
+    expect(() => parseHeaderEnvPairs(['DD-API-KEY='], environment)).toThrow(
+      'Invalid --header-env: expected KEY=ENV_VAR'
     )
   })
 
-  test('allows an empty value', () => {
-    expect(parseHeaderPairs(['key='])).toEqual({ key: '' })
+  test('throws without exposing a missing environment variable value', () => {
+    expect(() => parseHeaderEnvPairs(['Authorization=MISSING_SECRET'], environment)).toThrow(
+      'Environment variable MISSING_SECRET is not set'
+    )
   })
 })
 
@@ -83,18 +115,21 @@ describe('buildCreateDestinationBody', () => {
     })
   })
 
-  test('includes headers only when at least one --header was passed', () => {
+  test('includes headers only when at least one --header-env was passed', () => {
     const body = buildCreateDestinationBody(1, {
       ...baseOptions,
-      header: ['DD-API-KEY=abc123', 'X-Custom=Value=With=Equals'],
+      headerEnv: [
+        'DD-API-KEY=TEMPS_OTEL_TEST_DD_KEY',
+        'X-Custom=TEMPS_OTEL_TEST_CUSTOM',
+      ],
     })
     expect(body.headers).toEqual({
-      'DD-API-KEY': 'abc123',
+      'DD-API-KEY': 'synthetic-dd-secret',
       'X-Custom': 'Value=With=Equals',
     })
   })
 
-  test('omits headers when --header was never passed', () => {
+  test('omits headers when --header-env was never passed', () => {
     const body = buildCreateDestinationBody(1, baseOptions)
     expect(body.headers).toBeUndefined()
   })
@@ -137,14 +172,18 @@ describe('buildUpdateDestinationBody', () => {
     expect(buildUpdateDestinationBody({ vendor: 'honeycomb' })).toEqual({ vendor_preset: 'honeycomb' })
   })
 
-  test('includes headers only when --header was passed at least once', () => {
+  test('includes headers only when --header-env was passed at least once', () => {
     expect(buildUpdateDestinationBody({}).headers).toBeUndefined()
-    expect(buildUpdateDestinationBody({ header: [] }).headers).toBeUndefined()
-    expect(buildUpdateDestinationBody({ header: ['a=1'] }).headers).toEqual({ a: '1' })
+    expect(buildUpdateDestinationBody({ headerEnv: [] }).headers).toBeUndefined()
+    expect(
+      buildUpdateDestinationBody({ headerEnv: ['a=TEMPS_OTEL_TEST_A'] }).headers
+    ).toEqual({ a: '1' })
   })
 
-  test('a header value of exactly "***" round-trips as a literal value (server interprets the sentinel)', () => {
-    expect(buildUpdateDestinationBody({ header: ['token=***'] }).headers).toEqual({ token: '***' })
+  test('a header value of exactly "***" round-trips from the environment', () => {
+    expect(
+      buildUpdateDestinationBody({ headerEnv: ['token=TEMPS_OTEL_TEST_SENTINEL'] }).headers
+    ).toEqual({ token: '***' })
   })
 
   test('includes forward_traces/metrics/logs only when explicitly set', () => {
@@ -169,7 +208,7 @@ describe('buildUpdateDestinationBody', () => {
   test('builds a full partial body with every kind of field mixed', () => {
     const body = buildUpdateDestinationBody({
       name: 'new-name',
-      header: ['a=1', 'b=2'],
+      headerEnv: ['a=TEMPS_OTEL_TEST_A', 'b=TEMPS_OTEL_TEST_B'],
       logs: false,
       disabled: true,
       allowPrivateNetwork: true,
@@ -201,14 +240,17 @@ describe('buildCreateInstanceDefaultBody', () => {
     expect('project_id' in body).toBe(false)
   })
 
-  test('includes headers only when at least one --header was passed', () => {
+  test('includes headers only when at least one --header-env was passed', () => {
     const body = buildCreateInstanceDefaultBody({
       ...baseOptions,
-      header: ['X-Org=acme', 'Authorization=Bearer abc'],
+      headerEnv: [
+        'X-Org=TEMPS_OTEL_TEST_ORG',
+        'Authorization=TEMPS_OTEL_TEST_AUTH',
+      ],
     })
     expect(body.headers).toEqual({
-      'X-Org': 'acme',
-      Authorization: 'Bearer abc',
+      'X-Org': 'synthetic-org',
+      Authorization: 'Bearer synthetic-auth-secret',
     })
   })
 
@@ -242,10 +284,12 @@ describe('buildUpdateInstanceDefaultBody', () => {
     expect('project_id' in body).toBe(false)
   })
 
-  test('a header value of exactly "***" round-trips as a literal value (server interprets the sentinel)', () => {
-    expect(buildUpdateInstanceDefaultBody({ header: ['x-api-key=***'] }).headers).toEqual({
-      'x-api-key': '***',
-    })
+  test('a header value of exactly "***" round-trips from the environment', () => {
+    expect(
+      buildUpdateInstanceDefaultBody({
+        headerEnv: ['x-api-key=TEMPS_OTEL_TEST_SENTINEL'],
+      }).headers
+    ).toEqual({ 'x-api-key': '***' })
   })
 
   test('includes allow_private_network only when explicitly set (true or false)', () => {
@@ -256,7 +300,7 @@ describe('buildUpdateInstanceDefaultBody', () => {
   test('builds a full partial body with every kind of field mixed', () => {
     const body = buildUpdateInstanceDefaultBody({
       name: 'renamed-default',
-      header: ['a=1'],
+      headerEnv: ['a=TEMPS_OTEL_TEST_A'],
       traces: false,
       enabled: true,
     })
@@ -266,5 +310,105 @@ describe('buildUpdateInstanceDefaultBody', () => {
       forward_traces: false,
       enabled: true,
     })
+  })
+})
+
+describe('output sanitization', () => {
+  test('masks every header value, including vendor-specific and arbitrary names', () => {
+    expect(
+      maskHeaders({
+        'x-honeycomb-team': 'synthetic-honeycomb-secret',
+        'X-Org': 'synthetic-client-identifier',
+        Authorization: 'Bearer synthetic-auth-secret',
+      })
+    ).toEqual({
+      'x-honeycomb-team': '***',
+      'X-Org': '***',
+      Authorization: '***',
+    })
+  })
+
+  test('redacts URL credentials, all query values, and fragments', () => {
+    const sanitized = sanitizeUrlForOutput(
+      'https://user:synthetic-password@collector.example.com/otlp?tenant=synthetic-client&sig=synthetic-signature#private'
+    )
+    expect(sanitized).toContain('collector.example.com/otlp')
+    expect(sanitized).not.toContain('user')
+    expect(sanitized).not.toContain('synthetic-password')
+    expect(sanitized).not.toContain('synthetic-client')
+    expect(sanitized).not.toContain('synthetic-signature')
+    expect(sanitized).not.toContain('private')
+  })
+
+  test('sanitizes URLs embedded in error text', () => {
+    const sanitized = sanitizeTextForOutput(
+      'delivery to https://user:synthetic-password@example.com/v1/traces?sig=synthetic-signature failed'
+    )
+    expect(sanitized).toContain('delivery to https://example.com/v1/traces')
+    expect(sanitized).not.toContain('synthetic-password')
+    expect(sanitized).not.toContain('synthetic-signature')
+  })
+
+  test('sanitizes destination objects used by both human and JSON output', () => {
+    const destination: DestinationResponse = {
+      id: 1,
+      project_id: 2,
+      name: 'synthetic-destination',
+      vendor_preset: 'honeycomb',
+      endpoint_url: 'https://collector.example.com/otlp?tenant=synthetic-client',
+      headers: { 'x-honeycomb-team': 'synthetic-honeycomb-secret', 'X-Org': 'synthetic-client' },
+      forward_traces: true,
+      forward_metrics: true,
+      forward_logs: true,
+      enabled: true,
+      allow_private_network: false,
+      last_success_at: null,
+      last_error_at: '2026-08-10T12:00:00Z',
+      last_error: 'request to https://user:synthetic-password@example.com/?sig=synthetic-signature failed',
+      consecutive_failures: 1,
+      status: 'failing',
+      created_at: '2026-08-10T10:00:00Z',
+      updated_at: '2026-08-10T12:00:00Z',
+    }
+
+    const serialized = JSON.stringify(sanitizeDestinationForOutput(destination))
+    expect(serialized).toContain('x-honeycomb-team')
+    expect(serialized).toContain('***')
+    expect(serialized).not.toContain('synthetic-honeycomb-secret')
+    expect(serialized).not.toContain('synthetic-client')
+    expect(serialized).not.toContain('synthetic-password')
+    expect(serialized).not.toContain('synthetic-signature')
+  })
+})
+
+describe('endpoint URL validation', () => {
+  test('allows credential-free HTTP(S) collector URLs', () => {
+    expect(validateEndpointUrl('https://collector.example.com/otlp')).toBe(
+      'https://collector.example.com/otlp'
+    )
+  })
+
+  test('rejects userinfo without echoing it', () => {
+    expect(() =>
+      validateEndpointUrl('https://user:synthetic-password@collector.example.com/otlp')
+    ).toThrow('URL credentials are not allowed')
+  })
+
+  test('rejects query parameters and fragments', () => {
+    expect(() => validateEndpointUrl('https://collector.example.com/otlp?sig=synthetic-secret')).toThrow(
+      'query parameters are not allowed'
+    )
+    expect(() => validateEndpointUrl('https://collector.example.com/otlp#synthetic-secret')).toThrow(
+      'fragments are not allowed'
+    )
+  })
+
+  test('rejects non-HTTP and malformed URLs', () => {
+    expect(() => validateEndpointUrl('file:///tmp/collector')).toThrow(
+      'only HTTP(S) URLs are supported'
+    )
+    expect(() => validateEndpointUrl('not-a-url')).toThrow(
+      'expected an absolute HTTP(S) URL'
+    )
   })
 })

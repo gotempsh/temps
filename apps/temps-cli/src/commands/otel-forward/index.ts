@@ -135,17 +135,51 @@ export interface InstanceDefaultListResponse {
 
 const VENDOR_PRESET_HINT = 'datadog, honeycomb, new_relic, grafana_cloud, generic_otlp'
 
-/**
- * The server masks sensitive header values as `"***"` in every response, so
- * this shouldn't ever see a real secret — but the human-readable display
- * path doesn't rely on that alone. Any header whose name looks like it
- * carries a credential is always shown as `***` here regardless of what the
- * response actually contained, so a server-side regression in masking can't
- * turn into a secret printed to a terminal / CI log. `--json` output is a
- * deliberate raw passthrough for scripting and isn't redacted here.
+/** Mask every returned header value. Header names are not a reliable signal
+ * of sensitivity (`x-honeycomb-team`, for example, is an API credential), so
+ * output must be fail-closed for both human-readable and JSON modes.
  */
-function isSensitiveHeaderName(name: string): boolean {
-  return /token|secret|key|password|authorization/i.test(name)
+export function maskHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.keys(headers).map((name) => [name, '***']))
+}
+
+/** Remove URL credentials and redact every query value before display. */
+export function sanitizeUrlForOutput(value: string): string {
+  try {
+    const url = new URL(value)
+    url.username = ''
+    url.password = ''
+    for (const name of [...url.searchParams.keys()]) {
+      url.searchParams.set(name, '***')
+    }
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return '[invalid URL redacted]'
+  }
+}
+
+/** Sanitize URLs embedded in server and transport error strings. */
+export function sanitizeTextForOutput(value: string): string {
+  return value.replace(/https?:\/\/[^\s"'<>]+/gi, (url) => sanitizeUrlForOutput(url))
+}
+
+export function sanitizeDestinationForOutput<T extends DestinationResponse | InstanceDefaultResponse>(
+  destination: T
+): T {
+  return {
+    ...destination,
+    endpoint_url: sanitizeUrlForOutput(destination.endpoint_url),
+    headers: maskHeaders(destination.headers),
+    last_error: destination.last_error ? sanitizeTextForOutput(destination.last_error) : null,
+  }
+}
+
+function sanitizeTestDeliveryForOutput(result: TestDeliveryResponse): TestDeliveryResponse {
+  return {
+    ...result,
+    error: result.error ? sanitizeTextForOutput(result.error) : null,
+  }
 }
 
 // ============================================================================
@@ -165,7 +199,7 @@ function destinationErrorMessage(response: Response | undefined, error: unknown)
   if (response?.status === 404) {
     return OTEL_FORWARD_UNAVAILABLE_MESSAGE
   }
-  return getErrorMessage(error)
+  return sanitizeTextForOutput(getErrorMessage(error))
 }
 
 function throwDestinationError(response: Response | undefined, error: unknown): never {
@@ -176,34 +210,60 @@ function throwDestinationError(response: Response | undefined, error: unknown): 
 // Option parsing helpers (unit tested)
 // ============================================================================
 
-/** Collect repeatable `--header` values into an array. */
-export function collectHeader(value: string, previous: string[]): string[] {
+/** Collect repeatable `--header-env` references into an array. */
+export function collectHeaderEnv(value: string, previous: string[]): string[] {
   return [...previous, value]
 }
 
 /**
- * Parse repeated `--header KEY=VALUE` options into an object. Values may
- * contain `=` (only the first `=` splits).
+ * Resolve repeated `--header-env KEY=ENV_VAR` options without putting the
+ * credential itself in argv or shell history.
  */
-export function parseHeaderPairs(pairs: string[] | undefined): Record<string, string> {
+export function parseHeaderEnvPairs(
+  pairs: string[] | undefined,
+  environment: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
   const out: Record<string, string> = {}
   if (!pairs) return out
   for (const pair of pairs) {
     const idx = pair.indexOf('=')
-    if (idx <= 0) {
-      // Deliberately doesn't echo the malformed value back: the most likely
-      // way to hit this is pasting a bare credential with no `=` (or a
-      // leading `=`) into --header, and printing it back would put that
-      // credential in the terminal/CI log we're trying to avoid it landing in.
-      throw new Error(
-        "Invalid --header: expected KEY=VALUE (got no '=' or an empty key)"
-      )
+    if (idx <= 0 || idx === pair.length - 1) {
+      throw new Error("Invalid --header-env: expected KEY=ENV_VAR")
     }
     const key = pair.slice(0, idx)
-    const value = pair.slice(idx + 1)
+    const environmentName = pair.slice(idx + 1)
+    const value = environment[environmentName]
+    if (value === undefined) {
+      throw new Error(`Environment variable ${environmentName} is not set`)
+    }
     out[key] = value
   }
   return out
+}
+
+/** Reject endpoint URL components that commonly carry credentials and would
+ * otherwise be exposed through argv, persisted configuration, or errors.
+ */
+export function validateEndpointUrl(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('Invalid --endpoint-url: expected an absolute HTTP(S) URL')
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Invalid --endpoint-url: only HTTP(S) URLs are supported')
+  }
+  if (url.username || url.password) {
+    throw new Error('Invalid --endpoint-url: URL credentials are not allowed; use --header-env')
+  }
+  if (url.search) {
+    throw new Error('Invalid --endpoint-url: query parameters are not allowed; use --header-env')
+  }
+  if (url.hash) {
+    throw new Error('Invalid --endpoint-url: fragments are not allowed')
+  }
+  return value
 }
 
 /**
@@ -222,7 +282,7 @@ interface CreateOptions {
   name: string
   vendor: string
   endpointUrl: string
-  header?: string[]
+  headerEnv?: string[]
   traces?: boolean
   metrics?: boolean
   logs?: boolean
@@ -236,7 +296,7 @@ interface UpdateOptions {
   name?: string
   vendor?: string
   endpointUrl?: string
-  header?: string[]
+  headerEnv?: string[]
   traces?: boolean
   metrics?: boolean
   logs?: boolean
@@ -252,10 +312,10 @@ export function buildCreateDestinationBody(projectId: number, options: CreateOpt
     project_id: projectId,
     name: options.name,
     vendor_preset: options.vendor,
-    endpoint_url: options.endpointUrl,
+    endpoint_url: validateEndpointUrl(options.endpointUrl),
   }
 
-  const headers = parseHeaderPairs(options.header)
+  const headers = parseHeaderEnvPairs(options.headerEnv)
   if (Object.keys(headers).length > 0) {
     body.headers = headers
   }
@@ -278,10 +338,10 @@ export function buildUpdateDestinationBody(options: UpdateOptions): UpdateDestin
 
   if (options.name !== undefined) body.name = options.name
   if (options.vendor !== undefined) body.vendor_preset = options.vendor
-  if (options.endpointUrl !== undefined) body.endpoint_url = options.endpointUrl
+  if (options.endpointUrl !== undefined) body.endpoint_url = validateEndpointUrl(options.endpointUrl)
 
-  if (options.header && options.header.length > 0) {
-    body.headers = parseHeaderPairs(options.header)
+  if (options.headerEnv && options.headerEnv.length > 0) {
+    body.headers = parseHeaderEnvPairs(options.headerEnv)
   }
 
   if (options.traces !== undefined) body.forward_traces = options.traces
@@ -300,7 +360,7 @@ interface CreateInstanceDefaultOptions {
   name: string
   vendor: string
   endpointUrl: string
-  header?: string[]
+  headerEnv?: string[]
   traces?: boolean
   metrics?: boolean
   logs?: boolean
@@ -314,7 +374,7 @@ interface UpdateInstanceDefaultOptions {
   name?: string
   vendor?: string
   endpointUrl?: string
-  header?: string[]
+  headerEnv?: string[]
   traces?: boolean
   metrics?: boolean
   logs?: boolean
@@ -329,10 +389,10 @@ export function buildCreateInstanceDefaultBody(options: CreateInstanceDefaultOpt
   const body: CreateInstanceDefaultBody = {
     name: options.name,
     vendor_preset: options.vendor,
-    endpoint_url: options.endpointUrl,
+    endpoint_url: validateEndpointUrl(options.endpointUrl),
   }
 
-  const headers = parseHeaderPairs(options.header)
+  const headers = parseHeaderEnvPairs(options.headerEnv)
   if (Object.keys(headers).length > 0) {
     body.headers = headers
   }
@@ -355,10 +415,10 @@ export function buildUpdateInstanceDefaultBody(options: UpdateInstanceDefaultOpt
 
   if (options.name !== undefined) body.name = options.name
   if (options.vendor !== undefined) body.vendor_preset = options.vendor
-  if (options.endpointUrl !== undefined) body.endpoint_url = options.endpointUrl
+  if (options.endpointUrl !== undefined) body.endpoint_url = validateEndpointUrl(options.endpointUrl)
 
-  if (options.header && options.header.length > 0) {
-    body.headers = parseHeaderPairs(options.header)
+  if (options.headerEnv && options.headerEnv.length > 0) {
+    body.headers = parseHeaderEnvPairs(options.headerEnv)
   }
 
   if (options.traces !== undefined) body.forward_traces = options.traces
@@ -378,71 +438,63 @@ export function buildUpdateInstanceDefaultBody(options: UpdateInstanceDefaultOpt
 // ============================================================================
 
 function printDestinationDetails(destination: DestinationResponse): void {
+  const safeDestination = sanitizeDestinationForOutput(destination)
   newline()
-  header(`${icons.info} ${destination.name}`)
-  keyValue('ID', destination.id)
-  keyValue('Project ID', destination.project_id)
-  keyValue('Vendor', destination.vendor_preset)
-  keyValue('Endpoint', destination.endpoint_url)
-  keyValue('Status', statusBadge(destination.status))
-  keyValue('Enabled', destination.enabled ? colors.success('yes') : colors.muted('no'))
-  keyValue('Forward traces', destination.forward_traces ? 'yes' : 'no')
-  keyValue('Forward metrics', destination.forward_metrics ? 'yes' : 'no')
-  keyValue('Forward logs', destination.forward_logs ? 'yes' : 'no')
-  keyValue('Allow private network', destination.allow_private_network ? 'yes' : 'no')
+  header(`${icons.info} ${safeDestination.name}`)
+  keyValue('ID', safeDestination.id)
+  keyValue('Project ID', safeDestination.project_id)
+  keyValue('Vendor', safeDestination.vendor_preset)
+  keyValue('Endpoint', safeDestination.endpoint_url)
+  keyValue('Status', statusBadge(safeDestination.status))
+  keyValue('Enabled', safeDestination.enabled ? colors.success('yes') : colors.muted('no'))
+  keyValue('Forward traces', safeDestination.forward_traces ? 'yes' : 'no')
+  keyValue('Forward metrics', safeDestination.forward_metrics ? 'yes' : 'no')
+  keyValue('Forward logs', safeDestination.forward_logs ? 'yes' : 'no')
+  keyValue('Allow private network', safeDestination.allow_private_network ? 'yes' : 'no')
 
-  const headerEntries = Object.entries(destination.headers)
+  const headerEntries = Object.entries(safeDestination.headers)
   if (headerEntries.length > 0) {
-    keyValue(
-      'Headers',
-      headerEntries
-        .map(([k, v]) => `${k}=${isSensitiveHeaderName(k) ? '***' : v}`)
-        .join(', ')
-    )
+    keyValue('Headers', headerEntries.map(([k, v]) => `${k}=${v}`).join(', '))
   }
 
-  keyValue('Consecutive failures', destination.consecutive_failures)
-  keyValue('Last success', destination.last_success_at ? formatDate(destination.last_success_at) : colors.muted('never'))
-  keyValue('Last error', destination.last_error_at ? formatDate(destination.last_error_at) : colors.muted('never'))
-  if (destination.last_error) {
-    keyValue('Last error detail', destination.last_error)
+  keyValue('Consecutive failures', safeDestination.consecutive_failures)
+  keyValue('Last success', safeDestination.last_success_at ? formatDate(safeDestination.last_success_at) : colors.muted('never'))
+  keyValue('Last error', safeDestination.last_error_at ? formatDate(safeDestination.last_error_at) : colors.muted('never'))
+  if (safeDestination.last_error) {
+    keyValue('Last error detail', safeDestination.last_error)
   }
-  keyValue('Created', formatDate(destination.created_at))
-  keyValue('Updated', formatDate(destination.updated_at))
+  keyValue('Created', formatDate(safeDestination.created_at))
+  keyValue('Updated', formatDate(safeDestination.updated_at))
   newline()
 }
 
 function printInstanceDefaultDetails(instanceDefault: InstanceDefaultResponse): void {
+  const safeInstanceDefault = sanitizeDestinationForOutput(instanceDefault)
   newline()
-  header(`${icons.info} ${instanceDefault.name} (instance default)`)
-  keyValue('ID', instanceDefault.id)
-  keyValue('Vendor', instanceDefault.vendor_preset)
-  keyValue('Endpoint', instanceDefault.endpoint_url)
-  keyValue('Status', statusBadge(instanceDefault.status))
-  keyValue('Enabled', instanceDefault.enabled ? colors.success('yes') : colors.muted('no'))
-  keyValue('Forward traces', instanceDefault.forward_traces ? 'yes' : 'no')
-  keyValue('Forward metrics', instanceDefault.forward_metrics ? 'yes' : 'no')
-  keyValue('Forward logs', instanceDefault.forward_logs ? 'yes' : 'no')
-  keyValue('Allow private network', instanceDefault.allow_private_network ? 'yes' : 'no')
+  header(`${icons.info} ${safeInstanceDefault.name} (instance default)`)
+  keyValue('ID', safeInstanceDefault.id)
+  keyValue('Vendor', safeInstanceDefault.vendor_preset)
+  keyValue('Endpoint', safeInstanceDefault.endpoint_url)
+  keyValue('Status', statusBadge(safeInstanceDefault.status))
+  keyValue('Enabled', safeInstanceDefault.enabled ? colors.success('yes') : colors.muted('no'))
+  keyValue('Forward traces', safeInstanceDefault.forward_traces ? 'yes' : 'no')
+  keyValue('Forward metrics', safeInstanceDefault.forward_metrics ? 'yes' : 'no')
+  keyValue('Forward logs', safeInstanceDefault.forward_logs ? 'yes' : 'no')
+  keyValue('Allow private network', safeInstanceDefault.allow_private_network ? 'yes' : 'no')
 
-  const headerEntries = Object.entries(instanceDefault.headers)
+  const headerEntries = Object.entries(safeInstanceDefault.headers)
   if (headerEntries.length > 0) {
-    keyValue(
-      'Headers',
-      headerEntries
-        .map(([k, v]) => `${k}=${isSensitiveHeaderName(k) ? '***' : v}`)
-        .join(', ')
-    )
+    keyValue('Headers', headerEntries.map(([k, v]) => `${k}=${v}`).join(', '))
   }
 
-  keyValue('Consecutive failures', instanceDefault.consecutive_failures)
-  keyValue('Last success', instanceDefault.last_success_at ? formatDate(instanceDefault.last_success_at) : colors.muted('never'))
-  keyValue('Last error', instanceDefault.last_error_at ? formatDate(instanceDefault.last_error_at) : colors.muted('never'))
-  if (instanceDefault.last_error) {
-    keyValue('Last error detail', instanceDefault.last_error)
+  keyValue('Consecutive failures', safeInstanceDefault.consecutive_failures)
+  keyValue('Last success', safeInstanceDefault.last_success_at ? formatDate(safeInstanceDefault.last_success_at) : colors.muted('never'))
+  keyValue('Last error', safeInstanceDefault.last_error_at ? formatDate(safeInstanceDefault.last_error_at) : colors.muted('never'))
+  if (safeInstanceDefault.last_error) {
+    keyValue('Last error detail', safeInstanceDefault.last_error)
   }
-  keyValue('Created', formatDate(instanceDefault.created_at))
-  keyValue('Updated', formatDate(instanceDefault.updated_at))
+  keyValue('Created', formatDate(safeInstanceDefault.created_at))
+  keyValue('Updated', formatDate(safeInstanceDefault.updated_at))
   newline()
 }
 
@@ -470,7 +522,7 @@ export function registerOtelForwardCommands(program: Command): void {
     .requiredOption('--name <name>', 'Destination name')
     .requiredOption('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
     .requiredOption('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
-    .option('--header <k=v>', 'HTTP header sent with every export (repeatable)', collectHeader, [] as string[])
+    .option('--header-env <k=env>', 'HTTP header sourced from an environment variable (repeatable)', collectHeaderEnv, [] as string[])
     .option('--traces', 'Forward traces (default: true)')
     .option('--no-traces', 'Do not forward traces')
     .option('--metrics', 'Forward metrics (default: true)')
@@ -496,9 +548,9 @@ export function registerOtelForwardCommands(program: Command): void {
     .option('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
     .option('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
     .option(
-      '--header <k=v>',
-      'HTTP header sent with every export (repeatable); a value of exactly "***" keeps that header\'s existing value',
-      collectHeader,
+      '--header-env <k=env>',
+      'HTTP header sourced from an environment variable (repeatable)',
+      collectHeaderEnv,
       [] as string[]
     )
     .option('--traces', 'Forward traces')
@@ -548,7 +600,7 @@ export function registerOtelForwardCommands(program: Command): void {
     .requiredOption('--name <name>', 'Destination name')
     .requiredOption('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
     .requiredOption('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
-    .option('--header <k=v>', 'HTTP header sent with every export (repeatable)', collectHeader, [] as string[])
+    .option('--header-env <k=env>', 'HTTP header sourced from an environment variable (repeatable)', collectHeaderEnv, [] as string[])
     .option('--traces', 'Forward traces (default: true)')
     .option('--no-traces', 'Do not forward traces')
     .option('--metrics', 'Forward metrics (default: true)')
@@ -574,9 +626,9 @@ export function registerOtelForwardCommands(program: Command): void {
     .option('--vendor <preset>', `Vendor preset (${VENDOR_PRESET_HINT})`)
     .option('--endpoint-url <url>', 'OTLP-compatible collector endpoint URL')
     .option(
-      '--header <k=v>',
-      'HTTP header sent with every export (repeatable); a value of exactly "***" keeps that header\'s existing value',
-      collectHeader,
+      '--header-env <k=env>',
+      'HTTP header sourced from an environment variable (repeatable)',
+      collectHeaderEnv,
       [] as string[]
     )
     .option('--traces', 'Forward traces')
@@ -630,16 +682,20 @@ async function listDestinationsAction(options: { projectId: string; json?: boole
     }
     return data
   })
+  const safeResult: DestinationListResponse = {
+    ...result,
+    items: result.items.map(sanitizeDestinationForOutput),
+  }
 
   if (options.json) {
-    json(result)
+    json(safeResult)
     return
   }
 
   newline()
-  header(`${icons.info} OTel Forwarding Destinations for Project ${projectId} (${result.total})`)
+  header(`${icons.info} OTel Forwarding Destinations for Project ${projectId} (${safeResult.total})`)
 
-  if (result.items.length === 0) {
+  if (safeResult.items.length === 0) {
     info('No OTel forwarding destinations configured')
     info('Run: temps otel-forward create --project-id ' + projectId + ' --name <name> --vendor <preset> --endpoint-url <url>')
     newline()
@@ -659,7 +715,7 @@ async function listDestinationsAction(options: { projectId: string; json?: boole
     },
   ]
 
-  printTable(result.items, columns, { style: 'minimal' })
+  printTable(safeResult.items, columns, { style: 'minimal' })
   newline()
 }
 
@@ -693,7 +749,7 @@ async function createDestinationAction(options: CreateOptions): Promise<void> {
   })
 
   if (options.json) {
-    json(destination)
+    json(sanitizeDestinationForOutput(destination))
     return
   }
 
@@ -723,7 +779,7 @@ async function showDestinationAction(id: string, options: { json?: boolean }): P
   })
 
   if (options.json) {
-    json(destination)
+    json(sanitizeDestinationForOutput(destination))
     return
   }
 
@@ -766,7 +822,7 @@ async function updateDestinationAction(id: string, options: UpdateOptions): Prom
   })
 
   if (options.json) {
-    json(destination)
+    json(sanitizeDestinationForOutput(destination))
     return
   }
 
@@ -840,20 +896,21 @@ async function testDestinationAction(id: string, options: { json?: boolean }): P
     }
     return data
   })
+  const safeResult = sanitizeTestDeliveryForOutput(result)
 
   if (options.json) {
-    json(result)
+    json(safeResult)
     return
   }
 
   newline()
-  const statusSuffix = result.http_status !== null ? ` (HTTP ${result.http_status})` : ''
-  if (result.success) {
+  const statusSuffix = safeResult.http_status !== null ? ` (HTTP ${safeResult.http_status})` : ''
+  if (safeResult.success) {
     success(`Test delivery succeeded${statusSuffix}`)
   } else {
     warning(`Test delivery failed${statusSuffix}`)
-    if (result.error) {
-      warning(result.error)
+    if (safeResult.error) {
+      warning(safeResult.error)
     }
   }
   newline()
@@ -876,16 +933,20 @@ async function listInstanceDefaultsAction(options: { json?: boolean }): Promise<
     }
     return data
   })
+  const safeResult: InstanceDefaultListResponse = {
+    ...result,
+    items: result.items.map(sanitizeDestinationForOutput),
+  }
 
   if (options.json) {
-    json(result)
+    json(safeResult)
     return
   }
 
   newline()
-  header(`${icons.info} Instance Default Forwarding Destinations (${result.total})`)
+  header(`${icons.info} Instance Default Forwarding Destinations (${safeResult.total})`)
 
-  if (result.items.length === 0) {
+  if (safeResult.items.length === 0) {
     info('No instance default forwarding destinations configured')
     info(
       'Run: temps otel-forward instance-default create --name <name> --vendor <preset> --endpoint-url <url>'
@@ -907,7 +968,7 @@ async function listInstanceDefaultsAction(options: { json?: boolean }): Promise<
     },
   ]
 
-  printTable(result.items, columns, { style: 'minimal' })
+  printTable(safeResult.items, columns, { style: 'minimal' })
   newline()
 }
 
@@ -938,7 +999,7 @@ async function createInstanceDefaultAction(options: CreateInstanceDefaultOptions
   )
 
   if (options.json) {
-    json(instanceDefault)
+    json(sanitizeDestinationForOutput(instanceDefault))
     return
   }
 
@@ -968,7 +1029,7 @@ async function showInstanceDefaultAction(id: string, options: { json?: boolean }
   })
 
   if (options.json) {
-    json(instanceDefault)
+    json(sanitizeDestinationForOutput(instanceDefault))
     return
   }
 
@@ -1011,7 +1072,7 @@ async function updateInstanceDefaultAction(id: string, options: UpdateInstanceDe
   })
 
   if (options.json) {
-    json(instanceDefault)
+    json(sanitizeDestinationForOutput(instanceDefault))
     return
   }
 
@@ -1090,20 +1151,21 @@ async function testInstanceDefaultAction(id: string, options: { json?: boolean }
     }
     return data
   })
+  const safeResult = sanitizeTestDeliveryForOutput(result)
 
   if (options.json) {
-    json(result)
+    json(safeResult)
     return
   }
 
   newline()
-  const statusSuffix = result.http_status !== null ? ` (HTTP ${result.http_status})` : ''
-  if (result.success) {
+  const statusSuffix = safeResult.http_status !== null ? ` (HTTP ${safeResult.http_status})` : ''
+  if (safeResult.success) {
     success(`Test delivery succeeded${statusSuffix}`)
   } else {
     warning(`Test delivery failed${statusSuffix}`)
-    if (result.error) {
-      warning(result.error)
+    if (safeResult.error) {
+      warning(safeResult.error)
     }
   }
   newline()
