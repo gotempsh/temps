@@ -27,17 +27,30 @@ log() { printf '\033[1;33m[%s]\033[0m %s\n' "$WORKER_NAME" "$*"; }
 
 # 1. dockerd
 for _ in $(seq 1 30); do
-  docker info >/dev/null 2>&1 && break || sleep 1
+  if docker info >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
 done
 
-# 2. binary
-cd "$WORKSPACE"
-log "ensuring temps binary is up to date"
-cargo build --bin temps >&2
-install -m 0755 "$WORKSPACE/target/debug/temps" "$BIN"
+# 2. binary. CI supplies the same already-tested Linux binary used by the
+# other scenario shards; local dev-cluster runs continue to build from source.
+if [[ -n "${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}" ]]; then
+  if [[ ! -x "$DEV_CLUSTER_PREBUILT_TEMPS_BIN" ]]; then
+    log "prebuilt temps binary is not executable: $DEV_CLUSTER_PREBUILT_TEMPS_BIN"
+    exit 1
+  fi
+  log "installing prebuilt temps binary from $DEV_CLUSTER_PREBUILT_TEMPS_BIN"
+  install -m 0755 "$DEV_CLUSTER_PREBUILT_TEMPS_BIN" "$BIN"
+else
+  cd "$WORKSPACE"
+  log "ensuring temps binary is up to date"
+  cargo build --bin temps >&2
+  install -m 0755 "$WORKSPACE/target/debug/temps" "$BIN"
+fi
 
 # 3. wait for join token (control plane writes it during its first boot)
-log "waiting for join token at ${JOIN_TOKEN_FILE#$WORKSPACE/}"
+log "waiting for join token at ${JOIN_TOKEN_FILE#"$WORKSPACE"/}"
 for _ in $(seq 1 120); do
   if [[ -f "$JOIN_TOKEN_FILE" ]]; then break; fi
   sleep 1

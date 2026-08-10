@@ -28,14 +28,12 @@
  * git-clone-and-build pipeline work against a real repo host" that would
  * actually prove this.
  */
-import { getDeployStatus, waitForDeployment } from '../lib/flows.ts'
+import { getDeployStatus, pollUntil, waitForDeployment } from '../lib/flows.ts'
 import {
   createE2eGitProject,
   getProductionEnvironment,
   triggerPipelineAndGetDeploymentId,
   resolveLoadTarget,
-  waitForHttpReady,
-  assertNotConsoleFallback,
   teardown,
   makeRunId,
 } from '../lib/flows.ts'
@@ -96,6 +94,11 @@ export async function gitDeployScenarioCommand(opts: GitDeployScenarioOptions): 
   // Real clone + real build (not a prebuilt-image pull), so this needs more
   // headroom than the other scenarios' 300000ms default.
   const deployTimeoutMs = Number(opts.deployTimeout ?? '600000')
+  // A deployment can report healthy just before the proxy's asynchronously
+  // rebuilt route table reaches every request handler. Keep polling the data
+  // plane for a meaningful window instead of falling back to the helper's
+  // short default and racing route propagation on busy CI runners.
+  const appReadyTimeoutMs = Math.min(deployTimeoutMs, 120_000)
 
   const projectIds: number[] = []
   const deployments: { projectId: number; deploymentId: number }[] = []
@@ -138,8 +141,32 @@ export async function gitDeployScenarioCommand(opts: GitDeployScenarioOptions): 
 
     const target = resolveLoadTarget(cfg.url, env.mainUrl)
     await step('wait for the app to serve real traffic', async () => {
-      await waitForHttpReady({ url: target.url, headers: target.headers })
-      await assertNotConsoleFallback({ url: target.url, headers: target.headers })
+      const expected = { message: 'Hello from Go on Temps!' }
+      await pollUntil(
+        async () => {
+          try {
+            const res = await fetch(target.url, { headers: target.headers })
+            const body = await res.text()
+            return { status: res.status, body }
+          } catch (error) {
+            return { status: 0, body: (error as Error).message }
+          }
+        },
+        ({ status, body }) => {
+          if (status !== 200) return false
+          try {
+            return JSON.stringify(JSON.parse(body)) === JSON.stringify(expected)
+          } catch {
+            return false
+          }
+        },
+        {
+          timeoutMs: appReadyTimeoutMs,
+          intervalMs: 1500,
+          onPoll: ({ status }) => log(`    ...app HTTP ${status || '(connection failed)'}`),
+          label: 'git deployment to serve the exact expected application response',
+        },
+      )
     })
 
     await step('/ returns the exact body baked into the real repo source', async () => {

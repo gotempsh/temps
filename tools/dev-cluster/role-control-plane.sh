@@ -24,12 +24,16 @@ log() { printf '\033[1;36m[control-plane]\033[0m %s\n' "$*"; }
 #    on first boot. Cheap to re-check.
 # ---------------------------------------------------------------------------
 for _ in $(seq 1 30); do
-  docker info >/dev/null 2>&1 && break || sleep 1
+  if docker info >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
 done
 
 # ---------------------------------------------------------------------------
-# 2. Build the temps binary if missing or stale. Fast on subsequent
-#    boots thanks to the cargo registry cache + workspace target/.
+# 2. Install a caller-supplied Linux binary when available (CI builds one
+#    once and shares it with every scenario); otherwise build from source.
+#    The local dev-cluster path remains unchanged and uses Cargo's caches.
 # ---------------------------------------------------------------------------
 build_temps() {
   log "building temps binary (cargo build --bin temps)"
@@ -38,7 +42,14 @@ build_temps() {
   install -m 0755 "target/debug/temps" "$BIN"
 }
 
-if [[ ! -x "$BIN" ]]; then
+if [[ -n "${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}" ]]; then
+  if [[ ! -x "$DEV_CLUSTER_PREBUILT_TEMPS_BIN" ]]; then
+    log "prebuilt temps binary is not executable: $DEV_CLUSTER_PREBUILT_TEMPS_BIN"
+    exit 1
+  fi
+  log "installing prebuilt temps binary from $DEV_CLUSTER_PREBUILT_TEMPS_BIN"
+  install -m 0755 "$DEV_CLUSTER_PREBUILT_TEMPS_BIN" "$BIN"
+elif [[ ! -x "$BIN" ]]; then
   build_temps
 else
   # Check whether the source has changed since the binary was built.
@@ -153,7 +164,7 @@ if [[ ! -f "$MARKER" ]]; then
   chmod 600 "$JOIN_TOKEN_FILE"
 
   touch "$MARKER"
-  log "setup complete; admin credentials in ${ADMIN_PASSWORD_FILE#$WORKSPACE/}, join token in ${JOIN_TOKEN_FILE#$WORKSPACE/}"
+  log "setup complete; admin credentials in ${ADMIN_PASSWORD_FILE#"$WORKSPACE"/}, join token in ${JOIN_TOKEN_FILE#"$WORKSPACE"/}"
 fi
 
 # ---------------------------------------------------------------------------

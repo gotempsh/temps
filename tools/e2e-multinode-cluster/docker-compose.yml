@@ -19,16 +19,17 @@
 #
 # The role scripts (`role-control-plane.sh`, `role-worker.sh`,
 # `entrypoint.sh`) and the DinD build image (`Dockerfile.dind-temps`) are
-# reused UNMODIFIED from ../dev-cluster -- see this compose file's `build:`
+# shared with ../dev-cluster -- see this compose file's `build:`
 # blocks (`context: ../dev-cluster`) and `command:` entries (which reach
 # into `/workspace/tools/dev-cluster/...`, workspace-relative, so it doesn't
 # matter which tool directory's compose file invoked them). Do not fork
 # those scripts here; if scenario behavior needs to change, change what this
 # compose file asks them to do (env vars), not the scripts themselves.
 #
-# The temps source tree is mounted read-write at /workspace in both
-# containers, same as dev-cluster, so the binary each one builds from source
-# on first boot is real, current code -- never a stale prebuilt image.
+# The source tree is mounted read-only at /workspace. Local runs build the
+# current checkout inside the nodes; CI installs the same commit-specific musl
+# artifact already exercised by the other jobs, avoiding two cold workspace
+# builds without weakening commit provenance.
 
 name: temps-e2e-mn
 
@@ -152,6 +153,9 @@ services:
       DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
       DEV_CLUSTER_USE_ENROLLMENT_TOKEN: "true"
       DEV_CLUSTER_ENROLLMENT_NODE_NAME: worker-1
+      # CI passes the musl binary already built for this commit. Local runs
+      # leave this empty and the shared role script builds from source.
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
       # No TLS listener in this cluster -- disable the HTTP->HTTPS redirect
       # so the scenario can hit plain http://localhost:18180 directly.
       # TEMPS_TLS_ADDRESS is deliberately NOT set: `temps serve` reads it as
@@ -217,6 +221,7 @@ services:
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
       TEMPS_TELEMETRY: "0"
       DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
     volumes:
       - ../../:/workspace:ro
       - workspace-target:/workspace/target

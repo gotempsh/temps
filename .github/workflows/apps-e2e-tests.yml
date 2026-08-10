@@ -228,6 +228,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ci-prebuilt
+
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -248,20 +254,33 @@ jobs:
           bun run typecheck
 
       - name: Run dedicated multinode scenario
+        env:
+          DEV_CLUSTER_PREBUILT_TEMPS_BIN: /workspace/ci-prebuilt/temps
         run: |
           # Compose overlays writable named volumes below a read-only
           # /workspace bind. On a clean checkout these gitignored mountpoints
           # do not exist, and runc cannot create them through the read-only
           # parent mount.
           mkdir -p target crates/temps-cli/dist
+          chmod +x ci-prebuilt/temps
           cd apps/temps-e2e
-          bun run src/index.ts multinode-join-scenario --json --build-timeout 2400000
+          # Keep the topology until the always() cleanup step so a failed
+          # scenario still has containers available for diagnostic logs.
+          bun run src/index.ts multinode-join-scenario --json --keep --build-timeout 600000
 
       - name: Collect multinode logs on failure
         if: failure()
         run: |
-          docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn ps -a || true
-          docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn logs --no-color > /tmp/temps-multinode.log 2>&1 || true
+          {
+            docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn ps -a || true
+            docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn logs --no-color || true
+            for node in temps-e2e-mn-control-plane temps-e2e-mn-worker-1; do
+              echo "===== $node: inner docker ps ====="
+              docker exec "$node" docker ps -a --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' || true
+              echo "===== $node: inner dockerd log ====="
+              docker exec "$node" tail -n 300 /var/log/docker.log || true
+            done
+          } > /tmp/temps-multinode.log 2>&1
 
       - name: Upload multinode logs
         if: failure()
