@@ -64,6 +64,12 @@ volumes:
   # containers, with a working fingerprint cache.
   workspace-target:
     name: temps-e2e-mn-workspace-target
+  # temps-cli's debug build creates a placeholder dist/index.html for
+  # include_dir!. The source checkout is intentionally read-only, so give
+  # that generated directory its own writable volume (fresh CI checkouts do
+  # not contain the gitignored dist directory developers often have locally).
+  cli-dist:
+    name: temps-e2e-mn-cli-dist
 
   # Shared only between the control plane and worker during bootstrap. Contains
   # the one-time enrollment token and generated admin password; never touches
@@ -157,6 +163,7 @@ services:
     volumes:
       - ../../:/workspace:ro
       - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - cp-docker:/var/lib/docker
@@ -213,6 +220,7 @@ services:
     volumes:
       - ../../:/workspace:ro
       - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - worker1-docker:/var/lib/docker

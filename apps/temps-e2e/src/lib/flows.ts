@@ -677,28 +677,45 @@ export async function registerPebbleDefaultIp(opts?: {
   const network = opts?.network ?? 'temps-e2e-pebble-net'
   const managementUrl = opts?.managementUrl ?? 'http://localhost:8056'
 
-  const proc = Bun.spawn(
-    [
-      'docker',
-      'run',
-      '--rm',
-      '--network',
-      network,
-      'alpine:latest',
-      'getent',
-      'hosts',
-      'host.docker.internal',
-    ],
-    { stdout: 'pipe', stderr: 'pipe' },
-  )
-  const [out, err, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (code !== 0) {
-    throw new Error(`failed to resolve host.docker.internal via throwaway container: ${err}`)
+  const resolve = async (extraArgs: string[] = []) => {
+    const proc = Bun.spawn(
+      [
+        'docker',
+        'run',
+        '--rm',
+        '--network',
+        network,
+        ...extraArgs,
+        'alpine:latest',
+        'getent',
+        'hosts',
+        'host.docker.internal',
+      ],
+      { stdout: 'pipe', stderr: 'pipe' },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    return { stdout, stderr, code }
   }
+
+  // Docker Desktop defines host.docker.internal automatically. Plain Linux
+  // dockerd (including GitHub-hosted runners) does not, so retry with
+  // host-gateway exactly as the established Playwright E2E preflight does.
+  let resolved = await resolve()
+  if (resolved.code !== 0 || !resolved.stdout.trim()) {
+    resolved = await resolve(['--add-host', 'host.docker.internal:host-gateway'])
+  }
+  if (resolved.code !== 0) {
+    const detail = [resolved.stdout, resolved.stderr].filter((s) => s.trim()).join('\n').trim()
+    throw new Error(
+      `failed to resolve host.docker.internal via throwaway container (exit ${resolved.code})` +
+        (detail ? `: ${detail}` : ''),
+    )
+  }
+  const out = resolved.stdout
   const ip = out.trim().split(/\s+/)[0]
   if (!ip) {
     throw new Error(`could not parse host IP from getent output: ${JSON.stringify(out)}`)

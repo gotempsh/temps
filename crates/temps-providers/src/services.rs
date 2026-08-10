@@ -7284,14 +7284,10 @@ echo "[restore] Pre-seed complete"
         // Port bindings: map the container port to the same host port.
         // Each cluster member uses a unique port assigned by the manager so
         // there are no conflicts even when multiple members run on the same host.
-        let mut port_bindings = std::collections::HashMap::new();
         let container_port_key = format!("{}/tcp", params.container_port);
-        port_bindings.insert(
-            container_port_key.clone(),
-            Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(params.container_port.to_string()),
-            }]),
+        let port_bindings = crate::utils::local_port_binding(
+            &container_port_key,
+            &params.container_port.to_string(),
         );
 
         // Wire the per-host Hickory resolver into the container's

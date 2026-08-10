@@ -135,6 +135,7 @@ jobs:
           ACME_DIRECTORY_URL: https://localhost:14000/dir
           ACME_INSECURE: "1"
           TEMPS_ALLOW_PEBBLE_PROVIDER: "1"
+          TEMPS_OTEL_QUOTA_GB: "1"
         run: |
           "$TEMPS_BIN" serve \
             --database-url "$DATABASE_URL" \
@@ -147,6 +148,11 @@ jobs:
             > /tmp/temps-scenarios.log 2>&1 &
           echo $! > /tmp/temps-scenarios.pid
           timeout 180 bash -c 'until curl -sf http://localhost:5002/ >/dev/null; do sleep 2; done'
+          # WAL-G runs inside managed-service containers. Put MinIO on the
+          # same network so endpoint resolution uses its container address
+          # instead of host.docker.internal, which plain Linux Docker does
+          # not define for arbitrary managed-service containers.
+          docker network connect temps-app-network temps-e2e-minio-1
 
       - name: Mint masked scenario credential
         run: |
@@ -179,6 +185,19 @@ jobs:
           path: /tmp/temps-scenarios.log
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Show Docker diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker network inspect temps-app-network || true
+          docker ps -aq --filter label=sh.temps.service=true | while IFS= read -r container; do
+            # Restrict inspect output to operational fields. A full inspect
+            # includes container environment variables and would leak managed
+            # service credentials into the Actions log.
+            docker inspect --format '{{json .Name}} {{json .State}} {{json .NetworkSettings.Ports}} {{json .NetworkSettings.Networks}}' "$container" || true
+            docker logs --tail 200 "$container" || true
+          done
 
       - name: Cleanup
         if: always()

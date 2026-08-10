@@ -22,14 +22,14 @@ run_scenario() {
 
 case "$SHARD" in
   core)
-    run_scenario scenario --with-db --requests 50 --concurrency 10
+    run_scenario scenario --image traefik/whoami:latest --port 80 --with-db --requests 50 --concurrency 10
     run_scenario cli-scenario
     run_scenario flags-scenario
     run_scenario audit-scenario
     run_scenario error-tracking-scenario
     run_scenario env-vars-scenario --registry "$REGISTRY"
     run_scenario api-key-scenario --temps-root "$PWD" --database-url "$DATABASE_URL"
-    run_scenario rbac-scenario --temps-root "$PWD" --database-url "$DATABASE_URL"
+    run_scenario rbac-scenario --image traefik/whoami:latest --temps-root "$PWD" --database-url "$DATABASE_URL"
     ;;
   observability)
     run_scenario logs-scenario --registry "$REGISTRY"
@@ -55,7 +55,7 @@ case "$SHARD" in
     run_scenario pg-upgrade-scenario --registry "$REGISTRY" --upgrade-timeout 900000
     ;;
   edge)
-    run_scenario tls-scenario --tls-port 3443
+    run_scenario tls-scenario --image traefik/whoami:latest --port 80 --tls-port 3443
     run_scenario dns01-wildcard-scenario
     run_scenario email-scenario
     run_scenario git-deploy-scenario

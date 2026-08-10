@@ -102,7 +102,6 @@ import {
   waitForDeployment,
   getDeployStatus,
   resolveLoadTarget,
-  assertNotConsoleFallback,
   teardown,
   makeRunId,
   pollUntil,
@@ -157,6 +156,7 @@ async function runStreamed(
   timeoutMs?: number,
 ): Promise<void> {
   const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' })
+  const outputTail: string[] = []
   let timedOut = false
   const timeout = timeoutMs === undefined
     ? undefined
@@ -174,9 +174,18 @@ async function runStreamed(
       buf += decoder.decode(value, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop() ?? ''
-      for (const l of lines) if (l.trim()) onLog(l)
+      for (const l of lines) {
+        if (!l.trim()) continue
+        onLog(l)
+        outputTail.push(l)
+        if (outputTail.length > 60) outputTail.shift()
+      }
     }
-    if (buf.trim()) onLog(buf)
+    if (buf.trim()) {
+      onLog(buf)
+      outputTail.push(buf)
+      if (outputTail.length > 60) outputTail.shift()
+    }
   }
   const [, , code] = await Promise.all([pump(proc.stdout), pump(proc.stderr), proc.exited])
   if (timeout !== undefined) clearTimeout(timeout)
@@ -184,7 +193,8 @@ async function runStreamed(
     throw new Error(`${what} did not finish within ${Math.round(timeoutMs! / 1000)}s and was terminated`)
   }
   if (code !== 0) {
-    throw new Error(`${what} failed (exit ${code})`)
+    const detail = outputTail.length ? `\n${outputTail.join('\n')}` : ''
+    throw new Error(`${what} failed (exit ${code})${detail}`)
   }
 }
 
@@ -224,6 +234,29 @@ async function dockerPsNames(containerName: string): Promise<string[]> {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
+}
+
+/** Wait until the proxy serves the actual whoami container, not a transient 404/console route. */
+async function waitForWhoami(
+  target: ReturnType<typeof resolveLoadTarget>,
+  timeoutMs = 60_000,
+): Promise<void> {
+  await pollUntil(
+    async () => {
+      try {
+        const res = await fetch(target.url, { headers: target.headers })
+        return { status: res.status, body: (await res.text()).slice(0, 200) }
+      } catch (error) {
+        return { status: 0, body: (error as Error).message }
+      }
+    },
+    (response) => response.status === 200 && response.body.includes('Hostname'),
+    {
+      timeoutMs,
+      intervalMs: 1000,
+      label: 'control-plane proxy to serve the traefik/whoami deployment',
+    },
+  )
 }
 
 export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOptions): Promise<void> {
@@ -499,16 +532,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     })
 
     const target = resolveLoadTarget(cfg.url, env.mainUrl)
-    await step('real HTTP proof of life through the control-plane proxy', async () => {
-      await assertNotConsoleFallback({ url: target.url, headers: target.headers, timeoutMs: 60_000 })
-      const res = await fetch(target.url, { headers: target.headers })
-      const body = await res.text()
-      if (res.status !== 200 || !body.includes('Hostname')) {
-        throw new Error(
-          `expected a real traefik/whoami response (status 200, body containing "Hostname"), got HTTP ${res.status}: ${body.slice(0, 200)}`,
-        )
-      }
-    })
+    await step('real HTTP proof of life through the control-plane proxy', () => waitForWhoami(target))
 
     await step('drain the worker', async () => {
       unwrap(
@@ -577,7 +601,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       }
       log(`  post-drain: worker-1=[${workerContainers.join(', ')}] control-plane=[${cpContainers.join(', ')}]`)
 
-      await assertNotConsoleFallback({ url: target.url, headers: target.headers, timeoutMs: 60_000 })
+      await waitForWhoami(target)
     })
 
     await step('remove the worker node', async () => {
