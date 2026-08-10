@@ -1416,6 +1416,7 @@ impl DeploymentService {
     pub async fn trigger_image_deployment(
         &self,
         project_id: i32,
+        target_environment_id: Option<i32>,
         image_ref: String,
         health_check_path: Option<String>,
     ) -> Result<(), DeploymentError> {
@@ -1434,6 +1435,7 @@ impl DeploymentService {
             .send(temps_core::Job::DeployImageRequested(
                 temps_core::DeployImageRequestedJob {
                     project_id,
+                    target_environment_id,
                     image_ref,
                     health_check_path,
                 },
@@ -1448,65 +1450,50 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Redeploy an environment using the context (branch, tag, commit) from its
-    /// latest successful deployment.  Used by node drain and failover — these
-    /// operations need to reschedule existing workloads, not start a fresh
-    /// deployment from scratch.
-    ///
-    /// Falls back to the environment's configured branch when no prior
-    /// deployment exists.
+    /// Redeploy the exact workload affected by node drain or failover.
     pub async fn redeploy_environment(
         &self,
         project_id: i32,
         environment_id: i32,
+        deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        // Find the most recent deployment for this environment regardless of
-        // state. Node drain/failover can fire seconds after a deploy reports
-        // "running" at the proxy — well before its `deployments.state` row
-        // settles into a terminal value ("deployed"/"completed"/"ready") —
-        // so filtering on terminal states here made this query race the
-        // deployment pipeline's own state transition and silently see no
-        // rows, which fell through to the git-only path below.
-        let latest = deployments::Entity::find()
+        // Use the deployment that owns the affected containers. Selecting the
+        // newest row can race a concurrent failed/cancelled deploy and restore
+        // the wrong workload during failover.
+        let deploy = deployments::Entity::find_by_id(deployment_id)
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await
-            .map_err(|e| DeploymentError::Other(e.to_string()))?;
+            .map_err(|e| DeploymentError::Other(format!(
+                "Failed to load deployment {deployment_id} for project {project_id}, environment {environment_id}: {e}"
+            )))?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Deployment {deployment_id} was not found in project {project_id}, environment {environment_id}"
+                ))
+            })?;
 
         // Git-less deployments (docker_image source, e.g. imports or
         // `deployFromImage`) have no branch/tag/commit to rebuild from —
         // `trigger_pipeline` requires `repo_owner`/`repo_name` and fails with
         // "Project repo_owner is missing" for these. Redeploy them from the
         // same image instead, mirroring `trigger_image_deployment`.
-        if let Some(ref deploy) = latest {
-            if let Some(image_ref) = deploy
-                .metadata
-                .as_ref()
-                .and_then(|m| m.external_image_ref.clone())
-            {
-                return self
-                    .trigger_image_deployment(project_id, image_ref, None)
-                    .await;
-            }
+        if let Some(image_ref) = deploy
+            .metadata
+            .as_ref()
+            .and_then(|m| m.external_image_ref.clone())
+        {
+            return self
+                .trigger_image_deployment(project_id, Some(environment_id), image_ref, None)
+                .await;
         }
 
-        let (branch, tag, commit) = if let Some(ref deploy) = latest {
-            (
-                deploy.branch_ref.clone(),
-                deploy.tag_ref.clone(),
-                deploy.commit_sha.clone(),
-            )
-        } else {
-            // No prior deployment — fall back to environment's branch
-            let env = temps_entities::environments::Entity::find_by_id(environment_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| DeploymentError::Other(e.to_string()))?;
-            let branch = env.and_then(|e| e.branch.filter(|b| !b.is_empty()));
-            (branch, None, None)
-        };
+        let (branch, tag, commit) = (
+            deploy.branch_ref.clone(),
+            deploy.tag_ref.clone(),
+            deploy.commit_sha.clone(),
+        );
 
         self.trigger_pipeline(project_id, environment_id, branch, tag, commit)
             .await
@@ -7143,7 +7130,7 @@ mod tests {
         let deployment_service = create_deployment_service_for_test(db);
 
         let result = deployment_service
-            .trigger_image_deployment(1, String::new(), None)
+            .trigger_image_deployment(1, None, String::new(), None)
             .await;
 
         assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
@@ -7162,6 +7149,7 @@ mod tests {
         deployment_service
             .trigger_image_deployment(
                 42,
+                Some(7),
                 "ghcr.io/org/app:latest".to_string(),
                 Some("/healthz".to_string()),
             )
@@ -7179,8 +7167,76 @@ mod tests {
         };
 
         assert_eq!(job.project_id, 42);
+        assert_eq!(job.target_environment_id, Some(7));
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_uses_affected_deployment_and_target_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, affected, _) = setup_test_deployment(&db).await?;
+
+        let mut affected_active: deployments::ActiveModel = affected.clone().into();
+        affected_active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.example/app:known-good".to_string()),
+            ..Default::default()
+        }));
+        affected_active.update(db.as_ref()).await?;
+
+        // A newer failed deployment must never supersede the workload whose
+        // container is actually being migrated.
+        deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("failed".to_string()),
+            slug: Set("failed-newer-deployment".to_string()),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata {
+                external_image_ref: Some("registry.example/app:failed".to_string()),
+                ..Default::default()
+            })),
+            created_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            updated_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db);
+        let mut receiver = service.queue_service.subscribe();
+        service
+            .redeploy_environment(project.id, environment.id, affected.id)
+            .await?;
+
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
+        assert_eq!(job.image_ref, "registry.example/app:known-good");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_rejects_deployment_from_another_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let service = create_deployment_service_for_test(db);
+
+        let result = service
+            .redeploy_environment(project.id, environment.id + 1, deployment.id)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
         Ok(())
     }
 }

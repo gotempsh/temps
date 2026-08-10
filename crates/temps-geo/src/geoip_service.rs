@@ -195,22 +195,25 @@ pub enum GeoIpService {
 /// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
 /// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
 pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_path = cwd.join(filename);
-        if cwd_path.exists() {
-            return cwd_path;
-        }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
+    resolve_mmdb_path_from(filename, &cwd, data_dir.as_deref())
+}
+
+fn resolve_mmdb_path_from(
+    filename: &str,
+    cwd: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let cwd_path = cwd.join(filename);
+    if cwd_path.exists() {
+        return cwd_path;
     }
-    if let Ok(data_dir) = std::env::var("TEMPS_DATA_DIR") {
-        let data_dir_path = std::path::PathBuf::from(data_dir).join(filename);
-        if data_dir_path.exists() {
-            return data_dir_path;
-        }
-    }
-    // Neither exists -- fall back to the CWD path so the resulting error
-    // message names a location relative to where the process was started
-    // (unchanged behavior for the common case of no TEMPS_DATA_DIR set).
-    std::env::current_dir().unwrap_or_default().join(filename)
+
+    // When neither file exists yet, prefer the configured data directory:
+    // startup downloads there. Returning the absent CWD candidate would make
+    // the plugin wait loop watch a path that can never receive the download.
+    data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
 }
 
 impl GeoIpService {
@@ -452,5 +455,40 @@ mod tests {
     fn test_case_insensitive_match() {
         assert!(is_hosting_org("SUBNET DIGITAL LLC"));
         assert!(is_hosting_org("subnet digital llc"));
+    }
+
+    #[test]
+    fn mmdb_resolution_watches_data_dir_when_download_is_pending() {
+        let unique = format!(
+            "temps-geo-resolution-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let cwd = std::env::temp_dir().join(&unique).join("cwd");
+        let data_dir = std::env::temp_dir().join(&unique).join("data");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            data_dir.join("GeoLite2-City.mmdb")
+        );
+    }
+
+    #[test]
+    fn mmdb_resolution_keeps_existing_cwd_file_precedence() {
+        let root = std::env::temp_dir().join(format!("temps-geo-existing-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let cwd_file = cwd.join("GeoLite2-City.mmdb");
+        std::fs::write(&cwd_file, b"test").expect("write test mmdb placeholder");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            cwd_file
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove test directories");
     }
 }

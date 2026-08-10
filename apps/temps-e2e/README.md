@@ -1181,7 +1181,7 @@ it arrives mid-reconcile.
 
 ### `multinode-join-scenario` steps
 
-The first-ever e2e coverage for temps's multi-node/WireGuard clustering
+The first-ever e2e coverage for temps's direct-underlay multi-node clustering
 feature. Before this, the only coverage anywhere was Rust unit tests
 against a `MockDatabase`
 (`crates/temps-deployments/tests/multinode_integration_test.rs`) and a
@@ -1196,7 +1196,8 @@ at an already-running `temps serve` (started via the `start-temps` skill)
 and drives it over HTTP. Multi-node clustering can't be proven that way:
 it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
 its own network identity — registering into the first node's mesh over
-real mTLS. `tls-scenario` already established the precedent that a
+single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
+topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
 scenario can need "a dedicated instance on a fixed port, not a normal dev
 slot" (see that section above) because of Pebble's hardcoded port; this
 scenario takes the same idea further: it brings up its own 2-node
@@ -1229,6 +1230,9 @@ tears the whole thing down at the end. It does NOT accept `--url`/
    `status: "active"` — the real proof `POST /internal/nodes/register`
    completed a genuine registration, not a mocked one. Bounded by the same
    generous timeout: the worker also compiles its own binary from scratch.
+   Then verify the node endpoint uses HTTPS, the worker persisted its mTLS
+   leaf/key/CA, legacy shared enrollment is disabled, and the node-bound
+   single-use enrollment token has exactly one use.
 6. create a throwaway project, resolve its production environment.
 7. `PUT /projects/{id}/environments/{id}/settings` with
    `target_nodes: [worker_node_id]` — pins every future deploy in this

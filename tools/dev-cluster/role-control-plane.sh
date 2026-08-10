@@ -16,7 +16,6 @@ set -euo pipefail
 WORKSPACE=/workspace
 BIN=/usr/local/bin/temps
 MARKER=/var/lib/temps/.dev-cluster-setup-done
-ADMIN_PASSWORD_FILE=/workspace/tools/dev-cluster/.state/admin.txt
 
 log() { printf '\033[1;36m[control-plane]\033[0m %s\n' "$*"; }
 
@@ -56,12 +55,14 @@ log "temps binary at $BIN ($($BIN --version 2>/dev/null || echo 'unknown'))"
 # 3. First-boot setup. We mark completion so a `down`/`up` of the same
 #    postgres volume short-circuits straight to `serve`.
 # ---------------------------------------------------------------------------
-STATE_DIR="$WORKSPACE/tools/dev-cluster/.state"
+STATE_DIR="${DEV_CLUSTER_STATE_DIR:-$WORKSPACE/tools/dev-cluster/.state}"
+ADMIN_PASSWORD_FILE="$STATE_DIR/admin.txt"
 JOIN_TOKEN_FILE="$STATE_DIR/join_token.txt"
 
 if [[ ! -f "$MARKER" ]]; then
   log "first boot: running temps setup --auto"
   mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
 
   # --auto implies non-interactive, skip-ssl, skip-dns-records, skip-git.
   # We pass --server-ip 10.42.0.10 because auto-detect probes the public
@@ -90,11 +91,9 @@ if [[ ! -f "$MARKER" ]]; then
   printf 'admin@local.dev\n%s\n' "$ADMIN_PASSWORD" > "$ADMIN_PASSWORD_FILE"
   chmod 600 "$ADMIN_PASSWORD_FILE"
 
-  # Generate a join token for the workers. Writing to network_config /
-  # settings via the API requires login, which is itself fiddly to
-  # script. Cheat: insert the hash directly into the settings table
-  # using psql, mirroring what `POST /settings/join-token/generate`
-  # does internally.
+  # Generate a bootstrap token for the workers. Dedicated security E2E
+  # topologies use a short-lived enrollment token; the normal dev cluster
+  # retains its backwards-compatible shared-token behavior.
   JOIN_TOKEN="$(head -c 32 /dev/urandom | xxd -p -c 999)"
   JOIN_TOKEN_HASH="$(printf '%s' "$JOIN_TOKEN" | sha256sum | awk '{print $1}')"
   log "minting join token (hash $(echo "$JOIN_TOKEN_HASH" | cut -c1-12)…)"
@@ -113,21 +112,45 @@ if [[ ! -f "$MARKER" ]]; then
   DB_HOST="${DB_HOSTPORT%%:*}"
   DB_NAME="${DB_HOSTPORT_DB#*/}"
 
-  # The settings.data column is plain JSON (not JSONB). Cast to jsonb for
-  # the merge, cast back when writing — same effect as
-  # POST /settings/join-token/generate but without needing an admin login.
-  PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
-    UPDATE settings
-       SET data = jsonb_set(
-                    COALESCE(data::jsonb, '{}'::jsonb),
-                    '{multi_node,join_token_hash}',
-                    to_jsonb('${JOIN_TOKEN_HASH}'::text)
-                  )::json
-     WHERE id = 1
-  " >/dev/null
+  if [[ "${DEV_CLUSTER_USE_ENROLLMENT_TOKEN:-false}" == "true" ]]; then
+    BOUND_NODE_NAME="${DEV_CLUSTER_ENROLLMENT_NODE_NAME:-worker-1}"
+    if [[ ! "$BOUND_NODE_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      log "invalid DEV_CLUSTER_ENROLLMENT_NODE_NAME '$BOUND_NODE_NAME'"
+      exit 1
+    fi
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
+      UPDATE settings
+         SET data = jsonb_set(
+                      jsonb_set(COALESCE(data::jsonb, '{}'::jsonb),
+                                '{multi_node,require_mtls}', 'true'::jsonb),
+                      '{multi_node,legacy_shared_token_enabled}', 'false'::jsonb
+                    )::json
+       WHERE id = 1;
+      INSERT INTO node_enrollment_tokens
+        (token_hash, max_uses, used_count, expires_at, bound_node_name,
+         created_at, updated_at)
+      VALUES
+        ('${JOIN_TOKEN_HASH}', 1, 0, now() + interval '1 hour',
+         '${BOUND_NODE_NAME}', now(), now());
+    " >/dev/null
+    log "minted single-use enrollment token bound to $BOUND_NODE_NAME; mTLS required"
+  else
+    # The settings.data column is plain JSON (not JSONB). Cast to jsonb for
+    # the merge, cast back when writing — same effect as the legacy join-token
+    # API without needing an admin login.
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
+      UPDATE settings
+         SET data = jsonb_set(
+                      COALESCE(data::jsonb, '{}'::jsonb),
+                      '{multi_node,join_token_hash}',
+                      to_jsonb('${JOIN_TOKEN_HASH}'::text)
+                    )::json
+       WHERE id = 1
+    " >/dev/null
+  fi
 
   printf '%s\n' "$JOIN_TOKEN" > "$JOIN_TOKEN_FILE"
-  chmod 644 "$JOIN_TOKEN_FILE"
+  chmod 600 "$JOIN_TOKEN_FILE"
 
   touch "$MARKER"
   log "setup complete; admin credentials in ${ADMIN_PASSWORD_FILE#$WORKSPACE/}, join token in ${JOIN_TOKEN_FILE#$WORKSPACE/}"

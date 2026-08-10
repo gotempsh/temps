@@ -494,7 +494,7 @@ program
 program
   .command('multinode-join-scenario')
   .description(
-    'Real multi-node/WireGuard clustering proof: brings up its OWN dedicated 2-node DinD cluster ' +
+    'Real direct-underlay multi-node/mTLS proof: brings up its OWN dedicated 2-node DinD cluster ' +
       '(tools/e2e-multinode-cluster/, not the shared instance -- no --url/--api-key), waits for a real ' +
       'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
       'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +

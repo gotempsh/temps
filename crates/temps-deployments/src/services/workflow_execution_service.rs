@@ -2,7 +2,7 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::sync::Arc;
 use temps_core::{
     Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
@@ -845,7 +845,7 @@ impl WorkflowExecutionService {
                     .teardown_previous_deployment(
                         deployment.project_id,
                         deployment.environment_id,
-                        deployment_id,
+                        &deployment,
                     )
                     .await
                 {
@@ -2730,11 +2730,13 @@ impl WorkflowExecutionService {
         &self,
         project_id: i32,
         environment_id: i32,
-        current_deployment_id: i32,
+        current_deployment: &deployments::Model,
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
-        // Find previous deployments in this environment (excluding the current one).
+        // Find active deployments that are chronologically older than the
+        // current one. An older workflow can finish after a newer workflow;
+        // `id != current` would let it tear the newer deployment back down.
         //
         // Scope this to active states and cap the result, newest-first. This is a
         // safety net that runs in addition to MarkDeploymentCompleteJob's own
@@ -2749,7 +2751,15 @@ impl WorkflowExecutionService {
         let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::Id.ne(current_deployment_id)) // Exclude current deployment
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
             .filter(deployments::Column::State.is_in(vec![
                 "pending",
                 "running",
@@ -4077,6 +4087,34 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // Simulate a newer deployment completing while this older workflow is
+        // still in its post-success cleanup. It must not be selected as a
+        // "previous" deployment merely because its ID differs.
+        let newer_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("newer-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() + chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let newer_container = deployment_containers::ActiveModel {
+            deployment_id: Set(newer_deployment.id),
+            container_id: Set("newer-container-1".to_string()),
+            container_name: Set("newer-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
@@ -4111,7 +4149,7 @@ mod tests {
         );
 
         let stopped_container_id = service
-            .teardown_previous_deployment(project.id, environment.id, current_deployment.id)
+            .teardown_previous_deployment(project.id, environment.id, &current_deployment)
             .await?;
 
         assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
@@ -4122,6 +4160,15 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("newer container row still exists");
+        assert!(
+            newer_refreshed.deleted_at.is_none(),
+            "an older workflow cleanup must not remove a newer deployment's container"
+        );
 
         Ok(())
     }

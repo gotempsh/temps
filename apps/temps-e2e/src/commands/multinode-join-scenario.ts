@@ -1,5 +1,5 @@
 /**
- * The first-ever e2e test for temps's multi-node/WireGuard clustering
+ * The first-ever e2e test for temps's direct-underlay multi-node clustering
  * feature. Nothing tests this today — only Rust unit tests with
  * MockDatabase (`crates/temps-deployments/tests/multinode_integration_test.rs`)
  * and a manual, non-automated dev tool (`tools/dev-cluster/`).
@@ -9,8 +9,8 @@
  * skill) and drives it over HTTP. This one can't: it has to prove a SECOND,
  * genuinely separate node (its own Docker daemon, its own binary, its own
  * network identity) joins the first node's mesh — that needs its own
- * Docker-in-Docker (DinD) 2-node cluster with real WireGuard/mTLS
- * registration, exactly what `tools/dev-cluster/` already proves works,
+ * Docker-in-Docker (DinD) 2-node cluster with real single-use enrollment and
+ * mTLS registration. WireGuard relay enrollment remains a separate topology,
  * just not automated or asserted against. So this scenario does NOT use the
  * global `--url`/`--api-key`/`connection()` the way every other scenario
  * does (the one precedent for a scenario driving its own topology is
@@ -41,7 +41,9 @@
  *   5. poll `GET /internal/nodes` until a node named `worker-1` (the
  *      `WORKER_NAME` the compose file sets) appears with `status: "active"`
  *      — this is the real proof `POST /internal/nodes/register` completed
- *      a genuine mTLS-registered join, not a mocked one. Bounded by the
+ *      a genuine mTLS-registered join, not a mocked one, then assert that the
+ *      stored node endpoint is HTTPS, cert material exists, legacy enrollment
+ *      is disabled, and the single-use token was consumed. Bounded by the
  *      same generous timeout: the worker ALSO compiles its own binary from
  *      scratch on first boot.
  *   6. create a throwaway project + resolve its production environment.
@@ -103,7 +105,6 @@ import {
   assertNotConsoleFallback,
   teardown,
   makeRunId,
-  sleep,
   pollUntil,
 } from '../lib/flows.ts'
 import type { Client } from '@temps-sdk/api/client'
@@ -124,6 +125,7 @@ const IDENTITY_VOLUMES = [
   'temps-e2e-mn-worker1-docker',
   'temps-e2e-mn-worker1-data',
   'temps-e2e-mn-worker1-home',
+  'temps-e2e-mn-bootstrap-state',
 ]
 
 export interface MultinodeJoinScenarioOptions {
@@ -152,8 +154,16 @@ async function runStreamed(
   args: string[],
   onLog: (line: string) => void,
   what: string,
+  timeoutMs?: number,
 ): Promise<void> {
   const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' })
+  let timedOut = false
+  const timeout = timeoutMs === undefined
+    ? undefined
+    : setTimeout(() => {
+        timedOut = true
+        proc.kill()
+      }, timeoutMs)
   const pump = async (stream: ReadableStream<Uint8Array>) => {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
@@ -168,8 +178,11 @@ async function runStreamed(
     }
     if (buf.trim()) onLog(buf)
   }
-  await Promise.all([pump(proc.stdout), pump(proc.stderr)])
-  const code = await proc.exited
+  const [, , code] = await Promise.all([pump(proc.stdout), pump(proc.stderr), proc.exited])
+  if (timeout !== undefined) clearTimeout(timeout)
+  if (timedOut) {
+    throw new Error(`${what} did not finish within ${Math.round(timeoutMs! / 1000)}s and was terminated`)
+  }
   if (code !== 0) {
     throw new Error(`${what} failed (exit ${code})`)
   }
@@ -216,6 +229,9 @@ async function dockerPsNames(containerName: string): Promise<string[]> {
 export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOptions): Promise<void> {
   const composeFile = opts.composeFile ?? DEFAULT_COMPOSE_FILE
   const buildTimeoutMs = Number(opts.buildTimeout ?? '1800000')
+  if (!Number.isFinite(buildTimeoutMs) || buildTimeoutMs <= 0) {
+    throw new Error(`--build-timeout must be a positive number of milliseconds, got "${opts.buildTimeout}"`)
+  }
   const json = !!opts.json
   const log = (msg: string) => {
     if (!json) process.stderr.write(msg + '\n')
@@ -248,23 +264,47 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
   const projectIds: number[] = []
   const deployments: { projectId: number; deploymentId: number }[] = []
   let workerNodeId: number | undefined
-  let clusterUp = false
+  let clusterStartAttempted = false
+  const revokeTemporaryApiKey = async () => {
+    if (!clusterStartAttempted) return
+    const revoke = await runCaptured([
+      'docker',
+      'exec',
+      'temps-e2e-mn-postgres',
+      'psql',
+      '-U',
+      'temps',
+      '-d',
+      'temps',
+      '-c',
+      "UPDATE api_keys SET is_active = false, updated_at = now() WHERE name = 'e2e-multinode' AND is_active = true",
+    ])
+    if (revoke.code !== 0) log('    ! temporary API-key revocation failed; cluster teardown will remove its database')
+  }
 
   try {
+    await step('remove any stale multinode E2E topology and identity state', async () => {
+      const down = await runCaptured([...composeArgs, 'down'])
+      if (down.code !== 0) {
+        throw new Error(`preflight docker compose down failed: ${down.stderr.trim()}`)
+      }
+      for (const volume of IDENTITY_VOLUMES) {
+        // Missing volumes are expected on a genuinely fresh run.
+        await runCaptured(['docker', 'volume', 'rm', '-f', volume])
+      }
+    })
+
     await step(
       `bring up the 2-node cluster (docker compose up -d --build, bounded ${Math.round(buildTimeoutMs / 1000)}s — first-run compile is ~15-20 min, this is NOT hung)`,
       async () => {
         const t0 = performance.now()
-        const run = runStreamed(
+        clusterStartAttempted = true
+        await runStreamed(
           [...composeArgs, 'up', '-d', '--build'],
           (line) => log(`    [compose] ${line}`),
           'docker compose up -d --build',
+          buildTimeoutMs,
         )
-        const timeout = sleep(buildTimeoutMs).then(() => {
-          throw new Error(`docker compose up did not finish within ${Math.round(buildTimeoutMs / 1000)}s`)
-        })
-        await Promise.race([run, timeout])
-        clusterUp = true
         log(`    cluster containers started in ${((performance.now() - t0) / 1000).toFixed(1)}s (images may still be compiling in the background)`)
       },
     )
@@ -298,17 +338,17 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         '--output-format=json',
       ])
       if (res.code !== 0) {
-        throw new Error(`temps api-key exited ${res.code}\nstdout: ${res.stdout}\nstderr: ${res.stderr}`)
+        throw new Error(`temps api-key exited ${res.code}; credential-bearing output suppressed`)
       }
       const jsonStart = res.stdout.indexOf('{')
       if (jsonStart === -1) {
-        throw new Error(`temps api-key produced no JSON on stdout:\n${res.stdout}`)
+        throw new Error('temps api-key produced no JSON; credential-bearing output suppressed')
       }
       let parsed: { api_key: string }
       try {
         parsed = JSON.parse(res.stdout.slice(jsonStart))
       } catch (e) {
-        throw new Error(`temps api-key produced unparsable JSON: ${(e as Error).message}\nstdout: ${res.stdout}`)
+        throw new Error(`temps api-key produced unparsable JSON: ${(e as Error).message}; credential-bearing output suppressed`)
       }
       return parsed.api_key
     })
@@ -326,18 +366,60 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
             if (res.error || !res.data) return undefined
             return res.data.nodes.find((n) => n.name === WORKER_NAME)
           },
-          (n) => n !== undefined && n.status === 'active',
+          // `temps join` creates the node before the agent has started with
+          // its issued leaf certificate. The first agent heartbeat upgrades
+          // the provisional HTTP address to its final HTTPS endpoint, so wait
+          // for both states instead of racing that hand-off.
+          (n) => n !== undefined && n.status === 'active' && n.address.startsWith('https://'),
           {
             timeoutMs: buildTimeoutMs,
             intervalMs: 5000,
-            onPoll: (n) => log(`    ...${WORKER_NAME}=${n ? n.status : '(not registered yet)'}`),
-            label: `node '${WORKER_NAME}' to register and report status=active`,
+            onPoll: (n) =>
+              log(
+                `    ...${WORKER_NAME}=${n ? `${n.status} ${n.address}` : '(not registered yet)'}`,
+              ),
+            label: `node '${WORKER_NAME}' to register, report active, and publish its HTTPS agent endpoint`,
           },
         )
         return node!.id
       },
     )
     log(`  worker node id=${workerNodeId}`)
+
+    await step('verify worker registration negotiated mTLS', async () => {
+      const nodes = unwrap(await adminListNodes({ client: client! }), 'adminListNodes')
+      const worker = nodes.nodes.find((node) => node.id === workerNodeId)
+      if (!worker?.address.startsWith('https://')) {
+        throw new Error(`worker address is ${worker?.address ?? '(missing)'}, expected an https:// mTLS endpoint`)
+      }
+      const certCheck = await runCaptured([
+        'docker',
+        'exec',
+        WORKER_CONTAINER,
+        'bash',
+        '-c',
+        'test -s /root/.temps/node.cert.pem && test -s /root/.temps/node.key.pem && test -s /root/.temps/cluster-ca.pem',
+      ])
+      if (certCheck.code !== 0) {
+        throw new Error('worker did not persist its mTLS leaf, private key, and cluster CA')
+      }
+      const posture = await runCaptured([
+        'docker',
+        'exec',
+        'temps-e2e-mn-postgres',
+        'psql',
+        '-At',
+        '-U',
+        'temps',
+        '-d',
+        'temps',
+        '-c',
+        "SELECT data::jsonb->'multi_node'->>'require_mtls', data::jsonb->'multi_node'->>'legacy_shared_token_enabled', used_count, max_uses FROM settings CROSS JOIN node_enrollment_tokens WHERE settings.id = 1",
+      ])
+      if (posture.code !== 0 || posture.stdout.trim() !== 'true|false|1|1') {
+        throw new Error(`unexpected enrollment posture: ${posture.stdout.trim() || posture.stderr.trim() || '(no output)'}`)
+      }
+    })
 
     const project = await step('create a throwaway project', () =>
       createE2eProject(client!, { name: `${runId}-mn`, exposedPort: 80 }),
@@ -453,17 +535,49 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     )
 
     await step('confirm the container migrated off the worker (2-node cluster: only place left is the control plane)', async () => {
-      const [workerContainers, cpContainers] = await Promise.all([
-        dockerPsNames(WORKER_CONTAINER),
-        dockerPsNames(CONTROL_PLANE_CONTAINER),
-      ])
+      // `drain_complete` means the source node has no remaining containers
+      // and is safe to remove. The replacement deployment is queued
+      // asynchronously, so its Docker container can appear a few seconds
+      // later. Poll the actual data plane instead of racing that queue.
+      let workerContainers: string[] = []
+      let cpContainers: string[] = []
+      await pollUntil(
+        async () => {
+          ;[workerContainers, cpContainers] = await Promise.all([
+            dockerPsNames(WORKER_CONTAINER),
+            dockerPsNames(CONTROL_PLANE_CONTAINER),
+          ])
+          return {
+            onWorker: workerContainers.some((n) => n.includes(runId)),
+            onControlPlane: cpContainers.some((n) => n.includes(runId)),
+          }
+        },
+        (placement) => !placement.onWorker && placement.onControlPlane,
+        {
+          timeoutMs: 60_000,
+          intervalMs: 1000,
+          onPoll: (placement) =>
+            log(
+              `    ...post-drain placement worker=${placement.onWorker} control-plane=${placement.onControlPlane}`,
+            ),
+          label: 'replacement container to become visible on the control plane after drain',
+        },
+      )
       const onWorker = workerContainers.some((n) => n.includes(runId))
+      const onControlPlane = cpContainers.some((n) => n.includes(runId))
       if (onWorker) {
         throw new Error(
           `deployment container still present on worker-1's docker ps after drain (containers: ${workerContainers.join(', ')})`,
         )
       }
+      if (!onControlPlane) {
+        throw new Error(
+          `deployment container was not recreated on the control plane after drain (containers: ${cpContainers.join(', ') || '(none)'})`,
+        )
+      }
       log(`  post-drain: worker-1=[${workerContainers.join(', ')}] control-plane=[${cpContainers.join(', ')}]`)
+
+      await assertNotConsoleFallback({ url: target.url, headers: target.headers, timeoutMs: 60_000 })
     })
 
     await step('remove the worker node', async () => {
@@ -471,6 +585,20 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         await adminRemoveNode({ client: client!, path: { node_id: workerNodeId! } }),
         'adminRemoveNode',
       )
+    })
+
+    await step('reject replay of the consumed enrollment token after node removal', async () => {
+      const replay = await runCaptured([
+        'docker',
+        'exec',
+        WORKER_CONTAINER,
+        'bash',
+        '-c',
+        'read -r token < /run/temps-bootstrap/join_token.txt; TEMPS_JOIN_TOKEN="$token" /usr/local/bin/temps join http://10.52.0.10:80 "$token" --name worker-1 --private-address 10.52.0.21 --agent-address 0.0.0.0:3100',
+      ])
+      if (replay.code === 0) {
+        throw new Error('consumed single-use enrollment token unexpectedly registered the removed node again')
+      }
     })
 
     await step('confirm the node is gone from GET /internal/nodes', async () => {
@@ -483,6 +611,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     // Failure already recorded in `steps`; fall through to teardown.
   } finally {
     if (opts.keep) {
+      await revokeTemporaryApiKey()
       log(`\n(kept: entire 2-node cluster left running -- 'docker compose -f ${composeFile} -p ${COMPOSE_PROJECT} down' to stop it)`)
     } else {
       // Best-effort SDK-level teardown first (project/deployments), then tear
@@ -495,7 +624,8 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         )
         for (const e of td.errors) log(`    ! ${e}`)
       }
-      if (clusterUp) {
+      await revokeTemporaryApiKey()
+      if (clusterStartAttempted) {
         log('\n▶ teardown: docker compose down (preserving cache volumes for a fast re-run)')
         try {
           await runStreamed(

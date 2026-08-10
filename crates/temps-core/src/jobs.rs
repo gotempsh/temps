@@ -51,6 +51,10 @@ pub struct GitPushEventJob {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DeployImageRequestedJob {
     pub project_id: i32,
+    /// Restrict the deployment to one environment. `None` preserves the
+    /// project-wide template/import behavior for older queued jobs.
+    #[serde(default)]
+    pub target_environment_id: Option<i32>,
     /// Docker image reference to pull and run (e.g. "ghcr.io/org/app:latest").
     pub image_ref: String,
     /// Optional HTTP health-check path probed after the container starts.

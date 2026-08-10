@@ -495,7 +495,7 @@ impl NodeService {
 
             tracing::info!(
                 node_id = node_id,
-                "Node drain complete — all containers migrated, status set to drained"
+                "Node drain source cleanup complete — no containers remain, status set to drained"
             );
             return Ok(true);
         }

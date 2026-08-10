@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -227,7 +227,8 @@ impl MarkDeploymentCompleteJob {
         // graceful stop per container) and doesn't need serialization —
         // the route table already points to the new deployment.
         if result.is_ok() {
-            self.cancel_previous_deployments(environment_id).await;
+            self.cancel_previous_deployments(environment_id, deployment.created_at)
+                .await;
         }
 
         result
@@ -1532,14 +1533,18 @@ impl MarkDeploymentCompleteJob {
     /// teardown passes — bounding this work regardless of how much deployment
     /// history accumulates. The route table already points at the new
     /// deployment (via `environments.current_deployment_id`) before this runs.
-    async fn cancel_previous_deployments(&self, environment_id: i32) {
+    async fn cancel_previous_deployments(
+        &self,
+        environment_id: i32,
+        current_created_at: chrono::DateTime<chrono::Utc>,
+    ) {
         use sea_orm::Set;
 
         self.log("Checking for previous deployments to teardown...".to_string())
             .await
             .ok();
 
-        // Find previous active deployments for this environment (excluding the new one).
+        // Find active deployments that are chronologically older than this one.
         //
         // "failed" is intentionally excluded to preserve error history. Once a
         // deployment is torn down here its state is flipped to "stopped" (see
@@ -1552,9 +1557,21 @@ impl MarkDeploymentCompleteJob {
         // The result is additionally capped (newest-first) so that even a large
         // backlog of un-processed rows can't make a single pass run for minutes;
         // anything beyond the cap is handled by the next deployment's sweep.
+        // Filtering only `id != current` lets a slower older workflow tear down
+        // a newer deployment that completed while the older job was waiting on
+        // route propagation. Compare creation order explicitly; ID is the
+        // deterministic tie-breaker for equal timestamps.
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::Id.ne(self.deployment_id))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_created_at))
+                            .add(deployments::Column::Id.lt(self.deployment_id)),
+                    ),
+            )
             .filter(deployments::Column::State.is_in(vec![
                 "pending",
                 "running",
@@ -2105,7 +2122,8 @@ mod teardown_tests {
         let deployer = Arc::new(RecordingDeployer::new());
         let job = make_job(db.clone(), new.id, deployer.clone());
 
-        job.cancel_previous_deployments(env.id).await;
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
 
         // The previous deployment is now "stopped" and won't be re-scanned.
         let prev_after = deployments::Entity::find_by_id(prev.id)
@@ -2135,7 +2153,8 @@ mod teardown_tests {
 
         // A second teardown pass finds nothing to do — proving the scan is
         // bounded and "stopped" deployments are not re-processed.
-        job.cancel_previous_deployments(env.id).await;
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
         assert_eq!(
             deployer.stopped.lock().unwrap().len(),
             1,
@@ -2161,7 +2180,8 @@ mod teardown_tests {
 
         let deployer = Arc::new(RecordingDeployer::new());
         let job = make_job(db.clone(), new.id, deployer.clone());
-        job.cancel_previous_deployments(env.id).await;
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
 
         let failed_after = deployments::Entity::find_by_id(failed.id)
             .one(db.as_ref())
@@ -2173,5 +2193,40 @@ mod teardown_tests {
             "failed deployments must be left untouched"
         );
         assert!(deployer.stopped.lock().unwrap().is_empty());
+    }
+
+    /// A slow older completion must never tear down a newer deployment that
+    /// became healthy while the old job was waiting for route propagation.
+    #[tokio::test]
+    async fn test_teardown_from_older_job_preserves_newer_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let (project, env) = seed_project_env(&db).await;
+        let old = insert_deployment(&db, project.id, env.id, "old-deploy", "completed").await;
+        insert_container(&db, old.id, "old-container").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer-deploy", "completed").await;
+        insert_container(&db, newer.id, "newer-container").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let stale_job = make_job(db.clone(), old.id, deployer.clone());
+        stale_job
+            .cancel_previous_deployments(env.id, old.created_at)
+            .await;
+
+        let newer_after = deployments::Entity::find_by_id(newer.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer_after.state, "completed");
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        assert!(deployer.removed.lock().unwrap().is_empty());
     }
 }
