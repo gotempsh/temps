@@ -32,6 +32,7 @@ use crate::services::job_tracker::JobTracker;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::snapshot_service::SnapshotService;
 
 /// Optional initial content to seed into the sandbox after create.
 /// Mirrors `@vercel/sandbox`'s `source: { type, url, revision?, username?,
@@ -168,6 +169,11 @@ pub struct CreateSandboxRequest {
     /// Project to derive the repo from when `source` is absent, and to
     /// attribute the sandbox to. `None` → unattached sandbox.
     pub project_id: Option<i32>,
+    /// Pre-resolved snapshot artifact (ADR-037). When `Some`, the sandbox
+    /// is created via `provider.create_from_snapshot` instead of
+    /// `provider.create`. Mutually exclusive with `image`; validated in the
+    /// handler before this field is populated.
+    pub from_snapshot_artifact: Option<temps_agents::sandbox::SnapshotArtifact>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -441,6 +447,10 @@ pub struct SandboxService {
     /// allocated. Each sandbox gets `{data_dir}/{public_id}/` bind-mounted
     /// to `/workspace` inside the container.
     data_root: PathBuf,
+    /// Snapshot service for nullifying `source_sandbox_id` references when
+    /// a sandbox is destroyed (ADR-037). `None` when snapshots are not
+    /// enabled for this deployment (e.g. Firecracker-only).
+    snapshot_service: Option<Arc<SnapshotService>>,
 }
 
 impl SandboxService {
@@ -461,7 +471,15 @@ impl SandboxService {
             cookie_crypto,
             git_provider_manager,
             data_root,
+            snapshot_service: None,
         }
+    }
+
+    /// Set the snapshot service after construction (two-phase init).
+    /// Called by the plugin once both services are registered (ADR-037).
+    pub fn with_snapshot_service(mut self, svc: Arc<SnapshotService>) -> Self {
+        self.snapshot_service = Some(svc);
+        self
     }
 
     pub fn registry(&self) -> &StandaloneSandboxRegistry {
@@ -994,7 +1012,16 @@ impl SandboxService {
             backend,
         };
 
-        let handle = match self.registry.create(config).await {
+        // Choose create path: snapshot restore vs normal create.
+        let create_result = if let Some(ref artifact) = req.from_snapshot_artifact {
+            // ADR-037: restore from snapshot. The provider ensures the image
+            // is loaded into the daemon before creating the container.
+            self.registry.create_from_snapshot(artifact, config).await
+        } else {
+            self.registry.create(config).await
+        };
+
+        let handle = match create_result {
             Ok(h) => h,
             Err(e) => {
                 // Tear the container down before touching the work dir.
@@ -1408,6 +1435,22 @@ TEMPS_ASKPASS_EOF\n\
         self.remove_work_dir(public_id_value).await;
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
+
+        // Nullify source_sandbox_id on any snapshot that references this
+        // sandbox (ADR-037). Best-effort: a failure here is not fatal to
+        // the destroy — the snapshot rows still exist and are usable, they
+        // just carry a stale integer reference to a now-gone sandbox.
+        if let Some(ref snap_svc) = self.snapshot_service {
+            if let Err(e) = snap_svc.nullify_source_sandbox(row.id).await {
+                tracing::warn!(
+                    sandbox_id = %public_id_value,
+                    internal_id = row.id,
+                    "destroy: failed to nullify source_sandbox_id on snapshots: {}",
+                    e
+                );
+            }
+        }
+
         Ok(())
     }
 

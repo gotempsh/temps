@@ -1,0 +1,485 @@
+//! Snapshot API handlers (ADR-037).
+//!
+//! Routes:
+//! - `POST /v1/sandboxes/{id}/snapshots`    — create snapshot (202)
+//! - `GET  /v1/sandbox-snapshots`           — list snapshots for user
+//! - `GET  /v1/sandbox-snapshots/storage-summary` — quota usage
+//! - `GET  /v1/sandbox-snapshots/{snap_id}` — get single snapshot
+//! - `DELETE /v1/sandbox-snapshots/{snap_id}` — soft-delete snapshot
+//!
+//! All handlers follow the three-layer pattern: RequireAuth + permission
+//! check → service call → typed DTO. No DB access here.
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use temps_auth::{permissions::Permission, RequireAuth};
+use temps_core::problemdetails::{self, Problem};
+
+use crate::error::SandboxSnapshotError;
+use crate::handlers::SandboxAppState;
+use crate::services::snapshot_service::StorageSummary;
+
+// ── Error → Problem conversion ───────────────────────────────────────────────
+
+impl From<SandboxSnapshotError> for Problem {
+    fn from(error: SandboxSnapshotError) -> Self {
+        match error {
+            SandboxSnapshotError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Snapshot Not Found")
+                .with_detail(error.to_string()),
+            SandboxSnapshotError::NotReady { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Snapshot Not Ready")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::CrossBackendRestore { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Cross-Backend Restore Not Supported")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::NotSupported { .. } => {
+                problemdetails::new(StatusCode::NOT_IMPLEMENTED)
+                    .with_title("Snapshots Not Supported")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::QuotaExceeded { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Snapshot Quota Exceeded")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::InvalidState { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Invalid Sandbox State")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::SandboxNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Sandbox Not Found")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::ScrubFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Credential Scrub Failed")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::DigestMismatch { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Snapshot Digest Mismatch")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::ArtifactMissing { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Snapshot Artifact Missing")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::Database(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(error.to_string()),
+            SandboxSnapshotError::Provider(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Provider Error")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
+
+// ── DTOs ─────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /v1/sandboxes/{id}/snapshots`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSnapshotBody {
+    /// Optional human-readable label for the snapshot.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Single snapshot as returned by the API.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SnapshotResponse {
+    pub id: String,
+    pub status: String,
+    pub backend: String,
+    pub label: Option<String>,
+    pub content_digest: String,
+    pub size_bytes: i64,
+    pub image_ref: Option<String>,
+    pub source_sandbox_id: Option<i32>,
+    pub project_id: Option<i32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<temps_entities::sandbox_snapshots::Model> for SnapshotResponse {
+    fn from(m: temps_entities::sandbox_snapshots::Model) -> Self {
+        Self {
+            id: m.public_id,
+            status: m.status,
+            backend: m.backend,
+            label: m.label,
+            content_digest: m.content_digest,
+            size_bytes: m.size_bytes,
+            image_ref: m.image_ref,
+            source_sandbox_id: m.source_sandbox_id,
+            project_id: m.project_id,
+            created_at: m.created_at.to_rfc3339(),
+            updated_at: m.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Paginated list of snapshots.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListSnapshotsResponse {
+    pub snapshots: Vec<SnapshotResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
+}
+
+/// Query params for `GET /v1/sandbox-snapshots`.
+#[derive(Debug, Deserialize)]
+pub struct ListSnapshotsQuery {
+    #[serde(default)]
+    pub project_id: Option<i32>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub page: Option<u64>,
+    #[serde(default)]
+    pub page_size: Option<u64>,
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+/// `POST /v1/sandboxes/{id}/snapshots`
+///
+/// Initiates a snapshot of the sandbox. The response is **202 Accepted**
+/// with the snapshot row in `creating` status. The caller should poll
+/// `GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or
+/// `failed`.
+///
+/// The sandbox is stopped for the duration of the snapshot and restarted
+/// automatically when it completes (unless it was already stopped).
+#[utoipa::path(
+    tag = "Snapshots",
+    post,
+    path = "/v1/sandboxes/{id}/snapshots",
+    params(("id" = String, Path, description = "Sandbox public ID")),
+    request_body = CreateSnapshotBody,
+    responses(
+        (status = 202, description = "Snapshot initiated", body = SnapshotResponse),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Sandbox not found"),
+        (status = 422, description = "Quota exceeded or invalid state"),
+        (status = 500, description = "Internal error"),
+        (status = 501, description = "Snapshots not supported by backend"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_snapshot(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(sandbox_id): Path<String>,
+    Json(body): Json<CreateSnapshotBody>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::handlers::sandboxes::sandbox_permission_guard;
+    sandbox_permission_guard(
+        &auth,
+        Permission::SandboxesWrite,
+        Permission::SandboxesWrite,
+    )?;
+
+    let user_id = auth.user_id();
+
+    // Resolve the sandbox (ownership check + not-destroyed guard inside
+    // find_by_public_id; non-owners get NotFound so we don't leak existence).
+    let sandbox = state
+        .sandbox_service
+        .find_by_public_id(&sandbox_id, user_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+        Problem::from(SandboxSnapshotError::NotSupported {
+            backend: "unknown".to_string(),
+        })
+    })?;
+
+    let snap = snapshot_svc
+        .create_snapshot(
+            sandbox.id,
+            &sandbox_id,
+            user_id,
+            sandbox.project_id,
+            body.label,
+        )
+        .await
+        .map_err(Problem::from)?;
+
+    let location = format!("/v1/sandbox-snapshots/{}", snap.public_id);
+
+    tracing::info!(
+        user_id = %user_id,
+        sandbox_id = %sandbox_id,
+        snapshot_id = %snap.public_id,
+        "snapshot: created"
+    );
+
+    let resp = SnapshotResponse::from(snap);
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, location)],
+        Json(resp),
+    ))
+}
+
+/// `GET /v1/sandbox-snapshots`
+#[utoipa::path(
+    tag = "Snapshots",
+    get,
+    path = "/v1/sandbox-snapshots",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Filter by project"),
+        ("status" = Option<String>, Query, description = "Filter by status"),
+        ("page" = Option<u64>, Query, description = "Page number (1-indexed)"),
+        ("page_size" = Option<u64>, Query, description = "Page size (max 100)"),
+    ),
+    responses(
+        (status = 200, description = "List of snapshots", body = ListSnapshotsResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_snapshots(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Query(query): Query<ListSnapshotsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::handlers::sandboxes::sandbox_permission_guard;
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::SandboxesRead)?;
+
+    let user_id = auth.user_id();
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(20);
+
+    let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+        Problem::from(SandboxSnapshotError::NotSupported {
+            backend: "unknown".to_string(),
+        })
+    })?;
+
+    let (rows, total) = snapshot_svc
+        .list_snapshots(user_id, query.project_id, query.status, page, page_size)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(ListSnapshotsResponse {
+        snapshots: rows.into_iter().map(SnapshotResponse::from).collect(),
+        total,
+        page,
+        page_size,
+    }))
+}
+
+/// `GET /v1/sandbox-snapshots/storage-summary`
+#[utoipa::path(
+    tag = "Snapshots",
+    get,
+    path = "/v1/sandbox-snapshots/storage-summary",
+    responses(
+        (status = 200, description = "Storage usage summary", body = StorageSummary),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn storage_summary(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::handlers::sandboxes::sandbox_permission_guard;
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::SandboxesRead)?;
+
+    let user_id = auth.user_id();
+
+    let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+        Problem::from(SandboxSnapshotError::NotSupported {
+            backend: "unknown".to_string(),
+        })
+    })?;
+
+    let summary = snapshot_svc
+        .storage_summary(user_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(summary))
+}
+
+/// `GET /v1/sandbox-snapshots/{snap_id}`
+#[utoipa::path(
+    tag = "Snapshots",
+    get,
+    path = "/v1/sandbox-snapshots/{snap_id}",
+    params(("snap_id" = String, Path, description = "Snapshot public ID")),
+    responses(
+        (status = 200, description = "Snapshot detail", body = SnapshotResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_snapshot(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(snap_id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::handlers::sandboxes::sandbox_permission_guard;
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::SandboxesRead)?;
+
+    let user_id = auth.user_id();
+
+    let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+        Problem::from(SandboxSnapshotError::NotFound {
+            snapshot_id: snap_id.clone(),
+        })
+    })?;
+
+    let row = snapshot_svc
+        .get_snapshot(user_id, &snap_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(SnapshotResponse::from(row)))
+}
+
+/// `DELETE /v1/sandbox-snapshots/{snap_id}`
+#[utoipa::path(
+    tag = "Snapshots",
+    delete,
+    path = "/v1/sandbox-snapshots/{snap_id}",
+    params(("snap_id" = String, Path, description = "Snapshot public ID")),
+    responses(
+        (status = 204, description = "Snapshot deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_snapshot(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(snap_id): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::handlers::sandboxes::sandbox_permission_guard;
+    sandbox_permission_guard(
+        &auth,
+        Permission::SandboxesWrite,
+        Permission::SandboxesWrite,
+    )?;
+
+    let user_id = auth.user_id();
+
+    let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+        Problem::from(SandboxSnapshotError::NotFound {
+            snapshot_id: snap_id.clone(),
+        })
+    })?;
+
+    // Audit: log before delete so we have a record even on failure.
+    tracing::info!(
+        user_id = %user_id,
+        snapshot_id = %snap_id,
+        "snapshot: user requested delete"
+    );
+
+    snapshot_svc
+        .delete_snapshot(user_id, &snap_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_response_from_model() {
+        use chrono::Utc;
+        use temps_entities::sandbox_snapshots;
+
+        let now = Utc::now();
+        let model = sandbox_snapshots::Model {
+            id: 1,
+            public_id: "snap_aabbccdd11223344".to_string(),
+            user_id: 42,
+            project_id: None,
+            source_sandbox_id: Some(7),
+            label: Some("my snap".to_string()),
+            status: "ready".to_string(),
+            backend: "docker".to_string(),
+            content_digest: "abc123".to_string(),
+            content_path: "/data/snapshots/abc123.tar".to_string(),
+            size_bytes: 100_000_000,
+            image_ref: Some("temps-snapshot/my-snap:latest".to_string()),
+            metadata: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let resp = SnapshotResponse::from(model);
+        assert_eq!(resp.id, "snap_aabbccdd11223344");
+        assert_eq!(resp.status, "ready");
+        assert_eq!(resp.backend, "docker");
+        assert_eq!(resp.size_bytes, 100_000_000);
+        assert_eq!(resp.source_sandbox_id, Some(7));
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_not_found_to_404() {
+        let err = SandboxSnapshotError::NotFound {
+            snapshot_id: "snap_x".to_string(),
+        };
+        let prob = Problem::from(err);
+        assert_eq!(prob.status_code.as_u16(), 404);
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_quota_exceeded_to_422() {
+        let err = SandboxSnapshotError::QuotaExceeded {
+            user_id: 1,
+            used_bytes: 11_000_000_000,
+            quota_bytes: 10_000_000_000,
+        };
+        let prob = Problem::from(err);
+        assert_eq!(prob.status_code.as_u16(), 422);
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_not_supported_to_501() {
+        let err = SandboxSnapshotError::NotSupported {
+            backend: "local".to_string(),
+        };
+        let prob = Problem::from(err);
+        assert_eq!(prob.status_code.as_u16(), 501);
+    }
+}

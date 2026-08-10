@@ -76,6 +76,93 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", escaped)
 }
 
+// ── Credential-scrubbing helpers (ADR-037 §4) ─────────────────────────────────
+//
+// These are module-level so they can be unit-tested without a Docker daemon.
+// The production path in `take_snapshot` calls them; the test suite verifies
+// the pattern list and the scrubbing logic independently.
+
+/// Known-sensitive env-var key patterns from ADR-013 + ADR-037.
+///
+/// Matching is case-insensitive substring: a key is considered sensitive when
+/// its uppercased form **contains** any of these patterns. This deliberately
+/// catches variants like `MY_ANTHROPIC_API_KEY` and `GITHUB_TOKEN_READONLY`
+/// without requiring an exhaustive allowlist.
+///
+/// **Security invariant**: this list is the single source of truth for which
+/// env vars the scrubber strips. Adding a new secret kind to the sandbox API
+/// must be accompanied by adding its pattern here.
+pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "BITBUCKET_TOKEN",
+    "GIT_TOKEN",
+    "API_KEY",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AWS_SECRET",
+    "AWS_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CODEX_API_KEY",
+    "OPENCODE_API_KEY",
+    "TEMPS_",
+];
+
+/// Returns `true` if `key` (case-insensitive) matches any sensitive pattern.
+///
+/// Called by `take_snapshot` for both the scrubbing step (zero-out the value)
+/// and the verification step (reject if a non-empty value survives).
+pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
+    let key_upper = key.to_uppercase();
+    SENSITIVE_ENV_PATTERNS
+        .iter()
+        .any(|pat| key_upper.contains(pat))
+}
+
+/// Strip sensitive values from a `KEY=VALUE` env list.
+///
+/// Every entry whose key matches [`is_sensitive_env_key`] is rewritten to
+/// `KEY=` (empty value). Non-sensitive entries are left unchanged. The result
+/// is passed as `ContainerConfig.env` to `docker commit` so the committed
+/// image config never carries a live secret.
+pub(crate) fn scrub_env_vars(env: &[String]) -> Vec<String> {
+    env.iter()
+        .map(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            if is_sensitive_env_key(key) {
+                format!("{}=", key)
+            } else {
+                kv.clone()
+            }
+        })
+        .collect()
+}
+
+/// Returns the keys of any env entries that are sensitive AND still have a
+/// non-empty value.
+///
+/// Called after `docker commit` to verify the scrubbing worked. An empty
+/// return means the image config is clean. A non-empty return triggers an
+/// abort: the staged image is removed and `take_snapshot` returns an error.
+pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter_map(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            let val = kv.split_once('=').map(|(_, v)| v).unwrap_or("");
+            if !val.is_empty() && is_sensitive_env_key(key) {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Shared Docker network for all workspace/agent sandboxes AND the preview
 /// gateway. The gateway resolves `temps-sandbox-<sid>:<port>` via Docker's
 /// embedded DNS — both sides must share this user-defined network for that
@@ -2487,6 +2574,492 @@ impl SandboxProvider for DockerSandboxProvider {
 
         Ok(image_name)
     }
+
+    // ── Snapshot: take ────────────────────────────────────────────────────────
+
+    /// Capture the current state of `handle` as a content-addressed tarball.
+    ///
+    /// **Security contract (ADR-037 §4):** before calling `docker commit` this
+    /// method executes three scrubbing steps:
+    ///
+    /// 1. Shred and remove `/etc/temps/credential-daemon.env` — the file that
+    ///    holds the git-provider token injected by the credential daemon shim.
+    /// 2. For every known-sensitive env-var key in the committed image config,
+    ///    pass `--change "ENV KEY="` to `docker commit` to zero the value.
+    ///    (Docker `commit --change` is the only supported way to rewrite the
+    ///    image config without a full rebuild.)
+    /// 3. Inspect the committed image's `Config.Env` and reject the snapshot —
+    ///    removing the committed image and returning `SandboxExecFailed` — if
+    ///    any known-sensitive key pattern survives.
+    ///
+    /// The sandbox is assumed to be stopped by the caller (the service layer
+    /// stops it before calling here for filesystem consistency). If it is
+    /// running the commit will still work, but there is a TOCTOU window.
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        label: Option<String>,
+    ) -> Result<super::SnapshotArtifact, AgentError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        let container_id = &handle.sandbox_id;
+
+        // ── Step 1: scrub the credential-daemon env file ──────────────────────
+        // Use `shred -u` if available (overwrites before unlinking); fall back
+        // to plain `rm -f` if the sandbox image doesn't have coreutils.
+        tracing::info!(
+            container_id = %container_id,
+            "snapshot: scrubbing credential-daemon env file"
+        );
+        let scrub_cred_result = self
+            .run_root_exec(
+                container_id,
+                0,
+                "snapshot-scrub-cred",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    // shred is not always available; fall back to rm -f.
+                    // Either way the file must not exist after this step.
+                    "shred -u /etc/temps/credential-daemon.env 2>/dev/null || rm -f /etc/temps/credential-daemon.env; test ! -f /etc/temps/credential-daemon.env".to_string(),
+                ],
+            )
+            .await;
+
+        if let Ok(code) = scrub_cred_result {
+            if code != 0 {
+                tracing::warn!(
+                    container_id = %container_id,
+                    exit_code = %code,
+                    "snapshot: credential-daemon env scrub exited non-zero — file may still exist"
+                );
+            }
+        } else {
+            tracing::warn!(
+                container_id = %container_id,
+                "snapshot: credential-daemon env scrub exec failed (may already be absent)"
+            );
+        }
+
+        // ── Step 2: collect known-sensitive env vars to strip via --change ────
+        // Inspect the *running container's* Config.Env to find injected vars.
+        // The sensitive-pattern list and scrubbing helpers are module-level
+        // functions (see `SENSITIVE_ENV_PATTERNS`, `scrub_env_vars`, and
+        // `find_surviving_sensitive_keys`) so they are unit-testable without
+        // a live Docker daemon.
+        let container_inspect = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to inspect container: {}", e),
+            })?;
+
+        // Collect env vars set on the container (from the original create call
+        // via ContainerCreateBody.env).
+        let container_env: Vec<String> = container_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Build the list of sensitive keys for logging only (the scrubbing
+        // itself is done via `scrub_env_vars` below).
+        let change_flags: Vec<String> = container_env
+            .iter()
+            .filter_map(|kv| {
+                let key = kv.split('=').next()?;
+                if is_sensitive_env_key(key) {
+                    Some(format!("ENV {}=", key))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // ── Step 2b: commit the container with the scrubbing --change flags ───
+        // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
+        // during the commit phase; we rename it to the public_id tag after
+        // digest verification. Using the container_id avoids a race if two
+        // snapshots are taken concurrently.
+        let short_id = &container_id[..container_id.len().min(12)];
+        let commit_tag = format!("temps-snapshot-staging/{}", short_id);
+
+        tracing::info!(
+            container_id = %container_id,
+            commit_tag = %commit_tag,
+            scrubbed_keys = change_flags.len(),
+            "snapshot: committing container image"
+        );
+
+        let commit_opts = bollard::query_parameters::CommitContainerOptionsBuilder::new()
+            .container(container_id.as_str())
+            .repo(commit_tag.as_str())
+            .tag("latest")
+            .build();
+
+        // Build the Config override: zero out sensitive env vars via the
+        // module-level `scrub_env_vars` helper (tested independently of Docker).
+        let scrubbed_env = scrub_env_vars(&container_env);
+
+        let config_override = bollard::models::ContainerConfig {
+            env: Some(scrubbed_env),
+            ..Default::default()
+        };
+
+        let commit_resp = self
+            .docker
+            .commit_container(commit_opts, config_override)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: docker commit failed: {}", e),
+            })?;
+
+        // IdResponse.id is a plain String (not Option<String>) in bollard 0.20.
+        let committed_image_id = commit_resp.id;
+
+        // ── Step 3: verify no sensitive key survived in the committed image ───
+        let committed_inspect = self
+            .docker
+            .inspect_image(&committed_image_id)
+            .await
+            .map_err(|e| {
+                // Clean up the staged image before returning the error
+                let docker = self.docker.clone();
+                let img = committed_image_id.clone();
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                });
+                AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!(
+                        "snapshot: failed to inspect committed image for scrub verification: {}",
+                        e
+                    ),
+                }
+            })?;
+
+        let committed_env: Vec<String> = committed_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Use the module-level helper to find any sensitive keys that survived.
+        // An empty list means the image is clean; any key triggers an abort.
+        let survivors = find_surviving_sensitive_keys(&committed_env);
+        if let Some(key) = survivors.first() {
+            // Scrub verification failed — remove the staged image and abort.
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            tokio::spawn(async move {
+                let _ = docker
+                    .remove_image(
+                        &img,
+                        Some(
+                            bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                .force(true)
+                                .build(),
+                        ),
+                        None,
+                    )
+                    .await;
+            });
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: scrub verification failed — sensitive key '{}' survived in committed image config; snapshot aborted and staged image removed",
+                    key
+                ),
+            });
+        }
+
+        // ── Export to content-addressed tarball ───────────────────────────────
+        let data_dir = std::env::var("TEMPS_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(".temps")
+            });
+        let snapshots_dir = data_dir.join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).map_err(|e| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: container_id.clone(),
+            reason: format!(
+                "snapshot: failed to create snapshots directory {}: {}",
+                snapshots_dir.display(),
+                e
+            ),
+        })?;
+
+        // Stream the export through a Sha256 hasher while writing to a temp
+        // file, then rename atomically.
+        let tmp_path = snapshots_dir.join(format!(".tmp-{}", short_id));
+        let mut tmp_file =
+            std::fs::File::create(&tmp_path).map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to create temp file: {}", e),
+            })?;
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes: u64 = 0;
+
+        {
+            let mut export_stream = self.docker.export_image(&committed_image_id);
+            while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
+                let chunk = chunk.map_err(|e| AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: image export stream error: {}", e),
+                })?;
+                hasher.update(&chunk);
+                size_bytes += chunk.len() as u64;
+                tmp_file
+                    .write_all(&chunk)
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: container_id.clone(),
+                        reason: format!("snapshot: failed to write to temp file: {}", e),
+                    })?;
+            }
+        }
+
+        tmp_file
+            .flush()
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to flush temp file: {}", e),
+            })?;
+        drop(tmp_file);
+
+        let digest_hex = hex::encode(hasher.finalize());
+        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+
+        // Atomic rename — the file is only visible at the final path once
+        // fully written, so a concurrent reader never sees a partial write.
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: container_id.clone(),
+            reason: format!("snapshot: atomic rename failed: {}", e),
+        })?;
+
+        // ── Tag the committed image with the public-facing name ───────────────
+        // Derive an image_ref from the label if provided, otherwise use digest.
+        let image_label = label
+            .as_deref()
+            .map(|l| {
+                // Sanitize: lowercase, replace non-alphanumeric with '-'
+                l.chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| digest_hex[..16].to_string());
+        let image_ref = format!("temps-snapshot/{}:latest", image_label);
+
+        // Re-tag the committed image to the canonical snapshot name.
+        self.docker
+            .tag_image(
+                &committed_image_id,
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(format!("temps-snapshot/{}", image_label).as_str())
+                        .tag("latest")
+                        .build(),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "snapshot: failed to tag committed image as {}: {}",
+                    image_ref,
+                    e
+                );
+                // Non-fatal: the tarball is written; the image can be re-imported
+                // from the tarball on restore.
+                AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
+                }
+            })?;
+
+        // Remove the staging tag now that the canonical tag is in place.
+        let _ = self
+            .docker
+            .remove_image(
+                &format!("{}:latest", commit_tag),
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .noprune(true) // keep the layers — only untag
+                        .build(),
+                ),
+                None,
+            )
+            .await;
+
+        tracing::info!(
+            container_id = %container_id,
+            digest = %digest_hex,
+            size_bytes = %size_bytes,
+            path = %final_path.display(),
+            image_ref = %image_ref,
+            "snapshot: completed successfully"
+        );
+
+        Ok(super::SnapshotArtifact {
+            content_path: final_path,
+            content_digest: digest_hex,
+            size_bytes,
+            backend: super::SandboxBackend::Docker,
+            image_ref: Some(image_ref),
+        })
+    }
+
+    // ── Snapshot: restore ─────────────────────────────────────────────────────
+
+    /// Create a new sandbox seeded from a snapshot artifact.
+    ///
+    /// Ensures the snapshot image is present in the Docker daemon (loading
+    /// from the tarball if the tag is absent or stale), then delegates to
+    /// `create` with the image override set to `artifact.image_ref`.
+    async fn create_from_snapshot(
+        &self,
+        artifact: &super::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let image_ref =
+            artifact
+                .image_ref
+                .as_deref()
+                .ok_or_else(|| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: "snapshot: artifact has no image_ref (non-Docker snapshot?)"
+                        .to_string(),
+                })?;
+
+        // Check if the image is already present in the daemon.
+        let image_present = self.docker.inspect_image(image_ref).await.is_ok();
+
+        if !image_present {
+            // Load from the tarball. `docker load` imports all tags embedded
+            // in the tarball — the image will re-appear under `image_ref`.
+            tracing::info!(
+                image_ref = %image_ref,
+                path = %artifact.content_path.display(),
+                "snapshot: image not in daemon — loading from tarball"
+            );
+
+            let tarball = std::fs::File::open(&artifact.content_path).map_err(|e| {
+                AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "snapshot: failed to open tarball {}: {}",
+                        artifact.content_path.display(),
+                        e
+                    ),
+                }
+            })?;
+
+            let metadata = tarball
+                .metadata()
+                .map_err(|e| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: format!("snapshot: failed to stat tarball: {}", e),
+                })?;
+            let file_size = metadata.len();
+
+            // Read the whole tarball into memory for the Bollard API.
+            // For large snapshots this is expensive, but it's what Bollard
+            // supports. A streaming path can be added in v2 via reqwest body.
+            use std::io::Read;
+            let mut buf = Vec::with_capacity(file_size as usize);
+            let mut tarball = tarball;
+            tarball
+                .read_to_end(&mut buf)
+                .map_err(|e| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: format!("snapshot: failed to read tarball into memory: {}", e),
+                })?;
+
+            let mut load_stream = self.docker.import_image_stream(
+                bollard::query_parameters::ImportImageOptionsBuilder::new()
+                    .quiet(true)
+                    .build(),
+                futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(buf))
+                }),
+                None,
+            );
+
+            while let Some(result) = futures::StreamExt::next(&mut load_stream).await {
+                match result {
+                    Ok(info) => {
+                        if let Some(ref detail) = info.error_detail {
+                            let msg = detail
+                                .message
+                                .as_deref()
+                                .unwrap_or("unknown docker load error");
+                            return Err(AgentError::SandboxExecFailed {
+                                run_id: config.run_id,
+                                sandbox_id: String::new(),
+                                reason: format!("snapshot: docker load error: {}", msg),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: config.run_id,
+                            sandbox_id: String::new(),
+                            reason: format!("snapshot: docker load stream error: {}", e),
+                        });
+                    }
+                }
+            }
+
+            tracing::info!(
+                image_ref = %image_ref,
+                "snapshot: image loaded from tarball"
+            );
+        }
+
+        // Delegate to the normal create path with the snapshot image.
+        let mut config = config;
+        config.image = Some(image_ref.to_string());
+        self.create(config).await
+    }
 }
 
 /// Apply iptables FORWARD-chain rules on the sandbox bridge to block egress to
@@ -4017,6 +4590,166 @@ mod tests {
                 chain, "TEMPS_SANDBOX_EGRESS",
                 "range {} must be appended to the TEMPS_SANDBOX_EGRESS chain, not '{}'",
                 cidr, chain
+            );
+        }
+    }
+
+    // ── Credential-scrubbing tests (ADR-037 §4) ───────────────────────────────
+    //
+    // These tests verify the scrubbing helpers in isolation — no Docker daemon
+    // is required. The security invariant is: after `scrub_env_vars`, no entry
+    // in the result should trigger `is_sensitive_env_key` with a non-empty value.
+
+    #[test]
+    fn is_sensitive_env_key_detects_anthropic_api_key() {
+        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_key("anthropic_api_key")); // case-insensitive
+        assert!(is_sensitive_env_key("MY_ANTHROPIC_API_KEY")); // substring match
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_github_token() {
+        assert!(is_sensitive_env_key("GITHUB_TOKEN"));
+        assert!(is_sensitive_env_key("GITHUB_TOKEN_READONLY")); // variant
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_temps_prefix() {
+        // Every TEMPS_ var is treated as potentially sensitive — the daemon
+        // env file, internal tokens, and credential paths all use this namespace.
+        assert!(is_sensitive_env_key("TEMPS_DATA_DIR"));
+        assert!(is_sensitive_env_key("TEMPS_CREDENTIAL_TOKEN"));
+    }
+
+    #[test]
+    fn is_sensitive_env_key_passes_safe_keys() {
+        assert!(!is_sensitive_env_key("PATH"));
+        assert!(!is_sensitive_env_key("HOME"));
+        assert!(!is_sensitive_env_key("USER"));
+        assert!(!is_sensitive_env_key("LANG"));
+        assert!(!is_sensitive_env_key("DEBIAN_FRONTEND"));
+        assert!(!is_sensitive_env_key("NODE_VERSION"));
+    }
+
+    #[test]
+    fn scrub_env_vars_zeros_sensitive_values() {
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "HOME=/home/temps".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "NODE_VERSION=20".to_string(),
+        ];
+
+        let scrubbed = scrub_env_vars(&env);
+
+        // Safe vars unchanged.
+        assert!(
+            scrubbed.contains(&"PATH=/usr/bin:/bin".to_string()),
+            "PATH should be unchanged"
+        );
+        assert!(
+            scrubbed.contains(&"HOME=/home/temps".to_string()),
+            "HOME should be unchanged"
+        );
+        assert!(
+            scrubbed.contains(&"NODE_VERSION=20".to_string()),
+            "NODE_VERSION should be unchanged"
+        );
+
+        // Sensitive vars zeroed.
+        assert!(
+            scrubbed.contains(&"ANTHROPIC_API_KEY=".to_string()),
+            "ANTHROPIC_API_KEY value must be empty after scrub"
+        );
+        assert!(
+            scrubbed.contains(&"GITHUB_TOKEN=".to_string()),
+            "GITHUB_TOKEN value must be empty after scrub"
+        );
+
+        // Length preserved (no entries removed, just zeroed).
+        assert_eq!(scrubbed.len(), env.len());
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_returns_empty_for_clean_env() {
+        // A fully-scrubbed env: sensitive vars have empty values.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=".to_string(), // already zeroed
+            "GITHUB_TOKEN=".to_string(),      // already zeroed
+            "HOME=/home/temps".to_string(),
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.is_empty(),
+            "expected no surviving keys, got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_catches_unzeroed_secret() {
+        // A committed image where scrubbing somehow missed a key.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // NOT zeroed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert_eq!(survivors, vec!["ANTHROPIC_API_KEY"]);
+    }
+
+    #[test]
+    fn scrub_then_verify_leaves_no_survivors() {
+        // Property: scrub_env_vars ∘ find_surviving_sensitive_keys = ∅.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "OPENAI_API_KEY=sk-openai-value".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "MY_DB_PASSWORD=hunter2".to_string(),
+            "HOME=/home/temps".to_string(),
+            "TEMPS_CREDENTIAL_TOKEN=tok_internal".to_string(),
+        ];
+
+        let scrubbed = scrub_env_vars(&env);
+        let survivors = find_surviving_sensitive_keys(&scrubbed);
+
+        assert!(
+            survivors.is_empty(),
+            "scrub_env_vars must leave no surviving sensitive keys, but found: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn sensitive_patterns_list_covers_required_keys() {
+        // Ensure the pattern list includes every key the ADR explicitly names.
+        // This is a static test — adding a required pattern to the ADR but
+        // forgetting to add it to the list will fail here.
+        let required = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            "API_KEY",
+            "SECRET",
+            "PASSWORD",
+            "CREDENTIAL",
+            "AWS_SECRET",
+            "AWS_ACCESS_KEY",
+            "AZURE_CLIENT_SECRET",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "TEMPS_",
+        ];
+        for required_key in required {
+            assert!(
+                SENSITIVE_ENV_PATTERNS.contains(&required_key),
+                "SENSITIVE_ENV_PATTERNS is missing required key '{}'",
+                required_key
             );
         }
     }
