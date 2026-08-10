@@ -5458,4 +5458,214 @@ mod tests {
         cleanup_test_analytics!(db);
         Ok(())
     }
+
+    /// Regression test for the bounce/exit-page "-" bug: a session's last
+    /// pageview has no next event to diff against, so `time_on_page` must
+    /// fall back to the session's own `last_accessed_at` instead of coming
+    /// back NULL. Covers `get_page_path_visitors` (the "Individual visits"
+    /// table).
+    #[tokio::test]
+    async fn test_get_page_path_visitors_bounce_has_real_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_page_path_visitors_bounce_duration");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        let window_start = now - chrono::Duration::hours(1);
+        let window_end = now + chrono::Duration::hours(1);
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("bounce-duration-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        // No page_leave and no next page_view exist for this session, so the
+        // query's only signal for how long the visitor stayed is the
+        // session's own last-activity timestamp -- 27s after the pageview.
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("cccccccc-0000-4000-8000-000000000003".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::seconds(27)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/bounce-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/bounce-page".to_string()),
+            href: Set("https://example.com/bounce-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let response = service
+            .get_page_path_visitors(
+                project.id,
+                "/bounce-page",
+                window_start,
+                window_end,
+                None,
+                1,
+                20,
+            )
+            .await?;
+
+        assert_eq!(response.sessions.len(), 1);
+        let session = &response.sessions[0];
+        assert!(
+            session.is_bounce,
+            "single-pageview session must be a bounce"
+        );
+        assert_eq!(
+            session.time_on_page,
+            Some(27),
+            "time_on_page must come from the session's last_accessed_at, not be NULL/\"-\""
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Same regression as above, for `get_visitor_journey` (the "Visitor
+    /// Journey" panel's per-event duration).
+    #[tokio::test]
+    async fn test_get_visitor_journey_exit_page_has_real_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_visitor_journey_exit_duration");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("journey-duration-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("dddddddd-0000-4000-8000-000000000004".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::seconds(19)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/journey-exit-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/journey-exit-page".to_string()),
+            href: Set("https://example.com/journey-exit-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let journey = service
+            .get_visitor_journey(test_visitor.id, project.id, None)
+            .await?
+            .expect("get_visitor_journey must return Some for an existing visitor");
+
+        let session = journey
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_row.id)
+            .expect("seeded session must appear in the journey");
+        let page_view_event = session
+            .events
+            .iter()
+            .find(|e| e.event_type == "page_view")
+            .expect("page_view event must appear in the session's events");
+
+        assert_eq!(
+            page_view_event.time_on_page,
+            Some(19),
+            "exit-page time_on_page must come from the session's last_accessed_at, not be NULL"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
 }
