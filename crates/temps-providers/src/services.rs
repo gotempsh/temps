@@ -37,6 +37,11 @@ use temps_core::EncryptionService;
 #[allow(dead_code)]
 const NONCE_LENGTH: usize = 12;
 
+/// Local cluster ports are published on Docker's IPv4 loopback interface.
+/// Keep control-plane connections on the same address: `localhost` may resolve
+/// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
+pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
 #[derive(Error, Debug)]
 pub enum ExternalServiceError {
     #[error("Service {id} not found")]
@@ -2676,7 +2681,7 @@ impl ExternalServiceManager {
         } else {
             // Local members publish their container port on the control-plane
             // host; Docker-internal names and addresses are not host-routable.
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
 
         Ok((host, port))
@@ -2886,7 +2891,7 @@ impl ExternalServiceManager {
         };
 
         // Resolve the monitor host: prefer overlay IP, fall back to the
-        // node's underlay address, then localhost. The monitor's host port
+        // node's underlay address, then the IPv4 loopback address. The monitor's host port
         // is `service_id * 10 + 6000` for the dev cluster; in general
         // `monitor.port` is what the lifecycle hook stored.
         let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
@@ -2905,7 +2910,7 @@ impl ExternalServiceManager {
                 }
             }
         } else {
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -3079,7 +3084,7 @@ impl ExternalServiceManager {
                 }
             }
         } else {
-            "localhost".to_string()
+            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -7284,11 +7289,7 @@ echo "[restore] Pre-seed complete"
         // Port bindings: map the container port to the same host port.
         // Each cluster member uses a unique port assigned by the manager so
         // there are no conflicts even when multiple members run on the same host.
-        let container_port_key = format!("{}/tcp", params.container_port);
-        let port_bindings = crate::utils::local_port_binding(
-            &container_port_key,
-            &params.container_port.to_string(),
-        );
+        let (exposed_ports, port_bindings) = cluster_member_port_config(params.container_port);
 
         // Wire the per-host Hickory resolver into the container's
         // resolv.conf so it can resolve `*.temps.local` natively
@@ -7318,6 +7319,14 @@ echo "[restore] Pre-seed complete"
             image: Some(params.image.clone()),
             env: Some(env),
             cmd: params.command.clone(),
+            // The postgres-ha image only declares 5432/tcp, while HA members
+            // listen on dynamically assigned ports (for example 6040-6042).
+            // Docker's create API requires the dynamic port in ExposedPorts as
+            // well as HostConfig.PortBindings. Docker Desktop happens to
+            // tolerate the binding alone, but Linux engines may leave it
+            // unpublished, producing a healthy container behind a refused
+            // localhost socket.
+            exposed_ports: Some(exposed_ports),
             host_config: Some(cluster_host_config),
             labels: Some(HashMap::from([
                 ("sh.temps.managed".to_string(), "true".to_string()),
@@ -10130,6 +10139,20 @@ echo "[restore] Pre-seed complete"
     }
 }
 
+/// Build the two matching pieces Docker requires to publish a cluster
+/// member's dynamically assigned port.
+fn cluster_member_port_config(
+    container_port: u16,
+) -> (
+    Vec<String>,
+    HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
+) {
+    let container_port_key = format!("{container_port}/tcp");
+    let port_bindings =
+        crate::utils::local_port_binding(&container_port_key, &container_port.to_string());
+    (vec![container_port_key], port_bindings)
+}
+
 /// Map our `ServiceResourceLimits` onto a bollard `ContainerUpdateBody`.
 ///
 /// CRITICAL: Docker uses `0` (not `null`) as the special value for
@@ -10706,7 +10729,7 @@ mod tests {
                 .stored_member_endpoint(41, &local)
                 .await
                 .expect("local persisted member should resolve"),
-            ("localhost".to_owned(), 5432)
+            (LOCAL_CLUSTER_HOST.to_owned(), 5432)
         );
 
         let mut remote = service_member_info(2, "cluster-node-2", "node", "running");
@@ -14563,5 +14586,19 @@ mod tests {
             "stopped member must be rejected: {}",
             msg
         );
+    }
+
+    #[test]
+    fn cluster_member_dynamic_port_is_exposed_and_bound_to_loopback() {
+        let (exposed_ports, bindings) = cluster_member_port_config(6040);
+
+        assert_eq!(exposed_ports, vec!["6040/tcp"]);
+        let binding = bindings
+            .get("6040/tcp")
+            .and_then(Option::as_ref)
+            .and_then(|entries| entries.first())
+            .expect("the exposed dynamic port must have a matching host binding");
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(binding.host_port.as_deref(), Some("6040"));
     }
 }

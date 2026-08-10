@@ -111,6 +111,12 @@ jobs:
             -c 'until mc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb --ignore-existing backup/temps-e2e-backups'
 
       - name: Prepare Temps instance
+        # Authenticate public GitHub API requests made by the git-deploy
+        # scenario. GitHub-hosted runners share the anonymous 60 req/hour
+        # quota, so --skip-git makes this scenario inherently flaky. The
+        # workflow token is read-only, job-scoped, and automatically masked.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$TEMPS_DATA_DIR"
           cp crates/temps-cli/GeoLite2-City.mmdb "$TEMPS_DATA_DIR/GeoLite2-City.mmdb"
@@ -127,7 +133,7 @@ jobs:
             --wildcard-domain "*.localho.st" \
             --wildcard-domain-cert /tmp/localho.st.crt \
             --wildcard-domain-key /tmp/localho.st.key \
-            --skip-dns-records --skip-git --skip-geolite2-download \
+            --skip-dns-records --skip-geolite2-download \
             --output-format json
 
       - name: Start Temps
@@ -242,7 +248,14 @@ jobs:
           bun run typecheck
 
       - name: Run dedicated multinode scenario
-        run: cd apps/temps-e2e && bun run src/index.ts multinode-join-scenario --json --build-timeout 2400000
+        run: |
+          # Compose overlays writable named volumes below a read-only
+          # /workspace bind. On a clean checkout these gitignored mountpoints
+          # do not exist, and runc cannot create them through the read-only
+          # parent mount.
+          mkdir -p target crates/temps-cli/dist
+          cd apps/temps-e2e
+          bun run src/index.ts multinode-join-scenario --json --build-timeout 2400000
 
       - name: Collect multinode logs on failure
         if: failure()
