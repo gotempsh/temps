@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS sandbox_snapshots (
     id               SERIAL PRIMARY KEY,
     public_id        VARCHAR NOT NULL UNIQUE,
     user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- project_id has no FK intentionally: mirrors source_sandbox_id's design —
+    -- a snapshot outlives the project it was taken in, and project deletion
+    -- should not cascade-delete the user's snapshot artifacts.
     project_id       INTEGER,
+    -- source_sandbox_id has no FK intentionally: the source sandbox may be
+    -- destroyed after snapping. The destroy path nullifies this column.
     source_sandbox_id INTEGER,
     label            VARCHAR,
     status           VARCHAR(16) NOT NULL DEFAULT 'creating',
