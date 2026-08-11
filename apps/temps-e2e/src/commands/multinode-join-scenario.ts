@@ -732,7 +732,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
           label: 'Postgres service and all members to report running',
         },
       )
-      await pollUntil(
+      const steadyState = await pollUntil(
         async () => unwrap(await getClusterHealth({ client: client!, path: { id: databaseService.id } }), 'getClusterHealth'),
         (health) =>
           !health.monitor_error &&
@@ -746,15 +746,29 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
           label: 'Postgres cluster health and role DNS records to converge',
         },
       )
+      const electedPrimary = steadyState.members.find((member) =>
+        POSTGRES_PRIMARY_STATES.has(member.reported_state),
+      )
+      if (!electedPrimary) {
+        throw new Error('Postgres cluster health returned no elected primary')
+      }
       const detail = unwrap(
         await getService({ client: client!, path: { id: databaseService.id } }),
         'getService',
       )
-      const dataMember = (detail.service.members ?? []).find((member) => member.role !== 'monitor')
-      if (!dataMember || dataMember.port === undefined || dataMember.port === null) {
-        throw new Error('Postgres cluster returned no addressable data member')
+      // pg_auto_failover may elect either data member. POSTGRES_URL retains
+      // target_session_attrs=read-write after we replace its host, so using
+      // "the first replica" makes this scenario depend on election order and
+      // crash-loops the probe whenever that replica is the secondary.
+      const primaryMember = (detail.service.members ?? []).find(
+        (member) => member.container_name === electedPrimary.nodename,
+      )
+      if (!primaryMember || primaryMember.port === undefined || primaryMember.port === null) {
+        throw new Error(
+          `Postgres elected primary ${electedPrimary.nodename}, but the service returned no matching addressable member`,
+        )
       }
-      databaseDnsAddress = `${databaseService.name}-${dataMember.ordinal}.${databaseService.name}.temps.local:${dataMember.port}`
+      databaseDnsAddress = `${databaseService.name}-${primaryMember.ordinal}.${databaseService.name}.temps.local:${primaryMember.port}`
     })
 
     const probeProject = await step('create a control-plane probe application', () =>

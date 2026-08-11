@@ -1492,17 +1492,10 @@ impl DeployImageJob {
         environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
 
         tracing::info!(
-            "Deploying container with {} env vars, POSTGRES_HOST={:?}, POSTGRES_URL={:?}",
+            "Deploying container with {} env vars (Postgres host configured: {}, URL configured: {})",
             environment_vars.len(),
-            environment_vars.get("POSTGRES_HOST"),
-            environment_vars.get("POSTGRES_URL").map(|u| {
-                // Truncate for logging (may contain password)
-                if u.len() > 60 {
-                    format!("{}...", &u[..60])
-                } else {
-                    u.clone()
-                }
-            })
+            environment_vars.contains_key("POSTGRES_HOST"),
+            environment_vars.contains_key("POSTGRES_URL")
         );
 
         // Create unique container name for each replica

@@ -753,14 +753,15 @@ impl WorkflowPlanner {
                     for (key, value) in remote_vars.iter_mut() {
                         // Replace container_name:internal_port → private_address:host_port
                         if value.contains(&container_name) {
-                            let old_value = value.clone();
                             *value = value
                                 .replace(
                                     &format!("{}:{}", container_name, internal_port),
                                     &format!("{}:{}", private_address, host_port),
                                 )
                                 .replace(&container_name, &private_address);
-                            info!("Rewrote {}={} -> {}", key, old_value, value);
+                            // Connection strings contain credentials. Log the
+                            // affected key, never either secret-bearing value.
+                            info!("Rewrote environment variable {} for remote deployment", key);
                             rewritten_count += 1;
                         }
                     }
