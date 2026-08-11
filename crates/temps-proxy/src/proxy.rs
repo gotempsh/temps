@@ -241,6 +241,23 @@ fn strip_script_and_style(html: &str) -> String {
     out
 }
 
+/// Last-resort fallback when `htmd::convert` fails: extract plain text nodes
+/// from an HTML fragment via `scraper`, which — unlike `htmd::convert` — has
+/// no failure mode on malformed input. Used only so a response already
+/// committed to `Content-Type: text/markdown` never carries literal HTML
+/// markup in its body.
+fn plain_text_fallback(html: &str) -> String {
+    let fragment = scraper::Html::parse_fragment(html);
+    fragment
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Inspect the upstream response headers and decide whether Markdown conversion should
 /// proceed.  Cancels (`ctx.wants_markdown = false`) for anything other than a successful
 /// (2xx) `text/html` response, or when the connection is SSE/WebSocket.
@@ -268,7 +285,20 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     let is_html = upstream_ct.contains("text/html");
     let has_ct = !upstream_ct.is_empty();
 
-    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html {
+    // Reject bodies we already know are too large from Content-Length, before
+    // we commit to a text/markdown Content-Type in response_filter. Pingora
+    // sends response headers to the client before response_body_filter runs,
+    // so once we say "markdown" we cannot take it back — the only safe time
+    // to opt out over size is here, before headers are sent. Chunked/unknown-
+    // length upstreams are still capped in response_body_filter_inner.
+    let declared_too_large = upstream_response
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > MAX_MARKDOWN_BODY_BYTES);
+
+    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large {
         // Cannot or should not convert — reset the flag so response_body_filter
         // will pass the body through normally.
         ctx.wants_markdown = false;
@@ -281,6 +311,12 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: non-2xx status={}, content-type={:?}",
                 status, upstream_ct
+            );
+        } else if declared_too_large {
+            debug!(
+                "Markdown conversion cancelled: Content-Length exceeds {}-byte limit \
+                 (content-type={:?})",
+                MAX_MARKDOWN_BODY_BYTES, upstream_ct
             );
         } else {
             debug!(
@@ -2245,21 +2281,29 @@ fn response_body_filter_inner(
     // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
     if ctx.wants_markdown {
         if let Some(chunk) = body.take() {
-            // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
-            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                warn!(
-                    "Response body exceeds 2 MB markdown conversion limit for path={}, \
-                     falling back to passthrough",
-                    ctx.path
-                );
-                // Disable markdown, flush the buffer + current chunk as-is.
-                ctx.wants_markdown = false;
-                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                flushed.extend_from_slice(&chunk);
-                *body = Some(Bytes::from(flushed));
-                return Ok(None);
+            // Enforce a 2 MB cap — mirrors Cloudflare's Markdown for Agents constraint.
+            //
+            // We must NOT fall back to raw-HTML passthrough here even though the
+            // buffer is over budget: response_filter already sent the client a
+            // `Content-Type: text/markdown` header before this function ever runs
+            // (Pingora sends response headers before invoking response_body_filter),
+            // so there is no way to un-promise Markdown at this point. Emitting the
+            // untouched HTML bytes under that header is exactly the "text/markdown
+            // returns raw HTML" bug — instead we truncate the buffer at the cap and
+            // still convert what we have, discarding the remainder of the upstream
+            // body rather than forwarding it unconverted.
+            let remaining = MAX_MARKDOWN_BODY_BYTES.saturating_sub(ctx.markdown_buffer.len());
+            if remaining > 0 {
+                let take = remaining.min(chunk.len());
+                ctx.markdown_buffer.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    warn!(
+                        "Response body for path={} exceeds the {}-byte markdown conversion \
+                         limit; truncating before conversion",
+                        ctx.path, MAX_MARKDOWN_BODY_BYTES
+                    );
+                }
             }
-            ctx.markdown_buffer.extend_from_slice(&chunk);
         }
 
         if end_of_stream {
@@ -2273,14 +2317,18 @@ fn response_body_filter_inner(
             let markdown = match htmd::convert(&content) {
                 Ok(md) => md,
                 Err(e) => {
+                    // Cannot fall back to the original HTML bytes here: response_filter
+                    // already committed `Content-Type: text/markdown` to the client
+                    // before this body was available (see the truncation comment
+                    // above), so raw HTML would arrive mislabeled as Markdown. Use a
+                    // tag-stripping plain-text extraction instead — it cannot fail —
+                    // so the body is always actual text under a text/markdown header.
                     warn!(
-                        "HTML-to-Markdown conversion failed for path={}: {}",
+                        "HTML-to-Markdown conversion failed for path={}: {}; falling back to \
+                         plain-text extraction",
                         ctx.path, e
                     );
-                    // Fall back to the original HTML bytes so the client gets something.
-                    let original = std::mem::take(&mut ctx.markdown_buffer);
-                    *body = Some(Bytes::from(original));
-                    return Ok(None);
+                    plain_text_fallback(&content)
                 }
             };
 
@@ -5346,39 +5394,12 @@ mod markdown_tests {
 
     // ── response_body_filter buffering logic ──────────────────────────────────
 
-    /// Simulate the body filter for a single-chunk response.
-    /// Mirrors the production pipeline: parse → extract_page_meta →
-    /// extract_content_html → htmd::convert → prepend frontmatter.
+    /// Simulate the body filter for a single-chunk response by delegating to
+    /// the real `response_body_filter_inner`, so this test module exercises
+    /// production behaviour rather than a parallel re-implementation of it.
     fn run_body_filter_single_chunk(ctx: &mut ProxyContext, html: &[u8]) -> Option<Bytes> {
         let mut body: Option<Bytes> = Some(Bytes::copy_from_slice(html));
-        let end_of_stream = true;
-
-        if ctx.wants_markdown {
-            if let Some(chunk) = body.take() {
-                if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                    ctx.wants_markdown = false;
-                    let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                    flushed.extend_from_slice(&chunk);
-                    return Some(Bytes::from(flushed));
-                }
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-            }
-            if end_of_stream {
-                let html_str = String::from_utf8_lossy(&ctx.markdown_buffer);
-                let document = scraper::Html::parse_document(&html_str);
-                let meta = extract_page_meta(&document);
-                let content = extract_content_html(&document);
-                let markdown = htmd::convert(&content).unwrap_or_default();
-                let final_markdown = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-                ctx.markdown_buffer = Vec::new();
-                return Some(Bytes::from(final_markdown));
-            }
-            return None;
-        }
-
+        response_body_filter_inner(&mut body, true, ctx).unwrap();
         body
     }
 
@@ -5635,21 +5656,36 @@ mod markdown_tests {
     }
 
     #[test]
-    fn test_body_filter_size_guard_disables_conversion() {
+    fn test_body_filter_size_guard_truncates_instead_of_passthrough() {
+        // Regression test: response_filter has already sent the client a
+        // `Content-Type: text/markdown` header by the time this body filter
+        // runs, so it must never fall back to raw HTML passthrough for an
+        // oversized body — that would ship raw markup mislabeled as markdown.
+        // It must truncate to the cap and still convert.
         let mut ctx = make_ctx();
         ctx.wants_markdown = true;
 
-        // Create a body slightly larger than 2 MB
-        let oversized = vec![b'x'; MAX_MARKDOWN_BODY_BYTES + 1];
-        let result = run_body_filter_single_chunk(&mut ctx, &oversized);
-
-        // Should fall back to passthrough — returns original bytes, conversion disabled
-        assert!(
-            !ctx.wants_markdown,
-            "wants_markdown should be reset to false"
+        let html = format!(
+            "<html><body><main><p>{}</p></main></body></html>",
+            "x".repeat(MAX_MARKDOWN_BODY_BYTES + 1)
         );
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().len(), oversized.len());
+        let result = run_body_filter_single_chunk(&mut ctx, html.as_bytes());
+
+        assert!(
+            ctx.wants_markdown,
+            "wants_markdown must stay true — the header commitment can't be undone"
+        );
+        let result = result.expect("a truncated, converted body must still be produced");
+        assert!(
+            result.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "body must be bounded near the cap, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.len() < html.len(),
+            "body must actually be truncated, not equal to the {}-byte input",
+            html.len()
+        );
     }
 
     #[test]
@@ -5800,7 +5836,9 @@ mod markdown_pipeline_tests {
         resp
     }
 
-    /// Simulate the full pipeline for a single-chunk body.
+    /// Simulate the full pipeline for a single-chunk body, delegating body handling
+    /// to the real `response_body_filter_inner` (the production function) rather
+    /// than a re-implementation, so these tests catch real regressions in it.
     /// Returns (final_ctx, outbound_response_header, body_bytes).
     fn run_pipeline(
         mut ctx: ProxyContext,
@@ -5813,35 +5851,33 @@ mod markdown_pipeline_tests {
         // Phase 2: response_filter — header rewrite
         apply_markdown_response_headers(&mut resp, &ctx);
 
-        // Phase 3: response_body_filter — buffer + convert (single-chunk, end_of_stream=true)
-        let body_out = if ctx.is_sse || ctx.is_websocket {
-            Some(Bytes::copy_from_slice(body))
-        } else if ctx.wants_markdown {
-            let chunk = Bytes::copy_from_slice(body);
-            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                ctx.wants_markdown = false;
-                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                flushed.extend_from_slice(&chunk);
-                Some(Bytes::from(flushed))
-            } else {
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-                let html = String::from_utf8_lossy(&ctx.markdown_buffer);
-                let document = scraper::Html::parse_document(&html);
-                let meta = extract_page_meta(&document);
-                let content = extract_content_html(&document);
-                let markdown = htmd::convert(&content).unwrap_or_default();
-                ctx.markdown_buffer = Vec::new();
-                let final_md = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-                Some(Bytes::from(final_md))
-            }
-        } else {
-            Some(Bytes::copy_from_slice(body))
-        };
+        // Phase 3: response_body_filter — single chunk, end_of_stream=true
+        let mut body_opt: Option<Bytes> = Some(Bytes::copy_from_slice(body));
+        response_body_filter_inner(&mut body_opt, true, &mut ctx).unwrap();
 
-        (ctx, resp, body_out)
+        (ctx, resp, body_opt)
+    }
+
+    /// Feed a body through `response_body_filter_inner` as multiple chunks,
+    /// mirroring how Pingora streams a real chunked upstream response — used to
+    /// exercise the size cap without allocating one enormous `Bytes` value.
+    fn run_pipeline_chunked(
+        mut ctx: ProxyContext,
+        mut resp: ResponseHeader,
+        chunks: &[&[u8]],
+    ) -> (ProxyContext, ResponseHeader, Option<Bytes>) {
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        apply_markdown_response_headers(&mut resp, &ctx);
+
+        let mut last_body = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let end_of_stream = i == chunks.len() - 1;
+            let mut body_opt: Option<Bytes> = Some(Bytes::copy_from_slice(chunk));
+            response_body_filter_inner(&mut body_opt, end_of_stream, &mut ctx).unwrap();
+            last_body = body_opt;
+        }
+
+        (ctx, resp, last_body)
     }
 
     // ── Gate tests ────────────────────────────────────────────────────────────
@@ -6201,24 +6237,160 @@ mod markdown_pipeline_tests {
         );
     }
 
+    // ── Regression tests: text/markdown must never surface raw HTML ───────────
+    //
+    // response_filter rewrites Content-Type to text/markdown and Pingora sends
+    // those headers to the client BEFORE response_body_filter ever runs — so by
+    // the time the body-filter discovers a problem (body too large, conversion
+    // failure), it is too late to change the Content-Type back to text/html.
+    // These tests pin down that once wants_markdown is true after the gate, the
+    // body filter must always hand back real, tag-free text — truncated if
+    // necessary — never the untouched upstream HTML bytes.
+
     #[test]
-    fn pipeline_size_guard_passthrough_on_oversized_body() {
+    fn gate_cancels_when_content_length_declares_oversized_body() {
+        // Discovered upfront (before headers are sent) via Content-Length —
+        // the cheapest way to avoid ever promising markdown for a body we
+        // already know will not fit.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Length", (MAX_MARKDOWN_BODY_BYTES + 1).to_string())
+            .unwrap();
+
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+
+        assert!(
+            !ctx.wants_markdown,
+            "an oversized declared Content-Length must cancel conversion before \
+             response_filter ever commits the markdown Content-Type"
+        );
+    }
+
+    #[test]
+    fn gate_allows_when_content_length_under_limit() {
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Length", "1024").unwrap();
+
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+
+        assert!(
+            ctx.wants_markdown,
+            "a small declared Content-Length must not cancel conversion"
+        );
+    }
+
+    #[test]
+    fn pipeline_oversized_body_is_truncated_not_leaked_as_raw_html() {
+        // No Content-Length header — the gate can't reject this upfront (mirrors
+        // a chunked upstream response), so the over-cap condition is only
+        // discovered while streaming the body, after the client already has a
+        // `Content-Type: text/markdown` response header.
         let mut ctx = make_ctx();
         ctx.wants_markdown = true;
         let resp = make_response(200, Some("text/html; charset=utf-8"));
-        let oversized = vec![b'x'; MAX_MARKDOWN_BODY_BYTES + 1];
+        let html = format!(
+            "<html><body><main><p>{}</p></main></body></html>",
+            "x".repeat(MAX_MARKDOWN_BODY_BYTES + 1)
+        );
 
-        let (final_ctx, _out_resp, body) = run_pipeline(ctx, resp, &oversized);
+        let (final_ctx, out_resp, body) = run_pipeline(ctx, resp, html.as_bytes());
+
+        assert_eq!(
+            out_resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/markdown; charset=utf-8"),
+            "the markdown Content-Type was already sent to the client before the \
+             body filter ran — it cannot be reverted to text/html here"
+        );
+        assert!(
+            final_ctx.wants_markdown,
+            "conversion must stay committed once the header promise is made"
+        );
+
+        let body = body.expect("a body must still be produced when truncated");
+        assert!(
+            body.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "converted body ({} bytes) must be bounded near the cap, not grow to \
+             the full oversized input",
+            body.len()
+        );
+        assert!(
+            body.len() < html.len(),
+            "body must actually be truncated, not the full {}-byte input passed \
+             through untouched",
+            html.len()
+        );
+
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("<main>") && !text.contains("<body>") && !text.contains("<html>"),
+            "a response already labeled text/markdown must never contain literal, \
+             unconverted HTML tags: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn pipeline_oversized_body_truncated_across_multiple_chunks() {
+        // Same regression as above, but exercised the way Pingora actually
+        // delivers a chunked upstream response: several response_body_filter
+        // calls, only the last one with end_of_stream = true.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let resp = make_response(200, Some("text/html; charset=utf-8"));
+
+        let opening = b"<html><body><main><p>".to_vec();
+        let giant_chunk = vec![b'x'; MAX_MARKDOWN_BODY_BYTES];
+        let closing = b"</p></main></body></html>".to_vec();
+        let chunks: Vec<&[u8]> = vec![&opening, &giant_chunk, &closing];
+
+        let (final_ctx, out_resp, body) = run_pipeline_chunked(ctx, resp, &chunks);
+
+        assert_eq!(
+            out_resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/markdown; charset=utf-8")
+        );
+        assert!(final_ctx.wants_markdown);
+
+        let body = body.expect("final chunk must flush a converted body");
+        assert!(
+            body.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "buffer must have been capped across chunk boundaries, got {} bytes",
+            body.len()
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains('<'),
+            "no raw HTML tags may survive into a text/markdown body: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn plain_text_fallback_never_leaks_html_tags() {
+        // Exercises the last-resort branch used when htmd::convert() itself
+        // fails — must always return readable text, never markup, since the
+        // client has already been told Content-Type: text/markdown.
+        let html = "<div><h1>Title</h1><p>Some <b>bold</b> text.</p></div>";
+        let text = plain_text_fallback(html);
 
         assert!(
-            !final_ctx.wants_markdown,
-            "size guard must disable conversion"
+            !text.contains('<') && !text.contains('>'),
+            "fallback must strip all HTML tags: {}",
+            text
         );
-        assert_eq!(
-            body.unwrap().len(),
-            oversized.len(),
-            "original bytes must be returned unchanged"
-        );
+        assert!(text.contains("Title"));
+        assert!(text.contains("Some"));
+        assert!(text.contains("bold"));
+        assert!(text.contains("text."));
     }
 
     #[test]
