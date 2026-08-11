@@ -599,6 +599,10 @@ mod tests {
             Some("Bingbot".to_string())
         );
         assert_eq!(
+            CrawlerDetector::get_crawler_name(Some("curl/8.7.1")),
+            Some("curl".to_string())
+        );
+        assert_eq!(
             CrawlerDetector::get_crawler_name(Some("Regular Browser")),
             None
         );
