@@ -1107,11 +1107,11 @@ mod tests {
     fn public_url_preserves_external_http_scheme_and_non_default_port() {
         assert_eq!(
             format_public_url(
-                "sandbox-smoke2-production.localho.st",
-                Some("http://localho.st:8240"),
+                "app-production.example.test",
+                Some("http://example.test:8240"),
                 8240,
             ),
-            "http://sandbox-smoke2-production.localho.st:8240"
+            "http://app-production.example.test:8240"
         );
     }
 

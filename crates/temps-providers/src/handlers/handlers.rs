@@ -2158,7 +2158,9 @@ async fn issue_runtime_credentials(
 fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Problem {
     use crate::services::ExternalServiceError as E;
     match e {
-        E::ServiceNotFound { .. } => not_found().detail(e.to_string()).build(),
+        E::ServiceNotFound { .. } | E::EnvironmentNotFound { .. } => {
+            not_found().detail(e.to_string()).build()
+        }
         E::ServiceNotLinkedToProject { .. } => conflict().detail(e.to_string()).build(),
         E::InvalidServiceType { .. } => bad_request().detail(e.to_string()).build(),
         _ => internal_server_error()

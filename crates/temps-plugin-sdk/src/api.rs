@@ -145,15 +145,15 @@ pub struct DeployStaticBundle {
 
 /// Start a deployment from a container image the platform can already reach.
 ///
-/// "Reach" means a registry it can pull from, *or* an image already present
-/// in the host's Docker — which is the case for one a plugin built there.
-/// Naming the image is what makes that possible: the alternative,
-/// [`PlatformApi::deploy_image_upload`], has to carry the entire tarball
-/// through the platform channel and hits its 32 MiB body cap on any image
-/// with a real runtime in it.
+/// Set `claim_local` only for an image built in the platform host's Docker.
+/// Temps inspects and retags that image into a project-owned internal name,
+/// then verifies its immutable image ID before deployment. Registry images
+/// must leave it false and are never resolved from local daemon state.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeployImage {
     pub image_ref: String,
+    #[serde(default)]
+    pub claim_local: bool,
 }
 
 // ── Response projections ───────────────────────────────────────────────

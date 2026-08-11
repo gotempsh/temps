@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use temps_core::external_plugin::{HandshakeMessage, PluginManifest};
+use temps_core::external_plugin::{
+    HandshakeMessage, PluginLaunchConfig, PluginManifest, EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
@@ -28,8 +30,8 @@ pub struct ExternalPluginProcess {
     pub binary_path: PathBuf,
     /// Unix socket path for communication
     pub socket_path: PathBuf,
-    /// Per-process secret used to authenticate proxy assertions to this
-    /// plugin. It must never be shared with another installed plugin.
+    /// Per-process secret used to bind internal requests to this staged
+    /// plugin launch. This is protocol integrity, not shared-UID isolation.
     auth_secret: String,
     /// Path to the PID file for this process
     pid_file_path: PathBuf,
@@ -94,9 +96,8 @@ pub struct ExternalPluginConfig {
     /// Directory for plugin data files
     pub data_dir: PathBuf,
     /// The instance's own data root — the parent of all the directories
-    /// above. Passed to plugins as `--host-data-dir` so a plugin that also
-    /// receives `--database-url` can reach the platform state that lives on
-    /// disk rather than in the database (sandbox roots, key material).
+    /// above. Disclosed in the typed launch configuration only when a trusted
+    /// plugin declares that privileged requirement.
     pub host_data_dir: PathBuf,
     /// Base URL at which this instance's API answers, passed to plugins as
     /// `--host-api-url`. `None` when the caller did not supply one, in which
@@ -106,7 +107,8 @@ pub struct ExternalPluginConfig {
     pub ui_assets_dir: PathBuf,
     /// Directory for PID files (one per running plugin process)
     pub pids_dir: PathBuf,
-    /// Database URL to pass to plugins
+    /// Database URL disclosed in typed launch configuration to plugins that
+    /// declare direct database access.
     pub database_url: String,
     /// Timeout for plugin handshake (default: 30s)
     pub handshake_timeout: Duration,
@@ -123,6 +125,52 @@ const SUN_PATH_MAX: usize = 108;
 
 fn generate_plugin_auth_secret() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+fn legacy_startup_eof_error(binary_name: &str) -> String {
+    format!(
+        "Plugin {binary_name} closed stdout before sending the staged protocol v{EXTERNAL_PLUGIN_PROTOCOL_VERSION} hello. The binary is incompatible or uses a legacy temps-plugin-sdk; rebuild it with protocol v{EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
+    )
+}
+
+#[cfg(unix)]
+fn secure_socket_directory(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "plugin socket directory contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `path` is a valid C string. O_NOFOLLOW rejects a malicious
+    // symlink at the deterministic /tmp path, and OwnedFd closes the result.
+    let raw_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw_fd` was returned by open above and ownership is transferred
+    // exactly once to OwnedFd.
+    let directory = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    // SAFETY: fchmod operates on the live directory descriptor and does not
+    // dereference the path again, closing the symlink-swap race.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl ExternalPluginConfig {
@@ -238,9 +286,25 @@ impl ExternalPluginManager {
     ///
     /// Returns the list of successfully started plugin manifests.
     pub async fn discover_and_start(&self) -> Vec<PluginManifest> {
+        #[cfg(unix)]
+        if let Err(error) = secure_socket_directory(&self.config.sockets_dir) {
+            error!(
+                directory = %self.config.sockets_dir.display(),
+                "Failed to create a secure 0700 plugin socket directory: {error}"
+            );
+            return Vec::new();
+        }
+        #[cfg(not(unix))]
+        if let Err(error) = tokio::fs::create_dir_all(&self.config.sockets_dir).await {
+            error!(
+                directory = %self.config.sockets_dir.display(),
+                "Failed to create plugin socket directory: {error}"
+            );
+            return Vec::new();
+        }
+
         for dir in [
             &self.config.plugins_dir,
-            &self.config.sockets_dir,
             &self.config.data_dir,
             &self.config.ui_assets_dir,
             &self.config.pids_dir,
@@ -250,7 +314,6 @@ impl ExternalPluginManager {
                 return Vec::new();
             }
         }
-
         // Kill any stale plugin processes left over from a previous run
         // (e.g. if the server was killed without graceful shutdown).
         self.kill_stale_processes().await;
@@ -449,9 +512,9 @@ impl ExternalPluginManager {
             .sockets_dir
             .join(format!("{}.sock", binary_name));
         let plugin_data_dir = self.config.data_dir.join(binary_name);
-        // A compromised plugin must not be able to forge caller assertions
-        // to a sibling plugin. Generate this before spawn and retain it only
-        // with this process's proxy state.
+        // This authenticates traffic as belonging to the staged child process.
+        // Installed plugins are trusted host code under the current shared-UID
+        // architecture; this is protocol integrity, not a sandbox boundary.
         let auth_secret = generate_plugin_auth_secret();
 
         // Validate that the socket path fits within the OS limit.
@@ -474,62 +537,30 @@ impl ExternalPluginManager {
 
         let pid_file_path = self.config.pids_dir.join(format!("{}.pid", binary_name));
 
-        let mut child = Command::new(binary_path)
+        let mut command = Command::new(binary_path);
+        command
+            .kill_on_drop(true)
             .arg("--socket-path")
             .arg(socket_path.to_str().unwrap_or_default())
-            .arg("--database-url")
-            .arg(&self.config.database_url)
             .arg("--data-dir")
             .arg(plugin_data_dir.to_str().unwrap_or_default())
-            // The platform's own data root, alongside its own database URL.
-            //
-            // `--data-dir` is the plugin's private corner
-            // (`<root>/plugin-data/<binary>`); this is the root itself, where
-            // the instance keeps the state a plugin needs to act *as* the
-            // platform rather than beside it: the sandbox data root, and the
-            // key material that makes the database's encrypted columns and
-            // session cookies readable.
-            //
-            // Only plugins that already receive `--database-url` get anything
-            // new here — with the database alone a plugin holds every
-            // ciphertext but no key. Treat installing a plugin as trusting it
-            // with the instance.
-            .arg("--host-data-dir")
-            .arg(self.config.host_data_dir.to_str().unwrap_or_default())
             .args(
                 self.config
                     .host_api_url
                     .iter()
                     .flat_map(|url| ["--host-api-url", url.as_str()]),
-            )
+            );
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn {}: {}", binary_name, e))?;
 
-        // Deliver the per-process assertion secret through a one-shot pipe,
-        // never argv or environment. Plugins share the host OS user today,
-        // so command-line visibility would collapse per-plugin isolation.
         let mut child_stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("Failed to open the authentication pipe for {binary_name}"))?;
-        if let Err(error) = child_stdin
-            .write_all(format!("{auth_secret}\n").as_bytes())
-            .await
-        {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Failed to deliver the request-assertion secret to {binary_name}: {error}"
-            ));
-        }
-        if let Err(error) = child_stdin.shutdown().await {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Failed to close the authentication pipe for {binary_name}: {error}"
-            ));
-        }
+            .ok_or_else(|| format!("Failed to open the launch-config pipe for {binary_name}"))?;
 
         // Write PID file so we can clean up stale processes on restart
         if let Some(pid) = child.id() {
@@ -586,27 +617,34 @@ impl ExternalPluginManager {
             }
         };
 
-        // Read manifest (handshake phase 1)
+        // Stage 1: the already-running child identifies its protocol and
+        // declares which host values it needs. Nothing sensitive or privileged
+        // has been passed to it in argv.
         let manifest = match tokio::time::timeout(self.config.handshake_timeout, async {
             let line = reader
                 .next_line()
                 .await
                 .map_err(|e| format!("Failed to read manifest from {}: {}", binary_name, e))?
-                .ok_or_else(|| {
-                    format!(
-                        "Plugin {} closed stdout before sending manifest",
-                        binary_name
-                    )
-                })?;
+                .ok_or_else(|| legacy_startup_eof_error(binary_name))?;
 
             let msg: HandshakeMessage = serde_json::from_str(&line)
                 .map_err(|e| format!("Invalid manifest JSON from {}: {}", binary_name, e))?;
 
             match msg {
-                HandshakeMessage::Manifest(m) => Ok(*m),
+                HandshakeMessage::Hello(hello)
+                    if hello.protocol_version == EXTERNAL_PLUGIN_PROTOCOL_VERSION =>
+                {
+                    Ok(*hello.manifest)
+                }
+                HandshakeMessage::Hello(hello) => Err(format!(
+                    "Plugin {binary_name} uses external-plugin protocol {}, but this Temps build requires {}; rebuild the plugin with the current temps-plugin-sdk",
+                    hello.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION
+                )),
+                HandshakeMessage::Manifest(_) => Err(format!(
+                    "Plugin {binary_name} uses the legacy startup handshake; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
+                )),
                 _ => Err(format!(
-                    "Expected manifest message from {}, got something else",
-                    binary_name
+                    "Plugin {binary_name} sent an unexpected startup message; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
                 )),
             }
         })
@@ -629,13 +667,50 @@ impl ExternalPluginManager {
                     task.abort();
                 }
                 return Err(format!(
-                    "Handshake timeout for {}{}",
-                    binary_name, stderr_context
+                    "Plugin {binary_name} did not emit the staged startup hello; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}{stderr_context}"
                 ));
             }
         };
 
         debug!(plugin = %manifest.name, "Received manifest from plugin");
+
+        // Stage 2: send one typed line to this same child. The manifest flags
+        // control disclosure/routing for trusted installed code; they do not
+        // turn a shared-UID plugin process into a security sandbox.
+        if manifest.requires_host_data_access {
+            warn!(
+                plugin = %manifest.name,
+                "Plugin declares privileged access to the platform host data root"
+            );
+        }
+        let launch_config = PluginLaunchConfig {
+            protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+            auth_secret: auth_secret.clone(),
+            database_url: manifest
+                .requires_db
+                .then(|| self.config.database_url.clone()),
+            host_data_dir: manifest
+                .requires_host_data_access
+                .then(|| self.config.host_data_dir.to_string_lossy().into_owned()),
+        };
+        let launch_json = serde_json::to_string(&launch_config).map_err(|error| {
+            format!("Failed to encode launch configuration for {binary_name}: {error}")
+        })?;
+        if let Err(error) = child_stdin
+            .write_all(format!("{launch_json}\n").as_bytes())
+            .await
+        {
+            let _ = child.start_kill();
+            return Err(format!(
+                "Failed to deliver typed launch configuration to {binary_name}: {error}"
+            ));
+        }
+        if let Err(error) = child_stdin.shutdown().await {
+            let _ = child.start_kill();
+            return Err(format!(
+                "Failed to close the launch-config pipe for {binary_name}: {error}"
+            ));
+        }
 
         // Read ready signal (handshake phase 2)
         let (has_ui, openapi_schema) = match tokio::time::timeout(self.config.handshake_timeout, async {
@@ -655,6 +730,12 @@ impl ExternalPluginManager {
 
             match msg {
                 HandshakeMessage::Ready(r) => {
+                    if r.protocol_version != EXTERNAL_PLUGIN_PROTOCOL_VERSION {
+                        return Err(format!(
+                            "Plugin {binary_name} uses external-plugin protocol {}, but this Temps build requires {}; rebuild the plugin with the current temps-plugin-sdk",
+                            r.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION
+                        ));
+                    }
                     if r.ready {
                         // Parse the OpenAPI schema if provided
                         let openapi = match r.openapi {
@@ -727,8 +808,18 @@ impl ExternalPluginManager {
             self.db.clone(),
             self.host_api.clone(),
             manifest.capabilities.clone(),
+            &auth_secret,
         )
         .await;
+        let channel = match channel {
+            Some(channel) => channel,
+            None => {
+                let _ = child.start_kill();
+                return Err(format!(
+                    "Plugin {binary_name} did not establish an authenticated platform channel; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
+                ));
+            }
+        };
 
         let process = ExternalPluginProcess {
             manifest,
@@ -738,7 +829,7 @@ impl ExternalPluginManager {
             pid_file_path,
             child,
             has_ui,
-            channel,
+            channel: Some(channel),
             openapi_schema,
         };
 
@@ -935,6 +1026,16 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.is_empty());
         assert!(!second.is_empty());
+    }
+
+    #[test]
+    fn legacy_startup_eof_is_actionable_and_keeps_stderr_context() {
+        let stderr = "\nPlugin stderr:\n  error: unexpected argument '--socket-path'";
+        let error = format!("{}{}", legacy_startup_eof_error("plugin-v0.0.8"), stderr);
+
+        assert!(error.contains("incompatible or uses a legacy temps-plugin-sdk"));
+        assert!(error.contains("rebuild it with protocol v2"));
+        assert!(error.contains("unexpected argument '--socket-path'"));
     }
 
     #[tokio::test]
@@ -1146,6 +1247,23 @@ mod tests {
             config_a.sockets_dir, config_b.sockets_dir,
             "Different data dirs must produce different socket dirs"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secure_socket_directory_uses_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join("sockets");
+        secure_socket_directory(&socket_dir).expect("secure socket directory");
+
+        let mode = std::fs::metadata(socket_dir)
+            .expect("socket directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[tokio::test]

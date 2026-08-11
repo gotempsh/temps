@@ -88,6 +88,12 @@ pub enum ExternalServiceError {
     #[error("Project {id} not found")]
     ProjectNotFound { id: i32 },
 
+    #[error("Environment {environment_id} not found in project {project_id}")]
+    EnvironmentNotFound {
+        environment_id: i32,
+        project_id: i32,
+    },
+
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
 
@@ -8114,6 +8120,20 @@ echo "[restore] Pre-seed complete"
             });
         }
 
+        // Resolve the environment inside the authorized project before
+        // decrypting service configuration or provisioning any tenant
+        // resource. An environment ID is not globally sufficient proof of
+        // project ownership, and soft-deleted environments are not targets.
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::EnvironmentNotFound {
+                environment_id,
+                project_id,
+            })?;
+
         let parameters = self.get_service_parameters(service_id_val).await?;
 
         // Compute the per-tenant database name once — both paths use
@@ -8124,12 +8144,6 @@ echo "[restore] Pre-seed complete"
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
-        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
-            })?;
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
             &format!("{}_{}", project.slug, environment.slug),
         );
@@ -12542,6 +12556,46 @@ mod tests {
             ai_data_access: false,
             container_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_credentials_reject_cross_project_environment_before_provisioning() {
+        let service = encrypted_service_model(
+            71,
+            serde_json::json!({
+                "username": "app",
+                "password": "secret",
+                "database": "postgres"
+            }),
+        );
+        let link = project_services::Model {
+            id: 9,
+            project_id: 10,
+            service_id: 71,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![link]])
+            // Environment 20 belongs to another project, so the combined
+            // id + project_id + deleted_at query returns no row.
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let error = manager
+            .get_runtime_env_vars(71, 10, 20)
+            .await
+            .expect_err("cross-project environment must be rejected");
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::EnvironmentNotFound {
+                environment_id: 20,
+                project_id: 10
+            }
+        ));
     }
 
     #[tokio::test]

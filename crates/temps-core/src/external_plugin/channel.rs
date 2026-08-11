@@ -417,6 +417,28 @@ pub struct ApiCall {
     pub actor: ActorToken,
 }
 
+/// In-process proof that a platform HTTP request originated from a verified
+/// external-plugin channel call.
+///
+/// This is inserted into request extensions only after the channel has
+/// verified the plugin-bound actor token. HTTP headers cannot create it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPluginApiCaller {
+    plugin_name: String,
+}
+
+impl VerifiedPluginApiCaller {
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+}
+
 /// The platform's reply to an [`ApiCall`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiCallResult {

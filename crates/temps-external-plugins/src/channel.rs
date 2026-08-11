@@ -24,6 +24,7 @@ use temps_core::external_plugin::manifest::PluginCapability;
 use temps_core::external_plugin::PluginEvent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -48,6 +49,7 @@ impl PluginChannel {
         db: Arc<DatabaseConnection>,
         host_api: Arc<HostApiSlot>,
         capabilities: Vec<PluginCapability>,
+        auth_secret: &str,
     ) -> Option<Self> {
         let socket_path_str = socket_path.to_string_lossy().to_string();
 
@@ -79,7 +81,25 @@ impl PluginChannel {
         };
 
         let uri = format!("ws://localhost{}", PLUGIN_CHANNEL_PATH);
-        let ws_stream = match tokio_tungstenite::client_async(&uri, stream).await {
+        let mut request = match uri.into_client_request() {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(plugin = %plugin_name, "Cannot build channel handshake: {error}");
+                return None;
+            }
+        };
+        let auth_header = match auth_secret.parse() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(plugin = %plugin_name, "Cannot encode channel authentication: {error}");
+                return None;
+            }
+        };
+        request.headers_mut().insert(
+            temps_core::external_plugin::headers::AUTH_SIGNATURE,
+            auth_header,
+        );
+        let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
             Ok((ws, _resp)) => {
                 debug!(
                     plugin = %plugin_name,

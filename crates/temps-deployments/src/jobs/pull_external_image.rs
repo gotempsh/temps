@@ -257,71 +257,19 @@ impl WorkflowTask for PullExternalImageJob {
             }
         }
 
-        // A failed pull is not automatically a failed deploy: the image may
-        // already be in the local daemon. That is how a plugin deploys a
-        // container it built on this host without shipping the whole tarball
-        // through the platform channel, which caps a body at 32 MiB.
-        //
-        // The pull is attempted first and only its *failure* falls back.
-        // Checking locally up front would pin `nginx:latest` to whatever copy
-        // this host happened to have, silently never updating.
-        //
-        // The fallback is restricted to references with no registry host, and
-        // that restriction is load-bearing rather than cosmetic. The daemon is
-        // shared by every tenant and `deploy/image-upload` lets a caller
-        // `docker load` a tarball and tag it with any reference they like. If
-        // a registry-qualified name could resolve locally, one tenant could
-        // plant `ghcr.io/victim/app:v1` and wait: the next time the victim's
-        // own pull failed — an expired credential, a rate limit, a registry
-        // blip — their deploy would silently run the planted image with the
-        // victim's environment variables injected. Refusing to resolve
-        // anything registry-qualified from local state means a name that
-        // *claims* to come from a registry can only ever come from one.
-        //
-        // A bare `nginx:latest` is still plantable this way; closing that
-        // needs uploaded tags namespaced per project, which is a separate
-        // change to the upload endpoint.
         if !pull_succeeded {
-            if let Some(error) = last_error {
-                let local_ok = registry.is_none();
-                match self.docker.inspect_image(&self.image_ref).await {
-                    Ok(_) if local_ok => {
-                        self.log(
-                            LogLevel::Info,
-                            &format!(
-                                "📦 Could not pull {} ({error}) — using the copy already in \
-                                 this host's Docker. If you expected a registry image, the \
-                                 local one may be stale.",
-                                self.image_ref
-                            ),
-                        )
-                        .await;
-                    }
-                    Ok(_) => {
-                        return Ok(JobResult::failure(
-                            context,
-                            format!(
-                                "Failed to pull image {}: {error}. A copy exists on this host, \
-                                 but it will not be used: the reference names a registry, and \
-                                 resolving that from local state would let an image planted \
-                                 here stand in for the registry's. Push the image, or deploy \
-                                 it under a name with no registry host.",
-                                self.image_ref
-                            ),
-                        ));
-                    }
-                    Err(_) => {
-                        return Ok(JobResult::failure(
-                            context,
-                            format!(
-                                "Failed to pull image {}: {error}. It is not present in this \
-                                 host's Docker either.",
-                                self.image_ref
-                            ),
-                        ));
-                    }
-                }
-            }
+            let error = last_error.unwrap_or_else(|| {
+                "the registry pull ended without confirming a downloaded image".to_string()
+            });
+            return Ok(JobResult::failure(
+                context,
+                format!(
+                    "Failed to pull image {} from its registry: {error}. Local daemon images \
+                     are never used as a fallback; use the authorized local-image claim path \
+                     for an image built on this host.",
+                    self.image_ref
+                ),
+            ));
         }
 
         // Inspect the image to get details
@@ -450,15 +398,10 @@ mod tests {
         assert_eq!(tag, "latest");
     }
 
-    /// An image built on this host and pushed nowhere still deploys.
-    ///
-    /// This is how a plugin ships a container without pushing the whole
-    /// tarball through the platform channel, which caps bodies at 32 MiB —
-    /// smaller than any image with a real runtime in it. The pull is expected
-    /// to fail here (the tag exists in no registry); the job must fall back to
-    /// the local copy rather than failing the deploy.
+    /// Even a bare tag already present locally must never satisfy a registry
+    /// pull. Local images use the separately authorized claim flow.
     #[tokio::test]
-    async fn a_locally_built_image_deploys_without_a_registry() {
+    async fn an_arbitrary_bare_local_tag_never_satisfies_a_failed_pull() {
         let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
             println!("Docker not available, skipping");
             return;
@@ -522,12 +465,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            result.status,
-            temps_core::JobStatus::Success,
-            "a locally-built image must deploy without a registry, got: {:?}",
-            result.message
-        );
+        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert!(result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("never used as a fallback")));
     }
 
     /// A registry-qualified name must never resolve from local state.

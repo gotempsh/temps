@@ -378,7 +378,10 @@ impl PluginEventListener {
             .uri(PLUGIN_EVENTS_PATH)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::HOST, "localhost")
-            .header("x-temps-auth", auth_secret)
+            .header(
+                temps_core::external_plugin::headers::AUTH_SIGNATURE,
+                auth_secret,
+            )
             .header("x-temps-request-id", uuid::Uuid::new_v4().to_string())
             .body(Body::from(body))
             .map_err(|e| format!("Failed to build request: {}", e))?;

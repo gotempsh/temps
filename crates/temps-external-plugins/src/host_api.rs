@@ -46,7 +46,7 @@ use temps_auth::UserService;
 use temps_core::external_plugin::actor::{verify_plugin_actor_token, ActorPrincipal};
 use temps_core::external_plugin::channel::{
     ApiCall, ApiCallResult, CallBody, ChannelError, ChannelErrorCode, JsonBody, MultipartPart,
-    PartContent, MAX_CALL_BODY_BYTES,
+    PartContent, VerifiedPluginApiCaller, MAX_CALL_BODY_BYTES,
 };
 use temps_core::CookieCrypto;
 use tower::ServiceExt;
@@ -178,7 +178,8 @@ impl RouterHostApi {
                     ChannelError::new(
                         ChannelErrorCode::Internal,
                         format!(
-                            "Failed to resolve the current role for user {user_id} while \n+                             redeeming an actor token for plugin '{plugin}': {e}"
+                            "Failed to resolve the current role for user {user_id} while \
+                             redeeming an actor token for plugin '{plugin}': {e}"
                         ),
                     )
                 })?;
@@ -420,6 +421,9 @@ impl HostApiBridge for RouterHostApi {
         // docs: the middleware will not overwrite it, and nothing else in
         // the codebase inserts an AuthContext a request did not earn.
         request.extensions_mut().insert(auth);
+        request
+            .extensions_mut()
+            .insert(VerifiedPluginApiCaller::new(plugin));
 
         debug!(plugin = %plugin, method = %call.method.as_str(), uri = %uri, "Serving plugin API call");
 

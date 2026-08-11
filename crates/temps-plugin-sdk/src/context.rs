@@ -5,9 +5,9 @@ use crate::client::TempsClient;
 /// Runtime context provided to external plugins.
 ///
 /// This is the plugin's window into the Temps ecosystem.
-/// Platform data is accessed exclusively through the [`TempsClient`]
-/// returned by [`temps()`](Self::temps) — the plugin never has
-/// direct database access.
+/// Platform data normally flows through the [`TempsClient`] returned by
+/// [`temps()`](Self::temps). A trusted plugin that explicitly declares
+/// `requires_db` can also receive the direct database URL.
 #[derive(Clone)]
 pub struct PluginContext {
     /// Typed client for querying the Temps platform
@@ -16,11 +16,15 @@ pub struct PluginContext {
     plugin_name: String,
     /// Directory for plugin-specific data files
     data_dir: std::path::PathBuf,
+    /// Direct database URL disclosed only when declared in the manifest.
+    database_url: Option<String>,
     /// The instance's own data root, when Temps passed one.
     host_data_dir: Option<std::path::PathBuf>,
     /// Base URL at which the instance's API answers, when Temps passed one.
     host_api_url: Option<String>,
-    /// HMAC secret for validating requests from Temps
+    /// Per-process assertion secret for validating requests from Temps.
+    /// This is protocol integrity for trusted installed code, not process
+    /// isolation under the shared host user.
     auth_secret: String,
 }
 
@@ -30,6 +34,7 @@ impl PluginContext {
         temps_client: TempsClient,
         plugin_name: String,
         data_dir: std::path::PathBuf,
+        database_url: Option<String>,
         host_data_dir: Option<std::path::PathBuf>,
         host_api_url: Option<String>,
         auth_secret: String,
@@ -38,6 +43,7 @@ impl PluginContext {
             temps_client,
             plugin_name,
             data_dir,
+            database_url,
             host_data_dir,
             host_api_url,
             auth_secret,
@@ -112,15 +118,21 @@ impl PluginContext {
         &self.data_dir
     }
 
+    /// Direct platform database URL for a trusted plugin that declared
+    /// `requires_db`; absent for ordinary plugins.
+    pub fn database_url(&self) -> Option<&str> {
+        self.database_url.as_deref()
+    }
+
     /// The Temps instance's own data root, if it passed one.
     ///
-    /// `None` on a Temps predating `--host-data-dir`, so treat it as a
-    /// capability to check rather than assume — a plugin that needs it
+    /// `None` when the manifest did not declare privileged host-data access,
+    /// so treat it as a capability to check rather than assume — a plugin that needs it
     /// should say so rather than fall back to guessing a path relative to
     /// [`Self::data_dir`].
     ///
     /// This is the platform's directory, not the plugin's: it holds state
-    /// that belongs to the instance (sandbox roots, encryption key, auth
+    /// that belongs to the instance (deployment data roots, encryption key, auth
     /// secret). Read what you need; write only under [`Self::data_dir`].
     pub fn host_data_dir(&self) -> Option<&std::path::Path> {
         self.host_data_dir.as_deref()

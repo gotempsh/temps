@@ -10,11 +10,10 @@
 //!   │                                  │
 //!   │── spawn with args ──────────────>│
 //!   │   --socket-path /tmp/x.sock      │
-//!   │   --database-url postgres://...   │
-//!   │   --auth-secret <hmac_key>       │
 //!   │   --data-dir ~/.temps/plugins/x/ │
 //!   │                                  │
-//!   │<── stdout: manifest JSON ────────│  (plugin writes manifest)
+//!   │<── stdout: protocol + manifest ──│
+//!   │── stdin: typed launch config ───>│  (requested values only)
 //!   │                                  │
 //!   │                                  │── starts axum on socket
 //!   │                                  │
@@ -40,7 +39,7 @@
 //! - `X-Temps-User-Email`: authenticated user email (if available)
 //! - `X-Temps-User-Role`: effective role (admin, user, reader, etc.)
 //! - `X-Temps-Request-Id`: unique request ID for tracing
-//! - `X-Temps-Auth-Signature`: HMAC signature of the request
+//! - `X-Temps-Auth-Signature`: per-process assertion secret
 
 use serde::{Deserialize, Serialize};
 
@@ -51,14 +50,15 @@ pub struct PluginArgs {
     #[arg(long)]
     pub socket_path: String,
 
-    /// Database URL (optional, passed by Temps for plugins that need direct DB access).
+    /// Database URL populated from staged launch configuration for plugins
+    /// that declare direct DB access.
     /// Most plugins should use the WebSocket channel instead of direct database access.
-    #[arg(long)]
+    #[arg(skip)]
     pub database_url: Option<String>,
 
     /// Request-assertion secret populated internally from the host's one-shot
-    /// stdin pipe. It is deliberately not accepted as a CLI argument because
-    /// sibling plugin processes can inspect command lines on the same host.
+    /// stdin pipe. It is not accepted as a CLI argument, so it does not appear
+    /// in ordinary process listings.
     #[arg(skip)]
     pub auth_secret: Option<String>,
 
@@ -68,11 +68,10 @@ pub struct PluginArgs {
 
     /// The instance's own data root, of which `data_dir` is a subdirectory.
     ///
-    /// Optional so a plugin built against a newer SDK still runs on an older
-    /// Temps that does not pass it. Only useful alongside `database_url`:
-    /// together they let a plugin act as the platform (reading sandbox
-    /// roots and key material) rather than merely beside it.
-    #[arg(long)]
+    /// Present only when the manifest explicitly requests the privileged
+    /// `requires_host_data_access` capability. This can expose encryption
+    /// keys and platform-owned state; ordinary plugins must use `data_dir`.
+    #[arg(skip)]
     pub host_data_dir: Option<String>,
 
     /// Base URL at which the instance's API answers, e.g.

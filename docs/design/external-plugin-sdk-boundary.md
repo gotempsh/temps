@@ -35,19 +35,42 @@ not parse forwarded headers itself or reconstruct permissions from role names.
 ## Runtime trust model
 
 The SDK is not intended to replace every internal Rust service for first-party
-plugins. A private plugin may link internal crates when it needs in-process
-access to configured services. Such a plugin is explicitly trusted and
-version-locked to Temps.
+plugins. Every installed external plugin is fully trusted host code: plugin
+processes currently run as the Temps operating-system user and are not
+sandboxed from the instance filesystem or sibling processes. The caller and
+capability checks in this document protect user requests and prevent accidental
+authority widening; they are not containment against a malicious plugin.
+
+A private plugin may link internal crates when it needs in-process access to
+configured services. Such a plugin is explicitly trusted and version-locked to
+Temps, but it still receives no database credential or host-data path in its
+launch configuration by default.
+
+Direct control-plane database access and host-data access are independent,
+privileged manifest disclosures. `requires_db(true)` asks Temps to supply the
+database URL. `requires_host_data_access(true)` asks it to supply the instance
+data root, which can contain encryption and authentication keys. These flags
+minimize ambient launch data and make privilege visible to operators; they do
+not create an OS security boundary. Ordinary plugins should request neither.
 
 Raw host services and secrets are not part of the general third-party plugin
-contract. Future third-party plugins require narrower host capabilities or a
-separate sandboxed execution model.
+contract. Untrusted third-party plugins require a separate UID, container, or
+sandbox with a private filesystem and plugin-scoped database credentials; that
+containment is not provided by the current runtime.
 
 ## Implemented work
 
 - Added the resolved permission header to the host/plugin protocol.
 - Added typed authenticated and optional caller extractors.
 - Verified proxy assertions in SDK middleware before inserting caller state.
+- Authenticated the internal WebSocket channel and HTTP event fallback before
+  either endpoint consumes plugin state.
+- Restricted the socket directory and socket itself to the host process user.
+- Added a versioned, staged startup handshake. One process publishes its
+  manifest and then receives typed launch configuration through stdin; legacy
+  or mismatched binaries get an actionable rebuild error.
+- Defaulted database and host-data launch values off and supplied them
+  independently from the declared manifest.
 - Caller-scoped channel clients are captured from the initiating request and
   carried into background work; there is no mutable user-ID token registry.
 - Added caller-scoped project listing through the platform HTTP handler.
@@ -57,7 +80,6 @@ separate sandboxed execution model.
 
 ## Remaining work
 
-- Add protocol-version negotiation and actionable compatibility errors.
 - Add explicit expiry reporting for background delegations so a long-running
   operation can explain when its initiating actor token has expired.
 - Add multi-user integration coverage proving project isolation.
@@ -74,4 +96,6 @@ separate sandboxed execution model.
 - Local external-plugin E2E covering SDK caller extraction, delegated platform
   calls, and generated public URLs.
 - Security-auditor approval before merge.
+- Rebuild external plugin binaries against the matching SDK protocol before a
+  host release; legacy binaries fail secure startup preflight.
 - OSS Temps changes merge through a PR with runtime evidence.

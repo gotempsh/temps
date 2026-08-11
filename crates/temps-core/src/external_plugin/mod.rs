@@ -21,9 +21,10 @@ pub use channel::{
     ActorToken, ApiCall, ApiCallResult, CallOutcome, ChannelError, ChannelErrorCode, ChannelEvent,
     ChannelMessage, ChannelRequest, ChannelResponse, DeploymentInfo, EnvironmentInfo, HttpMethod,
     JsonBody, JsonBodyError, PlatformCall, PlatformCallRequest, PlatformCallResponse, ProjectInfo,
-    ProtocolMismatch, PLUGIN_CHANNEL_PATH,
+    ProtocolMismatch, VerifiedPluginApiCaller, PLUGIN_CHANNEL_PATH,
 };
 pub use manifest::{
-    HandshakeMessage, NavEntry, NavSection, PluginCapability, PluginEvent, PluginManifest,
-    PluginManifestBuilder, PluginReady, UiManifest, UiRoute, PLUGIN_EVENTS_PATH,
+    HandshakeMessage, NavEntry, NavSection, PluginCapability, PluginEvent, PluginHello,
+    PluginLaunchConfig, PluginManifest, PluginManifestBuilder, PluginReady, UiManifest, UiRoute,
+    EXTERNAL_PLUGIN_PROTOCOL_VERSION, PLUGIN_EVENTS_PATH,
 };

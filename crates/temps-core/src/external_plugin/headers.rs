@@ -11,9 +11,9 @@
 //! by the caller. The proxy strips every inbound `x-temps-*` header before
 //! injecting its own, so a client cannot present `x-temps-user-role: admin`
 //! and have it survive to the plugin. A plugin may therefore treat these as
-//! authoritative — but only because it is reachable exclusively through that
-//! proxy. A plugin whose Unix socket is reachable by other local processes
-//! gets no such guarantee from these headers alone.
+//! authoritative for requests carrying the staged process secret. This does
+//! not isolate installed plugins from one another under the current shared-UID
+//! host model; installed plugin binaries are trusted host code.
 
 /// Namespace for every header the proxy asserts. The proxy removes all
 /// inbound headers with this prefix before adding its own.

@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::protocol::headers;
 
@@ -211,7 +212,7 @@ pub(crate) fn verify_proxy_headers(
         .headers()
         .get(headers::AUTH_SIGNATURE)
         .and_then(|value| value.to_str().ok());
-    if signature != Some(expected_secret) {
+    if !signature.is_some_and(|provided| secure_secret_matches(provided, expected_secret)) {
         return Err(AuthenticationRequired);
     }
 
@@ -271,6 +272,10 @@ pub(crate) fn verify_proxy_headers(
     Ok(caller)
 }
 
+pub(crate) fn secure_secret_matches(provided: &str, expected: &str) -> bool {
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +310,8 @@ mod tests {
             .body(axum::body::Body::empty())
             .expect("test request");
         assert!(verify_proxy_headers(&mut request, "secret").is_err());
+        assert!(!secure_secret_matches("secreu", "secret"));
+        assert!(!secure_secret_matches("secret-extra", "secret"));
     }
 
     #[test]

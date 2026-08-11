@@ -20,7 +20,7 @@ pub struct PluginProxy {
     pub socket_path: PathBuf,
     /// Plugin name for header injection
     pub plugin_name: String,
-    /// HMAC secret for authenticating proxied requests
+    /// Per-process assertion secret for authenticating proxied requests.
     pub auth_secret: String,
     /// Route prefixes the plugin authenticates itself, from its manifest.
     /// See [`temps_core::external_plugin::manifest::PluginManifest::public_paths`].
@@ -73,8 +73,8 @@ impl PluginProxy {
 
     /// Whether `path` is one the plugin gates itself.
     ///
-    /// Prefix match, but only at a segment boundary: `/vibe/mcp` must not
-    /// also open `/vibe/mcp-admin`.
+    /// Prefix match, but only at a segment boundary: `/hooks/incoming` must
+    /// not also open `/hooks/incoming-admin`.
     fn is_public(&self, path: &str) -> bool {
         self.public_paths.iter().any(|prefix| {
             let prefix = prefix.trim_end_matches('/');
@@ -152,10 +152,9 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
                 path = %path,
                 "Failed to proxy request to plugin: {}", e
             );
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Plugin '{}' unavailable: {}", proxy.plugin_name, e),
-            )
+            problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("Plugin Unavailable")
+                .with_detail("The plugin could not complete the request.")
                 .into_response()
         }
     }
@@ -687,28 +686,28 @@ mod tests {
 
     #[test]
     fn public_paths_match_on_segment_boundaries() {
-        let proxy = test_proxy().with_public_paths(vec!["/vibe/mcp".into()]);
+        let proxy = test_proxy().with_public_paths(vec!["/hooks/incoming".into()]);
 
-        assert!(proxy.is_public("/vibe/mcp"));
-        assert!(proxy.is_public("/vibe/mcp/agents"));
+        assert!(proxy.is_public("/hooks/incoming"));
+        assert!(proxy.is_public("/hooks/incoming/jobs"));
         // The obvious trap: a sibling route whose name merely starts the same.
-        assert!(!proxy.is_public("/vibe/mcp-admin"));
-        assert!(!proxy.is_public("/vibe/apps"));
+        assert!(!proxy.is_public("/hooks/incoming-admin"));
+        assert!(!proxy.is_public("/hooks/outgoing"));
     }
 
     #[test]
     fn no_public_paths_means_everything_is_gated() {
         let proxy = test_proxy();
-        assert!(!proxy.is_public("/vibe/mcp/agents"));
+        assert!(!proxy.is_public("/hooks/incoming/jobs"));
         assert!(!proxy.is_public("/"));
     }
 
     #[test]
     fn trailing_slash_in_manifest_does_not_change_matching() {
-        let proxy = test_proxy().with_public_paths(vec!["/vibe/mcp/".into()]);
-        assert!(proxy.is_public("/vibe/mcp"));
-        assert!(proxy.is_public("/vibe/mcp/agents"));
-        assert!(!proxy.is_public("/vibe/mcp-admin"));
+        let proxy = test_proxy().with_public_paths(vec!["/hooks/incoming/".into()]);
+        assert!(proxy.is_public("/hooks/incoming"));
+        assert!(proxy.is_public("/hooks/incoming/jobs"));
+        assert!(!proxy.is_public("/hooks/incoming-admin"));
     }
 
     #[test]

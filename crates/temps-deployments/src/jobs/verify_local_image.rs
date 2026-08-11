@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Output from VerifyLocalImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,17 +181,16 @@ impl WorkflowTask for VerifyLocalImageJob {
             let actual_normalized = normalize_id(&image_id);
             let expected_normalized = normalize_id(expected_id);
 
-            if !actual_normalized
-                .starts_with(&expected_normalized[..12.min(expected_normalized.len())])
-            {
-                let warning_msg = format!(
-                    "Image ID mismatch: expected '{}', found '{}'. Proceeding with found image.",
+            if actual_normalized != expected_normalized {
+                let error_msg = format!(
+                    "Image ID mismatch for '{}': expected '{}', found '{}'. Refusing to deploy a changed local image.",
+                    self.image_ref,
                     expected_id, image_id
                 );
-                debug!("{}", warning_msg);
-                self.log(LogLevel::Warning, &format!("⚠️ {}", warning_msg))
+                error!("{}", error_msg);
+                self.log(LogLevel::Error, &format!("❌ {}", error_msg))
                     .await;
-                // Don't fail - the image exists, just log the mismatch
+                return Ok(JobResult::failure(context, error_msg));
             }
         }
 
@@ -279,5 +278,52 @@ mod tests {
         );
 
         assert_eq!(job.extract_tag(), "v1.0");
+    }
+
+    #[tokio::test]
+    async fn immutable_image_id_mismatch_fails_closed() {
+        use bollard::query_parameters::CreateImageOptionsBuilder;
+        use futures::StreamExt;
+
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        docker
+            .create_image(
+                Some(
+                    CreateImageOptionsBuilder::new()
+                        .from_image("hello-world:latest")
+                        .build(),
+                ),
+                None,
+                None,
+            )
+            .for_each(|_| async {})
+            .await;
+        if docker.inspect_image("hello-world:latest").await.is_err() {
+            println!("Could not fetch a test image (offline?), skipping");
+            return;
+        }
+
+        let job = VerifyLocalImageJob::new(
+            "verify-immutable".to_string(),
+            "hello-world:latest".to_string(),
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".into()),
+            Arc::new(docker),
+        );
+        let context = crate::test_utils::create_test_context("run-mismatch".into(), 1, 1, 1);
+        let result = job.execute(context).await.expect("verification result");
+
+        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert!(result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Refusing to deploy a changed local image")));
     }
 }
