@@ -1220,9 +1220,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -1849,9 +1849,9 @@ checksum = "93a719913643003b84bd13022b4b7e703c09342cd03b679c4641c7d2e50dc34d"
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1859,9 +1859,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -4724,9 +4724,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 dependencies = [
  "serde",
 ]
@@ -4964,12 +4964,12 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "lettre"
-version = "0.11.22"
+version = "0.11.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
+checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "email-encoding",
  "email_address",
  "fastrand",
@@ -5758,9 +5758,9 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-core"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3463cbb78394cb0141e2c926b93fc2197e473394b761986eca3b9da2c63ae0f4"
+checksum = "b897d7bd4f0af82e68d40d0344cf37e97f9c97ddf74a098de3e4da05e96ca395"
 dependencies = [
  "paste",
 ]
@@ -10203,7 +10203,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "futures-util",
@@ -10389,7 +10389,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "flate2",
  "sea-orm",
@@ -10439,7 +10439,7 @@ dependencies = [
  "axum",
  "axum-macros",
  "base32",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cookie",
  "hex",
@@ -10704,7 +10704,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "config",
  "dirs",
@@ -10739,7 +10739,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cookie",
  "futures",
@@ -10905,7 +10905,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-macros",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cloudflare 0.14.0",
  "futures",
@@ -10969,7 +10969,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -11021,7 +11021,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "dirs",
@@ -11102,7 +11102,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "hex",
  "hmac 0.13.0",
@@ -11355,7 +11355,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -11420,7 +11420,7 @@ name = "temps-google-indexing-plugin"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "include_dir",
  "jsonwebtoken 11.0.0",
@@ -11592,7 +11592,7 @@ name = "temps-import-kubernetes"
 version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "reqwest 0.12.28",
  "sea-orm",
@@ -11947,7 +11947,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "clickhouse",
  "http 1.5.0",
@@ -12126,7 +12126,7 @@ dependencies = [
  "aws-smithy-runtime",
  "axum",
  "axum-macros",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -12183,7 +12183,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clickhouse",
@@ -12383,7 +12383,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "csv",
@@ -12443,7 +12443,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "flate2",
  "futures",
@@ -12478,7 +12478,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "headless_chrome",
  "mockito",
  "reqwest 0.12.28",
@@ -12659,7 +12659,7 @@ dependencies = [
 name = "temps-wireguard"
 version = "0.1.0-beta.55"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "defguard_wireguard_rs",
  "serde",
  "serde_json",
@@ -12837,9 +12837,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.54"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "js-sys",
