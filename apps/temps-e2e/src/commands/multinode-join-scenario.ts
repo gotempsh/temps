@@ -836,7 +836,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       )
       if (!databaseInfo.ok) throw new Error(String(databaseInfo.detail))
       if (!databaseInfo.detail.database_host.includes('.temps.local')) {
-        throw new Error(`injected POSTGRES_URL did not contain internal DNS hosts: ${databaseInfo.detail.database_host}`)
+        throw new Error(`database probe did not use an internal DNS host: ${databaseInfo.detail.database_host}`)
       }
 
       const write = await fetch(`${probeTarget.url.replace(/\/+$/, '')}/probe`, { headers: probeTarget.headers })
