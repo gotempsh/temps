@@ -703,6 +703,12 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
+    title: 'Build & Deployment',
+    url: 'build',
+    icon: Settings,
+    keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
+  },
+  {
     title: 'Security',
     url: 'settings/security',
     icon: Shield,

@@ -172,6 +172,7 @@ mod tests {
             public_ports: vec![ComposePublicPort {
                 service: "web".to_string(),
                 port: 3000,
+                ..Default::default()
             }],
         };
 

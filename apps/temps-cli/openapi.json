@@ -5113,6 +5113,10 @@
             "format": "date-time",
             "type": "string"
           },
+          "has_authenticated_credentials": {
+            "description": "Whether this connection can make authenticated provider requests. This exposes capability only; credential values are never serialized.",
+            "type": "boolean"
+          },
           "health_message": {
             "description": "Human-readable reason when health_status is \"unhealthy\"; null otherwise.",
             "type": [
@@ -5183,6 +5187,7 @@
           "provider_id",
           "account_name",
           "account_type",
+          "has_authenticated_credentials",
           "is_active",
           "is_expired",
           "syncing",

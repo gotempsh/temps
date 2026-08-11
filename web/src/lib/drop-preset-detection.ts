@@ -1,9 +1,18 @@
-import type { DropInspectionResponse } from '@/api/client'
+import type { DropInspectionResponse, DropPresetCandidate } from '@/api/client'
 import { prepareDrop, type DropFile } from '@/lib/drop-archive'
 
 export interface PreparedDropInspection {
   archive: File
   inspection: DropInspectionResponse
+}
+
+export function presetConfigForDropCandidate(
+  candidate: DropPresetCandidate
+): { composePath: string } | undefined {
+  if (candidate.preset !== 'docker-compose' || !candidate.composePath) {
+    return undefined
+  }
+  return { composePath: candidate.composePath }
 }
 
 interface PrepareAndInspectOptions {

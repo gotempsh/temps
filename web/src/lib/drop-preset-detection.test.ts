@@ -1,7 +1,24 @@
 import { describe, expect, test } from 'bun:test'
-import { prepareAndInspectDrop } from './drop-preset-detection'
+import {
+  prepareAndInspectDrop,
+  presetConfigForDropCandidate,
+} from './drop-preset-detection'
 
 describe('prepareAndInspectDrop', () => {
+  test('preserves a detected modern Compose filename for project creation', () => {
+    expect(
+      presetConfigForDropCandidate({
+        composePath: 'compose.yaml',
+        confidence: 'high',
+        directory: '.',
+        isStatic: false,
+        label: 'Docker Compose',
+        preset: 'docker-compose',
+        reason: 'Docker Compose file found',
+      })
+    ).toEqual({ composePath: 'compose.yaml' })
+  })
+
   test('packages selected files and returns the detected preset', async () => {
     let inspectedArchive: File | undefined
     const result = await prepareAndInspectDrop(

@@ -21,6 +21,13 @@ pub struct HealthCheckService {
 }
 
 impl HealthCheckService {
+    /// Match deployment-readiness semantics: a redirect is a valid public
+    /// application response (login/setup redirects are common), while 4xx/5xx
+    /// indicate that the configured application URL is not usable.
+    fn is_operational_http_status(status: reqwest::StatusCode) -> bool {
+        status.is_success() || status.is_redirection()
+    }
+
     /// Create a new HealthCheckService with mandatory ConfigService and JobQueue
     pub fn new(
         db: Arc<DatabaseConnection>,
@@ -30,6 +37,11 @@ impl HealthCheckService {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("Temps-Status-Monitor/1.0")
+            // The application controls redirect targets. Following them would
+            // turn periodic monitoring into a blind SSRF primitive against
+            // loopback/private/link-local services, and would also prevent us
+            // from classifying the original 3xx as a healthy app response.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 
@@ -143,7 +155,6 @@ impl HealthCheckService {
                         if let Err(e) = validate_check_path(path) {
                             warn!(
                                 monitor_id = monitor.id,
-                                check_path = %path,
                                 error = %e,
                                 "Stored check_path failed validation; falling back to default URL"
                             );
@@ -213,13 +224,9 @@ impl HealthCheckService {
                 Ok(Ok(response)) => {
                     let status_code = response.status();
 
-                    let status = if status_code.is_success()
-                        || status_code.as_u16() == 404
-                        || status_code.as_u16() == 405
-                    {
-                        // 2xx, 404, and 405 are all considered healthy — many apps
-                        // return 404 on / (API backends) or 405 (no GET handler)
-                        // but the server is running fine.
+                    let status = if Self::is_operational_http_status(status_code) {
+                        // Redirects are healthy (many apps redirect `/` to login or
+                        // setup); client/server errors are not usable.
                         "operational"
                     } else if status_code.is_server_error() {
                         // For server errors, retry
@@ -662,7 +669,7 @@ impl HealthCheckService {
         match check_result {
             Ok(Ok(response)) => {
                 let code = response.status();
-                let status = if code.is_success() || code.as_u16() == 404 || code.as_u16() == 405 {
+                let status = if Self::is_operational_http_status(code) {
                     "operational"
                 } else if code.is_server_error() {
                     "major_outage"
@@ -809,5 +816,24 @@ mod tests {
         assert_eq!(result[0].id, 2);
         assert_eq!(result[1].id, 3);
         assert_eq!(result[2].id, 5);
+    }
+
+    #[test]
+    fn test_operational_http_status_matches_deployment_readiness() {
+        for status in [200, 204, 301, 302, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(
+                HealthCheckService::is_operational_http_status(status),
+                "HTTP {status} should be operational"
+            );
+        }
+
+        for status in [400, 401, 403, 404, 405, 429, 500, 502, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(
+                !HealthCheckService::is_operational_http_status(status),
+                "HTTP {status} should not be operational"
+            );
+        }
     }
 }

@@ -33,10 +33,14 @@ import {
   FolderGit2,
   Filter,
   ArrowRight,
+  X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { usePresets } from '@/contexts/PresetContext'
+import { RepositoryAvatar } from './RepositoryAvatar'
+import { hasNextRepositoryPage } from '@/lib/repository-pagination'
+import { RepositoryPresetLogos } from './RepositoryPresetLogos'
 
 interface RepositoryListProps {
   connectionId: number
@@ -47,6 +51,7 @@ interface RepositoryListProps {
   className?: string
   showHeader?: boolean
   compactMode?: boolean
+  providerType?: string | null
 }
 
 type SortOption = 'name' | 'pushed' | 'created'
@@ -61,11 +66,13 @@ export function RepositoryList({
   className,
   showHeader = true,
   compactMode = false,
+  providerType,
 }: RepositoryListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [sortBy, setSortBy] = useState<SortOption>('pushed')
   const [filterBy, setFilterBy] = useState<FilterOption>('all')
+  const [searchOpen, setSearchOpen] = useState(false)
   const queryClient = useQueryClient()
   const { getPresetBySlug } = usePresets()
 
@@ -101,6 +108,7 @@ export function RepositoryList({
         direction: 'desc',
         page: currentPage,
         per_page: itemsPerPage,
+        private: filterBy === 'all' ? undefined : filterBy === 'private',
       },
     }),
     enabled: !!connectionId,
@@ -182,21 +190,10 @@ export function RepositoryList({
     })
   }
 
-  // Apply client-side visibility filter since API doesn't support it
   const processedRepositories = useMemo(() => {
     if (!repositories?.repositories) return []
-
-    let filtered = [...repositories.repositories]
-
-    // Apply visibility filter (client-side only)
-    if (filterBy !== 'all') {
-      filtered = filtered.filter((repo) =>
-        filterBy === 'private' ? repo.private : !repo.private
-      )
-    }
-
-    return filtered
-  }, [repositories, filterBy])
+    return repositories.repositories
+  }, [repositories])
 
   // Reset page when debounced search changes
   useEffect(() => {
@@ -204,11 +201,12 @@ export function RepositoryList({
     setCurrentPage(1)
   }, [debouncedSearchQuery])
 
-  // Since we're using server-side pagination, we need to estimate total pages
-  // If we got less than per_page items, we're on the last page
-  const hasMorePages =
-    repositories?.repositories &&
-    repositories.repositories.length === itemsPerPage
+  const totalCount = repositories?.total_count ?? 0
+  const hasMorePages = hasNextRepositoryPage(
+    totalCount,
+    currentPage,
+    itemsPerPage
+  )
   const paginatedRepositories = processedRepositories
 
   // Handle search change without resetting page immediately
@@ -248,27 +246,36 @@ export function RepositoryList({
     <div className={cn('space-y-4', className)}>
       {showHeader && (
         <div className="space-y-3">
-          {/* Search and Filters — stack on mobile, inline from sm up. */}
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <div className="relative flex-1 sm:min-w-[220px]">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={searchQuery}
-                onChange={(e) => handleSearchChange(e.target.value)}
-                placeholder="Search repositories…"
-                className="pl-9 pr-10"
-              />
-              {searchQuery !== debouncedSearchQuery && (
-                <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                  <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
-                </div>
-              )}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-base/6 text-muted-foreground sm:text-sm/5">
+              {totalCount === 0
+                ? 'No repositories found'
+                : searchQuery
+                  ? `${totalCount} matching`
+                  : `${totalCount} repositories`}
+              <span aria-hidden="true" className="px-1.5 opacity-40">
+                ·
+              </span>
+              <span className="tabular-nums">Page {currentPage}</span>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+              {compactMode && (
+                <Button
+                  type="button"
+                  variant={searchOpen ? 'secondary' : 'outline'}
+                  size="sm"
+                  onClick={() => setSearchOpen((open) => !open)}
+                  className="gap-1.5"
+                  aria-expanded={searchOpen}
+                >
+                  <Search className="size-4 shrink-0" />
+                  Search
+                </Button>
+              )}
               <Select value={filterBy} onValueChange={handleFilterChange}>
-                <SelectTrigger className="w-full sm:w-[140px]">
-                  <Filter className="mr-2 h-4 w-4 shrink-0" />
+                <SelectTrigger className="w-[140px] max-sm:flex-1">
+                  <Filter className="mr-2 size-4 shrink-0" />
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -279,7 +286,7 @@ export function RepositoryList({
               </Select>
 
               <Select value={sortBy} onValueChange={handleSortChange}>
-                <SelectTrigger className="w-full sm:w-[160px]">
+                <SelectTrigger className="w-[160px] max-sm:flex-1">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -290,34 +297,60 @@ export function RepositoryList({
               </Select>
 
               <Button
+                type="button"
                 variant="outline"
                 size="icon"
-                className="shrink-0"
+                className="relative shrink-0"
                 onClick={() => refetch()}
                 disabled={isLoading}
                 aria-label="Refresh repositories"
               >
+                <span
+                  className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
+                  aria-hidden="true"
+                />
                 <RefreshCw
-                  className={cn('h-4 w-4', isLoading && 'animate-spin')}
+                  className={cn('size-4 shrink-0', isLoading && 'animate-spin')}
                 />
               </Button>
             </div>
           </div>
 
-          {/* Results count */}
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>
-              {processedRepositories.length === 0
-                ? 'No repositories found'
-                : searchQuery
-                  ? `${processedRepositories.length} matching`
-                  : `${processedRepositories.length} repositories`}
-            </span>
-            <span className="tabular-nums">
-              Page {currentPage}
-              {hasMorePages ? '+' : ''}
-            </span>
-          </div>
+          {(!compactMode || searchOpen) && (
+            <div className="relative">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 shrink-0 stroke-muted-foreground" />
+              <Input
+                name="repository-search"
+                aria-label="Search repositories"
+                value={searchQuery}
+                onChange={(e) => handleSearchChange(e.target.value)}
+                placeholder="Search repositories…"
+                className="pr-10 pl-9 max-sm:text-base/6"
+                autoFocus={compactMode}
+              />
+              {searchQuery !== debouncedSearchQuery ? (
+                <RefreshCw className="absolute top-1/2 right-3 size-4 -translate-y-1/2 animate-spin shrink-0 stroke-muted-foreground" />
+              ) : (
+                compactMode && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery('')
+                      setSearchOpen(false)
+                    }}
+                    className="absolute top-1/2 right-2 flex size-8 -translate-y-1/2 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+                    aria-label="Close repository search"
+                  >
+                    <span
+                      className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
+                      aria-hidden="true"
+                    />
+                    <X className="size-4 shrink-0 stroke-muted-foreground" />
+                  </button>
+                )
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -339,23 +372,33 @@ export function RepositoryList({
       {isLoading ? (
         <div
           className={cn(
-            'grid gap-3',
+            'grid',
             compactMode
-              ? 'grid-cols-1'
-              : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
+              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
           {Array.from({ length: itemsPerPage }).map((_, i) => (
-            <div key={i} className="rounded-xl border bg-card p-4">
+            <div
+              key={i}
+              className={cn(
+                'border bg-card',
+                compactMode ? 'rounded-lg p-2.5' : 'rounded-xl p-4'
+              )}
+            >
               <div className="flex items-center gap-3">
-                <Skeleton className="size-9 shrink-0 rounded-lg" />
+                <Skeleton className="size-9 shrink-0 rounded-md" />
                 <div className="flex-1 space-y-1.5">
                   <Skeleton className="h-3 w-2/3" />
                   <Skeleton className="h-2.5 w-1/3" />
                 </div>
               </div>
-              <Skeleton className="mt-3 h-4 w-24 rounded-full" />
-              <Skeleton className="mt-3 h-2.5 w-full" />
+              {!compactMode && (
+                <>
+                  <Skeleton className="mt-3 h-4 w-24 rounded-full" />
+                  <Skeleton className="mt-3 h-2.5 w-full" />
+                </>
+              )}
             </div>
           ))}
         </div>
@@ -410,16 +453,97 @@ export function RepositoryList({
       ) : (
         <div
           className={cn(
-            'grid gap-3',
+            'grid',
             compactMode
-              ? 'grid-cols-1'
-              : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
+              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
           {paginatedRepositories.map((repo) => {
-            const isSelected =
-              showSelection && selectedRepositoryId === repo.id
+            const isSelected = showSelection && selectedRepositoryId === repo.id
             const interactive = !!onRepositorySelect
+            if (compactMode) {
+              return (
+                <div
+                  key={repo.id}
+                  className={cn(
+                    'group flex min-w-0 items-center rounded-lg border bg-card',
+                    interactive &&
+                      !isSelected &&
+                      'hover:border-primary/40 hover:bg-accent/40',
+                    isSelected &&
+                      'border-primary bg-primary/5 ring-1 ring-primary'
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleRepositoryClick(repo)}
+                    disabled={!interactive}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      'flex min-w-0 flex-1 items-center gap-3 p-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                      !interactive && 'cursor-default'
+                    )}
+                  >
+                    <RepositoryAvatar
+                      repository={repo}
+                      providerType={providerType}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-base font-semibold sm:text-sm">
+                        {repo.name}
+                      </p>
+                      <div className="flex min-w-0 items-center gap-1.5 text-base/6 text-muted-foreground sm:text-sm/5">
+                        <span className="truncate">{repo.owner}</span>
+                        <span
+                          aria-hidden="true"
+                          className="shrink-0 opacity-40"
+                        >
+                          ·
+                        </span>
+                        <span className="shrink-0">
+                          {repo.private ? 'Private' : 'Public'}
+                        </span>
+                        {repo.language && (
+                          <>
+                            <span
+                              aria-hidden="true"
+                              className="shrink-0 opacity-40"
+                            >
+                              ·
+                            </span>
+                            <span className="flex min-w-0 items-center gap-1.5">
+                              <span
+                                className={cn(
+                                  'size-2 shrink-0 rounded-full',
+                                  getLanguageColor(repo.language)
+                                )}
+                              />
+                              <span className="truncate">{repo.language}</span>
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    {isSelected ? (
+                      <CheckCircle2 className="size-5 shrink-0 stroke-primary sm:size-4" />
+                    ) : (
+                      interactive && (
+                        <ArrowRight className="size-5 shrink-0 stroke-muted-foreground opacity-0 transition-transform group-hover:translate-x-0.5 group-hover:opacity-100 sm:size-4" />
+                      )
+                    )}
+                  </button>
+                  <div className="shrink-0 pr-1.5">
+                    <RepositoryPresetLogos
+                      repository={repo}
+                      automaticDetectionEnabled={
+                        connection?.has_authenticated_credentials ?? false
+                      }
+                    />
+                  </div>
+                </div>
+              )
+            }
             return (
               <button
                 key={repo.id}
@@ -428,123 +552,119 @@ export function RepositoryList({
                 disabled={!interactive}
                 aria-pressed={isSelected}
                 className={cn(
-                  'group flex flex-col rounded-xl border bg-card p-4 text-left transition-colors',
+                  'group flex flex-col rounded-lg border bg-card p-4 text-left',
                   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                   interactive &&
                     !isSelected &&
                     'hover:border-primary/40 hover:bg-accent/40',
-                  isSelected && 'border-primary bg-primary/5 ring-1 ring-primary',
+                  isSelected &&
+                    'border-primary bg-primary/5 ring-1 ring-primary',
                   !interactive && 'cursor-default'
                 )}
               >
-                {/* Title row: repo avatar, name/owner, select/arrow affordance */}
-                <div className="flex items-start gap-3">
-                  <div
-                    className={cn(
-                      'flex size-9 shrink-0 items-center justify-center rounded-lg transition-colors',
-                      isSelected
-                        ? 'bg-primary/15 text-primary'
-                        : 'bg-muted text-muted-foreground group-hover:bg-primary/10 group-hover:text-primary'
-                    )}
-                  >
-                    <FolderGit2 className="size-4" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold leading-tight">
-                      {repo.name}
-                    </p>
-                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                      {repo.owner}
-                    </p>
-                  </div>
-                  {isSelected ? (
-                    <CheckCircle2 className="size-4 shrink-0 text-primary" />
-                  ) : (
-                    interactive && (
-                      <ArrowRight className="size-4 shrink-0 text-muted-foreground opacity-0 transition-all group-hover:translate-x-0.5 group-hover:opacity-100" />
-                    )
-                  )}
-                </div>
-
-                {/* Badges: visibility + detected framework presets */}
-                <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px]',
-                      repo.private
-                        ? 'bg-muted/60 text-muted-foreground'
-                        : 'bg-background text-muted-foreground'
-                    )}
-                  >
-                    {repo.private ? (
-                      <Lock className="size-2.5" />
+                <>
+                  {/* Title row: repository identity and selection affordance. */}
+                  <div className="flex items-start gap-3">
+                    <RepositoryAvatar
+                      repository={repo}
+                      providerType={providerType}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-base font-semibold sm:text-sm">
+                        {repo.name}
+                      </p>
+                      <p className="truncate text-base/6 text-muted-foreground sm:text-sm/5">
+                        {repo.owner}
+                      </p>
+                    </div>
+                    {isSelected ? (
+                      <CheckCircle2 className="size-5 shrink-0 stroke-primary sm:size-4" />
                     ) : (
-                      <Unlock className="size-2.5" />
+                      interactive && (
+                        <ArrowRight className="size-5 shrink-0 stroke-muted-foreground opacity-0 transition-transform group-hover:translate-x-0.5 group-hover:opacity-100 sm:size-4" />
+                      )
                     )}
-                    {repo.private ? 'Private' : 'Public'}
-                  </span>
-                  {repo.preset?.slice(0, 3).map((presetItem, index) => {
-                    const presetInfo = getPresetBySlug(presetItem.preset)
-                    const iconUrl = presetInfo?.icon_url || '/presets/custom.svg'
-                    return (
-                      <span
-                        key={index}
-                        className="inline-flex items-center gap-1 rounded-md border bg-background px-1.5 py-0.5 text-[11px] text-foreground/80"
-                      >
-                        <img
-                          src={iconUrl}
-                          alt=""
-                          aria-hidden
-                          className="size-3 object-contain"
-                          onError={(e) => {
-                            e.currentTarget.src = '/presets/custom.svg'
-                          }}
-                        />
-                        {presetItem.presetLabel}
-                        {presetItem.path !== './' && (
-                          <span className="opacity-60">
-                            ({presetItem.path})
-                          </span>
-                        )}
+                  </div>
+
+                  {/* Badges: visibility + detected framework presets */}
+                  <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-md border py-1 pr-2 pl-1 text-base/6 sm:text-sm/5',
+                        repo.private
+                          ? 'bg-muted/60 text-muted-foreground'
+                          : 'bg-background text-muted-foreground'
+                      )}
+                    >
+                      {repo.private ? (
+                        <Lock className="size-5 shrink-0 sm:size-4" />
+                      ) : (
+                        <Unlock className="size-5 shrink-0 sm:size-4" />
+                      )}
+                      {repo.private ? 'Private' : 'Public'}
+                    </span>
+                    {repo.preset?.slice(0, 3).map((presetItem, index) => {
+                      const presetInfo = getPresetBySlug(presetItem.preset)
+                      const iconUrl =
+                        presetInfo?.icon_url || '/presets/custom.svg'
+                      return (
+                        <span
+                          key={index}
+                          className="inline-flex items-center gap-1 rounded-md border bg-background px-1.5 py-0.5 text-[11px] text-foreground/80"
+                        >
+                          <img
+                            src={iconUrl}
+                            alt=""
+                            aria-hidden
+                            className="size-3 object-contain"
+                            onError={(e) => {
+                              e.currentTarget.src = '/presets/custom.svg'
+                            }}
+                          />
+                          {presetItem.presetLabel}
+                          {presetItem.path !== './' && (
+                            <span className="opacity-60">
+                              ({presetItem.path})
+                            </span>
+                          )}
+                        </span>
+                      )
+                    })}
+                    {repo.preset && repo.preset.length > 3 && (
+                      <span className="inline-flex items-center rounded-md border bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                        +{repo.preset.length - 3} more
                       </span>
-                    )
-                  })}
-                  {repo.preset && repo.preset.length > 3 && (
-                    <span className="inline-flex items-center rounded-md border bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                      +{repo.preset.length - 3} more
-                    </span>
-                  )}
-                </div>
+                    )}
+                  </div>
 
-                {repo.description && (
-                  <p className="mt-2 line-clamp-1 text-xs text-muted-foreground">
-                    {repo.description}
-                  </p>
-                )}
+                  {repo.description && (
+                    <p className="mt-2 line-clamp-1 text-base/6 text-muted-foreground sm:text-sm/5">
+                      {repo.description}
+                    </p>
+                  )}
 
-                {/* Meta footer: pushed time + language — pinned to the card
-                    bottom so rows with taller cards stay aligned. */}
-                <div className="mt-auto flex items-center gap-2 pt-3 text-[11px] text-muted-foreground">
-                  {repo.pushed_at && (
-                    <span className="inline-flex items-center gap-1">
-                      Pushed <TimeAgo date={repo.pushed_at} />
-                    </span>
-                  )}
-                  {repo.language && repo.pushed_at && (
-                    <span className="text-muted-foreground/40">•</span>
-                  )}
-                  {repo.language && (
-                    <span className="inline-flex items-center gap-1.5">
-                      <span
-                        className={cn(
-                          'size-2 rounded-full',
-                          getLanguageColor(repo.language)
-                        )}
-                      />
-                      {repo.language}
-                    </span>
-                  )}
-                </div>
+                  <div className="mt-auto flex items-center gap-2 pt-3 text-base/6 text-muted-foreground sm:text-sm/5">
+                    {repo.pushed_at && (
+                      <span className="inline-flex items-center gap-1">
+                        Pushed <TimeAgo date={repo.pushed_at} />
+                      </span>
+                    )}
+                    {repo.language && repo.pushed_at && (
+                      <span className="text-muted-foreground/40">•</span>
+                    )}
+                    {repo.language && (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span
+                          className={cn(
+                            'size-2 rounded-full',
+                            getLanguageColor(repo.language)
+                          )}
+                        />
+                        {repo.language}
+                      </span>
+                    )}
+                  </div>
+                </>
               </button>
             )
           })}

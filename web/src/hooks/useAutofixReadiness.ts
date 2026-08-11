@@ -140,7 +140,7 @@ export function useAutofixReadiness(opts?: {
       // settings overview, so connecting is one click from onboarding. The
       // same page is where a public URL is swapped for a provider connection.
       to: opts.projectSlug
-        ? `/projects/${opts.projectSlug}/git/change-repository`
+        ? `/projects/${opts.projectSlug}/connect-repository`
         : '/settings/git-providers',
     })
   }

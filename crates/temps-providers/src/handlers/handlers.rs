@@ -26,8 +26,8 @@ use super::audit::{
     ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
     ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
     ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
-    ExternalServiceParameterRevealedAudit, ExternalServiceStatusChangedAudit,
-    ExternalServiceUpdatedAudit, ServiceHealthChecked,
+    ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
+    ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
@@ -322,6 +322,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/preview-environment-masked",
             get(get_service_preview_environment_variables_masked),
+        )
+        .route(
+            "/external-services/{id}/environment",
+            get(reveal_service_environment_variables),
         )
         .route(
             "/external-services/by-slug/{slug}",
@@ -2295,6 +2299,83 @@ async fn get_service_preview_environment_variables_masked(
     }
 }
 
+/// Reveal a service's basic environment variables in plaintext, before it is
+/// linked to any project. Used by the new-project wizard to fill a detected
+/// variable (e.g. `DATABASE_URL`) from a service the user just picked or
+/// created — every successful reveal is recorded, matching the audited
+/// single-variable reveal used once a service is project-linked.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/environment",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Service environment variables in plaintext", body = HashMap<String, String>),
+        (status = 403, description = "Caller cannot access a project linked to this service"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn reveal_service_environment_variables(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    require_service_parameter_project_access(&auth, &app_state, id).await?;
+
+    let options = EnvironmentVariableOptions {
+        include_docker: false,
+        include_runtime: false,
+        mask_sensitive: false,
+        names_only: false,
+    };
+
+    let response = match app_state
+        .external_service_manager
+        .get_environment_variables(id, None, None, options)
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return match e.to_string().as_str() {
+                "Service not found" => Err(not_found().detail("Service not found").build()),
+                _ => Err(internal_server_error()
+                    .detail(format!("Failed to get environment variables: {}", e))
+                    .build()),
+            }
+        }
+    };
+
+    let audit = ExternalServiceEnvironmentVariablesRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: id,
+    };
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
+        error!(service_id = id, error = %error, "Failed to audit service environment variables reveal");
+    }
+    require_reveal_audit(
+        audit_result,
+        "The environment variables could not be revealed because their audit record failed",
+    )?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(response.variables),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Container runtime + stats + resource limits.
 //
@@ -2499,6 +2580,7 @@ async fn update_service_resources(
         get_project_service_environment_variables,
         get_service_preview_environment_variable_names,
         get_service_preview_environment_variables_masked,
+        reveal_service_environment_variables,
         get_service_by_slug,
         get_service_health_status,
         trigger_service_health_check,

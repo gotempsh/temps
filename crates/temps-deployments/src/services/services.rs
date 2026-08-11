@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
     deployment_container_logs, deployment_containers, deployment_domains, deployments,
-    environments, projects,
+    environments, nodes, projects,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -39,6 +39,23 @@ pub struct ContainerLogParams {
     pub tail: Option<String>,
     pub timestamps: bool,
     pub follow: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedContainerResourceLimits {
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerPresentationContext {
+    pub node_names: HashMap<i32, String>,
+    pub app_settings: temps_core::AppSettings,
+    pub environment_subdomain: String,
+    pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
+    pub resource_limits: ResolvedContainerResourceLimits,
 }
 
 #[derive(Error, Debug)]
@@ -140,6 +157,74 @@ pub struct DeploymentService {
 }
 
 impl DeploymentService {
+    pub async fn container_presentation_context(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        node_ids: &[i32],
+    ) -> Result<ContainerPresentationContext, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Project {project_id} not found while resolving container presentation"
+                ))
+            })?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Environment {environment_id} not found in project {project_id} while resolving container presentation"
+                ))
+            })?;
+        let app_settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::Other(format!(
+                "Failed to load application settings for containers in project {project_id}, environment {environment_id}: {error}"
+            ))
+        })?;
+        let node_names = if node_ids.is_empty() {
+            HashMap::new()
+        } else {
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|node| (node.id, node.name))
+                .collect()
+        };
+        let public_ports = match project.preset_config.as_ref() {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => {
+                config.public_ports.clone()
+            }
+            _ => Vec::new(),
+        };
+        let environment_config = environment.deployment_config.as_ref();
+        let project_config = project.deployment_config.as_ref();
+        let resolve =
+            |get: fn(&temps_entities::deployment_config::DeploymentConfig) -> Option<i32>| {
+                environment_config
+                    .and_then(get)
+                    .or_else(|| project_config.and_then(get))
+            };
+
+        Ok(ContainerPresentationContext {
+            node_names,
+            app_settings,
+            environment_subdomain: environment.subdomain,
+            public_ports,
+            resource_limits: ResolvedContainerResourceLimits {
+                cpu_request: resolve(|config| config.cpu_request),
+                cpu_limit: resolve(|config| config.cpu_limit),
+                memory_request: resolve(|config| config.memory_request),
+                memory_limit: resolve(|config| config.memory_limit),
+            },
+        })
+    }
+
     async fn cleanup_containers(
         &self,
         project_id: i32,
@@ -4443,6 +4528,35 @@ mod tests {
         Ok(())
     }
 
+    fn spawn_test_readiness_proxy() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind rollback readiness proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make rollback readiness proxy nonblocking");
+        let address = listener.local_addr().expect("read readiness proxy address");
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("create async rollback readiness proxy");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
     fn create_deployment_service_for_test(
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
@@ -4452,12 +4566,13 @@ mod tests {
         // Create a minimal real config service for testing
         // We need to provide the database URL that the test database is using
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let proxy_address = spawn_test_readiness_proxy();
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
-                "127.0.0.1:8080".to_string(),
+                proxy_address,
                 test_db_url.to_string(),
                 None,
-                None,
+                Some("127.0.0.1:3001".to_string()),
             )
             .expect("Failed to create test server config"),
         );
@@ -4609,6 +4724,15 @@ mod tests {
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
         }
+    }
+
+    async fn configure_test_service_for_http_readiness(
+        service: &DeploymentService,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut settings = service.config_service.get_settings().await?;
+        settings.external_url = Some("http://temps-test.local".to_string());
+        service.config_service.update_settings(settings).await?;
+        Ok(())
     }
 
     /// Stub `get_container_info` so the runtime ownership check in
@@ -5085,6 +5209,7 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test rollback
         let result = deployment_service
@@ -5201,6 +5326,7 @@ mod tests {
 
         // Default test service: image_exists -> true (image present locally).
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         let result = deployment_service
             .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
@@ -6337,6 +6463,7 @@ mod tests {
         let environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test 1: Rollback to deployment2
         // Rollback now creates a NEW deployment record with is_rollback metadata

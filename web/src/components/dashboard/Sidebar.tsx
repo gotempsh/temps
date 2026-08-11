@@ -941,6 +941,7 @@ const projectBaseNav: ProjectNavItem[] = [
   { title: 'Feature Flags', url: 'flags', icon: Flag },
   { title: 'Domains', url: 'domains', icon: Globe },
   { title: 'Git', url: 'git', icon: GitFork },
+  { title: 'Build & Deploy', url: 'build', icon: Settings2 },
   { title: 'Logs', url: 'runtime', icon: ScrollText },
   {
     title: 'OpenTelemetry',

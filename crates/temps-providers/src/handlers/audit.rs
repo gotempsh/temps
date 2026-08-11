@@ -36,6 +36,18 @@ pub struct ExternalServiceEnvironmentVariableRevealedAudit {
     pub variable_name: String,
 }
 
+/// Bulk reveal of a service's basic (non-docker, non-runtime) environment
+/// variables in plaintext, before the service is linked to any project —
+/// e.g. so the new-project wizard can offer "fill from service" for a
+/// connection-string variable like `DATABASE_URL`. Project-agnostic by
+/// necessity (no project exists yet), unlike
+/// [`ExternalServiceEnvironmentVariableRevealedAudit`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceEnvironmentVariablesRevealedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceDeletedAudit {
     pub context: AuditContext,
@@ -280,6 +292,29 @@ impl AuditOperation for ExternalServiceParameterRevealedAudit {
 impl AuditOperation for ExternalServiceEnvironmentVariableRevealedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_ENVIRONMENT_VARIABLE_REVEALED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceEnvironmentVariablesRevealedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_ENVIRONMENT_VARIABLES_REVEALED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

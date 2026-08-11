@@ -39,7 +39,10 @@ import {
   validateDropEnvironmentVariables,
   type DropEnvironmentVariable,
 } from '@/lib/drop-environment-variables'
-import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
+import {
+  prepareAndInspectDrop,
+  presetConfigForDropCandidate,
+} from '@/lib/drop-preset-detection'
 import { ensureDropProjectName } from '@/lib/drop-project-name'
 import { cn } from '@/lib/utils'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
@@ -289,6 +292,7 @@ export function Drop() {
           source_type: candidate.isStatic ? 'static_files' : 'uploaded_source',
           project_type: candidate.isStatic ? 'static' : 'server',
           automatic_deploy: false,
+          preset_config: presetConfigForDropCandidate(candidate),
           storage_service_ids: [],
           environment_variables:
             serializeDropEnvironmentVariables(environmentVariables),

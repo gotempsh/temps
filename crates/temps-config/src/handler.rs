@@ -125,6 +125,12 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Port the main Pingora proxy listens on (parsed from `--address`), the
+    /// same value `ConfigService::proxy_port()` feeds into
+    /// `compute_deployment_url`/`compute_environment_url` when `external_url`
+    /// is unset. The console uses this to preview a project's real
+    /// `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
+    pub proxy_port: u16,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -337,6 +343,12 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            // Overridden by the handler via `with_proxy_port` — this struct
+            // has no access to `ConfigService` here, only the DB-backed
+            // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s
+            // own fallback so an un-reconciled response is never worse than
+            // that.
+            proxy_port: 8080,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -454,6 +466,13 @@ impl AppSettingsResponse {
         } else {
             MetricsStoreKind::TimescaleDb
         };
+        self
+    }
+
+    /// Sets the real proxy listener port, resolved from `ConfigService`
+    /// (unavailable to the plain `From<AppSettings>` conversion above).
+    fn with_proxy_port(mut self, proxy_port: u16) -> Self {
+        self.proxy_port = proxy_port;
         self
     }
 
@@ -1293,7 +1312,8 @@ async fn get_settings(
                 .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
-                .with_effective_timescale_state(policies, monitored_services_count);
+                .with_effective_timescale_state(policies, monitored_services_count)
+                .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
         Err(e) => {

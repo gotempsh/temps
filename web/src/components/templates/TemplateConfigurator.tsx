@@ -224,8 +224,13 @@ export function TemplateConfigurator({
       resolveDeploymentUrlBase({
         previewDomain: platformSettings?.preview_domain,
         externalUrl: platformSettings?.external_url,
+        proxyPort: platformSettings?.proxy_port,
       }),
-    [platformSettings?.preview_domain, platformSettings?.external_url]
+    [
+      platformSettings?.preview_domain,
+      platformSettings?.external_url,
+      platformSettings?.proxy_port,
+    ]
   )
 
   // Initialize form with template defaults, running any default_generator on

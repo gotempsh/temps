@@ -306,6 +306,9 @@ pub struct ProjectResponse {
     pub updated_at: i64,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Authoritative repository visibility. A missing connection alone does
+    /// not imply that an incompletely configured repository is public.
+    pub is_public_repo: bool,
     /// Git clone URL for the repository (used for public repos without a provider connection)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
@@ -372,6 +375,7 @@ impl ProjectResponse {
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
@@ -943,6 +947,12 @@ impl From<ProjectError> for Problem {
             ProjectError::DeploymentCleanupFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Project Runtime Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+
+            ProjectError::RouteReloadFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Proxy Route Reload Failed")
                     .with_detail(error.to_string())
             }
 

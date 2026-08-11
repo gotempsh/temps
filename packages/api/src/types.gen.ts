@@ -2458,7 +2458,11 @@ export type ConnectionResponse = {
   /**
    * Current health status: "healthy", "unhealthy", or "unknown".
    */
-  health_status: string;
+    health_status: string;
+    /**
+     * Whether this connection can make authenticated provider requests. This exposes capability only; credential values are never serialized.
+     */
+    has_authenticated_credentials: boolean;
   id: number;
   installation_id?: string | null;
   is_active: boolean;

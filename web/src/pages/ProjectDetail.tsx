@@ -18,7 +18,11 @@ import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
-import { GitSettings, ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
+import {
+  BuildSettings,
+  ChangeRepositoryPage,
+  GitSettings,
+} from '@/components/project/settings/GitSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
@@ -108,7 +112,12 @@ export function ProjectDetail() {
     refetchInterval: (query) => {
       const data = query.state.data
       // Poll more frequently for active deployments
-      if (data && (data.status === 'pending' || data.status === 'running' || data.status === 'building')) {
+      if (
+        data &&
+        (data.status === 'pending' ||
+          data.status === 'running' ||
+          data.status === 'building')
+      ) {
         return 2500 // 2.5 seconds for active deployments
       }
       // Poll while waiting for screenshot to be generated
@@ -141,7 +150,10 @@ export function ProjectDetail() {
         name: project?.repo_name || '',
       },
     }),
-    enabled: !!project?.repo_owner && !!project?.repo_name && !!project?.git_provider_connection_id,
+    enabled:
+      !!project?.repo_owner &&
+      !!project?.repo_name &&
+      !!project?.git_provider_connection_id,
   })
 
   // Mutation to disable attack mode
@@ -296,234 +308,242 @@ export function ProjectDetail() {
 
   return (
     <div className="flex h-full w-full overflow-hidden">
-        <Confetti active={showConfetti} duration={4000} particleCount={100} />
-        <div className="flex flex-1 flex-col overflow-hidden min-w-0">
-          <ProjectDetailHeader
-            project={project}
-            activeVisitorsCount={activeVisitorsCount}
-            repositoryCloneUrl={
-              repository?.clone_url ||
-              (project?.repo_owner && project?.repo_name
-                ? `https://github.com/${project.repo_owner}/${project.repo_name}`
-                : undefined)
-            }
-            lastDeploymentUrl={
-              lastDeployment ? resolveStableUrl(lastDeployment) : null
-            }
-            isLoadingLastDeployment={isLoadingLastDeployment}
-          />
-          <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
-            {/* Attack Mode Banner */}
-            {(project as any).attack_mode && (
-              <Alert className="mb-4 border-primary bg-primary/10">
-                <ShieldAlert className="h-4 w-4 text-primary" />
-                <AlertDescription className="flex items-center justify-between">
-                  <span className="text-foreground">
-                    Attack Mode is enabled for this project
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2 text-primary hover:bg-primary/20"
-                    onClick={handleDisableAttackMode}
-                    disabled={disableAttackMode.isPending}
-                  >
-                    {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
-                  </Button>
-                </AlertDescription>
-              </Alert>
-            )}
-            <ProjectTour />
-            <Routes>
-              <Route
-                index
-                element={<Navigate to="project" replace />}
-              />
-              <Route
-                path="project"
-                element={
-                  <ProjectOverview
-                    project={project}
-                    lastDeployment={lastDeployment}
-                  />
-                }
-              />
-              <Route path="setup" element={<ProjectSetup project={project} />} />
-              <Route
-                path="deployments"
-                element={<ProjectDeployments project={project} />}
-              />
-              <Route
-                path="deployments/:deploymentId"
-                element={<DeploymentDetails project={project} />}
-              />
-              <Route path="drop" element={<ProjectDrop project={project} />} />
-              <Route
-                path="environment-variables"
-                element={<EnvironmentVariablesSettings project={project} />}
-              />
-              <Route
-                path="flags"
-                element={<ProjectFeatureFlags project={project} />}
-              />
-              <Route
-                path="domains"
-                element={<DomainsSettings project={project} />}
-              />
-              <Route
-                path="git"
-                element={<GitSettings project={project} refetch={refetch} />}
-              />
-              <Route
-                path="git/change-repository"
-                element={
-                  <ChangeRepositoryPage project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="analytics/*"
-                element={<ProjectAnalytics project={project} />}
-              />
-              <Route
-                path="storage"
-                element={<ProjectStorage project={project} />}
-              />
-              <Route
-                path="services/*"
-                element={<ProjectServices project={project} />}
-              />
-              <Route
-                path="runtime"
-                element={<ProjectRuntime project={project} />}
-              />
-              <Route
-                path="observe"
-                element={<Observe project={project} />}
-              />
-              <Route
-                path="settings/*"
-                element={
-                  <ProjectSettings project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="speed"
-                element={<ProjectSpeedInsights project={project} />}
-              />
-              <Route
-                path="logs/*"
-                element={<RequestLogs project={project} />}
-              />
-              <Route
-                path="request-logs/*"
-                element={<RequestLogs project={project} />}
-              />
-              <Route
-                path="ai-crawlers"
-                element={<ProjectAiCrawlers project={project} />}
-              />
-              <Route
-                path="monitors"
-                element={<ProjectMonitors project={project} />}
-              />
-              <Route
-                path="monitors/:monitorId"
-                element={<MonitorDetail project={project} />}
-              />
-              <Route
-                path="traces/*"
-                element={<Traces project={project} />}
-              />
-              <Route
-                path="telemetry-logs"
-                element={<LogsList project={project} />}
-              />
-              <Route
-                path="metrics/*"
-                element={<Metrics project={project} />}
-              />
-              {/* Dashboards moved under the unified Metrics surface; redirect
+      <Confetti active={showConfetti} duration={4000} particleCount={100} />
+      <div className="flex flex-1 flex-col overflow-hidden min-w-0">
+        <ProjectDetailHeader
+          project={project}
+          activeVisitorsCount={activeVisitorsCount}
+          repositoryCloneUrl={
+            repository?.clone_url ||
+            (project?.repo_owner && project?.repo_name
+              ? `https://github.com/${project.repo_owner}/${project.repo_name}`
+              : undefined)
+          }
+          lastDeploymentUrl={
+            lastDeployment ? resolveStableUrl(lastDeployment) : null
+          }
+          isLoadingLastDeployment={isLoadingLastDeployment}
+        />
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+          {/* Attack Mode Banner */}
+          {(project as any).attack_mode && (
+            <Alert className="mb-4 border-primary bg-primary/10">
+              <ShieldAlert className="h-4 w-4 text-primary" />
+              <AlertDescription className="flex items-center justify-between">
+                <span className="text-foreground">
+                  Attack Mode is enabled for this project
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-primary hover:bg-primary/20"
+                  onClick={handleDisableAttackMode}
+                  disabled={disableAttackMode.isPending}
+                >
+                  {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
+                </Button>
+              </AlertDescription>
+            </Alert>
+          )}
+          <ProjectTour />
+          <Routes>
+            <Route index element={<Navigate to="project" replace />} />
+            <Route
+              path="project"
+              element={
+                <ProjectOverview
+                  project={project}
+                  lastDeployment={lastDeployment}
+                />
+              }
+            />
+            <Route path="setup" element={<ProjectSetup project={project} />} />
+            <Route
+              path="deployments"
+              element={<ProjectDeployments project={project} />}
+            />
+            <Route
+              path="deployments/:deploymentId"
+              element={<DeploymentDetails project={project} />}
+            />
+            <Route path="drop" element={<ProjectDrop project={project} />} />
+            <Route
+              path="environment-variables"
+              element={<EnvironmentVariablesSettings project={project} />}
+            />
+            <Route
+              path="flags"
+              element={<ProjectFeatureFlags project={project} />}
+            />
+            <Route
+              path="domains"
+              element={<DomainsSettings project={project} />}
+            />
+            <Route
+              path="git"
+              element={<GitSettings project={project} refetch={refetch} />}
+            />
+            <Route
+              path="build"
+              element={<BuildSettings project={project} refetch={refetch} />}
+            />
+            <Route
+              path="git/change-repository"
+              element={
+                <Navigate
+                  to={`/projects/${project.slug}/connect-repository`}
+                  replace
+                />
+              }
+            />
+            <Route
+              path="connect-repository"
+              element={
+                <ChangeRepositoryPage project={project} refetch={refetch} />
+              }
+            />
+            <Route
+              path="connect-repository/connections/:connectionId"
+              element={
+                <ChangeRepositoryPage project={project} refetch={refetch} />
+              }
+            />
+            <Route
+              path="connect-repository/connections/:connectionId/repositories/:repositoryId"
+              element={
+                <ChangeRepositoryPage project={project} refetch={refetch} />
+              }
+            />
+            <Route
+              path="analytics/*"
+              element={<ProjectAnalytics project={project} />}
+            />
+            <Route
+              path="storage"
+              element={<ProjectStorage project={project} />}
+            />
+            <Route
+              path="services/*"
+              element={<ProjectServices project={project} />}
+            />
+            <Route
+              path="runtime"
+              element={<ProjectRuntime project={project} />}
+            />
+            <Route path="observe" element={<Observe project={project} />} />
+            <Route
+              path="settings/*"
+              element={<ProjectSettings project={project} refetch={refetch} />}
+            />
+            <Route
+              path="speed"
+              element={<ProjectSpeedInsights project={project} />}
+            />
+            <Route path="logs/*" element={<RequestLogs project={project} />} />
+            <Route
+              path="request-logs/*"
+              element={<RequestLogs project={project} />}
+            />
+            <Route
+              path="ai-crawlers"
+              element={<ProjectAiCrawlers project={project} />}
+            />
+            <Route
+              path="monitors"
+              element={<ProjectMonitors project={project} />}
+            />
+            <Route
+              path="monitors/:monitorId"
+              element={<MonitorDetail project={project} />}
+            />
+            <Route path="traces/*" element={<Traces project={project} />} />
+            <Route
+              path="telemetry-logs"
+              element={<LogsList project={project} />}
+            />
+            <Route path="metrics/*" element={<Metrics project={project} />} />
+            {/* Dashboards moved under the unified Metrics surface; redirect
                   any lingering /dashboards links. */}
-              <Route
-                path="dashboards/*"
-                element={<Navigate to="../metrics/dashboards" replace />}
-              />
-              <Route
-                path="ai-gateway"
-                element={<ProjectAgentActivity projectId={project.id} />}
-              />
-              <Route
-                path="revenue"
-                element={<ProjectRevenue project={project} />}
-              />
-              <Route
-                path="agents"
-                element={<AutopilotPage project={project} />}
-              />
-              <Route
-                path="agents/detail/:agentSlug"
-                element={<AgentDetailPage project={project} />}
-              />
-              <Route
-                path="agents/detail/:agentSlug/edit"
-                element={<AgentEditPage project={project} />}
-              />
-              <Route
-                path="agents/:runId"
-                element={<AutopilotRunDetail project={project} />}
-              />
-              <Route
-                path="autofixer"
-                element={<AutofixerPage project={project} />}
-              />
-              <Route
-                path="errors"
-                element={<ErrorTracking project={project} />}
-              />
-              <Route
-                path="errors/setup"
-                element={<ErrorTrackingSetup project={project} />}
-              />
-              <Route
-                path="errors/alert-rules"
-                element={<AlertRulesManagement projectId={project.id} />}
-              />
-              <Route
-                path="errors/alert-rules/new"
-                element={<AlertRuleForm projectId={project.id} />}
-              />
-              <Route
-                path="errors/alert-rules/:ruleId/edit"
-                element={<AlertRuleForm projectId={project.id} />}
-              />
-              <Route
-                path="errors/:errorGroupId"
-                element={<ErrorGroupDetail project={project} />}
-              />
-              <Route
-                path="errors/:errorGroupId/autofix"
-                element={<AutofixRedirect project={project} />}
-              />
-              <Route
-                path="errors/:errorGroupId/event/:eventId"
-                element={<ErrorEventDetail project={project} />}
-              />
-              <Route
-                path="security"
-                element={<SecurityOverview project={project} />}
-              />
-              <Route path="security/scans/:scanId" element={<ScanDetail />} />
-              <Route
-                path="security/scans/:scanId/vulnerabilities/:vulnId"
-                element={<VulnerabilityDetailPage />}
-              />
-              <Route
-                path="environments/*"
-                element={<EnvironmentsTabsView project={project} />}
-              />
-            </Routes>
-          </div>
+            <Route
+              path="dashboards/*"
+              element={<Navigate to="../metrics/dashboards" replace />}
+            />
+            <Route
+              path="ai-gateway"
+              element={<ProjectAgentActivity projectId={project.id} />}
+            />
+            <Route
+              path="revenue"
+              element={<ProjectRevenue project={project} />}
+            />
+            <Route
+              path="agents"
+              element={<AutopilotPage project={project} />}
+            />
+            <Route
+              path="agents/detail/:agentSlug"
+              element={<AgentDetailPage project={project} />}
+            />
+            <Route
+              path="agents/detail/:agentSlug/edit"
+              element={<AgentEditPage project={project} />}
+            />
+            <Route
+              path="agents/:runId"
+              element={<AutopilotRunDetail project={project} />}
+            />
+            <Route
+              path="autofixer"
+              element={<AutofixerPage project={project} />}
+            />
+            <Route
+              path="errors"
+              element={<ErrorTracking project={project} />}
+            />
+            <Route
+              path="errors/setup"
+              element={<ErrorTrackingSetup project={project} />}
+            />
+            <Route
+              path="errors/alert-rules"
+              element={<AlertRulesManagement projectId={project.id} />}
+            />
+            <Route
+              path="errors/alert-rules/new"
+              element={<AlertRuleForm projectId={project.id} />}
+            />
+            <Route
+              path="errors/alert-rules/:ruleId/edit"
+              element={<AlertRuleForm projectId={project.id} />}
+            />
+            <Route
+              path="errors/:errorGroupId"
+              element={<ErrorGroupDetail project={project} />}
+            />
+            <Route
+              path="errors/:errorGroupId/autofix"
+              element={<AutofixRedirect project={project} />}
+            />
+            <Route
+              path="errors/:errorGroupId/event/:eventId"
+              element={<ErrorEventDetail project={project} />}
+            />
+            <Route
+              path="security"
+              element={<SecurityOverview project={project} />}
+            />
+            <Route path="security/scans/:scanId" element={<ScanDetail />} />
+            <Route
+              path="security/scans/:scanId/vulnerabilities/:vulnId"
+              element={<VulnerabilityDetailPage />}
+            />
+            <Route
+              path="environments/*"
+              element={<EnvironmentsTabsView project={project} />}
+            />
+          </Routes>
         </div>
       </div>
+    </div>
   )
 }

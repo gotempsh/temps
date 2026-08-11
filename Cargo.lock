@@ -10804,6 +10804,7 @@ dependencies = [
  "http-body-util",
  "mockall",
  "num_cpus",
+ "regex",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

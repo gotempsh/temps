@@ -410,7 +410,7 @@ impl ImportOrchestrator {
             // Detect preset from repository
             match self
                 .git_provider_manager
-                .calculate_repository_preset_live(repo_id, None)
+                .calculate_repository_preset_live(repo_id, user_id, None)
                 .await
             {
                 Ok(preset_info) => {

@@ -45,6 +45,22 @@ enum DeploymentFailureStage {
     Unknown,
 }
 
+/// Read all per-service Compose runtime selections together so a new setting
+/// cannot be persisted successfully and then be silently omitted by the
+/// deployment workflow.
+fn compose_service_security_settings(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match preset_config {
+        Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => (
+            config.excluded_services.clone(),
+            config.relaxed_capability_services.clone(),
+            config.unsandboxed_services.clone(),
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    }
+}
+
 impl DeploymentFailureStage {
     const fn as_str(self) -> &'static str {
         match self {
@@ -2355,6 +2371,21 @@ impl WorkflowExecutionService {
                     }
                 });
 
+                // Services the user opted to exclude from this project's compose
+                // stack (e.g. an unmanaged database in favor of a Temps-managed one).
+                let (excluded_services, relaxed_capability_services, unsandboxed_services) =
+                    compose_service_security_settings(project.preset_config.as_ref());
+                let public_ports = project
+                    .preset_config
+                    .as_ref()
+                    .and_then(|config| match config {
+                        temps_entities::preset::PresetConfig::DockerCompose(config) => {
+                            Some(config.public_ports.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
                 let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
                     self.docker.clone(),
                     self.config_service.data_dir(),
@@ -2370,6 +2401,10 @@ impl WorkflowExecutionService {
                     .directory(directory)
                     .compose_content(compose_content)
                     .compose_override(compose_override)
+                    .excluded_services(excluded_services)
+                    .relaxed_capability_services(relaxed_capability_services)
+                    .unsandboxed_services(unsandboxed_services)
+                    .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
                     .build_args(build_args)
@@ -2964,6 +2999,25 @@ mod tests {
             Ok(docker) => docker.ping().await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn compose_runtime_settings_flow_from_persisted_preset_config() {
+        let preset_config = temps_entities::preset::PresetConfig::DockerCompose(
+            temps_entities::preset::DockerComposeConfig {
+                excluded_services: vec!["managed-db".to_string()],
+                relaxed_capability_services: vec!["postgres".to_string()],
+                unsandboxed_services: vec!["webserver".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let (excluded, relaxed, unsandboxed) =
+            compose_service_security_settings(Some(&preset_config));
+
+        assert_eq!(excluded, ["managed-db"]);
+        assert_eq!(relaxed, ["postgres"]);
+        assert_eq!(unsandboxed, ["webserver"]);
     }
 
     #[test]
