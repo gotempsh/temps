@@ -236,7 +236,6 @@ impl PluginManifestBuilder {
         self
     }
 
-    /// Hide the console's header strip above this plugin's UI — see
     /// Declare a capability this plugin needs for its channel API calls.
     ///
     /// Without the matching capability a call is refused before it reaches
@@ -249,7 +248,10 @@ impl PluginManifestBuilder {
         self
     }
 
-    /// [`PluginManifest::hide_header`]. For plugins that render their own.
+    /// Hide the console's header strip above this plugin's UI.
+    ///
+    /// See [`PluginManifest::hide_header`]. Use this for plugins that render
+    /// their own full-page header.
     pub fn hide_header(mut self, hide: bool) -> Self {
         self.manifest.hide_header = hide;
         self

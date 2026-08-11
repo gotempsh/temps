@@ -12,7 +12,7 @@
 //! Temps (main process)
 //!   │
 //!   ├── Scans ~/.temps/plugins/ for binaries
-//!   ├── Spawns each binary with --socket-path and --auth-secret
+//!   ├── Spawns each binary and sends its assertion secret over a one-shot pipe
 //!   ├── Reads JSON manifest from stdout handshake
 //!   ├── Opens WebSocket to plugin's /_temps/channel (bidirectional data channel)
 //!   ├── Proxies /api/x/{plugin_name}/* → Unix socket
@@ -155,7 +155,7 @@ pub trait ExternalPlugin: Send + Sync + 'static {
 /// Macro that generates the `main()` function for a plugin binary.
 ///
 /// This handles:
-/// - Parsing CLI arguments (--socket-path, --auth-secret, --data-dir)
+/// - Parsing host-supplied runtime arguments
 /// - Setting up tracing/logging
 /// - Writing the manifest to stdout (handshake)
 /// - Starting the axum server on the Unix socket
