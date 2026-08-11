@@ -493,7 +493,125 @@ impl HostApiBridge for RouterHostApi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::external_plugin::channel::BinaryPayload;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_auth::context::AuthSource;
+    use temps_core::external_plugin::actor::{encode_plugin_actor_token, PLUGIN_ACTOR_TOKEN_TTL};
+    use temps_core::external_plugin::channel::{ActorToken, BinaryPayload, HttpMethod};
+
+    const TEST_PLUGIN: &str = "security-test-plugin";
+
+    fn crypto() -> Arc<CookieCrypto> {
+        Arc::new(
+            CookieCrypto::new("host-api-security-test-key-00001")
+                .expect("test encryption key should be valid"),
+        )
+    }
+
+    fn user() -> temps_entities::users::Model {
+        let now = Utc::now();
+        temps_entities::users::Model {
+            id: 42,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn session() -> temps_entities::sessions::Model {
+        temps_entities::sessions::Model {
+            id: 7,
+            user_id: 42,
+            session_token: "hashed-session-token".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(30),
+            mfa_pending: false,
+            step_up_expires_at: None,
+        }
+    }
+
+    fn api_key(expires_at: Option<chrono::DateTime<Utc>>) -> temps_entities::api_keys::Model {
+        let now = Utc::now();
+        temps_entities::api_keys::Model {
+            id: 9,
+            name: "restricted-plugin-key".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test".to_string(),
+            user_id: 42,
+            role_type: "custom".to_string(),
+            permissions: Some(r#"["projects:read"]"#.to_string()),
+            is_active: true,
+            expires_at,
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        }
+    }
+
+    fn api_with_database(
+        db: sea_orm::DatabaseConnection,
+        crypto: Arc<CookieCrypto>,
+    ) -> (RouterHostApi, Arc<DatabaseConnection>) {
+        let db = Arc::new(db);
+        let users = Arc::new(UserService::new(db.clone()));
+        (
+            RouterHostApi::new(Router::new(), db.clone(), crypto, users),
+            db,
+        )
+    }
+
+    fn actor_call(crypto: &CookieCrypto, principal: ActorPrincipal) -> ApiCall {
+        let (token, _) = encode_plugin_actor_token(
+            crypto,
+            TEST_PLUGIN,
+            42,
+            principal,
+            PLUGIN_ACTOR_TOKEN_TTL,
+            SystemTime::now(),
+        )
+        .expect("actor token should be minted");
+        ApiCall {
+            method: HttpMethod::Get,
+            path: "/projects".to_string(),
+            query: None,
+            body: None,
+            actor: ActorToken::new(token),
+        }
+    }
+
+    fn transaction_sql(db: Arc<DatabaseConnection>) -> String {
+        Arc::try_unwrap(db)
+            .expect("host API should release the test database")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_unauthenticated(error: ChannelError, reason: &str) {
+        assert_eq!(error.code, ChannelErrorCode::Unauthenticated);
+        assert!(
+            error.message.contains(reason),
+            "expected {reason:?} in error: {}",
+            error.message
+        );
+    }
 
     fn upload_parts() -> Vec<MultipartPart> {
         vec![
@@ -588,5 +706,151 @@ mod tests {
         let text = String::from_utf8_lossy(&encoded);
         assert!(!text.contains("X-Injected: yes\r\n"), "{text}");
         assert!(text.contains("filename=\"aX-Injected: yes\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn valid_session_reconstructs_current_user_authority() {
+        let crypto = crypto();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([vec![session()]])
+            // No admin role row: current authority is an ordinary user even
+            // if the actor token was minted before a role change.
+            .append_query_results([Vec::<temps_entities::roles::Model>::new()])
+            .into_connection();
+        let (api, db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::Session { session_id: 7 });
+
+        let auth = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect("live session should resolve");
+
+        assert_eq!(auth.user_id_opt(), Some(42));
+        assert_eq!(auth.session_id(), Some(7));
+        assert_eq!(auth.effective_role, Role::User);
+        assert!(auth.has_permission(&Permission::ProjectsRead));
+        drop(api);
+        let sql = transaction_sql(db);
+        assert!(sql.contains("\"sessions\".\"expires_at\" >"), "{sql}");
+        assert!(sql.contains("\"sessions\".\"mfa_pending\" ="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn revoked_expired_or_mfa_pending_session_fails_closed() {
+        // MockDatabase does not evaluate WHERE predicates. An empty second
+        // result represents each reason the database excludes the row; the
+        // SQL assertions prove all fail-closed predicates are present.
+        for reason in ["revoked", "expired", "MFA-pending"] {
+            let crypto = crypto();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![user()]])
+                .append_query_results([Vec::<temps_entities::sessions::Model>::new()])
+                .into_connection();
+            let (api, db) = api_with_database(db, crypto.clone());
+            let call = actor_call(crypto.as_ref(), ActorPrincipal::Session { session_id: 7 });
+
+            let error = api
+                .resolve_actor(TEST_PLUGIN, &call)
+                .await
+                .expect_err("non-live session must be rejected");
+            assert_unauthenticated(error, "session 7, but that session is no longer valid");
+            drop(api);
+            let sql = transaction_sql(db);
+            assert!(
+                sql.contains("\"sessions\".\"expires_at\" >"),
+                "{reason}: {sql}"
+            );
+            assert!(
+                sql.contains("\"sessions\".\"mfa_pending\" ="),
+                "{reason}: {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_restricted_api_key_reconstructs_narrowed_permissions() {
+        let crypto = crypto();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([vec![api_key(None)]])
+            .into_connection();
+        let (api, db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
+
+        let auth = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect("active API key should resolve");
+
+        assert_eq!(auth.user_id_opt(), Some(42));
+        assert_eq!(auth.effective_role, Role::Custom);
+        assert_eq!(
+            auth.custom_permissions,
+            Some(vec![Permission::ProjectsRead])
+        );
+        assert!(auth.has_permission(&Permission::ProjectsRead));
+        assert!(!auth.has_permission(&Permission::ProjectsWrite));
+        assert!(matches!(auth.source, AuthSource::ApiKey { key_id: 9, .. }));
+        drop(api);
+        let sql = transaction_sql(db);
+        assert!(sql.contains("\"api_keys\".\"is_active\" ="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn revoked_api_key_fails_closed() {
+        let crypto = crypto();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+        let (api, db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
+
+        let error = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect_err("revoked API key must be rejected");
+        assert_unauthenticated(error, "key 9, but that key is no longer active");
+        drop(api);
+        let sql = transaction_sql(db);
+        assert!(sql.contains("\"api_keys\".\"is_active\" ="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn expired_api_key_fails_closed() {
+        let crypto = crypto();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([vec![api_key(Some(Utc::now() - ChronoDuration::minutes(1)))]])
+            .into_connection();
+        let (api, _db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
+
+        let error = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect_err("expired API key must be rejected");
+        assert_unauthenticated(error, "key 9, but that key has expired");
+    }
+
+    #[tokio::test]
+    async fn deleted_or_missing_user_fails_closed_before_principal_lookup() {
+        let crypto = crypto();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::users::Model>::new()])
+            .into_connection();
+        let (api, db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::Session { session_id: 7 });
+
+        let error = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect_err("deleted user must be rejected");
+        assert_unauthenticated(error, "user 42, but that user no longer exists");
+        drop(api);
+        let sql = transaction_sql(db);
+        assert!(sql.contains("\"users\".\"deleted_at\" IS NULL"), "{sql}");
+        assert!(!sql.contains("FROM \"sessions\""), "{sql}");
     }
 }

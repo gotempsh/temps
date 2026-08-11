@@ -10,6 +10,7 @@ use axum::Router;
 use temps_auth::context::{AuthContext, AuthSource};
 use temps_core::external_plugin::actor::ActorPrincipal;
 use temps_core::external_plugin::headers;
+use temps_core::external_plugin::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use temps_core::problemdetails;
 use tracing::{debug, error, warn};
 
@@ -108,6 +109,24 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
     let uri = request.uri().clone();
     let path = uri.path();
 
+    // These endpoints accept assertions that only the platform may make.
+    // They remain reachable over the plugin's private Unix socket for event
+    // delivery and channel setup, but must never be exposed through the
+    // wildcard user-facing proxy — doing so would let an external caller
+    // borrow the proxy's trusted signature.
+    if is_reserved_internal_path(path) {
+        warn!(
+            plugin = %proxy.plugin_name,
+            method = %method,
+            path = %path,
+            "Rejecting external request to reserved plugin transport endpoint"
+        );
+        return problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Not Found")
+            .with_detail("The requested plugin route does not exist.")
+            .into_response();
+    }
+
     // Authenticate here, because nothing else will. Ordinary routes enforce
     // auth per-handler via the `RequireAuth` extractor; a proxied plugin
     // route has no handler of ours to put that extractor in. The auth
@@ -158,6 +177,22 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
                 .into_response()
         }
     }
+}
+
+/// Whether a user-facing proxy path targets a platform-only transport route.
+///
+/// Descendants are reserved as well so future nested transport endpoints do
+/// not become reachable accidentally. Segment-boundary matching keeps benign
+/// routes such as `/_events-calendar` available to plugins.
+fn is_reserved_internal_path(path: &str) -> bool {
+    [PLUGIN_EVENTS_PATH, PLUGIN_CHANNEL_PATH]
+        .into_iter()
+        .any(|reserved| {
+            path == reserved
+                || path
+                    .strip_prefix(reserved)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 /// Forward an HTTP request to a plugin over its Unix domain socket.
@@ -260,12 +295,11 @@ fn inject_temps_headers(
 ) {
     // The browser's session cookie and any Authorization header are the
     // caller's real platform credential — good for far more than this one
-    // plugin. A plugin process is untrusted third-party code; handing it
-    // that credential would let it act as the user against the platform
-    // directly, bypassing the scoped, single-plugin actor token below
-    // entirely. The plugin gets identity via `x-temps-*` headers and (if it
-    // asked for API access) an actor token bound to it specifically — never
-    // the caller's own credential.
+    // plugin. Installed plugins are trusted host code running under the same
+    // OS user as Temps, so this is defense in depth and least credential
+    // disclosure, not a process-isolation boundary: the plugin should receive
+    // only the scoped, single-plugin actor token it needs. Identity arrives via
+    // `x-temps-*` headers and that actor token, never the caller's credential.
     for name in [
         hyper::header::COOKIE,
         hyper::header::AUTHORIZATION,
@@ -438,6 +472,7 @@ impl ActorCryptoSlot {
 mod tests {
     use super::*;
     use temps_auth::permissions::Role;
+    use tower::ServiceExt;
 
     fn test_proxy() -> PluginProxy {
         PluginProxy::new(
@@ -719,5 +754,141 @@ mod tests {
         );
         assert_eq!(proxy.plugin_name, "test-plugin");
         assert_eq!(proxy.socket_path, PathBuf::from("/tmp/test.sock"));
+    }
+
+    #[test]
+    fn reserved_transport_paths_match_exactly_and_by_segment() {
+        for path in [
+            PLUGIN_EVENTS_PATH,
+            "/_events/forge",
+            PLUGIN_CHANNEL_PATH,
+            "/_temps/channel/upgrade",
+        ] {
+            assert!(is_reserved_internal_path(path), "{path}");
+        }
+
+        for path in [
+            "/_events-calendar",
+            "/_temps/channel-status",
+            "/_temps/channels",
+            "/events",
+        ] {
+            assert!(!is_reserved_internal_path(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn external_proxy_rejects_reserved_transport_routes_before_forwarding() {
+        // Even declaring these as public cannot override the platform-only
+        // reservation. The socket does not exist; a 404 therefore proves the
+        // handler rejected before attempting UDS forwarding/signature injection.
+        let router = create_plugin_proxy_router(test_proxy().with_public_paths(vec![
+            PLUGIN_EVENTS_PATH.to_string(),
+            PLUGIN_CHANNEL_PATH.to_string(),
+        ]));
+
+        for uri in [
+            "/_events",
+            "/_events/forge?event=deployment.succeeded",
+            "/_temps/channel",
+            "/_temps/channel/upgrade?transport=websocket",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("reserved-path request should build"),
+                )
+                .await
+                .expect("proxy router should respond");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_uds_delivery_still_reaches_reserved_event_endpoint() {
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use tokio::net::UnixListener;
+
+        // Unix socket paths are capped at roughly 100 bytes on macOS; its
+        // per-user temp directory is already long, so keep this unique path
+        // under the short system temp root there. Other platforms use their
+        // configured temp directory rather than assuming macOS' `/private`.
+        #[cfg(target_os = "macos")]
+        let socket_root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let socket_root = std::env::temp_dir();
+        let socket_path = socket_root.join(format!("tp-{}.sock", uuid::Uuid::new_v4()));
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping direct UDS delivery test: sandbox forbids socket bind at {}",
+                    socket_path.display()
+                );
+                return;
+            }
+            Err(error) => panic!("test UDS should bind at {}: {error}", socket_path.display()),
+        };
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let observed_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(observed_tx)));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("direct UDS connection");
+            let _connection_result = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let observed_tx = observed_tx.clone();
+                        async move {
+                            let observed = (
+                                request.uri().path().to_string(),
+                                request
+                                    .headers()
+                                    .get(headers::AUTH_SIGNATURE)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            if let Some(tx) = observed_tx
+                                .lock()
+                                .expect("observation lock should remain available")
+                                .take()
+                            {
+                                let _ = tx.send(observed);
+                            }
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::NO_CONTENT)
+                                    .body(Body::empty())
+                                    .expect("test response should build"),
+                            )
+                        }
+                    }),
+                )
+                .await;
+        });
+
+        let mut proxy = test_proxy();
+        proxy.socket_path = socket_path.clone();
+        let request = Request::builder()
+            .uri(PLUGIN_EVENTS_PATH)
+            .body(Body::empty())
+            .expect("direct request should build");
+        let response = forward_to_unix_socket(&proxy, None, request, PLUGIN_EVENTS_PATH)
+            .await
+            .expect("platform-internal UDS delivery should remain available");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (observed_path, observed_signature) = observed_rx
+            .await
+            .expect("direct UDS server should observe the request");
+        assert_eq!(observed_path, PLUGIN_EVENTS_PATH);
+        assert_eq!(observed_signature.as_deref(), Some("s3cr3t"));
+        server.await.expect("test UDS server should finish");
+        tokio::fs::remove_file(&socket_path)
+            .await
+            .expect("test UDS socket should be removed");
     }
 }
