@@ -8,7 +8,8 @@ use crate::externalsvc::{
     rustfs::RustfsService,
     s3::S3Service,
     AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendKind, ManagedS3BackendSelection, ServiceConfig, ServiceType,
+    ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
+    ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -41,6 +42,39 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Whether a live pg_auto_failover state identifies a node that accepts writes.
+///
+/// Keep connection planning, backups, deletion guards, and DNS reconciliation
+/// on the typed state model. In particular, `wait_primary` is writable: it is
+/// the stable state of a promoted node that currently has no standby attached.
+fn live_state_is_writable_primary(state: Option<&str>) -> bool {
+    state
+        .and_then(|state| state.parse::<PgAutoFailoverState>().ok())
+        .is_some_and(PgAutoFailoverState::is_primary)
+}
+
+/// Return the monitor identity of the sole healthy, recently reporting writer.
+///
+/// pg_auto_failover retains a stopped node's last `reported_state`, so a stale
+/// unhealthy `primary` can coexist with the promoted healthy `wait_primary`.
+/// Selecting solely by state and member order can therefore route connections
+/// or backups to the dead node. Ambiguous reports fail closed.
+fn healthy_writable_primary_nodename(health: &ClusterHealthReport) -> Option<&str> {
+    if health.monitor_error.is_some() {
+        return None;
+    }
+    let mut candidates = health.members.iter().filter(|member| {
+        member.health == 1
+            && member.seconds_since_report < 30
+            && live_state_is_writable_primary(Some(&member.reported_state))
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(&candidate.nodename)
+}
 
 /// Select the network endpoint advertised for a managed cluster member.
 ///
@@ -2725,7 +2759,7 @@ impl ExternalServiceManager {
     ///   - the service isn't a cluster
     ///   - the monitor is unreachable (callers should treat this as
     ///     "primary unknown" rather than "no primary")
-    ///   - the monitor knows of no node in `primary | single` state
+    ///   - the monitor knows of no node in a writable-primary state
     ///
     /// Replaces the old `members.iter().find(|m| m.role == "primary")`
     /// pattern, which broke the moment we stopped storing the primary
@@ -2742,15 +2776,19 @@ impl ExternalServiceManager {
         if health.monitor_error.is_some() {
             return Ok(None);
         }
-        let primary_name = health
-            .members
-            .iter()
-            .find(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
-            .map(|h| h.nodename.clone());
-        let Some(name) = primary_name else {
+        let Some(name) = healthy_writable_primary_nodename(&health) else {
             return Ok(None);
         };
-        Ok(members.iter().find(|m| m.container_name == name))
+        let mut matches = members.iter().filter(|member| {
+            is_role_data_member(&member.role)
+                && member.status == "running"
+                && member.container_name == name
+        });
+        let member = matches.next();
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+        Ok(member)
     }
 
     /// Live primary check: ask the pg_auto_failover monitor whether the
@@ -2811,14 +2849,7 @@ impl ExternalServiceManager {
             .members
             .iter()
             .find(|h| h.nodename == container_name)
-            .map(|h| {
-                <crate::externalsvc::PgAutoFailoverState as std::str::FromStr>::from_str(
-                    &h.reported_state,
-                )
-                .expect("PgAutoFailoverState::from_str is Infallible")
-                .is_primary()
-            })
-            .unwrap_or(false)
+            .is_some_and(|h| live_state_is_writable_primary(Some(&h.reported_state)))
     }
 
     /// Same shape as `get_service_members`, but for cluster topologies
@@ -3222,7 +3253,7 @@ impl ExternalServiceManager {
             // AND the node is healthy. A stale ghost-primary
             // (`reportedstate='primary'` but `health<=0`) would otherwise
             // route us to a dead host and the panel would lose sync data.
-            if matches!(reported_state.as_str(), "primary" | "single")
+            if live_state_is_writable_primary(Some(&reported_state))
                 && health == 1
                 && seconds_since_report < 30
             {
@@ -3409,21 +3440,16 @@ impl ExternalServiceManager {
             });
         }
 
-        let members = self.get_service_members_with_live_state(service.id).await?;
-        // `live_state` is the runtime FSM state from pg_auto_failover.
-        // Backup must run against the writable primary; "single" is the
-        // single-node form pg_auto_failover uses before a replica
-        // catches up — also writable. Anything else (secondary,
-        // catchingup, report_lsn, …) is a replica.
-        let primary = members
-            .iter()
-            .find(|m| {
-                m.status == "running"
-                    && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-            })
+        let members = self.get_service_members(service.id).await?;
+        let health = self.cluster_health(service).await;
+        // Resolve the sole healthy, fresh writer back through persisted member
+        // identity. Monitor state is authoritative for role, but never for a
+        // credential destination.
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename))
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
-                reason: "Cannot run backup: cluster has no running primary (monitor unreachable or no node in primary state)".to_string(),
+                reason: "Cannot run backup: cluster has no unique healthy, recently reporting primary (monitor unreachable, election incomplete, or primary state ambiguous)".to_string(),
             })?;
 
         // Write the external_service_backups row up front so the UI's
@@ -4334,11 +4360,10 @@ echo "[restore] Pre-seed complete"
         // Using the stored role here would have produced the same lag
         // bug the UI hit — Browse Data and other callers would dial a
         // freshly-demoted node post-failover.
-        let members = self.get_service_members_with_live_state(service_id).await?;
-        let primary = members.iter().find(|m| {
-            m.status == "running"
-                && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
-        });
+        let members = self.get_service_members(service_id).await?;
+        let health = self.cluster_health(&service).await;
+        let primary = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename));
 
         if let Some(primary) = primary {
             self.stored_member_endpoint(service_id, primary)
@@ -4347,7 +4372,7 @@ echo "[restore] Pre-seed complete"
         } else {
             Err(ExternalServiceError::InternalError {
                 reason: format!(
-                    "Cluster service {} has no running primary data node",
+                    "Cluster service {} has no unique healthy, recently reporting primary data node",
                     service_id
                 ),
             })
@@ -10656,6 +10681,82 @@ mod tests {
             sync_state: None,
             replay_lag_ms: None,
         }
+    }
+
+    /// Regression for deployment environment resolution and cluster backups:
+    /// both paths used to hand-match only `primary | single`, so an application
+    /// deployment could fail with "no running primary data node" during the
+    /// normal writable `wait_primary` state even though cluster health passed.
+    #[test]
+    fn writable_primary_live_state_includes_wait_primary() {
+        for state in ["primary", "single", "wait_primary"] {
+            assert!(
+                live_state_is_writable_primary(Some(state)),
+                "{state} must be accepted as a writable primary"
+            );
+        }
+
+        for state in ["secondary", "catchingup", "demoted", "unknown"] {
+            assert!(
+                !live_state_is_writable_primary(Some(state)),
+                "{state} must not be accepted as a writable primary"
+            );
+        }
+        assert!(!live_state_is_writable_primary(None));
+    }
+
+    /// A dead node keeps its last reported `primary` state in the monitor.
+    /// Selection must ignore that stale row, choose the healthy promoted
+    /// `wait_primary`, and fail closed if two live writers are ever reported.
+    #[test]
+    fn healthy_primary_selection_ignores_stale_rows_and_rejects_ambiguity() {
+        let mut unhealthy_primary = cluster_member_health("orders-1", "primary");
+        unhealthy_primary.health = 0;
+        unhealthy_primary.seconds_since_report = 1;
+        let promoted = cluster_member_health("orders-2", "wait_primary");
+        let unhealthy_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![unhealthy_primary, promoted.clone()],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&unhealthy_report),
+            Some("orders-2")
+        );
+
+        let mut stale_primary = cluster_member_health("orders-1", "primary");
+        stale_primary.health = 1;
+        stale_primary.seconds_since_report = 30;
+        let stale_report = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![stale_primary, promoted],
+        };
+        assert_eq!(
+            healthy_writable_primary_nodename(&stale_report),
+            Some("orders-2")
+        );
+
+        let ambiguous = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 5,
+            monitor_error: None,
+            members: vec![
+                cluster_member_health("orders-1", "primary"),
+                cluster_member_health("orders-2", "wait_primary"),
+            ],
+        };
+        assert!(healthy_writable_primary_nodename(&ambiguous).is_none());
+
+        let unreachable = ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms: 0,
+            monitor_error: Some("monitor unavailable".to_string()),
+            members: vec![cluster_member_health("orders-2", "wait_primary")],
+        };
+        assert!(healthy_writable_primary_nodename(&unreachable).is_none());
     }
 
     /// Regression for `remove_cluster_member`'s delete-protection gate
