@@ -911,29 +911,50 @@ const getErrorTitle = (
 const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error, query) => {
-      const status = (error as { status?: number })?.status
-      if (status !== 401) return
+      // ProblemDetails response bodies never carry a "status" field -- the
+      // Rust Problem type serializes only what was explicitly set via
+      // .with_title()/.with_detail()/etc, and status is communicated solely
+      // via the HTTP status line (see temps-core's problemdetails::Problem::
+      // into_response). So `error.status` is always undefined here; matching
+      // on it silently never fires. `title` is the only reliable signal in
+      // the body, and it's exactly what ProtectedLayout already keys off of
+      // to decide whether to show the login screen -- match it the same way.
+      const problem = error as { title?: string } | null
+      const isUnauthorized =
+        problem?.title === 'Authentication Required' || problem?.title === 'Unauthorized'
+      if (!isUnauthorized) return
 
-      // The current-user query already surfaces its own 401 straight to
-      // AuthContext (see below). Reacting to it here too would invalidate
-      // it, trigger an immediate refetch (it's always mounted), get 401
-      // again, and invalidate again -- a loop that never settles and
-      // hammers the API for every logged-out visitor. Only react to a 401
-      // discovered by some *other* query.
+      // The current-user query already surfaces its own auth error straight
+      // to AuthContext (see below). Reacting to it here too would invalidate
+      // it, trigger an immediate refetch (it's always mounted), get the same
+      // error again, and invalidate again -- a loop that never settles and
+      // hammers the API for every logged-out visitor. Only react to an auth
+      // error discovered by some *other* query.
       const currentUserKey = getCurrentUserOptions({}).queryKey
       if (JSON.stringify(query.queryKey) === JSON.stringify(currentUserKey)) {
         return
       }
 
-      // A 401 from any other query means the session died mid-session --
-      // e.g. a page like onboarding that reads cached localStorage state
-      // and keeps rendering from it even though its own API calls are
-      // silently failing. Clear the cache so stale data from the dead
-      // session doesn't linger, which also forces the current-user query
-      // to refetch, transitioning AuthContext into its error state so
-      // ProtectedLayout redirects to login instead of leaving the user
-      // stuck on whatever screen happened to be open.
-      queryClient.clear()
+      // An auth error from any other query means the session died
+      // mid-session -- e.g. a page like onboarding that reads cached
+      // localStorage state and keeps rendering from it even though its own
+      // API calls are silently failing. Invalidating the current-user query
+      // is what forces its always-mounted observer in AuthContext to
+      // refetch immediately, transitioning it into its error state so
+      // ProtectedLayout redirects to login.
+      //
+      // Deliberately NOT sweeping the rest of the cache here (e.g. via
+      // queryClient.clear()/removeQueries()): several other queries besides
+      // current-user are *also* always mounted app-wide (PresetContext's
+      // presets query, ProjectsContext's projects query). Forcibly removing
+      // an active query's cache entry makes its observer refetch
+      // immediately -- so clearing them from inside this handler makes them
+      // fail, re-enter this handler, and get cleared again: an unbounded
+      // loop through whichever always-mounted query isn't current-user, the
+      // same failure mode the current-user guard above exists to prevent,
+      // just one hop removed. Scope the reaction to exactly the one query
+      // that actually drives the redirect decision.
+      queryClient.invalidateQueries({ queryKey: currentUserKey })
     },
   }),
   defaultOptions: {
