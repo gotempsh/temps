@@ -195,13 +195,37 @@ mod tests {
 
         // The compatibility migration is deliberately reversible as a no-op:
         // the concurrently managed index must survive both down and re-up.
-        Migrator::down(connection.as_ref(), Some(1)).await?;
+        //
+        // Compute how many migrations exist AFTER
+        // `m20260806_000001_index_permission_denied_retention` so we roll back
+        // exactly (count + 1) migrations to land just before it. Hardcoding
+        // `Some(1)` broke whenever a new migration was appended after this one
+        // — that new migration would be the one rolled back instead of the
+        // index-retention migration we're actually testing.
+        let target = "m20260806_000001_index_permission_denied_retention";
+        let all_migrations = Migrator::migrations();
+        let target_pos = all_migrations
+            .iter()
+            .position(|m| m.name() == target)
+            .ok_or_else(|| anyhow::anyhow!("{} not found in migration list", target))?;
+        let after_count = all_migrations.len() - target_pos - 1;
+        let steps = (after_count + 1) as u32;
+
+        Migrator::down(connection.as_ref(), Some(steps)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
+        // Pending migrations are returned in ascending (chronological) order —
+        // the target is the oldest pending migration, so it is first().
+        // Rolling back more than 1 step means later migrations appear after it.
         assert_eq!(
-            pending_after_down.last().map(String::as_str),
-            Some("m20260806_000001_index_permission_denied_retention")
+            pending_after_down.first().map(String::as_str),
+            Some(target),
+            "expected first pending migration to be '{}' after rolling back {} steps (after_count={}), got: {:?}",
+            target,
+            steps,
+            after_count,
+            pending_after_down,
         );
-        Migrator::up(connection.as_ref(), Some(1)).await?;
+        Migrator::up(connection.as_ref(), Some(steps)).await?;
         let index_after_round_trip = connection
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
