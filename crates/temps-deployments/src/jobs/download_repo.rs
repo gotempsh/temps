@@ -16,8 +16,25 @@ use temps_logs::{LogLevel, LogService};
 /// operational debug knob (restart-to-change, not per-tenant config), not
 /// business configuration -- see `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` in the
 /// environment variable reference.
+///
+/// It disables cleanup on every path, including successful deployments, so
+/// leaving it set reintroduces the disk-space leak this file exists to fix.
+/// The first check emits a one-time warning so an operator who set it for a
+/// debug session and forgot to unset it sees it in the server logs, not only
+/// in a single deployment's log.
 fn keep_deployment_temp_files() -> bool {
-    std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok()
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let keep = std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok();
+    if keep {
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "TEMPS_DEPLOYMENT_KEEP_TEMP_FILES is set -- deployment temp directories under \
+                 /tmp/temps-deployments will NOT be cleaned up, including for successful \
+                 deployments. This must not remain set in production."
+            );
+        });
+    }
+    keep
 }
 
 /// Removes a deployment's temp directory on drop unless `disarm()` was
@@ -52,20 +69,24 @@ impl TempDirGuard {
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        if !self.armed || self.keep || !self.path.exists() {
+        if !self.armed || self.keep {
             return;
         }
-        if let Err(e) = std::fs::remove_dir_all(&self.path) {
-            tracing::error!(
-                path = %self.path.display(),
-                error = %e,
-                "Failed to clean up deployment temp directory after download error"
-            );
-        } else {
-            tracing::warn!(
-                path = %self.path.display(),
-                "🧹 Cleaned up deployment temp directory after download error"
-            );
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    "🧹 Cleaned up deployment temp directory after download error"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::error!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "Failed to clean up deployment temp directory after download error"
+                );
+            }
         }
     }
 }
