@@ -214,6 +214,10 @@ export function statusBadge(status: string): string {
     error: chalk.red,
     unhealthy: chalk.red,
     cancelled: chalk.red,
+    degraded: chalk.yellow,
+    failing: chalk.red,
+    disabled: chalk.gray,
+    never_delivered: chalk.gray,
   }
 
   const colorFn = statusColors[safeStatus.toLowerCase()] ?? chalk.white

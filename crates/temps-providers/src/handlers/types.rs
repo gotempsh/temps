@@ -600,6 +600,27 @@ impl From<crate::services::ServiceHealthSnapshot> for ServiceHealthResponse {
     }
 }
 
+/// Live connection variables for a service in one environment.
+///
+/// Every value is plaintext — this is the response of the audited issuance
+/// endpoint, not of the masked bulk read. Callers must treat it as a
+/// credential: do not log it, do not cache it, do not put it in an error.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct RuntimeCredentialsResponse {
+    /// Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.
+    pub variables: std::collections::HashMap<String, String>,
+}
+
+/// Debug prints names only. A `{:?}` of a credential response in a log line
+/// would defeat the point of the endpoint being audited.
+impl std::fmt::Debug for RuntimeCredentialsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&String> = self.variables.keys().collect();
+        names.sort();
+        write!(f, "RuntimeCredentialsResponse {{ variables: {names:?} }}")
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EnvironmentVariableInfo {
     pub name: String,

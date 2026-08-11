@@ -127,13 +127,68 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
             purpose: AiAgentPurpose::UserFetch,
         },
     ),
-    // Google AI surfaces — Google-Extended is a robots.txt token, not a UA,
-    // but GoogleOther is a real UA they use for non-Search fetching.
+    // Google AI surfaces — Google-Extended is a robots.txt token, not a UA:
+    // per Google's own developer docs, "Google-Extended doesn't have a
+    // separate HTTP request user agent string. Crawling is done with
+    // existing Google user agent strings; the robots.txt user-agent token
+    // is used in a control capacity." So there is nothing to pattern-match
+    // here — it can't be distinguished from plain Googlebot traffic at the
+    // request level, only opted out of via robots.txt.
+    //
+    // GoogleOther and Gemini-Deep-Research, unlike Google-Extended, are real
+    // distinct UAs.
     (
         r"(?i)\bGoogleOther\b",
         AiAgentMatch {
             provider: "Google",
             agent: "GoogleOther",
+            purpose: AiAgentPurpose::Mixed,
+        },
+    ),
+    // Gemini's Deep Research agent fetches pages live in response to a
+    // user's research query (same category as ChatGPT-User / Claude-User),
+    // distinct from both Googlebot indexing and Google-Extended's
+    // training-opt-out token.
+    (
+        r"(?i)\bGemini-Deep-Research\b",
+        AiAgentMatch {
+            provider: "Google",
+            agent: "Gemini-Deep-Research",
+            purpose: AiAgentPurpose::UserFetch,
+        },
+    ),
+    // Plain Googlebot. Google's own AI-features documentation says AI
+    // Overviews and Gemini's Search-grounded answers are "rooted in our
+    // core Search ranking and quality systems" — there is no separate
+    // crawler for AI answers, they're built from the same index Googlebot
+    // already crawls for regular Search. So this traffic is genuinely
+    // dual-purpose (Search ranking + AI answer citation), not exclusively
+    // a non-AI "Search / SEO crawler" the way Bingbot or YandexBot are.
+    //
+    // Caution: this is by far the highest-volume pattern in this table.
+    // Ordinary Googlebot indexing crawls every page constantly, so this
+    // will typically dominate the AI-agents view by orders of magnitude
+    // over agents like GPTBot or ClaudeBot — expected, not a bug, but
+    // worth knowing before reading the dashboard as "how much AI traffic
+    // do I get."
+    (
+        r"(?i)\bGooglebot\b",
+        AiAgentMatch {
+            provider: "Google",
+            agent: "Googlebot",
+            purpose: AiAgentPurpose::Mixed,
+        },
+    ),
+    // Bingbot — same dual-purpose reasoning as plain Googlebot above.
+    // Microsoft's crawlers behind Bing Search and Copilot include Bingbot,
+    // AdIdxBot, and BingPreview; Bingbot itself is the primary indexing
+    // crawler and its access directly controls how content can appear in
+    // Copilot's Bing-grounded answers, not just classic search results.
+    (
+        r"(?i)\bBingbot\b",
+        AiAgentMatch {
+            provider: "Microsoft",
+            agent: "Bingbot",
             purpose: AiAgentPurpose::Mixed,
         },
     ),
@@ -198,6 +253,15 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
             purpose: AiAgentPurpose::Training,
         },
     ),
+    // DeepSeek
+    (
+        r"(?i)\bDeepSeekBot\b",
+        AiAgentMatch {
+            provider: "DeepSeek",
+            agent: "DeepSeekBot",
+            purpose: AiAgentPurpose::Mixed,
+        },
+    ),
     // Cohere
     (
         r"(?i)\bcohere-ai\b",
@@ -244,10 +308,10 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
     ),
     // Brave
     (
-        r"(?i)\bBravebot\b",
+        r"(?i)\bBraveBot\b",
         AiAgentMatch {
             provider: "Brave",
-            agent: "Bravebot",
+            agent: "BraveBot",
             purpose: AiAgentPurpose::Search,
         },
     ),
@@ -313,12 +377,24 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
             purpose: AiAgentPurpose::UserFetch,
         },
     ),
-    // xAI / Grok
+    // xAI / Grok — xAI documents two separate tokens (GrokBot and
+    // xAI-Grok). Independent observation has repeatedly found xAI's actual
+    // crawler spoofing ordinary browser UAs rather than honoring either
+    // one, so treat a match here as "traffic that *claims* to be xAI", not
+    // a reliable signal of total xAI crawl volume.
     (
         r"(?i)\bGrokBot\b",
         AiAgentMatch {
             provider: "xAI",
             agent: "GrokBot",
+            purpose: AiAgentPurpose::Training,
+        },
+    ),
+    (
+        r"(?i)\bxAI-Grok\b",
+        AiAgentMatch {
+            provider: "xAI",
+            agent: "xAI-Grok",
             purpose: AiAgentPurpose::Training,
         },
     ),
@@ -399,6 +475,23 @@ mod tests {
     }
 
     #[test]
+    fn detects_googlebot_as_mixed() {
+        let m = detect(Some(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        ))
+        .expect("should detect Googlebot");
+        assert_eq!(m.provider, "Google");
+        assert_eq!(m.agent, "Googlebot");
+        assert_eq!(m.purpose, AiAgentPurpose::Mixed);
+    }
+
+    #[test]
+    fn detects_googleother_distinct_from_googlebot() {
+        let m = detect(Some("Mozilla/5.0 GoogleOther")).expect("should detect GoogleOther");
+        assert_eq!(m.agent, "GoogleOther");
+    }
+
+    #[test]
     fn ignores_regular_browsers() {
         assert!(detect(Some(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -411,5 +504,47 @@ mod tests {
         assert!(detect(None).is_none());
         assert!(detect(Some("")).is_none());
         assert!(detect(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn detects_bingbot_as_mixed() {
+        let m = detect(Some(
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/116.0.1938.76 Safari/537.36",
+        ))
+        .expect("should detect bingbot");
+        assert_eq!(m.provider, "Microsoft");
+        assert_eq!(m.agent, "Bingbot");
+        assert_eq!(m.purpose, AiAgentPurpose::Mixed);
+    }
+
+    #[test]
+    fn detects_deepseekbot() {
+        let m = detect(Some(
+            "Mozilla/5.0 (compatible; DeepSeekBot/1.0; +https://www.deepseek.com/about)",
+        ))
+        .expect("should detect DeepSeekBot");
+        assert_eq!(m.provider, "DeepSeek");
+        assert_eq!(m.agent, "DeepSeekBot");
+        assert_eq!(m.purpose, AiAgentPurpose::Mixed);
+    }
+
+    #[test]
+    fn detects_gemini_deep_research_distinct_from_googlebot() {
+        let m =
+            detect(Some("Gemini-Deep-Research/1.0")).expect("should detect Gemini-Deep-Research");
+        assert_eq!(m.provider, "Google");
+        assert_eq!(m.agent, "Gemini-Deep-Research");
+        assert_eq!(m.purpose, AiAgentPurpose::UserFetch);
+    }
+
+    #[test]
+    fn detects_xai_grok_distinct_from_grokbot() {
+        let grokbot = detect(Some("GrokBot/1.0")).expect("should detect GrokBot");
+        assert_eq!(grokbot.agent, "GrokBot");
+
+        let xai_grok = detect(Some("xAI-Grok/1.0")).expect("should detect xAI-Grok");
+        assert_eq!(xai_grok.provider, "xAI");
+        assert_eq!(xai_grok.agent, "xAI-Grok");
+        assert_eq!(xai_grok.purpose, AiAgentPurpose::Training);
     }
 }

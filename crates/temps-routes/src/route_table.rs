@@ -713,6 +713,13 @@ impl CachedPeerTable {
                         let containers = deployment_containers::Entity::find()
                             .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
                             .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // A container row survives (deleted_at stays NULL) for the
+                            // deployment's whole lifecycle, but `status` still moves
+                            // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                            // deployment pause, or a manual per-container stop) without
+                            // ever being soft-deleted. Only route live traffic to
+                            // containers that are actually up, or where a container has
+                            // never had a status recorded yet.
                             .filter(
                                 Condition::any()
                                     .add(deployment_containers::Column::Status.is_null())
@@ -967,6 +974,13 @@ impl CachedPeerTable {
                         let containers = deployment_containers::Entity::find()
                             .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
                             .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // A container row survives (deleted_at stays NULL) for the
+                            // deployment's whole lifecycle, but `status` still moves
+                            // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                            // deployment pause, or a manual per-container stop) without
+                            // ever being soft-deleted. Only route live traffic to
+                            // containers that are actually up, or where a container has
+                            // never had a status recorded yet.
                             .filter(
                                 Condition::any()
                                     .add(deployment_containers::Column::Status.is_null())
@@ -1147,6 +1161,9 @@ impl CachedPeerTable {
                     let containers = deployment_containers::Entity::find()
                         .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
                         .filter(deployment_containers::Column::DeletedAt.is_null())
+                        // See the matching comment above: `status` (not just
+                        // `deleted_at`) governs routability, so a paused/stopped
+                        // deployment's containers don't keep serving live traffic.
                         .filter(
                             Condition::any()
                                 .add(deployment_containers::Column::Status.is_null())
@@ -1535,6 +1552,9 @@ impl CachedPeerTable {
                     let containers = deployment_containers::Entity::find()
                         .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
                         .filter(deployment_containers::Column::DeletedAt.is_null())
+                        // See the matching comment above: `status` (not just
+                        // `deleted_at`) governs routability, so a paused/stopped
+                        // deployment's containers don't keep serving live traffic.
                         .filter(
                             Condition::any()
                                 .add(deployment_containers::Column::Status.is_null())

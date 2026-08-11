@@ -504,6 +504,124 @@ async fn test_storage_quota() {
     assert!(!exceeded); // Fresh DB, should not be exceeded
 }
 
+/// Regression test for the `hypertable_size()` fix.
+///
+/// `test_storage_quota` above only exercises a freshly-created, empty
+/// database, where the old buggy `pg_total_relation_size(otel_spans)`
+/// (root-relation) formula and the fixed `hypertable_size('otel_spans')`
+/// (chunk-aware) formula are indistinguishable — both report ~0 bytes
+/// because no data has ever been inserted. That made the old formula's bug
+/// invisible to this test suite: a hypertable's root relation holds no
+/// rows/bytes of its own regardless of how much real data lives in its
+/// child chunk tables, so quota enforcement was silently inert for every
+/// project (see the CORRECTNESS comment on `get_storage_quota`).
+///
+/// This test closes that gap by actually inserting span rows via
+/// `store_spans` (the real ingest path, not a synthetic row count) and
+/// asserting `total_bytes`/`usage_pct` track that real volume. If a future
+/// change reverts `get_storage_quota` back to
+/// `pg_total_relation_size(otel_spans::regclass)` on the hypertable root,
+/// `total_bytes` will stay near zero regardless of the ~500 inserted spans
+/// and the assertions below will fail.
+#[tokio::test]
+async fn test_storage_quota_tracks_real_ingested_span_volume() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let project_id = 4242;
+
+    // Each span carries a sizeable `attributes` payload (20 keys x ~200
+    // bytes each, ~4KB/span) so the real bytes written to the `otel_spans`
+    // hypertable's chunks are well above any catalog/index noise floor a
+    // table -- even an empty one -- can carry. With ~500 such spans this is
+    // several hundred KB to low-MB of real chunk data, comfortably over the
+    // 200KB quota limit used below.
+    let mut attrs = BTreeMap::new();
+    for i in 0..20 {
+        attrs.insert(format!("attribute.key.number.{i}"), "x".repeat(200));
+    }
+
+    let mut spans = Vec::with_capacity(500);
+    for i in 0..500u32 {
+        let mut span = sample_span(
+            project_id,
+            &format!("{i:032x}"),
+            &format!("{i:016x}"),
+            None,
+            "load-test-span",
+            SpanKind::Internal,
+            SpanStatusCode::Ok,
+            10.0,
+        );
+        span.attributes = attrs.clone();
+        spans.push(span);
+    }
+
+    let stored = storage.store_spans(spans).await.unwrap();
+    assert_eq!(stored, 500);
+
+    // A 200KB limit. Calibrated live against both formulas on this exact
+    // dataset (~500 spans x ~4KB attributes each):
+    //   - fixed `hypertable_size()` formula:            ~856KB total_bytes
+    //   - old `pg_total_relation_size(root)` formula:     ~64KB total_bytes
+    //     (a hypertable's empty root relation carries a small constant
+    //     amount of index/catalog overhead that does NOT grow with chunk
+    //     data — this is that constant, not real ingested volume)
+    // 200KB sits with wide margin between the two, so this assertion is
+    // only satisfied by a formula that actually accounts for chunk storage.
+    const TEST_QUOTA_LIMIT_BYTES: u64 = 200 * 1024;
+    let storage_with_tiny_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(TEST_QUOTA_LIMIT_BYTES));
+    let quota = storage_with_tiny_quota
+        .get_storage_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        quota.total_bytes > TEST_QUOTA_LIMIT_BYTES,
+        "expected chunk-aware total_bytes to exceed the {TEST_QUOTA_LIMIT_BYTES}-byte test \
+         limit after inserting ~500 spans with ~4KB of attributes each (got {} bytes) -- \
+         this is exactly the regression the hypertable_size() fix protects against: the old \
+         pg_total_relation_size(root) formula reports only the root relation's constant \
+         ~64KB of index/catalog overhead here, never the real chunk volume",
+        quota.total_bytes
+    );
+    assert!(
+        quota.usage_pct >= 100.0,
+        "usage_pct should have crossed 100% of the {TEST_QUOTA_LIMIT_BYTES}-byte limit, got {}",
+        quota.usage_pct
+    );
+
+    let exceeded = storage_with_tiny_quota
+        .check_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        exceeded,
+        "check_quota must trip once real ingested span volume exceeds the configured limit"
+    );
+
+    // Sanity check in the other direction: a generous limit against the
+    // same real data must NOT report exceeded, proving usage_pct is a real
+    // proportional measurement and not just pegged to 100%.
+    let storage_with_generous_quota =
+        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(10 * 1024 * 1024 * 1024));
+    let generous_quota = storage_with_generous_quota
+        .get_storage_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        generous_quota.usage_pct < 100.0,
+        "a 10GB limit should not be exceeded by ~500 spans of test data, got usage_pct = {}",
+        generous_quota.usage_pct
+    );
+    let not_exceeded = storage_with_generous_quota
+        .check_quota(project_id)
+        .await
+        .unwrap();
+    assert!(!not_exceeded);
+}
+
 #[tokio::test]
 async fn test_get_storage_quota_disabled_skips_database() {
     use sea_orm::{DatabaseBackend, MockDatabase};

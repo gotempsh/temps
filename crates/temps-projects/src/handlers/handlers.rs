@@ -2163,6 +2163,7 @@ pub async fn create_project_from_template(
         let deploy_job =
             temps_core::Job::DeployImageRequested(temps_core::DeployImageRequestedJob {
                 project_id: project.id,
+                target_environment_id: None,
                 image_ref: image_ref.clone(),
                 health_check_path: template.health_check_path.clone(),
             });

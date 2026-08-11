@@ -138,6 +138,9 @@ tikv-jemallocator = { workspace = true }
 # a real listener. Already present transitively; pinned here for test use.
 tower = { workspace = true }
 tempfile = { workspace = true }
+# Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
+# endpoint table still matches the handlers this crate assembles into the API.
+temps-plugin-sdk = { path = "../temps-plugin-sdk" }
 
 [build-dependencies]
 chrono = { workspace = true }

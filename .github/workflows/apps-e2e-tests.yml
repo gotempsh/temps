@@ -1,0 +1,298 @@
+name: Temps Scenario E2E Tests
+
+# Reusable from rust-tests.yml so every shard consumes the exact musl binary
+# already built for the current commit. This is intentionally separate from
+# e2e-tests.yml, which owns Playwright and the small example-deployment smoke.
+on:
+  workflow_call:
+    inputs:
+      binary-artifact:
+        description: Name of the artifact holding the prebuilt temps binary
+        required: false
+        default: temps-binary-musl-fast
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: postgresql://temps:temps@localhost:5432/temps
+  TEMPS_DATABASE_URL: postgresql://temps:temps@localhost:5432/temps
+  TEMPS_DATA_DIR: /tmp/temps-scenario-data
+  TEMPS_URL: http://localhost:5002
+  TEMPS_E2E_REGISTRY: localhost:5111
+  TEMPS_TELEMETRY: "0"
+  TEMPS_BIN: ${{ github.workspace }}/ci-prebuilt/temps
+  ADMIN_EMAIL: admin@localho.st
+  ADMIN_PASSWORD: E2eScenarioPass123!
+
+jobs:
+  scenarios:
+    name: Scenarios (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - shard: core
+            timeout: 75
+          - shard: observability
+            timeout: 90
+          - shard: services
+            timeout: 100
+          - shard: recovery
+            timeout: 180
+          - shard: edge
+            timeout: 75
+          - shard: examples
+            timeout: 120
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_DB: temps
+          POSTGRES_USER: temps
+          POSTGRES_PASSWORD: temps
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U temps -d temps"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ci-prebuilt
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build and link scenario SDK dependencies
+        run: |
+          chmod +x "$TEMPS_BIN"
+          cd packages/api
+          bun install --frozen-lockfile
+          bun run build
+          bun link
+          cd ../../sdks/node/packages/node-sdk
+          bun install
+          bun run build
+          bun link
+          cd ../../../../apps/temps-cli
+          bun install --frozen-lockfile
+          cd ../temps-e2e
+          bun install --frozen-lockfile
+          bun run typecheck
+
+      - name: Start registry and external-service fixtures
+        run: |
+          docker run -d --name temps-e2e-registry -p 5111:5000 registry:2
+          docker compose -p temps-e2e -f apps/temps-e2e/docker-compose.e2e.yml up -d
+          timeout 90 bash -c 'until nc -z localhost 14000 && nc -z localhost 8056 && nc -z localhost 1025 && nc -z localhost 8025 && nc -z localhost 9092; do sleep 2; done'
+          docker run --rm --network temps-e2e_default --entrypoint /bin/sh minio/mc \
+            -c 'until mc alias set backup http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb --ignore-existing backup/temps-e2e-backups'
+
+      - name: Prepare Temps instance
+        # Authenticate public GitHub API requests made by the git-deploy
+        # scenario. GitHub-hosted runners share the anonymous 60 req/hour
+        # quota, so --skip-git makes this scenario inherently flaky. The
+        # workflow token is read-only, job-scoped, and automatically masked.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$TEMPS_DATA_DIR"
+          cp crates/temps-cli/GeoLite2-City.mmdb "$TEMPS_DATA_DIR/GeoLite2-City.mmdb"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout /tmp/localho.st.key -out /tmp/localho.st.crt -days 1 -nodes \
+            -subj "/CN=localho.st" -addext "subjectAltName=DNS:localho.st,DNS:*.localho.st"
+          sudo cp /tmp/localho.st.crt /usr/local/share/ca-certificates/temps-localhost.crt
+          sudo update-ca-certificates
+          "$TEMPS_BIN" setup --non-interactive \
+            --database-url "$DATABASE_URL" \
+            --data-dir "$TEMPS_DATA_DIR" \
+            --admin-email "$ADMIN_EMAIL" \
+            --admin-password "$ADMIN_PASSWORD" \
+            --wildcard-domain "*.localho.st" \
+            --wildcard-domain-cert /tmp/localho.st.crt \
+            --wildcard-domain-key /tmp/localho.st.key \
+            --skip-dns-records --skip-geolite2-download \
+            --output-format json
+
+      - name: Start Temps
+        env:
+          ACME_DIRECTORY_URL: https://localhost:14000/dir
+          ACME_INSECURE: "1"
+          TEMPS_ALLOW_PEBBLE_PROVIDER: "1"
+          TEMPS_OTEL_QUOTA_GB: "1"
+        run: |
+          "$TEMPS_BIN" serve \
+            --database-url "$DATABASE_URL" \
+            --data-dir "$TEMPS_DATA_DIR" \
+            --address 0.0.0.0:5002 \
+            --tls-address 0.0.0.0:3443 \
+            --console-address 127.0.0.1:8081 \
+            --disable-https-redirect \
+            --screenshot-provider noop \
+            > /tmp/temps-scenarios.log 2>&1 &
+          echo $! > /tmp/temps-scenarios.pid
+          timeout 180 bash -c 'until curl -sf http://localhost:5002/ >/dev/null; do sleep 2; done'
+          # WAL-G runs inside managed-service containers. Put MinIO on the
+          # same network so endpoint resolution uses its container address
+          # instead of host.docker.internal, which plain Linux Docker does
+          # not define for arbitrary managed-service containers.
+          docker network connect temps-app-network temps-e2e-minio-1
+
+      - name: Mint masked scenario credential
+        run: |
+          if ! API_OUTPUT=$("$TEMPS_BIN" api-key \
+            --database-url "$DATABASE_URL" \
+            --name "scenario-${{ matrix.shard }}" \
+            --role admin \
+            --user-email "$ADMIN_EMAIL" \
+            --output-format json 2>/dev/null); then
+            echo "Failed to create scenario API key (credential-bearing stdout/stderr suppressed)"
+            exit 1
+          fi
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty')
+          if [ -z "$API_KEY" ]; then
+            echo "Credential output did not contain an API key (output suppressed)"
+            exit 1
+          fi
+          echo "::add-mask::$API_KEY"
+          printf 'TEMPS_API_KEY=%s\n' "$API_KEY" >> "$GITHUB_ENV"
+          echo "Created masked API key for shard ${{ matrix.shard }}"
+
+      - name: Run scenario shard
+        run: bash .github/scripts/run-temps-e2e-shard.sh "${{ matrix.shard }}"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-scenario-${{ matrix.shard }}-logs
+          path: /tmp/temps-scenarios.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Show Docker diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker network inspect temps-app-network || true
+          docker ps -aq --filter label=sh.temps.service=true | while IFS= read -r container; do
+            # Restrict inspect output to operational fields. A full inspect
+            # includes container environment variables and would leak managed
+            # service credentials into the Actions log.
+            docker inspect --format '{{json .Name}} {{json .State}} {{json .NetworkSettings.Ports}} {{json .NetworkSettings.Networks}}' "$container" || true
+            docker logs --tail 200 "$container" || true
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/temps-scenarios.pid ]; then
+            kill "$(cat /tmp/temps-scenarios.pid)" 2>/dev/null || true
+          fi
+          docker compose -p temps-e2e -f apps/temps-e2e/docker-compose.e2e.yml down -v 2>/dev/null || true
+          docker rm -f temps-e2e-registry 2>/dev/null || true
+          docker system prune -af --volumes 2>/dev/null || true
+
+  multinode:
+    name: Scenario (multinode mTLS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ci-prebuilt
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build and link scenario SDK dependencies
+        run: |
+          cd packages/api
+          bun install --frozen-lockfile
+          bun run build
+          bun link
+          cd ../../sdks/node/packages/node-sdk
+          bun install
+          bun run build
+          bun link
+          cd ../../../../apps/temps-e2e
+          bun install --frozen-lockfile
+          bun run typecheck
+
+      - name: Run dedicated multinode scenario
+        env:
+          DEV_CLUSTER_PREBUILT_TEMPS_BIN: /workspace/ci-prebuilt/temps
+        run: |
+          # Compose overlays writable named volumes below a read-only
+          # /workspace bind. On a clean checkout these gitignored mountpoints
+          # do not exist, and runc cannot create them through the read-only
+          # parent mount.
+          mkdir -p target crates/temps-cli/dist
+          chmod +x ci-prebuilt/temps
+          cd apps/temps-e2e
+          # Keep the topology until the always() cleanup step so a failed
+          # scenario still has containers available for diagnostic logs.
+          bun run src/index.ts multinode-join-scenario --json --keep --build-timeout 600000
+
+      - name: Collect multinode logs on failure
+        if: failure()
+        run: |
+          {
+            docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn ps -a || true
+            docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn logs --no-color || true
+            for node in temps-e2e-mn-control-plane temps-e2e-mn-worker-1; do
+              echo "===== $node: inner docker ps ====="
+              docker exec "$node" docker ps -a --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' || true
+              echo "===== $node: inner dockerd log ====="
+              docker exec "$node" tail -n 300 /var/log/docker.log || true
+            done
+          } > /tmp/temps-multinode.log 2>&1
+
+      - name: Upload multinode logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-multinode-logs
+          path: /tmp/temps-multinode.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Cleanup multinode topology
+        if: always()
+        run: |
+          docker compose -f tools/e2e-multinode-cluster/docker-compose.yml -p temps-e2e-mn down -v 2>/dev/null || true
+          docker system prune -af --volumes 2>/dev/null || true

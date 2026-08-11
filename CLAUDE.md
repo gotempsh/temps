@@ -776,6 +776,16 @@ Merge conflicts in either client are conflicts in build output. Never
 hand-merge them: take one side to clear the conflict, then regenerate from a
 server built off the merged source and typecheck both packages.
 
+**Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`.**
+Some backend endpoints are served by a plugin crate that isn't part of this
+repository, so their schema doesn't exist in the spec this file's generated
+client is built from, and it must stay that way. For CLI parity on those
+endpoints, hand-write local request/response interfaces mirroring the
+plugin's shapes and call the shared `client` object directly via its generic
+`.get/.post/.patch/.delete` methods — same call shape every generated SDK
+function already uses, just without codegen. See
+`apps/temps-cli/src/commands/otel-forward/index.ts` for the pattern.
+
 ### Permission System
 
 ```rust

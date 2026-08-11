@@ -48,6 +48,7 @@ tar = "0.4.45"
 
 # UUID for request IDs
 uuid = { workspace = true }
+subtle = "2.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

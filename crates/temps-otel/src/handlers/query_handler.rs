@@ -560,6 +560,8 @@ pub async fn list_metric_label_values(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("attributes" = Option<String>, Query, description = "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\""),
+        ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("limit" = Option<u64>, Query, description = "Max spans to return (default: 100, max: 1000)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),

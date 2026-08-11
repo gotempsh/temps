@@ -190,12 +190,12 @@ export async function triggerPipelineAndGetDeploymentId(
 export async function getProductionEnvironment(
   client: Client,
   projectId: number,
-): Promise<{ id: number; mainUrl: string; name: string }> {
+): Promise<{ id: number; mainUrl: string; name: string; slug: string }> {
   const res = await getEnvironments({ client, path: { project_id: projectId } })
   const envs = unwrap(res, 'getEnvironments')
   const prod = envs.find((e) => e.is_preview === false) ?? envs[0]
   if (!prod) throw new Error(`No environment found for project ${projectId}`)
-  return { id: prod.id, mainUrl: prod.main_url, name: prod.name }
+  return { id: prod.id, mainUrl: prod.main_url, name: prod.name, slug: prod.slug }
 }
 
 /** Trigger a deploy from a prebuilt public image; returns the deployment id. */
@@ -275,7 +275,7 @@ export async function createE2eService(
   client: Client,
   opts: {
     name: string
-    serviceType: 'postgres' | 'redis' | 'mongodb' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio'
+    serviceType: 'postgres' | 'redis' | 'mongodb' | 'mariadb' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio'
     version?: string
     parameters?: Record<string, unknown>
   },
@@ -287,6 +287,52 @@ export async function createE2eService(
       service_type: opts.serviceType,
       parameters: opts.parameters ?? {},
       ...(opts.version ? { version: opts.version } : {}),
+    },
+  })
+  const s = unwrap(res, 'createService') as { id: number; name: string }
+  return { id: s.id, name: s.name }
+}
+
+/**
+ * Provision an HA cluster service (currently only `postgres` supports
+ * `topology: 'cluster'` -- see `CLUSTER_SERVICE_TYPES` in
+ * `web/src/pages/CreateServiceNew.tsx`). Cluster creation is asynchronous
+ * server-side (`ExternalServiceManager::create_service` spawns a background
+ * task and returns immediately with `status: "creating"`) -- callers must
+ * poll `getService` for `status === 'running'` themselves, same as the
+ * console does.
+ *
+ * All members are placed on the control plane (`node_id: null`) --
+ * multi-container HA on a single Docker host, matching how
+ * `PostgresClusterService` names/ports members (`postgres-<name>-monitor`,
+ * `postgres-<name>-<ordinal>`, unique host ports per member) -- distinct
+ * from multi-node/WireGuard clustering, which needs real separate hosts.
+ * Per `DEFAULT_CLUSTER_ROLES` in the console, every data node is requested
+ * as `role: 'replica'`; pg_auto_failover elects whichever registers first
+ * as the actual primary (see `live_state` on `ServiceMemberInfo`), the
+ * client never picks one.
+ */
+export async function createE2eClusterService(
+  client: Client,
+  opts: {
+    name: string
+    serviceType: 'postgres'
+    dataNodes: number
+    parameters?: Record<string, unknown>
+  },
+): Promise<CreatedService> {
+  const members = [
+    { role: 'monitor', node_id: null },
+    ...Array.from({ length: opts.dataNodes }, () => ({ role: 'replica', node_id: null })),
+  ]
+  const res = await createService({
+    client,
+    body: {
+      name: opts.name,
+      service_type: opts.serviceType,
+      parameters: opts.parameters ?? {},
+      topology: 'cluster',
+      members,
     },
   })
   const s = unwrap(res, 'createService') as { id: number; name: string }
@@ -469,9 +515,19 @@ export async function waitForHttpReady(opts: {
  */
 export function looksLikeConsoleFallback(body: string): boolean {
   if (!/<!doctype html>/i.test(body)) return false
-  // The Temps console index.html sets `<title>Temps</title>`. A static SPA
-  // example sets its own title (e.g. "react-basic"), so this stays specific.
-  return /<title>\s*Temps\s*<\/title>/i.test(body)
+  // The Temps console index.html sets `<title>Temps</title>` in production
+  // builds and `<title>Temps - Development Build</title>` in dev builds.
+  // A deployed app never starts its page title with "Temps" (they use their
+  // own names), so matching the prefix is sufficient and avoids brittleness
+  // against the exact suffix used in each build mode.
+  //
+  // Character class is `[\s<]` (space or `<`), NOT `[\s\-<]`. In both real
+  // title forms the character immediately after "Temps" is either `<` (closing
+  // tag, production) or ` ` (space before " - Development Build", dev). A
+  // hyphen directly after "Temps" is never produced by any Temps build, and
+  // including `\-` in the class would cause false positives for any deployed
+  // app whose title starts with "Temps-" (e.g. "Temps-sync-dashboard").
+  return /<title>\s*Temps[\s<]/i.test(body)
 }
 
 /**
@@ -512,6 +568,68 @@ export async function assertNotConsoleFallback(opts: {
   throw new Error(
     `served the Temps console fallback (HTTP ${status}) instead of the app after ` +
       `${Math.round(timeoutMs / 1000)}s — the deployment is not actually serving ` +
+      `(body starts: ${JSON.stringify(body.slice(0, 80))})`,
+  )
+}
+
+/**
+ * Fetch a target and return its raw status/body. Used where a scenario needs
+ * to assert on the EXACT response body (e.g. "traffic is serving version A's
+ * distinguishable text, byte for byte") rather than just "not the console
+ * fallback".
+ */
+export async function fetchBody(
+  url: string,
+  headers?: Record<string, string>,
+  timeoutMs = 10_000,
+): Promise<{ status: number; body: string }> {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal })
+    const body = await res.text()
+    return { status: res.status, body }
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+/**
+ * The mirror of `assertNotConsoleFallback`: poll a target until it DOES serve
+ * the Temps console SPA fallback (or times out still serving something else).
+ *
+ * Used to prove a deployment pause actually took live traffic offline: after
+ * pausing, `route_table::load_routes` finds no routable container for the
+ * environment (see the fix note there) and skips the route entirely, so the
+ * proxy falls through to its unknown-host console fallback. A real app
+ * response (or a hung/refused connection) here means pause did NOT actually
+ * stop traffic.
+ */
+export async function waitForConsoleFallback(opts: {
+  url: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  intervalMs?: number
+}): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 30_000
+  const intervalMs = opts.intervalMs ?? 1500
+  const start = performance.now()
+  let body = ''
+  let status = 0
+  while (performance.now() - start < timeoutMs) {
+    try {
+      const r = await fetchBody(opts.url, opts.headers, 10_000)
+      status = r.status
+      body = r.body
+      if (looksLikeConsoleFallback(body)) return
+    } catch {
+      // transient — retry
+    }
+    await sleep(intervalMs)
+  }
+  throw new Error(
+    `expected the paused deployment to serve the Temps console fallback, but got HTTP ${status} ` +
+      `with a non-fallback body after ${Math.round(timeoutMs / 1000)}s ` +
       `(body starts: ${JSON.stringify(body.slice(0, 80))})`,
   )
 }
@@ -559,28 +677,45 @@ export async function registerPebbleDefaultIp(opts?: {
   const network = opts?.network ?? 'temps-e2e-pebble-net'
   const managementUrl = opts?.managementUrl ?? 'http://localhost:8056'
 
-  const proc = Bun.spawn(
-    [
-      'docker',
-      'run',
-      '--rm',
-      '--network',
-      network,
-      'alpine:latest',
-      'getent',
-      'hosts',
-      'host.docker.internal',
-    ],
-    { stdout: 'pipe', stderr: 'pipe' },
-  )
-  const [out, err, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (code !== 0) {
-    throw new Error(`failed to resolve host.docker.internal via throwaway container: ${err}`)
+  const resolve = async (extraArgs: string[] = []) => {
+    const proc = Bun.spawn(
+      [
+        'docker',
+        'run',
+        '--rm',
+        '--network',
+        network,
+        ...extraArgs,
+        'alpine:latest',
+        'getent',
+        'hosts',
+        'host.docker.internal',
+      ],
+      { stdout: 'pipe', stderr: 'pipe' },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    return { stdout, stderr, code }
   }
+
+  // Docker Desktop defines host.docker.internal automatically. Plain Linux
+  // dockerd (including GitHub-hosted runners) does not, so retry with
+  // host-gateway exactly as the established Playwright E2E preflight does.
+  let resolved = await resolve()
+  if (resolved.code !== 0 || !resolved.stdout.trim()) {
+    resolved = await resolve(['--add-host', 'host.docker.internal:host-gateway'])
+  }
+  if (resolved.code !== 0) {
+    const detail = [resolved.stdout, resolved.stderr].filter((s) => s.trim()).join('\n').trim()
+    throw new Error(
+      `failed to resolve host.docker.internal via throwaway container (exit ${resolved.code})` +
+        (detail ? `: ${detail}` : ''),
+    )
+  }
+  const out = resolved.stdout
   const ip = out.trim().split(/\s+/)[0]
   if (!ip) {
     throw new Error(`could not parse host IP from getent output: ${JSON.stringify(out)}`)
@@ -1197,6 +1332,42 @@ export async function ensureBlobEnabled(
   throw new Error(`blob storage did not become enabled+healthy within ${Math.round(timeoutMs / 1000)}s`)
 }
 
+export interface DockerCommandResult {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+/**
+ * Run a `docker` subcommand against a container by name and collect its
+ * output. Used by HA/failover scenarios to simulate a real outage (`stop`/
+ * `kill`) and independently confirm container state (`inspect`) via a side
+ * channel the platform API can't fake -- Docker itself, not a DB row.
+ */
+export async function runDockerContainerCommand(
+  action: 'stop' | 'start' | 'kill' | 'inspect',
+  containerName: string,
+  extraArgs: string[] = [],
+): Promise<DockerCommandResult> {
+  const args = action === 'inspect' ? ['inspect', ...extraArgs, containerName] : [action, ...extraArgs, containerName]
+  const proc = Bun.spawn(['docker', ...args], { stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  return { code, stdout, stderr }
+}
+
+/** `docker inspect -f '{{.State.Status}}' <name>` -- 'running', 'exited', etc. Throws if the container doesn't exist. */
+export async function dockerContainerStatus(containerName: string): Promise<string> {
+  const res = await runDockerContainerCommand('inspect', containerName, ['-f', '{{.State.Status}}'])
+  if (res.code !== 0) {
+    throw new Error(`docker inspect ${containerName} failed: ${res.stderr.trim()}`)
+  }
+  return res.stdout.trim()
+}
+
 /** Best-effort teardown of the email-provider/domain resources this flow created. Never throws. */
 export async function teardownEmailResources(
   client: Client,
@@ -1218,4 +1389,28 @@ export async function teardownEmailResources(
     }
   }
   return errors
+}
+
+/**
+ * Mirror of `PostgresService::normalize_database_name`
+ * (`crates/temps-providers/src/externalsvc/postgres.rs`): lowercase,
+ * non-alphanumeric -> `_`, `db_`-prefix if it'd start with a digit, capped
+ * at 63 bytes (Postgres identifier limit).
+ *
+ * A linked postgres service does NOT hand a deployed app the database named
+ * at service-creation time -- linking auto-provisions (and injects
+ * `POSTGRES_URL` for) a SEPARATE per-project-per-environment database named
+ * `normalize_database_name("{project_slug}_{environment_name}")` (see
+ * `PostgresService::get_runtime_env_vars`), e.g. project slug
+ * `my-app` + environment `production` -> database `my_app_production`.
+ * Anything reading the actual table data back (not just calling the
+ * deployed app's own HTTP API) needs this exact name, not the service's
+ * own `database` parameter.
+ */
+export function normalizePostgresDatabaseName(name: string): string {
+  let normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '_')
+  if (/^[0-9]/.test(normalized)) {
+    normalized = `db_${normalized}`
+  }
+  return normalized.slice(0, 63)
 }

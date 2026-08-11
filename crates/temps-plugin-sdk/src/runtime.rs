@@ -1,23 +1,28 @@
 //! Plugin binary runtime — handles startup, handshake, and serving.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use hyper_util::rt::TokioIo;
 use temps_core::external_plugin::{PluginEvent, PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
+use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
 use tower::{Service, ServiceExt};
 use tracing::{debug, error, info, warn};
 
 use crate::client::{EventReceiver, TempsClient};
 use crate::context::PluginContext;
-use crate::manifest::{HandshakeMessage, PluginReady};
+use crate::manifest::{
+    HandshakeMessage, PluginHello, PluginLaunchConfig, PluginReady,
+    EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+};
 use crate::protocol::PluginArgs;
 use crate::ExternalPlugin;
 
@@ -26,11 +31,11 @@ use crate::ExternalPlugin;
 /// This function:
 /// 1. Parses CLI args
 /// 2. Sets up tracing
-/// 3. Writes the manifest to stdout (handshake phase 1)
-/// 4. Starts axum on the Unix socket with a WebSocket endpoint for the platform channel
-/// 5. Writes the ready signal to stdout (handshake phase 2)
-/// 6. Waits for the platform to connect via WebSocket, then creates the PluginContext
-/// 7. Serves until SIGTERM
+/// 3. Emits the protocol hello and manifest
+/// 4. Reads the typed launch configuration from stdin
+/// 5. Starts axum on the Unix socket and emits Ready
+/// 6. Authenticates the platform channel and creates the PluginContext
+/// 7. Serves plugin routes and events until SIGTERM
 pub fn run_plugin<P: ExternalPlugin + Default>(plugin: P) {
     // Parse CLI arguments
     let args = PluginArgs::parse();
@@ -47,10 +52,16 @@ pub fn run_plugin<P: ExternalPlugin + Default>(plugin: P) {
         .init();
 
     // Build tokio runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("Failed to build tokio runtime");
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Failed to build plugin runtime: {error}");
+            std::process::exit(1);
+        }
+    };
 
     rt.block_on(async move {
         if let Err(e) = run_plugin_async(plugin, args).await {
@@ -60,22 +71,80 @@ pub fn run_plugin<P: ExternalPlugin + Default>(plugin: P) {
     });
 }
 
+fn write_handshake_message(message: &HandshakeMessage) -> Result<(), crate::error::PluginSdkError> {
+    let json = serde_json::to_string(message)?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{json}")?;
+    output.flush()?;
+    Ok(())
+}
+
 async fn run_plugin_async<P: ExternalPlugin>(
     plugin: P,
-    args: PluginArgs,
+    mut args: PluginArgs,
 ) -> Result<(), crate::error::PluginSdkError> {
     let manifest = plugin.manifest();
     let plugin_name = manifest.name.clone();
 
     info!(plugin = %plugin_name, "Starting external plugin");
 
-    // Step 1: Write manifest to stdout (handshake phase 1)
+    // Step 1: identify the protocol and disclose requested privileges before
+    // Temps sends any secret or host-owned path to this same child process.
     // IMPORTANT: stdout is ONLY for handshake messages. Logs go to stderr.
-    let manifest_msg = HandshakeMessage::Manifest(Box::new(manifest.clone()));
-    let manifest_json = serde_json::to_string(&manifest_msg)?;
-    println!("{}", manifest_json);
+    write_handshake_message(&HandshakeMessage::Hello(PluginHello {
+        protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+        manifest: Box::new(manifest.clone()),
+    }))?;
 
-    // Step 2: Ensure data directory exists
+    // Step 2: receive the typed launch configuration. The manager fills only
+    // fields the manifest requested. Installed plugins execute as trusted host
+    // code today; this staged exchange is disclosure control and protocol
+    // integrity, not process isolation.
+    let mut launch_line = String::new();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    stdin.read_line(&mut launch_line).await.map_err(|error| {
+        crate::error::PluginSdkError::Initialization {
+            plugin_name: plugin_name.clone(),
+            reason: format!("Failed to read typed launch configuration: {error}"),
+        }
+    })?;
+    if launch_line.is_empty() {
+        return Err(crate::error::PluginSdkError::Initialization {
+            plugin_name,
+            reason: "Temps closed stdin before sending typed launch configuration; this plugin and Temps likely use incompatible SDK versions".to_string(),
+        });
+    }
+    let launch: PluginLaunchConfig = serde_json::from_str(launch_line.trim_end())?;
+    if launch.protocol_version != EXTERNAL_PLUGIN_PROTOCOL_VERSION {
+        return Err(crate::error::PluginSdkError::Initialization {
+            plugin_name,
+            reason: format!(
+                "Temps sent external-plugin protocol {}, but this SDK requires {}",
+                launch.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION
+            ),
+        });
+    }
+    if launch.auth_secret.trim().is_empty() {
+        return Err(crate::error::PluginSdkError::Initialization {
+            plugin_name,
+            reason: "Temps supplied an empty request-assertion secret".to_string(),
+        });
+    }
+    if manifest.requires_db != launch.database_url.is_some()
+        || manifest.requires_host_data_access != launch.host_data_dir.is_some()
+    {
+        return Err(crate::error::PluginSdkError::Initialization {
+            plugin_name,
+            reason: "Temps launch configuration does not match the manifest's declared host access requirements".to_string(),
+        });
+    }
+    let auth_secret = launch.auth_secret;
+    args.auth_secret = Some(auth_secret.clone());
+    args.database_url = launch.database_url;
+    args.host_data_dir = launch.host_data_dir;
+
+    // Step 3: Ensure data directory exists
     let data_dir = PathBuf::from(&args.data_dir);
     tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
         crate::error::PluginSdkError::Initialization {
@@ -84,10 +153,10 @@ async fn run_plugin_async<P: ExternalPlugin>(
         }
     })?;
 
-    // Step 3: Wrap plugin in Arc for shared access
+    // Step 4: Wrap plugin in Arc for shared access
     let plugin = Arc::new(plugin);
 
-    // Step 4: Remove stale socket file if it exists
+    // Step 5: Remove stale socket file if it exists
     let socket_path = PathBuf::from(&args.socket_path);
     if socket_path.exists() {
         tokio::fs::remove_file(&socket_path).await.map_err(|e| {
@@ -98,12 +167,22 @@ async fn run_plugin_async<P: ExternalPlugin>(
         })?;
     }
 
-    // Step 5: Bind Unix socket
+    // Step 6: Bind Unix socket
     let listener =
         UnixListener::bind(&socket_path).map_err(|e| crate::error::PluginSdkError::SocketBind {
             path: args.socket_path.clone(),
             reason: e.to_string(),
         })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| crate::error::PluginSdkError::SocketBind {
+                path: args.socket_path.clone(),
+                reason: format!("Failed to restrict socket permissions to 0600: {error}"),
+            },
+        )?;
+    }
 
     info!(
         plugin = %plugin_name,
@@ -111,7 +190,7 @@ async fn run_plugin_async<P: ExternalPlugin>(
         "Plugin server listening on Unix socket"
     );
 
-    // Step 6: Signal ready to Temps (handshake phase 2)
+    // Step 7: Signal ready to Temps (handshake phase 2)
     // Include OpenAPI schema if the plugin provides one
     let openapi_json = plugin
         .openapi_schema()
@@ -119,12 +198,12 @@ async fn run_plugin_async<P: ExternalPlugin>(
     let ready_msg = HandshakeMessage::Ready(PluginReady {
         ready: true,
         has_ui: plugin.ui_assets().is_some(),
+        protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
         openapi: openapi_json,
     });
-    let ready_json = serde_json::to_string(&ready_msg)?;
-    println!("{}", ready_json);
+    write_handshake_message(&ready_msg)?;
 
-    // Step 7: Wait for the platform to connect via WebSocket on /_temps/channel.
+    // Step 8: Prepare the authenticated platform WebSocket channel.
     //
     // We use a oneshot channel: the first request to /_temps/channel
     // upgrades to WebSocket and sends the stream here, which we use
@@ -139,25 +218,45 @@ async fn run_plugin_async<P: ExternalPlugin>(
 
     let ws_tx_clone = ws_tx.clone();
     let channel_handler_plugin_name = plugin_name.clone();
-    let channel_route = get(move |ws: axum::extract::WebSocketUpgrade| {
-        let ws_tx = ws_tx_clone.clone();
-        let pname = channel_handler_plugin_name.clone();
-        async move {
-            ws.on_upgrade(move |socket| async move {
-                debug!(plugin = %pname, "Platform channel WebSocket connected");
-
-                // Convert axum WebSocket to tokio-tungstenite compatible stream
-                let ws_stream = AxumWsAdapter::new(socket);
-                let (client, event_rx) = TempsClient::from_ws(ws_stream);
-
-                // Send the client to the main task (only the first connection wins)
-                let mut guard = ws_tx.lock().await;
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send((client, event_rx));
+    let channel_secret = auth_secret.clone();
+    let channel_route = get(
+        move |headers: HeaderMap, ws: axum::extract::WebSocketUpgrade| {
+            let ws_tx = ws_tx_clone.clone();
+            let pname = channel_handler_plugin_name.clone();
+            let expected_secret = channel_secret.clone();
+            async move {
+                let supplied_secret = headers
+                    .get(crate::protocol::headers::AUTH_SIGNATURE)
+                    .and_then(|value| value.to_str().ok());
+                if !supplied_secret.is_some_and(|provided| {
+                    crate::auth::secure_secret_matches(provided, &expected_secret)
+                }) {
+                    warn!(plugin = %pname, "Rejected unauthenticated platform channel attempt");
+                    return StatusCode::UNAUTHORIZED.into_response();
                 }
-            })
-        }
-    });
+
+                let sender = {
+                    let mut guard = ws_tx.lock().await;
+                    match guard.take() {
+                        Some(sender) => sender,
+                        None => return StatusCode::CONFLICT.into_response(),
+                    }
+                };
+
+                ws.on_upgrade(move |socket| async move {
+                    debug!(plugin = %pname, "Platform channel WebSocket connected");
+
+                    // Convert axum WebSocket to tokio-tungstenite compatible stream
+                    let ws_stream = AxumWsAdapter::new(socket);
+                    let (client, event_rx) = TempsClient::from_ws(ws_stream);
+
+                    // Send the client to the main task (only the first connection wins)
+                    let _ = sender.send((client, event_rx));
+                })
+                .into_response()
+            }
+        },
+    );
 
     let initial_app = Router::new()
         .route(&manifest.health_path, get(health_handler))
@@ -226,7 +325,7 @@ async fn run_plugin_async<P: ExternalPlugin>(
         }
     });
 
-    // Step 8: Wait for the platform channel to connect (with timeout)
+    // Step 9: Wait for the platform channel to connect (with timeout)
     let (temps_client, event_rx) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         ws_rx,
@@ -262,24 +361,39 @@ async fn run_plugin_async<P: ExternalPlugin>(
         }
     };
 
-    // Step 9: Build the PluginContext with the TempsClient
+    // Step 10: Build the PluginContext with the TempsClient
     let ctx = PluginContext::new(
         temps_client,
         plugin_name.clone(),
         data_dir,
-        args.auth_secret.clone(),
+        args.database_url.clone(),
+        args.host_data_dir.as_deref().map(std::path::PathBuf::from),
+        args.host_api_url.clone(),
+        auth_secret.clone(),
     );
 
-    // Step 10: Call on_start hook
+    // Step 11: Call on_start hook
     plugin.on_start(&ctx)?;
 
-    // Step 11: Build the full router with plugin routes
-    let plugin_router = plugin.router(ctx.clone());
+    // Step 12: Build the full router with plugin routes
+    let plugin_router = plugin.router(ctx.clone()).layer(axum::middleware::from_fn({
+        let auth_secret = auth_secret.clone();
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let auth_secret = auth_secret.clone();
+            async move {
+                match crate::auth::verify_proxy_headers(&mut request, &auth_secret) {
+                    Ok(_) => next.run(request).await,
+                    Err(rejection) => rejection.into_response(),
+                }
+            }
+        }
+    }));
 
     // Build the events handler if needed
     let event_state = EventHandlerState {
         plugin: plugin.clone(),
         ctx: ctx.clone(),
+        auth_secret: auth_secret.clone(),
     };
 
     let mut full_app = Router::new()
@@ -307,13 +421,13 @@ async fn run_plugin_async<P: ExternalPlugin>(
 
     info!(plugin = %plugin_name, "Plugin fully initialized and serving requests");
 
-    // Step 12: Spawn event delivery task (events received via channel)
+    // Step 13: Spawn event delivery task (events received via channel)
     let event_plugin = plugin.clone();
     let event_ctx = ctx.clone();
     let event_plugin_name = plugin_name.clone();
     spawn_event_delivery(event_rx, event_plugin, event_ctx, event_plugin_name);
 
-    // Step 13: Wait for shutdown
+    // Step 14: Wait for shutdown
     shutdown.await.ok();
     info!(plugin = %plugin_name, "Received shutdown signal");
     plugin.on_shutdown();
@@ -355,6 +469,7 @@ async fn health_handler() -> &'static str {
 struct EventHandlerState<P: ExternalPlugin> {
     plugin: Arc<P>,
     ctx: PluginContext,
+    auth_secret: String,
 }
 
 // Manual Clone impl — Arc<P> is always Clone regardless of P's Clone impl.
@@ -363,6 +478,7 @@ impl<P: ExternalPlugin> Clone for EventHandlerState<P> {
         Self {
             plugin: self.plugin.clone(),
             ctx: self.ctx.clone(),
+            auth_secret: self.auth_secret.clone(),
         }
     }
 }
@@ -371,8 +487,18 @@ impl<P: ExternalPlugin> Clone for EventHandlerState<P> {
 /// (Kept for backward compatibility with the HTTP-based event delivery.)
 async fn event_handler<P: ExternalPlugin>(
     State(state): State<EventHandlerState<P>>,
+    headers: HeaderMap,
     Json(event): Json<PluginEvent>,
-) -> impl IntoResponse {
+) -> Response {
+    let supplied_secret = headers
+        .get(crate::protocol::headers::AUTH_SIGNATURE)
+        .and_then(|value| value.to_str().ok());
+    if !supplied_secret
+        .is_some_and(|provided| crate::auth::secure_secret_matches(provided, &state.auth_secret))
+    {
+        warn!(plugin = %state.ctx.plugin_name(), "Rejected unauthenticated internal event");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     debug!(
         plugin = %state.ctx.plugin_name(),
         event_type = %event.event_type,
@@ -382,7 +508,7 @@ async fn event_handler<P: ExternalPlugin>(
 
     state.plugin.on_event(&state.ctx, event);
 
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 // ── Axum WebSocket → tokio-tungstenite adapter ─────────────────────────
@@ -528,6 +654,12 @@ fn tungstenite_msg_to_axum(
     }
 }
 
+/// Pull the actor token and its user out of the platform's headers.
+///
+/// Both must be present and agree: a token with no user id cannot be filed
+/// under anyone, and a user id with no token is nothing to remember. Absent
+/// on `public_paths` routes and on plugins that declare no API capability,
+/// which is why this silently does nothing rather than warning.
 #[cfg(test)]
 mod tests {
     use super::*;

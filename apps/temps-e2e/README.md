@@ -5,8 +5,11 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `kv-scenario`, `blob-scenario`, `flags-scenario`, `audit-scenario`,
 `managed-services-scenario`, `rbac-scenario`, `monitoring-scenario`,
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
-`session-replay-scenario`, `backup-restore-scenario`, `git-deploy-scenario`,
-`examples`) drive the real
+`session-replay-scenario`, `backup-restore-scenario`, `pitr-scenario`,
+`git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
+`db-ha-failover-scenario`, `pg-upgrade-scenario`, `redis-restore-scenario`,
+`mongodb-restore-scenario`, `s3-restore-scenario`, `mariadb-restore-scenario`,
+`env-vars-scenario`, `api-key-scenario`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -154,12 +157,78 @@ bun run src/index.ts session-replay-scenario --registry localhost:5111
 # reverting writes made after the backup. Needs MinIO (docker-compose.e2e.yml).
 bun run src/index.ts backup-restore-scenario --registry localhost:5111
 
+# pitr: point-in-time recovery of a real postgres service via MinIO -- write
+# rows, wait for their WAL to archive, capture a recovery-target timestamp,
+# write MORE rows, PITR-restore to the captured timestamp, and prove via the
+# read-only data-browser API (not /probe) that exactly the pre-target rows
+# survive. Needs MinIO (docker-compose.e2e.yml). Runs ~90s of real wall-clock
+# wait time so a WAL segment actually archives -- see the steps section below.
+bun run src/index.ts pitr-scenario --registry localhost:5111
+
+# pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
+# pinned to postgres:16-bookworm, write 5 marker rows, trigger the upgrade
+# (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
+# and prove via the read-only data-browser API that the marker rows survived
+# the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111
+bun run src/index.ts pg-upgrade-scenario --registry localhost:5111 --upgrade-timeout 900000  # generous timeout for slow hosts
+
 # git-deploy: real clone + build of a public GitHub repo
 # (github.com/gotempsh/temps-examples) via trigger-pipeline -- proves the
 # actual git pipeline, not an image pull or a synthesized Dockerfile. Hits
 # real github.com (documented exception to this suite's "no real internet"
 # rule -- see "External-service test infra" below).
 bun run src/index.ts git-deploy-scenario
+
+# db-ha-failover: real Postgres HA (pg_auto_failover) automatic-failover
+# proof -- provision a 1-monitor + 2-data-node cluster, deploy an app through
+# the injected multi-host POSTGRES_URL, `docker stop` the elected primary,
+# and assert a surviving replica gets promoted AND the same app (no
+# redeploy) resumes writing within a bounded window.
+bun run src/index.ts db-ha-failover-scenario --registry localhost:5111
+
+# deploy-lifecycle: deploy version A, deploy version B, rollback to A, pause,
+# resume, and promote B into a second environment -- asserts the EXACT
+# response body served over the real proxied URL at every step (never just a
+# deployment row's status field). Needs a registry the Temps server can pull
+# from, same as `examples`/`logs-scenario`/etc.
+bun run src/index.ts deploy-lifecycle-scenario --registry localhost:5111
+bun run src/index.ts deploy-lifecycle-scenario --keep --json    # inspect afterward (CI)
+
+# otel-quota: real OTLP/HTTP protobuf traces/metrics/logs (hand-encoded, no
+# @opentelemetry/* SDK) round-tripped through the query API + Observe feed,
+# then real storage-quota enforcement pushed past a configured
+# TEMPS_OTEL_QUOTA_GB until ingestion is actually rejected (413). The target
+# instance MUST be launched with TEMPS_OTEL_QUOTA_GB=1 (the smallest nonzero
+# value) for the quota half to mean anything -- see its section below.
+bun run src/index.ts otel-quota-scenario
+bun run src/index.ts otel-quota-scenario --max-quota-batches 400 --json
+
+# redis-restore / mongodb-restore / s3-restore: backup + in-place restore of
+# each managed service via MinIO, proven by verifying pre-backup data
+# survives and post-backup-only data is erased. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts redis-restore-scenario --registry localhost:5111
+bun run src/index.ts mongodb-restore-scenario
+bun run src/index.ts s3-restore-scenario
+
+# mariadb-restore: backup + in-place restore of a real MariaDB service --
+# insert pre-backup rows via docker exec, real backup (physical or logical,
+# engine-selected) to MinIO, insert post-backup rows, restore in place, and
+# verify via the data-browser API that only the pre-backup rows survive.
+# Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts mariadb-restore-scenario
+
+# env-vars: create/update/delete a project env var and redeploy after each
+# change, asserting the RUNNING CONTAINER (an echo-server app, not just the
+# API response) reflects the new/updated/removed value, plus an
+# environment-scoping check.
+bun run src/index.ts env-vars-scenario --registry localhost:5111
+
+# api-key: a second low-privilege user creates a scoped API key over real
+# HTTP, the key gets 200 on an in-scope request and 403 on an out-of-scope
+# one, then revocation makes an immediate retry fail. Needs DB-direct access
+# to mint the second user's initial session, same as rbac-scenario.
+bun run src/index.ts api-key-scenario --temps-root /path/to/temps --database-url postgres://...
 ```
 
 ### `examples`
@@ -696,6 +765,230 @@ every single backup. Confirmed live 3x, including that the second and third
 backups on the same service skip the archiving setup entirely (faster
 restore, no extra container recreate).
 
+### `pitr-scenario` steps
+
+1. provision a real standalone postgres service, link it to a project,
+   deploy the same `db-probe` app `backup-restore-scenario` uses
+2. create an S3 source pointed at the local MinIO
+3. trigger a real base backup and poll it to `completed` (real `wal-g
+   backup-push`)
+4. write 5 real rows through the injected `POSTGRES_URL` (the "T1" marker)
+5. wait 75s for the WAL segment covering T1 to actually archive to S3 --
+   every managed postgres runs with `archive_timeout=60` (see
+   `PostgresService::create_container`), which forces the archiver to close
+   and archive the current WAL segment every 60s even though 5 tiny inserts
+   never fill the 16MB size threshold on their own. `wal-g wal-fetch` during
+   a restore can only see WAL that's actually landed in S3, not whatever's
+   still sitting in the live container's `pg_wal`
+6. capture a recovery-target timestamp strictly after T1 and strictly
+   before the next write
+7. write 3 MORE rows (the "T2" marker, count now 8) -- data the PITR target
+   must NOT include -- then a short wait so T2's WAL is durably fsynced
+8. start a PITR restore in place to the captured T1 timestamp
+   (`POST /external-services/{id}/restore`, `mode: "pitr"`) and poll
+   `GET /restore-runs/{id}` to `completed`
+9. read the actual `e2e_probe` table back through the read-only
+   data-browser API (`GET
+   /external-services/{id}/query/containers/{path}/entities/{entity}/data`
+   -- the same endpoint `temps data rows` uses) and assert the exact row
+   count (5) and exact primary-key set (`[1,2,3,4,5]`) -- an INDEPENDENT
+   side channel from `/probe`, which mutates on every call, so this is a
+   genuine content check, not just "the restore run's status flipped to
+   completed"
+10. hit `/probe` once more and re-read the table, asserting total_count is
+    6, the first 5 ids are still exactly T1s `[1,2,3,4,5]`, and the new
+    row's id is strictly greater than all of them -- proving the recovered
+    cluster is fully writable on top of the restored data, not just
+    readable
+11. teardown (deployment, project, service, S3 source)
+
+PITR depends on the same WAL-G continuous-archiving fix documented above
+under `backup-restore-scenario` already being on `main` -- without it, no
+backup on this platform is restorable at all, PITR included.
+
+Two things worth documenting, neither a platform bug -- both correct
+platform/Postgres behavior that this scenario's first draft got wrong:
+
+- Step 9's container path is NOT `{service's own database}/public`.
+  Linking a service to a project auto-provisions a SEPARATE
+  per-project-per-environment database and points the deployed app's
+  injected `POSTGRES_URL` at THAT (`PostgresService::get_runtime_env_vars`
+  in `crates/temps-providers/src/externalsvc/postgres.rs`), named
+  `normalize_database_name("{project_slug}_{environment_name}")` -- e.g.
+  project slug `my-app` + environment `production` ->
+  `my_app_production`. `normalizePostgresDatabaseName`
+  (`apps/temps-e2e/src/lib/flows.ts`) mirrors the Rust normalization so the
+  scenario can compute the real path instead of guessing.
+- Step 10 does NOT assert the new row lands as id 6. Postgres WAL-logs
+  sequence advances `SEQ_LOG_VALS` (32) values ahead of what's actually
+  been handed out, specifically so crash/PITR recovery can never replay a
+  value a client already received -- the first `nextval()` after ANY
+  recovery legitimately jumps past `count+1`. The scenario asserts the row
+  count and the restored ids' exact identity instead of the new row's
+  specific id.
+
+### `pg-upgrade-scenario` steps
+
+Closes the real coverage gap noted in the former "Known gaps" section: the
+`PostgresUpgradeOrchestrator`
+(`crates/temps-providers/src/externalsvc/postgres_upgrade.rs`) and its
+`POST /external-services/{service_id}/upgrades` HTTP surface were fully wired
+and real, but zero e2e coverage existed for the actual dump+restore data
+path -- the only honest proof that a major-version upgrade preserves data is
+reading the rows back after it finishes, not just watching a status field flip.
+
+1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
+   `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
+   it inserts a row into `e2e_probe` and returns the total count
+2. provision a real standalone Postgres service pinned to `postgres:16-bookworm`
+   via `parameters.docker_image` at creation time. Standard official postgres
+   images are used; `extract_postgres_version("postgres:16-bookworm")` returns
+   `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
+   pin is required because the upgrade API validates that `to_version > from_version`
+   and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
+   -- using the platform default 18-bookworm image would leave nowhere to
+   upgrade to in an e2e test
+3. create a **default** S3 source (`is_default: true`) pointed at the local
+   MinIO. `phase_pre_backup` in the orchestrator calls
+   `BackupService::default_s3_source_id` (`WHERE is_default = true`) to find
+   the backup target; the upgrade API returns 412 immediately if no default
+   source is configured -- this is a hard precondition, not an optional step
+4. link the service to a project, deploy the db-probe app, wait for it to be
+   healthy, and confirm `/health` succeeds (real DB ping)
+5. write 5 real rows through `/probe` (the T1 marker set). These land in the
+   per-project auto-provisioned database (NOT the service's own `database`
+   parameter -- see `PostgresService::get_runtime_env_vars`), named
+   `normalize_database_name("{project_slug}_{env_slug}")` as computed by
+   `normalizePostgresDatabaseName` in `flows.ts`
+6. `POST /external-services/{service_id}/upgrades` with
+   from_version="16" / to_version="17" / from_image="postgres:16-bookworm" /
+   to_image="postgres:17-bookworm". The orchestrator spawns a
+   tokio task and returns immediately with status="pending". It then runs
+   seven real phases synchronously:
+     - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
+     - `snapshot`: stop old container, `docker cp`-style volume copy to a
+       rollback volume, remove the original volume
+     - `dump`: boot throwaway old-version container with rollback volume
+       mounted, run `pg_dumpall`, write dump to a separate volume
+     - `new_container`: `lifecycle.create_and_start(service_id, to_image)` --
+       boots a fresh 17-bookworm container (empty data volume → initdb)
+     - `restore`: boot a psql container with the dump volume, run
+       `psql < data.sql` against the new container
+     - `swap`: persist `to_image` onto the service's `parameters.docker_image`
+       column via `lifecycle.set_docker_image`, restart the container
+     - `analyze`: run `ANALYZE` so the planner sees the new-version stats
+7. poll `GET /external-services/{service_id}/upgrades/{id}` every 5s until
+   `status === "completed"` or `status === "failed"`, up to `--upgrade-timeout`
+   (default 600s). On failure, the error includes the last-seen phase and
+   `error_message` from the upgrade row so the cause is always visible
+8. assert the 5 T1 marker rows survived: read them via the read-only
+   data-browser API (`GET /external-services/{id}/query/containers/{path}/entities/{entity}/data`
+   -- same endpoint `pitr-scenario` uses) and assert `total_count=5` and
+   `ids=[1,2,3,4,5]` exactly. This is the only honest proof: the dump captured
+   those rows and psql restored them. A status=completed without this
+   check would pass even if the restore loaded into the wrong database or no
+   database at all
+9. assert the service is fully writable on the new version: hit `/probe` once
+   more and confirm a 6th row landed, read back via data-browser and assert
+   `total_count=6`, first 5 ids exactly `[1,2,3,4,5]`, new id > 5. The
+   sequence jumps past the pre-dump high-water mark for the same reason
+   PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
+   monotonicity, not the exact new id
+10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
+    now equals `postgres:17-bookworm`. `phase_swap` calls
+    `lifecycle.set_docker_image` which persists the new image into
+    `external_services.parameters`; this checks the API-visible result
+11. teardown (deployment, project, service, S3 source)
+
+### `mariadb-restore-scenario` steps
+
+Closes the last remaining gap in the backup/restore engine parity story:
+Postgres (`backup-restore-scenario`, `pitr-scenario`, `pg-upgrade-scenario`),
+Redis, MongoDB, and S3 all have restore e2e coverage; MariaDB had the engine
+code (`crates/temps-providers/src/externalsvc/mariadb.rs`'s
+`restore_capabilities`/`restore_to_new_service`/`restore_pitr`, all fully
+wired to the trait) but no live-server proof until now.
+
+1. provision a real MariaDB service and read its root password directly off
+   the container via `docker inspect` (`MARIADB_ROOT_PASSWORD`, per
+   `MariaDbService::get_container_name`)
+2. insert 3 pre-backup rows into a real table via `docker exec mariadb -uroot
+   -p... -e ...` -- no synthetic DB rows, the same discipline every other
+   restore scenario holds itself to
+3. create a MinIO S3 source and trigger a real backup; the backup engine
+   auto-selects physical or logical (`crates/temps-backup/src/engines/dispatch.rs`)
+4. insert 2 more rows post-backup, to prove restore reverts state rather than
+   just leaving current state alone
+5. start an in-place restore and poll until it completes
+6. verify via the read-only data-browser API (not a direct DB read) that the
+   3 pre-backup rows are present with correct values, the 2 post-backup rows
+   are absent, and exactly 3 rows remain
+7. teardown (S3 source, service)
+
+### `env-vars-scenario` steps
+
+Proves environment-variable changes actually propagate into the running
+container -- not just that the API round-trips the value. App env vars have
+**no hot-reload**: a changed value only takes effect after a redeploy, so
+the scenario redeploys after every change and asserts on the live
+container's own response, never the database row.
+
+1. create a project, deploy `examples/echo-server` (its response body
+   includes `env: process.env`, so it directly surfaces the real container's
+   environment)
+2. create an env var scoped to production with a distinct marker value;
+   assert the create response round-trips it in plaintext (list responses
+   mask non-secret values as `"***"` -- only create/update return plaintext)
+3. redeploy, then poll the live container's own response until
+   `env["E2E_ENV_VAR_MARKER"]` actually equals the new value
+4. update the var to a second marker value, redeploy again, assert the
+   response reflects the NEW value (not the stale one) -- proves updates,
+   not just creates
+5. delete the var, redeploy, assert the key is genuinely absent from the
+   running container's environment
+6. lightweight, deploy-free check: a var scoped only to production must not
+   appear when `GET .../env-vars` is filtered by a second (staging)
+   environment's id, but must appear when filtered by production
+7. teardown (env vars, deployments, project)
+
+### `api-key-scenario` steps
+
+Promotes `web/e2e/authenticated/api-key-create.spec.ts` (UI-only: open
+dialog, fill name, submit, see the key once) to a real API round trip,
+covering what only an API-level test can prove: scope enforcement and
+revocation actually cutting off access, not just that api-key CRUD returns
+2xx.
+
+A real constraint shaped this scenario: `POST /api-keys` is gated by
+`SensitiveAction::CreateApiKey`, and `DefaultSensitiveActionAuthorizer`
+denies every machine (API-key-authenticated) principal outright
+(`machine_principals_are_denied_by_default`,
+`crates/temps-auth/src/sensitive_action.rs`) -- so this suite's own primary
+bearer-key identity can never call it. Same wall `rbac-scenario` already
+documented. The fix here: mint a second, low-privilege user via DB-direct
+`temps api-key` (needs `--temps-root`/`--database-url`, same as
+`rbac-scenario`), log it in for real via `POST /auth/login`, and drive key
+creation/revocation with the resulting `session` cookie via raw `fetch` --
+the SDK client always attaches a Bearer header, so it can't be used for this
+leg.
+
+1. create a project (primary bearer identity)
+2. create + log in a second, low-privilege user; capture its `session` cookie
+3. `POST /api-keys` (session-cookie authenticated) with a custom key scoped
+   to `projects:read` only; capture the plaintext key (returned only once)
+4. use the scoped key (`Authorization: Bearer tk_...`) against `GET
+   /projects/{id}` -- assert 200
+5. use the same key against `PATCH /projects/{id}` -- assert 403 with
+   `required_permission: "projects:write"`
+6. revoke the key (`POST /api-keys/{id}/deactivate`, session-cookie
+   authenticated)
+7. immediately retry the previously-200 request with the revoked key --
+   assert it now fails. Revocation is instant (`ApiKeyService::validate_api_key`
+   queries `IsActive.eq(true)` directly on every call; the only cache
+   throttles `last_used_at` write-back, never the pass/fail read), so this
+   is a single request, not a poll
+8. teardown (key, second user, project)
+
 ### `git-deploy-scenario` steps
 
 1. create a project pointed at a real public repo
@@ -739,6 +1032,492 @@ strictly greater than it. Confirmed live 3x.
 This is deliberately the one scenario in this suite that hits real
 `github.com` -- see "External-service test infra" below for why the others
 don't.
+
+### `db-ha-failover-scenario` steps
+
+Closes a real gap: `PostgresClusterService`
+(`crates/temps-providers/src/externalsvc/postgres_cluster.rs`), the
+`cluster-health`/`members`/`promote` API surface
+(`crates/temps-providers/src/handlers/handlers.rs`), and the multi-host
+`POSTGRES_URL` env-var injection
+(`ExternalServiceManager::build_cluster_env_vars_for_resource`) are all real
+and wired end-to-end, but had zero e2e coverage before this. This is
+single-Docker-host HA (every member is `node_id: null`, placed on the
+control plane with unique container names/ports) -- distinct from
+multi-node/WireGuard clustering, which needs separate real hosts and is out
+of scope here.
+
+1. provision a real 1-monitor + 2-data-node Postgres HA cluster
+   (`topology: 'cluster'`) and poll until the service and all 3 members
+   report `status: 'running'`
+2. poll `GET /external-services/{id}/cluster-health` (reads
+   `pgautofailover.node` directly off the monitor) until the cluster
+   reaches a steady state: exactly one data node reporting a writable-primary
+   state, the other `secondary`
+3. independently confirm the elected primary's container is actually
+   running via `docker inspect` -- a side channel the platform API can't
+   fake
+4. link the cluster to a project **before** deploying (env vars resolve at
+   deploy-job-creation time), deploy a `db-probe` Go app built with the
+   `pgx` driver (not this suite's usual `lib/pq` probe -- see
+   `buildHaProbeImage`'s doc comment in `lib/probe-app.ts`: `lib/pq`'s
+   latest *released* version cannot parse a multi-host
+   `postgresql://host1:port1,host2:port2/db` connection string at all,
+   verified live), and confirm it got the cluster's multi-host
+   `POSTGRES_URL`
+5. write 5 real rows through `/probe`
+6. `docker stop` the primary's container -- a real, ungraceful outage, not
+   an API call. `docker stop`, not `kill`: every cluster member's
+   `HostConfig.RestartPolicy` is `unless-stopped`, so Docker itself would
+   silently resurrect a `kill`ed container before pg_auto_failover's
+   monitor ever declared it unhealthy, masking whether real failover
+   happened at all
+7. poll cluster-health until the surviving replica reports a
+   writable-primary state -- proves the monitor actually promoted it, not
+   just that the old primary's row went stale
+8. poll `/probe` (tolerating connection errors while pg_auto_failover
+   completes the promotion) until writes succeed again, bounded, proving
+   the app's existing connection string routes to the new primary with no
+   redeploy, config change, or app restart
+9. assert the post-failover row count is monotonic -- the write actually
+   landed, not just that the HTTP call returned 200
+10. teardown (`delete_service` removes cluster containers by name
+    regardless of running state, so the stopped ex-primary is cleaned up
+    too)
+
+Between steps 7 and 8, the scenario also asserts a platform-level symptom
+the PR's own root-cause narrative below cites: that the **console/CLI-facing
+API** (`GET /external-services/{id}`, backed by
+`get_service_members_with_live_state`) reflects the promotion via
+`ServiceMemberInfo.live_state` — not just the raw `cluster-health` probe
+already checked in step 7. This exercises a genuinely different code path
+than step 2/7's polling: `get_service_info`'s own doc comment explains why
+`live_state` (not `service_members.role`) is the field to check —
+`service_members.role` is intentionally config-only (`monitor`/`replica`)
+in the current design and is never written to `"primary"` at runtime
+(confirmed by reading the code: `PgAutoFailoverState::to_cluster_role()`,
+which maps to a `Primary` role, is defined and unit-tested but not called
+from any production code path — `sync_member_roles` only ever demotes
+legacy `"primary"` rows to `"replica"` once). Asserting a `role` flip would
+therefore assert something that doesn't happen by design; `live_state` is
+the faithful, current equivalent.
+
+The PR's narrative also cites the DNS reconciler failing to republish
+`primary.<svc>.temps.local`. That assertion was investigated and **skipped
+as impractical for this round**: the only HTTP surface that exposes the
+internal DNS zone content is `GET /internal/nodes/{node_id}/dns/changes`
+(`crates/temps-dns/src/handlers/dns_sync.rs`), gated behind per-node
+bearer-token auth (`nodes.token_hash`), not the user/API-key auth this
+suite otherwise uses end-to-end — and this scenario deliberately stays
+single-Docker-host with no worker node registered, so there is no node
+token to present. Reaching the DNS row from the e2e script would mean
+either registering a throwaway worker node purely to mint a token (a
+disproportionate amount of new surface for one assertion) or querying the
+control-plane's own Postgres directly (breaking this suite's API-only
+testing philosophy, and requiring connection details this scenario file
+otherwise has no reason to know). A cheaper, non-API path would be adding a
+narrow admin/debug endpoint that returns a service's internal DNS records —
+worth doing if this assertion becomes a priority, but out of scope for this
+round.
+
+**Two real platform bugs found and fixed, both in
+`crates/temps-providers/src/externalsvc/cluster_role.rs`'s
+`PgAutoFailoverState::is_primary()`** -- the single classifier the DNS
+reconciler, `member_is_live_primary`'s delete-protection gate, and (via a
+copy in this scenario) the e2e assertions all keyed off:
+
+- `is_primary()` excluded `WaitPrimary`, on the documented (but factually
+  wrong) theory that it meant "candidate primary, not yet writable."
+  Verified live against a real 2-data-node cluster: `docker stop` the
+  primary, and pg_auto_failover promotes the survivor straight to
+  `wait_primary` -- direct `psql` against that node the whole time showed
+  `pg_is_in_recovery() = false`, `default_transaction_read_only = off`, and
+  a real `INSERT` succeeding. With only one node left, there's no third
+  node to attach as a new standby, so `wait_primary` isn't a brief
+  transition here -- it's the cluster's **permanent, correct steady state**
+  after a 2-node failover (confirmed: it never left `wait_primary` even
+  after a 300s poll). `crates/temps-providers/src/services.rs`'s own
+  `cluster_states::WRITABLE` already modeled this correctly
+  (`&["primary", "wait_primary", "single", "apply_settings"]`) -- the two
+  had drifted apart. Consequence: `drafts_for_snapshot` (the DNS
+  reconciler) never republished `primary.<svc>.temps.local` after exactly
+  this failover, and `to_cluster_role()` never flipped `service_members.role`
+  either -- both would have gone stale forever on any 2-node cluster.
+- `member_is_live_primary` (`services.rs`) had its own, independent
+  `matches!(reported_state, "primary" | "single")` string check for the
+  same concept -- also missing `wait_primary`, and used to gate
+  `remove_cluster_member`'s "don't delete the writable node" safety check.
+  A `wait_primary` primary would have passed this check as "not the
+  primary," meaning an operator could have deleted the cluster's only
+  writable node while it was actively serving traffic. Fixed to call
+  `PgAutoFailoverState::is_primary()` instead of hand-rolling the match, so
+  this can't drift from the reconciler's definition again.
+
+Both fixes are behavioral, not cosmetic: before them, this scenario's
+`docker stop` step hung until the 90s failover-timeout expired on every
+run, even though the app's own `/probe` endpoint -- hit directly, out of
+band -- was already serving fresh writes against the promoted node the
+whole time. The platform was already treating the node as the real primary
+for actual traffic; only the status classification was wrong. Confirmed
+live 3x after the fix (`failoverDetectedMs` ~50-53s, `writesRecoveredMs`
+~11ms -- the app's connection string re-resolves to the new primary almost
+instantly once pg_auto_failover reports it, since `pgx`'s
+`target_session_attrs=read-write` just tries each host in the DSN).
+
+Also fixed along the way (not a platform bug, a startup-ordering bug in the
+reconciler's own shutdown path,
+`crates/temps-providers/src/externalsvc/postgres_role_reconciler.rs`):
+`ReconcilerShutdown` existed as a struct but was never actually wired into
+`spawn_role_reconciler`/`stop_role_reconciler`/`run()`, which still used a
+bare `tokio::sync::Notify` -- `notify_waiters()` only wakes a task that is
+*already* parked in `.notified()`, so a shutdown signal that arrived while
+`run()`'s loop was mid-`reconcile_once` (real monitor I/O) was silently
+lost forever, leaking one reconciler task per deleted cluster that logged
+"Monitor not found" every 5s for the rest of the process's life. Wired
+`ReconcilerShutdown`'s `AtomicBool` + `Notify` pair through end-to-end
+(`run()` checks `is_stopped()` at the top of every loop iteration, not just
+inside the tick `select!`), so a signal is caught within one tick even if
+it arrives mid-reconcile.
+
+### `multinode-join-scenario` steps
+
+The first-ever e2e coverage for temps's direct-underlay multi-node clustering
+feature. Before this, the only coverage anywhere was Rust unit tests
+against a `MockDatabase`
+(`crates/temps-deployments/tests/multinode_integration_test.rs`) and a
+manual, non-automated dev tool (`tools/dev-cluster/`) a human has to run
+and eyeball. Nothing asserted that a second real node actually joins the
+mesh, that a deployment pinned to it actually lands there, or that drain/
+removal actually work.
+
+**Why this scenario owns its entire cluster instead of using the shared
+instance.** Every other scenario in this suite points `--url`/`--api-key`
+at an already-running `temps serve` (started via the `start-temps` skill)
+and drives it over HTTP. Multi-node clustering can't be proven that way:
+it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
+its own network identity — registering into the first node's mesh over
+single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
+topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
+scenario can need "a dedicated instance on a fixed port, not a normal dev
+slot" (see that section above) because of Pebble's hardcoded port; this
+scenario takes the same idea further: it brings up its own 2-node
+Docker-in-Docker cluster (`tools/e2e-multinode-cluster/docker-compose.yml`
+— a trimmed, re-subnetted clone of `tools/dev-cluster/`'s topology, safe to
+run alongside a developer's own dev-cluster instance or any other local
+service; see that compose file's header comment for the exact isolation
+guarantees), mints its own admin credential once the cluster is up, and
+tears the whole thing down at the end. It does NOT accept `--url`/
+`--api-key` — there is no "target instance" to point at.
+
+1. `docker compose up -d --build` the 2-node cluster. First run compiles
+   the full `temps` binary from source TWICE (once per DinD container) —
+   budget 15-20+ minutes; this is streamed to the scenario's own log output
+   line-by-line (prefixed `[compose]`) specifically so a long first build
+   is visibly progressing, not indistinguishable from a hang. Bounded by
+   `--build-timeout` (default 30 min).
+2. poll `docker inspect --format '{{.State.Health.Status}}'` on the
+   control-plane container until `healthy`.
+3. mint an admin API key directly from the DB: `docker exec ... temps
+   api-key --database-url=... --name=e2e-multinode --role=admin
+   --user-email=admin@local.dev --output-format=json` — the same DB-direct
+   pattern this README documents under "Auth" and `db-apikey.ts`/
+   `rbac-scenario` already use elsewhere in this suite. Works because
+   `role-control-plane.sh`'s `temps setup --auto` guarantees
+   `admin@local.dev` exists by the time the healthcheck passes.
+4. from here on, drive everything through the normal `@temps-sdk/api`
+   client against `http://localhost:18180`, same as every other scenario.
+5. poll `GET /internal/nodes` until a node named `worker-1` reports
+   `status: "active"` — the real proof `POST /internal/nodes/register`
+   completed a genuine registration, not a mocked one. Bounded by the same
+   generous timeout: the worker also compiles its own binary from scratch.
+   Then verify the node endpoint uses HTTPS, the worker persisted its mTLS
+   leaf/key/CA, legacy shared enrollment is disabled, and the node-bound
+   single-use enrollment token has exactly one use.
+6. create a throwaway project, resolve its production environment.
+7. `PUT /projects/{id}/environments/{id}/settings` with
+   `target_nodes: [worker_node_id]` — pins every future deploy in this
+   environment to the worker, never the control plane.
+8. deploy `traefik/whoami:latest` (same image other scenarios in this repo
+   already use for basic deploys) and poll it to a terminal state.
+9. the core assertion: `docker exec temps-e2e-mn-worker-1 docker ps` shows
+   the deployed container; `docker exec temps-e2e-mn-control-plane docker
+   ps` does not — a side channel the platform API can't fake, mirroring how
+   `db-ha-failover-scenario` proves promotion via `docker inspect`.
+10. real HTTP proof of life: hit the deployed app through the
+    control-plane's proxy (`localhost:18180`) with the app's `Host` header
+    and assert the actual `traefik/whoami` response body, not just a
+    healthy status field.
+11. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+    `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
+    same `docker ps` side-channel check on both containers to confirm the
+    container migrated off the worker. In this 2-node cluster it has
+    nowhere to go but the control plane, so this step also implicitly
+    re-tests the `Local` scheduling fallback path.
+12. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+    gone from `GET /internal/nodes`.
+13. teardown (in a `finally`, same discipline as every other scenario):
+    `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
+    workspace-target cache volumes survive for a near-instant re-run), then
+    explicitly `docker volume rm` the identity/state volumes (postgres
+    data, both containers' `/var/lib/docker` + `/var/lib/temps`, the
+    worker's `/root`) so the next run proves a genuinely fresh
+    registration/join rather than silently skipping it via one of the role
+    scripts' own idempotency marker files. `--keep` skips all of this —
+    unlike every other scenario's `--keep`, this leaves an entire running
+    2-node cluster behind, not just one container.
+
+**What makes step 9 work without a registry.** Unlike most `--registry`-
+requiring scenarios in this suite, deploying a bare public image tag to a
+remote node needs no registry at all: `ensure_image_on_remote` in
+`crates/temps-deployments/src/jobs/deploy_image.rs` has the control plane's
+own `DockerImageBuilder` pull (if needed) and `docker save` the image to a
+tar, stream it to the worker agent's `POST /agent/images/import`, and the
+agent `docker load`s it there. `image_builder` is injected into the deploy
+job per `workflow_execution_service.rs` (`builder.image_builder(...)`,
+around the node-scheduler wiring) specifically for this transfer path. So
+`traefik/whoami:latest` works exactly as described in this section's
+design with zero extra image-transfer complexity — this was verified by
+reading the actual remote-deploy code path, not assumed.
+
+```bash
+bun run src/index.ts multinode-join-scenario
+bun run src/index.ts multinode-join-scenario --keep --json    # inspect the running cluster after (CI)
+bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
+```
+
+### `deploy-lifecycle-scenario` steps
+
+Rollback / pause / resume / promote are the platform's primary safety valve
+for a bad deploy on live traffic. Every other scenario in this suite only
+proves create -> health -> teardown; this one proves the actual
+traffic-affecting operations work, by asserting the EXACT response body
+served over the real proxied URL at each step -- never just "the deployment
+row's status field flipped".
+
+1. build + push two genuinely different images (`versioned-app.ts`, a
+   throwaway Go app whose entire response body is a string baked in at
+   `docker build --build-arg VERSION_TEXT=...` time via `-ldflags -X`) --
+   "version A" and "version B"
+2. deploy version A; assert live traffic serves `"version A"` byte-for-byte
+3. deploy version B to the SAME project/environment; assert live traffic now
+   serves `"version B"` byte-for-byte
+4. `POST .../deployments/{A}/rollback`; assert live traffic reverts to
+   `"version A"` byte-for-byte -- proves a real rollback, not just a state
+   transition
+5. `POST .../deployments/{current}/pause`; assert the live URL genuinely
+   stops serving the app -- see the real-bug note below for what "paused"
+   actually renders as and why
+6. `POST .../deployments/{current}/resume`; assert live traffic serves
+   `"version A"` again
+7. create a second environment, `POST .../deployments/{B}/promote` into it;
+   assert ITS live URL serves `"version B"` byte-for-byte, and that
+   production is unaffected (proves promote is a genuinely distinct
+   mechanism from rollback: an arbitrary historical deployment's image,
+   copied into a different environment -- not "restore a previous version in
+   place")
+8. teardown (deployments, project -- cascades the second environment)
+
+`cancel_deployment` is deliberately not covered: it aborts an in-flight
+(pending/deploying) job, a different lifecycle stage than the four
+"deployment is already live" operations above, and there's nothing serving
+yet to assert a body against.
+
+**Three real platform bugs found and fixed (`temps-deployments` +
+`temps-routes`)**:
+
+1. **Rollback/promote rejected their own primary use case.** Both validated
+   the source deployment's state against `["deployed", "completed"]` (promote
+   also allowed `"ready"`) -- but a deployment superseded by a newer one in
+   its own environment is `"stopped"` (see `cancel_previous_deployments` /
+   `teardown_deployment`), which is exactly the state any deployment you'd
+   actually want to roll back to or promote is in. Every realistic "rollback
+   to the previous version" or "promote that known-good build" call 400'd
+   with `Cannot rollback to deployment in 'stopped' state`. Reproduced live:
+   step 4 below 400'd on every run before this fix. Fixed by adding
+   `"stopped"` to both allow-lists.
+
+2. **Pause and resume used incompatible Docker operations.**
+   `pause_deployment` used to `docker stop` **and** force-`docker rm` each
+   container, but `resume_deployment` called `deployer.resume_container` --
+   Docker's `unpause` (the reverse of a cgroup-freeze `docker pause`), which
+   only ever undoes a *genuine* `docker pause`. Nothing in the real pause
+   path ever paused (froze) a container; it removed it outright, so resume
+   always failed against a real deployment ("no such container") the instant
+   pause had actually run. The existing unit tests never caught it because
+   neither one set up a real backing container to pause/resume. Fixed:
+   `pause_deployment` now only `docker stop`s (never removes) each
+   container, and `resume_deployment` now calls `deployer.start_container`
+   -- the correct reverse of `stop` -- instead of `resume_container`.
+
+3. **Even with (2) fixed, a paused container stayed live in the proxy
+   indefinitely.** `route_table::load_routes` filtered candidate upstream
+   containers ONLY on `deleted_at IS NULL`, never on `status` -- so a
+   stopped-but-not-removed container's row still looked routable. Worse,
+   neither `pause_deployment` nor `resume_deployment` ever requested a
+   route-table reload: the only DB triggers wired to the in-process
+   route-table listener are on `environments`/`projects`
+   (`m2025*_add_*_route_trigger.rs`), and a bare `deployment_containers`
+   status `UPDATE` fires neither. **Reproduced live**: after pause, the
+   proxy kept retrying the OLD (still "valid-looking") container address and
+   returned Pingora's own `503 Service Unavailable` ("Fail to connect ...
+   Connection refused") -- not a clean "paused" signal, just an accident of
+   a stale cached route; the "an untested guess would reach for a 503"
+   sentence that used to be here was itself exactly that untested guess,
+   and turned out to be the pre-fix bug, not the fixed behavior. Fixed by
+   (a) filtering `route_table::load_routes` to `status IS NULL OR status =
+   'running'`, so a stopped container's route is skipped once reloaded, and
+   (b) having pause/resume publish `Job::ForceRouteReload` (the same
+   in-process broadcast `mark_deployment_complete.rs` already uses after a
+   normal deploy) so the reload happens immediately. With both fixes,
+   pausing makes the route disappear entirely and the proxy falls through to
+   its existing unknown-host console-fallback response (HTTP 200,
+   `<title>Temps</title>`) -- that fallback is the real, asserted "paused"
+   behavior in step 5 above.
+
+Confirmed live 3x back to back (after the environment-flakiness note below),
+including that resume correctly restarts the SAME container (not a rebuild)
+and traffic recovers within ~1.5s of the resume call.
+
+Also worth noting for anyone re-running this: the local dev instance used to
+verify this crashed several times mid-run with no panic/error logged (just
+stops writing to its log) while this branch was being built, on a heavily
+loaded shared dev machine running many other agents' builds/containers
+concurrently -- unrelated to this scenario's own logic (it reproduced before
+any pause/resume traffic ran, e.g. mid-`docker pull`). Launching the server
+with the harness's `run_in_background` tool option (or
+`dangerouslyDisableSandbox` + `nohup ... &`) rather than a plain backgrounded
+shell command was what made it survive a full run.
+
+### `otel-quota-scenario` steps
+
+Requires the target instance to be launched with `TEMPS_OTEL_QUOTA_GB=1`
+(the smallest nonzero value the knob accepts -- it's parsed as a whole
+`u64` GB count, see `crates/temps-otel/src/plugin.rs`). Without it, quota
+is disabled instance-wide and step 5 fails fast with a clear "you didn't
+configure this" error instead of a false pass.
+
+1. create a project. OTel's `tk_` (API-key) ingest path authenticates with a
+   bearer `tk_` token plus `X-Temps-Project-Id`
+   (`crates/temps-otel/src/ingest/auth.rs::authenticate_api_key`) -- the same
+   shape the harness's own control-plane calls already use, so this scenario
+   ingests with that same key rather than minting a fresh one via
+   `POST /api-keys`: creating an API key is a `SensitiveAction::CreateApiKey`
+   that the OSS `RequireVerificationAuthorizer` always downgrades to "needs
+   interactive step-up verification" for every principal type, including an
+   already-authenticated API key, by design (so a leaked `tk_` key can't mint
+   itself more credentials). A scriptable run has no session to step up
+   with, so it uses the credential it was given -- exactly what a real
+   deployed collector does.
+2. hand-encode one real root span, one gauge metric point, and one log
+   record as raw OTLP/HTTP protobuf (`apps/temps-e2e/src/lib/otlp.ts` --
+   field numbers copied directly from the vendored `.proto` files at
+   `crates/temps-otel/proto/opentelemetry/proto/**`, not guessed) and POST
+   each to `/otel/v1/{traces,metrics,logs}`
+3. read them all back through the real query API -- `GET /otel/traces`
+   (by `trace_id`), `GET /otel/traces/{project_id}/{trace_id}`,
+   `GET /otel/logs` (body + trace correlation), `GET /otel/metrics` (exact
+   value) -- asserting decoded field values, not just "a row exists"
+4. confirm the root span appears in the unified Observe feed
+   (`GET /projects/{id}/observe/events?kinds=span`), and that
+   `kinds=log` is rejected 400 (there is no `Log` variant in
+   `ObservabilityEvent` by design -- logs have their own page; see the bug
+   fix below)
+5. read `GET /otel/quota/{project_id}` and confirm a fresh project starts
+   well under 100% with a nonzero configured limit
+6. push ~9 MB OTLP trace batches (one span each, one giant filler
+   attribute) in a loop, polling the **uncached** `GET /otel/quota`
+   endpoint after every batch, until `usage_pct >= 100` (capped at
+   `--max-quota-batches`, default 250)
+7. sleep past the ingest-time quota cache TTL (30s, see
+   `crates/temps-otel/src/ingest/quota_cache.rs::QUOTA_CACHE_TTL`) --
+   `check_quota` on the hot ingest path deliberately reuses a cached
+   result for up to 30s (an exact per-project `COUNT(*)`-based estimate on
+   every request would be too expensive), so a burst inside that window
+   can legitimately land after crossing 100%; that's a documented
+   accuracy/hot-path tradeoff, not a bug, and pushing through it would
+   make the next assertion flaky
+8. send one more (small) batch with a unique canary span name and assert
+   it's rejected with HTTP 413 (`OtelError::QuotaExceeded`, body mentions
+   "quota") -- twice, to rule out a one-off race
+9. query `GET /otel/traces` for the canary span name and confirm it never
+   landed -- proves the rejection is real (the row didn't get written),
+   not just that the HTTP call happened to error while ingestion secretly
+   continued
+10. teardown: delete the project
+
+**Real bug found and fixed (the headline one): quota enforcement was
+silently inert for every project.** `TimescaleDbStorage::get_storage_quota`
+(`crates/temps-otel/src/storage/timescaledb.rs`) estimates a project's
+share of each OTel hypertable as `hypertable_size * (project_rows /
+approximate_row_count(hypertable))` -- but the code being fixed called
+`pg_total_relation_size('otel_spans')` (etc.) instead of
+`hypertable_size('otel_spans'::regclass)`. A hypertable's "root" relation
+(the name you create it under) holds no rows and almost no bytes of its
+own -- TimescaleDB partitions all actual data into child "chunk" tables
+under `_timescaledb_internal`, and `pg_total_relation_size` on the root
+name measures only that root's tiny catalog/index footprint. Verified live:
+with `TEMPS_OTEL_QUOTA_GB=1` configured, pushing over 2GB of real OTLP
+trace data into one project (250 batches, `--max-quota-batches`'s cap)
+never moved `total_bytes` past ~15MB or `usage_pct` past ~1.5% -- the quota
+could not be crossed no matter how much was ingested. `hypertable_size()`
+is TimescaleDB's chunk-aware equivalent (sums every chunk's own
+`pg_total_relation_size`, still cheap -- proportional to chunk count, not
+row count). After the fix, the same volume test trips the quota
+consistently at ~110 batches / ~990MB sent against a 1024MB (1 GiB)
+configured limit, across 4 consecutive clean runs. This is the exact
+160GB/day-flood failure mode the quota exists to prevent, and it could not
+have been caught by unit tests against a mocked storage layer -- only a
+real TimescaleDB instance has real chunk partitioning to get wrong.
+Alongside this, `LEAST(1.0, ratio)` was added around each per-table
+proportion: `approximate_row_count` is a planner-statistics estimate that
+can lag the true count right after a write burst, and without the clamp a
+stale (too-low) denominator could compute a per-project share above 100%
+of the table, inflating `total_bytes` past what the table itself reports.
+
+**Residual limitation found (not fixed here, documented as a known
+follow-up)**: because `approximate_row_count` is planner-statistics-based
+and shared across every project on the same hypertable, a project that
+checks its quota shortly after a DIFFERENT project on the same instance
+just finished a large write burst can be told it's already near/over 100%
+usage from a handful of its own rows -- the stale (too-low) row-count
+denominator combined with the `LEAST(1.0, ..)` clamp above conservatively
+(but incorrectly) attributes the whole table to whichever project asks
+first. Reproduced live: running this scenario twice back-to-back against
+the *same* database (no fresh project/DB in between) makes the second
+run's very first quota check fail with `usage_pct` already `>100` on a
+project with only its own 3 initial spans. It self-heals once
+autovacuum/`ANALYZE` catches up (seconds, in practice), and does not
+recur when each run gets an isolated database (the normal way this suite
+runs, and how CI would run it). A proper fix -- e.g. a periodic background
+`ANALYZE` of the three OTel hypertables, decoupled from any single
+project's request path -- is a bigger design/cost tradeoff than fits this
+PR; flagged here rather than silently patched around or ignored.
+
+**Real bug found and fixed (secondary)**: `EventsQuery.kinds`'s doc comment
+(which `utoipa` surfaces into the OpenAPI spec, and from there into
+`@temps-sdk/api`'s generated docs) advertised `log` as a valid Observe
+`kinds` filter value alongside `request,span,error,revenue`. It never was
+-- `ObservabilityEvent` has no `Log` variant (a deliberate, documented
+design choice: runtime logs are too high-volume to interleave with
+business signals, and have their own retention/storage model), and
+`EventKind::parse("log")` returns `None`, so `kinds=log` has always 400'd
+with `InvalidKindsFilter`. Fixed the doc comment in
+`crates/temps-observability/src/handlers/events.rs` to match what the code
+has always actually done, instead of leaving a promise nothing implements
+for the next reader (human or agent) to trip over. Step 4 asserts the real
+behavior directly: `kinds=span` finds the span, `kinds=log` 400s.
+
+**Real bug found and fixed (third, minor)**: `query_traces`'s utoipa
+`#[utoipa::path(params(...))]` list (`crates/temps-otel/src/handlers/query_handler.rs`)
+was missing `attributes` and `name_pattern` -- both real, functioning query
+params on `TraceQueryParams` (and both already correctly documented on the
+neighboring `query_trace_summaries` handler a few lines below), silently
+absent from the generated OpenAPI spec and therefore from `@temps-sdk/api`'s
+typed `queryTraces()` signature: a real server capability the typed SDK
+couldn't express. Fixed by adding both to the params list. This scenario
+doesn't depend on the fix (it filters the quota canary span by `trace_id`,
+which was already typed correctly) -- found while checking why `name_pattern`
+wasn't available on the typed client during development.
 
 ## External-service test infra (TLS, DNS, email, backups)
 
@@ -824,6 +1603,32 @@ HTTP-driven e2e run. `vercel-labs/emulate` (used elsewhere in this repo for
 mocking third-party APIs test-harness-side) can't help here either, for the
 same reason — see `web/e2e/README.md`'s "Mocking third-party services"
 section, which documents the identical constraint for the console UI tests.
+
+**Generic outbound webhooks** — same guard, same conclusion, no
+`webhook-scenario` command. `POST /projects/{project_id}/webhooks` runs every
+URL (create *and* update) through
+`WebhookService::validate_webhook_url` (`crates/temps-webhooks/src/service.rs`),
+which calls the exact same `temps_core::url_validation::validate_external_url`
+Slack goes through, then `validate_domain_async` for the DNS-resolved case.
+Unlike the DNS-01/Pebble guard in `crates/temps-dns/src/providers/pebble.rs`
+(which has an explicit `TEMPS_ALLOW_PEBBLE_PROVIDER=1` opt-in for exactly this
+kind of test), there is no dev/test bypass anywhere in the webhooks path —
+grepped `crates/temps-webhooks/` and `crates/temps-core/src/url_validation.rs`
+for `TEMPS_ALLOW*`, `debug_assertions`, `is_dev`/`dev_mode`/`test_mode`, and
+found nothing. A local receiver is also unreachable via the DNS-rebinding
+route: actual delivery in `deliver_webhook` re-resolves and pins the HTTP
+client to the validated IPs (`delivery_client_for`), so a domain that
+resolves publicly at create-time and privately at delivery-time is rejected
+too. Net effect: no loopback, RFC1918, or link-local target — including
+anything inside `docker-compose.e2e.yml`'s bridge network — can ever be a
+legal webhook URL against a real instance, create or update. The signing math
+(`sha256=` HMAC over `{timestamp}.{payload}`) is covered by
+`test_signature_generation` in `crates/temps-webhooks/src/service.rs`, which
+is the right layer for that piece, same as Slack's `wiremock` unit test one
+section up. Proving actual delivery end-to-end would need a real public receiver (e.g. a
+tunnel or hosted catcher) wired into the harness, which does not exist in
+this repo today. It was deliberately not added, and the SSRF guard was not
+weakened, for test convenience — the same call made for Slack above.
 
 ## Notes
 

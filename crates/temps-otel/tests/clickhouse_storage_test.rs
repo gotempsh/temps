@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use sea_orm::{DatabaseBackend, MockDatabase};
 
 use temps_otel::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -27,6 +27,7 @@ use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
 use temps_otel::types::{
     AggregationTemporality, MetricAggregation, MetricPoint, MetricQuery, MetricType, ResourceInfo,
+    SpanKind, SpanRecord, SpanStatusCode,
 };
 
 #[derive(::clickhouse::Row, serde::Deserialize)]
@@ -34,9 +35,10 @@ struct ChTypeNameRow {
     type_name: String,
 }
 
-/// Container handle + a connected `ClickHouseOtelStorage`. Returns `None` when
-/// Docker is unavailable so the test can skip without failing CI.
-async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>)> {
+/// Start a real ClickHouse testcontainer, wait for it to accept queries, and
+/// apply the OTel CH migrations. Returns the connected config + container
+/// handle, or `None` when Docker is unavailable (test should skip).
+async fn start_ch_container() -> Option<(ClickHouseOtelConfig, Box<dyn std::any::Any + Send>)> {
     use testcontainers::{
         core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -125,6 +127,14 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
         .await
         .expect("apply_migrations failed against testcontainer ClickHouse");
 
+    Some((config, Box::new(container)))
+}
+
+/// Container handle + a connected `ClickHouseOtelStorage`. Returns `None` when
+/// Docker is unavailable so the test can skip without failing CI.
+async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>)> {
+    let (config, container) = start_ch_container().await?;
+
     // The inner Timescale storage is never exercised by the metric methods under
     // test; a MockDatabase satisfies the constructor without a Postgres server.
     // The trace-refs test IS an exception: `get_trace_ref_projects` unions the
@@ -139,7 +149,38 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
 
     let storage =
         ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
-    Some((storage, Box::new(container)))
+    Some((storage, container))
+}
+
+/// Same as [`setup`], but the inner `TimescaleDbStorage` is configured with a
+/// real per-project quota limit (`quota_bytes_per_project`), and its
+/// `MockDatabase` is pre-loaded with `logs_rows` queued responses to
+/// `hypertable_bytes_for_project("otel_log_events", ...)` — one per
+/// `get_storage_quota`/`check_quota` call the test makes. Used by the
+/// storage-quota regression test below, which needs `get_storage_quota` to
+/// take its real (non-early-exit) path.
+async fn setup_with_quota(
+    limit_bytes: u64,
+    logs_bytes_per_call: i64,
+    calls: usize,
+) -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>)> {
+    let (config, container) = start_ch_container().await?;
+
+    let log_row =
+        move || BTreeMap::from([("total_bytes", sea_orm::Value::from(logs_bytes_per_call))]);
+    let mock_db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(std::iter::repeat_with(move || vec![log_row()]).take(calls))
+        .into_connection();
+    let inner = Arc::new(TimescaleDbStorage::with_config(
+        Arc::new(mock_db),
+        None,
+        7,
+        Some(limit_bytes),
+    ));
+
+    let storage =
+        ClickHouseOtelStorage::new(config, inner, Arc::new(temps_core::FixedRetentionResolver));
+    Some((storage, container))
 }
 
 fn gauge_point() -> MetricPoint {
@@ -746,4 +787,153 @@ async fn trace_refs_roundtrip_record_and_lookup() {
         .await
         .expect("lookup unknown trace");
     assert!(none.is_empty());
+}
+
+// ── Storage quota (ClickHouse-native span/metric accounting) ───────────────
+
+/// Cheap xorshift64-based pseudo-random hex string generator. Used to give
+/// each test span's attribute values high entropy (unlike a fixed repeated
+/// filler string, which ZSTD — the codec ClickHouse compresses these parts
+/// with — collapses to a near-zero footprint regardless of row count,
+/// making it useless for asserting on real on-disk bytes).
+fn pseudo_random_hex(seed: u64, len: usize) -> String {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut out = String::with_capacity(len + 16);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push_str(&format!("{state:016x}"));
+    }
+    out.truncate(len);
+    out
+}
+
+/// Build a sample SpanRecord with a sizeable, high-entropy `attributes`
+/// payload, so a batch of these produces real, measurable (not
+/// compressed-away) ClickHouse part bytes.
+fn quota_test_span(project_id: i32, index: u32) -> SpanRecord {
+    let start = Utc::now() - Duration::milliseconds(10);
+    let mut attributes = BTreeMap::new();
+    for key_idx in 0..20u32 {
+        let seed = (index as u64) * 1000 + key_idx as u64;
+        attributes.insert(
+            format!("attribute.key.number.{key_idx}"),
+            pseudo_random_hex(seed, 200),
+        );
+    }
+    SpanRecord {
+        project_id,
+        deployment_id: None,
+        resource: ResourceInfo {
+            service_name: "quota-test-service".into(),
+            service_version: Some("1.0.0".into()),
+            deployment_environment: Some("test".into()),
+            attributes: BTreeMap::new(),
+        },
+        trace_id: format!("{index:032x}"),
+        span_id: format!("{index:016x}"),
+        parent_span_id: None,
+        name: "quota-load-span".into(),
+        kind: SpanKind::Internal,
+        start_time: start,
+        end_time: start + Duration::milliseconds(10),
+        duration_ms: 10.0,
+        status_code: SpanStatusCode::Ok,
+        status_message: String::new(),
+        attributes,
+        events: vec![],
+    }
+}
+
+/// Regression test for the ClickHouse-backed storage-quota gap: before this
+/// fix, `ClickHouseOtelStorage::get_storage_quota`/`check_quota` delegated
+/// straight to the inner `TimescaleDbStorage`, which sums Postgres
+/// `otel_spans`/`otel_metrics`/`otel_log_events` hypertables — tables a
+/// ClickHouse-enabled install never writes span/metric rows into (`spans`
+/// and `metrics` are ClickHouse-native; see `store_spans`/`store_metrics`).
+/// Quota enforcement was therefore silently inert for every CH-backed
+/// project regardless of real ingested volume.
+///
+/// This test proves the fix against a REAL ClickHouse testcontainer: insert
+/// real span rows via `store_spans` (the production ingest path, not a
+/// synthetic byte count), and assert `get_storage_quota`/`check_quota`
+/// actually track that ClickHouse-native volume.
+#[tokio::test]
+async fn test_storage_quota_tracks_real_clickhouse_span_volume() {
+    let project_id = 777;
+
+    // 4 get_storage_quota/check_quota calls below each consume one queued
+    // mock logs-share response (see setup_with_quota): the empty-project
+    // check, the post-ingest get_storage_quota, check_quota's internal
+    // get_storage_quota, and the unrelated-project check.
+    let Some((storage, _container)) = setup_with_quota(300 * 1024, 0, 4).await else {
+        return; // Docker unavailable — skip gracefully.
+    };
+
+    // ── Phase 1: before any data, with a quota configured, usage is zero. ──
+    let empty_quota = storage
+        .get_storage_quota(project_id)
+        .await
+        .expect("get_storage_quota on empty project");
+    assert_eq!(
+        empty_quota.total_bytes, 0,
+        "no spans/metrics ingested yet for this project"
+    );
+
+    // ── Phase 2: insert real span volume, then a tiny limit must trip. ──
+    // Each span carries ~4KB of high-entropy (pseudo-random) attributes (20
+    // keys x 200 bytes) -- unlike a repeated filler string, this survives
+    // ZSTD compression well enough that ~500 of them push real ClickHouse
+    // part bytes comfortably past the 300KB test limit below.
+    // `logs_bytes_per_call` is mocked to 0 (see `setup_with_quota`) so every
+    // byte this test observes comes from the ClickHouse-native
+    // spans/metrics accounting under test, not the inner Postgres delegate.
+    let spans: Vec<SpanRecord> = (0..500u32)
+        .map(|i| quota_test_span(project_id, i))
+        .collect();
+    let stored = storage
+        .store_spans(spans)
+        .await
+        .expect("store_spans should succeed");
+    assert_eq!(stored, 500);
+
+    let quota = storage
+        .get_storage_quota(project_id)
+        .await
+        .expect("get_storage_quota after real ingest");
+    assert!(
+        quota.total_bytes > 300 * 1024,
+        "expected ClickHouse-native total_bytes to exceed the 300KB test limit after \
+         inserting ~500 spans with ~4KB of high-entropy attributes each (got {} bytes) -- \
+         this is exactly the regression this fix protects against: a plain delegation to \
+         the inner TimescaleDbStorage would report ~0 bytes here, since the \
+         ClickHouse-backed Postgres otel_spans table never receives these rows",
+        quota.total_bytes
+    );
+    assert!(
+        quota.usage_pct >= 100.0,
+        "usage_pct should have crossed 100% of the 300KB limit, got {}",
+        quota.usage_pct
+    );
+
+    let exceeded = storage
+        .check_quota(project_id)
+        .await
+        .expect("check_quota after real ingest");
+    assert!(
+        exceeded,
+        "check_quota must trip once real ClickHouse-ingested span volume exceeds the \
+         configured limit"
+    );
+
+    // A different, unrelated project sees none of this volume.
+    let other_quota = storage
+        .get_storage_quota(999_999)
+        .await
+        .expect("get_storage_quota for unrelated project");
+    assert_eq!(
+        other_quota.total_bytes, 0,
+        "an unrelated project must not see this project's ClickHouse-ingested bytes"
+    );
 }

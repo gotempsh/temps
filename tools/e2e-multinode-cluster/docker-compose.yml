@@ -1,0 +1,242 @@
+# Isolated, throwaway 2-node Temps cluster for the `multinode-join-scenario`
+# e2e test (apps/temps-e2e/src/commands/multinode-join-scenario.ts).
+#
+# This is a TRIMMED, RE-SUBNETTED clone of ../dev-cluster/docker-compose.yml
+# (postgres + 1 control-plane + 1 worker, not 3 workers) with every name,
+# subnet, and host port changed so it can run ALONGSIDE a developer's own
+# `tools/dev-cluster` instance (or any other local service) with zero
+# collision:
+#
+#   - network `temps-e2e-mn-underlay`, subnet 10.52.0.0/24 (dev-cluster uses
+#     10.42.0.0/24 -- different octet, no overlap)
+#   - every container/volume name is prefixed `temps-e2e-mn-` (dev-cluster
+#     uses `temps-dev-`)
+#   - the control plane's HTTP port is published on the host as 18180, a
+#     range that collides with nothing else on this machine: dev slots use
+#     8080-8370, TLS scenarios use 8443-8733, the web dev server uses
+#     3000-3029, EE uses 9080/9081/9443/9100. No 443 is published at all --
+#     this scenario doesn't need TLS.
+#
+# The role scripts (`role-control-plane.sh`, `role-worker.sh`,
+# `entrypoint.sh`) and the DinD build image (`Dockerfile.dind-temps`) are
+# shared with ../dev-cluster -- see this compose file's `build:`
+# blocks (`context: ../dev-cluster`) and `command:` entries (which reach
+# into `/workspace/tools/dev-cluster/...`, workspace-relative, so it doesn't
+# matter which tool directory's compose file invoked them). Do not fork
+# those scripts here; if scenario behavior needs to change, change what this
+# compose file asks them to do (env vars), not the scripts themselves.
+#
+# The source tree is mounted read-only at /workspace. Local runs build the
+# current checkout inside the nodes; CI installs the same commit-specific musl
+# artifact already exercised by the other jobs, avoiding two cold workspace
+# builds without weakening commit provenance.
+
+name: temps-e2e-mn
+
+networks:
+  underlay:
+    name: temps-e2e-mn-underlay
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.52.0.0/24
+
+volumes:
+  # ── Cache volumes ─────────────────────────────────────────────────────
+  # These SURVIVE `docker compose down` (the scenario's teardown step never
+  # removes them) so re-running the scenario is near-instant after the
+  # first ~10-20 min compile. Shared by both containers via Docker's
+  # storage backend.
+  cargo-cache:
+    name: temps-e2e-mn-cargo-cache
+  # Cargo's git-dep cache (cloned source for `git = ...` Cargo.toml deps).
+  # Without this, cargo re-clones every git dependency from scratch on
+  # every fresh container -- can take minutes on its own.
+  cargo-git:
+    name: temps-e2e-mn-cargo-git
+  # Shared workspace `target/` directory. MUST be a named volume, not part
+  # of the /workspace bind mount: macOS bind-mount mtime semantics (gRPC
+  # FUSE / VirtioFS) defeat cargo's fingerprint cache, and mixing native
+  # macOS Mach-O artifacts with Linux ELF artifacts in one tree breaks the
+  # build outright. Mounting a named volume *over* /workspace/target inside
+  # each container keeps the source tree hot-reloadable from the host while
+  # target/ stays a clean Linux-native directory, shared across both
+  # containers, with a working fingerprint cache.
+  workspace-target:
+    name: temps-e2e-mn-workspace-target
+  # temps-cli's debug build creates a placeholder dist/index.html for
+  # include_dir!. The source checkout is intentionally read-only, so give
+  # that generated directory its own writable volume (fresh CI checkouts do
+  # not contain the gitignored dist directory developers often have locally).
+  cli-dist:
+    name: temps-e2e-mn-cli-dist
+
+  # Shared only between the control plane and worker during bootstrap. Contains
+  # the one-time enrollment token and generated admin password; never touches
+  # the host worktree and is removed after every run.
+  bootstrap-state:
+    name: temps-e2e-mn-bootstrap-state
+
+  # ── Identity/state volumes ────────────────────────────────────────────
+  # These are torn down EVERY scenario run (the scenario's teardown step
+  # explicitly `docker volume rm`s them after `compose down`) so each run
+  # proves a genuinely fresh registration/join, never a skip via one of the
+  # role scripts' own marker files (`.dev-cluster-setup-done`,
+  # `.dev-cluster-join-done`). Keeping these around between runs would mean
+  # the second run onward never re-exercises `POST /internal/nodes/register`
+  # at all -- the exact thing this scenario exists to prove.
+  postgres-data:
+    name: temps-e2e-mn-postgres-data
+  cp-docker:
+    name: temps-e2e-mn-cp-docker
+  cp-data:
+    name: temps-e2e-mn-cp-data
+  worker1-docker:
+    name: temps-e2e-mn-worker1-docker
+  worker1-data:
+    name: temps-e2e-mn-worker1-data
+  # Worker's /root (~/.temps/agent.json, written by `temps join`). Without
+  # this named volume, a container recreate wipes the join credential and
+  # the agent can't reconnect.
+  worker1-home:
+    name: temps-e2e-mn-worker1-home
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18
+    container_name: temps-e2e-mn-postgres
+    networks:
+      underlay:
+        ipv4_address: 10.52.0.5
+    environment:
+      POSTGRES_DB: temps
+      POSTGRES_USER: temps
+      POSTGRES_PASSWORD: temps
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres-data:/home/postgres/pgdata
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "temps", "-d", "temps"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  control-plane:
+    build:
+      context: ../dev-cluster
+      dockerfile: Dockerfile.dind-temps
+    image: temps-e2e-mn-cluster/dind-temps:latest
+    container_name: temps-e2e-mn-control-plane
+    privileged: true
+    hostname: control-plane
+    # Required for the inner dockerd (DinD) to manage child cgroups on a
+    # cgroupv2 host (e.g. Docker Desktop) -- same fix dev-cluster applies.
+    cgroup: private
+    networks:
+      underlay:
+        ipv4_address: 10.52.0.10
+    ports:
+      # HTTP only -- no TLS testing in this scenario, so no 443 published.
+      # 18180 is well outside every port range already reserved on this
+      # machine (see the header comment above).
+      - "127.0.0.1:18180:80"
+    environment:
+      TEMPS_DATABASE_URL: postgres://temps:temps@10.52.0.5:5432/temps
+      TEMPS_ADDRESS: 0.0.0.0:80
+      TEMPS_DATA_DIR: /var/lib/temps
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      # This is a throwaway local test cluster, not a real self-hosted
+      # instance -- never report product telemetry for it.
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_USE_ENROLLMENT_TOKEN: "true"
+      DEV_CLUSTER_ENROLLMENT_NODE_NAME: worker-1
+      # CI passes the musl binary already built for this commit. Local runs
+      # leave this empty and the shared role script builds from source.
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
+      # No TLS listener in this cluster -- disable the HTTP->HTTPS redirect
+      # so the scenario can hit plain http://localhost:18180 directly.
+      # TEMPS_TLS_ADDRESS is deliberately NOT set: `temps serve` reads it as
+      # a real --tls-address value (clap `env = "TEMPS_TLS_ADDRESS"`), so any
+      # placeholder string here would make pingora try to bind a TLS
+      # listener to it and panic. Leaving it unset -> `tls_address: None` ->
+      # no TLS listener, which is what this cluster actually wants.
+      ROLE: control-plane
+    volumes:
+      - ../../:/workspace:ro
+      - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cp-docker:/var/lib/docker
+      - cp-data:/var/lib/temps
+      - bootstrap-state:/run/temps-bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # role-control-plane.sh is reused unmodified from tools/dev-cluster --
+    # it's workspace-relative and doesn't care which compose file invoked
+    # it. Builds the binary from source, runs `temps setup --auto`, mints a
+    # single-use enrollment token via direct psql (documented shortcut in the
+    # script itself), enables mTLS, then execs `temps serve`.
+    command: ["bash", "/workspace/tools/dev-cluster/role-control-plane.sh"]
+    healthcheck:
+      # TCP-only probe (bash /dev/tcp) -- the admin API requires auth on
+      # every route, so we only care that the listener accepts a
+      # connection. start_period is generous: first boot compiles the full
+      # Rust workspace from scratch inside the container, which can take
+      # 15-20+ minutes on a cold cargo cache.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 900s
+
+  worker-1:
+    build:
+      context: ../dev-cluster
+      dockerfile: Dockerfile.dind-temps
+    image: temps-e2e-mn-cluster/dind-temps:latest
+    container_name: temps-e2e-mn-worker-1
+    privileged: true
+    hostname: worker-1
+    # Workers can race the control plane's mid-boot state (e.g. the join
+    # token file not written yet) -- retry instead of leaving the container
+    # in `Exited` state forever.
+    restart: on-failure:5
+    cgroup: private
+    networks:
+      underlay:
+        ipv4_address: 10.52.0.21
+    environment:
+      ROLE: worker
+      WORKER_NAME: worker-1
+      WORKER_UNDERLAY_IP: 10.52.0.21
+      CONTROL_PLANE_URL: http://10.52.0.10:80
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_OVERLAY_NETWORK: temps0
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
+    volumes:
+      - ../../:/workspace:ro
+      - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - worker1-docker:/var/lib/docker
+      - worker1-data:/var/lib/temps
+      - worker1-home:/root
+      - bootstrap-state:/run/temps-bootstrap
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    # role-worker.sh is reused unmodified from tools/dev-cluster -- builds
+    # the binary from source, polls for the join token file the control
+    # plane writes, runs `temps join` (idempotent via its own marker file),
+    # then execs `temps agent`.
+    command: ["bash", "/workspace/tools/dev-cluster/role-worker.sh"]

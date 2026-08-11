@@ -1458,16 +1458,51 @@ mod tests {
         let host = container.get_host().await?.to_string();
         let port = container.get_host_port_ipv4(3306).await?;
         let mut source = None;
-        for _ in 0..20 {
-            match MariaDbSource::connect(&host, port, "root", "test", "app").await {
-                Ok(connected) => {
+        let mut last_connect_error = None;
+        // The image readiness message can precede the host-published socket
+        // becoming reachable on loaded GitHub runners. Give that final
+        // network hand-off a bounded 30-second window.
+        let readiness_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while tokio::time::Instant::now() < readiness_deadline {
+            let remaining =
+                readiness_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let attempt_timeout = remaining.min(std::time::Duration::from_secs(3));
+            match tokio::time::timeout(
+                attempt_timeout,
+                MariaDbSource::connect(&host, port, "root", "test", "app"),
+            )
+            .await
+            {
+                Ok(Ok(connected)) => {
                     source = Some(connected);
                     break;
                 }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                Ok(Err(error)) => {
+                    last_connect_error = Some(error.to_string());
+                }
+                Err(_) => {
+                    last_connect_error = Some(format!(
+                        "connection attempt exceeded {}ms",
+                        attempt_timeout.as_millis()
+                    ))
+                }
+            }
+            let remaining =
+                readiness_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(500))).await;
             }
         }
-        let source = source.ok_or_else(|| anyhow::anyhow!("MariaDB did not become reachable"))?;
+        let source = source.ok_or_else(|| {
+            anyhow::anyhow!(
+                "MariaDB at {}:{} did not become reachable within 30s: {}",
+                host,
+                port,
+                last_connect_error
+                    .as_deref()
+                    .unwrap_or("no connection error captured")
+            )
+        })?;
         sqlx::query("CREATE TABLE rows_budget (id BIGINT PRIMARY KEY, payload LONGTEXT NOT NULL)")
             .execute(&source.pool)
             .await?;

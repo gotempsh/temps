@@ -144,7 +144,7 @@ impl DeploymentVerifier {
             let trigger_result = match image_ref {
                 Some(image_ref) => {
                     self.deployment_service
-                        .trigger_image_deployment(project_id, image_ref, None)
+                        .trigger_image_deployment(project_id, None, image_ref, None)
                         .await
                 }
                 None => {

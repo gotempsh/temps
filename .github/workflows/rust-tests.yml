@@ -7,6 +7,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# PR-controlled build scripts and privileged E2E containers do not need a
+# repository-write token. Keep the run read-only even if repository defaults
+# are later broadened.
+permissions:
+  contents: read
+
 # Superseded PR pushes used to leave the previous run's jobs going to
 # completion — including an 80-minute cold musl build whose output nobody
 # would ever look at, while the new commit's jobs queued behind it. Cancel
@@ -164,6 +170,16 @@ jobs:
     name: E2E
     needs: build-binary
     uses: ./.github/workflows/e2e-tests.yml
+    with:
+      binary-artifact: temps-binary-musl-fast
+
+  # The existing E2E workflow above covers Playwright and three example
+  # deployments. This separate matrix runs the real apps/temps-e2e scenario
+  # CLI in isolated shards, including the dedicated multinode/mTLS topology.
+  scenario-e2e:
+    name: Scenario E2E
+    needs: build-binary
+    uses: ./.github/workflows/apps-e2e-tests.yml
     with:
       binary-artifact: temps-binary-musl-fast
 

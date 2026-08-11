@@ -13,6 +13,7 @@ import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { flagsScenarioCommand } from './commands/flags-scenario.ts'
 import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
+import { pitrScenarioCommand } from './commands/pitr-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
 import { rbacScenarioCommand } from './commands/rbac-scenario.ts'
@@ -22,6 +23,17 @@ import { logsScenarioCommand } from './commands/logs-scenario.ts'
 import { analyticsScenarioCommand } from './commands/analytics-scenario.ts'
 import { sessionReplayScenarioCommand } from './commands/session-replay-scenario.ts'
 import { gitDeployScenarioCommand } from './commands/git-deploy-scenario.ts'
+import { dbHaFailoverScenarioCommand } from './commands/db-ha-failover-scenario.ts'
+import { deployLifecycleScenarioCommand } from './commands/deploy-lifecycle-scenario.ts'
+import { otelQuotaScenarioCommand } from './commands/otel-quota-scenario.ts'
+import { s3RestoreScenarioCommand } from './commands/s3-restore-scenario.ts'
+import { redisRestoreScenarioCommand } from './commands/redis-restore-scenario.ts'
+import { mongodbRestoreScenarioCommand } from './commands/mongodb-restore-scenario.ts'
+import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
+import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenario.ts'
+import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
+import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
+import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
 
 const program = new Command()
 
@@ -190,6 +202,36 @@ program
   })
 
 program
+  .command('pitr-scenario')
+  .description(
+    'Point-in-time recovery of a real postgres service via MinIO: real wal-g backup-push, write T1 rows, wait for their WAL to archive, capture a recovery-target timestamp, write T2 rows, PITR-restore to T1, and prove via the read-only data-browser API (not /probe) that exactly T1s rows survive',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await pitrScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('mongodb-restore-scenario')
+  .description(
+    'MongoDB backup + in-place restore: provision a MongoDB service, insert pre-backup docs via docker exec mongosh, ' +
+      'run a real mongodump backup (MongodbEngine sidecar → MinIO), insert post-backup docs, restore in place, ' +
+      'and verify via the data-browser API that pre-backup docs are present and post-backup docs are absent',
+  )
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await mongodbRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
   .command('git-deploy-scenario')
   .description(
     'Real git-triggered deploy against a public repo (github.com/gotempsh/temps-examples): clone + build a language-preset subdirectory, trigger-pipeline, verify the exact response body baked into the real repo source',
@@ -303,6 +345,77 @@ program
   })
 
 program
+  .command('db-ha-failover-scenario')
+  .description(
+    'Real Postgres HA (pg_auto_failover) automatic-failover proof: provision a 1-monitor + 2-data-node cluster on a single Docker host, deploy an app through the injected multi-host POSTGRES_URL, write real rows, `docker stop` the elected primary container, and assert cluster-health promotes the surviving replica AND the same app (no redeploy) resumes writing within a bounded window -- not just that a status field flipped',
+  )
+  .option('--registry <host>', 'registry to push the probe image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--cluster-timeout <ms>', 'max wait for the cluster to reach a running/steady state', '180000')
+  .option('--failover-timeout <ms>', 'max wait for promotion + write recovery after stopping the primary', '90000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await dbHaFailoverScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('redis-restore-scenario')
+  .description(
+    'Backup + restore a real Redis service via MinIO: real wal-g backup-push into a helper container, real S3 upload, real in-place restore proven by verifying pre-backup keys survive (HTTP 200 from data-browser) and post-backup keys are erased (HTTP 404) -- not just that the API calls returned 2xx',
+  )
+  .option('--registry <host:port>', 'registry to push the redis-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await redisRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('otel-quota-scenario')
+  .description(
+    'Real OTLP/HTTP protobuf ingestion (traces/metrics/logs, hand-encoded, no @opentelemetry/* SDK) round-tripped through the real query API and the unified Observe feed, then real storage-quota enforcement: push volume past a configured TEMPS_OTEL_QUOTA_GB until GET /otel/quota crosses 100%, and assert ingestion is actually rejected with 413 (and the rejected data never lands) once the ingest-time quota cache re-checks -- not just that the config knob exists',
+  )
+  .option('--max-quota-batches <n>', 'safety cap on ~9MB batches pushed while hunting for the quota cutoff', '250')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await otelQuotaScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('s3-restore-scenario')
+  .description(
+    'S3/MinIO managed-service restore: provision a real MinIO service with known credentials, upload pre-backup objects, mirror-backup via mc, diverge (add + delete), restore in-place with --overwrite --remove, and verify via the platform data-browser API that the live bucket exactly matches the backup-time state (deleted object restored, post-backup object gone)',
+  )
+  .option('--minio-endpoint <url>', 'backup-destination MinIO S3 API endpoint (must already have the bucket)', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'backup-destination bucket (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await s3RestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('pg-upgrade-scenario')
+  .description(
+    'Real Postgres major-version upgrade (16 → 17): provision a service pinned to postgres:16-bookworm, deploy a db-probe app, write 5 marker rows, trigger the upgrade, poll through all phases to completed, and assert the marker rows survived via the read-only data-browser API (not /probe) -- proves the actual pg_dumpall → psql restore path, not just that the status field flipped',
+  )
+  .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--upgrade-timeout <ms>', 'max wait for the upgrade to complete (real wal-g backup + pg_dumpall + psql restore)', '600000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await pgUpgradeScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
   .command('examples')
   .description('Build the repo example projects (Go, Python, Node, …) and run the full deploy/verify lifecycle for each')
   .option('--only <key...>', 'run only these example keys (repeatable); default = fast subset')
@@ -317,6 +430,84 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await examplesCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('deploy-lifecycle-scenario')
+  .description(
+    'Real deployment lifecycle: deploy version A, deploy version B, rollback to A, pause, resume, and promote B into a second environment -- asserting the EXACT response body served over the real proxied URL at each step, not just a deployment row\'s status field',
+  )
+  .option('--registry <host>', 'registry to push the versioned-app images to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for each deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await deployLifecycleScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('mariadb-restore-scenario')
+  .description(
+    'MariaDB backup + in-place restore: provision a MariaDB service, insert pre-backup rows via docker exec mariadb, ' +
+      'run a real backup (physical or logical, engine-selected) to MinIO, insert post-backup rows, restore in place, ' +
+      'and verify via the data-browser API that pre-backup rows are present and post-backup rows are absent',
+  )
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await mariadbRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('env-vars-scenario')
+  .description(
+    'Real environment-variable lifecycle: deploy an echo-server app, create/update/delete a project env var, ' +
+      'redeploy after each change, and assert the RUNNING CONTAINER reflects the new/updated/removed value ' +
+      '(not just that the API round-trips it) -- plus a lightweight environment-scoping check via the list endpoint',
+  )
+  .option('--registry <host>', 'registry to push the echo-server image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await envVarsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('api-key-scenario')
+  .description(
+    'Real API-key lifecycle via HTTP: a second low-privilege user creates a scoped API key through POST /api-keys ' +
+      '(session-cookie authenticated, since machine principals cannot create keys), the key gets 200 on an ' +
+      'in-scope request and 403 on an out-of-scope one, then revocation makes an immediate retry fail -- ' +
+      'not just that api-key CRUD returns 2xx',
+  )
+  .option('--temps-root <path>', 'checkout root (needs crates/temps-cli) to mint the second user\'s bearer key via DB-direct `temps api-key`; or $TEMPS_ROOT')
+  .option('--database-url <url>', 'Postgres URL the temps binary can reach directly; or $TEMPS_DATABASE_URL')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await apiKeyScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('multinode-join-scenario')
+  .description(
+    'Real direct-underlay multi-node/mTLS proof: brings up its OWN dedicated 2-node DinD cluster ' +
+      '(tools/e2e-multinode-cluster/, not the shared instance -- no --url/--api-key), waits for a real ' +
+      'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
+      'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
+      'channel, drains the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
+      'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
+  )
+  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
+  .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await multinodeJoinScenarioCommand(opts)
   })
 
 program.parseAsync().catch((err: unknown) => {

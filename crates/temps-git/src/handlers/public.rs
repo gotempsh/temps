@@ -187,11 +187,28 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
                 "Repository {}/{} not found or is not public: {}",
                 owner, repo, msg
             )),
+        PublicRepoError::RepositoryNotPublic(_) => problem_new(StatusCode::NOT_FOUND)
+            .with_title("Repository Not Found")
+            .with_detail(format!(
+                "Repository {}/{} was not found or is not public.",
+                owner, repo
+            )),
         PublicRepoError::RateLimitExceeded => problem_new(StatusCode::TOO_MANY_REQUESTS)
             .with_title("Rate Limit Exceeded")
             .with_detail(
                 "The provider API rate limit was reached. When you are signed in, Temps automatically uses a valid GitHub connection owned by your account. Check or reconnect it in Git Providers, retry after the provider resets the limit, or install a GitHub App without creating a personal access token.",
             ),
+        PublicRepoError::PermissionDenied {
+            operation,
+            required_permission,
+        } => problem_new(StatusCode::FORBIDDEN)
+            .with_title("Git Provider Permission Required")
+            .with_detail(format!(
+                "The git provider denied permission to {}. Grant '{}' to the credential for this repository.",
+                operation, required_permission
+            ))
+            .with_value("operation", operation)
+            .with_value("required_permission", required_permission),
         PublicRepoError::BranchNotFound(branch) => problem_new(StatusCode::NOT_FOUND)
             .with_title("Branch Not Found")
             .with_detail(format!("Branch '{}' not found in repository", branch)),
@@ -283,6 +300,7 @@ async fn provider_for_public_request(
     responses(
         (status = 200, description = "List of branches", body = BranchListResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -374,6 +392,7 @@ pub async fn get_public_branches(
     responses(
         (status = 200, description = "Detected presets", body = PublicPresetResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -399,7 +418,6 @@ pub async fn detect_public_presets(
     let target_branch = if let Some(branch) = params.branch.clone() {
         branch
     } else {
-        // Fetch repository info to get default branch
         repo_info.default_branch
     };
 
@@ -731,6 +749,7 @@ pub async fn get_public_compose_preview(
     responses(
         (status = 200, description = "Repository information", body = PublicRepositoryInfo),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -1133,10 +1152,41 @@ mod tests {
     }
 
     #[test]
+    fn test_private_repository_is_hidden_as_not_found() {
+        let err = PublicRepoError::RepositoryNotPublic("owner/private".to_string());
+        let problem = map_error(err, "owner", "private");
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        assert!(!problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("credential") || detail.contains("token")));
+    }
+
+    #[test]
     fn test_error_mapping_rate_limit() {
         let err = PublicRepoError::RateLimitExceeded;
         let problem = map_error(err, "owner", "repo");
         assert_eq!(problem.status_code, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_error_mapping_permission_denied() {
+        let err = PublicRepoError::PermissionDenied {
+            operation: "list branches for owner/repo".to_string(),
+            required_permission: "Contents: read".to_string(),
+        };
+        let problem = map_error(err, "owner", "repo");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Git Provider Permission Required")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Contents: read")));
     }
 
     #[test]

@@ -1414,7 +1414,8 @@ impl Analytics for AnalyticsService {
         // instead of correlated subqueries to preserve exact 3-priority logic:
         //   Priority 1: next page_leave for same session+page within 30 min
         //   Priority 2: next page_view in same session (any page)
-        //   Priority 3: fallback 30 seconds
+        //   Priority 3: the session's own last_accessed_at (covers the exit
+        //     page, which has no next event), clamped to [1, 1800] seconds
         let events_sql = format!(
             r#"
             WITH all_session_events AS MATERIALIZED (
@@ -1430,7 +1431,8 @@ impl Analytics for AnalyticsService {
                     e.scroll_depth,
                     e.session_id,
                     COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
-                    rs.id as rs_id
+                    rs.id as rs_id,
+                    rs.last_accessed_at as session_last_accessed_at
                 FROM events e
                 -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
                 -- events.session_id (see get_visitor_sessions_by_id comment).
@@ -1485,13 +1487,20 @@ impl Analytics for AnalyticsService {
                 ase.referrer,
                 CASE
                     WHEN ase.event_type = 'page_view' THEN
-                        EXTRACT(EPOCH FROM (
+                        -- Priority 3 falls back to the session's own last-activity
+                        -- timestamp (not a fixed guess) so the exit page of a
+                        -- session -- which by definition has no next event to
+                        -- diff against -- still gets a real duration instead of
+                        -- NULL. Clamped to [1, 1800] so bounces still render a
+                        -- nonzero value and stale/anomalous gaps don't inflate it.
+                        LEAST(1800, GREATEST(1, EXTRACT(EPOCH FROM (
                             COALESCE(
                                 p1.next_page_leave_ts,
                                 p2.next_page_view_ts,
-                                ase.occurred_at + INTERVAL '30 seconds'
+                                ase.session_last_accessed_at,
+                                ase.occurred_at + INTERVAL '1 second'
                             ) - ase.occurred_at
-                        ))::int
+                        ))::int))
                     ELSE NULL
                 END as computed_time_on_page,
                 ase.scroll_depth,
@@ -1544,7 +1553,9 @@ impl Analytics for AnalyticsService {
         for row in event_rows {
             total_events += 1;
             let time_on_page = if row.event_type == "page_view" {
-                row.computed_time_on_page.filter(|&t| t > 0 && t < 1800)
+                // SQL already clamps to [1, 1800] for page_view rows, so this is
+                // never NULL/out-of-range here -- no further filtering needed.
+                row.computed_time_on_page
             } else {
                 None
             };
@@ -3182,7 +3193,8 @@ WHERE project_id = $1
         // exact 3-priority COALESCE logic:
         //   Priority 1: next page_leave for same session+page within 30 min
         //   Priority 2: next page_view in same session (any page)
-        //   Priority 3: fallback 30 seconds
+        //   Priority 3: the session's own last_accessed_at (covers the exit
+        //     page, which has no next event), clamped to [1, 1800] seconds
         let data_query = format!(
             r#"
             WITH session_events AS MATERIALIZED (
@@ -3198,8 +3210,15 @@ WHERE project_id = $1
                     e.browser,
                     e.operating_system,
                     e.device_type,
-                    e.ip_geolocation_id
+                    e.ip_geolocation_id,
+                    rs.last_accessed_at as session_last_accessed_at
                 FROM events e
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see get_visitor_sessions_by_id comment).
+                LEFT JOIN request_sessions rs ON (
+                    rs.session_id = e.session_id
+                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
+                )
                 WHERE e.session_id IN (
                     SELECT DISTINCT session_id
                     FROM events
@@ -3269,13 +3288,20 @@ WHERE project_id = $1
                     COALESCE(v.visitor_id, '') as visitor_uuid,
                     p1.session_id,
                     p1.pv_ts as viewed_at,
-                    EXTRACT(EPOCH FROM (
+                    -- Priority 3 falls back to the session's own last-activity
+                    -- timestamp (not a fixed guess) so the exit page -- which by
+                    -- definition has no next event to diff against -- still gets
+                    -- a real duration instead of NULL. Clamped to [1, 1800] so
+                    -- bounces still render a nonzero value and stale/anomalous
+                    -- gaps don't inflate it.
+                    LEAST(1800, GREATEST(1, EXTRACT(EPOCH FROM (
                         COALESCE(
                             p1.next_page_leave_ts,
                             p2.next_page_view_ts,
-                            p1.pv_ts + INTERVAL '30 seconds'
+                            se.session_last_accessed_at,
+                            p1.pv_ts + INTERVAL '1 second'
                         ) - p1.pv_ts
-                    ))::int as computed_time_on_page,
+                    ))::int)) as computed_time_on_page,
                     (po.pv_number = 1) as is_entry,
                     (po.pv_number = po.pv_total) as is_exit,
                     (po.pv_total <= 1) as is_bounce,
@@ -3299,11 +3325,8 @@ WHERE project_id = $1
                 visitor_uuid,
                 session_id,
                 viewed_at,
-                CASE
-                    WHEN computed_time_on_page > 0 AND computed_time_on_page < 1800
-                    THEN computed_time_on_page
-                    ELSE NULL
-                END as time_on_page,
+                -- computed_time_on_page is already clamped to [1, 1800] above.
+                computed_time_on_page as time_on_page,
                 is_entry,
                 is_exit,
                 is_bounce,
@@ -5431,6 +5454,419 @@ mod tests {
             .find(|p| p.page_path == "/other")
             .expect("/other must be a top exit page");
         assert_eq!(other_exit.exit_count, 1, "session B exited on /other");
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Regression test for the bounce/exit-page "-" bug: a session's last
+    /// pageview has no next event to diff against, so `time_on_page` must
+    /// fall back to the session's own `last_accessed_at` instead of coming
+    /// back NULL. Covers `get_page_path_visitors` (the "Individual visits"
+    /// table).
+    #[tokio::test]
+    async fn test_get_page_path_visitors_bounce_has_real_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_page_path_visitors_bounce_duration");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        let window_start = now - chrono::Duration::hours(1);
+        let window_end = now + chrono::Duration::hours(1);
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("bounce-duration-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        // No page_leave and no next page_view exist for this session, so the
+        // query's only signal for how long the visitor stayed is the
+        // session's own last-activity timestamp -- 27s after the pageview.
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("cccccccc-0000-4000-8000-000000000003".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::seconds(27)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/bounce-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/bounce-page".to_string()),
+            href: Set("https://example.com/bounce-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let response = service
+            .get_page_path_visitors(
+                project.id,
+                "/bounce-page",
+                window_start,
+                window_end,
+                None,
+                1,
+                20,
+            )
+            .await?;
+
+        assert_eq!(response.sessions.len(), 1);
+        let session = &response.sessions[0];
+        assert!(
+            session.is_bounce,
+            "single-pageview session must be a bounce"
+        );
+        assert_eq!(
+            session.time_on_page,
+            Some(27),
+            "time_on_page must come from the session's last_accessed_at, not be NULL/\"-\""
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// The other half of the fallback fix's contract: when the session's
+    /// `last_accessed_at` is far past the pageview (e.g. a tab left open for
+    /// a long time before the last heartbeat), the computed duration must be
+    /// clamped to 1800s rather than reporting an unbounded value.
+    #[tokio::test]
+    async fn test_get_page_path_visitors_clamps_upper_bound_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_page_path_visitors_clamp_upper_bound");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        let window_start = now - chrono::Duration::hours(1);
+        let window_end = now + chrono::Duration::hours(1);
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("clamp-upper-bound-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        // 40 minutes of "activity" after the pageview -- well past the
+        // 1800s (30 minute) clamp ceiling.
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("eeeeeeee-0000-4000-8000-000000000005".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::minutes(40)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/clamp-upper-bound-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/clamp-upper-bound-page".to_string()),
+            href: Set("https://example.com/clamp-upper-bound-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let response = service
+            .get_page_path_visitors(
+                project.id,
+                "/clamp-upper-bound-page",
+                window_start,
+                window_end,
+                None,
+                1,
+                20,
+            )
+            .await?;
+
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(
+            response.sessions[0].time_on_page,
+            Some(1800),
+            "time_on_page must clamp to 1800s, not report the raw 2400s gap"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Same regression as above, for `get_visitor_journey` (the "Visitor
+    /// Journey" panel's per-event duration).
+    #[tokio::test]
+    async fn test_get_visitor_journey_exit_page_has_real_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_visitor_journey_exit_duration");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("journey-duration-test-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("dddddddd-0000-4000-8000-000000000004".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::seconds(19)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/journey-exit-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/journey-exit-page".to_string()),
+            href: Set("https://example.com/journey-exit-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let journey = service
+            .get_visitor_journey(test_visitor.id, project.id, None)
+            .await?
+            .expect("get_visitor_journey must return Some for an existing visitor");
+
+        let session = journey
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_row.id)
+            .expect("seeded session must appear in the journey");
+        let page_view_event = session
+            .events
+            .iter()
+            .find(|e| e.event_type == "page_view")
+            .expect("page_view event must appear in the session's events");
+
+        assert_eq!(
+            page_view_event.time_on_page,
+            Some(19),
+            "exit-page time_on_page must come from the session's last_accessed_at, not be NULL"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Upper-bound counterpart of `test_get_visitor_journey_exit_page_has_real_time_on_page`:
+    /// a `last_accessed_at` far past the pageview must clamp to 1800s.
+    #[tokio::test]
+    async fn test_get_visitor_journey_clamps_upper_bound_time_on_page() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_visitor_journey_clamp_upper_bound");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+
+        let test_visitor = visitor::ActiveModel {
+            visitor_id: Set("journey-clamp-upper-bound-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let pageview_ts = now - chrono::Duration::minutes(10);
+        let session_row = request_sessions::ActiveModel {
+            session_id: Set("ffffffff-0000-4000-8000-000000000006".to_string()),
+            started_at: Set(pageview_ts),
+            last_accessed_at: Set(pageview_ts + chrono::Duration::minutes(40)),
+            visitor_id: Set(Some(test_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(test_visitor.id)),
+            session_id: Set(Some(session_row.session_id.clone())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/journey-clamp-upper-bound-page".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/journey-clamp-upper-bound-page".to_string()),
+            href: Set("https://example.com/journey-clamp-upper-bound-page".to_string()),
+            timestamp: Set(pageview_ts),
+            is_entry: Set(false),
+            is_exit: Set(false),
+            is_bounce: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let journey = service
+            .get_visitor_journey(test_visitor.id, project.id, None)
+            .await?
+            .expect("get_visitor_journey must return Some for an existing visitor");
+
+        let session = journey
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_row.id)
+            .expect("seeded session must appear in the journey");
+        let page_view_event = session
+            .events
+            .iter()
+            .find(|e| e.event_type == "page_view")
+            .expect("page_view event must appear in the session's events");
+
+        assert_eq!(
+            page_view_event.time_on_page,
+            Some(1800),
+            "time_on_page must clamp to 1800s, not report the raw 2400s gap"
+        );
 
         cleanup_test_analytics!(db);
         Ok(())

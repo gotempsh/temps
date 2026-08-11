@@ -25,6 +25,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
+use temps_core::external_plugin::VerifiedPluginApiCaller;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
 use temps_entities::deployments::DeploymentMetadata;
@@ -484,6 +485,11 @@ pub struct DeployFromImageRequest {
     /// External image ID (if already registered). If provided without image_ref,
     /// the image reference will be fetched from the registered external image.
     pub external_image_id: Option<i32>,
+    /// Claim an image already present in the platform host's Docker daemon.
+    /// Temps retags it into a generated project-owned namespace and records
+    /// its immutable image ID. Never set this for a registry image.
+    #[serde(default)]
+    pub claim_local: bool,
     /// Optional deployment metadata
     pub metadata: Option<serde_json::Value>,
     /// Optional HTTP health-check path override (e.g. "/api/healthz").
@@ -493,6 +499,91 @@ pub struct DeployFromImageRequest {
     #[serde(default)]
     #[schema(example = "/api/healthz")]
     pub health_check_path: Option<String>,
+}
+
+const RESERVED_LOCAL_IMAGE_PREFIX: &str = "temps.internal/";
+
+fn platform_local_image_tag(project_id: i32, environment_id: i32, source: &str) -> String {
+    format!(
+        "{RESERVED_LOCAL_IMAGE_PREFIX}project-{project_id}/environment-{environment_id}/{source}-{}:immutable",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn is_reserved_local_image_ref(image_ref: &str) -> bool {
+    image_ref.starts_with(RESERVED_LOCAL_IMAGE_PREFIX)
+}
+
+fn authorize_local_image_claim(
+    claim_local: bool,
+    caller: Option<&VerifiedPluginApiCaller>,
+) -> Result<(), Problem> {
+    if claim_local && caller.is_none() {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Local Image Claim Not Permitted")
+            .with_detail(
+                "Local daemon images may be claimed only through a verified external-plugin channel call",
+            ));
+    }
+    Ok(())
+}
+
+async fn claim_local_image(
+    state: &AppState,
+    project_id: i32,
+    environment_id: i32,
+    source_ref: &str,
+) -> Result<(String, String), Problem> {
+    if is_reserved_local_image_ref(source_ref) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Reserved Image Reference")
+            .with_detail("Platform-owned local image references cannot be claimed by name"));
+    }
+
+    let inspected = state
+        .docker
+        .inspect_image(source_ref)
+        .await
+        .map_err(|error| {
+            warn!(image = %source_ref, %error, "Could not inspect claimed local image");
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Local Image Not Found")
+                .with_detail(format!("Local image '{source_ref}' was not found"))
+        })?;
+    let image_id = inspected.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+        problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+            .with_title("Local Image Has No Immutable ID")
+            .with_detail(format!(
+                "Docker did not report an immutable ID for local image '{source_ref}'"
+            ))
+    })?;
+
+    let internal_ref = platform_local_image_tag(project_id, environment_id, "claim");
+    let (repository, tag) = internal_ref.rsplit_once(':').ok_or_else(|| {
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Internal Image Reference Error")
+            .with_detail("Temps generated an invalid internal image reference")
+    })?;
+    state
+        .docker
+        .tag_image(
+            &image_id,
+            Some(
+                bollard::query_parameters::TagImageOptionsBuilder::new()
+                    .repo(repository)
+                    .tag(tag)
+                    .build(),
+            ),
+        )
+        .await
+        .map_err(|error| {
+            error!(image = %source_ref, image_id = %image_id, %error, "Failed to establish local image claim");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Local Image Claim Failed")
+                .with_detail("Temps could not create the project-owned local image reference")
+        })?;
+
+    Ok((internal_ref, image_id))
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -534,8 +625,8 @@ pub struct PaginationQuery {
 /// Query parameters for deploying from an uploaded image tarball
 #[derive(Debug, Clone, Deserialize, ToSchema, IntoParams)]
 pub struct DeployFromImageUploadQuery {
-    /// Tag to apply to the imported image (e.g., "myapp:v1.0")
-    /// If not provided, a unique tag will be generated
+    /// Deprecated display hint retained for wire compatibility. Temps always
+    /// generates the actual project-scoped internal image reference.
     #[schema(example = "myapp:v1.0")]
     pub tag: Option<String>,
     /// Optional HTTP health-check path override (e.g. "/api/healthz").
@@ -820,6 +911,7 @@ pub async fn deploy_from_image(
     State(state): State<Arc<AppState>>,
     Path((project_id, environment_id)): Path<(i32, i32)>,
     Extension(metadata): Extension<RequestMetadata>,
+    plugin_caller: Option<Extension<VerifiedPluginApiCaller>>,
     Json(req): Json<DeployFromImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
@@ -828,6 +920,10 @@ pub async fn deploy_from_image(
         project_id,
         state.project_access_checker
     );
+    authorize_local_image_claim(
+        req.claim_local,
+        plugin_caller.as_ref().map(|Extension(caller)| caller),
+    )?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -919,6 +1015,7 @@ pub async fn deploy_from_image(
 
     // 2. Verify environment exists, belongs to project, and is not deleted
     let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::ProjectId.eq(project_id))
         .filter(environments::Column::DeletedAt.is_null())
         .one(state.db.as_ref())
         .await
@@ -934,11 +1031,18 @@ pub async fn deploy_from_image(
                 .with_detail(format!("Environment {} not found", environment_id))
         })?;
 
-    if environment.project_id != project_id {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Environment")
-            .with_detail("Environment does not belong to this project"));
-    }
+    let (image_ref, uploaded_image_id) = if req.claim_local {
+        if external_image_id.is_some() {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Local Image Claim")
+                .with_detail("A local image claim cannot use an external_image_id"));
+        }
+        let (internal_ref, image_id) =
+            claim_local_image(&state, project_id, environment_id, &image_ref).await?;
+        (internal_ref, Some(image_id))
+    } else {
+        (image_ref, None)
+    };
 
     // 3. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
@@ -955,6 +1059,8 @@ pub async fn deploy_from_image(
         external_image_ref: Some(image_ref.clone()),
         external_image_id,
         deployment_source_type: Some(SourceType::DockerImage),
+        image_uploaded_locally: uploaded_image_id.is_some(),
+        uploaded_image_id,
         health_check_path: req.health_check_path.clone(),
         ..Default::default()
     };
@@ -1163,6 +1269,7 @@ pub async fn deploy_from_static(
 
     // 2. Verify environment exists, belongs to project, and is not deleted
     let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::ProjectId.eq(project_id))
         .filter(environments::Column::DeletedAt.is_null())
         .one(state.db.as_ref())
         .await
@@ -1177,12 +1284,6 @@ pub async fn deploy_from_static(
                 .with_title("Environment Not Found")
                 .with_detail(format!("Environment {} not found", environment_id))
         })?;
-
-    if environment.project_id != project_id {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Environment")
-            .with_detail("Environment does not belong to this project"));
-    }
 
     // 3. Verify static bundle exists and belongs to project
     let bundle = state
@@ -1529,15 +1630,11 @@ pub async fn deploy_from_image_upload(
                 .with_detail(e.to_string())
         })?;
 
-    // 5. Generate image tag if not provided
-    let image_tag = query.tag.unwrap_or_else(|| {
-        format!(
-            "temps-{}-{}:upload-{}",
-            project.slug,
-            environment.slug,
-            Utc::now().timestamp()
-        )
-    });
+    // 5. The actual daemon tag is always generated by Temps. A caller-chosen
+    // tag could collide with another project's local claim in the shared
+    // Docker daemon. `query.tag` remains accepted for wire compatibility but
+    // has no authority over the internal reference.
+    let image_tag = platform_local_image_tag(project_id, environment_id, "upload");
 
     // 6. Import the image using docker load
     info!("Importing image from tarball with tag: {}", image_tag);
@@ -1551,12 +1648,32 @@ pub async fn deploy_from_image_upload(
         debug!("Failed to remove temporary file: {}", e);
     }
 
-    let imported_image_id = import_result.map_err(|e| {
+    import_result.map_err(|e| {
         error!("Failed to import image: {}", e);
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("Image Import Failed")
             .with_detail(format!("Failed to import Docker image: {}", e))
     })?;
+
+    // `docker load` may report the loaded tag rather than the content ID.
+    // Inspect the generated internal tag and persist the daemon's immutable ID
+    // so VerifyLocalImageJob can detect any later retagging or replacement.
+    let imported_image_id = state
+        .image_builder
+        .inspect_image(&image_tag)
+        .await
+        .map_err(|error| {
+            error!(image = %image_tag, %error, "Failed to inspect imported image");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Imported Image Verification Failed")
+                .with_detail("Temps could not record the imported image's immutable ID")
+        })?
+        .id;
+    if imported_image_id.is_empty() {
+        return Err(problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+            .with_title("Imported Image Has No Immutable ID")
+            .with_detail("Docker did not report an immutable ID for the imported image"));
+    }
 
     info!(
         "Successfully imported image with ID: {}, tag: {}",
@@ -2561,6 +2678,32 @@ mod tests {
     fn uploaded_image_accepted_when_no_cluster_platform_is_known() {
         assert!(uploaded_image_is_runnable("linux/arm64", &[]));
         assert!(uploaded_image_is_runnable("linux/riscv64", &[]));
+    }
+
+    #[test]
+    fn internal_local_image_tags_are_unique_and_project_scoped() {
+        let first = platform_local_image_tag(7, 11, "claim");
+        let second = platform_local_image_tag(8, 11, "claim");
+        let another = platform_local_image_tag(7, 11, "claim");
+
+        assert!(first.starts_with("temps.internal/project-7/environment-11/claim-"));
+        assert!(second.starts_with("temps.internal/project-8/environment-11/claim-"));
+        assert_ne!(
+            first, another,
+            "each claim must get an immutable unique tag"
+        );
+        assert!(is_reserved_local_image_ref(&first));
+        assert!(!is_reserved_local_image_ref("plugin-built-image:latest"));
+    }
+
+    #[test]
+    fn direct_http_callers_cannot_claim_local_daemon_images() {
+        assert!(authorize_local_image_claim(true, None).is_err());
+        assert!(authorize_local_image_claim(false, None).is_ok());
+
+        let verified = VerifiedPluginApiCaller::new("trusted-builder");
+        assert!(authorize_local_image_claim(true, Some(&verified)).is_ok());
+        assert_eq!(verified.plugin_name(), "trusted-builder");
     }
 
     #[test]

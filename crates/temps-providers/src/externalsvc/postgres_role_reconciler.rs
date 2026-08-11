@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,65 @@ use temps_entities::service_members;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
+
+/// Cancellation handle for a running reconciler task.
+///
+/// A bare `tokio::sync::Notify` is not enough here: `notify_waiters()` only
+/// wakes tasks that are *already* parked in a `.notified()` call at the
+/// exact instant it's called — it has no buffering, unlike `notify_one()`'s
+/// single-permit behavior. `run()`'s loop only awaits `.notified()` while
+/// it's inside the tick `select!`; the rest of the time (running
+/// `reconcile_once`, which does real network I/O against the monitor and
+/// can take up to `PROBE_TIMEOUT`) it isn't waiting on anything. Calling
+/// `stop_role_reconciler` during that window used to silently lose the
+/// shutdown signal forever — the task had no way to learn it should stop,
+/// and looped every `TICK_INTERVAL` until the whole `temps serve` process
+/// restarted. Confirmed live: deleting a cluster left its reconciler
+/// logging "Monitor not found for cluster service {id}" every 5s for the
+/// rest of the process's life, one leaked task per deleted cluster,
+/// competing for the same DB connection pool every real deploy/reconcile
+/// path also depends on.
+///
+/// The fix pairs the `Notify` with a plain `AtomicBool` flag `signal()`
+/// sets *before* calling `notify_waiters()`. `run()`'s loop checks the flag
+/// on every iteration (not just inside the `select!`), so even a signal
+/// that arrives mid-`reconcile_once` and is never "seen" by `.notified()`
+/// still stops the loop on its very next check — worst case one extra tick
+/// after `stop_role_reconciler` is called, never forever.
+#[derive(Debug)]
+pub struct ReconcilerShutdown {
+    notify: Notify,
+    stopped: AtomicBool,
+}
+
+impl ReconcilerShutdown {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            notify: Notify::new(),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    /// Request shutdown. Safe to call any number of times; safe to call
+    /// whether or not the reconciler task is currently parked.
+    pub fn signal(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Park until `signal()` fires. Only meaningful combined with an
+    /// `is_stopped()` check on wake (including on the "the sibling branch
+    /// of a `select!` won instead" path) — `notify_waiters()` only wakes
+    /// tasks that are already parked at the instant it's called, so this
+    /// alone can still miss a signal that arrives outside the `select!`.
+    pub(crate) async fn wait(&self) {
+        self.notify.notified().await
+    }
+}
 
 /// How often the reconciler queries the monitor. 5 s strikes a balance:
 /// short enough that primary promotion → DNS flip is bounded under
@@ -238,8 +298,10 @@ pub async fn reconcile_once(
     //      and typically isn't in production either.
     //   2. `nodes.private_address` — the worker's underlay IP, always
     //      reachable from the control plane.
-    //   3. "localhost" — single-host clusters where the monitor runs on
-    //      the control-plane host and binds the host port.
+    //   3. IPv4 loopback — single-host clusters where the monitor runs on
+    //      the control-plane host and binds the host port. Do not use
+    //      `localhost`: Ubuntu may resolve it to ::1 while Docker publishes
+    //      this port only on 127.0.0.1.
     //
     // We deliberately do NOT fall back to `member.hostname` (the FQDN)
     // because it only resolves on hosts running the per-node Hickory
@@ -257,7 +319,7 @@ pub async fn reconcile_once(
             }
         }
     } else {
-        "localhost".to_string()
+        crate::services::LOCAL_CLUSTER_HOST.to_string()
     };
     let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -492,29 +554,69 @@ async fn query_monitor(
     Ok(out)
 }
 
-/// Long-running reconciler loop. Exits when `shutdown` is notified.
+/// Long-running reconciler loop. Exits once `shutdown.signal()` has been
+/// called — checked at the top of every iteration (not just inside the
+/// tick `select!`) so a signal that arrives while `reconcile_once` is
+/// in-flight (real network I/O against the monitor, up to `PROBE_TIMEOUT`)
+/// still stops the loop on the very next check instead of being lost. See
+/// [`ReconcilerShutdown`]'s doc comment for why a bare `Notify` isn't
+/// enough on its own.
+///
+/// Thin wrapper over [`run_loop`], which owns the actual shutdown-aware
+/// loop shape and is generic over the tick body so it can be exercised
+/// directly in tests without a real monitor connection.
 pub async fn run(
     db: Arc<DatabaseConnection>,
     registry: Arc<DnsRegistry>,
     service_id: i32,
     service_name: String,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<ReconcilerShutdown>,
 ) {
-    info!(service_id, service_name, "starting role reconciler");
-    loop {
+    run_loop(&shutdown, service_id, &service_name, || async {
         if let Err(e) = reconcile_once(&db, &registry, service_id, &service_name).await {
             // All errors are transient retries. Log at WARN, sleep, try
             // again. The only thing that stops the loop is shutdown.
             warn!(
                 service_id,
-                service_name,
+                service_name = %service_name,
                 error = %e,
                 "reconciler tick failed; will retry"
             );
         }
+    })
+    .await;
+}
+
+/// Shutdown-aware tick loop shared by `run()` and its tests. Runs `tick`
+/// once per iteration, checking `shutdown.is_stopped()` both before and
+/// after `tick` completes — not just inside the sleep `select!` — so a
+/// signal that arrives while `tick` is in flight still stops the loop the
+/// moment `tick` returns, rather than after an additional `TICK_INTERVAL`
+/// sleep or a whole extra tick. This exact double-check is the race fix
+/// [`ReconcilerShutdown`]'s doc comment describes.
+async fn run_loop<F, Fut>(
+    shutdown: &Arc<ReconcilerShutdown>,
+    service_id: i32,
+    service_name: &str,
+    mut tick: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    info!(service_id, service_name, "starting role reconciler");
+    loop {
+        if shutdown.is_stopped() {
+            info!(service_id, service_name, "role reconciler shutting down");
+            return;
+        }
+        tick().await;
+        if shutdown.is_stopped() {
+            info!(service_id, service_name, "role reconciler shutting down");
+            return;
+        }
         tokio::select! {
             _ = tokio::time::sleep(TICK_INTERVAL) => {}
-            _ = shutdown.notified() => {
+            _ = shutdown.wait() => {
                 info!(service_id, service_name, "role reconciler shutting down");
                 return;
             }
@@ -703,7 +805,10 @@ mod tests {
         assert!(node(1, "h", 1, "primary").is_primary());
         assert!(node(1, "h", 1, "single").is_primary());
         assert!(!node(1, "h", 1, "secondary").is_primary());
-        assert!(!node(1, "h", 1, "wait_primary").is_primary());
+        // `wait_primary` IS writable (promotion already completed, just no
+        // standby attached yet) -- see the doc comment on
+        // `PgAutoFailoverState::is_primary`.
+        assert!(node(1, "h", 1, "wait_primary").is_primary());
     }
 
     #[test]
@@ -712,5 +817,61 @@ mod tests {
         assert!(node(1, "h", 1, "catchingup").is_secondary());
         assert!(node(1, "h", 1, "apply_settings").is_secondary());
         assert!(!node(1, "h", 1, "primary").is_secondary());
+    }
+
+    /// Exercises the actual race `ReconcilerShutdown`'s AtomicBool + Notify
+    /// pair exists to close: a shutdown signal arriving *while a tick is
+    /// in flight* (real network I/O in production; simulated here with a
+    /// sleep standing in for that I/O). A bare `Notify` alone would lose
+    /// this signal (`notify_waiters()` only wakes tasks already parked in
+    /// `.notified()`, and the loop isn't parked there while a tick runs) —
+    /// the task would then fall through to the post-tick `select!`, see no
+    /// buffered wakeup, and sleep the *entire* next `TICK_INTERVAL` before
+    /// running a second full tick and only then noticing shutdown.
+    ///
+    /// Asserts both halves of "still observes it and exits promptly rather
+    /// than running one more full tick cycle first": (1) the loop returns
+    /// well under `TICK_INTERVAL` after the in-flight tick finishes, and
+    /// (2) the tick body is never invoked a second time.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_signalled_mid_tick_stops_promptly_not_after_a_full_next_tick() {
+        let shutdown = ReconcilerShutdown::new();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let start = tokio::time::Instant::now();
+        {
+            let call_count = call_count.clone();
+            let shutdown_for_tick = shutdown.clone();
+            run_loop(&shutdown, 1, "race-test-svc", move || {
+                let call_count = call_count.clone();
+                let shutdown = shutdown_for_tick.clone();
+                async move {
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Stand in for reconcile_once's real monitor I/O:
+                        // the signal arrives partway through this "tick",
+                        // well before it returns.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        shutdown.signal();
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            })
+            .await;
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "the loop must not start a second tick after shutdown was \
+             signalled mid-first-tick"
+        );
+        assert!(
+            elapsed < TICK_INTERVAL,
+            "loop must exit promptly once the in-flight tick completes, \
+             not after sleeping a full TICK_INTERVAL first: elapsed={:?}",
+            elapsed
+        );
     }
 }

@@ -217,6 +217,58 @@ pub struct GitProviderManager {
 }
 
 impl GitProviderManager {
+    fn url_has_origin(url: &str, expected_host: &str) -> bool {
+        let Ok(url) = Url::parse(url) else {
+            return false;
+        };
+
+        url.scheme() == "https"
+            && url.host_str() == Some(expected_host)
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+
+    /// Public-repository requests below are sent to github.com. A credential
+    /// configured for GitHub Enterprise must never cross that provider origin.
+    fn is_github_dot_com_provider(provider: &git_providers::Model) -> bool {
+        if provider.provider_type != "github" && provider.provider_type != "github_app" {
+            return false;
+        }
+
+        let api_is_public = provider
+            .api_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "api.github.com"))
+            .unwrap_or_else(|| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .map(|url| Self::url_has_origin(url, "github.com"))
+                    .unwrap_or(true)
+            });
+        let web_is_public = provider
+            .base_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "github.com"))
+            .unwrap_or(true);
+
+        api_is_public && web_is_public
+    }
+
+    async fn get_active_connections_for_user(
+        &self,
+        user_id: i32,
+    ) -> Result<Vec<git_provider_connections::Model>, sea_orm::DbErr> {
+        git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::IsExpired.eq(false))
+            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
+            .order_by_desc(git_provider_connections::Column::UpdatedAt)
+            .all(self.db.as_ref())
+            .await
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<temps_core::EncryptionService>,
@@ -254,14 +306,7 @@ impl GitProviderManager {
     pub async fn get_valid_github_token_for_user(&self, user_id: i32) -> Option<String> {
         use temps_entities::git_providers;
 
-        let connections = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true))
-            .filter(git_provider_connections::Column::IsExpired.eq(false))
-            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
-            .order_by_desc(git_provider_connections::Column::UpdatedAt)
-            .all(self.db.as_ref())
-            .await
-            .ok()?;
+        let connections = self.get_active_connections_for_user(user_id).await.ok()?;
 
         for conn in connections {
             // Keep this defensive check even though the database query applies
@@ -278,14 +323,11 @@ impl GitProviderManager {
                 .ok()
                 .flatten();
 
-            let is_github = provider
-                .as_ref()
-                .map(|p| {
-                    p.is_active && (p.provider_type == "github" || p.provider_type == "github_app")
-                })
-                .unwrap_or(false);
+            let Some(provider) = provider else {
+                continue;
+            };
 
-            if !is_github {
+            if !provider.is_active || !Self::is_github_dot_com_provider(&provider) {
                 continue;
             }
 
@@ -1927,11 +1969,18 @@ impl GitProviderManager {
         status: reqwest::StatusCode,
         operation: &str,
     ) -> GitProviderError {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             GitProviderError::AuthenticationFailed(format!(
                 "provider rejected the stored credential while trying to {}: HTTP {}",
                 operation, status
             ))
+        } else if status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::PermissionDenied {
+                operation: operation.to_string(),
+                required_permission:
+                    "repository access with the permission required by this operation".to_string(),
+                provider_message: format!("HTTP {}", status),
+            }
         } else {
             GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
         }
@@ -3749,7 +3798,9 @@ impl GitProviderManager {
         // This allows users to update a GitHub App installation connection to use a PAT
         let provider = self.get_provider(connection.provider_id).await?;
 
-        // Validate the new access token as a PAT (using /user endpoint)
+        // Validate the new access token as a PAT. GitHub's `/rate_limit`
+        // authenticates repository-scoped and Actions credentials without
+        // requiring user-profile access; GitLab still uses `/user`.
         let client = reqwest::Client::new();
         let api_url = provider
             .api_url
@@ -3757,7 +3808,11 @@ impl GitProviderManager {
             .unwrap_or("https://api.github.com");
         let validation_endpoint =
             if provider.provider_type == "github" || provider.provider_type == "gitlab" {
-                format!("{}/user", api_url)
+                if provider.provider_type == "github" {
+                    format!("{}/rate_limit", api_url)
+                } else {
+                    format!("{}/user", api_url)
+                }
             } else {
                 // For other providers, use the provider service's validate_token
                 let provider_service = self.get_provider_service(connection.provider_id).await?;
@@ -3825,20 +3880,39 @@ impl GitProviderManager {
                 ));
             }
             status => {
-                let error_text = response
-                    .text()
+                let provider_message = response
+                    .json::<serde_json::Value>()
                     .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
+                    .ok()
+                    .and_then(|body| {
+                        body.get("message")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("HTTP {}", status));
                 tracing::warn!(
                     "Error validating new access token for connection {}: {} - {}",
                     connection_id,
                     status,
-                    error_text
+                    provider_message
                 );
-                return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                    "Failed to validate the provided access token: {} - {}",
-                    status, error_text
-                )));
+                let error = match status {
+                    reqwest::StatusCode::FORBIDDEN => GitProviderError::PermissionDenied {
+                        operation: "validate the replacement credential".to_string(),
+                        required_permission: if provider.provider_type == "github" {
+                            "Metadata: read".to_string()
+                        } else {
+                            "read_user".to_string()
+                        },
+                        provider_message,
+                    },
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => GitProviderError::RateLimitExceeded,
+                    _ => GitProviderError::ApiError(format!(
+                        "{} returned HTTP {} while validating the replacement credential: {}",
+                        provider.provider_type, status, provider_message
+                    )),
+                };
+                return Err(error.into());
             }
         }
 
@@ -4023,14 +4097,17 @@ impl GitProviderManager {
             return Ok(false);
         };
 
-        // Try to get user info to validate the token
-        match provider_service.get_user(&access_token).await {
-            Ok(_) => Ok(true),
-            Err(_) => {
+        match provider_service.validate_token(&access_token).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
                 // Token is invalid, mark connection as inactive
                 self.deactivate_connection(connection_id).await?;
                 Ok(false)
             }
+            // A provider outage, rate limit, or missing operation permission
+            // does not prove that the credential is invalid. Preserve the
+            // typed error and keep the connection active.
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5725,18 +5802,20 @@ mod classify_provider_response_error_tests {
         );
     }
 
-    /// 403 is the other shape a revoked/insufficient credential takes
-    /// (GitHub returns it for token scope problems and some rate limits).
+    /// A valid credential that lacks a repository capability is not an
+    /// authentication failure: clients must tell the operator which grant to
+    /// add instead of asking them to reconnect the same credential.
     #[test]
-    fn forbidden_is_classified_as_authentication_failure() {
+    fn forbidden_is_classified_as_permission_denied() {
         let err = GitProviderManager::classify_provider_response_error(
             reqwest::StatusCode::FORBIDDEN,
             "get tree for owner/repo@main",
         );
         assert!(
-            matches!(err, GitProviderError::AuthenticationFailed(_)),
-            "403 must map to AuthenticationFailed, got {err:?}"
+            matches!(err, GitProviderError::PermissionDenied { .. }),
+            "403 must map to PermissionDenied, got {err:?}"
         );
+        assert!(err.to_string().contains("owner/repo@main"));
     }
 
     /// Everything else stays a generic API error — a provider outage is not
@@ -5789,6 +5868,160 @@ mod tests {
     use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{git_provider_connections, git_providers};
+
+    fn provider_model(
+        provider_type: &str,
+        base_url: Option<&str>,
+        api_url: Option<&str>,
+    ) -> git_providers::Model {
+        let now = chrono::Utc::now();
+        git_providers::Model {
+            id: 1,
+            name: "test-provider".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_url: api_url.map(str::to_string),
+            auth_method: "pat".to_string(),
+            auth_config: serde_json::json!({}),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_github_token_selection_rejects_enterprise_origins() {
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model(
+                "github",
+                Some("https://github.com/acme"),
+                Some("https://api.github.com")
+            )
+        ));
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model("github_app", None, None)
+        ));
+
+        for provider in [
+            provider_model(
+                "github",
+                Some("https://github.enterprise.example"),
+                Some("https://github.enterprise.example/api/v3"),
+            ),
+            provider_model(
+                "github_app",
+                Some("https://github.enterprise.example"),
+                Some("https://api.github.com"),
+            ),
+            provider_model(
+                "github",
+                Some("https://github.com.evil.example"),
+                Some("https://api.github.com.evil.example"),
+            ),
+        ] {
+            assert!(
+                !GitProviderManager::is_github_dot_com_provider(&provider),
+                "a non-GitHub.com credential must be rejected before token decryption or validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_scoped_connection_lookup_isolates_users_and_inactive_rows() {
+        use temps_entities::users;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Postgres unavailable; skipping connection-isolation test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+
+        let make_user = |email: &str| users::ActiveModel {
+            email: Set(email.to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set(email.to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let user_a = make_user("github-token-a@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        let user_b = make_user("github-token-b@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("GitHub.com".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(Some("https://github.com".to_string())),
+            api_url: Set(Some("https://api.github.com".to_string())),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        for (user_id, account_name, is_active) in [
+            (Some(user_a.id), "user-a-active", true),
+            (Some(user_a.id), "user-a-inactive", false),
+            (Some(user_b.id), "user-b-active", true),
+            (None, "ownerless-active", true),
+        ] {
+            git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(user_id),
+                account_name: Set(account_name.to_string()),
+                account_type: Set("User".to_string()),
+                access_token: Set(None),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(is_active),
+                is_expired: Set(false),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let connections = manager
+            .get_active_connections_for_user(user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].account_name, "user-a-active");
+    }
 
     #[test]
     fn is_auth_failure_recognizes_common_messages() {

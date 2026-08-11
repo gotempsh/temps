@@ -58,8 +58,11 @@ pub struct ObservabilityApiDoc;
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct EventsQuery {
-    /// Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-    /// missing returns every kind.
+    /// Comma-separated kinds: `request,span,error,revenue`. Empty or
+    /// missing returns every kind. There is no `log` kind — runtime logs
+    /// intentionally never appear in this feed (see `ObservabilityEvent`'s
+    /// "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+    /// `InvalidKindsFilter`, not silently ignored.
     pub kinds: Option<String>,
     /// Inclusive lower bound on event timestamp (ISO 8601, `Z` suffix).
     pub from: Option<DateTime<Utc>>,

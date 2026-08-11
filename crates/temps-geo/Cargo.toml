@@ -24,6 +24,7 @@ temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
 utoipa = "5.1"
 tracing = { workspace = true }
+tokio = { version = "1.0", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full"] }

@@ -14,9 +14,11 @@ temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 sea-orm = { workspace = true }
+async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
 serde = { workspace = true }

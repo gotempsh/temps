@@ -75,11 +75,59 @@ pub struct PluginManifest {
     #[serde(default)]
     pub ui: Option<UiManifest>,
     /// Whether the plugin needs database access
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub requires_db: bool,
+    /// Whether the plugin may read the platform's host data root.
+    ///
+    /// This is a highly privileged capability: the directory can contain
+    /// encryption keys and instance-owned state. It is independent of direct
+    /// database access and defaults to `false`.
+    #[serde(default)]
+    pub requires_host_data_access: bool,
     /// Health check endpoint path (relative to plugin root)
     #[serde(default = "default_health_path")]
     pub health_path: String,
+    /// Suppress the console's own header strip above this plugin's UI.
+    ///
+    /// The console normally renders the plugin's icon, display name and
+    /// version above the iframe. For a plugin whose UI is a full working
+    /// surface with its own header, that is a second title bar competing
+    /// for the same vertical space — and vertical space is exactly what a
+    /// dense full-page layout has none of. Opt out and the frame gets the
+    /// full height.
+    ///
+    /// The nav entry still names the plugin, so nothing becomes
+    /// unidentifiable by setting this.
+    #[serde(default)]
+    pub hide_header: bool,
+    /// Routes this plugin authenticates itself, which the platform's proxy
+    /// therefore does not gate.
+    ///
+    /// Every other proxied route requires an authenticated caller before it
+    /// reaches the plugin. That is right for anything a signed-in user
+    /// drives, and wrong for the endpoints a plugin exposes to clients that
+    /// hold no platform session — an agent in a sandbox presenting a
+    /// capability token, a share link opened by someone with no account.
+    /// This is the external-plugin counterpart of the in-process
+    /// `configure_public_routes`.
+    ///
+    /// Paths are relative to the plugin's mount point and match by prefix,
+    /// so `/webhooks/incoming` covers everything beneath it. A listed route is
+    /// reachable by anyone who can reach the instance: it **must** check its
+    /// own credential. Listing a route that does not is an open door.
+    #[serde(default)]
+    pub public_paths: Vec<String>,
+    /// What this plugin may do with the platform's own API over the channel.
+    ///
+    /// Empty by default, and empty means read-only channel queries and
+    /// nothing else: a plugin that never asks cannot deploy, cannot create
+    /// projects, and cannot provision databases. Declaring a capability is
+    /// not by itself permission to act — every call still runs the real
+    /// handler's `permission_guard!` as the user the plugin is acting for,
+    /// so a capability can only ever narrow what that user could already do
+    /// through the console.
+    #[serde(default)]
+    pub capabilities: Vec<PluginCapability>,
     /// Platform event types the plugin subscribes to.
     ///
     /// When specified, Temps will POST matching events to the plugin's
@@ -95,12 +143,41 @@ pub struct PluginManifest {
     pub events: Vec<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_health_path() -> String {
     "/health".to_string()
+}
+
+/// What a plugin is allowed to do with the platform API over the channel.
+///
+/// Coarse on purpose. Fine-grained authorization already exists in the
+/// permission system and is enforced per request against the acting user;
+/// this exists so an operator installing a binary can see at a glance
+/// whether it intends to *write* at all, without reading its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCapability {
+    /// Read platform resources through the API (`GET`).
+    ApiRead,
+    /// Create, change or delete platform resources through the API.
+    ApiWrite,
+}
+
+impl PluginCapability {
+    /// The capability a given verb requires.
+    pub fn for_method(method: super::channel::HttpMethod) -> Self {
+        if method.is_mutating() {
+            Self::ApiWrite
+        } else {
+            Self::ApiRead
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiRead => "api_read",
+            Self::ApiWrite => "api_write",
+        }
+    }
 }
 
 /// Builder for constructing a PluginManifest.
@@ -118,8 +195,14 @@ impl PluginManifest {
                 description: None,
                 nav: Vec::new(),
                 ui: None,
-                requires_db: true,
+                requires_db: false,
+                requires_host_data_access: false,
                 health_path: "/health".to_string(),
+                // Empty by default: a plugin opts routes out of platform
+                // auth explicitly, never by omission.
+                public_paths: Vec::new(),
+                capabilities: Vec::new(),
+                hide_header: false,
                 events: Vec::new(),
             },
         }
@@ -152,8 +235,47 @@ impl PluginManifestBuilder {
         self
     }
 
+    /// Request access to the platform's host data root.
+    ///
+    /// This exposes instance key material and other host-owned state. Plugins
+    /// should use their private data directory unless they explicitly need to
+    /// operate on platform-managed files.
+    pub fn requires_host_data_access(mut self, requires: bool) -> Self {
+        self.manifest.requires_host_data_access = requires;
+        self
+    }
+
     pub fn health_path(mut self, path: impl Into<String>) -> Self {
         self.manifest.health_path = path.into();
+        self
+    }
+
+    /// Declare a capability this plugin needs for its channel API calls.
+    ///
+    /// Without the matching capability a call is refused before it reaches
+    /// the router, and the error names what was missing so a plugin author
+    /// is not left guessing.
+    pub fn capability(mut self, capability: PluginCapability) -> Self {
+        if !self.manifest.capabilities.contains(&capability) {
+            self.manifest.capabilities.push(capability);
+        }
+        self
+    }
+
+    /// Hide the console's header strip above this plugin's UI.
+    ///
+    /// See [`PluginManifest::hide_header`]. Use this for plugins that render
+    /// their own full-page header.
+    pub fn hide_header(mut self, hide: bool) -> Self {
+        self.manifest.hide_header = hide;
+        self
+    }
+
+    /// Declare a route prefix the platform should not gate, because the
+    /// plugin authenticates it itself. See [`PluginManifest::public_paths`] —
+    /// anything listed here is reachable unauthenticated.
+    pub fn public_path(mut self, path: impl Into<String>) -> Self {
+        self.manifest.public_paths.push(path.into());
         self
     }
 
@@ -179,6 +301,8 @@ impl PluginManifestBuilder {
 pub struct PluginReady {
     pub ready: bool,
     pub has_ui: bool,
+    /// External-plugin protocol version implemented by the running SDK.
+    pub protocol_version: u32,
     /// Optional OpenAPI schema (serialized JSON) for the plugin's endpoints.
     ///
     /// When present, Temps merges this into the unified API documentation
@@ -187,10 +311,37 @@ pub struct PluginReady {
     pub openapi: Option<serde_json::Value>,
 }
 
+/// First message emitted by a staged plugin process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginHello {
+    pub protocol_version: u32,
+    pub manifest: Box<PluginManifest>,
+}
+
+/// Configuration sent to the same child after Temps reads its manifest.
+///
+/// Database and host-data fields reflect the manifest's declared needs. They
+/// are operational routing/disclosure controls for trusted installed code,
+/// not a sandbox boundary.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PluginLaunchConfig {
+    pub protocol_version: u32,
+    pub auth_secret: String,
+    pub database_url: Option<String>,
+    pub host_data_dir: Option<String>,
+}
+
+/// Current process-launch and internal-channel protocol version.
+pub const EXTERNAL_PLUGIN_PROTOCOL_VERSION: u32 = 2;
+
 /// Handshake envelope: tagged union for messages from plugin to Temps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HandshakeMessage {
+    #[serde(rename = "hello")]
+    Hello(PluginHello),
+    /// Legacy handshake retained only so the manager can return an actionable
+    /// incompatibility error instead of an opaque JSON parse failure.
     #[serde(rename = "manifest")]
     Manifest(Box<PluginManifest>),
     #[serde(rename = "ready")]
@@ -270,10 +421,32 @@ mod tests {
         assert_eq!(deserialized.name, "my-plugin");
         assert_eq!(deserialized.nav.len(), 1);
         assert_eq!(deserialized.nav[0].section, NavSection::Settings);
+        assert!(!deserialized.requires_db);
+        assert!(!deserialized.requires_host_data_access);
+    }
+
+    #[test]
+    fn host_data_access_is_separate_and_explicit() {
+        let manifest = PluginManifest::builder("privileged-plugin", "1.0.0")
+            .requires_host_data_access(true)
+            .build();
+
+        assert!(manifest.requires_host_data_access);
+        assert!(!manifest.requires_db);
     }
 
     #[test]
     fn test_handshake_message_serialization() {
+        let hello = HandshakeMessage::Hello(PluginHello {
+            protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+            manifest: Box::new(PluginManifest::builder("test", "0.1.0").build()),
+        });
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"type\":\"hello\""));
+        assert!(json.contains("\"protocol_version\":2"));
+
+        // Kept parseable so a legacy child gets an upgrade instruction from
+        // the manager instead of an opaque deserialization failure.
         let msg =
             HandshakeMessage::Manifest(Box::new(PluginManifest::builder("test", "0.1.0").build()));
         let json = serde_json::to_string(&msg).unwrap();
@@ -282,10 +455,22 @@ mod tests {
         let ready_msg = HandshakeMessage::Ready(PluginReady {
             ready: true,
             has_ui: false,
+            protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
             openapi: None,
         });
         let json = serde_json::to_string(&ready_msg).unwrap();
         assert!(json.contains("\"type\":\"ready\""));
+
+        let launch = PluginLaunchConfig {
+            protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+            auth_secret: "secret".to_string(),
+            database_url: None,
+            host_data_dir: None,
+        };
+        let launch_json = serde_json::to_string(&launch).unwrap();
+        let decoded: PluginLaunchConfig = serde_json::from_str(&launch_json).unwrap();
+        assert_eq!(decoded.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION);
+        assert_eq!(decoded.auth_secret, "secret");
     }
 
     #[test]
