@@ -1022,6 +1022,65 @@ impl MarkDeploymentCompleteJob {
                 .await?;
         }
 
+        // ── Pre-2.75 staleness check ─────────────────────────────────────
+        //
+        // A concurrent rollback may have called stop_environment_containers
+        // while we were waiting inside Phase 2 / Phase 2.5. That function
+        // killed our containers AND atomically flipped our state to "stopped"
+        // (CAS: only from "running") to signal supersession. If we let
+        // Phase 2.75 run now, it would probe our containers (which are gone),
+        // fail, and call reject_unusable_deployment — marking us "failed"
+        // even though we were intentionally superseded. Detect that here:
+        // re-read our state and abort cleanly when already "stopped".
+        //
+        // We do NOT call reject_unusable_deployment in this branch because
+        // the rollback's own MarkDeploymentCompleteJob will set
+        // env.current_deployment_id to the new rollback deployment once it
+        // acquires this environment's lock (which we hold, and will release
+        // momentarily when mark_complete_inner returns).
+        let deployment_state_before_readiness = deployments::Entity::find_by_id(self.deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to re-check deployment {} state before readiness gate: {}",
+                    self.deployment_id, e
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {} disappeared before readiness gate",
+                    self.deployment_id
+                ))
+            })?;
+
+        if deployment_state_before_readiness.state == "stopped" {
+            // A concurrent rollback superseded this deployment while we were
+            // propagating routes. The rollback already killed our containers
+            // and marked us "stopped". Abort the readiness check — calling
+            // reject_unusable_deployment would wrongly flip us to "failed".
+            // The rollback's MarkDeploymentCompleteJob will fix up
+            // env.current_deployment_id once it acquires this lock.
+            info!(
+                deployment_id = self.deployment_id,
+                environment_id,
+                "Deployment was superseded by a concurrent rollback during route \
+                 propagation — aborting readiness check cleanly (state: stopped)"
+            );
+            self.log(
+                "Deployment superseded by a concurrent rollback — aborting \
+                 readiness check; state already set to 'stopped'"
+                    .to_string(),
+            )
+            .await
+            .ok();
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Deployment {} was superseded by a concurrent rollback \
+                 (state: stopped) — readiness check aborted",
+                self.deployment_id
+            )));
+        }
+
         // ── Phase 2.75: Prove the user-facing URL works ──────────────────
         // Container state and route-table propagation are necessary but not
         // sufficient. Request the same public URL the uptime monitor uses and

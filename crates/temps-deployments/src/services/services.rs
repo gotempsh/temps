@@ -2363,6 +2363,52 @@ impl DeploymentService {
                     container_id
                 );
             }
+
+            // If this deployment is currently in-flight (state = "running"),
+            // its MarkDeploymentCompleteJob may still be executing — in
+            // particular, it may be waiting inside Phase 2.75 (public
+            // readiness check). We have just killed all of its containers, so
+            // Phase 2.75 will fail, causing reject_unusable_deployment to mark
+            // this deployment "failed" even though it was intentionally
+            // superseded by the incoming rollback. Atomically flip it to
+            // "stopped" here (CAS: only transitions from "running") so that
+            // the staleness check added to mark_complete_inner can detect the
+            // supersession and abort cleanly without calling
+            // reject_unusable_deployment, preserving "stopped" for
+            // promote/rollback reuse.
+            if dep.state == "running" {
+                use sea_orm::sea_query::Expr;
+                match deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("stopped"))
+                    .col_expr(
+                        deployments::Column::UpdatedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .filter(deployments::Column::Id.eq(dep.id))
+                    .filter(deployments::Column::State.eq("running"))
+                    .exec(self.db.as_ref())
+                    .await
+                {
+                    Ok(res) if res.rows_affected > 0 => {
+                        info!(
+                            "Pre-rollback: marked in-flight deployment {} as stopped \
+                             to prevent spurious 'failed' state from concurrent Phase 2.75",
+                            dep.id
+                        );
+                    }
+                    Ok(_) => {
+                        // 0 rows affected: deployment already left "running"
+                        // (e.g., completed between the container kill and this
+                        // update) — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Pre-rollback: failed to mark in-flight deployment {} as stopped: {}",
+                            dep.id, e
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -5754,6 +5800,11 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        // Phase 2.75 probes the public URL over HTTP via the test proxy.
+        // Without this the URL scheme defaults to "https", which causes the
+        // TLS handshake to fail against the plain-HTTP test proxy and the
+        // readiness gate times out rather than succeeding.
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Rollback to a "stopped" target must succeed, not bounce off the
         // InvalidDeploymentState guard.

@@ -317,8 +317,6 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
 
-        ensure_repository_is_public(!repo_data.private, owner, repo)?;
-
         Ok(PublicRepoInfo {
             owner: repo_data
                 .owner

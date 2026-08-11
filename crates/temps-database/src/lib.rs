@@ -195,13 +195,31 @@ mod tests {
 
         // The compatibility migration is deliberately reversible as a no-op:
         // the concurrently managed index must survive both down and re-up.
-        Migrator::down(connection.as_ref(), Some(1)).await?;
+        //
+        // Roll back exactly far enough to include this migration, computed
+        // from its position in the migrator's list rather than a hardcoded
+        // `Some(1)` -- migrations appended after it push it further from the
+        // end, and a hardcoded step count silently starts rolling back the
+        // wrong migration instead.
+        let target_migration_name = "m20260806_000001_index_permission_denied_retention";
+        let all_migrations = Migrator::migrations();
+        let target_index = all_migrations
+            .iter()
+            .position(|migration| migration.name() == target_migration_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{target_migration_name} not found in Migrator::migrations()")
+            })?;
+        let steps_to_target = (all_migrations.len() - target_index) as u32;
+        Migrator::down(connection.as_ref(), Some(steps_to_target)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
-        assert_eq!(
-            pending_after_down.last().map(String::as_str),
-            Some("m20260806_000001_index_permission_denied_retention")
+        assert!(
+            pending_after_down
+                .iter()
+                .any(|name| name == target_migration_name),
+            "expected {target_migration_name} to be pending after rolling back \
+             {steps_to_target} migration(s), got {pending_after_down:?}"
         );
-        Migrator::up(connection.as_ref(), Some(1)).await?;
+        Migrator::up(connection.as_ref(), Some(steps_to_target)).await?;
         let index_after_round_trip = connection
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,

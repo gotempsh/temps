@@ -46,8 +46,20 @@ import type { Client } from '@temps-sdk/api/client'
 import tls, { type TLSSocket } from 'node:tls'
 import { unwrap, normalizeApiUrl } from './client.ts'
 
-/** Terminal-success deployment states (see ADR / generated DeploymentResponse.state). */
-const DEPLOY_SUCCESS = new Set(['completed', 'succeeded', 'running', 'active'])
+/** Terminal-success deployment states (see ADR / generated DeploymentResponse.state).
+ *
+ * "running" is intentionally excluded: it is a transient state set by
+ * try_admit_deployment when the workflow starts executing and is ALWAYS
+ * followed by "completed" (on success) or "failed"/"cancelled" (on failure).
+ * Treating "running" as terminal caused waitForDeployment to return before
+ * MarkDeploymentCompleteJob finished its route-propagation and public-readiness
+ * phases — allowing a caller to trigger a rollback while those phases were
+ * still in progress, which killed the containers under Phase 2.75 and caused
+ * reject_unusable_deployment to mark the superseded deployment "failed" instead
+ * of letting cancel_previous_deployments mark it "stopped". "deployed" is
+ * included because resume_deployment sets that state as its terminal marker.
+ */
+const DEPLOY_SUCCESS = new Set(['completed', 'deployed', 'succeeded', 'active'])
 const DEPLOY_FAILED = new Set(['failed', 'cancelled', 'errored', 'error'])
 
 /**
