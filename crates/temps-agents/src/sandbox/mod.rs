@@ -664,6 +664,24 @@ pub trait SandboxProvider: Send + Sync {
         })
     }
 
+    /// Remove a snapshot image from the backend's image store.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted. Failure is logged but does not fail the delete — the
+    /// tarball (the source of truth) is already removed; an orphaned image
+    /// tag is cleaned up on the next GC or by the operator.
+    ///
+    /// **Default: a no-op with a debug log.** Backends other than Docker (e.g.
+    /// Local, Firecracker) have no image store concept and leave this default.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(
+            image_ref = %image_ref,
+            provider = %self.name(),
+            "delete_image: provider does not support image deletion (no-op)"
+        );
+        Ok(())
+    }
+
     /// Provider name for logging and error messages.
     fn name(&self) -> &str;
 

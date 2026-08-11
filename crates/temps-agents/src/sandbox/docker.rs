@@ -91,7 +91,11 @@ fn shell_quote(s: &str) -> String {
 ///
 /// **Security invariant**: this list is the single source of truth for which
 /// env vars the scrubber strips. Adding a new secret kind to the sandbox API
-/// must be accompanied by adding its pattern here.
+/// must be accompanied by adding its pattern here. Keep this in sync with
+/// every env var injected at sandbox creation time in:
+///   - `crates/temps-agents/src/services/executor.rs`  (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-agents/src/handlers/trigger.rs`   (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-agents/src/services/sandbox_injector.rs`
 pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -110,6 +114,9 @@ pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS",
     "CODEX_API_KEY",
     "OPENCODE_API_KEY",
+    // OAuth tokens — covers CLAUDE_CODE_OAUTH_TOKEN injected by executor.rs
+    // and trigger.rs for Claude subscription auth, and any future OAuth tokens.
+    "OAUTH_TOKEN",
     "TEMPS_",
 ];
 
@@ -124,27 +131,29 @@ pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
         .any(|pat| key_upper.contains(pat))
 }
 
-/// Strip sensitive values from a `KEY=VALUE` env list.
+/// Strip sensitive entries from a `KEY=VALUE` env list.
 ///
-/// Every entry whose key matches [`is_sensitive_env_key`] is rewritten to
-/// `KEY=` (empty value). Non-sensitive entries are left unchanged. The result
-/// is passed as `ContainerConfig.env` to `docker commit` so the committed
-/// image config never carries a live secret.
+/// Every entry whose key matches [`is_sensitive_env_key`] is **removed**
+/// from the list entirely (not zeroed to `KEY=`). Removing the entry ensures
+/// that neither the credential name nor its value appears in the committed
+/// image config — zeroing to `KEY=` would leave the key name visible, which
+/// leaks which secrets the sandbox was configured with.
+///
+/// Non-sensitive entries are left unchanged. The result is passed as
+/// `ContainerConfig.env` to `docker commit`.
 pub(crate) fn scrub_env_vars(env: &[String]) -> Vec<String> {
     env.iter()
-        .map(|kv| {
+        .filter(|kv| {
             let key = kv.split('=').next().unwrap_or("");
-            if is_sensitive_env_key(key) {
-                format!("{}=", key)
-            } else {
-                kv.clone()
-            }
+            !is_sensitive_env_key(key)
         })
+        .cloned()
         .collect()
 }
 
-/// Returns the keys of any env entries that are sensitive AND still have a
-/// non-empty value.
+/// Returns the keys of any env entries that are sensitive (key presence alone
+/// is the failure condition — the scrubber removes entries entirely, so any
+/// surviving sensitive key means scrubbing failed).
 ///
 /// Called after `docker commit` to verify the scrubbing worked. An empty
 /// return means the image config is clean. A non-empty return triggers an
@@ -153,8 +162,10 @@ pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
     env.iter()
         .filter_map(|kv| {
             let key = kv.split('=').next().unwrap_or("");
-            let val = kv.split_once('=').map(|(_, v)| v).unwrap_or("");
-            if !val.is_empty() && is_sensitive_env_key(key) {
+            // Key presence alone is the failure condition — scrub_env_vars
+            // removes entries entirely, so any surviving sensitive key means
+            // the commit's env override was ignored or bypassed.
+            if is_sensitive_env_key(key) {
                 Some(key.to_string())
             } else {
                 None
@@ -2579,71 +2590,51 @@ impl SandboxProvider for DockerSandboxProvider {
 
     /// Capture the current state of `handle` as a content-addressed tarball.
     ///
-    /// **Security contract (ADR-037 §4):** before calling `docker commit` this
-    /// method executes three scrubbing steps:
+    /// **Security contract (ADR-037 §4):** The caller (`SnapshotService`) is
+    /// responsible for shredding `/etc/temps/credential-daemon.env` via
+    /// `exec_as_root` **before** stopping the sandbox and calling this method.
+    /// Any failure in that step must abort the snapshot at the service layer.
     ///
-    /// 1. Shred and remove `/etc/temps/credential-daemon.env` — the file that
-    ///    holds the git-provider token injected by the credential daemon shim.
-    /// 2. For every known-sensitive env-var key in the committed image config,
-    ///    pass `--change "ENV KEY="` to `docker commit` to zero the value.
-    ///    (Docker `commit --change` is the only supported way to rewrite the
-    ///    image config without a full rebuild.)
-    /// 3. Inspect the committed image's `Config.Env` and reject the snapshot —
+    /// This method then executes two additional scrubbing steps:
+    ///
+    /// 1. Inspect the stopped container's `Config.Env` and remove every
+    ///    known-sensitive env-var key from the committed image config. Entries
+    ///    are removed entirely (not zeroed) so key names don't leak either.
+    /// 2. Inspect the committed image's `Config.Env` and reject the snapshot —
     ///    removing the committed image and returning `SandboxExecFailed` — if
     ///    any known-sensitive key pattern survives.
     ///
-    /// The sandbox is assumed to be stopped by the caller (the service layer
-    /// stops it before calling here for filesystem consistency). If it is
-    /// running the commit will still work, but there is a TOCTOU window.
+    /// The sandbox must be stopped by the caller before this is called for
+    /// filesystem consistency.
     async fn take_snapshot(
         &self,
         handle: &SandboxHandle,
         label: Option<String>,
     ) -> Result<super::SnapshotArtifact, AgentError> {
         use sha2::{Digest, Sha256};
-        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
 
         let container_id = &handle.sandbox_id;
 
-        // ── Step 1: scrub the credential-daemon env file ──────────────────────
-        // Use `shred -u` if available (overwrites before unlinking); fall back
-        // to plain `rm -f` if the sandbox image doesn't have coreutils.
-        tracing::info!(
-            container_id = %container_id,
-            "snapshot: scrubbing credential-daemon env file"
-        );
-        let scrub_cred_result = self
-            .run_root_exec(
-                container_id,
-                0,
-                "snapshot-scrub-cred",
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    // shred is not always available; fall back to rm -f.
-                    // Either way the file must not exist after this step.
-                    "shred -u /etc/temps/credential-daemon.env 2>/dev/null || rm -f /etc/temps/credential-daemon.env; test ! -f /etc/temps/credential-daemon.env".to_string(),
-                ],
-            )
-            .await;
-
-        if let Ok(code) = scrub_cred_result {
-            if code != 0 {
-                tracing::warn!(
-                    container_id = %container_id,
-                    exit_code = %code,
-                    "snapshot: credential-daemon env scrub exited non-zero — file may still exist"
-                );
+        // ── Validate label early, before any file I/O ─────────────────────────
+        // An empty label after sanitization produces an invalid Docker tag.
+        // Validate here so the rename to the final path never orphans a tarball
+        // because a later tag call fails.
+        if let Some(ref lbl) = label {
+            if lbl.trim().is_empty() {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: "snapshot: label must not be empty when provided \
+                             (empty label produces an invalid Docker image tag; \
+                             omit the label field to use the content digest instead)"
+                        .to_string(),
+                });
             }
-        } else {
-            tracing::warn!(
-                container_id = %container_id,
-                "snapshot: credential-daemon env scrub exec failed (may already be absent)"
-            );
         }
 
-        // ── Step 2: collect known-sensitive env vars to strip via --change ────
-        // Inspect the *running container's* Config.Env to find injected vars.
+        // ── Step 1: collect and scrub known-sensitive env vars ────────────────
+        // Inspect the stopped container's Config.Env to find injected vars.
         // The sensitive-pattern list and scrubbing helpers are module-level
         // functions (see `SENSITIVE_ENV_PATTERNS`, `scrub_env_vars`, and
         // `find_surviving_sensitive_keys`) so they are unit-testable without
@@ -2667,21 +2658,17 @@ impl SandboxProvider for DockerSandboxProvider {
             .map(|env| env.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
-        // Build the list of sensitive keys for logging only (the scrubbing
-        // itself is done via `scrub_env_vars` below).
-        let change_flags: Vec<String> = container_env
+        // Count sensitive keys for telemetry. The actual scrubbing removes
+        // entries entirely (not zeroed) via `scrub_env_vars` below.
+        let scrubbed_key_count = container_env
             .iter()
-            .filter_map(|kv| {
-                let key = kv.split('=').next()?;
-                if is_sensitive_env_key(key) {
-                    Some(format!("ENV {}=", key))
-                } else {
-                    None
-                }
+            .filter(|kv| {
+                let key = kv.split('=').next().unwrap_or("");
+                is_sensitive_env_key(key)
             })
-            .collect();
+            .count();
 
-        // ── Step 2b: commit the container with the scrubbing --change flags ───
+        // ── Step 1b: commit the container with sensitive env vars removed ──────
         // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
         // during the commit phase; we rename it to the public_id tag after
         // digest verification. Using the container_id avoids a race if two
@@ -2692,7 +2679,7 @@ impl SandboxProvider for DockerSandboxProvider {
         tracing::info!(
             container_id = %container_id,
             commit_tag = %commit_tag,
-            scrubbed_keys = change_flags.len(),
+            scrubbed_key_count = %scrubbed_key_count,
             "snapshot: committing container image"
         );
 
@@ -2702,8 +2689,10 @@ impl SandboxProvider for DockerSandboxProvider {
             .tag("latest")
             .build();
 
-        // Build the Config override: zero out sensitive env vars via the
-        // module-level `scrub_env_vars` helper (tested independently of Docker).
+        // Build the Config override: remove sensitive env var entries entirely
+        // via the module-level `scrub_env_vars` helper (tested independently of
+        // Docker). Removing entries (rather than zeroing them) ensures neither
+        // the key name nor its value appears in the committed image config.
         let scrubbed_env = scrub_env_vars(&container_env);
 
         let config_override = bollard::models::ContainerConfig {
@@ -2803,25 +2792,29 @@ impl SandboxProvider for DockerSandboxProvider {
                     .join(".temps")
             });
         let snapshots_dir = data_dir.join("snapshots");
-        std::fs::create_dir_all(&snapshots_dir).map_err(|e| AgentError::SandboxExecFailed {
-            run_id: 0,
-            sandbox_id: container_id.clone(),
-            reason: format!(
-                "snapshot: failed to create snapshots directory {}: {}",
-                snapshots_dir.display(),
-                e
-            ),
-        })?;
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: failed to create snapshots directory {}: {}",
+                    snapshots_dir.display(),
+                    e
+                ),
+            })?;
 
         // Stream the export through a Sha256 hasher while writing to a temp
-        // file, then rename atomically.
+        // file, then rename atomically. All file I/O uses tokio::fs so we
+        // never block the async runtime on a potentially multi-GB write.
         let tmp_path = snapshots_dir.join(format!(".tmp-{}", short_id));
-        let mut tmp_file =
-            std::fs::File::create(&tmp_path).map_err(|e| AgentError::SandboxExecFailed {
+        let mut tmp_file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+            AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: container_id.clone(),
                 reason: format!("snapshot: failed to create temp file: {}", e),
-            })?;
+            }
+        })?;
 
         let mut hasher = Sha256::new();
         let mut size_bytes: u64 = 0;
@@ -2838,6 +2831,7 @@ impl SandboxProvider for DockerSandboxProvider {
                 size_bytes += chunk.len() as u64;
                 tmp_file
                     .write_all(&chunk)
+                    .await
                     .map_err(|e| AgentError::SandboxExecFailed {
                         run_id: 0,
                         sandbox_id: container_id.clone(),
@@ -2848,6 +2842,7 @@ impl SandboxProvider for DockerSandboxProvider {
 
         tmp_file
             .flush()
+            .await
             .map_err(|e| AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: container_id.clone(),
@@ -2860,11 +2855,13 @@ impl SandboxProvider for DockerSandboxProvider {
 
         // Atomic rename — the file is only visible at the final path once
         // fully written, so a concurrent reader never sees a partial write.
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| AgentError::SandboxExecFailed {
-            run_id: 0,
-            sandbox_id: container_id.clone(),
-            reason: format!("snapshot: atomic rename failed: {}", e),
-        })?;
+        tokio::fs::rename(&tmp_path, &final_path)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: atomic rename failed: {}", e),
+            })?;
 
         // ── Tag the committed image with the public-facing name ───────────────
         // Derive an image_ref from the label if provided, otherwise use digest.
@@ -2979,40 +2976,62 @@ impl SandboxProvider for DockerSandboxProvider {
                 "snapshot: image not in daemon — loading from tarball"
             );
 
-            let tarball = std::fs::File::open(&artifact.content_path).map_err(|e| {
-                AgentError::SandboxExecFailed {
-                    run_id: config.run_id,
-                    sandbox_id: String::new(),
-                    reason: format!(
-                        "snapshot: failed to open tarball {}: {}",
-                        artifact.content_path.display(),
-                        e
-                    ),
-                }
-            })?;
+            // Hard cap: reject tarballs larger than 20 GiB before reading
+            // anything into memory. This prevents an unbounded Vec allocation
+            // on a 4 GB reference host. The cap is intentionally generous
+            // (a typical sandbox image is 2–4 GB) while still bounding risk.
+            const MAX_SNAPSHOT_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
 
-            let metadata = tarball
-                .metadata()
+            let path = artifact.content_path.clone();
+            let file_size = tokio::fs::metadata(&path)
+                .await
                 .map_err(|e| AgentError::SandboxExecFailed {
                     run_id: config.run_id,
                     sandbox_id: String::new(),
                     reason: format!("snapshot: failed to stat tarball: {}", e),
-                })?;
-            let file_size = metadata.len();
+                })?
+                .len();
 
-            // Read the whole tarball into memory for the Bollard API.
-            // For large snapshots this is expensive, but it's what Bollard
-            // supports. A streaming path can be added in v2 via reqwest body.
-            use std::io::Read;
-            let mut buf = Vec::with_capacity(file_size as usize);
-            let mut tarball = tarball;
-            tarball
-                .read_to_end(&mut buf)
-                .map_err(|e| AgentError::SandboxExecFailed {
+            if file_size > MAX_SNAPSHOT_BYTES {
+                return Err(AgentError::SandboxExecFailed {
                     run_id: config.run_id,
                     sandbox_id: String::new(),
-                    reason: format!("snapshot: failed to read tarball into memory: {}", e),
-                })?;
+                    reason: format!(
+                        "snapshot: tarball too large to import: {} bytes exceeds \
+                         maximum {} bytes (20 GiB); \
+                         contact support if you need to restore a larger snapshot",
+                        file_size, MAX_SNAPSHOT_BYTES,
+                    ),
+                });
+            }
+
+            // Read the tarball via spawn_blocking so the async runtime is not
+            // stalled on a potentially multi-GB disk read. The bollard
+            // `import_image_stream` API requires the full bytes upfront
+            // (it does not accept an async reader); the cap above bounds
+            // the worst-case allocation.
+            let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&path)?;
+                let mut buf = Vec::with_capacity(file_size as usize);
+                f.read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: config.run_id,
+                sandbox_id: String::new(),
+                reason: format!("snapshot: spawn_blocking join error reading tarball: {}", e),
+            })?
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: config.run_id,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "snapshot: failed to read tarball {}: {}",
+                    artifact.content_path.display(),
+                    e
+                ),
+            })?;
 
             let mut load_stream = self.docker.import_image_stream(
                 bollard::query_parameters::ImportImageOptionsBuilder::new()
@@ -3059,6 +3078,59 @@ impl SandboxProvider for DockerSandboxProvider {
         let mut config = config;
         config.image = Some(image_ref.to_string());
         self.create(config).await
+    }
+
+    // ── Snapshot: delete image ────────────────────────────────────────────────
+
+    /// Remove the Docker image tag for a deleted snapshot.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted and the tarball has been removed. This cleans up the
+    /// Docker daemon's image store so it doesn't accumulate stale snapshot
+    /// images indefinitely.
+    ///
+    /// Uses `noprune: false` (default) so untagged intermediate layers are
+    /// also reclaimed. `force: false` so an image referenced by a running
+    /// container isn't deleted — that's a bug, not a normal condition.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(image_ref = %image_ref, "snapshot: removing Docker image");
+        match self
+            .docker
+            .remove_image(
+                image_ref,
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .force(false)
+                        .noprune(false)
+                        .build(),
+                ),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(image_ref = %image_ref, "snapshot: Docker image removed");
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Image already absent — idempotent.
+                tracing::debug!(
+                    image_ref = %image_ref,
+                    "snapshot: Docker image not found during delete (already removed)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "snapshot: failed to remove Docker image '{}': {}",
+                    image_ref, e
+                ),
+            }),
+        }
     }
 }
 
@@ -4632,7 +4704,9 @@ mod tests {
     }
 
     #[test]
-    fn scrub_env_vars_zeros_sensitive_values() {
+    fn scrub_env_vars_removes_sensitive_entries_entirely() {
+        // scrub_env_vars must REMOVE sensitive entries (not zero them), so that
+        // neither the key name nor the value appears in the committed image config.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
             "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
@@ -4657,27 +4731,30 @@ mod tests {
             "NODE_VERSION should be unchanged"
         );
 
-        // Sensitive vars zeroed.
+        // Sensitive entries removed entirely — not zeroed but gone.
         assert!(
-            scrubbed.contains(&"ANTHROPIC_API_KEY=".to_string()),
-            "ANTHROPIC_API_KEY value must be empty after scrub"
+            !scrubbed.iter().any(|e| e.starts_with("ANTHROPIC_API_KEY")),
+            "ANTHROPIC_API_KEY entry must be removed entirely, not zeroed"
         );
         assert!(
-            scrubbed.contains(&"GITHUB_TOKEN=".to_string()),
-            "GITHUB_TOKEN value must be empty after scrub"
+            !scrubbed.iter().any(|e| e.starts_with("GITHUB_TOKEN")),
+            "GITHUB_TOKEN entry must be removed entirely, not zeroed"
         );
 
-        // Length preserved (no entries removed, just zeroed).
-        assert_eq!(scrubbed.len(), env.len());
+        // Fewer entries after scrubbing — sensitive ones were removed.
+        assert_eq!(
+            scrubbed.len(),
+            3,
+            "3 safe entries should remain; got {:?}",
+            scrubbed
+        );
     }
 
     #[test]
     fn find_surviving_sensitive_keys_returns_empty_for_clean_env() {
-        // A fully-scrubbed env: sensitive vars have empty values.
+        // After scrub_env_vars, no sensitive keys should be present at all.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
-            "ANTHROPIC_API_KEY=".to_string(), // already zeroed
-            "GITHUB_TOKEN=".to_string(),      // already zeroed
             "HOME=/home/temps".to_string(),
         ];
 
@@ -4690,11 +4767,11 @@ mod tests {
     }
 
     #[test]
-    fn find_surviving_sensitive_keys_catches_unzeroed_secret() {
-        // A committed image where scrubbing somehow missed a key.
+    fn find_surviving_sensitive_keys_catches_present_secret_key() {
+        // A committed image where scrubbing somehow missed a key (key still present).
         let env = vec![
             "PATH=/usr/bin".to_string(),
-            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // NOT zeroed
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // not removed
         ];
 
         let survivors = find_surviving_sensitive_keys(&env);
@@ -4702,8 +4779,25 @@ mod tests {
     }
 
     #[test]
+    fn find_surviving_sensitive_keys_rejects_zeroed_key_as_surviving() {
+        // A zeroed entry (KEY=) still counts as surviving since the key name
+        // itself is sensitive and should have been removed entirely.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(), // zeroed but still present as a key
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.contains(&"GITHUB_TOKEN".to_string()),
+            "a zeroed-but-present sensitive key counts as surviving: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
     fn scrub_then_verify_leaves_no_survivors() {
-        // Property: scrub_env_vars ∘ find_surviving_sensitive_keys = ∅.
+        // Property: find_surviving_sensitive_keys(scrub_env_vars(env)) = ∅.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
             "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
@@ -4722,6 +4816,63 @@ mod tests {
             "scrub_env_vars must leave no surviving sensitive keys, but found: {:?}",
             survivors
         );
+    }
+
+    // ── C2 regression: CLAUDE_CODE_OAUTH_TOKEN coverage ──────────────────────
+
+    /// Regression test for C2: CLAUDE_CODE_OAUTH_TOKEN must be classified
+    /// sensitive. It is injected by executor.rs (~line 470) and trigger.rs
+    /// (~line 768) for Claude subscription auth and would have been committed
+    /// into every subscription user's snapshot without this fix.
+    #[test]
+    fn is_sensitive_env_key_detects_claude_code_oauth_token() {
+        assert!(
+            is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN must be classified sensitive (regression for C2)"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_oauth_token_variants() {
+        // The pattern "OAUTH_TOKEN" catches any OAuth token variant.
+        assert!(is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("MY_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("oauth_token")); // case-insensitive
+    }
+
+    /// Regression: all env var names that are known to be injected into sandboxes
+    /// at create time must be classified as sensitive. Keep this list in sync with:
+    ///   - crates/temps-agents/src/services/executor.rs  (CLAUDE_CODE_OAUTH_TOKEN)
+    ///   - crates/temps-agents/src/handlers/trigger.rs   (CLAUDE_CODE_OAUTH_TOKEN)
+    ///
+    /// If a new credential injection site is added without updating
+    /// SENSITIVE_ENV_PATTERNS, this test fails and blocks the merge.
+    #[test]
+    fn all_known_injected_credential_env_vars_are_classified_sensitive() {
+        let injected_credentials = [
+            // Injected by executor.rs for Claude subscription auth
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            // Injected by executor.rs / sandbox_injector for API keys
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "OPENCODE_API_KEY",
+            // Injected for git provider tokens
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            // Injected via TEMPS_ prefix (credential daemon, internal tokens)
+            "TEMPS_GIT_CREDENTIAL_TOKEN",
+        ];
+
+        for key in &injected_credentials {
+            assert!(
+                is_sensitive_env_key(key),
+                "injected credential env var '{}' is NOT classified as sensitive — \
+                 add a matching pattern to SENSITIVE_ENV_PATTERNS",
+                key
+            );
+        }
     }
 
     #[test]
@@ -4743,6 +4894,7 @@ mod tests {
             "AWS_ACCESS_KEY",
             "AZURE_CLIENT_SECRET",
             "GOOGLE_APPLICATION_CREDENTIALS",
+            "OAUTH_TOKEN", // catches CLAUDE_CODE_OAUTH_TOKEN and any future OAuth tokens
             "TEMPS_",
         ];
         for required_key in required {
