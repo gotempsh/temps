@@ -646,6 +646,13 @@ struct MigrateProgressLine {
     /// Present on `complete` events — total migrations applied in the run.
     #[serde(default)]
     migrations_applied: u32,
+    /// Present on `finished` events where `success == false` — the migration
+    /// runner's own error text (e.g. the underlying DB error). Without this,
+    /// a migrate failure is reported as only "migrate exited with code N",
+    /// leaving the operator to go hunting through logs for what actually
+    /// broke.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 impl UpdateJob {
@@ -690,89 +697,85 @@ impl UpdateJob {
                     );
                 }
             },
-            Err(ExecuteError::PreSwap(e)) => {
+            Err(e) => {
+                // `Display` is the single source of truth for the operator
+                // -facing message in both variants — building it separately
+                // here would drift from `ExecuteError`'s own wording.
                 let message = e.to_string();
-                error!(
-                    from = %self.from_version,
-                    error = %message,
-                    "Self-update failed; the running binary was left untouched"
-                );
-                // Record the failure so it survives to the UI even if the
-                // operator's tab was closed when it happened.
-                let attempt = SelfUpdateAttempt {
-                    from_version: self.from_version.clone(),
-                    to_version: None,
-                    status: SelfUpdateStatus::Failed,
-                    started_at,
-                    finished_at: Some(Utc::now()),
-                    triggered_by_user_id: self.triggered_by_user_id,
-                    error: Some(message.clone()),
-                    previous_binary_path: None,
-                    migrations_applied: None,
-                    migrations_total: None,
-                };
-                if let Err(e) = write_journal(&self.journal_path, &attempt) {
-                    warn!("Could not persist failed self-update attempt: {}", e);
-                }
-                if let Ok(mut state) = self.state.write() {
-                    state.phase = SelfUpdatePhase::Failed;
-                    state.phase_error = Some(message);
-                    state.last_attempt = Some(attempt);
-                }
-            }
-            Err(ExecuteError::PostSwapMigration {
-                to_version,
-                backup_path,
-                error,
-                migrations_applied,
-                migrations_total,
-            }) => {
-                // The binary IS the new version on disk. This error message
-                // must never say "the running binary was left untouched" — it
-                // was replaced. The operator needs to know the exact state so
-                // they can decide whether to run `temps migrate` themselves
-                // before restarting.
-                let full_message = format!(
-                    "The binary was replaced with {to_version} but database migrations failed: \
-                     {error}. The schema may be partially migrated. {}Re-run `temps migrate` \
-                     against the database and then restart the server.",
-                    backup_path
-                        .as_ref()
-                        .map(|p| format!(
-                            "The previous binary was kept at {p} — restore it with \
-                             `mv {p} <binary_path>` if needed. "
-                        ))
-                        .unwrap_or_default()
-                );
-                error!(
-                    from = %self.from_version,
-                    to = %to_version,
-                    error = %error,
-                    "Binary swapped but migrations failed; schema may be partially migrated"
-                );
-                let attempt = SelfUpdateAttempt {
-                    from_version: self.from_version.clone(),
-                    to_version: Some(to_version),
-                    status: SelfUpdateStatus::Failed,
-                    started_at,
-                    finished_at: Some(Utc::now()),
-                    triggered_by_user_id: self.triggered_by_user_id,
-                    error: Some(full_message.clone()),
-                    previous_binary_path: backup_path,
-                    migrations_applied,
-                    migrations_total,
-                };
-                if let Err(e) = write_journal(&self.journal_path, &attempt) {
-                    warn!("Could not persist failed self-update attempt: {}", e);
-                }
-                if let Ok(mut state) = self.state.write() {
-                    // Clear live migration progress — it's now in the journal.
-                    state.migrations_applied = None;
-                    state.migrations_total = None;
-                    state.current_migration_name = None;
-                    state.phase = SelfUpdatePhase::Failed;
-                    state.phase_error = Some(full_message);
-                    state.last_attempt = Some(attempt);
+                match e {
+                    ExecuteError::PreSwap(_) => {
+                        error!(
+                            from = %self.from_version,
+                            error = %message,
+                            "Self-update failed; the running binary was left untouched"
+                        );
+                        // Record the failure so it survives to the UI even if
+                        // the operator's tab was closed when it happened.
+                        let attempt = SelfUpdateAttempt {
+                            from_version: self.from_version.clone(),
+                            to_version: None,
+                            status: SelfUpdateStatus::Failed,
+                            started_at,
+                            finished_at: Some(Utc::now()),
+                            triggered_by_user_id: self.triggered_by_user_id,
+                            error: Some(message.clone()),
+                            previous_binary_path: None,
+                            migrations_applied: None,
+                            migrations_total: None,
+                        };
+                        if let Err(e) = write_journal(&self.journal_path, &attempt) {
+                            warn!("Could not persist failed self-update attempt: {}", e);
+                        }
+                        if let Ok(mut state) = self.state.write() {
+                            state.phase = SelfUpdatePhase::Failed;
+                            state.phase_error = Some(message);
+                            state.last_attempt = Some(attempt);
+                        }
+                    }
+                    ExecuteError::PostSwapMigration {
+                        to_version,
+                        backup_path,
+                        migrations_applied,
+                        migrations_total,
+                        ..
+                    } => {
+                        // The binary IS the new version on disk. `message`
+                        // (built above from `Display`) never says "the
+                        // running binary was left untouched" for this variant
+                        // — it was replaced. The operator needs to know the
+                        // exact state so they can decide whether to run
+                        // `temps migrate` themselves before restarting.
+                        error!(
+                            from = %self.from_version,
+                            to = %to_version,
+                            error = %message,
+                            "Binary swapped but migrations failed; schema may be partially migrated"
+                        );
+                        let attempt = SelfUpdateAttempt {
+                            from_version: self.from_version.clone(),
+                            to_version: Some(to_version),
+                            status: SelfUpdateStatus::Failed,
+                            started_at,
+                            finished_at: Some(Utc::now()),
+                            triggered_by_user_id: self.triggered_by_user_id,
+                            error: Some(message.clone()),
+                            previous_binary_path: backup_path,
+                            migrations_applied,
+                            migrations_total,
+                        };
+                        if let Err(e) = write_journal(&self.journal_path, &attempt) {
+                            warn!("Could not persist failed self-update attempt: {}", e);
+                        }
+                        if let Ok(mut state) = self.state.write() {
+                            // Clear live migration progress — it's now in the journal.
+                            state.migrations_applied = None;
+                            state.migrations_total = None;
+                            state.current_migration_name = None;
+                            state.phase = SelfUpdatePhase::Failed;
+                            state.phase_error = Some(message);
+                            state.last_attempt = Some(attempt);
+                        }
+                    }
                 }
             }
         }
@@ -962,17 +965,26 @@ impl UpdateJob {
         // Drain stderr concurrently with stdout. If nothing reads it, a child
         // that writes more than the OS pipe buffer (64KB on Linux) to stderr
         // blocks on the write while we block reading stdout — a deadlock ends
-        // an update that would otherwise have succeeded. Logged via `warn!`
-        // rather than inherited: the child has `TEMPS_DATABASE_URL` in its
-        // environment, and a connection-failure message from sqlx/libpq can
-        // embed the full DSN (including the password) — piping and logging
-        // only the line text keeps that out of the parent's own log stream
-        // without silently discarding genuine error detail.
+        // an update that would otherwise have succeeded.
+        //
+        // Piped rather than inherited so this can be logged deliberately: the
+        // child has `TEMPS_DATABASE_URL` in its environment, and a
+        // connection-failure message from sqlx/libpq can embed the full DSN
+        // (including the password). Piping does NOT by itself keep the
+        // credential out of the parent's own log stream — `warn!` below IS
+        // the parent's log stream, same as `Stdio::inherit()` would have
+        // been, just structured instead of raw. `redact_dsn` is what
+        // actually prevents the leak, by stripping any `scheme://user:pass@`
+        // prefix before the line is logged.
         let stderr_task = tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
-                    warn!(target: "temps_cli::self_update::migrate_stderr", "{line}");
+                    warn!(
+                        target: "temps_cli::self_update::migrate_stderr",
+                        "{}",
+                        redact_dsn(&line)
+                    );
                 }
             }
         });
@@ -980,6 +992,10 @@ impl UpdateJob {
         let mut lines = tokio::io::BufReader::new(stdout).lines();
         let mut applied: u32 = 0;
         let mut total: u32 = 0;
+        // The migration that failed and why, if any `finished` event reports
+        // `success: false` — carried into the final error so the operator
+        // sees the actual DB failure instead of just an exit code.
+        let mut last_failure: Option<(String, String)> = None;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if let Ok(event) = serde_json::from_str::<MigrateProgressLine>(&line) {
@@ -1000,6 +1016,14 @@ impl UpdateJob {
                     "finished" => {
                         if event.success {
                             applied += 1;
+                        } else {
+                            last_failure = Some((
+                                event.name.clone(),
+                                event
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "no error detail reported".to_string()),
+                            ));
                         }
                         if let Ok(mut state) = self.state.write() {
                             state.migrations_applied = Some(applied);
@@ -1010,6 +1034,7 @@ impl UpdateJob {
                             total = event.total,
                             name = %event.name,
                             success = event.success,
+                            error = event.error.as_deref().unwrap_or(""),
                             "Migration step finished"
                         );
                     }
@@ -1043,10 +1068,16 @@ impl UpdateJob {
 
         if !status.success() {
             let code = status.code().unwrap_or(-1);
+            let error = match &last_failure {
+                Some((name, detail)) => {
+                    format!("migration '{name}' failed: {detail} (migrate exited with code {code})")
+                }
+                None => format!("migrate exited with code {code}"),
+            };
             return Err(ExecuteError::PostSwapMigration {
                 to_version: to_version.to_string(),
                 backup_path: backup_path.clone(),
-                error: format!("migrate exited with code {code}"),
+                error,
                 migrations_applied: Some(applied),
                 migrations_total: Some(total),
             });
@@ -1068,6 +1099,47 @@ impl UpdateJob {
             Some(version) => fetch_specific_release(version).await,
             None => fetch_latest_release_in_channel(self.channel).await,
         }
+    }
+}
+
+/// Strip `scheme://user:pass@` credentials from a line before it is logged.
+///
+/// Defense in depth for the `migrate` child's stderr: that child has
+/// `TEMPS_DATABASE_URL` in its environment, and a connection-failure message
+/// from sqlx/libpq is not guaranteed never to embed the DSN (including the
+/// password) in its `Display` output. Piping stderr into `warn!` instead of
+/// inheriting it only changes WHERE the line goes, not whether it contains a
+/// credential — this is what actually keeps one out of the log.
+fn redact_dsn(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains("://") {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut redacted_any = false;
+    while let Some(scheme_pos) = rest.find("://") {
+        let (before, after_marker) = rest.split_at(scheme_pos + 3);
+        result.push_str(before);
+        // The userinfo component, if present, ends at the next '/' or
+        // whitespace — scan only that span for a trailing '@'.
+        let boundary = after_marker
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(after_marker.len());
+        let candidate = &after_marker[..boundary];
+        if let Some(at_pos) = candidate.rfind('@') {
+            result.push_str("***@");
+            redacted_any = true;
+            rest = &after_marker[at_pos + 1..];
+        } else {
+            result.push_str(candidate);
+            rest = &after_marker[boundary..];
+        }
+    }
+    result.push_str(rest);
+    if redacted_any {
+        std::borrow::Cow::Owned(result)
+    } else {
+        std::borrow::Cow::Borrowed(line)
     }
 }
 
@@ -1239,6 +1311,39 @@ fn write_journal(path: &Path, attempt: &SelfUpdateAttempt) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_redact_dsn_strips_credentials() {
+        let line = "error connecting to postgresql://app:hunter2@db:5432/temps: connection refused";
+        let redacted = redact_dsn(line);
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(!redacted.contains("app:"), "{redacted}");
+        assert!(redacted.contains("***@db:5432/temps"), "{redacted}");
+    }
+
+    #[test]
+    fn test_redact_dsn_leaves_credential_free_lines_untouched() {
+        let line = "FATAL: password authentication failed for user \"app\"";
+        assert_eq!(redact_dsn(line), line);
+    }
+
+    #[test]
+    fn test_redact_dsn_leaves_url_without_userinfo_untouched() {
+        let line = "fetching https://example.com/releases/latest";
+        assert_eq!(redact_dsn(line), line);
+    }
+
+    #[test]
+    fn test_redact_dsn_handles_multiple_urls_in_one_line() {
+        let line = "postgres://a:b@host1/db and postgres://c:d@host2/db";
+        let redacted = redact_dsn(line);
+        assert!(!redacted.contains("a:b"), "{redacted}");
+        assert!(!redacted.contains("c:d"), "{redacted}");
+        assert_eq!(
+            redacted,
+            "postgres://***@host1/db and postgres://***@host2/db"
+        );
+    }
 
     fn updater(
         dir: &Path,
