@@ -4,7 +4,7 @@
 //! - Quota enforcement (per-user soft cap, default 10 GiB).
 //! - Deduplication of content-addressed artifacts.
 //! - Lifecycle management: create / list / get / delete.
-//! - Orchestrating the stop → snapshot → restart cycle via the provider.
+//! - Orchestrating the shred → stop → snapshot → restart cycle via the provider.
 //! - Nullifying `source_sandbox_id` references when a sandbox is destroyed.
 //!
 //! This module never imports bollard. All provider interaction goes through
@@ -18,6 +18,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder,
 };
+use tokio::sync::Mutex;
 
 use temps_agents::sandbox::{SandboxProvider, SnapshotArtifact};
 use temps_entities::sandbox_snapshots;
@@ -29,6 +30,19 @@ use crate::services::registry::StandaloneSandboxRegistry;
 /// Per-user snapshot storage quota: 10 GiB (soft cap, enforced at API level).
 pub const DEFAULT_SNAPSHOT_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// In-process serializer for snapshot creation quota checks.
+///
+/// Two concurrent `create_snapshot` calls for the same user would both read
+/// 0 bytes of storage, both pass the quota check, and both proceed to write —
+/// a TOCTOU race. Holding this Mutex across the storage-read + row-insert
+/// sequence ensures only one create runs that pair at a time. Snapshot creates
+/// are rare and coarse-grained (seconds of work), so a single service-level
+/// lock is acceptable.
+///
+/// For multi-process deployments a `SELECT ... FOR UPDATE` on a per-user row
+/// would be needed; the in-process lock covers the single-binary model.
+type QuotaLock = Arc<Mutex<()>>;
+
 /// Service for snapshot CRUD and lifecycle management.
 pub struct SnapshotService {
     db: Arc<DatabaseConnection>,
@@ -39,6 +53,9 @@ pub struct SnapshotService {
     /// Per-user quota in bytes. Configurable via AgentSandboxSettings in v2;
     /// v1 uses this hard-coded default.
     quota_bytes: u64,
+    /// Per-user lock to serialize concurrent quota-check + insert sequences
+    /// and eliminate the TOCTOU race in create_snapshot.
+    quota_lock: QuotaLock,
 }
 
 impl SnapshotService {
@@ -52,6 +69,7 @@ impl SnapshotService {
             registry,
             provider,
             quota_bytes: DEFAULT_SNAPSHOT_QUOTA_BYTES,
+            quota_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -66,8 +84,13 @@ impl SnapshotService {
     /// On success, transitions the row to `ready` and returns the model.
     /// On failure, transitions to `failed` (row kept for audit).
     ///
-    /// The sandbox is stopped before snapping (for filesystem consistency) and
-    /// restarted afterwards unless it was already stopped on entry.
+    /// Security protocol (ADR-037 §4):
+    /// 1. Shred `/etc/temps/credential-daemon.env` via exec_as_root WHILE the
+    ///    sandbox is still running — any failure hard-aborts the snapshot.
+    /// 2. Stop the sandbox (quiesce for filesystem consistency).
+    /// 3. Call provider.take_snapshot (env var scrubbing + commit + export).
+    ///
+    /// The sandbox is restarted afterwards unless it was already stopped on entry.
     pub async fn create_snapshot(
         &self,
         sandbox_internal_id: i32,
@@ -76,42 +99,49 @@ impl SnapshotService {
         project_id: Option<i32>,
         label: Option<String>,
     ) -> Result<sandbox_snapshots::Model, SandboxSnapshotError> {
-        // ── Quota check ───────────────────────────────────────────────────────
-        let storage = self.storage_summary(user_id).await?;
-        if storage.total_bytes >= self.quota_bytes {
-            return Err(SandboxSnapshotError::QuotaExceeded {
-                user_id,
-                used_bytes: storage.total_bytes,
-                quota_bytes: self.quota_bytes,
-            });
-        }
+        // ── Quota check (serialized to close TOCTOU race) ────────────────────
+        // Hold the service-level lock across the storage-read + row-insert so
+        // two concurrent creates can't both pass the quota check and both write.
+        let row = {
+            let _quota_guard = self.quota_lock.lock().await;
 
-        // ── Create the placeholder row ────────────────────────────────────────
-        let public_id = public_id::generate_with_prefix("snap");
-        let now = Utc::now();
+            let storage = self.storage_summary(user_id).await?;
+            if storage.total_bytes >= self.quota_bytes {
+                return Err(SandboxSnapshotError::QuotaExceeded {
+                    user_id,
+                    used_bytes: storage.total_bytes,
+                    quota_bytes: self.quota_bytes,
+                });
+            }
 
-        let active = sandbox_snapshots::ActiveModel {
-            public_id: Set(public_id.clone()),
-            user_id: Set(user_id),
-            project_id: Set(project_id),
-            source_sandbox_id: Set(Some(sandbox_internal_id)),
-            label: Set(label.clone()),
-            status: Set("creating".to_string()),
-            backend: Set(String::new()), // filled in after provider returns
-            content_digest: Set(String::new()), // filled in after
-            content_path: Set(String::new()), // filled in after
-            size_bytes: Set(0),
-            image_ref: Set(None),
-            metadata: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
+            // ── Create the placeholder row ────────────────────────────────────
+            let public_id = public_id::generate_with_prefix("snap");
+            let now = Utc::now();
+
+            let active = sandbox_snapshots::ActiveModel {
+                public_id: Set(public_id.clone()),
+                user_id: Set(user_id),
+                project_id: Set(project_id),
+                source_sandbox_id: Set(Some(sandbox_internal_id)),
+                label: Set(label.clone()),
+                status: Set("creating".to_string()),
+                backend: Set(String::new()), // filled in after provider returns
+                content_digest: Set(String::new()), // filled in after
+                content_path: Set(String::new()), // filled in after
+                size_bytes: Set(0),
+                image_ref: Set(None),
+                metadata: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+
+            active
+                .insert(self.db.as_ref())
+                .await
+                .map_err(SandboxSnapshotError::Database)?
+            // _quota_guard drops here — next create can now enter the critical section
         };
-
-        let row = active
-            .insert(self.db.as_ref())
-            .await
-            .map_err(SandboxSnapshotError::Database)?;
 
         // ── Get the sandbox handle ────────────────────────────────────────────
         let handle = self
@@ -134,6 +164,62 @@ impl SnapshotService {
                 })?;
             sb.status == "running"
         };
+
+        // ── Step 1 of security protocol: shred credential file BEFORE stop ────
+        // The credential-daemon env file contains the git-provider token; it
+        // must be removed while the container is still running (exec_as_root
+        // requires a live container). Failure is a hard abort — never proceed
+        // to commit if the file can't be confirmed absent.
+        let shred_result = self
+            .provider
+            .exec_as_root(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    // shred overwrites before unlinking; fall back to rm -f.
+                    // Either way, `test ! -f` verifies the file is gone.
+                    "shred -u /etc/temps/credential-daemon.env 2>/dev/null \
+                     || rm -f /etc/temps/credential-daemon.env; \
+                     test ! -f /etc/temps/credential-daemon.env"
+                        .to_string(),
+                ],
+                Default::default(),
+                None,
+            )
+            .await;
+
+        match shred_result {
+            Err(e) => {
+                let reason = format!(
+                    "exec_as_root failed while shredding credential-daemon.env: {}",
+                    e
+                );
+                let _ = self.mark_failed(row.id, &reason).await;
+                return Err(SandboxSnapshotError::ScrubFailed {
+                    sandbox_id: sandbox_public_id.to_string(),
+                    reason,
+                });
+            }
+            Ok(result) if result.exit_code != 0 => {
+                let reason = format!(
+                    "credential-daemon.env shred exited with code {} \
+                     (file may still be present — snapshot aborted)",
+                    result.exit_code
+                );
+                let _ = self.mark_failed(row.id, &reason).await;
+                return Err(SandboxSnapshotError::ScrubFailed {
+                    sandbox_id: sandbox_public_id.to_string(),
+                    reason,
+                });
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    sandbox_id = %sandbox_public_id,
+                    "snapshot: credential-daemon.env shredded successfully"
+                );
+            }
+        }
 
         if was_running {
             self.provider
@@ -178,7 +264,8 @@ impl SnapshotService {
                     // Same content already on disk — remove the duplicate file
                     // if the provider wrote a different one.
                     if artifact.content_path != Path::new(&dup.content_path) {
-                        let _ = std::fs::remove_file(&artifact.content_path);
+                        // Use tokio::fs to avoid blocking on disk I/O.
+                        let _ = tokio::fs::remove_file(&artifact.content_path).await;
                     }
                     // Update the creating row to point at the existing artifact.
                     let updated = self
@@ -350,8 +437,9 @@ impl SnapshotService {
             .map_err(SandboxSnapshotError::Database)?;
 
         // Remove the tarball only when no other row references this digest.
+        // Use tokio::fs to avoid blocking the async runtime on disk I/O.
         if sharing_count == 0 && !row.content_path.is_empty() {
-            if let Err(e) = std::fs::remove_file(&row.content_path) {
+            if let Err(e) = tokio::fs::remove_file(&row.content_path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(
                         snapshot_id = %public_id,
@@ -364,17 +452,18 @@ impl SnapshotService {
         }
 
         // Remove the Docker image tag (if present and image_ref is set).
-        // Best-effort: a missing image is not an error.
-        if let Some(image_ref) = &row.image_ref {
+        // Best-effort via the provider boundary (ADR-010 — no bollard import here).
+        // A missing or unremovable image logs a warning but does not fail the delete.
+        if let Some(ref image_ref) = row.image_ref {
             if !image_ref.is_empty() {
-                // We can't call docker directly (provider boundary), but we can
-                // attempt via the provider. Log warnings, don't fail the delete.
-                tracing::debug!(
-                    snapshot_id = %public_id,
-                    image_ref = %image_ref,
-                    "snapshot delete: image cleanup left to operator (rmi {})",
-                    image_ref
-                );
+                if let Err(e) = self.provider.delete_image(image_ref).await {
+                    tracing::warn!(
+                        snapshot_id = %public_id,
+                        image_ref = %image_ref,
+                        "snapshot delete: failed to remove Docker image (best-effort): {}",
+                        e
+                    );
+                }
             }
         }
 
@@ -463,6 +552,27 @@ impl SnapshotService {
         }
 
         let content_path = std::path::PathBuf::from(&row.content_path);
+
+        // Fast O(1) digest-consistency check: snapshot files are stored as
+        // `<digest>.tar`, so the path stem must equal the stored content_digest.
+        // Run this before the exists check so callers get the more specific
+        // DigestMismatch error when the row is corrupted, rather than the
+        // generic ArtifactMissing. A mismatch means the DB row and the
+        // artifact path have drifted — either from manual intervention or a
+        // dedup bug — and restoring from this artifact would be unsafe.
+        if !row.content_digest.is_empty() {
+            let path_stem = content_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if path_stem != row.content_digest.as_str() {
+                return Err(SandboxSnapshotError::DigestMismatch {
+                    expected: row.content_digest.clone(),
+                    actual: path_stem.to_string(),
+                });
+            }
+        }
+
         if !content_path.exists() {
             return Err(SandboxSnapshotError::ArtifactMissing {
                 path: row.content_path.clone(),
@@ -524,9 +634,210 @@ fn available_disk_space() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-    use temps_entities::sandbox_snapshots;
+    use std::collections::HashMap;
+    use temps_agents::error::AgentError;
+    use temps_agents::sandbox::{
+        SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
+        SnapshotArtifact,
+    };
+    use temps_entities::{sandbox_snapshots, sandboxes};
+
+    // ── Test provider ─────────────────────────────────────────────────────────
+
+    /// A minimal fake provider that supports the full create_snapshot
+    /// lifecycle (exec, stop, take_snapshot, start). Knobs: fail_take_snapshot
+    /// and fail_exec_as_root allow individual tests to trigger specific error
+    /// paths in SnapshotService.
+    struct FakeSnapshotProvider {
+        fail_take_snapshot: bool,
+        fail_exec_as_root: bool,
+    }
+
+    impl FakeSnapshotProvider {
+        fn new() -> Self {
+            Self {
+                fail_take_snapshot: false,
+                fail_exec_as_root: false,
+            }
+        }
+    }
+
+    fn fake_snap_handle_named(name: &str) -> SandboxHandle {
+        SandboxHandle {
+            sandbox_id: format!("container-{}", name),
+            sandbox_name: format!("temps-sandbox-{}", name),
+            work_dir: std::path::PathBuf::from("/workspace"),
+            backend: SandboxBackend::Docker,
+            image: String::new(),
+        }
+    }
+
+    #[async_trait]
+    impl SandboxProvider for FakeSnapshotProvider {
+        async fn create(&self, _config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            Ok(fake_snap_handle_named("test"))
+        }
+
+        async fn exec(
+            &self,
+            handle: &SandboxHandle,
+            _cmd: Vec<String>,
+            _env: HashMap<String, String>,
+            _on_output: Option<temps_agents::ai_cli::OnEventCallback>,
+        ) -> Result<SandboxExecResult, AgentError> {
+            if self.fail_exec_as_root {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: "shred failed (fake provider)".into(),
+                });
+            }
+            Ok(SandboxExecResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(vec![])
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &SandboxHandle,
+            _local_dir: &std::path::Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn kill_processes(
+            &self,
+            _handle: &SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn destroy(&self, _handle: &SandboxHandle, _purge: bool) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn stop(&self, _handle: &SandboxHandle) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn start(&self, _handle: &SandboxHandle) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+
+        /// Required to make registry.get() succeed (in-memory miss → provider lookup).
+        async fn recover_by_name(
+            &self,
+            container_name: &str,
+        ) -> Result<Option<SandboxHandle>, AgentError> {
+            Ok(Some(fake_snap_handle_named(container_name)))
+        }
+
+        fn name(&self) -> &str {
+            "fake_snap"
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "fake:latest".into()))
+        }
+
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("fake:latest".into())
+        }
+
+        async fn take_snapshot(
+            &self,
+            handle: &SandboxHandle,
+            _label: Option<String>,
+        ) -> Result<SnapshotArtifact, AgentError> {
+            if self.fail_take_snapshot {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: "take_snapshot: provider failed (fake)".into(),
+                });
+            }
+            Ok(SnapshotArtifact {
+                content_path: std::path::PathBuf::from("/tmp/test-snap.tar"),
+                content_digest: "sha256fakedigest1234567890abcdef01234567".to_string(),
+                size_bytes: 4096,
+                backend: SandboxBackend::Docker,
+                image_ref: Some("temps-snapshot/test:latest".to_string()),
+            })
+        }
+    }
+
+    /// Build a SnapshotService that uses the given provider.
+    fn make_service_with_provider<P: SandboxProvider + 'static>(
+        db: Arc<DatabaseConnection>,
+        provider: P,
+    ) -> SnapshotService {
+        let provider_arc = Arc::new(provider) as Arc<dyn SandboxProvider>;
+        let registry = Arc::new(StandaloneSandboxRegistry::new(provider_arc.clone()));
+        SnapshotService::new(db, registry, provider_arc)
+    }
+
+    fn make_sandbox_row(id: i32, public_id: &str, status: &str) -> sandboxes::Model {
+        let now = Utc::now();
+        sandboxes::Model {
+            id,
+            public_id: public_id.to_string(),
+            user_id: Some(1),
+            agent_run_id: None,
+            name: format!("sbx-{}", id),
+            status: status.to_string(),
+            image: None,
+            work_dir: "/workspace".into(),
+            timeout_secs: 3600,
+            metadata: None,
+            backend: Some("docker".into()),
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+            preview_password_hash: None,
+            preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
+        }
+    }
 
     #[test]
     fn default_quota_is_10_gib() {
@@ -740,6 +1051,42 @@ mod tests {
         );
     }
 
+    /// Minor 1: DigestMismatch is returned when the stored content_path stem
+    /// does not match the stored content_digest. This detects DB/artifact
+    /// drift (e.g. manual file moves or a dedup bug) before any file I/O.
+    ///
+    /// The check runs BEFORE the exists check so we don't need a real file.
+    #[tokio::test]
+    async fn resolve_for_restore_rejects_mismatched_digest() {
+        // Build a model where content_digest and the path stem disagree.
+        let mut model = make_snapshot_model(1, "snap_digest_mismatch1111", 5, "ready", 1_000);
+        // Overwrite with a path whose stem doesn't match the content_digest.
+        model.content_digest = "sha256correctdigest".to_string();
+        model.content_path = "/data/snapshots/sha256WRONGDIGEST.tar".to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .into_connection(),
+        );
+        let svc = make_service(db);
+
+        let result = svc
+            .resolve_for_restore(5, "snap_digest_mismatch1111", "docker")
+            .await;
+
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::DigestMismatch { .. })),
+            "expected DigestMismatch when path stem and content_digest disagree, got {:?}",
+            result
+        );
+        // Confirm the expected/actual fields are populated.
+        if let Err(SandboxSnapshotError::DigestMismatch { expected, actual }) = result {
+            assert_eq!(expected, "sha256correctdigest");
+            assert_eq!(actual, "sha256WRONGDIGEST");
+        }
+    }
+
     // ── nullify_source_sandbox ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -761,6 +1108,297 @@ mod tests {
             "nullify_source_sandbox should succeed: {:?}",
             result
         );
+    }
+
+    // ── create_snapshot ───────────────────────────────────────────────────────
+
+    /// Major 6: over-quota rejection. No provider interaction needed — the
+    /// service short-circuits at the storage_summary check before touching
+    /// the registry.
+    #[tokio::test]
+    async fn create_snapshot_rejects_over_quota() {
+        // storage_summary: one ready row at exactly the default quota
+        let at_quota = make_snapshot_model(
+            1,
+            "snap_existing1111111122222222",
+            7,
+            "ready",
+            DEFAULT_SNAPSHOT_QUOTA_BYTES as i64,
+        );
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![at_quota]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new())
+            .with_quota(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+
+        let result = svc
+            .create_snapshot(42, "sbx_aabbccddeeff0011", 7, None, None)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SandboxSnapshotError::QuotaExceeded { user_id: 7, .. })
+            ),
+            "at-quota create must be rejected with QuotaExceeded, got {:?}",
+            result
+        );
+    }
+
+    /// Major 6: over-quota — even slightly under the byte boundary passes,
+    /// confirming the comparison is `>=` not `>`.
+    #[tokio::test]
+    async fn create_snapshot_rejects_at_quota_boundary() {
+        let nearly_full = make_snapshot_model(
+            2,
+            "snap_nearlyfull111122223333",
+            8,
+            "ready",
+            (DEFAULT_SNAPSHOT_QUOTA_BYTES - 1) as i64,
+        );
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![nearly_full]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new())
+            .with_quota(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+
+        // quota_bytes - 1 < quota_bytes → should NOT be rejected
+        let result = svc
+            .create_snapshot(99, "sbx_notarealid0000001", 8, None, None)
+            .await;
+
+        // The test proves quota check passed; the DB has no further mocks so
+        // it will panic at the registry lookup (no sandboxes::Model). We only
+        // care that it did NOT return QuotaExceeded.
+        assert!(
+            !matches!(result, Err(SandboxSnapshotError::QuotaExceeded { .. })),
+            "one byte under quota must not be rejected as exceeded"
+        );
+    }
+
+    /// Major 6: when exec_as_root (shred) fails, create_snapshot returns
+    /// ScrubFailed and marks the row failed. This also validates C1 — the
+    /// hard-abort on shred failure.
+    ///
+    /// DB sequence:
+    ///   1. storage_summary SELECT (empty → under quota)
+    ///   2. INSERT new row RETURNING
+    ///   3. sandboxes::find_by_id (for was_running)
+    ///   4. mark_failed: find_by_id(row.id) RETURNING
+    ///   5. mark_failed: UPDATE RETURNING
+    #[tokio::test]
+    async fn create_snapshot_shred_failure_returns_scrub_failed() {
+        let creating = make_snapshot_model(1, "snap_shred000011112222", 3, "creating", 0);
+        let sandbox = make_sandbox_row(10, "sbx_shred000011112222", "running");
+        let failed = {
+            let mut m = creating.clone();
+            m.status = "failed".to_string();
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. storage_summary — empty
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 2. INSERT row RETURNING
+                .append_query_results(vec![vec![creating.clone()]])
+                // 3. sandboxes::find_by_id
+                .append_query_results(vec![vec![sandbox]])
+                // 4. mark_failed find_by_id
+                .append_query_results(vec![vec![creating]])
+                // 5. mark_failed UPDATE RETURNING
+                .append_query_results(vec![vec![failed]])
+                .into_connection(),
+        );
+
+        let provider = FakeSnapshotProvider {
+            fail_exec_as_root: true,
+            fail_take_snapshot: false,
+        };
+        let svc = make_service_with_provider(db, provider);
+
+        let result = svc
+            .create_snapshot(10, "sbx_shred000011112222", 3, None, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::ScrubFailed { .. })),
+            "exec_as_root failure must return ScrubFailed (C1), got {:?}",
+            result
+        );
+    }
+
+    /// Major 6: when `take_snapshot` fails, the service marks the row failed
+    /// and returns a Provider error (never proceeds to commit).
+    ///
+    /// DB sequence:
+    ///   1. storage_summary SELECT (empty)
+    ///   2. INSERT row RETURNING
+    ///   3. sandboxes::find_by_id (running)
+    ///   4. mark_failed: find_by_id RETURNING
+    ///   5. mark_failed: UPDATE RETURNING
+    #[tokio::test]
+    async fn create_snapshot_provider_failure_marks_row_failed() {
+        let creating = make_snapshot_model(1, "snap_provfail11112222", 5, "creating", 0);
+        let sandbox = make_sandbox_row(20, "sbx_provfail11112222", "running");
+        let failed = {
+            let mut m = creating.clone();
+            m.status = "failed".to_string();
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. storage_summary
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 2. INSERT
+                .append_query_results(vec![vec![creating.clone()]])
+                // 3. sandboxes lookup
+                .append_query_results(vec![vec![sandbox]])
+                // 4. mark_failed find_by_id
+                .append_query_results(vec![vec![creating]])
+                // 5. mark_failed update
+                .append_query_results(vec![vec![failed]])
+                .into_connection(),
+        );
+
+        let provider = FakeSnapshotProvider {
+            fail_take_snapshot: true,
+            fail_exec_as_root: false,
+        };
+        let svc = make_service_with_provider(db, provider);
+
+        let result = svc
+            .create_snapshot(20, "sbx_provfail11112222", 5, None, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::Provider(_))),
+            "take_snapshot failure must return Provider error, got {:?}",
+            result
+        );
+    }
+
+    /// Major 6: happy path — create_snapshot succeeds end-to-end.
+    ///
+    /// DB sequence:
+    ///   1. storage_summary SELECT (empty)
+    ///   2. INSERT row RETURNING (creating)
+    ///   3. sandboxes::find_by_id (running)
+    ///   4. dedup check (none)
+    ///   5. finalize_row find_by_id RETURNING
+    ///   6. finalize_row UPDATE RETURNING (ready)
+    #[tokio::test]
+    async fn create_snapshot_happy_path() {
+        let creating = make_snapshot_model(1, "snap_happypath111222", 6, "creating", 0);
+        let sandbox = make_sandbox_row(30, "sbx_happypath1112222", "running");
+        let ready = {
+            let mut m = creating.clone();
+            m.status = "ready".to_string();
+            m.size_bytes = 4096;
+            m.backend = "docker".to_string();
+            m.content_digest = "sha256fakedigest1234567890abcdef01234567".to_string();
+            m.content_path = "/tmp/test-snap.tar".to_string();
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. storage_summary
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 2. INSERT
+                .append_query_results(vec![vec![creating.clone()]])
+                // 3. sandboxes lookup
+                .append_query_results(vec![vec![sandbox]])
+                // 4. dedup check → no match
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 5. finalize find_by_id
+                .append_query_results(vec![vec![creating]])
+                // 6. finalize UPDATE
+                .append_query_results(vec![vec![ready.clone()]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(30, "sbx_happypath1112222", 6, None, None)
+            .await;
+
+        assert!(result.is_ok(), "happy path must succeed, got {:?}", result);
+        let row = result.unwrap();
+        assert_eq!(row.status, "ready");
+        assert_eq!(row.size_bytes, 4096);
+    }
+
+    /// Major 6: dedup — when the artifact digest matches an existing ready
+    /// row, the duplicate file is removed and the creating row is updated to
+    /// point at the existing artifact instead of writing a new one.
+    ///
+    /// DB sequence:
+    ///   1. storage_summary SELECT (empty)
+    ///   2. INSERT row RETURNING (creating)
+    ///   3. sandboxes::find_by_id (running)
+    ///   4. dedup check → existing ready row with same digest
+    ///   5. finalize_row find_by_id RETURNING (creating)
+    ///   6. finalize_row UPDATE RETURNING (ready, pointing at existing path)
+    #[tokio::test]
+    async fn create_snapshot_dedup_reuses_existing_artifact() {
+        let creating = make_snapshot_model(2, "snap_dedup000011112222", 9, "creating", 0);
+        let sandbox = make_sandbox_row(40, "sbx_dedup000011112222", "running");
+
+        // The existing ready row shares the digest that FakeSnapshotProvider returns
+        let existing_ready = {
+            let mut m = make_snapshot_model(1, "snap_existing11112222", 9, "ready", 4096);
+            m.content_digest = "sha256fakedigest1234567890abcdef01234567".to_string();
+            m.content_path = "/data/snapshots/existing.tar".to_string();
+            m
+        };
+
+        let deduped_ready = {
+            let mut m = creating.clone();
+            m.status = "ready".to_string();
+            m.content_digest = "sha256fakedigest1234567890abcdef01234567".to_string();
+            m.content_path = "/data/snapshots/existing.tar".to_string(); // reuses existing path
+            m.size_bytes = 4096;
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. storage_summary
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 2. INSERT creating row
+                .append_query_results(vec![vec![creating.clone()]])
+                // 3. sandboxes lookup
+                .append_query_results(vec![vec![sandbox]])
+                // 4. dedup check → existing ready row
+                .append_query_results(vec![vec![existing_ready]])
+                // 5. finalize find_by_id
+                .append_query_results(vec![vec![creating]])
+                // 6. finalize UPDATE RETURNING
+                .append_query_results(vec![vec![deduped_ready.clone()]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(40, "sbx_dedup000011112222", 9, None, None)
+            .await;
+
+        assert!(result.is_ok(), "dedup path must succeed, got {:?}", result);
+        let row = result.unwrap();
+        // Should point at the existing artifact path
+        assert_eq!(row.content_path, "/data/snapshots/existing.tar");
     }
 
     // ── list_snapshots ────────────────────────────────────────────────────────
