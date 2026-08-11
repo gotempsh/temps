@@ -1068,6 +1068,12 @@ All use `TEMPS_` prefix:
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
 
+Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
+
+| Variable | Default | Required |
+|---|---|---|
+| `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` | unset (clean up) | No -- set to any value to keep `/tmp/temps-deployments/deployment-*` directories after a deployment finishes or fails, for inspecting a build/download issue. Restart the server to change. |
+
 ---
 
 ## Quick Reference Checklists
