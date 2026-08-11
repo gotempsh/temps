@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -47,6 +48,17 @@ func main() {
 	dsn := os.Getenv("POSTGRES_URL")
 	if dsn == "" {
 		log.Fatal("POSTGRES_URL not set")
+	}
+	// DNS-focused scenarios can preserve every injected credential/database
+	// field while replacing only the address with a published *.temps.local
+	// service-member record.
+	if dnsAddress := os.Getenv("POSTGRES_DNS_ADDRESS"); dnsAddress != "" {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			log.Fatalf("parse POSTGRES_URL: %v", err)
+		}
+		parsed.Host = dnsAddress
+		dsn = parsed.String()
 	}
 	// The injected DSN carries no sslmode param, and lib/pq defaults to
 	// requiring SSL -- the managed container is plain internal Docker
@@ -93,6 +105,21 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]int{"count": count})
+	})
+	mux.HandleFunc("/database-info", func(w http.ResponseWriter, r *http.Request) {
+		parsedDSN, err := url.Parse(dsn)
+		if err != nil {
+			http.Error(w, "invalid POSTGRES_URL", http.StatusInternalServerError)
+			return
+		}
+		if err := db.PingContext(r.Context()); err != nil {
+			http.Error(w, "database ping failed", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"database_host": parsedDSN.Host,
+		})
 	})
 
 	port := os.Getenv("PORT")
@@ -181,6 +208,7 @@ export async function buildHaProbeImage(opts: {
   scratchRoot: string
   registry: string
   tag?: string
+  push?: boolean
   onLog?: (line: string) => void
 }): Promise<string> {
   const ctxDir = join(opts.scratchRoot, 'db-probe-ha')
@@ -194,8 +222,10 @@ export async function buildHaProbeImage(opts: {
 
   opts.onLog?.(`docker build -t ${imageRef} ${ctxDir}`)
   await runDocker(['build', '--load', '-t', imageRef, ctxDir], opts.onLog, `docker build ${imageRef}`)
-  opts.onLog?.(`docker push ${imageRef}`)
-  await runDocker(['push', imageRef], opts.onLog, `docker push ${imageRef}`)
+  if (opts.push !== false) {
+    opts.onLog?.(`docker push ${imageRef}`)
+    await runDocker(['push', imageRef], opts.onLog, `docker push ${imageRef}`)
+  }
   return imageRef
 }
 

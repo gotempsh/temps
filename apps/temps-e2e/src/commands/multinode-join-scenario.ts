@@ -66,15 +66,22 @@
  *  10. real HTTP proof of life: hit the deployed app through the
  *      control-plane's proxy (localhost:18180) with the app's Host header
  *      and assert a real response body, not just a healthy status field.
- *  11. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+ *  11. enable the opt-in cluster resolver, deploy a second unprivileged
+ *      application on the worker, and `docker exec` its `wget` against
+ *      `production.<project>.temps.local`. This proves application DNS from
+ *      inside a real deployed container, not from the host test process.
+ *  12. create a real Postgres HA service and a linked Go probe application.
+ *      The probe replaces only the linked DSN's address with the published
+ *      service-member FQDN, then performs a real INSERT + SELECT through it.
+ *  13. drain the worker (`POST /internal/nodes/{id}/drain`), poll
  *      `GET /internal/nodes/{id}/drain` until `drain_complete`, then
  *      re-run the same `docker ps` side-channel check on both containers —
  *      in this 2-node cluster the container has nowhere to go but the
  *      control plane, so this also implicitly re-tests the `Local`
  *      fallback scheduling path.
- *  12. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
+ *  14. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
  *      it's gone from `GET /internal/nodes`.
- *  13. teardown (in a `finally`, matching every other scenario's
+ *  15. teardown (in a `finally`, matching every other scenario's
  *      discipline): `docker compose down` (no `-v`, so the cache volumes —
  *      cargo registry/git + workspace target/ — survive for a fast
  *      re-run), then explicitly `docker volume rm` the identity/state
@@ -86,10 +93,16 @@
  *      cluster behind, not just one container.
  */
 import { fileURLToPath } from 'node:url'
+import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import {
   updateEnvironmentSettings,
   deployFromImage,
+  createEnvironmentVariable,
+  createService,
+  getService,
+  getClusterHealth,
+  linkServiceToProject,
   adminListNodes,
   adminDrainNode,
   adminDrainStatus,
@@ -106,6 +119,7 @@ import {
   makeRunId,
   pollUntil,
 } from '../lib/flows.ts'
+import { buildHaProbeImage } from '../lib/probe-app.ts'
 import type { Client } from '@temps-sdk/api/client'
 
 // apps/temps-e2e/src/commands/ -> repo root is 4 levels up.
@@ -117,6 +131,8 @@ const WORKER_CONTAINER = 'temps-e2e-mn-worker-1'
 const WORKER_NAME = 'worker-1'
 const CONTROL_PLANE_URL = 'http://localhost:18180'
 const POSTGRES_DIRECT_URL = 'postgres://temps:temps@10.52.0.5:5432/temps'
+const PROBE_SCRATCH_ROOT = path.join(process.env.TMPDIR ?? '/tmp', 'temps-e2e-multinode-dns')
+const POSTGRES_PRIMARY_STATES = new Set(['primary', 'single', 'wait_primary'])
 const IDENTITY_VOLUMES = [
   'temps-e2e-mn-postgres-data',
   'temps-e2e-mn-cp-docker',
@@ -146,6 +162,10 @@ interface MultinodeJoinScenarioResult {
   ok: boolean
   workerNodeId?: number
   steps: StepLog[]
+}
+
+interface DatabaseInfoResponse {
+  database_host: string
 }
 
 /** Run a subcommand, streaming stdout/stderr line-by-line through onLog; throws on non-zero exit. */
@@ -209,6 +229,45 @@ async function runCaptured(
     proc.exited,
   ])
   return { code, stdout, stderr }
+}
+
+/** Upload a host-built Docker image through Temps's registry-free image-upload API. */
+async function deployUploadedImage(opts: {
+  cfg: { url: string; apiKey: string }
+  projectId: number
+  environmentId: number
+  imageRef: string
+  runId: string
+}): Promise<number> {
+  await mkdir(PROBE_SCRATCH_ROOT, { recursive: true })
+  const hostTar = path.join(PROBE_SCRATCH_ROOT, `${opts.runId}.tar`)
+  try {
+    await runStreamed(
+      ['docker', 'save', '--output', hostTar, opts.imageRef],
+      () => {},
+      `docker save ${opts.imageRef}`,
+    )
+    const form = new FormData()
+    form.append('file', Bun.file(hostTar), `${opts.runId}.tar`)
+    const baseUrl = opts.cfg.url.replace(/\/+$/, '')
+    const query = new URLSearchParams({ tag: opts.imageRef, health_check_path: '/health' })
+    const response = await fetch(
+      `${baseUrl}/api/projects/${opts.projectId}/environments/${opts.environmentId}/deploy/image-upload?${query}`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${opts.cfg.apiKey}` },
+        body: form,
+      },
+    )
+    if (!response.ok) {
+      throw new Error(`image upload deployment failed (HTTP ${response.status}): ${await response.text()}`)
+    }
+    const deployment = (await response.json()) as { id?: number }
+    if (typeof deployment.id !== 'number') throw new Error('image upload deployment returned no deployment id')
+    return deployment.id
+  } finally {
+    await Bun.file(hostTar).delete().catch(() => {})
+  }
 }
 
 /** `docker inspect --format '{{.State.Health.Status}}' <name>`. Returns '' if the container doesn't exist yet. */
@@ -295,8 +354,10 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
   let client: Client | undefined
   let cfg: { url: string; apiKey: string } | undefined
   const projectIds: number[] = []
+  const serviceIds: number[] = []
   const deployments: { projectId: number; deploymentId: number }[] = []
   let workerNodeId: number | undefined
+  let databaseDnsAddress: string | undefined
   let clusterStartAttempted = false
   const revokeTemporaryApiKey = async () => {
     if (!clusterStartAttempted) return
@@ -325,6 +386,13 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         // Missing volumes are expected on a genuinely fresh run.
         await runCaptured(['docker', 'volume', 'rm', '-f', volume])
       }
+      // These named volumes are mounted below the read-only /workspace bind.
+      // runc cannot create their mountpoints through that parent on a clean
+      // checkout, so make the gitignored directories before Compose starts.
+      await Promise.all([
+        mkdir(path.join(REPO_ROOT, 'target'), { recursive: true }),
+        mkdir(path.join(REPO_ROOT, 'crates/temps-cli/dist'), { recursive: true }),
+      ])
     })
 
     await step(
@@ -447,9 +515,9 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         '-d',
         'temps',
         '-c',
-        "SELECT data::jsonb->'multi_node'->>'require_mtls', data::jsonb->'multi_node'->>'legacy_shared_token_enabled', used_count, max_uses FROM settings CROSS JOIN node_enrollment_tokens WHERE settings.id = 1",
+        "SELECT data::jsonb->'multi_node'->>'require_mtls', data::jsonb->'multi_node'->>'legacy_shared_token_enabled', data::jsonb->'cluster_dns'->>'enabled', used_count, max_uses FROM settings CROSS JOIN node_enrollment_tokens WHERE settings.id = 1",
       ])
-      if (posture.code !== 0 || posture.stdout.trim() !== 'true|false|1|1') {
+      if (posture.code !== 0 || posture.stdout.trim() !== 'true|false|true|1|1') {
         throw new Error(`unexpected enrollment posture: ${posture.stdout.trim() || posture.stderr.trim() || '(no output)'}`)
       }
     })
@@ -512,7 +580,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
             dockerPsNames(WORKER_CONTAINER),
             dockerPsNames(CONTROL_PLANE_CONTAINER),
           ])
-          return workerContainers.some((n) => n.includes(runId))
+          return workerContainers.some((n) => n.includes(project.slug))
         },
         (found) => found,
         {
@@ -522,7 +590,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
           label: "deployment container to appear on worker-1's docker ps",
         },
       )
-      const onControlPlane = cpContainers.some((n) => n.includes(runId))
+      const onControlPlane = cpContainers.some((n) => n.includes(project.slug))
       if (onControlPlane) {
         throw new Error(
           `deployment container unexpectedly found on the control plane's docker ps (containers: ${cpContainers.join(', ') || '(none)'}) -- target_nodes pinning did not take effect`,
@@ -533,6 +601,275 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
     const target = resolveLoadTarget(cfg.url, env.mainUrl)
     await step('real HTTP proof of life through the control-plane proxy', () => waitForWhoami(target))
+
+    const dnsClientProject = await step('create a second application for app-to-app DNS', () =>
+      createE2eProject(client!, { name: `${runId}-dns-client`, exposedPort: 8080 }),
+    )
+    projectIds.push(dnsClientProject.id)
+    const dnsClientEnv = await step('resolve the DNS client production environment', () =>
+      getProductionEnvironment(client!, dnsClientProject.id),
+    )
+    await step('pin the DNS client application to the worker', async () => {
+      unwrap(
+        await updateEnvironmentSettings({
+          client: client!,
+          path: { project_id: dnsClientProject.id, env_id: dnsClientEnv.id },
+          body: { target_nodes: [workerNodeId!] },
+        }),
+        'updateEnvironmentSettings',
+      )
+    })
+    const dnsClientDeploymentId = await step('deploy unprivileged Nginx as the DNS client application', () =>
+      deployFromImage({
+        client: client!,
+        path: { project_id: dnsClientProject.id, environment_id: dnsClientEnv.id },
+        body: { image_ref: 'nginxinc/nginx-unprivileged:alpine' },
+      }).then((res) => unwrap(res, 'deployFromImage').id),
+    )
+    deployments.push({ projectId: dnsClientProject.id, deploymentId: dnsClientDeploymentId })
+    await step('wait for the DNS client deployment on the worker', async () => {
+      await waitForDeployment(client!, {
+        projectId: dnsClientProject.id,
+        deploymentId: dnsClientDeploymentId,
+        timeoutMs: 300_000,
+        onPoll: (status) => log(`    ...${status.state}`),
+      })
+      const status = await getDeployStatus(client!, dnsClientProject.id, dnsClientDeploymentId)
+      if (!status.ok) throw new Error(`DNS client deployment ${dnsClientDeploymentId} is in state "${status.state}"`)
+    })
+
+    await step('prove one deployed application reaches another through *.temps.local DNS', async () => {
+      const clientContainer = await pollUntil(
+        async () => (await dockerPsNames(WORKER_CONTAINER)).find((name) => name.includes(dnsClientProject.slug)),
+        (name) => name !== undefined,
+        { timeoutMs: 30_000, intervalMs: 1000, label: 'DNS client container to appear on the worker' },
+      )
+      const appUrl = `http://production.${project.slug}.temps.local`
+      const request = await pollUntil(
+        () =>
+          runCaptured([
+            'docker',
+            'exec',
+            WORKER_CONTAINER,
+            'docker',
+            'exec',
+            clientContainer!,
+            'wget',
+            '-qO-',
+            appUrl,
+          ]),
+        (result) => result.code === 0,
+        {
+          timeoutMs: 60_000,
+          intervalMs: 2000,
+          onPoll: (result) => log(`    ...wget exit=${result.code}`),
+          label: `worker application to GET ${appUrl}`,
+        },
+      )
+      if (!request.stdout.includes('Hostname:')) {
+        throw new Error(`worker application received an unexpected response from ${appUrl}: ${request.stdout}`)
+      }
+      log(`  ${clientContainer} -> ${appUrl}`)
+    })
+
+    await step('remove the temporary DNS client application', async () => {
+      const cleanup = await teardown(client!, {
+        deployments: [{ projectId: dnsClientProject.id, deploymentId: dnsClientDeploymentId }],
+        projectIds: [dnsClientProject.id],
+      })
+      if (cleanup.errors.length) throw new Error(cleanup.errors.join('; '))
+      deployments.splice(deployments.findIndex((d) => d.deploymentId === dnsClientDeploymentId), 1)
+      projectIds.splice(projectIds.indexOf(dnsClientProject.id), 1)
+    })
+
+    const probeImage = await step('build the DNS/database probe image on the host', () =>
+      buildHaProbeImage({
+        scratchRoot: PROBE_SCRATCH_ROOT,
+        registry: 'unused',
+        tag: `temps-e2e-multinode-dns:${runId}`,
+        push: false,
+        onLog: (line) => log(`    [probe-build] ${line}`),
+      }),
+    )
+
+    const databaseService = await step('provision a real Postgres HA service with internal DNS', async () => {
+      const created = unwrap(
+        await createService({
+          client: client!,
+          body: {
+            name: `${runId}-dns-db`,
+            service_type: 'postgres',
+            topology: 'cluster',
+            parameters: { database: 'app', username: 'app' },
+            members: [
+              { role: 'monitor', node_id: null },
+              { role: 'replica', node_id: null },
+              { role: 'replica', node_id: null },
+            ],
+          },
+        }),
+        'createService',
+      ) as { id: number; name: string }
+      serviceIds.push(created.id)
+      return created
+    })
+
+    await step('wait for the Postgres cluster and DNS records to converge', async () => {
+      await pollUntil(
+        async () => unwrap(await getService({ client: client!, path: { id: databaseService.id } }), 'getService'),
+        (detail) => {
+          if (detail.service.status === 'failed') {
+            throw new Error(`cluster failed: ${detail.service.error_message ?? 'no error detail'}`)
+          }
+          const members = detail.service.members ?? []
+          return detail.service.status === 'running' && members.length === 3 && members.every((m) => m.status === 'running')
+        },
+        {
+          timeoutMs: 240_000,
+          intervalMs: 3000,
+          onPoll: (detail) =>
+            log(`    ...service=${detail.service.status} members=${(detail.service.members ?? []).map((m) => `${m.container_name}:${m.status}`).join(',')}`),
+          label: 'Postgres service and all members to report running',
+        },
+      )
+      await pollUntil(
+        async () => unwrap(await getClusterHealth({ client: client!, path: { id: databaseService.id } }), 'getClusterHealth'),
+        (health) =>
+          !health.monitor_error &&
+          health.members.length === 2 &&
+          health.members.filter((m) => POSTGRES_PRIMARY_STATES.has(m.reported_state)).length === 1 &&
+          health.members.every((m) => m.health === 1),
+        {
+          timeoutMs: 240_000,
+          intervalMs: 3000,
+          onPoll: (health) => log(`    ...${health.monitor_error ?? health.members.map((m) => `${m.nodename}:${m.reported_state}`).join(',')}`),
+          label: 'Postgres cluster health and role DNS records to converge',
+        },
+      )
+      const detail = unwrap(
+        await getService({ client: client!, path: { id: databaseService.id } }),
+        'getService',
+      )
+      const dataMember = (detail.service.members ?? []).find((member) => member.role !== 'monitor')
+      if (!dataMember || dataMember.port === undefined || dataMember.port === null) {
+        throw new Error('Postgres cluster returned no addressable data member')
+      }
+      databaseDnsAddress = `${databaseService.name}-${dataMember.ordinal}.${databaseService.name}.temps.local:${dataMember.port}`
+    })
+
+    const probeProject = await step('create a control-plane probe application', () =>
+      createE2eProject(client!, { name: `${runId}-dns-probe`, exposedPort: 3000 }),
+    )
+    projectIds.push(probeProject.id)
+    const probeEnv = await step('resolve the probe production environment', () =>
+      getProductionEnvironment(client!, probeProject.id),
+    )
+    await step('pin the database probe to the control plane and link the database', async () => {
+      unwrap(
+        await updateEnvironmentSettings({
+          client: client!,
+          path: { project_id: probeProject.id, env_id: probeEnv.id },
+          body: { target_nodes: [0] },
+        }),
+        'updateEnvironmentSettings',
+      )
+      unwrap(
+        await linkServiceToProject({
+          client: client!,
+          path: { id: databaseService.id },
+          body: { project_id: probeProject.id },
+        }),
+        'linkServiceToProject',
+      )
+      unwrap(
+        await createEnvironmentVariable({
+          client: client!,
+          path: { project_id: probeProject.id },
+          body: {
+            key: 'POSTGRES_DNS_ADDRESS',
+            value: databaseDnsAddress!,
+            environment_ids: [probeEnv.id],
+          },
+        }),
+        'createEnvironmentVariable',
+      )
+    })
+
+    const probeDeploymentId = await step('upload and deploy the probe image on the control plane', () =>
+      deployUploadedImage({
+        cfg: cfg!,
+        projectId: probeProject.id,
+        environmentId: probeEnv.id,
+        imageRef: probeImage,
+        runId,
+      }),
+    )
+    deployments.push({ projectId: probeProject.id, deploymentId: probeDeploymentId })
+    await step('wait for the DNS/database probe deployment', () =>
+      waitForDeployment(client!, {
+        projectId: probeProject.id,
+        deploymentId: probeDeploymentId,
+        timeoutMs: 300_000,
+        onPoll: (status) => log(`    ...${status.state}`),
+      }),
+    )
+
+    const probeTarget = resolveLoadTarget(cfg.url, probeEnv.mainUrl)
+    await step('prove the deployed application accesses Postgres through *.temps.local DNS', async () => {
+      const databaseInfo = await pollUntil(
+        async () => {
+          try {
+            const res = await fetch(`${probeTarget.url.replace(/\/+$/, '')}/database-info`, { headers: probeTarget.headers })
+            if (!res.ok) return { ok: false as const, detail: `HTTP ${res.status}: ${await res.text()}` }
+            return { ok: true as const, detail: (await res.json()) as DatabaseInfoResponse }
+          } catch (error) {
+            return { ok: false as const, detail: (error as Error).message }
+          }
+        },
+        (result) => result.ok,
+        {
+          timeoutMs: 90_000,
+          intervalMs: 2000,
+          onPoll: (result) => log(`    ...${result.ok ? 'connected' : result.detail}`),
+          label: 'probe application to reach Postgres through internal DNS',
+        },
+      )
+      if (!databaseInfo.ok) throw new Error(String(databaseInfo.detail))
+      if (!databaseInfo.detail.database_host.includes('.temps.local')) {
+        throw new Error(`injected POSTGRES_URL did not contain internal DNS hosts: ${databaseInfo.detail.database_host}`)
+      }
+
+      const write = await fetch(`${probeTarget.url.replace(/\/+$/, '')}/probe`, { headers: probeTarget.headers })
+      if (!write.ok) throw new Error(`database INSERT/SELECT probe failed (HTTP ${write.status}): ${await write.text()}`)
+      const body = (await write.json()) as { count?: number }
+      if (typeof body.count !== 'number' || body.count < 1) {
+        throw new Error(`database INSERT/SELECT returned an invalid row count: ${JSON.stringify(body)}`)
+      }
+      log(`  database=${databaseInfo.detail.database_host} rows=${body.count}`)
+    })
+
+    await step('remove DNS probe resources before draining the worker', async () => {
+      const cleanup = await teardown(client!, {
+        deployments: [{ projectId: probeProject.id, deploymentId: probeDeploymentId }],
+        projectIds: [probeProject.id],
+        serviceIds: [databaseService.id],
+      })
+      if (cleanup.errors.length) throw new Error(cleanup.errors.join('; '))
+      deployments.splice(deployments.findIndex((d) => d.deploymentId === probeDeploymentId), 1)
+      projectIds.splice(projectIds.indexOf(probeProject.id), 1)
+      serviceIds.splice(serviceIds.indexOf(databaseService.id), 1)
+      await pollUntil(
+        async () => {
+          const [worker, controlPlane] = await Promise.all([
+            dockerPsNames(WORKER_CONTAINER),
+            dockerPsNames(CONTROL_PLANE_CONTAINER),
+          ])
+          return [...worker, ...controlPlane].some((name) => name.includes(databaseService.name) || name.includes(probeProject.slug))
+        },
+        (found) => !found,
+        { timeoutMs: 90_000, intervalMs: 2000, label: 'probe and database containers to stop' },
+      )
+    })
 
     await step('drain the worker', async () => {
       unwrap(
@@ -572,8 +909,8 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
             dockerPsNames(CONTROL_PLANE_CONTAINER),
           ])
           return {
-            onWorker: workerContainers.some((n) => n.includes(runId)),
-            onControlPlane: cpContainers.some((n) => n.includes(runId)),
+            onWorker: workerContainers.some((n) => n.includes(project.slug)),
+            onControlPlane: cpContainers.some((n) => n.includes(project.slug)),
           }
         },
         (placement) => !placement.onWorker && placement.onControlPlane,
@@ -587,8 +924,8 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
           label: 'replacement container to become visible on the control plane after drain',
         },
       )
-      const onWorker = workerContainers.some((n) => n.includes(runId))
-      const onControlPlane = cpContainers.some((n) => n.includes(runId))
+      const onWorker = workerContainers.some((n) => n.includes(project.slug))
+      const onControlPlane = cpContainers.some((n) => n.includes(project.slug))
       if (onWorker) {
         throw new Error(
           `deployment container still present on worker-1's docker ps after drain (containers: ${workerContainers.join(', ')})`,
@@ -641,9 +978,9 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       // Best-effort SDK-level teardown first (project/deployments), then tear
       // down the cluster itself.
       if (client) {
-        const td = await teardown(client, { deployments, projectIds })
+        const td = await teardown(client, { deployments, projectIds, serviceIds })
         log(
-          `\n▶ teardown: tore down ${td.teardownDeployments} deployment(s), deleted ${td.deletedProjects} project(s)` +
+          `\n▶ teardown: tore down ${td.teardownDeployments} deployment(s), deleted ${td.deletedProjects} project(s), deleted ${td.deletedServices} service(s)` +
             (td.errors.length ? ` (${td.errors.length} errors)` : ''),
         )
         for (const e of td.errors) log(`    ! ${e}`)

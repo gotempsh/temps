@@ -160,6 +160,23 @@ if [[ ! -f "$MARKER" ]]; then
     " >/dev/null
   fi
 
+  # Internal *.temps.local resolution is still opt-in. Dedicated E2E
+  # topologies enable it before `temps serve` starts so both the control
+  # plane and joining workers launch their per-node DNS resolver. Keep the
+  # shared development cluster's default unchanged unless explicitly asked.
+  if [[ "${DEV_CLUSTER_ENABLE_DNS:-false}" == "true" ]]; then
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "
+      UPDATE settings
+         SET data = jsonb_set(
+                      COALESCE(data::jsonb, '{}'::jsonb),
+                      '{cluster_dns,enabled}',
+                      'true'::jsonb
+                    )::json
+       WHERE id = 1
+    " >/dev/null
+    log "enabled internal *.temps.local DNS for this cluster"
+  fi
+
   printf '%s\n' "$JOIN_TOKEN" > "$JOIN_TOKEN_FILE"
   chmod 600 "$JOIN_TOKEN_FILE"
 

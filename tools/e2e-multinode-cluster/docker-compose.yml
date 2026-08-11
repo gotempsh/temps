@@ -153,6 +153,7 @@ services:
       DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
       DEV_CLUSTER_USE_ENROLLMENT_TOKEN: "true"
       DEV_CLUSTER_ENROLLMENT_NODE_NAME: worker-1
+      DEV_CLUSTER_ENABLE_DNS: "true"
       # CI passes the musl binary already built for this commit. Local runs
       # leave this empty and the shared role script builds from source.
       DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}

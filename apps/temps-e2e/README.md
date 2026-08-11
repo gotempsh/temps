@@ -1247,15 +1247,24 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     control-plane's proxy (`localhost:18180`) with the app's `Host` header
     and assert the actual `traefik/whoami` response body, not just a
     healthy status field.
-11. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+11. deploy `nginxinc/nginx-unprivileged:alpine` as a second worker-pinned
+    application, then `docker exec` into it and `wget`
+    `http://production.<project>.temps.local`. The response must be the real
+    `whoami` body, proving app-to-app DNS from inside an application container.
+12. provision a real 1-monitor + 2-data-node Postgres HA service, link it to a
+    control-plane probe application, and replace only the injected DSN address
+    with the service member's published `.temps.local` FQDN. The probe must
+    report that DNS host and complete a real INSERT + SELECT. This catches DNS
+    records that resolve but advertise an unreachable IP/port pair.
+13. drain the worker (`POST /internal/nodes/{id}/drain`), poll
     `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
     same `docker ps` side-channel check on both containers to confirm the
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-12. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-13. teardown (in a `finally`, same discipline as every other scenario):
+15. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres
