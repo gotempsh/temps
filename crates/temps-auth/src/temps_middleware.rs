@@ -208,10 +208,7 @@ impl AuthMiddleware {
         if let Some(user) = user {
             req.extensions_mut().insert(user);
         }
-        let principal = auth_context
-            .as_ref()
-            .map(safe_principal)
-            .unwrap_or_else(SafePrincipal::anonymous);
+        let principal = safe_principal_for_request(&req, auth_context.as_ref());
         if let Some(auth_ctx) = auth_context {
             req.extensions_mut().insert(auth_ctx);
         }
@@ -314,6 +311,22 @@ fn safe_principal(auth: &crate::context::AuthContext) -> SafePrincipal {
         source,
         credential_id,
     }
+}
+
+/// Resolve audit attribution from the credential authenticated here or from a
+/// trusted context injected by an in-process caller before the router runs.
+///
+/// Normal HTTP credentials take precedence. A request extension cannot be
+/// supplied by an external HTTP caller, while delegated bridges such as the
+/// external-plugin host API use it to carry their already-verified actor.
+fn safe_principal_for_request(
+    req: &Request,
+    authenticated: Option<&crate::context::AuthContext>,
+) -> SafePrincipal {
+    authenticated
+        .or_else(|| req.extensions().get::<crate::context::AuthContext>())
+        .map(safe_principal)
+        .unwrap_or_else(SafePrincipal::anonymous)
 }
 
 fn matched_route_template(req: &Request) -> String {
@@ -443,6 +456,63 @@ mod tests {
         assert_eq!(event.denial_kind, "insufficient_permission");
         assert_eq!(event.required_permission.as_deref(), Some("projects:write"));
         assert_eq!(event.route, "/projects/{project_id}");
+    }
+
+    #[test]
+    fn delegated_auth_context_is_used_for_denial_attribution() {
+        let auth = crate::context::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::User),
+            Some(vec![Permission::ProjectsRead]),
+            "delegated-plugin-key".to_string(),
+            99,
+        );
+        let mut request = Request::new(axum::body::Body::empty());
+        request.extensions_mut().insert(auth);
+
+        let principal = safe_principal_for_request(&request, None);
+        let response = temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .permission_denial(
+                PermissionDenialKind::InsufficientPermission,
+                Some("projects:write".to_string()),
+            )
+            .build()
+            .into_response();
+        let event = permission_denial_event(
+            &response,
+            principal,
+            "POST".to_string(),
+            "/projects".to_string(),
+            None,
+            "plugin-channel".to_string(),
+        )
+        .expect("delegated permission denial should be audited");
+
+        assert_eq!(event.principal.user_id, Some(42));
+        assert_eq!(event.principal.source, AuthSourceKind::ApiKey);
+        assert_eq!(event.principal.credential_id, Some(99));
+    }
+
+    #[test]
+    fn authenticated_credential_takes_precedence_over_delegated_context() {
+        let mut delegated_user = test_user();
+        delegated_user.id = 7;
+        let delegated = crate::context::AuthContext::new_api_key(
+            delegated_user,
+            Some(Role::User),
+            Some(vec![Permission::ProjectsRead]),
+            "delegated-key".to_string(),
+            70,
+        );
+        let authenticated = crate::context::AuthContext::new_session(test_user(), Role::Admin);
+        let mut request = Request::new(axum::body::Body::empty());
+        request.extensions_mut().insert(delegated);
+
+        let principal = safe_principal_for_request(&request, Some(&authenticated));
+
+        assert_eq!(principal.user_id, Some(42));
+        assert_eq!(principal.source, AuthSourceKind::Session);
+        assert_eq!(principal.credential_id, None);
     }
 
     #[tokio::test(start_paused = true)]

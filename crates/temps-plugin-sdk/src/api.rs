@@ -111,7 +111,17 @@ pub struct NewService {
     pub parameters: std::collections::HashMap<String, String>,
     /// `standalone` unless the caller is building a cluster.
     pub topology: String,
-    pub members: Vec<i32>,
+    /// Cluster member specifications. Required when `topology` is `cluster`.
+    pub members: Vec<ClusterMemberRequest>,
+}
+
+/// Placement and service-specific role for one managed-service cluster member.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterMemberRequest {
+    /// Service-type-specific role, such as `primary`, `replica`, or `monitor`.
+    pub role: String,
+    /// Worker node on which to place the member, or the control plane when absent.
+    pub node_id: Option<i32>,
 }
 
 impl NewService {
@@ -735,6 +745,31 @@ mod tests {
     fn new_projects_never_auto_deploy() {
         assert!(!NewProject::static_files("demo", "vite").automatic_deploy);
         assert!(!NewProject::docker_image("demo", "dockerfile").automatic_deploy);
+    }
+
+    #[test]
+    fn cluster_members_serialize_with_role_and_optional_node_id() {
+        let mut service = NewService::postgres("database", "app", "app");
+        service.topology = "cluster".to_string();
+        service.members = vec![
+            ClusterMemberRequest {
+                role: "primary".to_string(),
+                node_id: Some(7),
+            },
+            ClusterMemberRequest {
+                role: "replica".to_string(),
+                node_id: None,
+            },
+        ];
+
+        let json = serde_json::to_value(service).expect("service request should serialize");
+        assert_eq!(
+            json["members"],
+            serde_json::json!([
+                {"role": "primary", "node_id": 7},
+                {"role": "replica", "node_id": null}
+            ])
+        );
     }
 
     #[test]
