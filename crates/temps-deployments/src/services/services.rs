@@ -1,14 +1,14 @@
 use futures::Stream;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    Set,
+    QuerySelect, Set,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
     deployment_container_logs, deployment_containers, deployment_domains, deployments,
-    environments, projects,
+    environments, nodes, projects,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -39,6 +39,23 @@ pub struct ContainerLogParams {
     pub tail: Option<String>,
     pub timestamps: bool,
     pub follow: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedContainerResourceLimits {
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerPresentationContext {
+    pub node_names: HashMap<i32, String>,
+    pub app_settings: temps_core::AppSettings,
+    pub environment_subdomain: String,
+    pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
+    pub resource_limits: ResolvedContainerResourceLimits,
 }
 
 #[derive(Error, Debug)]
@@ -130,9 +147,84 @@ pub struct DeploymentService {
     /// SAME resolved env (user vars, external-service vars, Sentry/OTel, API
     /// token) as a normal deploy — see [`crate::services::env_resolver`].
     env_resolver: std::sync::OnceLock<Arc<crate::services::env_resolver::DeploymentEnvResolver>>,
+    /// Late-bound Compose executor (the `Arc<bollard::Docker>` client it needs
+    /// is only constructed later in plugin init, after `DeploymentService`
+    /// itself). Set via [`Self::set_compose_executor`]. Used by
+    /// `cleanup_containers` to sweep Compose-managed volumes/networks -- which
+    /// individual `deployer.remove_container` calls never touch -- when a
+    /// project/environment that deployed via Docker Compose is deleted.
+    compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
 }
 
 impl DeploymentService {
+    pub async fn container_presentation_context(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        node_ids: &[i32],
+    ) -> Result<ContainerPresentationContext, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Project {project_id} not found while resolving container presentation"
+                ))
+            })?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Environment {environment_id} not found in project {project_id} while resolving container presentation"
+                ))
+            })?;
+        let app_settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::Other(format!(
+                "Failed to load application settings for containers in project {project_id}, environment {environment_id}: {error}"
+            ))
+        })?;
+        let node_names = if node_ids.is_empty() {
+            HashMap::new()
+        } else {
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|node| (node.id, node.name))
+                .collect()
+        };
+        let public_ports = match project.preset_config.as_ref() {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => {
+                config.public_ports.clone()
+            }
+            _ => Vec::new(),
+        };
+        let environment_config = environment.deployment_config.as_ref();
+        let project_config = project.deployment_config.as_ref();
+        let resolve =
+            |get: fn(&temps_entities::deployment_config::DeploymentConfig) -> Option<i32>| {
+                environment_config
+                    .and_then(get)
+                    .or_else(|| project_config.and_then(get))
+            };
+
+        Ok(ContainerPresentationContext {
+            node_names,
+            app_settings,
+            environment_subdomain: environment.subdomain,
+            public_ports,
+            resource_limits: ResolvedContainerResourceLimits {
+                cpu_request: resolve(|config| config.cpu_request),
+                cpu_limit: resolve(|config| config.cpu_limit),
+                memory_request: resolve(|config| config.memory_request),
+                memory_limit: resolve(|config| config.memory_limit),
+            },
+        })
+    }
+
     async fn cleanup_containers(
         &self,
         project_id: i32,
@@ -382,6 +474,45 @@ impl DeploymentService {
             }
         }
 
+        // Individual `deployer.remove_container` calls above remove Compose
+        // containers themselves, but never the volumes/networks `docker
+        // compose up` also creates for the stack -- those only carry the
+        // `com.docker.compose.project` label. Sweep them per environment
+        // (compose project names are `temps-{project_id}-{environment_id}`,
+        // see `DeployComposeJob`). Best-effort: a stuck volume/network must
+        // not block the deletion the caller is otherwise done with.
+        if let Some(compose_executor) = self.compose_executor.get() {
+            let compose_environment_ids: Vec<i32> = match environment_id {
+                Some(id) => vec![id],
+                None => environments::Entity::find()
+                    .filter(environments::Column::ProjectId.eq(project_id))
+                    .select_only()
+                    .column(environments::Column::Id)
+                    .into_tuple()
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(|error| temps_core::ContainerCleanupError::Discovery {
+                        project_id,
+                        environment_id,
+                        reason: format!(
+                            "failed to enumerate environments for Compose resource cleanup: {error}"
+                        ),
+                    })?,
+            };
+            for env_id in compose_environment_ids {
+                let compose_project_name = format!("temps-{project_id}-{env_id}");
+                if let Err(error) = compose_executor.destroy(&compose_project_name).await {
+                    warn!(
+                        project_id,
+                        environment_id = env_id,
+                        compose_project = %compose_project_name,
+                        %error,
+                        "Failed to clean up Compose-managed volumes/networks (best-effort)"
+                    );
+                }
+            }
+        }
+
         Ok(removed)
     }
 
@@ -446,6 +577,7 @@ impl DeploymentService {
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -456,6 +588,12 @@ impl DeploymentService {
         resolver: Arc<crate::services::env_resolver::DeploymentEnvResolver>,
     ) {
         let _ = self.env_resolver.set(resolver);
+    }
+
+    /// Late-bind the Compose executor (see the field docs). Called once
+    /// during plugin init after the `Arc<bollard::Docker>` client exists.
+    pub fn set_compose_executor(&self, executor: Arc<temps_deployer::compose::ComposeExecutor>) {
+        let _ = self.compose_executor.set(executor);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events
@@ -1416,6 +1554,7 @@ impl DeploymentService {
     pub async fn trigger_image_deployment(
         &self,
         project_id: i32,
+        target_environment_id: Option<i32>,
         image_ref: String,
         health_check_path: Option<String>,
     ) -> Result<(), DeploymentError> {
@@ -1434,6 +1573,7 @@ impl DeploymentService {
             .send(temps_core::Job::DeployImageRequested(
                 temps_core::DeployImageRequestedJob {
                     project_id,
+                    target_environment_id,
                     image_ref,
                     health_check_path,
                 },
@@ -1448,43 +1588,50 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Redeploy an environment using the context (branch, tag, commit) from its
-    /// latest successful deployment.  Used by node drain and failover — these
-    /// operations need to reschedule existing workloads, not start a fresh
-    /// deployment from scratch.
-    ///
-    /// Falls back to the environment's configured branch when no prior
-    /// deployment exists.
+    /// Redeploy the exact workload affected by node drain or failover.
     pub async fn redeploy_environment(
         &self,
         project_id: i32,
         environment_id: i32,
+        deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        // Find the latest successful deployment for this environment
-        let latest = deployments::Entity::find()
+        // Use the deployment that owns the affected containers. Selecting the
+        // newest row can race a concurrent failed/cancelled deploy and restore
+        // the wrong workload during failover.
+        let deploy = deployments::Entity::find_by_id(deployment_id)
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(vec!["deployed", "completed", "ready"]))
-            .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await
-            .map_err(|e| DeploymentError::Other(e.to_string()))?;
+            .map_err(|e| DeploymentError::Other(format!(
+                "Failed to load deployment {deployment_id} for project {project_id}, environment {environment_id}: {e}"
+            )))?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Deployment {deployment_id} was not found in project {project_id}, environment {environment_id}"
+                ))
+            })?;
 
-        let (branch, tag, commit) = if let Some(ref deploy) = latest {
-            (
-                deploy.branch_ref.clone(),
-                deploy.tag_ref.clone(),
-                deploy.commit_sha.clone(),
-            )
-        } else {
-            // No prior deployment — fall back to environment's branch
-            let env = temps_entities::environments::Entity::find_by_id(environment_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| DeploymentError::Other(e.to_string()))?;
-            let branch = env.and_then(|e| e.branch.filter(|b| !b.is_empty()));
-            (branch, None, None)
-        };
+        // Git-less deployments (docker_image source, e.g. imports or
+        // `deployFromImage`) have no branch/tag/commit to rebuild from —
+        // `trigger_pipeline` requires `repo_owner`/`repo_name` and fails with
+        // "Project repo_owner is missing" for these. Redeploy them from the
+        // same image instead, mirroring `trigger_image_deployment`.
+        if let Some(image_ref) = deploy
+            .metadata
+            .as_ref()
+            .and_then(|m| m.external_image_ref.clone())
+        {
+            return self
+                .trigger_image_deployment(project_id, Some(environment_id), image_ref, None)
+                .await;
+        }
+
+        let (branch, tag, commit) = (
+            deploy.branch_ref.clone(),
+            deploy.tag_ref.clone(),
+            deploy.commit_sha.clone(),
+        );
 
         self.trigger_pipeline(project_id, environment_id, branch, tag, commit)
             .await
@@ -4539,6 +4686,35 @@ mod tests {
         Ok(())
     }
 
+    fn spawn_test_readiness_proxy() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind rollback readiness proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make rollback readiness proxy nonblocking");
+        let address = listener.local_addr().expect("read readiness proxy address");
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("create async rollback readiness proxy");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
     fn create_deployment_service_for_test(
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
@@ -4548,12 +4724,13 @@ mod tests {
         // Create a minimal real config service for testing
         // We need to provide the database URL that the test database is using
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let proxy_address = spawn_test_readiness_proxy();
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
-                "127.0.0.1:8080".to_string(),
+                proxy_address,
                 test_db_url.to_string(),
                 None,
-                None,
+                Some("127.0.0.1:3001".to_string()),
             )
             .expect("Failed to create test server config"),
         );
@@ -4703,7 +4880,17 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
+    }
+
+    async fn configure_test_service_for_http_readiness(
+        service: &DeploymentService,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut settings = service.config_service.get_settings().await?;
+        settings.external_url = Some("http://temps-test.local".to_string());
+        service.config_service.update_settings(settings).await?;
+        Ok(())
     }
 
     /// Stub `get_container_info` so the runtime ownership check in
@@ -4772,6 +4959,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -5286,6 +5474,7 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test rollback
         let result = deployment_service
@@ -5402,6 +5591,7 @@ mod tests {
 
         // Default test service: image_exists -> true (image present locally).
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         let result = deployment_service
             .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
@@ -5636,6 +5826,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -6659,6 +6850,7 @@ mod tests {
         let environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test 1: Rollback to deployment2
         // Rollback now creates a NEW deployment record with is_rollback metadata
@@ -7097,6 +7289,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         };
 
         service
@@ -7121,7 +7314,7 @@ mod tests {
         let deployment_service = create_deployment_service_for_test(db);
 
         let result = deployment_service
-            .trigger_image_deployment(1, String::new(), None)
+            .trigger_image_deployment(1, None, String::new(), None)
             .await;
 
         assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
@@ -7140,6 +7333,7 @@ mod tests {
         deployment_service
             .trigger_image_deployment(
                 42,
+                Some(7),
                 "ghcr.io/org/app:latest".to_string(),
                 Some("/healthz".to_string()),
             )
@@ -7157,8 +7351,76 @@ mod tests {
         };
 
         assert_eq!(job.project_id, 42);
+        assert_eq!(job.target_environment_id, Some(7));
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_uses_affected_deployment_and_target_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, affected, _) = setup_test_deployment(&db).await?;
+
+        let mut affected_active: deployments::ActiveModel = affected.clone().into();
+        affected_active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.example/app:known-good".to_string()),
+            ..Default::default()
+        }));
+        affected_active.update(db.as_ref()).await?;
+
+        // A newer failed deployment must never supersede the workload whose
+        // container is actually being migrated.
+        deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("failed".to_string()),
+            slug: Set("failed-newer-deployment".to_string()),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata {
+                external_image_ref: Some("registry.example/app:failed".to_string()),
+                ..Default::default()
+            })),
+            created_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            updated_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db);
+        let mut receiver = service.queue_service.subscribe();
+        service
+            .redeploy_environment(project.id, environment.id, affected.id)
+            .await?;
+
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
+        assert_eq!(job.image_ref, "registry.example/app:known-good");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_rejects_deployment_from_another_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let service = create_deployment_service_for_test(db);
+
+        let result = service
+            .redeploy_environment(project.id, environment.id + 1, deployment.id)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
         Ok(())
     }
 }

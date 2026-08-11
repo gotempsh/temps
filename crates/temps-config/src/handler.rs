@@ -125,6 +125,12 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Port the main Pingora proxy listens on (parsed from `--address`), the
+    /// same value `ConfigService::proxy_port()` feeds into
+    /// `compute_deployment_url`/`compute_environment_url` when `external_url`
+    /// is unset. The console uses this to preview a project's real
+    /// `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
+    pub proxy_port: u16,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -337,6 +343,12 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            // Overridden by the handler via `with_proxy_port` — this struct
+            // has no access to `ConfigService` here, only the DB-backed
+            // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s
+            // own fallback so an un-reconciled response is never worse than
+            // that.
+            proxy_port: 8080,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -454,6 +466,13 @@ impl AppSettingsResponse {
         } else {
             MetricsStoreKind::TimescaleDb
         };
+        self
+    }
+
+    /// Sets the real proxy listener port, resolved from `ConfigService`
+    /// (unavailable to the plain `From<AppSettings>` conversion above).
+    fn with_proxy_port(mut self, proxy_port: u16) -> Self {
+        self.proxy_port = proxy_port;
         self
     }
 
@@ -935,6 +954,14 @@ pub struct UpdateCapabilityResponse {
     /// Most recent attempt, including one resolved during this boot — this is
     /// how the console reports the outcome of an update that restarted it.
     pub last_attempt: Option<temps_core::SelfUpdateAttempt>,
+    /// Number of migrations applied so far. `Some` while `phase` is `migrating`.
+    pub migrations_applied: Option<u32>,
+    /// Total migrations to be applied. `Some` once the migrate child has
+    /// reported its first `started` event.
+    pub migrations_total: Option<u32>,
+    /// Name of the migration currently running. `Some` while `phase` is
+    /// `migrating` and a migration step is in flight.
+    pub current_migration_name: Option<String>,
 }
 
 /// Optional pin for the version to install.
@@ -1008,6 +1035,9 @@ fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
         phase: temps_core::SelfUpdatePhase::Idle,
         phase_error: None,
         last_attempt: None,
+        migrations_applied: None,
+        migrations_total: None,
+        current_migration_name: None,
     }
 }
 
@@ -1109,6 +1139,9 @@ async fn get_update_capability(
         phase: capability.phase,
         phase_error: capability.phase_error,
         last_attempt: capability.last_attempt,
+        migrations_applied: capability.migrations_applied,
+        migrations_total: capability.migrations_total,
+        current_migration_name: capability.current_migration_name,
     }))
 }
 
@@ -1293,7 +1326,8 @@ async fn get_settings(
                 .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
-                .with_effective_timescale_state(policies, monitored_services_count);
+                .with_effective_timescale_state(policies, monitored_services_count)
+                .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
         Err(e) => {

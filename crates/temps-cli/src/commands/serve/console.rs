@@ -2232,7 +2232,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
         config.data_dir.clone(),
         config.database_url.clone(),
-    );
+    )
+    // Where this instance answers HTTP. A plugin's routes are only reachable
+    // through the proxy, so a plugin that has to hand out a URL to something
+    // outside the request (a sandboxed agent, a webhook receiver) cannot
+    // construct one without being told the address the proxy listens on.
+    .with_proxy_address(&config.address);
     let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
         external_plugin_config,
     ));
@@ -2973,6 +2978,17 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // the admin IP allowlist is active. The public surface is also the one that
     // exists in every topology (single- and dual-listener), so probes work
     // regardless of `console_admin_address`.
+    // The router plugins reach over the platform channel.
+    //
+    // Built from the same public + admin routes the console serves, but
+    // deliberately without the SPA fallback (a plugin wants the API, not
+    // index.html) and without the admin IP gate (that gate exists to keep
+    // browsers off the admin listener from untrusted networks; a channel
+    // call arrives in-process from a plugin the operator installed, and is
+    // authorised by an actor token plus the handler's own permission check).
+    let plugin_api_router =
+        Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
+
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .nest("/api", public_router)
@@ -3033,6 +3049,40 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let external_plugins_service = plugin_manager
         .service_context()
         .get_service::<temps_external_plugins::ExternalPluginsService>();
+
+    // Join the channel to the router now that both exist. Plugins connect
+    // during startup, before this router could possibly be assembled (it
+    // contains the external-plugin routes), so the bridge is installed into
+    // a shared slot the channel reads per call rather than passed at
+    // connect time.
+    if let Some(service) = external_plugins_service.clone() {
+        match plugin_manager
+            .service_context()
+            .get_service::<temps_auth::UserService>()
+        {
+            Some(user_service) => {
+                let bridge = Arc::new(temps_external_plugins::host_api::RouterHostApi::new(
+                    plugin_api_router,
+                    db.clone(),
+                    cookie_crypto.clone(),
+                    user_service,
+                ));
+                service.set_host_api(bridge).await;
+                // Same key the bridge verifies with, so a token this proxy
+                // mints is one the channel will accept.
+                service.set_actor_crypto(cookie_crypto.clone()).await;
+                info!("Plugin platform API bridge installed");
+            }
+            None => {
+                // Say so rather than leaving the slot empty and letting every
+                // plugin API call fail with a generic error later.
+                tracing::warn!(
+                    "UserService is not registered, so plugins cannot call the platform \
+                     API over the channel; plugin API calls will be refused"
+                );
+            }
+        }
+    }
 
     let shutdown_signal = {
         let svc = external_plugins_service.clone();

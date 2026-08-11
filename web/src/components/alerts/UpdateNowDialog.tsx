@@ -42,6 +42,7 @@ const PHASE_LABEL: Record<SelfUpdatePhase, string> = {
   downloading: 'Downloading…',
   verifying: 'Verifying checksum…',
   installing: 'Installing…',
+  migrating: 'Applying database migrations…',
   restarting: 'Restarting the server…',
   pending_restart: 'Installed — waiting for you to restart temps',
   failed: 'Failed',
@@ -187,6 +188,9 @@ export function UpdateNowDialog({
                   phase={phase}
                   waitedTooLong={waitedTooLong}
                   expectRestart={capability?.restart_mode !== 'manual'}
+                  migrationsApplied={capability?.migrations_applied ?? null}
+                  migrationsTotal={capability?.migrations_total ?? null}
+                  currentMigrationName={capability?.current_migration_name ?? null}
                 />
               ) : (
                 <ConfirmBody
@@ -330,10 +334,16 @@ function WatchingBody({
   phase,
   waitedTooLong,
   expectRestart,
+  migrationsApplied,
+  migrationsTotal,
+  currentMigrationName,
 }: {
   phase: SelfUpdatePhase
   waitedTooLong: boolean
   expectRestart: boolean
+  migrationsApplied: number | null
+  migrationsTotal: number | null
+  currentMigrationName: string | null
 }) {
   return (
     <>
@@ -341,6 +351,15 @@ function WatchingBody({
         <Loader2 className="h-4 w-4 animate-spin" />
         {PHASE_LABEL[phase] ?? 'Working…'}
       </p>
+
+      {phase === 'migrating' && (
+        <MigrationProgress
+          applied={migrationsApplied}
+          total={migrationsTotal}
+          currentName={currentMigrationName}
+        />
+      )}
+
       <p className="text-muted-foreground">
         {expectRestart
           ? 'The console loses contact with the server while it restarts — that is expected. This dialog reports the result as soon as it is back.'
@@ -360,6 +379,44 @@ function WatchingBody({
         </p>
       )}
     </>
+  )
+}
+
+function MigrationProgress({
+  applied,
+  total,
+  currentName,
+}: {
+  applied: number | null
+  total: number | null
+  currentName: string | null
+}) {
+  const hasCounts = applied !== null && total !== null && total > 0
+
+  return (
+    <div className="space-y-1 rounded border bg-muted/40 p-2 text-xs text-muted-foreground">
+      {hasCounts ? (
+        <>
+          <p className="font-medium text-foreground">
+            {applied} of {total} migration{total !== 1 ? 's' : ''} applied
+          </p>
+          {/* Progress bar */}
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-all duration-300"
+              style={{ width: `${Math.round((applied / total) * 100)}%` }}
+            />
+          </div>
+        </>
+      ) : (
+        <p>Checking for pending migrations…</p>
+      )}
+      {currentName && (
+        <p className="truncate font-mono" title={currentName}>
+          {currentName}
+        </p>
+      )}
+    </div>
   )
 }
 

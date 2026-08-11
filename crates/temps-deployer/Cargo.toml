@@ -39,6 +39,7 @@ utoipa = { workspace = true }
 flate2 = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

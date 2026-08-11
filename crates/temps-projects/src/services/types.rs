@@ -249,6 +249,15 @@ pub enum ProjectError {
     #[error("Failed to remove deployment containers for project {project_id}: {reason}")]
     DeploymentCleanupFailed { project_id: i32, reason: String },
 
+    #[error(
+        "Project {project_id} was saved, but its proxy routes could not be reloaded (queue: {queue_reason}; database notification: {database_reason})"
+    )]
+    RouteReloadFailed {
+        project_id: i32,
+        queue_reason: String,
+        database_reason: String,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 

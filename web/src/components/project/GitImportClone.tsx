@@ -1,13 +1,15 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
+  getRepositoryEnvExampleLiveOptions,
   createProjectMutation,
   getPublicBranchesOptions,
   detectPublicPresetsOptions,
+  detectPublicEnvExampleOptions,
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -380,7 +382,10 @@ export function GitImportClone({
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
   // Query for presets from authenticated connection
-  const { data: authenticatedPresetData } = useQuery({
+  const {
+    data: authenticatedPresetData,
+    refetch: refetchAuthenticatedPresetData,
+  } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: {
         repository_id: selectedRepository?.id || 0,
@@ -390,19 +395,20 @@ export function GitImportClone({
   })
 
   // Query for presets from public repository
-  const { data: publicPresetData } = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: parsedPublicRepo?.provider || 'github',
-        owner: parsedPublicRepo?.owner || '',
-        repo: parsedPublicRepo?.repo || '',
-      },
-      query: {
-        branch: selectedRepository?.default_branch,
-      },
-    }),
-    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-  })
+  const { data: publicPresetData, refetch: refetchPublicPresetData } =
+    useQuery({
+      ...detectPublicPresetsOptions({
+        path: {
+          provider: parsedPublicRepo?.provider || 'github',
+          owner: parsedPublicRepo?.owner || '',
+          repo: parsedPublicRepo?.repo || '',
+        },
+        query: {
+          branch: selectedRepository?.default_branch,
+        },
+      }),
+      enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+    })
 
   // Transform public preset data to match ProjectPresetResponse format (camelCase)
   const presetData = useGitUrl
@@ -416,6 +422,51 @@ export function GitImportClone({
         composeFiles: (p as any).compose_files as string[] | undefined,
       }))
     : authenticatedPresetData?.presets
+
+  // Query for env-example detection from authenticated connection
+  const { data: authenticatedEnvExampleData } = useQuery({
+    ...getRepositoryEnvExampleLiveOptions({
+      path: {
+        repository_id: selectedRepository?.id || 0,
+      },
+    }),
+    enabled: !useGitUrl && !!selectedRepository && !!selectedRepository?.id,
+  })
+
+  // Query for env-example detection from public repository
+  const { data: publicEnvExampleData } = useQuery({
+    ...detectPublicEnvExampleOptions({
+      path: {
+        provider: parsedPublicRepo?.provider || 'github',
+        owner: parsedPublicRepo?.owner || '',
+        repo: parsedPublicRepo?.repo || '',
+      },
+      query: {
+        branch: selectedRepository?.default_branch,
+      },
+    }),
+    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+  })
+
+  // Transform public env-example data to match the camelCase shape the
+  // authenticated endpoint already returns
+  const envExampleData = useMemo(
+    () =>
+      useGitUrl
+        ? {
+            path: publicEnvExampleData?.path ?? null,
+            variables: (publicEnvExampleData?.variables ?? []).map((v) => ({
+              key: v.key,
+              defaultValue: v.default_value,
+              description: v.description,
+            })),
+          }
+        : {
+            path: authenticatedEnvExampleData?.path ?? null,
+            variables: authenticatedEnvExampleData?.variables ?? [],
+          },
+    [useGitUrl, publicEnvExampleData, authenticatedEnvExampleData]
+  )
 
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
@@ -626,9 +677,26 @@ export function GitImportClone({
               selectedRepository.git_provider_connection_id ??
               Number(selectedConnection) ??
               0,
+            clone_url: selectedRepository.clone_url,
+            ssh_url: selectedRepository.ssh_url,
           }}
           connectionId={useGitUrl ? undefined : Number(selectedConnection)}
+          publicRepo={
+            useGitUrl && parsedPublicRepo
+              ? {
+                  provider: parsedPublicRepo.provider || 'github',
+                  owner: parsedPublicRepo.owner,
+                  repo: parsedPublicRepo.repo,
+                }
+              : null
+          }
           presetData={presetData}
+          onRefreshPresets={() =>
+            useGitUrl
+              ? refetchPublicPresetData()
+              : refetchAuthenticatedPresetData()
+          }
+          envExampleData={envExampleData}
           branches={branches?.branches}
           mode="wizard"
           onSubmit={async (data) => {
@@ -665,6 +733,14 @@ export function GitImportClone({
                         ? {
                             composePath:
                               (data as any).composePath || 'docker-compose.yml',
+                            ...(data.excludedServices &&
+                            data.excludedServices.length > 0
+                              ? { excludedServices: data.excludedServices }
+                              : {}),
+                            ...(data.composeServices &&
+                            data.composeServices.length > 0
+                              ? { composeServices: data.composeServices }
+                              : {}),
                           }
                         : undefined,
                   exposed_port:

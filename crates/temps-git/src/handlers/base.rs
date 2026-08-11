@@ -25,7 +25,7 @@ use tracing::info;
 
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_core::UtcDateTime;
-use temps_entities::git_provider_connections;
+use temps_entities::{git_provider_connections, preset::ComposePortMapping};
 use utoipa::ToSchema;
 
 /// Reject self-hosted Git provider URLs that point at internal infrastructure
@@ -151,6 +151,19 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/authentication_failed")
                 .with_title("Authentication Failed")
                 .with_detail(msg),
+            GitProviderError::PermissionDenied {
+                operation,
+                required_permission,
+                provider_message,
+            } => problem_new(StatusCode::FORBIDDEN)
+                .with_type("https://docs.temps.sh/errors/git_provider_permission_required")
+                .with_title("Git Provider Permission Required")
+                .with_detail(format!(
+                    "The git provider denied permission to {}. Grant '{}' to the credential for the target repository. Provider response: {}",
+                    operation, required_permission, provider_message
+                ))
+                .with_value("operation", operation)
+                .with_value("required_permission", required_permission),
             GitProviderError::ApiError(msg) => problem_new(StatusCode::BAD_GATEWAY)
                 .with_type("https://docs.temps.sh/errors/api_error")
                 .with_title("API Error")
@@ -390,6 +403,9 @@ pub struct ConnectionResponse {
     pub account_name: String,
     pub account_type: String,
     pub installation_id: Option<String>,
+    /// Whether this connection can make authenticated provider requests.
+    /// This exposes capability only; credential values are never serialized.
+    pub has_authenticated_credentials: bool,
     pub is_active: bool,
     pub is_expired: bool,
     pub syncing: bool,
@@ -412,8 +428,20 @@ pub struct ConnectionResponse {
     pub updated_at: UtcDateTime,
 }
 
+fn has_authenticated_credentials(
+    access_token: Option<&str>,
+    installation_id: Option<&str>,
+) -> bool {
+    access_token.is_some_and(|value| !value.trim().is_empty())
+        || installation_id.is_some_and(|value| !value.trim().is_empty())
+}
+
 impl From<git_provider_connections::Model> for ConnectionResponse {
     fn from(conn: git_provider_connections::Model) -> Self {
+        let has_authenticated_credentials = has_authenticated_credentials(
+            conn.access_token.as_deref(),
+            conn.installation_id.as_deref(),
+        );
         Self {
             id: conn.id,
             provider_id: conn.provider_id,
@@ -421,6 +449,7 @@ impl From<git_provider_connections::Model> for ConnectionResponse {
             account_name: conn.account_name,
             account_type: conn.account_type,
             installation_id: conn.installation_id,
+            has_authenticated_credentials,
             is_active: conn.is_active,
             is_expired: conn.is_expired,
             syncing: conn.syncing,
@@ -1291,7 +1320,7 @@ pub async fn get_repository_preset_by_name(
     // Calculate preset for this repository
     let preset_result = state
         .git_provider_manager
-        .calculate_repository_preset_live(repository.id, query.branch)
+        .calculate_repository_preset_live(repository.id, auth.user_id(), query.branch)
         .await?;
 
     Ok((
@@ -1629,6 +1658,20 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             "/repositories/{repository_id}/preset/live",
             get(get_repository_preset_live),
         )
+        // Repository env-example detection
+        .route(
+            "/repositories/{repository_id}/env-example/live",
+            get(get_repository_env_example_live),
+        )
+        // Repository compose-file service preview
+        .route(
+            "/repositories/{repository_id}/compose-file/live",
+            get(get_repository_compose_services_live),
+        )
+        .route(
+            "/repositories/{repository_id}/compose-file/preview",
+            post(get_repository_compose_preview),
+        )
         // Repository preset by owner/name
         .route(
             "/repositories/{owner}/{name}/preset",
@@ -1903,6 +1946,9 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
+        get_repository_env_example_live,
+        get_repository_compose_services_live,
+        get_repository_compose_preview,
         get_repository_preset_by_name,
         get_repository_by_name,
         get_repository_by_id,
@@ -1936,6 +1982,13 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             RepositoryResponse,
             RepositoryPresetResponse,
             ProjectPresetResponse,
+            RepositoryEnvExampleResponse,
+            EnvExampleVariableResponse,
+            RepositoryComposeServicesResponse,
+            ComposeServicePreviewResponse,
+            ComposePortMapping,
+            ComposePreviewRequest,
+            ComposePreviewResponse,
             RepositoryListQuery,
             SyncedRepositoryListQuery,
             RepositoryListResponse,
@@ -2399,6 +2452,28 @@ pub struct PresetLiveQuery {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvExampleVariableResponse {
+    /// Variable name (e.g. "DATABASE_URL")
+    pub key: String,
+    /// Placeholder/default value as written in the file (may be empty)
+    pub default_value: String,
+    /// Description derived from a `# comment` immediately preceding the
+    /// variable in the file, if any
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryEnvExampleResponse {
+    pub repository_id: i32,
+    /// Path of the detected env-example file (e.g. ".env.example"), `null`
+    /// if the repository has none
+    pub path: Option<String>,
+    pub variables: Vec<EnvExampleVariableResponse>,
+}
+
 #[utoipa::path(
     get,
     path = "/repositories/{repository_id}/preset/live",
@@ -2429,7 +2504,7 @@ pub async fn get_repository_preset_live(
     // Use only the service layer - no direct database access
     let preset_result = state
         .git_provider_manager
-        .calculate_repository_preset_live(repository_id, query.branch)
+        .calculate_repository_preset_live(repository_id, auth.user_id(), query.branch)
         .await?;
 
     Ok((
@@ -2455,6 +2530,226 @@ pub async fn get_repository_preset_live(
         }),
     ))
 }
+
+/// Detect and parse a `.env.example`-style file for a connected repository
+#[utoipa::path(
+    get,
+    path = "/repositories/{repository_id}/env-example/live",
+    params(
+        ("repository_id" = i32, Path, description = "Repository ID"),
+        ("branch" = Option<String>, Query, description = "Git branch to check (defaults to repository's default branch)"),
+    ),
+    responses(
+        (status = 200, description = "Env-example variables detected (empty if the repository has no env-example file)", body = RepositoryEnvExampleResponse),
+        (status = 401, description = "The git provider rejected the stored credential - the connection must be re-authorized"),
+        (status = 404, description = "Repository not found"),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_repository_env_example_live(
+    State(state): State<Arc<AppState>>,
+    Path(repository_id): Path<i32>,
+    Query(query): Query<PresetLiveQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let result = state
+        .git_provider_manager
+        .calculate_repository_env_example_live(repository_id, auth.user_id(), query.branch)
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RepositoryEnvExampleResponse {
+            repository_id: result.repository_id,
+            path: result.path,
+            variables: result
+                .variables
+                .into_iter()
+                .map(|v| EnvExampleVariableResponse {
+                    key: v.key,
+                    default_value: v.default_value,
+                    description: v.description,
+                })
+                .collect(),
+        }),
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ComposeServicesLiveQuery {
+    pub branch: Option<String>,
+    /// Compose file path to fetch and parse (from the `compose_files` list
+    /// `/preset/live` already returned, or a custom path the user typed).
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeServicePreviewResponse {
+    pub name: String,
+    pub image: Option<String>,
+    pub depends_on: Vec<String>,
+    /// Environment variable names declared by this service. Values are
+    /// intentionally omitted.
+    pub environment_variables: Vec<String>,
+    /// True when the image looks like a well-known database engine
+    /// (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+    /// compose service never becomes a Temps-managed `external_services` row,
+    /// so it never gets backup/restore. Informational only.
+    pub looks_like_database: bool,
+    /// Well-known managed-service family detected from the image, if any.
+    pub detected_service_type: Option<temps_entities::preset::ComposeServiceFamily>,
+    /// Ports declared by Compose. Route `target`, not `published`: the latter
+    /// is only the optional host-side Docker port.
+    pub ports: Vec<ComposePortMapping>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryComposeServicesResponse {
+    pub repository_id: i32,
+    pub path: String,
+    pub services: Vec<ComposeServicePreviewResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposePreviewRequest {
+    pub branch: Option<String>,
+    pub path: String,
+    pub compose_override: Option<String>,
+    #[serde(default)]
+    pub excluded_services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposePreviewResponse {
+    pub repository_id: i32,
+    pub path: String,
+    /// Effective user-controlled Compose YAML with sensitive values redacted.
+    pub effective_compose: String,
+    pub enabled_services: Vec<String>,
+    pub disabled_services: Vec<String>,
+    pub redacted_values: usize,
+}
+
+/// Parse a compose file's services for a connected repository, live
+#[utoipa::path(
+    get,
+    path = "/repositories/{repository_id}/compose-file/live",
+    params(
+        ("repository_id" = i32, Path, description = "Repository ID"),
+        ("branch" = Option<String>, Query, description = "Git branch to check (defaults to repository's default branch)"),
+        ("path" = String, Query, description = "Compose file path to fetch and parse"),
+    ),
+    responses(
+        (status = 200, description = "Compose services parsed successfully", body = RepositoryComposeServicesResponse),
+        (status = 401, description = "The git provider rejected the stored credential - the connection must be re-authorized"),
+        (status = 404, description = "Repository not found"),
+        (status = 400, description = "Bad request, or the compose file could not be parsed"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_repository_compose_services_live(
+    State(state): State<Arc<AppState>>,
+    Path(repository_id): Path<i32>,
+    Query(query): Query<ComposeServicesLiveQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let result = state
+        .git_provider_manager
+        .calculate_repository_compose_services_live(
+            repository_id,
+            auth.user_id(),
+            query.branch,
+            query.path,
+        )
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RepositoryComposeServicesResponse {
+            repository_id: result.repository_id,
+            path: result.path,
+            services: result
+                .services
+                .into_iter()
+                .map(|s| ComposeServicePreviewResponse {
+                    name: s.name,
+                    image: s.image,
+                    depends_on: s.depends_on,
+                    environment_variables: s.environment_variables,
+                    looks_like_database: s.looks_like_database,
+                    detected_service_type: s.detected_service_type,
+                    ports: s.ports,
+                })
+                .collect(),
+        }),
+    ))
+}
+
+/// Render a redacted effective Compose preview for a connected repository.
+#[utoipa::path(
+    post,
+    path = "/repositories/{repository_id}/compose-file/preview",
+    params(("repository_id" = i32, Path, description = "Repository ID")),
+    request_body = ComposePreviewRequest,
+    responses(
+        (status = 200, description = "Effective Compose preview rendered", body = ComposePreviewResponse),
+        (status = 400, description = "Compose file or override is invalid"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found")
+    ),
+    tag = "Git Providers",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_repository_compose_preview(
+    State(state): State<Arc<AppState>>,
+    Path(repository_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<ComposePreviewRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let result = state
+        .git_provider_manager
+        .calculate_repository_compose_preview_live(
+            repository_id,
+            auth.user_id(),
+            request.branch,
+            request.path,
+            request.compose_override,
+            request.excluded_services,
+        )
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ComposePreviewResponse {
+            repository_id: result.repository_id,
+            path: result.path,
+            effective_compose: result.preview.yaml,
+            enabled_services: result.preview.enabled_services,
+            disabled_services: result.preview.disabled_services,
+            redacted_values: result.preview.redacted_values,
+        }),
+    ))
+}
+
 /// Get connections for a specific git provider
 #[utoipa::path(
     get,
@@ -2786,6 +3081,9 @@ pub struct ValidationResponse {
     request_body = UpdateTokenRequest,
     responses(
         (status = 200, description = "Token updated successfully", body = UpdateTokenResponse),
+        (status = 400, description = "Invalid token configuration"),
+        (status = 403, description = "Git provider permission required"),
+        (status = 429, description = "Git provider rate limit exceeded"),
         (status = 404, description = "Connection not found"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
@@ -2823,6 +3121,8 @@ pub async fn update_connection_token(
     ),
     responses(
         (status = 200, description = "Connection validation result", body = ValidationResponse),
+        (status = 403, description = "Git provider permission required"),
+        (status = 429, description = "Git provider rate limit exceeded"),
         (status = 404, description = "Connection not found"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
@@ -2896,4 +3196,47 @@ pub async fn run_connection_health_check(
         .await?;
 
     Ok(Json(ConnectionResponse::from(connection)))
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::has_authenticated_credentials;
+
+    #[test]
+    fn authenticated_credentials_require_a_non_empty_token_or_installation() {
+        assert!(has_authenticated_credentials(Some("encrypted-token"), None));
+        assert!(has_authenticated_credentials(None, Some("installation-42")));
+        assert!(!has_authenticated_credentials(None, None));
+        assert!(!has_authenticated_credentials(Some("  "), Some("")));
+    }
+}
+
+#[cfg(test)]
+mod permission_error_tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_becomes_human_readable_forbidden_problem() {
+        let problem = Problem::from(GitProviderError::PermissionDenied {
+            operation: "list branches for owner/repo".to_string(),
+            required_permission: "Contents: read".to_string(),
+            provider_message: "Resource not accessible by integration".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Git Provider Permission Required")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Contents: read")));
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
+    }
 }

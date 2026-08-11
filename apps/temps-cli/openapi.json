@@ -2538,6 +2538,12 @@
           "preview_gateway": {
             "$ref": "#/components/schemas/PreviewGatewaySettingsMasked"
           },
+          "proxy_port": {
+            "description": "Port the main Pingora proxy listens on (parsed from `--address`), the\nsame value `ConfigService::proxy_port()` feeds into\n`compute_deployment_url`/`compute_environment_url` when `external_url`\nis unset. The console uses this to preview a project's real\n`{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
           },
@@ -2562,6 +2568,7 @@
         },
         "required": [
           "preview_domain",
+          "proxy_port",
           "screenshots",
           "letsencrypt",
           "dns_provider",
@@ -5013,6 +5020,103 @@
         ],
         "type": "string"
       },
+      "ComposePortMapping": {
+        "description": "A Docker Compose service port mapping, reduced to the information the UI\nneeds to build a public route without confusing host and container ports.",
+        "properties": {
+          "protocol": {
+            "description": "Transport protocol. Compose defaults to TCP.",
+            "type": "string"
+          },
+          "published": {
+            "description": "Optional port published on the Docker host by Compose.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target": {
+            "description": "Port inside the service container. Temps routes traffic to this port.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "type": "object"
+      },
+      "ComposePreviewRequest": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "composeOverride": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "excludedServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "ComposePreviewResponse": {
+        "properties": {
+          "disabledServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "effectiveCompose": {
+            "description": "Effective user-controlled Compose YAML with sensitive values redacted.",
+            "type": "string"
+          },
+          "enabledServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          },
+          "redactedValues": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repositoryId",
+          "path",
+          "effectiveCompose",
+          "enabledServices",
+          "disabledServices",
+          "redactedValues"
+        ],
+        "type": "object"
+      },
       "ComposePublicPort": {
         "description": "A port that should be exposed publicly through the proxy for a compose service.",
         "properties": {
@@ -5022,6 +5126,15 @@
             "minimum": 0,
             "type": "integer"
           },
+          "published": {
+            "description": "Optional port published on the Docker host by Compose. The proxy uses\nthis port when Temps runs on the host or reaches a remote node.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "service": {
             "description": "Compose service name (e.g. \"web\", \"clickhouse\")",
             "type": "string"
@@ -5030,6 +5143,73 @@
         "required": [
           "service",
           "port"
+        ],
+        "type": "object"
+      },
+      "ComposeServiceFamily": {
+        "description": "The specific well-known service family a compose service's image matches,\nwhen it matches one Temps can deploy as a managed `external_services` row\ninstead. Drives the \"deploy this as a Temps-managed service\" recommendation\nin `GitSettings.tsx` and the deploy-log message — kept separate from\n`ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)\nbecause that field only gates the unrelated \"may need elevated Linux\ncapabilities\" warning, and S3/MinIO images need this classification\nwithout tripping that warning.",
+        "enum": [
+          "postgres",
+          "mariadb",
+          "mongodb",
+          "redis",
+          "s3"
+        ],
+        "type": "string"
+      },
+      "ComposeServicePreviewResponse": {
+        "properties": {
+          "dependsOn": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "detectedServiceType": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeServiceFamily",
+                "description": "Well-known managed-service family detected from the image, if any."
+              }
+            ]
+          },
+          "environmentVariables": {
+            "description": "Environment variable names declared by this service. Values are\nintentionally omitted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "looksLikeDatabase": {
+            "description": "True when the image looks like a well-known database engine\n(Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw\ncompose service never becomes a Temps-managed `external_services` row,\nso it never gets backup/restore. Informational only.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ports": {
+            "description": "Ports declared by Compose. Route `target`, not `published`: the latter\nis only the optional host-side Docker port.",
+            "items": {
+              "$ref": "#/components/schemas/ComposePortMapping"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "dependsOn",
+          "environmentVariables",
+          "looksLikeDatabase",
+          "ports"
         ],
         "type": "object"
       },
@@ -5113,6 +5293,10 @@
             "format": "date-time",
             "type": "string"
           },
+          "has_authenticated_credentials": {
+            "description": "Whether this connection can make authenticated provider requests.\nThis exposes capability only; credential values are never serialized.",
+            "type": "boolean"
+          },
           "health_message": {
             "description": "Human-readable reason when health_status is \"unhealthy\"; null otherwise.",
             "type": [
@@ -5183,6 +5367,7 @@
           "provider_id",
           "account_name",
           "account_type",
+          "has_authenticated_credentials",
           "is_active",
           "is_expired",
           "syncing",
@@ -9075,6 +9260,10 @@
       },
       "DeployFromImageRequest": {
         "properties": {
+          "claim_local": {
+            "description": "Claim an image already present in the platform host's Docker daemon.\nTemps retags it into a generated project-owned namespace and records\nits immutable image ID. Never set this for a registry image.",
+            "type": "boolean"
+          },
           "external_image_id": {
             "description": "External image ID (if already registered). If provided without image_ref,\nthe image reference will be fetched from the registered external image.",
             "format": "int32",
@@ -9117,7 +9306,7 @@
             ]
           },
           "tag": {
-            "description": "Tag to apply to the imported image (e.g., \"myapp:v1.0\")\nIf not provided, a unique tag will be generated",
+            "description": "Deprecated display hint retained for wire compatibility. Temps always\ngenerates the actual project-scoped internal image reference.",
             "example": "myapp:v1.0",
             "type": [
               "string",
@@ -11996,7 +12185,7 @@
             "type": "boolean"
           },
           "drain_complete": {
-            "description": "Whether the drain is complete (all containers migrated)",
+            "description": "Whether the source node is empty and safe to remove. Replacement\ndeployments may still be converging asynchronously on other nodes.",
             "type": "boolean"
           },
           "message": {
@@ -12092,6 +12281,12 @@
       },
       "DropPresetCandidate": {
         "properties": {
+          "composePath": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "confidence": {
             "type": "string"
           },
@@ -13170,6 +13365,55 @@
         "required": [
           "name",
           "entity_type"
+        ],
+        "type": "object"
+      },
+      "EnvExampleVariable": {
+        "description": "A single environment variable parsed from a detected env-example file",
+        "properties": {
+          "default_value": {
+            "description": "Placeholder/default value as written in the file (may be empty)",
+            "type": "string"
+          },
+          "description": {
+            "description": "Description derived from a `# comment` immediately preceding the\nvariable in the file, if any",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "Variable name (e.g. \"DATABASE_URL\")",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "default_value"
+        ],
+        "type": "object"
+      },
+      "EnvExampleVariableResponse": {
+        "properties": {
+          "defaultValue": {
+            "description": "Placeholder/default value as written in the file (may be empty)",
+            "type": "string"
+          },
+          "description": {
+            "description": "Description derived from a `# comment` immediately preceding the\nvariable in the file, if any",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "Variable name (e.g. \"DATABASE_URL\")",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "defaultValue"
         ],
         "type": "object"
       },
@@ -19885,7 +20129,7 @@
         "description": "Query parameters for listing audit logs.\n\nEvery field is optional — omitting one means \"don't filter on it\". Deriving\n`IntoParams` makes utoipa render them as optional query params with the\ncorrect types; the previous hand-written `params((\"operation_type\", Query,\n…))` tuples defaulted every param to `required: true, type: string`, which\nmisled both API clients and the AI `describe_api`/`call_api` tools into\nthinking all filters were mandatory.",
         "properties": {
           "from": {
-            "description": "Start timestamp (milliseconds since epoch)",
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -19916,7 +20160,7 @@
             ]
           },
           "to": {
-            "description": "End timestamp (milliseconds since epoch)",
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
             "type": [
               "string",
@@ -20257,6 +20501,39 @@
         "required": [
           "presets",
           "total"
+        ],
+        "type": "object"
+      },
+      "ListRenewalAttemptsResponse": {
+        "description": "Paginated renewal-attempt history for one domain, newest first.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/RenewalAttemptResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempts",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -26239,9 +26516,24 @@
         ],
         "type": "object"
       },
+      "PluginCapability": {
+        "description": "What a plugin is allowed to do with the platform API over the channel.\n\nCoarse on purpose. Fine-grained authorization already exists in the\npermission system and is enforced per request against the acting user;\nthis exists so an operator installing a binary can see at a glance\nwhether it intends to *write* at all, without reading its source.",
+        "enum": [
+          "api_read",
+          "api_write"
+        ],
+        "type": "string"
+      },
       "PluginManifest": {
         "description": "The complete plugin manifest — the handshake contract.",
         "properties": {
+          "capabilities": {
+            "description": "What this plugin may do with the platform's own API over the channel.\n\nEmpty by default, and empty means read-only channel queries and\nnothing else: a plugin that never asks cannot deploy, cannot create\nprojects, and cannot provision databases. Declaring a capability is\nnot by itself permission to act — every call still runs the real\nhandler's `permission_guard!` as the user the plugin is acting for,\nso a capability can only ever narrow what that user could already do\nthrough the console.",
+            "items": {
+              "$ref": "#/components/schemas/PluginCapability"
+            },
+            "type": "array"
+          },
           "description": {
             "description": "Short description of what the plugin does",
             "type": [
@@ -26267,6 +26559,10 @@
             "description": "Health check endpoint path (relative to plugin root)",
             "type": "string"
           },
+          "hide_header": {
+            "description": "Suppress the console's own header strip above this plugin's UI.\n\nThe console normally renders the plugin's icon, display name and\nversion above the iframe. For a plugin whose UI is a full working\nsurface with its own header, that is a second title bar competing\nfor the same vertical space — and vertical space is exactly what a\ndense full-page layout has none of. Opt out and the frame gets the\nfull height.\n\nThe nav entry still names the plugin, so nothing becomes\nunidentifiable by setting this.",
+            "type": "boolean"
+          },
           "name": {
             "description": "Unique plugin identifier (kebab-case, e.g., \"backup-manager\")",
             "type": "string"
@@ -26278,8 +26574,19 @@
             },
             "type": "array"
           },
+          "public_paths": {
+            "description": "Routes this plugin authenticates itself, which the platform's proxy\ntherefore does not gate.\n\nEvery other proxied route requires an authenticated caller before it\nreaches the plugin. That is right for anything a signed-in user\ndrives, and wrong for the endpoints a plugin exposes to clients that\nhold no platform session — an agent in a sandbox presenting a\ncapability token, a share link opened by someone with no account.\nThis is the external-plugin counterpart of the in-process\n`configure_public_routes`.\n\nPaths are relative to the plugin's mount point and match by prefix,\nso `/webhooks/incoming` covers everything beneath it. A listed route is\nreachable by anyone who can reach the instance: it **must** check its\nown credential. Listing a route that does not is an open door.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "requires_db": {
             "description": "Whether the plugin needs database access",
+            "type": "boolean"
+          },
+          "requires_host_data_access": {
+            "description": "Whether the plugin may read the platform's host data root.\n\nThis is a highly privileged capability: the directory can contain\nencryption keys and instance-owned state. It is independent of direct\ndatabase access and defaults to `false`.",
             "type": "boolean"
           },
           "ui": {
@@ -27179,6 +27486,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "is_public_repo": {
+            "description": "Authoritative repository visibility. A missing connection alone does\nnot imply that an incompletely configured repository is public.",
+            "type": "boolean"
+          },
           "last_deployment": {
             "format": "int64",
             "type": [
@@ -27247,6 +27558,7 @@
           "main_branch",
           "created_at",
           "updated_at",
+          "is_public_repo",
           "deployment_config",
           "attack_mode",
           "ai_write_actions_enabled",
@@ -28470,6 +28782,183 @@
         ],
         "type": "object"
       },
+      "PublicComposePreviewRequest": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "composeOverride": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "excludedServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "PublicComposePreviewResponse": {
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "disabledServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "effectiveCompose": {
+            "description": "Effective user-controlled Compose YAML with sensitive values redacted.",
+            "type": "string"
+          },
+          "enabledServices": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          },
+          "redactedValues": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "branch",
+          "path",
+          "effectiveCompose",
+          "enabledServices",
+          "disabledServices",
+          "redactedValues"
+        ],
+        "type": "object"
+      },
+      "PublicComposeServicePreview": {
+        "description": "A single service parsed from a compose file's `services:` map",
+        "properties": {
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "detected_service_type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeServiceFamily",
+                "description": "Well-known managed-service family detected from the image, if any."
+              }
+            ]
+          },
+          "environment_variables": {
+            "description": "Environment variable names declared by this service. Values are\nintentionally omitted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "looks_like_database": {
+            "description": "True when the image looks like a well-known database engine\n(Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw\ncompose service never becomes a Temps-managed `external_services` row,\nso it never gets backup/restore. Informational only.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ports": {
+            "description": "Ports declared by Compose. `target` is the container port Temps can\nroute to; `published` is only the optional Docker host port.",
+            "items": {
+              "$ref": "#/components/schemas/ComposePortMapping"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "depends_on",
+          "environment_variables",
+          "looks_like_database",
+          "ports"
+        ],
+        "type": "object"
+      },
+      "PublicComposeServicesResponse": {
+        "description": "Response for compose-file service preview",
+        "properties": {
+          "branch": {
+            "description": "Branch the file was read from",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/PublicComposeServicePreview"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "branch",
+          "path",
+          "services"
+        ],
+        "type": "object"
+      },
+      "PublicEnvExampleResponse": {
+        "description": "Response for env-example detection",
+        "properties": {
+          "branch": {
+            "description": "Branch the file was read from",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path of the detected env-example file (e.g. \".env.example\"), `null`\nif the repository has none",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "variables": {
+            "description": "Parsed variables (empty if no env-example file was found)",
+            "items": {
+              "$ref": "#/components/schemas/EnvExampleVariable"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "branch",
+          "variables"
+        ],
+        "type": "object"
+      },
       "PublicHostnameStrategy": {
         "description": "Public hostname generation mode for Temps-managed preview routes.\n\nThe mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)\nrather than globally, so a provider such as Cloudflare can offer the flat layout\nrequired by its Universal SSL wildcard cert without changing every domain's behaviour.",
         "enum": [
@@ -29615,6 +30104,101 @@
         },
         "required": [
           "title"
+        ],
+        "type": "object"
+      },
+      "RenewalAttemptResponse": {
+        "description": "One row of the standard (non-on-demand) renewal-attempt audit log, backing\nthe domain detail page's renewal timeline.",
+        "properties": {
+          "created_at": {
+            "description": "When the attempt was recorded (epoch millis).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "outcome": {
+            "description": "`\"success\"` | `\"failed\"`.",
+            "type": "string"
+          },
+          "stage": {
+            "description": "`\"request_challenge\"` | `\"complete_challenge\"`.",
+            "type": "string"
+          },
+          "verification_method": {
+            "description": "`\"http-01\"` | `\"dns-01\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stage",
+          "verification_method",
+          "outcome",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "RepositoryComposeServicesResponse": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeServicePreviewResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositoryId",
+          "path",
+          "services"
+        ],
+        "type": "object"
+      },
+      "RepositoryEnvExampleResponse": {
+        "properties": {
+          "path": {
+            "description": "Path of the detected env-example file (e.g. \".env.example\"), `null`\nif the repository has none",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repositoryId": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/EnvExampleVariableResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositoryId",
+          "variables"
         ],
         "type": "object"
       },
@@ -31152,6 +31736,25 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RuntimeCredentialsResponse": {
+        "description": "Live connection variables for a service in one environment.\n\nEvery value is plaintext — this is the response of the audited issuance\nendpoint, not of the masked bulk read. Callers must treat it as a\ncredential: do not log it, do not cache it, do not put it in an error.",
+        "properties": {
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "variables"
+        ],
         "type": "object"
       },
       "S3ConnectionTestResponse": {
@@ -43687,6 +44290,50 @@
         ]
       }
     },
+    "/_temps/sentry/envelope": {
+      "post": {
+        "description": "No DSN credential — the project/environment/deployment are resolved from\nthe `Host` header via the proxy's route table, the same way\n`/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via\n`Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy\nforwards to the console from any domain a project is deployed on\n(`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without\nper-domain DSN configuration.\n\nSince there is no credential, an `Origin`/`Referer` check stands in for\nauthentication: the request must claim to come from the same host it\nresolves to, or it is rejected. This is weaker than a DSN (both are\nvisible to anyone who can read the page), but it closes the trivial case\nof a script targeting an arbitrary victim domain with no recon at all.",
+        "operationId": "ingest_tunneled_envelope",
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Sentry envelope as binary data",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Envelope ingested"
+          },
+          "204": {
+            "description": "Host resolved to a route with no attributable project (sandbox/orphan)"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "403": {
+            "description": "Origin/Referer does not match the resolved host"
+          },
+          "404": {
+            "description": "Unknown host"
+          },
+          "413": {
+            "description": "Request body too large (exceeds 2 MiB)"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          }
+        },
+        "summary": "Ingest a browser-tunneled Sentry envelope.",
+        "tags": [
+          "sentry-ingestor"
+        ]
+      }
+    },
     "/_temps/session-replay/events": {
       "post": {
         "operationId": "add_session_replay_events",
@@ -51612,6 +52259,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -51658,6 +52315,45 @@
       },
       "post": {
         "operationId": "blob_put",
+        "parameters": [
+          {
+            "description": "Path where the blob will be stored",
+            "in": "query",
+            "name": "pathname",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Content type of the blob (optional, will be guessed from extension)",
+            "in": "query",
+            "name": "content_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Add random suffix to pathname to prevent collisions",
+            "in": "query",
+            "name": "add_random_suffix",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Project ID (required for API key/session auth, optional for deployment tokens)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/octet-stream": {
@@ -54037,6 +54733,83 @@
         ]
       }
     },
+    "/domains/{domain}/renewal-attempts": {
+      "get": {
+        "description": "Returns rows from the append-only `renewal_attempts` audit log, newest\nfirst: every `request_challenge` (order creation) and `complete_challenge`\n(order finalization) attempt for this domain, successful or failed, with\nthe full error detail. Backs the domain detail page's renewal timeline —\n`domains.last_error` only ever holds the MOST RECENT failure, so this is\nthe only way to see the history behind it.",
+        "operationId": "list_renewal_attempts",
+        "parameters": [
+          {
+            "description": "Domain name",
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListRenewalAttemptsResponse"
+                }
+              }
+            },
+            "description": "Renewal attempts retrieved successfully"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Domain not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List certificate renewal attempts for a domain",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
     "/domains/{domain}/status": {
       "get": {
         "operationId": "check_domain_status",
@@ -55298,7 +56071,7 @@
           }
         ],
         "responses": {
-          "302": {
+          "307": {
             "description": "Redirect to original URL"
           },
           "404": {
@@ -56255,6 +57028,54 @@
           }
         ],
         "summary": "Per-member health for a Postgres HA cluster.",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/environment": {
+      "get": {
+        "operationId": "reveal_service_environment_variables",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Service environment variables in plaintext"
+          },
+          "403": {
+            "description": "Caller cannot access a project linked to this service"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Reveal a service's basic environment variables in plaintext, before it is\nlinked to any project. Used by the new-project wizard to fill a detected\nvariable (e.g. `DATABASE_URL`) from a service the user just picked or\ncreated — every successful reveal is recorded, matching the audited\nsingle-variable reveal used once a service is project-linked.",
         "tags": [
           "External Services"
         ]
@@ -57514,6 +58335,77 @@
           }
         },
         "summary": "Get specific environment variable for a service-project pair",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials": {
+      "post": {
+        "description": "Provisions the per-tenant database if it does not exist yet, then returns\nthe connection variables in plaintext — the same values a deployment gets\ninjected at runtime.\n\n**This is a POST because it is not a read.** It creates a database as a\nside effect, and its response is a live credential: a GET would be\nprefetchable, cacheable, and liable to end up in a proxy access log with\nthe whole connection in the URL's neighbourhood. Nothing about it is safe\nor idempotent in the HTTP sense.\n\nIntended for callers that need to *connect* an application to a managed\nservice — the console's own deploy path does this in-process; external\nplugins reach it here. For inspecting configuration, use the masked bulk\nread or the single-variable reveal instead.",
+        "operationId": "issue_runtime_credentials",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeCredentialsResponse"
+                }
+              }
+            },
+            "description": "Connection credentials issued"
+          },
+          "403": {
+            "description": "Plaintext secret access is not permitted"
+          },
+          "404": {
+            "description": "Service, project, or environment not found"
+          },
+          "409": {
+            "description": "Service is not linked to the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Issue live connection credentials for a service in an environment",
         "tags": [
           "External Services"
         ]
@@ -60134,11 +61026,20 @@
             },
             "description": "Token updated successfully"
           },
+          "400": {
+            "description": "Invalid token configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Connection not found"
+          },
+          "429": {
+            "description": "Git provider rate limit exceeded"
           },
           "500": {
             "description": "Internal server error"
@@ -60184,8 +61085,14 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Connection not found"
+          },
+          "429": {
+            "description": "Git provider rate limit exceeded"
           },
           "500": {
             "description": "Internal server error"
@@ -61184,6 +62091,9 @@
           "400": {
             "description": "Provider not supported"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -61255,6 +62165,9 @@
           "400": {
             "description": "Provider not supported"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -61266,6 +62179,236 @@
           }
         },
         "summary": "Get branches for a public repository (supports GitHub and GitLab)",
+        "tags": [
+          "Public Repositories"
+        ]
+      }
+    },
+    "/git/public/{provider}/{owner}/{repo}/compose-file": {
+      "get": {
+        "operationId": "get_public_compose_services",
+        "parameters": [
+          {
+            "description": "Git provider (github or gitlab)",
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Branch to read the compose file from (default: repository's default branch)",
+            "in": "query",
+            "name": "branch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Compose file path to fetch and parse (from the `compose_files` list\n`/preset` already returned, or a custom path the user typed)",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicComposeServicesResponse"
+                }
+              }
+            },
+            "description": "Compose services parsed successfully"
+          },
+          "400": {
+            "description": "Provider not supported, or the compose file could not be parsed"
+          },
+          "404": {
+            "description": "Repository, branch, or compose file not found"
+          },
+          "429": {
+            "description": "API rate limit exceeded"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Parse a compose file's services for a public repository (supports GitHub\nand GitLab). Unlike env-example detection, the caller already knows the\npath (from the `compose_files` list `/preset` already returned), so this\nfetches that one file directly rather than scanning the tree first.",
+        "tags": [
+          "Public Repositories"
+        ]
+      },
+      "post": {
+        "operationId": "get_public_compose_preview",
+        "parameters": [
+          {
+            "description": "Git provider (github or gitlab)",
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicComposePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicComposePreviewResponse"
+                }
+              }
+            },
+            "description": "Effective Compose preview rendered"
+          },
+          "400": {
+            "description": "Compose file or override is invalid"
+          },
+          "404": {
+            "description": "Repository, branch, or compose file not found"
+          }
+        },
+        "summary": "Render a redacted effective Compose preview for a public repository.",
+        "tags": [
+          "Public Repositories"
+        ]
+      }
+    },
+    "/git/public/{provider}/{owner}/{repo}/env-example": {
+      "get": {
+        "operationId": "detect_public_env_example",
+        "parameters": [
+          {
+            "description": "Git provider (github or gitlab)",
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Branch name to detect presets for (default: repository's default branch)",
+            "in": "query",
+            "name": "branch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Force fetch fresh data, bypassing cache (default: false)",
+            "in": "query",
+            "name": "fresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicEnvExampleResponse"
+                }
+              }
+            },
+            "description": "Detected env-example variables"
+          },
+          "400": {
+            "description": "Provider not supported"
+          },
+          "404": {
+            "description": "Repository or branch not found"
+          },
+          "429": {
+            "description": "API rate limit exceeded"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Detect and parse a `.env.example`-style file for a public repository\n(supports GitHub and GitLab)",
         "tags": [
           "Public Repositories"
         ]
@@ -61337,6 +62480,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository or branch not found"
@@ -63995,7 +65141,7 @@
             "description": "Start time (ISO 8601) - overrides days parameter",
             "in": "query",
             "name": "start_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -64004,7 +65150,7 @@
             "description": "End time (ISO 8601) - defaults to now",
             "in": "query",
             "name": "end_time",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -67724,6 +68870,24 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\"",
+            "in": "query",
+            "name": "attributes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by span name pattern (ILIKE)",
+            "in": "query",
+            "name": "name_pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -76845,7 +78009,7 @@
         "operationId": "deploy_from_image_upload",
         "parameters": [
           {
-            "description": "Tag to apply to the imported image (e.g., \"myapp:v1.0\")\nIf not provided, a unique tag will be generated",
+            "description": "Deprecated display hint retained for wire compatibility. Temps always\ngenerates the actual project-scoped internal image reference.",
             "in": "query",
             "name": "tag",
             "required": false,
@@ -80833,7 +81997,7 @@
             }
           },
           {
-            "description": "Comma-separated kinds: `log,request,span,error,revenue`. Empty or\nmissing returns every kind.",
+            "description": "Comma-separated kinds: `request,span,error,revenue`. Empty or\nmissing returns every kind. There is no `log` kind — runtime logs\nintentionally never appear in this feed (see `ObservabilityEvent`'s\n\"No `Log` variant\" doc); passing `kinds=log` is rejected with 400\n`InvalidKindsFilter`, not silently ignored.",
             "in": "query",
             "name": "kinds",
             "required": false,
@@ -86411,6 +87575,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -86485,6 +87652,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -86503,6 +87673,190 @@
         "summary": "Get repository tags",
         "tags": [
           "Repositories"
+        ]
+      }
+    },
+    "/repositories/{repository_id}/compose-file/live": {
+      "get": {
+        "operationId": "get_repository_compose_services_live",
+        "parameters": [
+          {
+            "description": "Repository ID",
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Git branch to check (defaults to repository's default branch)",
+            "in": "query",
+            "name": "branch",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Compose file path to fetch and parse",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryComposeServicesResponse"
+                }
+              }
+            },
+            "description": "Compose services parsed successfully"
+          },
+          "400": {
+            "description": "Bad request, or the compose file could not be parsed"
+          },
+          "401": {
+            "description": "The git provider rejected the stored credential - the connection must be re-authorized"
+          },
+          "404": {
+            "description": "Repository not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Parse a compose file's services for a connected repository, live",
+        "tags": [
+          "Git Providers"
+        ]
+      }
+    },
+    "/repositories/{repository_id}/compose-file/preview": {
+      "post": {
+        "operationId": "get_repository_compose_preview",
+        "parameters": [
+          {
+            "description": "Repository ID",
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComposePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePreviewResponse"
+                }
+              }
+            },
+            "description": "Effective Compose preview rendered"
+          },
+          "400": {
+            "description": "Compose file or override is invalid"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Repository not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Render a redacted effective Compose preview for a connected repository.",
+        "tags": [
+          "Git Providers"
+        ]
+      }
+    },
+    "/repositories/{repository_id}/env-example/live": {
+      "get": {
+        "operationId": "get_repository_env_example_live",
+        "parameters": [
+          {
+            "description": "Repository ID",
+            "in": "path",
+            "name": "repository_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Git branch to check (defaults to repository's default branch)",
+            "in": "query",
+            "name": "branch",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryEnvExampleResponse"
+                }
+              }
+            },
+            "description": "Env-example variables detected (empty if the repository has no env-example file)"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "The git provider rejected the stored credential - the connection must be re-authorized"
+          },
+          "404": {
+            "description": "Repository not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Detect and parse a `.env.example`-style file for a connected repository",
+        "tags": [
+          "Git Providers"
         ]
       }
     },
@@ -86646,6 +88000,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Git provider permission required"
+          },
           "404": {
             "description": "Repository not found"
           },
@@ -86715,6 +88072,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -86836,6 +88196,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository not found"
@@ -92474,8 +93837,8 @@
             }
           },
           {
-            "description": "Start timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "Start timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "from",
             "required": false,
@@ -92485,8 +93848,8 @@
             }
           },
           {
-            "description": "End timestamp (milliseconds since epoch)",
-            "example": 1,
+            "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
+            "example": "2024-01-15T14:30:00Z",
             "in": "query",
             "name": "to",
             "required": false,

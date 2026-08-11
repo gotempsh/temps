@@ -15,8 +15,13 @@ import {
   cancelDomainOrder,
   setupDnsChallenge as setupDnsChallengeApi,
   getHttpChallengeDebug,
+  listRenewalAttempts as listRenewalAttemptsApi,
 } from '../../api/sdk.gen.js'
-import type { DomainResponse, AcmeOrderResponse } from '../../api/types.gen.js'
+import type {
+  DomainResponse,
+  AcmeOrderResponse,
+  RenewalAttemptResponse,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -73,6 +78,13 @@ interface SslOptions {
 
 interface StatusOptions {
   domain: string
+}
+
+interface RenewalAttemptsOptions {
+  domain: string
+  page?: string
+  pageSize?: string
+  json?: boolean
 }
 
 interface OrderShowOptions {
@@ -152,6 +164,15 @@ export function registerDomainsCommands(program: Command): void {
     .description('Check domain status')
     .requiredOption('-d, --domain <domain>', 'Domain name')
     .action(domainStatus)
+
+  domains
+    .command('renewal-attempts')
+    .description('Show the certificate renewal-attempt history for a domain')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
+    .option('--page <page>', 'Page number (1-indexed)', '1')
+    .option('--page-size <pageSize>', 'Items per page (max 100)', '20')
+    .option('--json', 'Output in JSON format')
+    .action(listRenewalAttempts)
 
   // --- Nested orders command group ---
   const orders = domains
@@ -454,6 +475,62 @@ async function domainStatus(options: StatusOptions): Promise<void> {
   }
 
   newline()
+}
+
+async function listRenewalAttempts(options: RenewalAttemptsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const page = Number.parseInt(options.page ?? '1', 10) || 1
+  const pageSize = Number.parseInt(options.pageSize ?? '20', 10) || 20
+
+  const result = await withSpinner(`Fetching renewal attempts for ${options.domain}...`, async () => {
+    const { data, error } = await listRenewalAttemptsApi({
+      client,
+      path: { domain: options.domain },
+      query: { page, page_size: pageSize },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.lock} Renewal Attempts for ${options.domain} (${result?.total ?? 0} total, page ${result?.page ?? page}/${Math.max(1, Math.ceil((result?.total ?? 0) / (result?.page_size ?? pageSize)))})`)
+
+  const attempts = result?.attempts ?? []
+  if (attempts.length === 0) {
+    info('No renewal attempts recorded for this domain')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<RenewalAttemptResponse>[] = [
+    {
+      header: 'When',
+      accessor: (a) => formatDate(new Date(a.created_at).toISOString()),
+      color: (v) => colors.muted(v),
+    },
+    { header: 'Stage', key: 'stage' },
+    { header: 'Method', key: 'verification_method' },
+    { header: 'Outcome', key: 'outcome', color: (v) => statusBadge(v) },
+    {
+      header: 'Error',
+      accessor: (a) => a.error ?? '-',
+      color: (v) => (v === '-' ? colors.muted(v) : colors.error(v)),
+    },
+  ]
+
+  printTable(attempts, columns)
+  newline()
+  if ((result?.total ?? 0) > page * pageSize) {
+    info(`Run with --page ${page + 1} to see more`)
+    newline()
+  }
 }
 
 // --- ACME Orders ---

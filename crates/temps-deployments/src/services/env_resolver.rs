@@ -19,7 +19,7 @@ use temps_entities::{deployments, environments, projects};
 use tracing::{debug, info};
 
 use super::deployment_token_service::DeploymentTokenService;
-use super::workflow_planner::public_sentry_dsn_var;
+use super::workflow_planner::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
 /// Resolves the full environment-variable map for a `(project, environment,
 /// deployment)`. Holds the six services the resolution needs; cheap to clone
@@ -210,6 +210,19 @@ impl DeploymentEnvResolver {
                         // convention to the browser bundle, so we mirror that mapping.
                         if let Some(public_var) = public_sentry_dsn_var(project.preset) {
                             env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
+                        }
+
+                        // Add the same-origin tunnel path browser SDKs should pass as
+                        // `Sentry.init({ tunnel })`. The value is a constant (not
+                        // project-specific), but injecting it as an env var — rather
+                        // than hardcoding it in every framework's setup snippet — means
+                        // the path can change in one place (here) without touching
+                        // deployed apps' source or docs.
+                        if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
+                            env_vars_map.insert(
+                                tunnel_var.to_string(),
+                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
+                            );
                         }
                     }
                     Err(e) => {

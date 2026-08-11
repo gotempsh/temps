@@ -5,7 +5,7 @@ import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
-import { GitSettings } from './settings/GitSettings'
+import { BuildSettings, GitSettings } from './settings/GitSettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
@@ -35,13 +35,14 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           path="environment-variables"
           element={<EnvironmentVariablesSettings project={project} />}
         />
-        <Route
-          path="secrets"
-          element={<SecretsSettings project={project} />}
-        />
+        <Route path="secrets" element={<SecretsSettings project={project} />} />
         <Route
           path="git"
           element={<GitSettings project={project} refetch={refetch} />}
+        />
+        <Route
+          path="build"
+          element={<BuildSettings project={project} refetch={refetch} />}
         />
         <Route
           path="security"
@@ -72,10 +73,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           path="webhooks/:webhookId"
           element={<WebhookDetail project={project} />}
         />
-        <Route
-          path="skills"
-          element={<SkillsSettings project={project} />}
-        />
+        <Route path="skills" element={<SkillsSettings project={project} />} />
         <Route
           path="mcp-servers"
           element={<McpServersSettings project={project} />}

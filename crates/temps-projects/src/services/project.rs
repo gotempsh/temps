@@ -3,10 +3,12 @@ use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{info, warn};
 
 use sea_orm::{
-    prelude::Uuid, ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    prelude::Uuid, ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
-use temps_core::{Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob};
+use temps_core::{
+    ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
+};
 use temps_entities::projects;
 use temps_git::services::public_repo::PublicRepoProviderFactory;
 
@@ -67,6 +69,17 @@ fn slugify(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+fn compose_public_ports(
+    config: Option<&temps_entities::preset::PresetConfig>,
+) -> Vec<temps_entities::preset::ComposePublicPort> {
+    match config {
+        Some(temps_entities::preset::PresetConfig::DockerCompose(compose)) => {
+            compose.public_ports.clone()
+        }
+        _ => Vec::new(),
+    }
 }
 
 // API Response types
@@ -171,6 +184,41 @@ fn merge_preset_config(
             }
             PresetConfig::Dockerfile(parsed_cfg)
         }
+        (
+            Some(PresetConfig::DockerCompose(existing_cfg)),
+            PresetConfig::DockerCompose(mut parsed_cfg),
+        ) => {
+            // A partial PATCH (e.g. the settings-page exclusion toggle sends
+            // only `excludedServices`) parses into a config where every
+            // omitted field is its zero value, not "leave unchanged" — so
+            // without this, a one-field patch would silently wipe
+            // composePath/composeOverride/publicPorts/composeServices.
+            let obj = config_value.as_object();
+            let omits = |key: &str| obj.map(|map| !map.contains_key(key)).unwrap_or(true);
+            if omits("composePath") {
+                parsed_cfg.compose_path = existing_cfg.compose_path.clone();
+            }
+            if omits("composeOverride") {
+                parsed_cfg.compose_override = existing_cfg.compose_override.clone();
+            }
+            if omits("publicPorts") {
+                parsed_cfg.public_ports = existing_cfg.public_ports.clone();
+            }
+            if omits("excludedServices") {
+                parsed_cfg.excluded_services = existing_cfg.excluded_services.clone();
+            }
+            if omits("composeServices") {
+                parsed_cfg.compose_services = existing_cfg.compose_services.clone();
+            }
+            if omits("relaxedCapabilityServices") {
+                parsed_cfg.relaxed_capability_services =
+                    existing_cfg.relaxed_capability_services.clone();
+            }
+            if omits("unsandboxedServices") {
+                parsed_cfg.unsandboxed_services = existing_cfg.unsandboxed_services.clone();
+            }
+            PresetConfig::DockerCompose(parsed_cfg)
+        }
         (_, other) => other,
     }
 }
@@ -178,10 +226,147 @@ fn merge_preset_config(
 fn validate_preset_config(
     preset: temps_entities::preset::Preset,
     config: temps_entities::preset::PresetConfig,
+    config_value: Option<&serde_json::Value>,
 ) -> Result<temps_entities::preset::PresetConfig, ProjectError> {
     temps_presets::validate_preset_config(preset, &config)
         .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {}", error)))?;
+    // Only re-validate when this call's patch explicitly touched
+    // relaxedCapabilityServices. A value merged forward unchanged from the
+    // existing config (e.g. because a later, unrelated patch replaced
+    // composeServices and the previously-relaxed service name is no longer
+    // in the new snapshot) must not retroactively fail every subsequent
+    // save — that would permanently wedge the project's settings until the
+    // user manually clears a field they never touched.
+    let touches_relaxed_capability_services = config_value
+        .and_then(|v| v.as_object())
+        .is_some_and(|map| map.contains_key("relaxedCapabilityServices"));
+    let touches_unsandboxed_services = config_value
+        .and_then(|v| v.as_object())
+        .is_some_and(|map| map.contains_key("unsandboxedServices"));
+    if touches_relaxed_capability_services || touches_unsandboxed_services {
+        if let temps_entities::preset::PresetConfig::DockerCompose(ref cfg) = config {
+            validate_relaxed_capability_services(cfg)?;
+            validate_unsandboxed_services(cfg)?;
+        }
+    }
+    let touches_public_ports = config_value
+        .and_then(|value| value.as_object())
+        .is_some_and(|map| map.contains_key("publicPorts"));
+    if touches_public_ports {
+        if let temps_entities::preset::PresetConfig::DockerCompose(ref cfg) = config {
+            validate_compose_public_ports(cfg)?;
+        }
+    }
     Ok(config)
+}
+
+fn validate_compose_public_ports(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    let mut services = std::collections::HashSet::new();
+    for route in &cfg.public_ports {
+        if route.service.trim().is_empty() {
+            return Err(ProjectError::InvalidInput(
+                "Compose public route service cannot be empty".to_string(),
+            ));
+        }
+        if route.port == 0 || route.published == Some(0) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose public route for service '{}' must use ports between 1 and 65535",
+                route.service
+            )));
+        }
+        if !services.insert(route.service.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose service '{}' can have only one public URL",
+                route.service
+            )));
+        }
+        if cfg
+            .excluded_services
+            .iter()
+            .any(|excluded| excluded == &route.service)
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose service '{}' cannot be both disabled and public",
+                route.service
+            )));
+        }
+        if !cfg.compose_services.is_empty()
+            && !cfg
+                .compose_services
+                .iter()
+                .any(|service| service.name == route.service)
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Compose public route references unknown service '{}'",
+                route.service
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `relaxed_capability_services` grants a compose service back the Linux
+/// capabilities (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) many official
+/// images' entrypoints need to fix ownership on a data directory and drop
+/// from root to a service user at startup — this is not unique to database
+/// images (confirmed live: Gitea's own official image hits the identical
+/// `chown: ... Operation not permitted` / `su-exec: setgroups: Operation not
+/// permitted` failure), so the settings UI offers this toggle for every
+/// compose service, not just ones flagged `looks_like_database`. The
+/// server-side check mirrors that: any name is accepted as long as it
+/// matches a real service in the persisted snapshot, which rejects typos or
+/// phantom names without narrowing eligibility to a specific image family.
+/// If the snapshot is empty (e.g. before the first deploy has captured one),
+/// allow the list through rather than block a legitimate first-time setup,
+/// since there is nothing yet to validate against.
+fn validate_relaxed_capability_services(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    if cfg.relaxed_capability_services.is_empty() || cfg.compose_services.is_empty() {
+        return Ok(());
+    }
+    for service_name in &cfg.relaxed_capability_services {
+        let matches_known_service = cfg.compose_services.iter().any(|s| &s.name == service_name);
+        if !matches_known_service {
+            return Err(ProjectError::InvalidInput(format!(
+                "Cannot grant elevated capabilities to service '{}': it is not a recognized \
+                 service in this compose file.",
+                service_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unsandboxed_services(
+    cfg: &temps_entities::preset::DockerComposeConfig,
+) -> Result<(), ProjectError> {
+    if cfg.unsandboxed_services.is_empty() {
+        return Ok(());
+    }
+    if cfg.compose_services.is_empty() {
+        return Err(ProjectError::InvalidInput(
+            "Cannot disable the Temps sandbox before Compose services have been recognized. Sync the Compose services from the repository first."
+                .to_string(),
+        ));
+    }
+    for service_name in &cfg.unsandboxed_services {
+        if !cfg.compose_services.iter().any(|s| &s.name == service_name) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Cannot disable the Temps sandbox for service '{}': it is not a recognized service in this compose file.",
+                service_name
+            )));
+        }
+        if cfg.relaxed_capability_services.contains(service_name) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Service '{}' cannot use both elevated permissions and a disabled sandbox. Remove one of these settings.",
+                service_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
@@ -253,11 +438,23 @@ fn resolve_preset_selection(
         }
     };
 
-    if config.is_some() {
-        resolve_preset_slug(slug, config)
+    let resolved = if config.is_some() {
+        resolve_preset_slug(slug, config)?
     } else {
-        Ok(base_selection)
-    }
+        base_selection
+    };
+    let config = match resolved.config {
+        Some(config) => Some(validate_preset_config(
+            resolved.preset,
+            config,
+            config_value,
+        )?),
+        None => None,
+    };
+    Ok(temps_presets::StoredPreset {
+        preset: resolved.preset,
+        config,
+    })
 }
 
 #[derive(Clone)]
@@ -1117,6 +1314,7 @@ impl ProjectService {
                 "Project {} not found",
                 project_id
             )))?;
+        let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
@@ -1383,7 +1581,11 @@ impl ProjectService {
                     config_value,
                     true,
                 );
-                let merged = validate_preset_config(*active_project.preset.as_ref(), merged)?;
+                let merged = validate_preset_config(
+                    *active_project.preset.as_ref(),
+                    merged,
+                    Some(config_value),
+                )?;
                 active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
@@ -1391,6 +1593,11 @@ impl ProjectService {
             }
 
             let updated_project = active_project.update(self.db.as_ref()).await?;
+            if initial_public_ports != compose_public_ports(updated_project.preset_config.as_ref())
+            {
+                self.reload_routes_after_compose_port_change(project_id)
+                    .await?;
+            }
             let project_found = Self::map_db_project_to_project(updated_project);
 
             // Emit ProjectUpdated job
@@ -1546,6 +1753,7 @@ impl ProjectService {
         // Capture the current preset/config before converting to ActiveModel
         let project_preset = project.preset;
         let existing_preset_config = project.preset_config.clone();
+        let previous_public_ports = compose_public_ports(existing_preset_config.as_ref());
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
@@ -1575,7 +1783,7 @@ impl ProjectService {
             })?;
             let merged =
                 merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
-            let merged = validate_preset_config(project_preset, merged)?;
+            let merged = validate_preset_config(project_preset, merged, Some(config_value))?;
             active_project.preset_config = Set(Some(merged));
         }
 
@@ -1820,7 +2028,56 @@ impl ProjectService {
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
+        if previous_public_ports != compose_public_ports(updated_project.preset_config.as_ref()) {
+            self.reload_routes_after_compose_port_change(project_id)
+                .await?;
+        }
+
         Ok(Self::map_db_project_to_project(updated_project))
+    }
+
+    /// Public Compose ports are read directly from `projects.preset_config`
+    /// when the proxy builds its route table. Updating the JSON alone leaves
+    /// the in-memory table stale, because the project DB trigger deliberately
+    /// ignores generic preset-config changes. Publish both supported signals:
+    /// the queue gives this process a deterministic reload, while PostgreSQL
+    /// NOTIFY wakes other control-plane processes and remains a fallback if
+    /// the queue is unavailable.
+    async fn reload_routes_after_compose_port_change(
+        &self,
+        project_id: i32,
+    ) -> Result<(), ProjectError> {
+        let queue_result = self
+            .queue_service
+            .send(Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            }))
+            .await;
+
+        let payload = serde_json::json!({
+            "action": "UPDATE",
+            "project_id": project_id,
+            "field": "preset_config.public_ports",
+        })
+        .to_string();
+        let notify_result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_notify('project_route_change', $1)",
+                [payload.into()],
+            ))
+            .await;
+
+        match (queue_result, notify_result) {
+            (Ok(()), _) | (_, Ok(_)) => Ok(()),
+            (Err(queue_error), Err(database_error)) => Err(ProjectError::RouteReloadFailed {
+                project_id,
+                queue_reason: queue_error.to_string(),
+                database_reason: database_error.to_string(),
+            }),
+        }
     }
 
     /// Resolve whether the given connection points to a GitLab provider.
@@ -3051,18 +3308,26 @@ impl ProjectService {
                 "github"
             };
 
-            // Use authenticated token if available (avoids 60 req/hr rate limit)
-            let token = if provider_name == "github" {
-                self.git_provider_manager.get_any_github_token().await
-            } else {
-                None
-            };
+            // Public projects must never borrow a credential from an arbitrary
+            // provider connection. A repository that needs authentication must
+            // use the caller-owned connected-repository workflow instead.
+            let provider = PublicRepoProviderFactory::create(provider_name).map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to create public repo provider for {}: {}",
+                    provider_name, e
+                ))
+            })?;
 
-            let provider = PublicRepoProviderFactory::create_with_token(provider_name, token)
+            // A shared credential may be able to see private repositories.
+            // `is_public_repo` must never turn that credential into a private
+            // repository oracle, so verify visibility before reading branches.
+            provider
+                .get_repository(&project.repo_owner, &project.repo_name)
+                .await
                 .map_err(|e| {
                     ProjectError::Other(format!(
-                        "Failed to create public repo provider for {}: {}",
-                        provider_name, e
+                        "Failed to verify that repository {}/{} is public: {}",
+                        project.repo_owner, project.repo_name, e
                     ))
                 })?;
 
@@ -3220,6 +3485,292 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_matching_database_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["db".to_string()],
+            compose_services: vec![
+                ComposeServiceSnapshot {
+                    name: "db".to_string(),
+                    image: Some("postgres:18".to_string()),
+                    looks_like_database: true,
+                    ..Default::default()
+                },
+                ComposeServiceSnapshot {
+                    name: "web".to_string(),
+                    image: Some("nginx".to_string()),
+                    looks_like_database: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_non_database_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        // The fix isn't database-specific — e.g. Gitea's own official image
+        // hits the identical `chown: ... Operation not permitted` failure at
+        // startup, confirmed live. The toggle (and this validation) is
+        // available for any real service in the compose file, not just ones
+        // flagged looks_like_database.
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["web".to_string()],
+            compose_services: vec![
+                ComposeServiceSnapshot {
+                    name: "db".to_string(),
+                    image: Some("postgres:18".to_string()),
+                    looks_like_database: true,
+                    ..Default::default()
+                },
+                ComposeServiceSnapshot {
+                    name: "web".to_string(),
+                    image: Some("gitea/gitea:latest".to_string()),
+                    looks_like_database: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_rejects_unknown_service_name() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["nonexistent".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "db".to_string(),
+                image: Some("postgres:18".to_string()),
+                looks_like_database: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_relaxed_capability_services_allows_when_snapshot_empty() {
+        use temps_entities::preset::DockerComposeConfig;
+
+        // No compose_services snapshot yet (e.g. before the first deploy) —
+        // nothing to validate against, so don't block a legitimate first-time
+        // setup.
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["db".to_string()],
+            compose_services: vec![],
+            ..Default::default()
+        };
+        assert!(validate_relaxed_capability_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_allows_known_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["webserver".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                image: Some("ghcr.io/paperless-ngx/paperless-ngx:latest".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_unsandboxed_services(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_rejects_unknown_service() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["unknown".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error.to_string().contains("not a recognized service"));
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_rejects_elevated_overlap() {
+        use temps_entities::preset::{ComposeServiceSnapshot, DockerComposeConfig};
+
+        let cfg = DockerComposeConfig {
+            relaxed_capability_services: vec!["webserver".to_string()],
+            unsandboxed_services: vec!["webserver".to_string()],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "webserver".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot use both elevated permissions and a disabled sandbox"));
+    }
+
+    #[test]
+    fn test_validate_unsandboxed_services_requires_recognized_snapshot() {
+        use temps_entities::preset::DockerComposeConfig;
+
+        let cfg = DockerComposeConfig {
+            unsandboxed_services: vec!["webserver".to_string()],
+            ..Default::default()
+        };
+
+        let error = validate_unsandboxed_services(&cfg).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("before Compose services have been recognized"));
+    }
+
+    #[test]
+    fn test_partial_compose_patch_preserves_unsandboxed_services() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+
+        let existing = PresetConfig::DockerCompose(DockerComposeConfig {
+            compose_path: Some("compose.yml".to_string()),
+            unsandboxed_services: vec!["webserver".to_string()],
+            ..Default::default()
+        });
+        let parsed = PresetConfig::DockerCompose(DockerComposeConfig {
+            excluded_services: vec!["db".to_string()],
+            ..Default::default()
+        });
+
+        let merged = merge_preset_config(
+            Some(&existing),
+            parsed,
+            &serde_json::json!({ "excludedServices": ["db"] }),
+            true,
+        );
+
+        match merged {
+            PresetConfig::DockerCompose(cfg) => {
+                assert_eq!(cfg.compose_path.as_deref(), Some("compose.yml"));
+                assert_eq!(cfg.excluded_services, ["db"]);
+                assert_eq!(cfg.unsandboxed_services, ["webserver"]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_preset_selection_rejects_unknown_unsandboxed_service() {
+        let config = serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [{ "name": "webserver", "image": "paperless:latest" }],
+            "unsandboxedServices": ["unknown"]
+        });
+
+        let error = resolve_preset_selection("docker-compose", Some(&config), None).unwrap_err();
+
+        assert!(error.to_string().contains("not a recognized service"));
+    }
+
+    #[test]
+    fn test_preset_selection_rejects_overlapping_security_modes() {
+        let config = serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [{ "name": "webserver", "image": "paperless:latest" }],
+            "relaxedCapabilityServices": ["webserver"],
+            "unsandboxedServices": ["webserver"]
+        });
+
+        let error = resolve_preset_selection("docker-compose", Some(&config), None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot use both elevated permissions and a disabled sandbox"));
+    }
+
+    #[test]
+    fn validate_compose_public_ports_rejects_duplicate_unknown_and_disabled_services() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+
+        let route = |service: &str| ComposePublicPort {
+            service: service.to_string(),
+            port: 80,
+            published: Some(15_455),
+        };
+        let base = DockerComposeConfig {
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "web".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let duplicate = DockerComposeConfig {
+            public_ports: vec![route("web"), route("web")],
+            ..base.clone()
+        };
+        assert!(validate_compose_public_ports(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("only one public URL"));
+
+        let unknown = DockerComposeConfig {
+            public_ports: vec![route("missing")],
+            ..base.clone()
+        };
+        assert!(validate_compose_public_ports(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown service"));
+
+        let disabled = DockerComposeConfig {
+            public_ports: vec![route("web")],
+            excluded_services: vec!["web".to_string()],
+            ..base
+        };
+        assert!(validate_compose_public_ports(&disabled)
+            .unwrap_err()
+            .to_string()
+            .contains("disabled and public"));
+    }
+
+    #[test]
+    fn validate_compose_public_ports_accepts_target_and_published_mapping() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+        let cfg = DockerComposeConfig {
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 80,
+                published: Some(15_455),
+            }],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "web".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(validate_compose_public_ports(&cfg).is_ok());
+    }
+
     use std::sync::Arc;
     use std::sync::Mutex;
     use temps_core::async_trait::async_trait;
@@ -3853,6 +4404,364 @@ mod tests {
                 assert_eq!(cfg.nixpacks_config.as_deref(), Some(toml));
             }
             other => panic!("expected Nixpacks config with providers=[node], got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_preset_config_patch_preserves_docker_compose_fields() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Preserve Compose Fields");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
+                {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // A patch touching only excludedServices must not wipe composePath/composeServices.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "excludedServices": ["postgres"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("partial excludedServices patch");
+
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.compose_path, Some("compose.yml".to_string()));
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+                assert_eq!(cfg.compose_services.len(), 2);
+                assert_eq!(cfg.compose_services[0].name, "postgres");
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // A patch touching only relaxedCapabilityServices must not wipe the
+        // other DockerCompose fields either — same bug class, new field.
+        // "postgres" is still present and looksLikeDatabase in the snapshot
+        // at this point, so the server-side database-service check passes.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "relaxedCapabilityServices": ["postgres"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("partial relaxedCapabilityServices patch");
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+                // Still preserved from the earlier patch.
+                assert_eq!(cfg.compose_services.len(), 2);
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // A patch explicitly replacing composeServices to drop "postgres"
+        // entirely must still succeed even though it leaves
+        // relaxedCapabilityServices pointing at a service that no longer
+        // exists in the new snapshot — this patch doesn't touch that field,
+        // so the server-side database-service check must not re-run against
+        // the now-stale reference and wedge the update.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "composeServices": [
+                        {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
+                    ]
+                })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.compose_services.len(), 1);
+                assert_eq!(cfg.compose_services[0].name, "hub");
+                // excludedServices was omitted from this patch too, so it must
+                // still survive from the previous update.
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+                // relaxedCapabilityServices survives too, even though it now
+                // references a service absent from the new snapshot.
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+
+        // And a subsequent unrelated patch must not wipe (or re-reject)
+        // relaxedCapabilityServices either.
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "excludedServices": [] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("unrelated excludedServices patch");
+        assert_eq!(updated.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(
+                    cfg.relaxed_capability_services,
+                    vec!["postgres".to_string()]
+                );
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relaxed_capability_services_allows_non_database_service_via_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Allow Non-DB Relax");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
+                {"name": "gitea", "image": "gitea/gitea:latest", "looksLikeDatabase": false}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // "gitea" is a real service in the snapshot and not flagged
+        // looksLikeDatabase, but the fix isn't database-specific (confirmed
+        // live: Gitea's own official image hits the identical ownership-fix
+        // failure at startup) — the toggle must accept any real service.
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "relaxedCapabilityServices": ["gitea"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("relaxedCapabilityServices patch for a real non-database service");
+        assert_eq!(result.preset.as_deref(), Some("docker-compose"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert_eq!(cfg.relaxed_capability_services, vec!["gitea".to_string()]);
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relaxed_capability_services_rejects_phantom_service_via_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Reject Phantom Relax");
+        create.preset = "docker-compose".to_string();
+        create.preset_config = Some(serde_json::json!({
+            "composePath": "compose.yml",
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true}
+            ]
+        }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create docker-compose project");
+
+        // A name that doesn't correspond to any service in the compose file
+        // at all — typo or a fabricated API request — must still be
+        // rejected.
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "relaxedCapabilityServices": ["does-not-exist"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(ProjectError::InvalidInput(_))));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(cfg)) => {
+                assert!(cfg.relaxed_capability_services.is_empty());
+            }
+            other => panic!("expected DockerCompose config, got {other:?}"),
         }
     }
 
@@ -4901,6 +5810,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.directory, ".");
+    }
+
+    #[tokio::test]
+    async fn changing_compose_public_ports_requests_a_route_reload() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Compose route reload".to_string()),
+            slug: Set("compose-route-reload".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            preset_config: Set(Some(temps_entities::preset::PresetConfig::DockerCompose(
+                temps_entities::preset::DockerComposeConfig {
+                    public_ports: vec![temps_entities::preset::ComposePublicPort {
+                        service: "web".to_string(),
+                        port: 80,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        project_service
+            .update_git_settings(
+                inserted_project.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({
+                    "publicPorts": [{ "service": "web", "port": 8080 }]
+                })),
+                None,
+                None,
+            )
+            .await
+            .expect("compose port save should succeed");
+
+        let jobs = mock_queue.get_jobs().await;
+        assert!(jobs.iter().any(|job| matches!(
+            job,
+            Job::ForceRouteReload(ForceRouteReloadJob {
+                environment_id: None,
+                deployment_id: None,
+            })
+        )));
     }
 
     #[test]

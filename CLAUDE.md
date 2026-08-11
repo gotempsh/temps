@@ -776,6 +776,16 @@ Merge conflicts in either client are conflicts in build output. Never
 hand-merge them: take one side to clear the conflict, then regenerate from a
 server built off the merged source and typecheck both packages.
 
+**Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`.**
+Some backend endpoints are served by a plugin crate that isn't part of this
+repository, so their schema doesn't exist in the spec this file's generated
+client is built from, and it must stay that way. For CLI parity on those
+endpoints, hand-write local request/response interfaces mirroring the
+plugin's shapes and call the shared `client` object directly via its generic
+`.get/.post/.patch/.delete` methods — same call shape every generated SDK
+function already uses, just without codegen. See
+`apps/temps-cli/src/commands/otel-forward/index.ts` for the pattern.
+
 ### Permission System
 
 ```rust
@@ -1057,6 +1067,12 @@ All use `TEMPS_` prefix:
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
+
+Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
+
+| Variable | Default | Required |
+|---|---|---|
+| `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` | unset (clean up) | No -- set to any value to keep `/tmp/temps-deployments/deployment-*` directories after a deployment finishes or fails, for inspecting a build/download issue. Restart the server to change. |
 
 ---
 

@@ -46,6 +46,46 @@ pub struct RepositoryPresetDomain {
     pub calculated_at: UtcDateTime,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnvExampleVariableDomain {
+    pub key: String,
+    pub default_value: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryEnvExampleDomain {
+    pub repository_id: i32,
+    /// Path of the detected env-example file, `None` if the repository has none.
+    pub path: Option<String>,
+    pub variables: Vec<EnvExampleVariableDomain>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ComposeServicePreviewDomain {
+    pub name: String,
+    pub image: Option<String>,
+    pub depends_on: Vec<String>,
+    pub environment_variables: Vec<String>,
+    pub looks_like_database: bool,
+    pub detected_service_type: Option<temps_entities::preset::ComposeServiceFamily>,
+    pub ports: Vec<temps_entities::preset::ComposePortMapping>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryComposeServicesDomain {
+    pub repository_id: i32,
+    pub path: String,
+    pub services: Vec<ComposeServicePreviewDomain>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryComposePreviewDomain {
+    pub repository_id: i32,
+    pub path: String,
+    pub preview: temps_presets::EffectiveComposePreview,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectUsageInfo {
     pub id: i32,
@@ -177,6 +217,58 @@ pub struct GitProviderManager {
 }
 
 impl GitProviderManager {
+    fn url_has_origin(url: &str, expected_host: &str) -> bool {
+        let Ok(url) = Url::parse(url) else {
+            return false;
+        };
+
+        url.scheme() == "https"
+            && url.host_str() == Some(expected_host)
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+
+    /// Public-repository requests below are sent to github.com. A credential
+    /// configured for GitHub Enterprise must never cross that provider origin.
+    fn is_github_dot_com_provider(provider: &git_providers::Model) -> bool {
+        if provider.provider_type != "github" && provider.provider_type != "github_app" {
+            return false;
+        }
+
+        let api_is_public = provider
+            .api_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "api.github.com"))
+            .unwrap_or_else(|| {
+                provider
+                    .base_url
+                    .as_deref()
+                    .map(|url| Self::url_has_origin(url, "github.com"))
+                    .unwrap_or(true)
+            });
+        let web_is_public = provider
+            .base_url
+            .as_deref()
+            .map(|url| Self::url_has_origin(url, "github.com"))
+            .unwrap_or(true);
+
+        api_is_public && web_is_public
+    }
+
+    async fn get_active_connections_for_user(
+        &self,
+        user_id: i32,
+    ) -> Result<Vec<git_provider_connections::Model>, sea_orm::DbErr> {
+        git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::IsExpired.eq(false))
+            .filter(git_provider_connections::Column::UserId.eq(Some(user_id)))
+            .order_by_desc(git_provider_connections::Column::UpdatedAt)
+            .all(self.db.as_ref())
+            .await
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<temps_core::EncryptionService>,
@@ -205,16 +297,22 @@ impl GitProviderManager {
         self.decrypt_string(encrypted).await
     }
 
-    /// Get an access token from any active GitHub connection.
-    /// Used for public repo API calls to avoid unauthenticated rate limits (60 → 5000 req/hr).
-    /// Validates the token against GitHub's API before returning it.
-    pub async fn get_any_github_token(&self) -> Option<String> {
+    /// Get a valid access token from one of this user's active GitHub connections.
+    ///
+    /// Public repository discovery uses this to receive GitHub's authenticated
+    /// rate limit. Credentials are deliberately scoped to the requesting user:
+    /// an unauthenticated request, deployment token, or another user must never
+    /// borrow a connection token.
+    pub async fn get_valid_github_token_for_user(&self, user_id: i32) -> Option<String> {
         use temps_entities::git_providers;
 
-        let connections = self.get_user_connections().await.ok()?;
+        let connections = self.get_active_connections_for_user(user_id).await.ok()?;
 
         for conn in connections {
-            if !conn.is_active {
+            // Keep this defensive check even though the database query applies
+            // the same ownership filter. It prevents an incorrectly-behaving
+            // database mock or future query refactor from crossing tenants.
+            if !conn.is_active || conn.is_expired || conn.user_id != Some(user_id) {
                 continue;
             }
 
@@ -225,12 +323,11 @@ impl GitProviderManager {
                 .ok()
                 .flatten();
 
-            let is_github = provider
-                .as_ref()
-                .map(|p| p.provider_type == "github" || p.provider_type == "github_app")
-                .unwrap_or(false);
+            let Some(provider) = provider else {
+                continue;
+            };
 
-            if !is_github {
+            if !provider.is_active || !Self::is_github_dot_com_provider(&provider) {
                 continue;
             }
 
@@ -240,33 +337,14 @@ impl GitProviderManager {
                 _ => continue,
             };
 
-            // Verify the token actually works with a lightweight API call
-            let client = reqwest::Client::builder()
-                .user_agent("Temps-Engine/1.0")
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .ok()?;
-
-            let resp = client
-                .get("https://api.github.com/rate_limit")
-                .header("Authorization", format!("token {}", token))
-                .send()
-                .await
-                .ok()?;
-
-            if resp.status().is_success() {
-                tracing::debug!(
-                    "Using GitHub token from connection {} for public repo API calls",
-                    conn.id
-                );
-                return Some(token);
-            }
-
-            tracing::warn!(
-                "GitHub token from connection {} failed validation (status {}), trying next",
-                conn.id,
-                resp.status()
+            // get_connection_token validates and, when supported, refreshes the
+            // credential before returning it.
+            tracing::debug!(
+                user_id,
+                connection_id = conn.id,
+                "Using the request user's GitHub connection for public repository API calls"
             );
+            return Some(token);
         }
         None
     }
@@ -1615,6 +1693,37 @@ impl GitProviderManager {
             GitProviderManagerError::RepositoryNotFound(format!("Repository {} not found", id))
         })
     }
+
+    /// Resolve a repository only when its provider connection belongs to the
+    /// requesting user. Returning `RepositoryNotFound` for both missing and
+    /// foreign repositories avoids turning numeric repository IDs into a
+    /// cross-tenant existence oracle.
+    async fn get_repository_for_user(
+        &self,
+        repository_id: i32,
+        user_id: i32,
+    ) -> Result<repositories::Model, GitProviderManagerError> {
+        let result = repositories::Entity::find_by_id(repository_id)
+            .find_also_related(git_provider_connections::Entity)
+            .one(self.db.as_ref())
+            .await?;
+
+        let Some((repository, Some(connection))) = result else {
+            return Err(GitProviderManagerError::RepositoryNotFound(format!(
+                "Repository {} not found",
+                repository_id
+            )));
+        };
+
+        if connection.user_id != Some(user_id) {
+            return Err(GitProviderManagerError::RepositoryNotFound(format!(
+                "Repository {} not found",
+                repository_id
+            )));
+        }
+
+        Ok(repository)
+    }
     pub async fn get_repository_by_owner_and_name_in_connection(
         &self,
         owner: &str,
@@ -1860,11 +1969,18 @@ impl GitProviderManager {
         status: reqwest::StatusCode,
         operation: &str,
     ) -> GitProviderError {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             GitProviderError::AuthenticationFailed(format!(
                 "provider rejected the stored credential while trying to {}: HTTP {}",
                 operation, status
             ))
+        } else if status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::PermissionDenied {
+                operation: operation.to_string(),
+                required_permission:
+                    "repository access with the permission required by this operation".to_string(),
+                provider_message: format!("HTTP {}", status),
+            }
         } else {
             GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
         }
@@ -2385,7 +2501,7 @@ impl GitProviderManager {
     pub async fn calculate_and_store_preset(
         &self,
         repo_id: i32,
-        _connection_id: i32,
+        connection_id: i32,
     ) -> Result<(), GitProviderManagerError> {
         // Verify repository exists
         let _ = repositories::Entity::find_by_id(repo_id)
@@ -2398,10 +2514,21 @@ impl GitProviderManager {
                 ))
             })?;
 
+        let user_id = self
+            .get_connection(connection_id)
+            .await?
+            .user_id
+            .ok_or_else(|| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Connection {} has no owning user",
+                    connection_id
+                ))
+            })?;
+
         // Calculate preset (this will automatically cache it in the database)
         let _ = self
             .calculate_repository_preset_live(
-                repo_id, None, // Use default branch
+                repo_id, user_id, None, // Use default branch
             )
             .await?;
 
@@ -3297,18 +3424,10 @@ impl GitProviderManager {
     pub async fn calculate_repository_preset_live(
         &self,
         repository_id: i32,
+        user_id: i32,
         branch: Option<String>,
     ) -> Result<RepositoryPresetDomain, GitProviderManagerError> {
-        // Get repository from database
-        let repository = repositories::Entity::find_by_id(repository_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                GitProviderManagerError::InvalidConfiguration(format!(
-                    "Repository {} not found",
-                    repository_id
-                ))
-            })?;
+        let repository = self.get_repository_for_user(repository_id, user_id).await?;
 
         // Repository always has a git provider connection (required field)
         let connection_id = repository.git_provider_connection_id;
@@ -3410,6 +3529,212 @@ impl GitProviderManager {
         })
     }
 
+    /// Detect and parse a `.env.example`-style file for a repository, live
+    /// (not cached — this is a one-shot lookup for the New Project wizard,
+    /// unlike preset detection which persists to `repositories.preset`).
+    pub async fn calculate_repository_env_example_live(
+        &self,
+        repository_id: i32,
+        user_id: i32,
+        branch: Option<String>,
+    ) -> Result<RepositoryEnvExampleDomain, GitProviderManagerError> {
+        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+
+        let connection_id = repository.git_provider_connection_id;
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
+        };
+
+        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
+
+        let files = self
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                async move {
+                    self.get_repository_files(
+                        &provider_service,
+                        &access_token,
+                        &owner,
+                        &name,
+                        &target_branch,
+                    )
+                    .await
+                }
+            })
+            .await?;
+
+        let Some(env_path) = temps_presets::detect_env_example_files(&files)
+            .into_iter()
+            .next()
+        else {
+            return Ok(RepositoryEnvExampleDomain {
+                repository_id,
+                path: None,
+                variables: Vec::new(),
+            });
+        };
+
+        let file = self
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                let env_path = env_path.clone();
+                async move {
+                    provider_service
+                        .get_file_content(
+                            &access_token,
+                            &owner,
+                            &name,
+                            &env_path,
+                            Some(&target_branch),
+                        )
+                        .await
+                }
+            })
+            .await?;
+
+        let content = decode_file_content(&file.content, &file.encoding);
+        let variables = temps_presets::parse_env_example(&content)
+            .into_iter()
+            .map(|v| EnvExampleVariableDomain {
+                key: v.key,
+                default_value: v.default_value,
+                description: v.description,
+            })
+            .collect();
+
+        Ok(RepositoryEnvExampleDomain {
+            repository_id,
+            path: Some(env_path),
+            variables,
+        })
+    }
+
+    /// Parses a compose file's services for the New Project wizard, live (not
+    /// cached — same one-shot-lookup model as `calculate_repository_env_example_live`).
+    /// Unlike env-example detection, the compose path is already known by the
+    /// caller (it comes from the `compose_files` list `/preset/live` already
+    /// returned), so this skips straight to fetching that one file's content.
+    pub async fn calculate_repository_compose_services_live(
+        &self,
+        repository_id: i32,
+        user_id: i32,
+        branch: Option<String>,
+        path: String,
+    ) -> Result<RepositoryComposeServicesDomain, GitProviderManagerError> {
+        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+
+        let connection_id = repository.git_provider_connection_id;
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
+        };
+
+        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
+
+        let file = self
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                let path = path.clone();
+                async move {
+                    provider_service
+                        .get_file_content(&access_token, &owner, &name, &path, Some(&target_branch))
+                        .await
+                }
+            })
+            .await?;
+
+        let content = decode_file_content(&file.content, &file.encoding);
+        let services = temps_presets::list_compose_services(&content)
+            .map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Compose file '{}' could not be parsed: {}",
+                    path, e
+                ))
+            })?
+            .into_iter()
+            .map(|s| ComposeServicePreviewDomain {
+                name: s.name,
+                image: s.image,
+                depends_on: s.depends_on,
+                environment_variables: s.environment_variables,
+                looks_like_database: s.looks_like_database,
+                detected_service_type: s.detected_service_type,
+                ports: s.ports,
+            })
+            .collect();
+
+        Ok(RepositoryComposeServicesDomain {
+            repository_id,
+            path,
+            services,
+        })
+    }
+
+    /// Fetch and render the effective Compose document for the settings mini
+    /// editor. The presets layer removes disabled services, applies the inline
+    /// override, and redacts sensitive values before this method returns.
+    pub async fn calculate_repository_compose_preview_live(
+        &self,
+        repository_id: i32,
+        user_id: i32,
+        branch: Option<String>,
+        path: String,
+        compose_override: Option<String>,
+        excluded_services: Vec<String>,
+    ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
+        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+
+        let connection_id = repository.git_provider_connection_id;
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
+        };
+        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
+        let file = self
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                let path = path.clone();
+                async move {
+                    provider_service
+                        .get_file_content(&access_token, &owner, &name, &path, Some(&target_branch))
+                        .await
+                }
+            })
+            .await?;
+
+        let content = decode_file_content(&file.content, &file.encoding);
+        let preview = temps_presets::render_effective_compose_preview(
+            &content,
+            compose_override.as_deref(),
+            &excluded_services,
+        )
+        .map_err(|error| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Compose preview for '{}' could not be rendered: {}",
+                path, error
+            ))
+        })?;
+
+        Ok(RepositoryComposePreviewDomain {
+            repository_id,
+            path,
+            preview,
+        })
+    }
+
     /// Detect presets in directories with proper grouping and filtering
     async fn detect_presets_in_directories(&self, files: &[String]) -> Vec<ProjectPresetDomain> {
         // Use the centralized file tree detection from temps-presets
@@ -3473,7 +3798,9 @@ impl GitProviderManager {
         // This allows users to update a GitHub App installation connection to use a PAT
         let provider = self.get_provider(connection.provider_id).await?;
 
-        // Validate the new access token as a PAT (using /user endpoint)
+        // Validate the new access token as a PAT. GitHub's `/rate_limit`
+        // authenticates repository-scoped and Actions credentials without
+        // requiring user-profile access; GitLab still uses `/user`.
         let client = reqwest::Client::new();
         let api_url = provider
             .api_url
@@ -3481,7 +3808,11 @@ impl GitProviderManager {
             .unwrap_or("https://api.github.com");
         let validation_endpoint =
             if provider.provider_type == "github" || provider.provider_type == "gitlab" {
-                format!("{}/user", api_url)
+                if provider.provider_type == "github" {
+                    format!("{}/rate_limit", api_url)
+                } else {
+                    format!("{}/user", api_url)
+                }
             } else {
                 // For other providers, use the provider service's validate_token
                 let provider_service = self.get_provider_service(connection.provider_id).await?;
@@ -3549,20 +3880,39 @@ impl GitProviderManager {
                 ));
             }
             status => {
-                let error_text = response
-                    .text()
+                let provider_message = response
+                    .json::<serde_json::Value>()
                     .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
+                    .ok()
+                    .and_then(|body| {
+                        body.get("message")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("HTTP {}", status));
                 tracing::warn!(
                     "Error validating new access token for connection {}: {} - {}",
                     connection_id,
                     status,
-                    error_text
+                    provider_message
                 );
-                return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                    "Failed to validate the provided access token: {} - {}",
-                    status, error_text
-                )));
+                let error = match status {
+                    reqwest::StatusCode::FORBIDDEN => GitProviderError::PermissionDenied {
+                        operation: "validate the replacement credential".to_string(),
+                        required_permission: if provider.provider_type == "github" {
+                            "Metadata: read".to_string()
+                        } else {
+                            "read_user".to_string()
+                        },
+                        provider_message,
+                    },
+                    reqwest::StatusCode::TOO_MANY_REQUESTS => GitProviderError::RateLimitExceeded,
+                    _ => GitProviderError::ApiError(format!(
+                        "{} returned HTTP {} while validating the replacement credential: {}",
+                        provider.provider_type, status, provider_message
+                    )),
+                };
+                return Err(error.into());
             }
         }
 
@@ -3747,14 +4097,17 @@ impl GitProviderManager {
             return Ok(false);
         };
 
-        // Try to get user info to validate the token
-        match provider_service.get_user(&access_token).await {
-            Ok(_) => Ok(true),
-            Err(_) => {
+        match provider_service.validate_token(&access_token).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
                 // Token is invalid, mark connection as inactive
                 self.deactivate_connection(connection_id).await?;
                 Ok(false)
             }
+            // A provider outage, rate limit, or missing operation permission
+            // does not prove that the credential is invalid. Preserve the
+            // typed error and keep the connection active.
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -4866,6 +5219,21 @@ impl GitProviderManager {
     }
 }
 
+/// Decode a provider `FileContent`. GitHub and GitLab both return base64
+/// (with embedded newlines in GitHub's case); falls back to the raw string
+/// if decoding fails or the encoding isn't base64, so the caller still gets
+/// *something* rather than an error over a cosmetic decode issue.
+fn decode_file_content(content: &str, encoding: &str) -> String {
+    use base64::Engine;
+    if encoding.eq_ignore_ascii_case("base64") {
+        let stripped: String = content.split_whitespace().collect();
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(stripped) {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    content.to_string()
+}
+
 /// Parse a git URL to extract owner and repository name
 fn parse_git_url(url: &str) -> Option<(String, String)> {
     // Handle HTTPS URLs: https://github.com/owner/repo.git
@@ -5434,18 +5802,20 @@ mod classify_provider_response_error_tests {
         );
     }
 
-    /// 403 is the other shape a revoked/insufficient credential takes
-    /// (GitHub returns it for token scope problems and some rate limits).
+    /// A valid credential that lacks a repository capability is not an
+    /// authentication failure: clients must tell the operator which grant to
+    /// add instead of asking them to reconnect the same credential.
     #[test]
-    fn forbidden_is_classified_as_authentication_failure() {
+    fn forbidden_is_classified_as_permission_denied() {
         let err = GitProviderManager::classify_provider_response_error(
             reqwest::StatusCode::FORBIDDEN,
             "get tree for owner/repo@main",
         );
         assert!(
-            matches!(err, GitProviderError::AuthenticationFailed(_)),
-            "403 must map to AuthenticationFailed, got {err:?}"
+            matches!(err, GitProviderError::PermissionDenied { .. }),
+            "403 must map to PermissionDenied, got {err:?}"
         );
+        assert!(err.to_string().contains("owner/repo@main"));
     }
 
     /// Everything else stays a generic API error — a provider outage is not
@@ -5498,6 +5868,160 @@ mod tests {
     use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{git_provider_connections, git_providers};
+
+    fn provider_model(
+        provider_type: &str,
+        base_url: Option<&str>,
+        api_url: Option<&str>,
+    ) -> git_providers::Model {
+        let now = chrono::Utc::now();
+        git_providers::Model {
+            id: 1,
+            name: "test-provider".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_url: api_url.map(str::to_string),
+            auth_method: "pat".to_string(),
+            auth_config: serde_json::json!({}),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_github_token_selection_rejects_enterprise_origins() {
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model(
+                "github",
+                Some("https://github.com/acme"),
+                Some("https://api.github.com")
+            )
+        ));
+        assert!(GitProviderManager::is_github_dot_com_provider(
+            &provider_model("github_app", None, None)
+        ));
+
+        for provider in [
+            provider_model(
+                "github",
+                Some("https://github.enterprise.example"),
+                Some("https://github.enterprise.example/api/v3"),
+            ),
+            provider_model(
+                "github_app",
+                Some("https://github.enterprise.example"),
+                Some("https://api.github.com"),
+            ),
+            provider_model(
+                "github",
+                Some("https://github.com.evil.example"),
+                Some("https://api.github.com.evil.example"),
+            ),
+        ] {
+            assert!(
+                !GitProviderManager::is_github_dot_com_provider(&provider),
+                "a non-GitHub.com credential must be rejected before token decryption or validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_scoped_connection_lookup_isolates_users_and_inactive_rows() {
+        use temps_entities::users;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Postgres unavailable; skipping connection-isolation test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+
+        let make_user = |email: &str| users::ActiveModel {
+            email: Set(email.to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set(email.to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let user_a = make_user("github-token-a@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        let user_b = make_user("github-token-b@example.com")
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("GitHub.com".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(Some("https://github.com".to_string())),
+            api_url: Set(Some("https://api.github.com".to_string())),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        for (user_id, account_name, is_active) in [
+            (Some(user_a.id), "user-a-active", true),
+            (Some(user_a.id), "user-a-inactive", false),
+            (Some(user_b.id), "user-b-active", true),
+            (None, "ownerless-active", true),
+        ] {
+            git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(user_id),
+                account_name: Set(account_name.to_string()),
+                account_type: Set("User".to_string()),
+                access_token: Set(None),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(is_active),
+                is_expired: Set(false),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let connections = manager
+            .get_active_connections_for_user(user_a.id)
+            .await
+            .unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].account_name, "user-a-active");
+    }
 
     #[test]
     fn is_auth_failure_recognizes_common_messages() {
@@ -5612,6 +6136,398 @@ mod tests {
         );
     }
 
+    fn repository_fixture(connection_id: i32) -> repositories::Model {
+        let now = chrono::Utc::now();
+        repositories::Model {
+            id: 42,
+            git_provider_connection_id: connection_id,
+            owner: "example-owner".to_string(),
+            name: "example-repository".to_string(),
+            full_name: "example-owner/example-repository".to_string(),
+            description: None,
+            private: true,
+            fork: false,
+            created_at: now,
+            updated_at: now,
+            pushed_at: now,
+            size: 0,
+            stargazers_count: 0,
+            watchers_count: 0,
+            language: None,
+            default_branch: "main".to_string(),
+            open_issues_count: 0,
+            topics: String::new(),
+            repo_object: "{}".to_string(),
+            installation_id: None,
+            clone_url: None,
+            ssh_url: None,
+            preset: None,
+        }
+    }
+
+    fn connection_fixture(id: i32, user_id: Option<i32>) -> git_provider_connections::Model {
+        let now = chrono::Utc::now();
+        git_provider_connections::Model {
+            id,
+            provider_id: 7,
+            user_id,
+            account_name: "example-account".to_string(),
+            account_type: "User".to_string(),
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
+            refresh_token_expires_at: None,
+            installation_id: None,
+            metadata: None,
+            is_active: true,
+            is_expired: false,
+            syncing: false,
+            last_synced_at: None,
+            synced_repository_count: 0,
+            health_status: "healthy".to_string(),
+            health_message: None,
+            last_health_check_at: None,
+            consecutive_health_failures: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn github_provider_fixture() -> git_providers::Model {
+        let now = chrono::Utc::now();
+        git_providers::Model {
+            id: 7,
+            name: "GitHub".to_string(),
+            provider_type: "github".to_string(),
+            base_url: Some("https://github.com".to_string()),
+            api_url: Some("https://api.github.com".to_string()),
+            auth_method: "pat".to_string(),
+            auth_config: serde_json::json!({}),
+            webhook_secret: None,
+            is_active: true,
+            is_default: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn public_github_token_uses_valid_connection_owned_by_request_user() {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let validate_token = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer owned-github-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("owned-github-token")
+                .expect("test token should encrypt"),
+        );
+        let provider_model = github_provider_fixture();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[provider_model.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[provider_model]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "unused-constructor-token".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, provider);
+
+        let token = manager.get_valid_github_token_for_user(5).await;
+
+        assert_eq!(token.as_deref(), Some("owned-github-token"));
+        validate_token.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn public_github_token_never_uses_another_users_connection() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        // MockDatabase returns queued rows without applying SQL predicates.
+        // Returning another user's row exercises the method's defensive
+        // ownership check in addition to the query's UserId filter.
+        let connection = connection_fixture(11, Some(6));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        assert_eq!(manager.get_valid_github_token_for_user(5).await, None);
+    }
+
+    fn mock_manager_with_repository_owner(owner_user_id: Option<i32>) -> GitProviderManager {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let connection = connection_fixture(11, owner_user_id);
+        let repository = repository_fixture(connection.id);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[(repository, Some(connection))]])
+                .into_connection(),
+        );
+        GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        )
+    }
+
+    #[tokio::test]
+    async fn connected_repository_lookup_allows_its_owner() {
+        let manager = mock_manager_with_repository_owner(Some(5));
+
+        let repository = manager
+            .get_repository_for_user(42, 5)
+            .await
+            .expect("the owning user should resolve the repository");
+
+        assert_eq!(repository.id, 42);
+    }
+
+    #[tokio::test]
+    async fn connected_repository_lookup_hides_repository_from_other_users() {
+        let manager = mock_manager_with_repository_owner(Some(5));
+
+        let error = manager
+            .get_repository_for_user(42, 6)
+            .await
+            .expect_err("a different user must not resolve the repository");
+
+        assert!(matches!(
+            error,
+            GitProviderManagerError::RepositoryNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn connected_repository_lookup_rejects_ownerless_connections() {
+        let manager = mock_manager_with_repository_owner(None);
+
+        let error = manager
+            .get_repository_for_user(42, 5)
+            .await
+            .expect_err("an ownerless connection must not expose repository contents");
+
+        assert!(matches!(
+            error,
+            GitProviderManagerError::RepositoryNotFound(_)
+        ));
+    }
+
+    async fn mock_manager_with_compose_file(
+        content: &str,
+        expected_path: &str,
+        expected_branch: &str,
+    ) -> (
+        GitProviderManager,
+        mockito::ServerGuard,
+        mockito::Mock,
+        mockito::Mock,
+    ) {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use base64::Engine;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let validate_token = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let file_content = server
+            .mock(
+                "GET",
+                format!("/repos/example-owner/example-repository/contents/{expected_path}")
+                    .as_str(),
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                expected_branch.to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "path": expected_path,
+                    "content": base64::engine::general_purpose::STANDARD.encode(content),
+                    "encoding": "base64"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("test-access-token")
+                .expect("test access token should encrypt"),
+        );
+        let repository = repository_fixture(connection.id);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[(repository, Some(connection.clone()))]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "unused-constructor-token".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, provider);
+
+        (manager, server, validate_token, file_content)
+    }
+
+    #[tokio::test]
+    async fn connected_compose_preview_fetches_custom_ref_and_renders_safe_effective_yaml() {
+        let compose = r#"
+services:
+  web:
+    image: example/web:latest
+    depends_on:
+      - db
+    environment:
+      API_TOKEN: repository-secret
+    ports:
+      - "3000:3000"
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: database-secret
+"#;
+        let (manager, _server, validate_token, file_content) = mock_manager_with_compose_file(
+            compose,
+            "deploy/compose.preview.yml",
+            "feature/compose",
+        )
+        .await;
+
+        let result = manager
+            .calculate_repository_compose_preview_live(
+                42,
+                5,
+                Some("feature/compose".to_string()),
+                "deploy/compose.preview.yml".to_string(),
+                Some(
+                    "services:\n  web:\n    environment:\n      LOG_LEVEL: debug\n    ports:\n      - \"15455:80\"\n"
+                        .to_string(),
+                ),
+                vec!["db".to_string()],
+            )
+            .await
+            .expect("connected Compose preview should render");
+
+        assert_eq!(result.repository_id, 42);
+        assert_eq!(result.path, "deploy/compose.preview.yml");
+        assert_eq!(result.preview.enabled_services, ["web"]);
+        assert_eq!(result.preview.disabled_services, ["db"]);
+        assert!(result.preview.yaml.contains("15455:80"));
+        assert!(!result.preview.yaml.contains("3000:3000"));
+        assert!(!result.preview.yaml.contains("repository-secret"));
+        assert!(!result.preview.yaml.contains("database-secret"));
+        assert!(!result.preview.yaml.contains("POSTGRES_PASSWORD"));
+        assert!(result.preview.yaml.contains("API_TOKEN: <redacted>"));
+        assert!(result.preview.yaml.contains("LOG_LEVEL: <redacted>"));
+        validate_token.assert_async().await;
+        file_content.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn connected_compose_preview_reports_custom_path_for_invalid_yaml() {
+        let (manager, _server, validate_token, file_content) = mock_manager_with_compose_file(
+            "services: [not a mapping",
+            "ops/custom.compose.yaml",
+            "release-candidate",
+        )
+        .await;
+
+        let error = manager
+            .calculate_repository_compose_preview_live(
+                42,
+                5,
+                Some("release-candidate".to_string()),
+                "ops/custom.compose.yaml".to_string(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect_err("invalid repository YAML must fail preview rendering");
+
+        let message = error.to_string();
+        assert!(message.contains("ops/custom.compose.yaml"), "{message}");
+        assert!(message.contains("could not be rendered"), "{message}");
+        validate_token.assert_async().await;
+        file_content.assert_async().await;
+    }
+
     // Helper function to create a test ConfigService
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<temps_config::ConfigService> {
         let server_config = Arc::new(
@@ -5619,7 +6535,7 @@ mod tests {
                 "127.0.0.1:3000".to_string(),
                 "postgresql://test".to_string(),
                 None,
-                None,
+                Some("127.0.0.1:3001".to_string()),
             )
             .unwrap(),
         );

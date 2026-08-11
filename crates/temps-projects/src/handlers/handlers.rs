@@ -201,6 +201,8 @@ impl Drop for DropInspectionPermit {
 pub struct DropPresetCandidate {
     pub directory: String,
     pub preset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_path: Option<String>,
     pub label: String,
     pub confidence: String,
     pub reason: String,
@@ -307,9 +309,11 @@ pub async fn inspect_drop_archive(
             .into_iter()
             .map(|candidate| {
                 let preset = candidate.catalog_slug().to_string();
+                let compose_path = compose_path_for_candidate(&manifests, &candidate);
                 DropPresetCandidate {
                     directory: candidate.path,
                     preset,
+                    compose_path,
                     label: candidate.preset.display_name().to_string(),
                     confidence: candidate.confidence.to_string(),
                     reason: candidate.reason,
@@ -348,6 +352,27 @@ pub async fn inspect_drop_archive(
         suggested_name,
         candidates,
     }))
+}
+
+fn compose_path_for_candidate(
+    manifests: &BTreeMap<String, String>,
+    candidate: &temps_presets::ProjectCandidate,
+) -> Option<String> {
+    if candidate.preset != temps_entities::preset::Preset::DockerCompose {
+        return None;
+    }
+
+    temps_presets::docker_compose::COMPOSE_FILE_NAMES
+        .iter()
+        .find(|file_name| {
+            let archive_path = if candidate.path == "." {
+                (*file_name).to_string()
+            } else {
+                format!("{}/{file_name}", candidate.path.trim_end_matches('/'))
+            };
+            manifests.contains_key(&archive_path)
+        })
+        .map(|file_name| (*file_name).to_string())
 }
 
 fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, String>, Problem> {
@@ -834,6 +859,7 @@ pub async fn update_project(
         main_branch: Some(project.main_branch),
         preset: Some(project.preset),
         automatic_deploy: project.automatic_deploy,
+        compose_configuration_updated: None,
     };
 
     let audit_event = ProjectUpdatedAudit {
@@ -905,6 +931,7 @@ pub async fn change_project_source(
             main_branch: None,
             preset: None,
             automatic_deploy: None,
+            compose_configuration_updated: None,
         },
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
@@ -1082,6 +1109,7 @@ pub async fn update_project_settings(
         memory_limit: None,
         performance_metrics_enabled: None,
         slug: settings.slug,
+        compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {
@@ -1229,6 +1257,7 @@ pub async fn update_git_settings(
         main_branch: Some(settings.main_branch),
         preset: settings.preset,
         automatic_deploy: None,
+        compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
     };
 
     let audit_event = ProjectUpdatedAudit {
@@ -1312,6 +1341,7 @@ pub async fn reinstall_gitlab_webhook(
             main_branch: None,
             preset: None,
             automatic_deploy: None,
+            compose_configuration_updated: None,
         },
     };
 
@@ -2133,6 +2163,7 @@ pub async fn create_project_from_template(
         let deploy_job =
             temps_core::Job::DeployImageRequested(temps_core::DeployImageRequestedJob {
                 project_id: project.id,
+                target_environment_id: None,
                 image_ref: image_ref.clone(),
                 health_check_path: template.health_check_path.clone(),
             });
@@ -2215,7 +2246,46 @@ pub async fn create_project_from_template(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_owner_repo_from_git_url, project_created_from_template_telemetry_event};
+    use super::{
+        compose_path_for_candidate, parse_owner_repo_from_git_url,
+        project_created_from_template_telemetry_event,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn drop_compose_candidate_preserves_detected_modern_filename() {
+        let manifests = BTreeMap::from([(
+            "compose.yaml".to_string(),
+            "services:\n  web:\n    image: nginx".to_string(),
+        )]);
+        let candidate = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            compose_path_for_candidate(&manifests, &candidate).as_deref(),
+            Some("compose.yaml")
+        );
+    }
+
+    #[test]
+    fn drop_compose_candidate_returns_path_relative_to_nested_project() {
+        let manifests = BTreeMap::from([(
+            "apps/photos/compose.yml".to_string(),
+            "services:\n  web:\n    image: nginx".to_string(),
+        )]);
+        let candidate = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(candidate.path, "apps/photos");
+        assert_eq!(
+            compose_path_for_candidate(&manifests, &candidate).as_deref(),
+            Some("compose.yml")
+        );
+    }
 
     #[test]
     fn template_creation_telemetry_omits_operator_defined_slug() {

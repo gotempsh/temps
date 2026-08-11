@@ -17,6 +17,8 @@ temps-geo = { path = "../temps-geo" }
 temps-notifications = { path = "../temps-notifications" }
 temps-projects = { path = "../temps-projects" }
 temps-config = { path = "../temps-config" }
+temps-proxy = { path = "../temps-proxy" }
+temps-routes = { path = "../temps-routes" }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }

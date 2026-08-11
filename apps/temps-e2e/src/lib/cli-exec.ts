@@ -92,6 +92,21 @@ export function runCli(
  * full stdout/stderr on failure -- every scenario step should fail loudly
  * with the real CLI output, not a generic "expected 0" message.
  */
+/**
+ * Redacts the value following a `-p`/`--password` flag so error messages
+ * (which land in CI logs and --json `steps[].detail`) never echo a
+ * credential back out, even a throwaway scenario-generated one.
+ */
+function redactPasswordArgs(args: string[]): string[] {
+  const redacted = [...args]
+  for (let i = 0; i < redacted.length - 1; i++) {
+    if (redacted[i] === '-p' || redacted[i] === '--password') {
+      redacted[i + 1] = '***'
+    }
+  }
+  return redacted
+}
+
 export async function runCliOk(
   args: string[],
   cfg: CliConfig,
@@ -100,7 +115,7 @@ export async function runCliOk(
   const result = await runCli(args, cfg, opts)
   if (result.exitCode !== 0) {
     throw new Error(
-      `temps ${args.join(' ')} exited ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      `temps ${redactPasswordArgs(args).join(' ')} exited ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
     )
   }
   return result

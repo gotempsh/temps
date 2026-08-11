@@ -298,8 +298,10 @@ pub async fn reconcile_once(
     //      and typically isn't in production either.
     //   2. `nodes.private_address` — the worker's underlay IP, always
     //      reachable from the control plane.
-    //   3. "localhost" — single-host clusters where the monitor runs on
-    //      the control-plane host and binds the host port.
+    //   3. IPv4 loopback — single-host clusters where the monitor runs on
+    //      the control-plane host and binds the host port. Do not use
+    //      `localhost`: Ubuntu may resolve it to ::1 while Docker publishes
+    //      this port only on 127.0.0.1.
     //
     // We deliberately do NOT fall back to `member.hostname` (the FQDN)
     // because it only resolves on hosts running the per-node Hickory
@@ -317,7 +319,7 @@ pub async fn reconcile_once(
             }
         }
     } else {
-        "localhost".to_string()
+        crate::services::LOCAL_CLUSTER_HOST.to_string()
     };
     let monitor_port = monitor.port.unwrap_or(5432);
 

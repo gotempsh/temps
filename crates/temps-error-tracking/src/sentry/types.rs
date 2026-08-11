@@ -69,6 +69,10 @@ pub struct ProjectDSN {
     pub created_at: UtcDateTime,
     pub is_active: bool,
     pub event_count: i64,
+    /// Ingest rate limit for this DSN, enforced per project at ingest time.
+    /// `None` means unlimited (pre-existing rows created before this column
+    /// was enforced; new DSNs default to `Some(1000)`, see `generate_project_dsn`).
+    pub rate_limit_per_minute: Option<i32>,
 }
 
 /// Parsed DSN components

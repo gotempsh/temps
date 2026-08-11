@@ -608,40 +608,164 @@ async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
 #[derive(Debug, Clone)]
 pub struct GitHubUserInfo {
     pub username: String,
+    pub identity_warning: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GitHubTokenVerificationError {
+    #[error(
+        "GitHub rejected the credential as invalid or expired. GitHub said: {provider_message}"
+    )]
+    InvalidCredential { provider_message: String },
+    #[error(
+        "GitHub denied permission to {capability}. Grant '{required_permission}' to the token or GitHub App. GitHub said: {provider_message}"
+    )]
+    PermissionDenied {
+        capability: String,
+        required_permission: String,
+        provider_message: String,
+    },
+    #[error("GitHub API rate limit exhausted while validating the credential. Retry after the limit resets or use a different credential.")]
+    RateLimited,
+    #[error("Could not contact GitHub while validating the credential: {reason}")]
+    RequestFailed { reason: String },
+    #[error("GitHub returned an unexpected response while validating the credential: HTTP {status}. GitHub said: {provider_message}")]
+    Upstream {
+        status: reqwest::StatusCode,
+        provider_message: String,
+    },
+}
+
+fn github_error_message(body: &serde_json::Value) -> String {
+    body.get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or("no additional details")
+        .to_string()
+}
+
+fn validate_github_token_probe(
+    status: reqwest::StatusCode,
+    rate_limit_remaining: Option<u64>,
+    provider_message: String,
+) -> Result<(), GitHubTokenVerificationError> {
+    match status {
+        status if status.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Err(GitHubTokenVerificationError::InvalidCredential { provider_message })
+        }
+        reqwest::StatusCode::FORBIDDEN if rate_limit_remaining == Some(0) => {
+            Err(GitHubTokenVerificationError::RateLimited)
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(GitHubTokenVerificationError::PermissionDenied {
+            capability: "validate the credential".to_string(),
+            required_permission: "Metadata: read".to_string(),
+            provider_message,
+        }),
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Err(GitHubTokenVerificationError::RateLimited),
+        status => Err(GitHubTokenVerificationError::Upstream {
+            status,
+            provider_message,
+        }),
+    }
+}
+
+fn github_identity_from_response(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+    account_hint: Option<&str>,
+) -> Result<GitHubUserInfo, GitHubTokenVerificationError> {
+    if status.is_success() {
+        let username = body
+            .get("login")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| GitHubTokenVerificationError::Upstream {
+                status,
+                provider_message: "successful /user response did not contain a login".to_string(),
+            })?;
+        return Ok(GitHubUserInfo {
+            username: username.to_string(),
+            identity_warning: None,
+        });
+    }
+
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => Err(GitHubTokenVerificationError::InvalidCredential {
+            provider_message: github_error_message(body),
+        }),
+        reqwest::StatusCode::FORBIDDEN => {
+            // Repository-scoped and GitHub Actions installation tokens are
+            // valid credentials but cannot call the user-identity endpoint.
+            let username = account_hint
+                .filter(|hint| !hint.trim().is_empty())
+                .unwrap_or("repository-scoped-token")
+                .to_string();
+            Ok(GitHubUserInfo {
+                username,
+                identity_warning: Some(
+                    "GitHub user identity is unavailable for this repository-scoped credential. Repository permissions will be checked per operation."
+                        .to_string(),
+                ),
+            })
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Err(GitHubTokenVerificationError::RateLimited),
+        status => Err(GitHubTokenVerificationError::Upstream {
+            status,
+            provider_message: github_error_message(body),
+        }),
+    }
 }
 
 async fn verify_github_token(token: &str) -> anyhow::Result<GitHubUserInfo> {
     let client = reqwest::Client::new();
-    let response = client
+    let probe_response = client
+        .get("https://api.github.com/rate_limit")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "temps-setup")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| GitHubTokenVerificationError::RequestFailed {
+            reason: error.to_string(),
+        })?;
+
+    let probe_status = probe_response.status();
+    let rate_limit_remaining = probe_response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let probe_body = probe_response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    validate_github_token_probe(
+        probe_status,
+        rate_limit_remaining,
+        github_error_message(&probe_body),
+    )?;
+
+    let identity_response = client
         .get("https://api.github.com/user")
         .header("Authorization", format!("Bearer {}", token))
         .header("User-Agent", "temps-setup")
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to verify GitHub token: {}", e))?;
+        .map_err(|error| GitHubTokenVerificationError::RequestFailed {
+            reason: error.to_string(),
+        })?;
+    let identity_status = identity_response.status();
+    let identity_body = identity_response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let account_hint = std::env::var("GITHUB_ACTOR").ok();
 
-    if response.status().is_success() {
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse GitHub user response: {}", e))?;
-
-        let username = json
-            .get("login")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("GitHub response missing 'login' field"))?
-            .to_string();
-
-        Ok(GitHubUserInfo { username })
-    } else {
-        Err(anyhow::anyhow!(
-            "GitHub token is invalid or does not have required permissions (HTTP {}).\n\
-             Required scopes: 'repo' (full access) and 'read:user'.\n\
-             Create a token at: https://github.com/settings/tokens/new",
-            response.status()
-        ))
-    }
+    Ok(github_identity_from_response(
+        identity_status,
+        &identity_body,
+        account_hint.as_deref(),
+    )?)
 }
 
 /// Auto-detect the server's public IP address using external services
@@ -1664,10 +1788,10 @@ impl SetupCommand {
 
             println!("   Verifying GitHub token...");
             let github_user = rt.block_on(verify_github_token(github_token))?;
-            print_success(&format!(
-                "GitHub token verified (user: {})",
-                github_user.username
-            ));
+            print_success(&format!("GitHub token verified ({})", github_user.username));
+            if let Some(warning) = github_user.identity_warning.as_deref() {
+                print_warning(warning);
+            }
 
             let git_result = rt.block_on(create_git_provider(
                 db.as_ref(),
@@ -2854,6 +2978,89 @@ fn finish_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_scoped_github_token_does_not_require_user_identity() {
+        validate_github_token_probe(
+            reqwest::StatusCode::OK,
+            Some(4_999),
+            "no additional details".to_string(),
+        )
+        .expect("the token-compatible probe should accept the credential");
+
+        let identity = github_identity_from_response(
+            reqwest::StatusCode::FORBIDDEN,
+            &serde_json::json!({"message": "Resource not accessible by integration"}),
+            Some("ci-actor"),
+        )
+        .expect("missing user identity must not invalidate a repository-scoped token");
+
+        assert_eq!(identity.username, "ci-actor");
+        assert!(identity
+            .identity_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("Repository permissions will be checked")));
+    }
+
+    #[test]
+    fn github_token_probe_distinguishes_permission_and_rate_limit_failures() {
+        let denied = validate_github_token_probe(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(4_999),
+            "Resource not accessible by integration".to_string(),
+        )
+        .expect_err("a non-rate-limited 403 must be a permission error");
+        assert!(matches!(
+            denied,
+            GitHubTokenVerificationError::PermissionDenied { .. }
+        ));
+        assert!(denied.to_string().contains("Metadata: read"));
+
+        let limited = validate_github_token_probe(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(0),
+            "API rate limit exceeded".to_string(),
+        )
+        .expect_err("an exhausted rate-limit response must stay distinct");
+        assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
+    }
+
+    #[test]
+    fn github_token_probe_reports_invalid_credentials_without_scope_claims() {
+        let error = validate_github_token_probe(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None,
+            "Bad credentials".to_string(),
+        )
+        .expect_err("401 must reject the credential");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid or expired"));
+        assert!(message.contains("Bad credentials"));
+        assert!(!message.contains("repo' (full access)"));
+    }
+
+    #[test]
+    fn github_identity_probe_does_not_hide_upstream_or_rate_limit_failures() {
+        let upstream = github_identity_from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"message": "server error"}),
+            Some("ci-actor"),
+        )
+        .expect_err("an upstream failure must not be presented as verified identity metadata");
+        assert!(matches!(
+            upstream,
+            GitHubTokenVerificationError::Upstream { .. }
+        ));
+
+        let limited = github_identity_from_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({"message": "rate limit"}),
+            Some("ci-actor"),
+        )
+        .expect_err("a rate-limit failure must remain actionable");
+        assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
+    }
 
     /// Pins the dashed spelling. Reverting this to the dotted form still
     /// compiles and passes every other check, while silently making every

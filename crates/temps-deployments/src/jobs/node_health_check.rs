@@ -470,7 +470,7 @@ pub async fn failover_offline_nodes(
             if dep.needs_redeploy() {
                 // All replicas were on this node — must redeploy
                 match deployment_service
-                    .redeploy_environment(dep.project_id, dep.environment_id)
+                    .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
                     .await
                 {
                     Ok(_) => {

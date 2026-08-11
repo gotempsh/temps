@@ -7,6 +7,7 @@ use sea_orm::{
 use std::sync::Arc;
 use temps_entities::domains;
 use temps_entities::on_demand_cert_attempts;
+use temps_entities::renewal_attempts;
 use temps_entities::tls_acme_certificates;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -203,6 +204,54 @@ impl DomainService {
     }
 
     /// Step 2: Request a Let's Encrypt challenge for the domain
+    /// Append one row to the `renewal_attempts` audit log. Best-effort: a
+    /// failure to write the audit row must never fail the caller's actual
+    /// renewal outcome, so errors are logged and swallowed here.
+    async fn record_renewal_attempt(
+        &self,
+        domain_id: i32,
+        stage: &str,
+        verification_method: &str,
+        outcome: &str,
+        error: Option<String>,
+        error_type: Option<String>,
+    ) {
+        let row = renewal_attempts::ActiveModel {
+            domain_id: Set(domain_id),
+            stage: Set(stage.to_string()),
+            verification_method: Set(verification_method.to_string()),
+            outcome: Set(outcome.to_string()),
+            error: Set(error),
+            error_type: Set(error_type),
+            ..Default::default()
+        };
+        if let Err(e) = row.insert(self.db.as_ref()).await {
+            error!(
+                "Failed to record renewal attempt for domain_id {}: {}",
+                domain_id, e
+            );
+        }
+    }
+
+    /// Paginated renewal-attempt history for one domain, most recent first.
+    /// Returns `(attempts, total_count)`.
+    pub async fn list_renewal_attempts(
+        &self,
+        domain_id: i32,
+        page: u64,
+        page_size: u64,
+    ) -> Result<(Vec<renewal_attempts::Model>, u64), DomainServiceError> {
+        let paginator = renewal_attempts::Entity::find()
+            .filter(renewal_attempts::Column::DomainId.eq(domain_id))
+            .order_by_desc(renewal_attempts::Column::CreatedAt)
+            .paginate(self.db.as_ref(), page_size.max(1));
+
+        let total = paginator.num_items().await?;
+        let attempts = paginator.fetch_page(page.saturating_sub(1)).await?;
+
+        Ok((attempts, total))
+    }
+
     pub async fn request_challenge(
         &self,
         domain_name: &str,
@@ -226,6 +275,7 @@ impl DomainService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let domain_id = domain.id;
 
         // Clean up any existing order for this domain (important for renewals)
         // This ensures we always start fresh with a new challenge
@@ -245,13 +295,57 @@ impl DomainService {
             "dns-01" => ChallengeType::Dns01,
             _ => ChallengeType::Http01, // Default to HTTP-01
         };
+        let challenge_type_str = match challenge_type {
+            ChallengeType::Http01 => "http-01",
+            ChallengeType::Dns01 => "dns-01",
+        };
 
         // Request challenge from Let's Encrypt
-        match self
+        let provisioning_result = match self
             .cert_provider
             .provision(domain_name, challenge_type, user_email)
-            .await?
+            .await
         {
+            Ok(result) => result,
+            Err(e) => {
+                // Previously this error propagated via `?` straight out of the
+                // function: never persisted to `domains.last_error`, never
+                // recorded anywhere, so a renewal that fails at order-creation
+                // (rate limit, ACME account error, network blip) leaves no
+                // trace at all — unlike a `complete_challenge` failure, which
+                // already persists `last_error`/`last_error_type`. Mirror that
+                // here, and record the attempt in the history table so it
+                // survives the next attempt overwriting `last_error`.
+                error!(
+                    "Failed to request challenge for domain {}: {}",
+                    domain_name, e
+                );
+
+                let mut domain_active: domains::ActiveModel = domain.clone().into();
+                domain_active.last_error = Set(Some(e.to_string()));
+                domain_active.last_error_type = Set(Some("challenge_request".to_string()));
+                if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
+                    error!(
+                        "Failed to persist challenge-request failure for domain {}: {}",
+                        domain_name, update_err
+                    );
+                }
+
+                self.record_renewal_attempt(
+                    domain_id,
+                    "request_challenge",
+                    challenge_type_str,
+                    "failed",
+                    Some(e.to_string()),
+                    Some("challenge_request".to_string()),
+                )
+                .await;
+
+                return Err(e.into());
+            }
+        };
+
+        match provisioning_result {
             ProvisioningResult::Challenge(challenge_data) => {
                 // Save challenge data to acme_orders table
                 let challenge_type_str = match challenge_data.challenge_type {
@@ -333,6 +427,16 @@ impl DomainService {
 
                 domain = domain_active.update(self.db.as_ref()).await?;
 
+                self.record_renewal_attempt(
+                    domain_id,
+                    "request_challenge",
+                    challenge_type_str,
+                    "success",
+                    None,
+                    None,
+                )
+                .await;
+
                 Ok(ChallengeData {
                     domain: domain.domain.to_string(),
                     challenge_type: challenge_type_str.to_string(),
@@ -370,6 +474,16 @@ impl DomainService {
                 domain_active.last_error_type = Set(None);
 
                 let domain = domain_active.update(self.db.as_ref()).await?;
+
+                self.record_renewal_attempt(
+                    domain_id,
+                    "request_challenge",
+                    &cert_data.verification_method,
+                    "success",
+                    None,
+                    None,
+                )
+                .await;
 
                 // Return challenge data indicating immediate completion
                 Ok(ChallengeData {
@@ -409,6 +523,7 @@ impl DomainService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let domain_id = domain.id;
 
         // Find the ACME order for this domain
         let order = self.repository.find_acme_order_by_domain(domain.id).await?
@@ -506,9 +621,6 @@ impl DomainService {
 
                 acme_cert.insert(self.db.as_ref()).await?;
 
-                // Capture domain ID before move
-                let domain_id = domain.id;
-
                 // Update domain record
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("active".to_string());
@@ -530,6 +642,17 @@ impl DomainService {
                     "Challenge completed successfully for domain: {}",
                     domain_name
                 );
+
+                self.record_renewal_attempt(
+                    domain_id,
+                    "complete_challenge",
+                    challenge_type_str,
+                    "success",
+                    None,
+                    None,
+                )
+                .await;
+
                 Ok(updated_domain)
             }
             Err(e) => {
@@ -574,6 +697,16 @@ impl DomainService {
                         domain_name, update_err
                     );
                 }
+
+                self.record_renewal_attempt(
+                    domain_id,
+                    "complete_challenge",
+                    challenge_type_str,
+                    "failed",
+                    Some(e.to_string()),
+                    Some("challenge_completion".to_string()),
+                )
+                .await;
 
                 Err(DomainServiceError::Challenge(format!(
                     "Failed to complete challenge: {}.",

@@ -26,7 +26,8 @@ use super::audit::{
     ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
     ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
     ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
-    ExternalServiceParameterRevealedAudit, ExternalServiceStatusChangedAudit,
+    ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
+    ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceStatusChangedAudit,
     ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
@@ -34,7 +35,7 @@ use crate::handlers::types::{
     ClusterMemberHealthResponse, CreateExternalServiceRequest, EnvironmentVariableInfo,
     ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
     ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, SensitiveValueResponse, ServiceHealthResponse,
+    RetryClusterRequest, RuntimeCredentialsResponse, SensitiveValueResponse, ServiceHealthResponse,
     ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse, ServiceMemberInfo,
     ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
     UpgradeExternalServiceRequest,
@@ -312,6 +313,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             get(get_service_environment_variables),
         )
         .route(
+            "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
+            post(issue_runtime_credentials),
+        )
+        .route(
             "/external-services/projects/{project_id}/environment",
             get(get_project_service_environment_variables),
         )
@@ -322,6 +327,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/preview-environment-masked",
             get(get_service_preview_environment_variables_masked),
+        )
+        .route(
+            "/external-services/{id}/environment",
+            get(reveal_service_environment_variables),
         )
         .route(
             "/external-services/by-slug/{slug}",
@@ -2051,6 +2060,120 @@ async fn get_service_environment_variable(
     }
 }
 
+/// Issue live connection credentials for a service in an environment
+///
+/// Provisions the per-tenant database if it does not exist yet, then returns
+/// the connection variables in plaintext — the same values a deployment gets
+/// injected at runtime.
+///
+/// **This is a POST because it is not a read.** It creates a database as a
+/// side effect, and its response is a live credential: a GET would be
+/// prefetchable, cacheable, and liable to end up in a proxy access log with
+/// the whole connection in the URL's neighbourhood. Nothing about it is safe
+/// or idempotent in the HTTP sense.
+///
+/// Intended for callers that need to *connect* an application to a managed
+/// service — the console's own deploy path does this in-process; external
+/// plugins reach it here. For inspecting configuration, use the masked bulk
+/// read or the single-variable reveal instead.
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Connection credentials issued", body = RuntimeCredentialsResponse),
+        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 404, description = "Service, project, or environment not found"),
+        (status = 409, description = "Service is not linked to the project"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn issue_runtime_credentials(
+    State(app_state): State<Arc<AppState>>,
+    Path((id, project_id, environment_id)): Path<(i32, i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    // Same gate as the single-variable reveal, plus a write permission: this
+    // one provisions. A caller that may only read must not be able to create
+    // a database by asking for its credentials.
+    permission_guard!(auth, ExternalServicesWrite);
+    permission_guard!(auth, SecretsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    let variables = app_state
+        .external_service_manager
+        .get_runtime_env_vars(id, project_id, environment_id)
+        .await
+        .map_err(runtime_credentials_problem)?;
+
+    let mut variable_names: Vec<String> = variables.keys().cloned().collect();
+    variable_names.sort();
+
+    let audit = ExternalServiceRuntimeCredentialsIssuedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: id,
+        project_id,
+        environment_id,
+        variable_names,
+    };
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
+        error!(
+            service_id = id,
+            project_id,
+            environment_id,
+            error = %error,
+            "Failed to audit runtime-credential issuance"
+        );
+    }
+    // No credential leaves the process without a durable record of who got
+    // it. Same rule the single-variable reveal applies, and the reason it is
+    // a hard failure rather than a warning: an unaudited credential handout
+    // is indistinguishable afterwards from one that never happened.
+    require_reveal_audit(
+        audit_result,
+        "The connection credentials could not be issued because the audit record failed",
+    )?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(RuntimeCredentialsResponse { variables }),
+    ))
+}
+
+/// HTTP mapping for credential issuance.
+///
+/// "Not linked" is a 409 rather than a 404: the service and the project both
+/// exist, and the fix is to link them — a 404 would send the caller looking
+/// for a missing record.
+fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Problem {
+    use crate::services::ExternalServiceError as E;
+    match e {
+        E::ServiceNotFound { .. } | E::EnvironmentNotFound { .. } => {
+            not_found().detail(e.to_string()).build()
+        }
+        E::ServiceNotLinkedToProject { .. } => conflict().detail(e.to_string()).build(),
+        E::InvalidServiceType { .. } => bad_request().detail(e.to_string()).build(),
+        _ => internal_server_error()
+            .detail(format!("Failed to issue connection credentials: {e}"))
+            .build(),
+    }
+}
+
 /// Get all environment variables for a service-project pair
 #[utoipa::path(
     get,
@@ -2295,6 +2418,83 @@ async fn get_service_preview_environment_variables_masked(
     }
 }
 
+/// Reveal a service's basic environment variables in plaintext, before it is
+/// linked to any project. Used by the new-project wizard to fill a detected
+/// variable (e.g. `DATABASE_URL`) from a service the user just picked or
+/// created — every successful reveal is recorded, matching the audited
+/// single-variable reveal used once a service is project-linked.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/environment",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Service environment variables in plaintext", body = HashMap<String, String>),
+        (status = 403, description = "Caller cannot access a project linked to this service"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn reveal_service_environment_variables(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    permission_guard!(auth, SecretsRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    require_service_parameter_project_access(&auth, &app_state, id).await?;
+
+    let options = EnvironmentVariableOptions {
+        include_docker: false,
+        include_runtime: false,
+        mask_sensitive: false,
+        names_only: false,
+    };
+
+    let response = match app_state
+        .external_service_manager
+        .get_environment_variables(id, None, None, options)
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return match e.to_string().as_str() {
+                "Service not found" => Err(not_found().detail("Service not found").build()),
+                _ => Err(internal_server_error()
+                    .detail(format!("Failed to get environment variables: {}", e))
+                    .build()),
+            }
+        }
+    };
+
+    let audit = ExternalServiceEnvironmentVariablesRevealedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: id,
+    };
+    let audit_result = app_state.audit_service.create_audit_log(&audit).await;
+    if let Err(error) = &audit_result {
+        error!(service_id = id, error = %error, "Failed to audit service environment variables reveal");
+    }
+    require_reveal_audit(
+        audit_result,
+        "The environment variables could not be revealed because their audit record failed",
+    )?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(response.variables),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Container runtime + stats + resource limits.
 //
@@ -2495,10 +2695,12 @@ async fn update_service_resources(
         list_service_projects,
         list_project_services,
         get_service_environment_variable,
+        issue_runtime_credentials,
         get_service_environment_variables,
         get_project_service_environment_variables,
         get_service_preview_environment_variable_names,
         get_service_preview_environment_variables_masked,
+        reveal_service_environment_variables,
         get_service_by_slug,
         get_service_health_status,
         trigger_service_health_check,

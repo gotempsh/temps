@@ -498,6 +498,11 @@ static FULL_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!("(?i){}", full_pattern_str)).expect("Failed to compile full bot pattern")
 });
 
+/// Canonical names for crawlers whose broad bot-pattern match would otherwise
+/// return only a fragment such as `bot/`.
+const CANONICAL_CRAWLER_NAMES: &[(&str, &str)] =
+    &[("googlebot", "Googlebot"), ("bingbot", "Bingbot")];
+
 /// Crawler detector that identifies bots and crawlers from user agent strings
 pub struct CrawlerDetector;
 
@@ -518,13 +523,25 @@ impl CrawlerDetector {
         }
     }
 
-    /// Get crawler name from user agent if it's a bot
+    /// Get a canonical crawler name when one is known, otherwise return the
+    /// generic regex match.
+    ///
+    /// The generic matcher deliberately recognizes broad fragments such as
+    /// `bot/`. Returning that fragment for a known agent (for example,
+    /// `bingbot/2.0`) loses its identity even though detection succeeded.
     pub fn get_crawler_name(user_agent: Option<&str>) -> Option<String> {
-        if Self::is_bot(user_agent) {
-            Self::find_bot_match(user_agent)
-        } else {
-            None
-        }
+        let user_agent = user_agent.filter(|ua| Self::is_bot(Some(ua)))?;
+
+        CANONICAL_CRAWLER_NAMES
+            .iter()
+            .find(|(token, _)| {
+                user_agent
+                    .as_bytes()
+                    .windows(token.len())
+                    .any(|window| window.eq_ignore_ascii_case(token.as_bytes()))
+            })
+            .map(|(_, name)| (*name).to_string())
+            .or_else(|| Self::find_bot_match(Some(user_agent)))
     }
 }
 
@@ -571,10 +588,19 @@ mod tests {
 
     #[test]
     fn test_crawler_name_extraction() {
-        assert!(CrawlerDetector::get_crawler_name(Some("Googlebot/2.1")).is_some());
-        assert!(
-            CrawlerDetector::get_crawler_name(Some("Mozilla/5.0 (compatible; bingbot/2.0)"))
-                .is_some()
+        assert_eq!(
+            CrawlerDetector::get_crawler_name(Some("Googlebot/2.1")),
+            Some("Googlebot".to_string())
+        );
+        assert_eq!(
+            CrawlerDetector::get_crawler_name(Some(
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/116.0.1938.76 Safari/537.36"
+            )),
+            Some("Bingbot".to_string())
+        );
+        assert_eq!(
+            CrawlerDetector::get_crawler_name(Some("curl/8.7.1")),
+            Some("curl".to_string())
         );
         assert_eq!(
             CrawlerDetector::get_crawler_name(Some("Regular Browser")),

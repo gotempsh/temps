@@ -7,7 +7,10 @@ pub mod services;
 // Re-export main types but not the types modules to avoid ambiguity
 pub use handlers::handler;
 pub use providers::*;
-pub use sentry::{DSNService, Envelope, EnvelopeError, EnvelopeItem, SentryIngestionService};
+pub use sentry::{
+    DSNService, Envelope, EnvelopeError, EnvelopeItem, SentryIngestionService,
+    SENTRY_TUNNEL_ROUTE_PATH,
+};
 pub use services::*;
 
 // Export plugin

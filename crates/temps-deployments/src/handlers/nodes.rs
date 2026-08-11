@@ -273,7 +273,8 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
-    /// Whether the drain is complete (all containers migrated)
+    /// Whether the source node is empty and safe to remove. Replacement
+    /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
     /// Can the node be safely removed?
     pub can_remove: bool,
@@ -2065,7 +2066,7 @@ async fn admin_drain_node(
             // All replicas are on this node — must redeploy to maintain availability
             match app_state
                 .deployment_service
-                .redeploy_environment(dep.project_id, dep.environment_id)
+                .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
                 .await
             {
                 Ok(_) => {

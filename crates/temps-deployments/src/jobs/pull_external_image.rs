@@ -258,18 +258,22 @@ impl WorkflowTask for PullExternalImageJob {
         }
 
         if !pull_succeeded {
-            if let Some(error) = last_error {
-                return Ok(JobResult::failure(
-                    context,
-                    format!("Failed to pull image {}: {}", self.image_ref, error),
-                ));
-            }
-            // Check if we can still find the image (might have been pulled previously)
+            let error = last_error.unwrap_or_else(|| {
+                "the registry pull ended without confirming a downloaded image".to_string()
+            });
+            return Ok(JobResult::failure(
+                context,
+                format!(
+                    "Failed to pull image {} from its registry: {error}. Local daemon images \
+                     are never used as a fallback; use the authorized local-image claim path \
+                     for an image built on this host.",
+                    self.image_ref
+                ),
+            ));
         }
 
         // Inspect the image to get details
-        self.log(LogLevel::Info, "🔍 Inspecting pulled image...")
-            .await;
+        self.log(LogLevel::Info, "🔍 Inspecting image...").await;
 
         let image_inspect = self
             .docker
@@ -392,5 +396,192 @@ mod tests {
         assert_eq!(registry, Some("myregistry.io".to_string()));
         assert_eq!(image_name, "myregistry.io/app");
         assert_eq!(tag, "latest");
+    }
+
+    /// Even a bare tag already present locally must never satisfy a registry
+    /// pull. Local images use the separately authorized claim flow.
+    #[tokio::test]
+    async fn an_arbitrary_bare_local_tag_never_satisfies_a_failed_pull() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let docker = Arc::new(docker);
+
+        // `hello-world` is a few KB and is the smallest thing that is
+        // unambiguously a real image.
+        docker
+            .create_image(
+                Some(
+                    CreateImageOptionsBuilder::new()
+                        .from_image("hello-world:latest")
+                        .build(),
+                ),
+                None,
+                None,
+            )
+            .for_each(|_| async {})
+            .await;
+        if docker.inspect_image("hello-world:latest").await.is_err() {
+            println!("Could not fetch a base image (offline?), skipping");
+            return;
+        }
+
+        // A tag that cannot resolve anywhere: no registry has it, and it is
+        // unique per run so a leftover from a previous run cannot mask a
+        // regression.
+        let local_only = format!("temps-local-only-{}:test", uuid::Uuid::new_v4().simple());
+        docker
+            .tag_image(
+                "hello-world:latest",
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(local_only.split(':').next().unwrap_or(&local_only))
+                        .tag("test")
+                        .build(),
+                ),
+            )
+            .await
+            .expect("tagging a present image should succeed");
+
+        let job = PullExternalImageJob::new(
+            "local-image".to_string(),
+            local_only.clone(),
+            None,
+            docker.clone(),
+        );
+        let context = crate::test_utils::create_test_context("run-1".into(), 1, 1, 1);
+        let result = job.execute(context).await.expect("job should not error");
+
+        let _ = docker
+            .remove_image(
+                &local_only,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert!(result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("never used as a fallback")));
+    }
+
+    /// A registry-qualified name must never resolve from local state.
+    ///
+    /// The daemon is shared by every tenant and `deploy/image-upload` lets a
+    /// caller tag a loaded tarball with any reference. If this fell back, one
+    /// tenant could plant `ghcr.io/victim/app:v1` and wait for the victim's
+    /// own pull to fail — an expired credential, a rate limit — at which point
+    /// their deploy would run the planted image with the victim's environment
+    /// variables injected. Cross-tenant, and silent.
+    #[tokio::test]
+    async fn a_registry_qualified_name_never_resolves_from_local_state() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let docker = Arc::new(docker);
+
+        docker
+            .create_image(
+                Some(
+                    CreateImageOptionsBuilder::new()
+                        .from_image("hello-world:latest")
+                        .build(),
+                ),
+                None,
+                None,
+            )
+            .for_each(|_| async {})
+            .await;
+        if docker.inspect_image("hello-world:latest").await.is_err() {
+            println!("Could not fetch a base image (offline?), skipping");
+            return;
+        }
+
+        // Stand in for the planted image: registry-qualified, present locally,
+        // and pullable from nowhere.
+        let planted_repo = format!("ghcr.io/temps-e2e-victim/{}", uuid::Uuid::new_v4().simple());
+        let planted = format!("{planted_repo}:v1");
+        docker
+            .tag_image(
+                "hello-world:latest",
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(&planted_repo)
+                        .tag("v1")
+                        .build(),
+                ),
+            )
+            .await
+            .expect("tagging a present image should succeed");
+
+        let job =
+            PullExternalImageJob::new("planted".to_string(), planted.clone(), None, docker.clone());
+        let context = crate::test_utils::create_test_context("run-3".into(), 1, 1, 1);
+        let result = job.execute(context).await.expect("job should not error");
+
+        let _ = docker
+            .remove_image(
+                &planted,
+                None::<bollard::query_parameters::RemoveImageOptions>,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            temps_core::JobStatus::Failure,
+            "a registry-qualified reference must not be satisfied by a local image"
+        );
+    }
+
+    /// The local fallback must not swallow a genuinely missing image.
+    ///
+    /// The failure mode it guards against is the worst kind: a typo'd or
+    /// deleted image reference sailing past the pull step and only blowing up
+    /// later, at container creation, with an error that no longer mentions the
+    /// registry.
+    #[tokio::test]
+    async fn an_image_that_exists_nowhere_still_fails() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let missing = format!("temps-nonexistent-{}:test", uuid::Uuid::new_v4().simple());
+        let job = PullExternalImageJob::new(
+            "missing-image".to_string(),
+            missing.clone(),
+            None,
+            Arc::new(docker),
+        );
+        let context = crate::test_utils::create_test_context("run-2".into(), 1, 1, 1);
+        let result = job.execute(context).await.expect("job should not error");
+
+        assert_eq!(
+            result.status,
+            temps_core::JobStatus::Failure,
+            "an image in no registry and not on this host must fail the deploy"
+        );
+        let message = result.message.unwrap_or_default();
+        assert!(
+            message.contains(&missing),
+            "the failure must name the image that could not be found, got: {message}"
+        );
     }
 }

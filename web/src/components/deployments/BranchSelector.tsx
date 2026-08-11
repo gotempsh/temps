@@ -21,7 +21,7 @@ import {
 } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { cn } from '@/lib/utils'
+import { cn, withMinDuration } from '@/lib/utils'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -36,6 +36,7 @@ import {
 import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
 import { Link } from 'react-router'
+import { toast } from 'sonner'
 
 /** Detect git provider from a git URL */
 function detectProviderFromUrl(gitUrl: string): 'github' | 'gitlab' | null {
@@ -134,46 +135,66 @@ export function BranchSelector({
   // Merge the two queries
   const effectiveQuery = connectionId ? branchesQuery : publicBranchesQuery
 
-  const handleRefresh = async () => {
-    if (connectionId) {
-      // Refresh authenticated branches
-      const freshData = await queryClient.fetchQuery({
-        ...getRepositoryBranchesOptions({
-          path: {
-            owner: repoOwner,
-            repo: repoName,
-          },
-          query: {
-            connection_id: connectionId,
-            fresh: true,
-          },
-        }),
-      })
+  // The authenticated-branches refresh below fetches a *different* query key
+  // (fresh: true) than the one this component observes (fresh: false), so
+  // `branchesQuery.isFetching` never flips true for it — track it ourselves
+  // so the refresh button actually shows a spinner instead of doing nothing
+  // visible while it's in flight.
+  const [isRefreshing, setIsRefreshing] = useState(false)
 
-      queryClient.setQueryData(
-        getRepositoryBranchesOptions({
-          path: {
-            owner: repoOwner,
-            repo: repoName,
-          },
-          query: {
-            connection_id: connectionId,
-            fresh: false,
-          },
-        }).queryKey,
-        freshData
-      )
-    } else if (publicProvider) {
-      // Refresh public branches
-      await queryClient.invalidateQueries({
-        queryKey: getPublicBranchesOptions({
-          path: {
-            provider: publicProvider,
-            owner: repoOwner,
-            repo: repoName,
-          },
-        }).queryKey,
+  const handleRefresh = async () => {
+    setIsRefreshing(true)
+    try {
+      await withMinDuration(async () => {
+        if (connectionId) {
+          // Refresh authenticated branches
+          const freshData = await queryClient.fetchQuery({
+            ...getRepositoryBranchesOptions({
+              path: {
+                owner: repoOwner,
+                repo: repoName,
+              },
+              query: {
+                connection_id: connectionId,
+                fresh: true,
+              },
+            }),
+          })
+
+          queryClient.setQueryData(
+            getRepositoryBranchesOptions({
+              path: {
+                owner: repoOwner,
+                repo: repoName,
+              },
+              query: {
+                connection_id: connectionId,
+                fresh: false,
+              },
+            }).queryKey,
+            freshData
+          )
+        } else if (publicProvider) {
+          // Refresh public branches
+          await queryClient.invalidateQueries({
+            queryKey: getPublicBranchesOptions({
+              path: {
+                provider: publicProvider,
+                owner: repoOwner,
+                repo: repoName,
+              },
+            }).queryKey,
+          })
+        }
       })
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? `Failed to refresh branches: ${error.message}`
+          : 'Failed to refresh branches'
+      )
+    } finally {
+      setIsRefreshing(false)
     }
   }
 
@@ -325,11 +346,14 @@ export function BranchSelector({
         size="icon"
         className="shrink-0"
         onClick={handleRefresh}
-        disabled={effectiveQuery.isFetching || disabled}
+        disabled={effectiveQuery.isFetching || isRefreshing || disabled}
         title="Refresh branches"
       >
         <RefreshCw
-          className={cn('h-4 w-4', effectiveQuery.isFetching && 'animate-spin')}
+          className={cn(
+            'h-4 w-4',
+            (effectiveQuery.isFetching || isRefreshing) && 'animate-spin'
+          )}
         />
       </Button>
     </div>

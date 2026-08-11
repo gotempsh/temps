@@ -14,7 +14,8 @@ import {
   useConsoleExtensions,
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
@@ -908,6 +909,54 @@ const getErrorTitle = (
 }
 
 const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => {
+      // ProblemDetails response bodies never carry a "status" field -- the
+      // Rust Problem type serializes only what was explicitly set via
+      // .with_title()/.with_detail()/etc, and status is communicated solely
+      // via the HTTP status line (see temps-core's problemdetails::Problem::
+      // into_response). So `error.status` is always undefined here; matching
+      // on it silently never fires. `title` is the only reliable signal in
+      // the body, and it's exactly what ProtectedLayout already keys off of
+      // to decide whether to show the login screen -- match it the same way.
+      const problem = error as { title?: string } | null
+      const isUnauthorized =
+        problem?.title === 'Authentication Required' || problem?.title === 'Unauthorized'
+      if (!isUnauthorized) return
+
+      // The current-user query already surfaces its own auth error straight
+      // to AuthContext (see below). Reacting to it here too would invalidate
+      // it, trigger an immediate refetch (it's always mounted), get the same
+      // error again, and invalidate again -- a loop that never settles and
+      // hammers the API for every logged-out visitor. Only react to an auth
+      // error discovered by some *other* query.
+      const currentUserKey = getCurrentUserOptions({}).queryKey
+      if (JSON.stringify(query.queryKey) === JSON.stringify(currentUserKey)) {
+        return
+      }
+
+      // An auth error from any other query means the session died
+      // mid-session -- e.g. a page like onboarding that reads cached
+      // localStorage state and keeps rendering from it even though its own
+      // API calls are silently failing. Invalidating the current-user query
+      // is what forces its always-mounted observer in AuthContext to
+      // refetch immediately, transitioning it into its error state so
+      // ProtectedLayout redirects to login.
+      //
+      // Deliberately NOT sweeping the rest of the cache here (e.g. via
+      // queryClient.clear()/removeQueries()): several other queries besides
+      // current-user are *also* always mounted app-wide (PresetContext's
+      // presets query, ProjectsContext's projects query). Forcibly removing
+      // an active query's cache entry makes its observer refetch
+      // immediately -- so clearing them from inside this handler makes them
+      // fail, re-enter this handler, and get cleared again: an unbounded
+      // loop through whichever always-mounted query isn't current-user, the
+      // same failure mode the current-user guard above exists to prevent,
+      // just one hop removed. Scope the reaction to exactly the one query
+      // that actually drives the redirect decision.
+      queryClient.invalidateQueries({ queryKey: currentUserKey })
+    },
+  }),
   defaultOptions: {
     queries: {
       refetchOnWindowFocus: false,

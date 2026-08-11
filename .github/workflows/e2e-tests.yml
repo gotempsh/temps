@@ -17,6 +17,9 @@ on:
         default: temps-binary-musl-fast
         type: string
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -130,9 +133,9 @@ jobs:
 
       - name: Prepare data directory
         run: |
-          mkdir -p $TEMPS_DATA_DIR
+          mkdir -p "$TEMPS_DATA_DIR"
           # GeoLite2 database is checked into the repo
-          cp crates/temps-cli/GeoLite2-City.mmdb $TEMPS_DATA_DIR/GeoLite2-City.mmdb
+          cp crates/temps-cli/GeoLite2-City.mmdb "$TEMPS_DATA_DIR/GeoLite2-City.mmdb"
 
       - name: Verify TimescaleDB is ready
         run: |
@@ -252,7 +255,7 @@ jobs:
           echo "Temps server started with PID $(cat /tmp/temps.pid)"
           # Give it a moment to either start or crash
           sleep 3
-          if ! kill -0 $(cat /tmp/temps.pid) 2>/dev/null; then
+          if ! kill -0 "$(cat /tmp/temps.pid)" 2>/dev/null; then
             echo "ERROR: Temps server died immediately. Logs:"
             cat /tmp/temps.log
             exit 1
@@ -297,32 +300,38 @@ jobs:
       - name: Create API key via CLI
         id: auth
         run: |
-          API_OUTPUT=$("$TEMPS_BIN" api-key \
+          if ! API_OUTPUT=$("$TEMPS_BIN" api-key \
             --database-url "$DATABASE_URL" \
             --name "e2e-test" \
             --role admin \
-            --output-format json 2>&1)
-          echo "CLI output: $API_OUTPUT"
-
-          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty' 2>/dev/null)
-          if [ -z "$API_KEY" ]; then
-            echo "Failed to extract API key from CLI output"
+            --output-format json 2>/dev/null); then
+            echo "Failed to create the E2E API key (credential-bearing stdout/stderr suppressed)"
             exit 1
           fi
 
-          echo "API key created: ${API_KEY:0:12}..."
-          echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty' 2>/dev/null)
+          if [ -z "$API_KEY" ]; then
+            echo "Failed to extract API key from credential-bearing CLI output (output suppressed)"
+            exit 1
+          fi
+
+          echo "::add-mask::$API_KEY"
+          KEY_ID=$(echo "$API_OUTPUT" | jq -r '.id // "unknown"')
+          KEY_PREFIX=$(echo "$API_OUTPUT" | jq -r '.key_prefix // "unknown"')
+          echo "API key created: id=$KEY_ID prefix=$KEY_PREFIX"
+          printf 'api_key=%s\n' "$API_KEY" >> "$GITHUB_OUTPUT"
 
       - name: Deploy example applications
         env:
           API_KEY: ${{ steps.auth.outputs.api_key }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
 
           REPO_URL="https://github.com/${{ github.repository }}.git"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
-          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BRANCH="$SOURCE_BRANCH"
 
           # Define example apps: name|directory|preset
           APPS=(
@@ -506,7 +515,7 @@ jobs:
           if [ -f /tmp/temps.pid ]; then
             PID=$(cat /tmp/temps.pid)
             echo "Temps PID: $PID"
-            ps aux | grep temps || true
+            pgrep -af temps || true
           fi
 
           echo ""
@@ -528,6 +537,6 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/temps.pid ]; then
-            kill $(cat /tmp/temps.pid) 2>/dev/null || true
+            kill "$(cat /tmp/temps.pid)" 2>/dev/null || true
           fi
           docker system prune -f 2>/dev/null || true

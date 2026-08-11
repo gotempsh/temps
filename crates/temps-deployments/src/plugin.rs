@@ -202,6 +202,20 @@ impl TempsPlugin for DeploymentsPlugin {
                 bollard::Docker::connect_with_local_defaults()
                     .expect("Failed to connect to Docker"),
             );
+
+            // Late-bind the Compose executor onto DeploymentService now that
+            // the Docker client exists (DeploymentService itself is
+            // constructed earlier, before `docker` is available). Lets
+            // project/environment deletion clean up Compose-managed
+            // volumes/networks, not just containers -- see
+            // `DeploymentService::cleanup_containers`.
+            deployment_service.set_compose_executor(Arc::new(
+                temps_deployer::compose::ComposeExecutor::new(
+                    docker.clone(),
+                    config_service.data_dir(),
+                ),
+            ));
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),

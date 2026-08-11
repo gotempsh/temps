@@ -39,12 +39,14 @@ pub mod dsn_service;
 pub mod envelope;
 pub mod handlers;
 pub mod mapper;
+pub mod rate_limiter;
 pub mod service;
 pub mod types;
 
 // Re-exports for convenience
 pub use dsn_service::DSNService;
 pub use envelope::{Envelope, EnvelopeError, EnvelopeItem};
+pub use handlers::SENTRY_TUNNEL_ROUTE_PATH;
 pub use service::SentryIngestionService;
 pub use types::{
     CreateDSNRequest, DSNResponse, ParsedDSN, ProjectDSN, SentryEventRequest, SentryEventResponse,

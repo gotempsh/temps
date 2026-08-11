@@ -40,6 +40,7 @@ pub use super::project_services::Entity as ProjectServices;
 pub use super::project_team_access::Entity as ProjectTeamAccess;
 pub use super::projects::Entity as Projects;
 pub use super::proxy_logs::Entity as ProxyLogs;
+pub use super::renewal_attempts::Entity as RenewalAttempts;
 pub use super::repositories::{
     BranchPresetData, Entity as Repositories, PresetInfo, RepositoryPresetCache,
 };

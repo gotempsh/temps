@@ -3,8 +3,8 @@ use super::types::{
     CreateDomainRequest, DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState,
     DomainChallengeResponse, DomainError, DomainResponse, HttpChallengeDebugResponse,
     ListDomainsResponse, ListOnDemandCertsResponse, ListOrdersResponse,
-    OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse, SetupDnsChallengeRequest,
-    SetupDnsChallengeResponse, TxtRecord,
+    ListRenewalAttemptsResponse, OnDemandCertAttemptResponse, OnDemandCertRow, ProvisionResponse,
+    RenewalAttemptResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse, TxtRecord,
 };
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
@@ -246,6 +246,7 @@ impl From<DomainServiceError> for Problem {
         finalize_order,
         list_domains,
         renew_domain,
+        list_renewal_attempts,
         get_challenge_token,
         create_or_recreate_order,
         cancel_domain_order,
@@ -277,7 +278,9 @@ impl From<DomainServiceError> for Problem {
             ListOnDemandCertsResponse,
             OnDemandCertRow,
             OnDemandCertAttemptResponse,
-            CertStatusResponse
+            CertStatusResponse,
+            ListRenewalAttemptsResponse,
+            RenewalAttemptResponse
         )
     ),
     info(
@@ -1353,6 +1356,110 @@ async fn renew_domain(
                 .into_response())
         }
     }
+}
+
+/// Query parameters for listing renewal attempts.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+pub struct ListRenewalAttemptsParams {
+    /// Page number (1-indexed)
+    #[param(example = 1)]
+    pub page: Option<u64>,
+    /// Number of items per page (max 100)
+    #[param(example = 20)]
+    pub page_size: Option<u64>,
+}
+
+impl ListRenewalAttemptsParams {
+    pub fn normalize(&self) -> (u64, u64) {
+        let page = self.page.unwrap_or(1).max(1);
+        let page_size = self.page_size.unwrap_or(20).clamp(1, 100);
+        (page, page_size)
+    }
+}
+
+/// List certificate renewal attempts for a domain
+///
+/// Returns rows from the append-only `renewal_attempts` audit log, newest
+/// first: every `request_challenge` (order creation) and `complete_challenge`
+/// (order finalization) attempt for this domain, successful or failed, with
+/// the full error detail. Backs the domain detail page's renewal timeline —
+/// `domains.last_error` only ever holds the MOST RECENT failure, so this is
+/// the only way to see the history behind it.
+#[utoipa::path(
+    get,
+    path = "/domains/{domain}/renewal-attempts",
+    responses(
+        (status = 200, description = "Renewal attempts retrieved successfully", body = ListRenewalAttemptsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("domain" = String, Path, description = "Domain name"),
+        ListRenewalAttemptsParams,
+    ),
+    tag = "Domains",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn list_renewal_attempts(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<DomainAppState>>,
+    Path(domain): Path<String>,
+    Query(params): Query<ListRenewalAttemptsParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DomainsRead);
+
+    let (page, page_size) = params.normalize();
+
+    debug!(
+        "Listing renewal attempts for domain {} (page={}, page_size={}) for user: {}",
+        domain,
+        page,
+        page_size,
+        auth.user_id()
+    );
+
+    let domain_model = app_state
+        .domain_service
+        .get_domain(&domain)
+        .await
+        .map_err(|e| {
+            error!("Failed to get domain {}: {}", domain, e);
+            e
+        })?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Domain not found")
+                .detail(format!("Domain {} not found", domain))
+                .build()
+        })?;
+
+    let (rows, total) = app_state
+        .domain_service
+        .list_renewal_attempts(domain_model.id, page, page_size)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to list renewal attempts for domain {}: {}",
+                domain, e
+            );
+            e
+        })?;
+
+    let attempts: Vec<RenewalAttemptResponse> =
+        rows.into_iter().map(RenewalAttemptResponse::from).collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(ListRenewalAttemptsResponse {
+            attempts,
+            total,
+            page,
+            page_size,
+        }),
+    ))
 }
 
 /// Get domain challenge details
@@ -2459,6 +2566,10 @@ pub fn configure_routes() -> Router<Arc<DomainAppState>> {
         .route("/domains/{domain}", delete(delete_domain))
         .route("/domains/{domain}/provision", post(provision_domain))
         .route("/domains/{domain}/renew", post(renew_domain))
+        .route(
+            "/domains/{domain}/renewal-attempts",
+            get(list_renewal_attempts),
+        )
         .route("/domains/{domain}/challenge", get(get_domain_challenge))
         .route("/domains/{domain}/dns-completion", get(get_dns_completion))
         .route(

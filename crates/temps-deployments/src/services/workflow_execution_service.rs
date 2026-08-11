@@ -2,7 +2,7 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::sync::Arc;
 use temps_core::{
     Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
@@ -43,6 +43,22 @@ enum DeploymentFailureStage {
     Resource,
     Platform,
     Unknown,
+}
+
+/// Read all per-service Compose runtime selections together so a new setting
+/// cannot be persisted successfully and then be silently omitted by the
+/// deployment workflow.
+fn compose_service_security_settings(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match preset_config {
+        Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => (
+            config.excluded_services.clone(),
+            config.relaxed_capability_services.clone(),
+            config.unsandboxed_services.clone(),
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    }
 }
 
 impl DeploymentFailureStage {
@@ -845,7 +861,7 @@ impl WorkflowExecutionService {
                     .teardown_previous_deployment(
                         deployment.project_id,
                         deployment.environment_id,
-                        deployment_id,
+                        &deployment,
                     )
                     .await
                 {
@@ -2355,6 +2371,21 @@ impl WorkflowExecutionService {
                     }
                 });
 
+                // Services the user opted to exclude from this project's compose
+                // stack (e.g. an unmanaged database in favor of a Temps-managed one).
+                let (excluded_services, relaxed_capability_services, unsandboxed_services) =
+                    compose_service_security_settings(project.preset_config.as_ref());
+                let public_ports = project
+                    .preset_config
+                    .as_ref()
+                    .and_then(|config| match config {
+                        temps_entities::preset::PresetConfig::DockerCompose(config) => {
+                            Some(config.public_ports.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
                 let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
                     self.docker.clone(),
                     self.config_service.data_dir(),
@@ -2370,6 +2401,10 @@ impl WorkflowExecutionService {
                     .directory(directory)
                     .compose_content(compose_content)
                     .compose_override(compose_override)
+                    .excluded_services(excluded_services)
+                    .relaxed_capability_services(relaxed_capability_services)
+                    .unsandboxed_services(unsandboxed_services)
+                    .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
                     .build_args(build_args)
@@ -2730,11 +2765,13 @@ impl WorkflowExecutionService {
         &self,
         project_id: i32,
         environment_id: i32,
-        current_deployment_id: i32,
+        current_deployment: &deployments::Model,
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
-        // Find previous deployments in this environment (excluding the current one).
+        // Find active deployments that are chronologically older than the
+        // current one. An older workflow can finish after a newer workflow;
+        // `id != current` would let it tear the newer deployment back down.
         //
         // Scope this to active states and cap the result, newest-first. This is a
         // safety net that runs in addition to MarkDeploymentCompleteJob's own
@@ -2749,7 +2786,15 @@ impl WorkflowExecutionService {
         let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::Id.ne(current_deployment_id)) // Exclude current deployment
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
             .filter(deployments::Column::State.is_in(vec![
                 "pending",
                 "running",
@@ -2964,6 +3009,25 @@ mod tests {
             Ok(docker) => docker.ping().await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn compose_runtime_settings_flow_from_persisted_preset_config() {
+        let preset_config = temps_entities::preset::PresetConfig::DockerCompose(
+            temps_entities::preset::DockerComposeConfig {
+                excluded_services: vec!["managed-db".to_string()],
+                relaxed_capability_services: vec!["postgres".to_string()],
+                unsandboxed_services: vec!["webserver".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let (excluded, relaxed, unsandboxed) =
+            compose_service_security_settings(Some(&preset_config));
+
+        assert_eq!(excluded, ["managed-db"]);
+        assert_eq!(relaxed, ["postgres"]);
+        assert_eq!(unsandboxed, ["webserver"]);
     }
 
     #[test]
@@ -4077,6 +4141,34 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // Simulate a newer deployment completing while this older workflow is
+        // still in its post-success cleanup. It must not be selected as a
+        // "previous" deployment merely because its ID differs.
+        let newer_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("newer-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() + chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let newer_container = deployment_containers::ActiveModel {
+            deployment_id: Set(newer_deployment.id),
+            container_id: Set("newer-container-1".to_string()),
+            container_name: Set("newer-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
@@ -4111,7 +4203,7 @@ mod tests {
         );
 
         let stopped_container_id = service
-            .teardown_previous_deployment(project.id, environment.id, current_deployment.id)
+            .teardown_previous_deployment(project.id, environment.id, &current_deployment)
             .await?;
 
         assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
@@ -4122,6 +4214,15 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("newer container row still exists");
+        assert!(
+            newer_refreshed.deleted_at.is_none(),
+            "an older workflow cleanup must not remove a newer deployment's container"
+        );
 
         Ok(())
     }

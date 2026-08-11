@@ -20,9 +20,11 @@ use futures::stream::StreamExt;
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use temps_core::external_plugin::channel::*;
+use temps_core::external_plugin::manifest::PluginCapability;
 use temps_core::external_plugin::PluginEvent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +47,9 @@ impl PluginChannel {
         socket_path: &Path,
         plugin_name: String,
         db: Arc<DatabaseConnection>,
+        host_api: Arc<HostApiSlot>,
+        capabilities: Vec<PluginCapability>,
+        auth_secret: &str,
     ) -> Option<Self> {
         let socket_path_str = socket_path.to_string_lossy().to_string();
 
@@ -76,7 +81,25 @@ impl PluginChannel {
         };
 
         let uri = format!("ws://localhost{}", PLUGIN_CHANNEL_PATH);
-        let ws_stream = match tokio_tungstenite::client_async(&uri, stream).await {
+        let mut request = match uri.into_client_request() {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(plugin = %plugin_name, "Cannot build channel handshake: {error}");
+                return None;
+            }
+        };
+        let auth_header = match auth_secret.parse() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(plugin = %plugin_name, "Cannot encode channel authentication: {error}");
+                return None;
+            }
+        };
+        request.headers_mut().insert(
+            temps_core::external_plugin::headers::AUTH_SIGNATURE,
+            auth_header,
+        );
+        let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
             Ok((ws, _resp)) => {
                 debug!(
                     plugin = %plugin_name,
@@ -150,17 +173,47 @@ impl PluginChannel {
                 let msg: ChannelMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        warn!(
-                            plugin = %reader_plugin_name,
-                            "Invalid channel message from plugin: {}", e
-                        );
+                        // A plugin built against a newer Temps can name a call
+                        // this build has no variant for, and the envelope then
+                        // fails to deserialize as a whole. Answer it: leaving
+                        // the plugin's request unreplied hangs its caller until
+                        // the channel closes, which looks like a freeze rather
+                        // than an incompatibility.
+                        match peek_request_id(&text) {
+                            Some(id) => {
+                                warn!(
+                                    plugin = %reader_plugin_name,
+                                    "Unsupported channel request {}: {}", id, e
+                                );
+                                let _ =
+                                    reader_tx.send(ChannelMessage::Response(ChannelResponse::err(
+                                        id,
+                                        ChannelErrorCode::MethodNotFound,
+                                        format!(
+                                            "This Temps build does not support that channel \
+                                             call ({e}); rebuild the plugin against this version"
+                                        ),
+                                    )));
+                            }
+                            None => warn!(
+                                plugin = %reader_plugin_name,
+                                "Invalid channel message from plugin: {}", e
+                            ),
+                        }
                         continue;
                     }
                 };
 
                 match msg {
                     ChannelMessage::Request(req) => {
-                        let response = dispatch_request(&reader_plugin_name, &db, &req).await;
+                        let response = dispatch_request(
+                            &reader_plugin_name,
+                            &db,
+                            &host_api,
+                            &capabilities,
+                            &req,
+                        )
+                        .await;
                         let _ = reader_tx.send(ChannelMessage::Response(response));
                     }
                     _ => {
@@ -206,314 +259,315 @@ impl Drop for PluginChannel {
     }
 }
 
+/// Recover just the correlation id from a request this build cannot parse.
+///
+/// Deliberately minimal: it must succeed on messages the strongly-typed
+/// deserializer rejected, so it looks at nothing but `id`.
+fn peek_request_id(text: &str) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct IdOnly {
+        id: u64,
+    }
+    serde_json::from_str::<IdOnly>(text).ok().map(|p| p.id)
+}
+
+// ── Host API bridge ────────────────────────────────────────────────────
+
+/// Runs an [`ApiCall`] against the platform's own HTTP router.
+///
+/// A trait rather than a concrete type because this crate must not know how
+/// the console assembles its router — and cannot, since the router contains
+/// this crate's own routes. The console builds the router, then hands an
+/// implementation back through
+/// [`crate::service::ExternalPluginsService::set_host_api`].
+#[async_trait::async_trait]
+pub trait HostApiBridge: Send + Sync {
+    /// Dispatch `call` as `plugin`, resolving the acting user from the
+    /// call's actor token.
+    async fn call(&self, plugin: &str, call: ApiCall) -> Result<ApiCallResult, ChannelError>;
+}
+
+/// Late-bound holder for the [`HostApiBridge`].
+///
+/// Channels are opened while plugins start, which is *before* the console
+/// has finished assembling the router they will call into — the router
+/// contains this crate's own routes, so it cannot exist first. The slot is
+/// therefore shared at connect time and read on each call, so a plugin that
+/// connected during startup still reaches the router once it exists.
+pub type HostApiSlot = tokio::sync::RwLock<Option<Arc<dyn HostApiBridge>>>;
+
 // ── Request dispatch ───────────────────────────────────────────────────
 
-/// Route a plugin request to the appropriate query handler.
+/// Route a plugin request to the handler that serves it.
+///
+/// The match is exhaustive over [`PlatformCallRequest`] with no catch-all
+/// arm: adding a call to the protocol without handling it here is a compile
+/// error, which is the point of the typed protocol. A method this build does
+/// not know cannot reach here at all — it fails to deserialize, and the
+/// reader loop answers `MethodNotFound`.
 async fn dispatch_request(
     plugin_name: &str,
     db: &DatabaseConnection,
+    host_api: &HostApiSlot,
+    capabilities: &[PluginCapability],
     req: &ChannelRequest,
 ) -> ChannelResponse {
     debug!(
         plugin = %plugin_name,
-        method = %req.method,
+        method = %req.call.method_name(),
         id = req.id,
         "Dispatching channel request"
     );
 
-    match req.method.as_str() {
-        "get_project" => handle_get_project(db, req).await,
-        "list_projects" => handle_list_projects(db, req).await,
-        "get_environment" => handle_get_environment(db, req).await,
-        "list_environments" => handle_list_environments(db, req).await,
-        "get_deployment" => handle_get_deployment(db, req).await,
-        "get_last_deployment" => handle_get_last_deployment(db, req).await,
-        "list_deployments" => handle_list_deployments(db, req).await,
-        _ => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::MethodNotFound,
-            format!("Unknown method: {}", req.method),
-        ),
-    }
-}
-
-// ── Method handlers ────────────────────────────────────────────────────
-
-async fn handle_get_project(db: &DatabaseConnection, req: &ChannelRequest) -> ChannelResponse {
-    let project_id = match req.params.get("project_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: project_id",
-            )
+    let outcome = match &req.call {
+        PlatformCallRequest::GetProject(p) => handle_get_project(db, p).await,
+        PlatformCallRequest::ListProjects(p) => handle_list_projects(db, p).await,
+        PlatformCallRequest::GetEnvironment(p) => handle_get_environment(db, p).await,
+        PlatformCallRequest::ListEnvironments(p) => handle_list_environments(db, p).await,
+        PlatformCallRequest::GetDeployment(p) => handle_get_deployment(db, p).await,
+        PlatformCallRequest::GetLastDeployment(p) => handle_get_last_deployment(db, p).await,
+        PlatformCallRequest::ListDeployments(p) => handle_list_deployments(db, p).await,
+        PlatformCallRequest::ApiCall(call) => {
+            handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
         }
     };
 
-    use temps_entities::projects;
-
-    match projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(db)
-        .await
-    {
-        Ok(Some(project)) => {
-            let info = project_to_info(&project);
-            ChannelResponse::ok(req.id, serde_json::to_value(info).unwrap())
-        }
-        Ok(None) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::NotFound,
-            format!("Project {} not found", project_id),
-        ),
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
+    match outcome {
+        Ok(result) => ChannelResponse::ok(req.id, result),
+        Err(err) => ChannelResponse {
+            id: req.id,
+            outcome: CallOutcome::Err(err),
+        },
     }
 }
 
-async fn handle_list_projects(db: &DatabaseConnection, req: &ChannelRequest) -> ChannelResponse {
+/// Serve an [`ApiCall`] through the platform's own router.
+async fn handle_api_call(
+    plugin_name: &str,
+    host_api: &HostApiSlot,
+    capabilities: &[PluginCapability],
+    call: ApiCall,
+) -> Result<PlatformCallResponse, ChannelError> {
+    // Capability first: refuse before the request reaches the router, and
+    // name what is missing. A plugin author debugging this alone cannot
+    // guess "add api_write to your manifest" from a bare 403.
+    let required = PluginCapability::for_method(call.method);
+    if !capabilities.contains(&required) {
+        return Err(ChannelError::new(
+            ChannelErrorCode::PermissionDenied,
+            format!(
+                "Plugin '{plugin_name}' called {} {} but does not declare the '{}' capability;                  add it to the plugin manifest",
+                call.method.as_str(),
+                call.path,
+                required.as_str()
+            ),
+        ));
+    }
+
+    // Say which capability is missing rather than a bare "unavailable": an
+    // operator running an embedding build that never wired the bridge has no
+    // other way to find out why every plugin API call fails.
+    let Some(api) = host_api.read().await.clone() else {
+        return Err(ChannelError::new(
+            ChannelErrorCode::Internal,
+            format!(
+                "This Temps build did not wire the host API bridge, so plugin '{plugin_name}' \
+                 cannot call the platform API over the channel"
+            ),
+        ));
+    };
+    api.call(plugin_name, call)
+        .await
+        .map(PlatformCallResponse::ApiCall)
+}
+
+// ── Method handlers ────────────────────────────────────────────────────
+//
+// Each takes its own parameter struct and returns the response variant that
+// belongs to it. Nothing parses JSON by hand any more: a missing or
+// mistyped field is a deserialization failure on the envelope, reported
+// once, instead of every handler re-implementing "missing required
+// parameter".
+
+async fn handle_get_project(
+    db: &DatabaseConnection,
+    params: &GetProject,
+) -> Result<PlatformCallResponse, ChannelError> {
     use temps_entities::projects;
 
-    let limit = req
-        .params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(100)
-        .min(100);
+    let project = projects::Entity::find_by_id(params.project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
+        .one(db)
+        .await
+        .map_err(|e| db_error("project", e))?
+        .ok_or_else(|| {
+            ChannelError::new(
+                ChannelErrorCode::NotFound,
+                format!("Project {} not found", params.project_id),
+            )
+        })?;
 
-    match projects::Entity::find()
+    Ok(PlatformCallResponse::GetProject(project_to_info(&project)))
+}
+
+async fn handle_list_projects(
+    db: &DatabaseConnection,
+    _params: &ListProjects,
+) -> Result<PlatformCallResponse, ChannelError> {
+    use temps_entities::projects;
+
+    let projects = projects::Entity::find()
         .filter(projects::Column::IsDeleted.eq(false))
         .order_by_asc(projects::Column::Name)
         .all(db)
         .await
-    {
-        Ok(projects) => {
-            let infos: Vec<ProjectInfo> = projects
-                .iter()
-                .take(limit as usize)
-                .map(project_to_info)
-                .collect();
-            ChannelResponse::ok(req.id, serde_json::to_value(infos).unwrap())
-        }
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+        .map_err(|e| db_error("projects", e))?;
+
+    Ok(PlatformCallResponse::ListProjects(
+        projects.iter().map(project_to_info).collect(),
+    ))
 }
 
-async fn handle_get_environment(db: &DatabaseConnection, req: &ChannelRequest) -> ChannelResponse {
-    let environment_id = match req.params.get("environment_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: environment_id",
-            )
-        }
-    };
-
+async fn handle_get_environment(
+    db: &DatabaseConnection,
+    params: &GetEnvironment,
+) -> Result<PlatformCallResponse, ChannelError> {
     use temps_entities::environments;
 
-    match environments::Entity::find_by_id(environment_id)
+    let env = environments::Entity::find_by_id(params.environment_id)
         .filter(environments::Column::DeletedAt.is_null())
         .one(db)
         .await
-    {
-        Ok(Some(env)) => {
-            let info = environment_to_info(&env);
-            ChannelResponse::ok(req.id, serde_json::to_value(info).unwrap())
-        }
-        Ok(None) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::NotFound,
-            format!("Environment {} not found", environment_id),
-        ),
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+        .map_err(|e| db_error("environment", e))?
+        .ok_or_else(|| {
+            ChannelError::new(
+                ChannelErrorCode::NotFound,
+                format!("Environment {} not found", params.environment_id),
+            )
+        })?;
+
+    Ok(PlatformCallResponse::GetEnvironment(environment_to_info(
+        &env,
+    )))
 }
 
 async fn handle_list_environments(
     db: &DatabaseConnection,
-    req: &ChannelRequest,
-) -> ChannelResponse {
-    let project_id = match req.params.get("project_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: project_id",
-            )
-        }
-    };
-
+    params: &ListEnvironments,
+) -> Result<PlatformCallResponse, ChannelError> {
     use temps_entities::environments;
 
-    match environments::Entity::find()
-        .filter(environments::Column::ProjectId.eq(project_id))
+    let envs = environments::Entity::find()
+        .filter(environments::Column::ProjectId.eq(params.project_id))
         .filter(environments::Column::DeletedAt.is_null())
         .order_by_asc(environments::Column::Name)
         .all(db)
         .await
-    {
-        Ok(envs) => {
-            let infos: Vec<EnvironmentInfo> = envs.iter().map(environment_to_info).collect();
-            ChannelResponse::ok(req.id, serde_json::to_value(infos).unwrap())
-        }
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+        .map_err(|e| db_error("environments", e))?;
+
+    Ok(PlatformCallResponse::ListEnvironments(
+        envs.iter().map(environment_to_info).collect(),
+    ))
 }
 
-async fn handle_get_deployment(db: &DatabaseConnection, req: &ChannelRequest) -> ChannelResponse {
-    let deployment_id = match req.params.get("deployment_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: deployment_id",
-            )
-        }
-    };
-
+async fn handle_get_deployment(
+    db: &DatabaseConnection,
+    params: &GetDeployment,
+) -> Result<PlatformCallResponse, ChannelError> {
     use temps_entities::deployments;
 
-    match deployments::Entity::find_by_id(deployment_id).one(db).await {
-        Ok(Some(dep)) => {
-            let info = deployment_to_info(&dep);
-            ChannelResponse::ok(req.id, serde_json::to_value(info).unwrap())
-        }
-        Ok(None) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::NotFound,
-            format!("Deployment {} not found", deployment_id),
-        ),
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+    let dep = deployments::Entity::find_by_id(params.deployment_id)
+        .one(db)
+        .await
+        .map_err(|e| db_error("deployment", e))?
+        .ok_or_else(|| {
+            ChannelError::new(
+                ChannelErrorCode::NotFound,
+                format!("Deployment {} not found", params.deployment_id),
+            )
+        })?;
+
+    Ok(PlatformCallResponse::GetDeployment(deployment_to_info(
+        &dep,
+    )))
 }
 
 async fn handle_get_last_deployment(
     db: &DatabaseConnection,
-    req: &ChannelRequest,
-) -> ChannelResponse {
-    let project_id = match req.params.get("project_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: project_id",
-            )
-        }
-    };
-
-    let environment_id = req
-        .params
-        .get("environment_id")
-        .and_then(|v| v.as_i64())
-        .map(|id| id as i32);
-
+    params: &GetLastDeployment,
+) -> Result<PlatformCallResponse, ChannelError> {
     use temps_entities::deployments;
 
     let mut query = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
+        .filter(deployments::Column::ProjectId.eq(params.project_id))
         .order_by_desc(deployments::Column::CreatedAt);
 
-    if let Some(env_id) = environment_id {
+    if let Some(env_id) = params.environment_id {
         query = query.filter(deployments::Column::EnvironmentId.eq(env_id));
     }
 
-    match query.one(db).await {
-        Ok(Some(dep)) => {
-            let info = deployment_to_info(&dep);
-            ChannelResponse::ok(req.id, serde_json::to_value(info).unwrap())
-        }
-        Ok(None) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::NotFound,
-            format!(
-                "No deployments found for project {}{}",
-                project_id,
-                environment_id
-                    .map(|e| format!(" environment {}", e))
-                    .unwrap_or_default()
-            ),
-        ),
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+    let dep = query
+        .one(db)
+        .await
+        .map_err(|e| db_error("deployment", e))?
+        .ok_or_else(|| {
+            ChannelError::new(
+                ChannelErrorCode::NotFound,
+                format!(
+                    "No deployments found for project {}{}",
+                    params.project_id,
+                    params
+                        .environment_id
+                        .map(|e| format!(" environment {e}"))
+                        .unwrap_or_default()
+                ),
+            )
+        })?;
+
+    Ok(PlatformCallResponse::GetLastDeployment(deployment_to_info(
+        &dep,
+    )))
 }
 
-async fn handle_list_deployments(db: &DatabaseConnection, req: &ChannelRequest) -> ChannelResponse {
-    let project_id = match req.params.get("project_id").and_then(|v| v.as_i64()) {
-        Some(id) => id as i32,
-        None => {
-            return ChannelResponse::err(
-                req.id,
-                ChannelErrorCode::InvalidParams,
-                "Missing required parameter: project_id",
-            )
-        }
-    };
-
-    let environment_id = req
-        .params
-        .get("environment_id")
-        .and_then(|v| v.as_i64())
-        .map(|id| id as i32);
-
-    let limit = req
-        .params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20)
-        .min(100);
-
+async fn handle_list_deployments(
+    db: &DatabaseConnection,
+    params: &ListDeployments,
+) -> Result<PlatformCallResponse, ChannelError> {
     use sea_orm::QuerySelect;
     use temps_entities::deployments;
 
+    // Bounded regardless of what the plugin asks for: this runs against the
+    // control-plane database, and an unbounded fetch on a busy project is a
+    // memory spike on a small box.
+    let limit = params.limit.unwrap_or(20).min(100);
+
     let mut query = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
+        .filter(deployments::Column::ProjectId.eq(params.project_id))
         .order_by_desc(deployments::Column::CreatedAt)
         .limit(limit);
 
-    if let Some(env_id) = environment_id {
+    if let Some(env_id) = params.environment_id {
         query = query.filter(deployments::Column::EnvironmentId.eq(env_id));
     }
 
-    match query.all(db).await {
-        Ok(deps) => {
-            let infos: Vec<DeploymentInfo> = deps.iter().map(deployment_to_info).collect();
-            ChannelResponse::ok(req.id, serde_json::to_value(infos).unwrap())
-        }
-        Err(e) => ChannelResponse::err(
-            req.id,
-            ChannelErrorCode::Internal,
-            format!("Database error: {}", e),
-        ),
-    }
+    let deps = query
+        .all(db)
+        .await
+        .map_err(|e| db_error("deployments", e))?;
+
+    Ok(PlatformCallResponse::ListDeployments(
+        deps.iter().map(deployment_to_info).collect(),
+    ))
+}
+
+/// Database failures are internal errors, and the plugin is told which
+/// lookup failed so a plugin author can tell "no such project" from "the
+/// control plane is unwell".
+fn db_error(what: &str, e: sea_orm::DbErr) -> ChannelError {
+    ChannelError::new(
+        ChannelErrorCode::Internal,
+        format!("Failed to read {what} from the control-plane database: {e}"),
+    )
 }
 
 // ── Entity → DTO converters ────────────────────────────────────────────

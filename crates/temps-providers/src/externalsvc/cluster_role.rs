@@ -92,7 +92,7 @@ pub enum PgAutoFailoverState {
     Primary,
     /// Single-node mode (no replica yet); still writable.
     Single,
-    /// About to be promoted to primary; not yet writable.
+    /// Promotion completed and writable, but no standby is currently attached.
     WaitPrimary,
     /// Streaming from the primary; healthy.
     Secondary,

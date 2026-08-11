@@ -30,6 +30,11 @@ import { s3RestoreScenarioCommand } from './commands/s3-restore-scenario.ts'
 import { redisRestoreScenarioCommand } from './commands/redis-restore-scenario.ts'
 import { mongodbRestoreScenarioCommand } from './commands/mongodb-restore-scenario.ts'
 import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
+import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenario.ts'
+import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
+import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
+import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
+import { markdownCommand } from './commands/markdown.ts'
 
 const program = new Command()
 
@@ -439,6 +444,90 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await deployLifecycleScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('mariadb-restore-scenario')
+  .description(
+    'MariaDB backup + in-place restore: provision a MariaDB service, insert pre-backup rows via docker exec mariadb, ' +
+      'run a real backup (physical or logical, engine-selected) to MinIO, insert post-backup rows, restore in place, ' +
+      'and verify via the data-browser API that pre-backup rows are present and post-backup rows are absent',
+  )
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await mariadbRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('env-vars-scenario')
+  .description(
+    'Real environment-variable lifecycle: deploy an echo-server app, create/update/delete a project env var, ' +
+      'redeploy after each change, and assert the RUNNING CONTAINER reflects the new/updated/removed value ' +
+      '(not just that the API round-trips it) -- plus a lightweight environment-scoping check via the list endpoint',
+  )
+  .option('--registry <host>', 'registry to push the echo-server image to (e.g. localhost:5111); or $TEMPS_E2E_REGISTRY')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await envVarsScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('api-key-scenario')
+  .description(
+    'Real API-key lifecycle via HTTP: a second low-privilege user creates a scoped API key through POST /api-keys ' +
+      '(session-cookie authenticated, since machine principals cannot create keys), the key gets 200 on an ' +
+      'in-scope request and 403 on an out-of-scope one, then revocation makes an immediate retry fail -- ' +
+      'not just that api-key CRUD returns 2xx',
+  )
+  .option('--temps-root <path>', 'checkout root (needs crates/temps-cli) to mint the second user\'s bearer key via DB-direct `temps api-key`; or $TEMPS_ROOT')
+  .option('--database-url <url>', 'Postgres URL the temps binary can reach directly; or $TEMPS_DATABASE_URL')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await apiKeyScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('multinode-join-scenario')
+  .description(
+    'Real direct-underlay multi-node/mTLS proof: brings up its OWN dedicated 2-node DinD cluster ' +
+      '(tools/e2e-multinode-cluster/, not the shared instance -- no --url/--api-key), waits for a real ' +
+      'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
+      'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
+      'channel, proves app-to-app and managed-Postgres *.temps.local DNS from deployed containers, drains ' +
+      'the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
+      'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
+  )
+  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
+  .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await multinodeJoinScenarioCommand(opts)
+  })
+
+program
+  .command('markdown')
+  .description(
+    'Deploy a real app and verify Accept: text/markdown content negotiation (Markdown for Agents) through the live proxy',
+  )
+  .option(
+    '--image <ref>',
+    'public Docker image to deploy (must run as non-root; see README)',
+    'nginxinc/nginx-unprivileged:alpine',
+  )
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await markdownCommand({ ...opts, connection: connection() })
   })
 
 program.parseAsync().catch((err: unknown) => {

@@ -1182,6 +1182,14 @@ export type AppSettingsResponse = {
     observability_retention: ObservabilityRetentionSettings;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
+    /**
+     * Port the main Pingora proxy listens on (parsed from `--address`), the
+     * same value `ConfigService::proxy_port()` feeds into
+     * `compute_deployment_url`/`compute_environment_url` when `external_url`
+     * is unset. The console uses this to preview a project's real
+     * `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
+     */
+    proxy_port: number;
     rate_limiting: RateLimitSettings;
     /**
      * When enabled, Admin-role accounts without MFA enrolled are rejected
@@ -2411,6 +2419,44 @@ export type CommitListResponse = {
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
 /**
+ * A Docker Compose service port mapping, reduced to the information the UI
+ * needs to build a public route without confusing host and container ports.
+ */
+export type ComposePortMapping = {
+    /**
+     * Transport protocol. Compose defaults to TCP.
+     */
+    protocol?: string;
+    /**
+     * Optional port published on the Docker host by Compose.
+     */
+    published?: number | null;
+    /**
+     * Port inside the service container. Temps routes traffic to this port.
+     */
+    target: number;
+};
+
+export type ComposePreviewRequest = {
+    branch?: string | null;
+    composeOverride?: string | null;
+    excludedServices?: Array<string>;
+    path: string;
+};
+
+export type ComposePreviewResponse = {
+    disabledServices: Array<string>;
+    /**
+     * Effective user-controlled Compose YAML with sensitive values redacted.
+     */
+    effectiveCompose: string;
+    enabledServices: Array<string>;
+    path: string;
+    redactedValues: number;
+    repositoryId: number;
+};
+
+/**
  * A port that should be exposed publicly through the proxy for a compose service.
  */
 export type ComposePublicPort = {
@@ -2419,9 +2465,50 @@ export type ComposePublicPort = {
      */
     port: number;
     /**
+     * Optional port published on the Docker host by Compose. The proxy uses
+     * this port when Temps runs on the host or reaches a remote node.
+     */
+    published?: number | null;
+    /**
      * Compose service name (e.g. "web", "clickhouse")
      */
     service: string;
+};
+
+/**
+ * The specific well-known service family a compose service's image matches,
+ * when it matches one Temps can deploy as a managed `external_services` row
+ * instead. Drives the "deploy this as a Temps-managed service" recommendation
+ * in `GitSettings.tsx` and the deploy-log message — kept separate from
+ * `ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)
+ * because that field only gates the unrelated "may need elevated Linux
+ * capabilities" warning, and S3/MinIO images need this classification
+ * without tripping that warning.
+ */
+export type ComposeServiceFamily = 'postgres' | 'mariadb' | 'mongodb' | 'redis' | 's3';
+
+export type ComposeServicePreviewResponse = {
+    dependsOn: Array<string>;
+    detectedServiceType?: null | ComposeServiceFamily;
+    /**
+     * Environment variable names declared by this service. Values are
+     * intentionally omitted.
+     */
+    environmentVariables: Array<string>;
+    image?: string | null;
+    /**
+     * True when the image looks like a well-known database engine
+     * (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+     * compose service never becomes a Temps-managed `external_services` row,
+     * so it never gets backup/restore. Informational only.
+     */
+    looksLikeDatabase: boolean;
+    name: string;
+    /**
+     * Ports declared by Compose. Route `target`, not `published`: the latter
+     * is only the optional host-side Docker port.
+     */
+    ports: Array<ComposePortMapping>;
 };
 
 export type ConnectionListQuery = {
@@ -2443,6 +2530,11 @@ export type ConnectionResponse = {
     account_type: string;
     consecutive_health_failures: number;
     created_at: string;
+    /**
+     * Whether this connection can make authenticated provider requests.
+     * This exposes capability only; credential values are never serialized.
+     */
+    has_authenticated_credentials: boolean;
     /**
      * Human-readable reason when health_status is "unhealthy"; null otherwise.
      */
@@ -4338,6 +4430,12 @@ export type DeleteResponse = {
 
 export type DeployFromImageRequest = {
     /**
+     * Claim an image already present in the platform host's Docker daemon.
+     * Temps retags it into a generated project-owned namespace and records
+     * its immutable image ID. Never set this for a registry image.
+     */
+    claim_local?: boolean;
+    /**
      * External image ID (if already registered). If provided without image_ref,
      * the image reference will be fetched from the registered external image.
      */
@@ -4370,8 +4468,8 @@ export type DeployFromImageUploadQuery = {
      */
     health_check_path?: string | null;
     /**
-     * Tag to apply to the imported image (e.g., "myapp:v1.0")
-     * If not provided, a unique tag will be generated
+     * Deprecated display hint retained for wire compatibility. Temps always
+     * generates the actual project-scoped internal image reference.
      */
     tag?: string | null;
 };
@@ -5663,7 +5761,8 @@ export type DrainStatusResponse = {
      */
     can_remove: boolean;
     /**
-     * Whether the drain is complete (all containers migrated)
+     * Whether the source node is empty and safe to remove. Replacement
+     * deployments may still be converging asynchronously on other nodes.
      */
     drain_complete: boolean;
     message: string;
@@ -5708,6 +5807,7 @@ export type DropOffPoint = {
 };
 
 export type DropPresetCandidate = {
+    composePath?: string | null;
     confidence: string;
     directory: string;
     isStatic: boolean;
@@ -6127,6 +6227,41 @@ export type EntityResponse = {
      * Size in bytes (for files/objects)
      */
     size_bytes?: number | null;
+};
+
+/**
+ * A single environment variable parsed from a detected env-example file
+ */
+export type EnvExampleVariable = {
+    /**
+     * Placeholder/default value as written in the file (may be empty)
+     */
+    default_value: string;
+    /**
+     * Description derived from a `# comment` immediately preceding the
+     * variable in the file, if any
+     */
+    description?: string | null;
+    /**
+     * Variable name (e.g. "DATABASE_URL")
+     */
+    key: string;
+};
+
+export type EnvExampleVariableResponse = {
+    /**
+     * Placeholder/default value as written in the file (may be empty)
+     */
+    defaultValue: string;
+    /**
+     * Description derived from a `# comment` immediately preceding the
+     * variable in the file, if any
+     */
+    description?: string | null;
+    /**
+     * Variable name (e.g. "DATABASE_URL")
+     */
+    key: string;
 };
 
 /**
@@ -9133,7 +9268,7 @@ export type ListApiKeysQuery = {
  */
 export type ListAuditLogsQuery = {
     /**
-     * Start timestamp (milliseconds since epoch)
+     * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     from?: string | null;
     /**
@@ -9149,7 +9284,7 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
-     * End timestamp (milliseconds since epoch)
+     * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     to?: string | null;
     /**
@@ -9271,6 +9406,16 @@ export type ListOrdersResponse = {
 
 export type ListPresetsResponse = {
     presets: Array<PresetResponse>;
+    total: number;
+};
+
+/**
+ * Paginated renewal-attempt history for one domain, newest first.
+ */
+export type ListRenewalAttemptsResponse = {
+    attempts: Array<RenewalAttemptResponse>;
+    page: number;
+    page_size: number;
     total: number;
 };
 
@@ -11764,9 +11909,31 @@ export type PlatformInfo = {
 };
 
 /**
+ * What a plugin is allowed to do with the platform API over the channel.
+ *
+ * Coarse on purpose. Fine-grained authorization already exists in the
+ * permission system and is enforced per request against the acting user;
+ * this exists so an operator installing a binary can see at a glance
+ * whether it intends to *write* at all, without reading its source.
+ */
+export type PluginCapability = 'api_read' | 'api_write';
+
+/**
  * The complete plugin manifest — the handshake contract.
  */
 export type PluginManifest = {
+    /**
+     * What this plugin may do with the platform's own API over the channel.
+     *
+     * Empty by default, and empty means read-only channel queries and
+     * nothing else: a plugin that never asks cannot deploy, cannot create
+     * projects, and cannot provision databases. Declaring a capability is
+     * not by itself permission to act — every call still runs the real
+     * handler's `permission_guard!` as the user the plugin is acting for,
+     * so a capability can only ever narrow what that user could already do
+     * through the console.
+     */
+    capabilities?: Array<PluginCapability>;
     /**
      * Short description of what the plugin does
      */
@@ -11794,6 +11961,20 @@ export type PluginManifest = {
      */
     health_path?: string;
     /**
+     * Suppress the console's own header strip above this plugin's UI.
+     *
+     * The console normally renders the plugin's icon, display name and
+     * version above the iframe. For a plugin whose UI is a full working
+     * surface with its own header, that is a second title bar competing
+     * for the same vertical space — and vertical space is exactly what a
+     * dense full-page layout has none of. Opt out and the frame gets the
+     * full height.
+     *
+     * The nav entry still names the plugin, so nothing becomes
+     * unidentifiable by setting this.
+     */
+    hide_header?: boolean;
+    /**
      * Unique plugin identifier (kebab-case, e.g., "backup-manager")
      */
     name: string;
@@ -11802,9 +11983,35 @@ export type PluginManifest = {
      */
     nav?: Array<NavEntry>;
     /**
+     * Routes this plugin authenticates itself, which the platform's proxy
+     * therefore does not gate.
+     *
+     * Every other proxied route requires an authenticated caller before it
+     * reaches the plugin. That is right for anything a signed-in user
+     * drives, and wrong for the endpoints a plugin exposes to clients that
+     * hold no platform session — an agent in a sandbox presenting a
+     * capability token, a share link opened by someone with no account.
+     * This is the external-plugin counterpart of the in-process
+     * `configure_public_routes`.
+     *
+     * Paths are relative to the plugin's mount point and match by prefix,
+     * so `/webhooks/incoming` covers everything beneath it. A listed route is
+     * reachable by anyone who can reach the instance: it **must** check its
+     * own credential. Listing a route that does not is an open door.
+     */
+    public_paths?: Array<string>;
+    /**
      * Whether the plugin needs database access
      */
     requires_db?: boolean;
+    /**
+     * Whether the plugin may read the platform's host data root.
+     *
+     * This is a highly privileged capability: the directory can contain
+     * encryption keys and instance-owned state. It is independent of direct
+     * database access and defaults to `false`.
+     */
+    requires_host_data_access?: boolean;
     ui?: null | UiManifest;
     /**
      * SemVer version string
@@ -12300,6 +12507,11 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Authoritative repository visibility. A missing connection alone does
+     * not imply that an incompletely configured repository is public.
+     */
+    is_public_repo: boolean;
     last_deployment?: number | null;
     main_branch: string;
     name: string;
@@ -12760,6 +12972,83 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
+};
+
+export type PublicComposePreviewRequest = {
+    branch?: string | null;
+    composeOverride?: string | null;
+    excludedServices?: Array<string>;
+    path: string;
+};
+
+export type PublicComposePreviewResponse = {
+    branch: string;
+    disabledServices: Array<string>;
+    /**
+     * Effective user-controlled Compose YAML with sensitive values redacted.
+     */
+    effectiveCompose: string;
+    enabledServices: Array<string>;
+    path: string;
+    redactedValues: number;
+};
+
+/**
+ * A single service parsed from a compose file's `services:` map
+ */
+export type PublicComposeServicePreview = {
+    depends_on: Array<string>;
+    detected_service_type?: null | ComposeServiceFamily;
+    /**
+     * Environment variable names declared by this service. Values are
+     * intentionally omitted.
+     */
+    environment_variables: Array<string>;
+    image?: string | null;
+    /**
+     * True when the image looks like a well-known database engine
+     * (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+     * compose service never becomes a Temps-managed `external_services` row,
+     * so it never gets backup/restore. Informational only.
+     */
+    looks_like_database: boolean;
+    name: string;
+    /**
+     * Ports declared by Compose. `target` is the container port Temps can
+     * route to; `published` is only the optional Docker host port.
+     */
+    ports: Array<ComposePortMapping>;
+};
+
+/**
+ * Response for compose-file service preview
+ */
+export type PublicComposeServicesResponse = {
+    /**
+     * Branch the file was read from
+     */
+    branch: string;
+    path: string;
+    services: Array<PublicComposeServicePreview>;
+};
+
+/**
+ * Response for env-example detection
+ */
+export type PublicEnvExampleResponse = {
+    /**
+     * Branch the file was read from
+     */
+    branch: string;
+    /**
+     * Path of the detected env-example file (e.g. ".env.example"), `null`
+     * if the repository has none
+     */
+    path?: string | null;
+    /**
+     * Parsed variables (empty if no env-example file was found)
+     */
+    variables: Array<EnvExampleVariable>;
 };
 
 /**
@@ -13357,6 +13646,48 @@ export type RenameConversationRequest = {
      * New human-facing title. Trimmed; must be non-empty after trimming.
      */
     title: string;
+};
+
+/**
+ * One row of the standard (non-on-demand) renewal-attempt audit log, backing
+ * the domain detail page's renewal timeline.
+ */
+export type RenewalAttemptResponse = {
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    error?: string | null;
+    error_type?: string | null;
+    id: number;
+    /**
+     * `"success"` | `"failed"`.
+     */
+    outcome: string;
+    /**
+     * `"request_challenge"` | `"complete_challenge"`.
+     */
+    stage: string;
+    /**
+     * `"http-01"` | `"dns-01"`.
+     */
+    verification_method: string;
+};
+
+export type RepositoryComposeServicesResponse = {
+    path: string;
+    repositoryId: number;
+    services: Array<ComposeServicePreviewResponse>;
+};
+
+export type RepositoryEnvExampleResponse = {
+    /**
+     * Path of the detected env-example file (e.g. ".env.example"), `null`
+     * if the repository has none
+     */
+    path?: string | null;
+    repositoryId: number;
+    variables: Array<EnvExampleVariableResponse>;
 };
 
 export type RepositoryListQuery = {
@@ -13997,6 +14328,22 @@ export type RunExternalServiceBackupRequest = {
      * ID of the S3 source to store the backup. If omitted, the current default S3 source is used.
      */
     s3_source_id?: number | null;
+};
+
+/**
+ * Live connection variables for a service in one environment.
+ *
+ * Every value is plaintext — this is the response of the audited issuance
+ * endpoint, not of the masked bulk read. Callers must treat it as a
+ * credential: do not log it, do not cache it, do not put it in an error.
+ */
+export type RuntimeCredentialsResponse = {
+    /**
+     * Connection variables, e.g. `POSTGRES_URL`, `POSTGRES_PASSWORD`.
+     */
+    variables: {
+        [key: string]: string;
+    };
 };
 
 /**
@@ -19609,6 +19956,52 @@ export type RecordEventMetricsResponses = {
 
 export type RecordEventMetricsResponse = RecordEventMetricsResponses[keyof RecordEventMetricsResponses];
 
+export type IngestTunneledEnvelopeData = {
+    /**
+     * Sentry envelope as binary data
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/_temps/sentry/envelope';
+};
+
+export type IngestTunneledEnvelopeErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Origin/Referer does not match the resolved host
+     */
+    403: unknown;
+    /**
+     * Unknown host
+     */
+    404: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
+    /**
+     * Rate limit exceeded
+     */
+    429: unknown;
+};
+
+export type IngestTunneledEnvelopeResponses = {
+    /**
+     * Envelope ingested
+     */
+    200: unknown;
+    /**
+     * Host resolved to a route with no attributable project (sandbox/orphan)
+     */
+    204: void;
+};
+
+export type IngestTunneledEnvelopeResponse = IngestTunneledEnvelopeResponses[keyof IngestTunneledEnvelopeResponses];
+
 export type AddSessionReplayEventsData = {
     body: SessionReplayEventsRequest;
     path?: never;
@@ -24285,6 +24678,10 @@ export type BlobListData = {
          * Continuation token for pagination
          */
         cursor?: string;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
     };
     url: '/blob';
 };
@@ -24317,7 +24714,24 @@ export type BlobPutData = {
      */
     body: string;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Path where the blob will be stored
+         */
+        pathname?: string;
+        /**
+         * Content type of the blob (optional, will be guessed from extension)
+         */
+        content_type?: string;
+        /**
+         * Add random suffix to pathname to prevent collisions
+         */
+        add_random_suffix?: boolean;
+        /**
+         * Project ID (required for API key/session auth, optional for deployment tokens)
+         */
+        project_id?: number;
+    };
     url: '/blob';
 };
 
@@ -25920,6 +26334,51 @@ export type RenewDomainResponses = {
 };
 
 export type RenewDomainResponse = RenewDomainResponses[keyof RenewDomainResponses];
+
+export type ListRenewalAttemptsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name
+         */
+        domain: string;
+    };
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/{domain}/renewal-attempts';
+};
+
+export type ListRenewalAttemptsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListRenewalAttemptsResponses = {
+    /**
+     * Renewal attempts retrieved successfully
+     */
+    200: ListRenewalAttemptsResponse;
+};
+
+export type ListRenewalAttemptsResponse2 = ListRenewalAttemptsResponses[keyof ListRenewalAttemptsResponses];
 
 export type CheckDomainStatusData = {
     body?: never;
@@ -27536,6 +27995,44 @@ export type GetClusterHealthResponses = {
 
 export type GetClusterHealthResponse = GetClusterHealthResponses[keyof GetClusterHealthResponses];
 
+export type RevealServiceEnvironmentVariablesData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/environment';
+};
+
+export type RevealServiceEnvironmentVariablesErrors = {
+    /**
+     * Caller cannot access a project linked to this service
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealServiceEnvironmentVariablesResponses = {
+    /**
+     * Service environment variables in plaintext
+     */
+    200: {
+        [key: string]: string;
+    };
+};
+
+export type RevealServiceEnvironmentVariablesResponse = RevealServiceEnvironmentVariablesResponses[keyof RevealServiceEnvironmentVariablesResponses];
+
 export type TriggerServiceHealthCheckData = {
     body?: never;
     path: {
@@ -28421,6 +28918,54 @@ export type GetServiceEnvironmentVariableResponses = {
 };
 
 export type GetServiceEnvironmentVariableResponse = GetServiceEnvironmentVariableResponses[keyof GetServiceEnvironmentVariableResponses];
+
+export type IssueRuntimeCredentialsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials';
+};
+
+export type IssueRuntimeCredentialsErrors = {
+    /**
+     * Plaintext secret access is not permitted
+     */
+    403: unknown;
+    /**
+     * Service, project, or environment not found
+     */
+    404: unknown;
+    /**
+     * Service is not linked to the project
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IssueRuntimeCredentialsResponses = {
+    /**
+     * Connection credentials issued
+     */
+    200: RuntimeCredentialsResponse;
+};
+
+export type IssueRuntimeCredentialsResponse = IssueRuntimeCredentialsResponses[keyof IssueRuntimeCredentialsResponses];
 
 export type UpdateServiceResourcesData = {
     body: ServiceResourceLimits;
@@ -30185,13 +30730,25 @@ export type UpdateConnectionTokenData = {
 
 export type UpdateConnectionTokenErrors = {
     /**
+     * Invalid token configuration
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -30225,9 +30782,17 @@ export type ValidateConnectionErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Connection not found
      */
     404: unknown;
+    /**
+     * Git provider rate limit exceeded
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -30945,6 +31510,10 @@ export type GetPublicRepositoryErrors = {
      */
     400: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -30998,6 +31567,10 @@ export type GetPublicBranchesErrors = {
      */
     400: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -31019,6 +31592,161 @@ export type GetPublicBranchesResponses = {
 };
 
 export type GetPublicBranchesResponse = GetPublicBranchesResponses[keyof GetPublicBranchesResponses];
+
+export type GetPublicComposeServicesData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query: {
+        /**
+         * Branch to read the compose file from (default: repository's default branch)
+         */
+        branch?: string | null;
+        /**
+         * Compose file path to fetch and parse (from the `compose_files` list
+         * `/preset` already returned, or a custom path the user typed)
+         */
+        path: string;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/compose-file';
+};
+
+export type GetPublicComposeServicesErrors = {
+    /**
+     * Provider not supported, or the compose file could not be parsed
+     */
+    400: unknown;
+    /**
+     * Repository, branch, or compose file not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicComposeServicesResponses = {
+    /**
+     * Compose services parsed successfully
+     */
+    200: PublicComposeServicesResponse;
+};
+
+export type GetPublicComposeServicesResponse = GetPublicComposeServicesResponses[keyof GetPublicComposeServicesResponses];
+
+export type GetPublicComposePreviewData = {
+    body: PublicComposePreviewRequest;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git/public/{provider}/{owner}/{repo}/compose-file';
+};
+
+export type GetPublicComposePreviewErrors = {
+    /**
+     * Compose file or override is invalid
+     */
+    400: unknown;
+    /**
+     * Repository, branch, or compose file not found
+     */
+    404: unknown;
+};
+
+export type GetPublicComposePreviewResponses = {
+    /**
+     * Effective Compose preview rendered
+     */
+    200: PublicComposePreviewResponse;
+};
+
+export type GetPublicComposePreviewResponse = GetPublicComposePreviewResponses[keyof GetPublicComposePreviewResponses];
+
+export type DetectPublicEnvExampleData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Branch name to detect presets for (default: repository's default branch)
+         */
+        branch?: string | null;
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/env-example';
+};
+
+export type DetectPublicEnvExampleErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DetectPublicEnvExampleResponses = {
+    /**
+     * Detected env-example variables
+     */
+    200: PublicEnvExampleResponse;
+};
+
+export type DetectPublicEnvExampleResponse = DetectPublicEnvExampleResponses[keyof DetectPublicEnvExampleResponses];
 
 export type DetectPublicPresetsData = {
     body?: never;
@@ -31054,6 +31782,10 @@ export type DetectPublicPresetsErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository or branch not found
      */
@@ -32886,7 +33618,7 @@ export type GetUptimeHistoryData = {
          */
         monitor_id: number;
     };
-    query: {
+    query?: {
         /**
          * Number of days of history (default: 60) - ignored if start_time/end_time provided
          */
@@ -32894,11 +33626,11 @@ export type GetUptimeHistoryData = {
         /**
          * Start time (ISO 8601) - overrides days parameter
          */
-        start_time: string;
+        start_time?: string;
         /**
          * End time (ISO 8601) - defaults to now
          */
-        end_time: string;
+        end_time?: string;
     };
     url: '/monitors/{monitor_id}/uptime';
 };
@@ -34931,6 +35663,14 @@ export type QueryTracesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
+        /**
+         * Filter by span name pattern (ILIKE)
+         */
+        name_pattern?: string;
         /**
          * Max spans to return (default: 100, max: 1000)
          */
@@ -40798,8 +41538,8 @@ export type DeployFromImageUploadData = {
     };
     query?: {
         /**
-         * Tag to apply to the imported image (e.g., "myapp:v1.0")
-         * If not provided, a unique tag will be generated
+         * Deprecated display hint retained for wire compatibility. Temps always
+         * generates the actual project-scoped internal image reference.
          */
         tag?: string | null;
         /**
@@ -43318,8 +44058,11 @@ export type ObservabilityListEventsData = {
     };
     query?: {
         /**
-         * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
-         * missing returns every kind.
+         * Comma-separated kinds: `request,span,error,revenue`. Empty or
+         * missing returns every kind. There is no `log` kind — runtime logs
+         * intentionally never appear in this feed (see `ObservabilityEvent`'s
+         * "No `Log` variant" doc); passing `kinds=log` is rejected with 400
+         * `InvalidKindsFilter`, not silently ignored.
          */
         kinds?: string;
         /**
@@ -46357,6 +47100,10 @@ export type GetRepositoryBranchesErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46406,6 +47153,10 @@ export type GetRepositoryTagsErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46427,6 +47178,136 @@ export type GetRepositoryTagsResponses = {
 };
 
 export type GetRepositoryTagsResponse = GetRepositoryTagsResponses[keyof GetRepositoryTagsResponses];
+
+export type GetRepositoryComposeServicesLiveData = {
+    body?: never;
+    path: {
+        /**
+         * Repository ID
+         */
+        repository_id: number;
+    };
+    query: {
+        /**
+         * Git branch to check (defaults to repository's default branch)
+         */
+        branch?: string;
+        /**
+         * Compose file path to fetch and parse
+         */
+        path: string;
+    };
+    url: '/repositories/{repository_id}/compose-file/live';
+};
+
+export type GetRepositoryComposeServicesLiveErrors = {
+    /**
+     * Bad request, or the compose file could not be parsed
+     */
+    400: unknown;
+    /**
+     * The git provider rejected the stored credential - the connection must be re-authorized
+     */
+    401: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetRepositoryComposeServicesLiveResponses = {
+    /**
+     * Compose services parsed successfully
+     */
+    200: RepositoryComposeServicesResponse;
+};
+
+export type GetRepositoryComposeServicesLiveResponse = GetRepositoryComposeServicesLiveResponses[keyof GetRepositoryComposeServicesLiveResponses];
+
+export type GetRepositoryComposePreviewData = {
+    body: ComposePreviewRequest;
+    path: {
+        /**
+         * Repository ID
+         */
+        repository_id: number;
+    };
+    query?: never;
+    url: '/repositories/{repository_id}/compose-file/preview';
+};
+
+export type GetRepositoryComposePreviewErrors = {
+    /**
+     * Compose file or override is invalid
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+};
+
+export type GetRepositoryComposePreviewResponses = {
+    /**
+     * Effective Compose preview rendered
+     */
+    200: ComposePreviewResponse;
+};
+
+export type GetRepositoryComposePreviewResponse = GetRepositoryComposePreviewResponses[keyof GetRepositoryComposePreviewResponses];
+
+export type GetRepositoryEnvExampleLiveData = {
+    body?: never;
+    path: {
+        /**
+         * Repository ID
+         */
+        repository_id: number;
+    };
+    query?: {
+        /**
+         * Git branch to check (defaults to repository's default branch)
+         */
+        branch?: string;
+    };
+    url: '/repositories/{repository_id}/env-example/live';
+};
+
+export type GetRepositoryEnvExampleLiveErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * The git provider rejected the stored credential - the connection must be re-authorized
+     */
+    401: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetRepositoryEnvExampleLiveResponses = {
+    /**
+     * Env-example variables detected (empty if the repository has no env-example file)
+     */
+    200: RepositoryEnvExampleResponse;
+};
+
+export type GetRepositoryEnvExampleLiveResponse = GetRepositoryEnvExampleLiveResponses[keyof GetRepositoryEnvExampleLiveResponses];
 
 export type GetRepositoryPresetLiveData = {
     body?: never;
@@ -46528,6 +47409,10 @@ export type GetBranchesByRepositoryIdErrors = {
      */
     401: unknown;
     /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
      * Repository not found
      */
     404: unknown;
@@ -46572,6 +47457,10 @@ export type ListCommitsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -46665,6 +47554,10 @@ export type GetTagsByRepositoryIdErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository not found
      */
@@ -50390,11 +51283,11 @@ export type ListAuditLogsData = {
          */
         user_id?: number;
         /**
-         * Start timestamp (milliseconds since epoch)
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         from?: string;
         /**
-         * End timestamp (milliseconds since epoch)
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
          */
         to?: string;
         /**

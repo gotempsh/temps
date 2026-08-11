@@ -75,6 +75,22 @@ pub struct JobProcessorService {
 }
 
 impl JobProcessorService {
+    async fn resolve_image_target_environments(
+        db: &DbConnection,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+    ) -> Result<Vec<temps_entities::environments::Model>, sea_orm::DbErr> {
+        let mut query = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null());
+        query = if let Some(environment_id) = target_environment_id {
+            query.filter(temps_entities::environments::Column::Id.eq(environment_id))
+        } else {
+            query.filter(temps_entities::environments::Column::IsPreview.eq(false))
+        };
+        query.all(db).await
+    }
+
     /// Atomically admit a pending deployment only while both owners are active.
     pub(crate) async fn try_admit_deployment(
         db: &DbConnection,
@@ -321,14 +337,15 @@ impl JobProcessorService {
             }
         };
 
-        // Target the project's non-preview (production) environment(s). A fresh
-        // template project has exactly one.
-        let environments = match temps_entities::environments::Entity::find()
-            .filter(temps_entities::environments::Column::ProjectId.eq(job.project_id))
-            .filter(temps_entities::environments::Column::DeletedAt.is_null())
-            .filter(temps_entities::environments::Column::IsPreview.eq(false))
-            .all(db.as_ref())
-            .await
+        // A drain/failover job names the exact affected environment. Legacy
+        // project-wide template/import jobs continue targeting non-preview
+        // environments.
+        let environments = match Self::resolve_image_target_environments(
+            db.as_ref(),
+            job.project_id,
+            job.target_environment_id,
+        )
+        .await
         {
             Ok(envs) => envs,
             Err(e) => {
@@ -342,8 +359,9 @@ impl JobProcessorService {
 
         if environments.is_empty() {
             error!(
-                "DeployImageRequested: project {} has no deployable (non-preview) environment",
-                job.project_id
+                "DeployImageRequested: project {} has no matching deployable environment (target_environment_id={:?})",
+                job.project_id,
+                job.target_environment_id
             );
             return;
         }
@@ -1777,6 +1795,67 @@ mod tests {
             "a deployment denied admission must not receive a start timestamp"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_deployment_target_is_scoped_to_one_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image target integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Image Target Project".to_string()),
+            slug: Set("image-target-project".to_string()),
+            repo_owner: Set("temps-e2e".to_string()),
+            repo_name: Set("image-target-project".to_string()),
+            preset: Set(Preset::Dockerfile),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let make_environment = |name: &str, slug: &str| temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set(name.to_string()),
+            slug: Set(slug.to_string()),
+            host: Set(format!("{slug}.example.com")),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set(format!("{slug}.example.com")),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let production = make_environment("Production", "production")
+            .insert(db.as_ref())
+            .await?;
+        let staging = make_environment("Staging", "staging")
+            .insert(db.as_ref())
+            .await?;
+
+        let targeted = JobProcessorService::resolve_image_target_environments(
+            db.as_ref(),
+            project.id,
+            Some(staging.id),
+        )
+        .await?;
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].id, staging.id);
+
+        let project_wide =
+            JobProcessorService::resolve_image_target_environments(db.as_ref(), project.id, None)
+                .await?;
+        assert_eq!(project_wide.len(), 2);
+        assert!(project_wide.iter().any(|env| env.id == production.id));
+        assert!(project_wide.iter().any(|env| env.id == staging.id));
         Ok(())
     }
 

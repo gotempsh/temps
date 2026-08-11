@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::AuthContext;
 use temps_core::problemdetails::{new as problem_new, Problem};
+use temps_entities::preset::ComposePortMapping;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 /// Query parameters for public repository endpoints
@@ -91,6 +92,92 @@ pub struct PublicPresetResponse {
     pub presets: Vec<PresetInfo>,
 }
 
+/// A single environment variable parsed from a detected env-example file
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct EnvExampleVariable {
+    /// Variable name (e.g. "DATABASE_URL")
+    pub key: String,
+    /// Placeholder/default value as written in the file (may be empty)
+    pub default_value: String,
+    /// Description derived from a `# comment` immediately preceding the
+    /// variable in the file, if any
+    pub description: Option<String>,
+}
+
+/// Response for env-example detection
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PublicEnvExampleResponse {
+    /// Branch the file was read from
+    pub branch: String,
+    /// Path of the detected env-example file (e.g. ".env.example"), `null`
+    /// if the repository has none
+    pub path: Option<String>,
+    /// Parsed variables (empty if no env-example file was found)
+    pub variables: Vec<EnvExampleVariable>,
+}
+
+/// Query params for public compose-file service preview
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PublicComposeFileQueryParams {
+    /// Branch to read the compose file from (default: repository's default branch)
+    pub branch: Option<String>,
+    /// Compose file path to fetch and parse (from the `compose_files` list
+    /// `/preset` already returned, or a custom path the user typed)
+    pub path: String,
+}
+
+/// A single service parsed from a compose file's `services:` map
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PublicComposeServicePreview {
+    pub name: String,
+    pub image: Option<String>,
+    pub depends_on: Vec<String>,
+    /// Environment variable names declared by this service. Values are
+    /// intentionally omitted.
+    pub environment_variables: Vec<String>,
+    /// True when the image looks like a well-known database engine
+    /// (Postgres/MySQL/MariaDB/MongoDB/Redis and common forks) — a raw
+    /// compose service never becomes a Temps-managed `external_services` row,
+    /// so it never gets backup/restore. Informational only.
+    pub looks_like_database: bool,
+    /// Well-known managed-service family detected from the image, if any.
+    pub detected_service_type: Option<temps_entities::preset::ComposeServiceFamily>,
+    /// Ports declared by Compose. `target` is the container port Temps can
+    /// route to; `published` is only the optional Docker host port.
+    pub ports: Vec<ComposePortMapping>,
+}
+
+/// Response for compose-file service preview
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PublicComposeServicesResponse {
+    /// Branch the file was read from
+    pub branch: String,
+    pub path: String,
+    pub services: Vec<PublicComposeServicePreview>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicComposePreviewRequest {
+    pub branch: Option<String>,
+    pub path: String,
+    pub compose_override: Option<String>,
+    #[serde(default)]
+    pub excluded_services: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicComposePreviewResponse {
+    pub branch: String,
+    pub path: String,
+    /// Effective user-controlled Compose YAML with sensitive values redacted.
+    pub effective_compose: String,
+    pub enabled_services: Vec<String>,
+    pub disabled_services: Vec<String>,
+    pub redacted_values: usize,
+}
+
 /// Convert PublicRepoError to Problem
 fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     match err {
@@ -100,9 +187,28 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
                 "Repository {}/{} not found or is not public: {}",
                 owner, repo, msg
             )),
+        PublicRepoError::RepositoryNotPublic(_) => problem_new(StatusCode::NOT_FOUND)
+            .with_title("Repository Not Found")
+            .with_detail(format!(
+                "Repository {}/{} was not found or is not public.",
+                owner, repo
+            )),
         PublicRepoError::RateLimitExceeded => problem_new(StatusCode::TOO_MANY_REQUESTS)
             .with_title("Rate Limit Exceeded")
-            .with_detail("API rate limit exceeded for unauthenticated requests. Try again later."),
+            .with_detail(
+                "The provider API rate limit was reached. When you are signed in, Temps automatically uses a valid GitHub connection owned by your account. Check or reconnect it in Git Providers, retry after the provider resets the limit, or install a GitHub App without creating a personal access token.",
+            ),
+        PublicRepoError::PermissionDenied {
+            operation,
+            required_permission,
+        } => problem_new(StatusCode::FORBIDDEN)
+            .with_title("Git Provider Permission Required")
+            .with_detail(format!(
+                "The git provider denied permission to {}. Grant '{}' to the credential for this repository.",
+                operation, required_permission
+            ))
+            .with_value("operation", operation)
+            .with_value("required_permission", required_permission),
         PublicRepoError::BranchNotFound(branch) => problem_new(StatusCode::NOT_FOUND)
             .with_title("Branch Not Found")
             .with_detail(format!("Branch '{}' not found in repository", branch)),
@@ -121,6 +227,66 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     }
 }
 
+fn require_public_repository(
+    info: crate::services::public_repo::PublicRepoInfo,
+    owner: &str,
+    repo: &str,
+) -> Result<crate::services::public_repo::PublicRepoInfo, PublicRepoError> {
+    if info.is_private {
+        Err(PublicRepoError::NotFound(format!(
+            "Repository {owner}/{repo} is private"
+        )))
+    } else {
+        Ok(info)
+    }
+}
+
+/// Build the provider used by a public-repository request.
+///
+/// Authenticated GitHub users may contribute their own connection token so
+/// discovery receives GitHub's authenticated rate limit. Before that token is
+/// used for any repository content, we confirm the target is still public;
+/// this keeps private data out of public responses and shared caches.
+async fn provider_for_public_request(
+    state: &AppState,
+    auth: Option<&AuthContext>,
+    provider: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<
+    (
+        Box<dyn crate::services::public_repo::PublicRepoProvider>,
+        crate::services::public_repo::PublicRepoInfo,
+    ),
+    Problem,
+> {
+    let token = if provider.eq_ignore_ascii_case("github") {
+        if let Some(user_id) = auth.and_then(AuthContext::user_id_opt) {
+            state
+                .git_provider_manager
+                .get_valid_github_token_for_user(user_id)
+                .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let repo_provider = PublicRepoProviderFactory::create_with_token(provider, token)
+        .map_err(|error| map_error(error, owner, repo))?;
+
+    // Always verify current visibility, including before shared cache hits.
+    // A repository can become private while a branch or preset entry remains
+    // cached, so cached content is not itself proof that it is still public.
+    let info = repo_provider
+        .get_repository(owner, repo)
+        .await
+        .map_err(|error| map_error(error, owner, repo))?;
+    let info = require_public_repository(info, owner, repo)
+        .map_err(|error| map_error(error, owner, repo))?;
+    Ok((repo_provider, info))
+}
+
 /// Get branches for a public repository (supports GitHub and GitLab)
 #[utoipa::path(
     get,
@@ -134,6 +300,7 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     responses(
         (status = 200, description = "List of branches", body = BranchListResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -141,11 +308,20 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     tag = "Public Repositories"
 )]
 pub async fn get_public_branches(
-    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicRepoQueryParams>,
 ) -> Result<Json<BranchListResponse>, Problem> {
+    let (repo_provider, _) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
+
     // Create cache key for public repos
     let cache_key = PublicBranchCacheKey::new(provider.clone(), owner.clone(), repo.clone());
 
@@ -165,18 +341,6 @@ pub async fn get_public_branches(
             }));
         }
     }
-
-    // Try to get a token from any existing GitHub connection for higher rate limits
-    // (authenticated callers only — see get_github_token_from_connections)
-    let token = if provider == "github" {
-        get_github_token_from_connections(&state, auth.is_some()).await
-    } else {
-        None
-    };
-
-    // Create provider with token if available
-    let repo_provider = PublicRepoProviderFactory::create_with_token(&provider, token)
-        .map_err(|e| map_error(e, &owner, &repo))?;
 
     // Fetch branches from provider
     let provider_branches = repo_provider
@@ -228,6 +392,7 @@ pub async fn get_public_branches(
     responses(
         (status = 200, description = "Detected presets", body = PublicPresetResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -235,33 +400,24 @@ pub async fn get_public_branches(
     tag = "Public Repositories"
 )]
 pub async fn detect_public_presets(
-    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PresetQueryParams>,
 ) -> Result<Json<PublicPresetResponse>, Problem> {
-    // Try to get a token from any existing GitHub connection for higher rate limits
-    // (authenticated callers only — see get_github_token_from_connections)
-    let token = if provider == "github" {
-        get_github_token_from_connections(&state, auth.is_some()).await
-    } else {
-        None
-    };
-
-    // Create provider with token if available
-    let repo_provider = PublicRepoProviderFactory::create_with_token(&provider, token)
-        .map_err(|e| map_error(e, &owner, &repo))?;
+    let (repo_provider, repo_info) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
 
     // Get repository info to determine default branch if not specified
     let target_branch = if let Some(branch) = params.branch.clone() {
         branch
     } else {
-        // Fetch repository info to get default branch
-        let repo_info = repo_provider
-            .get_repository(&owner, &repo)
-            .await
-            .map_err(|e| map_error(e, &owner, &repo))?;
-
         repo_info.default_branch
     };
 
@@ -346,6 +502,241 @@ pub async fn detect_public_presets(
     }))
 }
 
+/// Decode a provider file's content. GitHub and GitLab both return base64
+/// (with embedded newlines in GitHub's case); falls back to the raw string
+/// if decoding fails or the encoding isn't base64.
+fn decode_file_content(content: &str, encoding: &str) -> String {
+    use base64::Engine;
+    if encoding.eq_ignore_ascii_case("base64") {
+        let stripped: String = content.split_whitespace().collect();
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(stripped) {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    content.to_string()
+}
+
+/// Detect and parse a `.env.example`-style file for a public repository
+/// (supports GitHub and GitLab)
+#[utoipa::path(
+    get,
+    path = "/git/public/{provider}/{owner}/{repo}/env-example",
+    params(
+        ("provider" = String, Path, description = "Git provider (github or gitlab)"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        PresetQueryParams
+    ),
+    responses(
+        (status = 200, description = "Detected env-example variables", body = PublicEnvExampleResponse),
+        (status = 400, description = "Provider not supported"),
+        (status = 404, description = "Repository or branch not found"),
+        (status = 429, description = "API rate limit exceeded"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Public Repositories"
+)]
+pub async fn detect_public_env_example(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
+    Path((provider, owner, repo)): Path<(String, String, String)>,
+    Query(params): Query<PresetQueryParams>,
+) -> Result<Json<PublicEnvExampleResponse>, Problem> {
+    let (repo_provider, repo_info) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
+
+    let target_branch = if let Some(branch) = params.branch.clone() {
+        branch
+    } else {
+        repo_info.default_branch
+    };
+
+    let files = repo_provider
+        .get_file_tree(&owner, &repo, &target_branch)
+        .await
+        .map_err(|e| map_error(e, &owner, &repo))?;
+
+    let Some(env_path) = temps_presets::detect_env_example_files(&files)
+        .into_iter()
+        .next()
+    else {
+        return Ok(Json(PublicEnvExampleResponse {
+            branch: target_branch,
+            path: None,
+            variables: Vec::new(),
+        }));
+    };
+
+    let file = repo_provider
+        .get_file_content(&owner, &repo, &env_path, &target_branch)
+        .await
+        .map_err(|e| map_error(e, &owner, &repo))?;
+
+    let content = decode_file_content(&file.content, &file.encoding);
+    let variables = temps_presets::parse_env_example(&content)
+        .into_iter()
+        .map(|v| EnvExampleVariable {
+            key: v.key,
+            default_value: v.default_value,
+            description: v.description,
+        })
+        .collect();
+
+    Ok(Json(PublicEnvExampleResponse {
+        branch: target_branch,
+        path: Some(env_path),
+        variables,
+    }))
+}
+
+/// Parse a compose file's services for a public repository (supports GitHub
+/// and GitLab). Unlike env-example detection, the caller already knows the
+/// path (from the `compose_files` list `/preset` already returned), so this
+/// fetches that one file directly rather than scanning the tree first.
+#[utoipa::path(
+    get,
+    path = "/git/public/{provider}/{owner}/{repo}/compose-file",
+    params(
+        ("provider" = String, Path, description = "Git provider (github or gitlab)"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        PublicComposeFileQueryParams
+    ),
+    responses(
+        (status = 200, description = "Compose services parsed successfully", body = PublicComposeServicesResponse),
+        (status = 400, description = "Provider not supported, or the compose file could not be parsed"),
+        (status = 404, description = "Repository, branch, or compose file not found"),
+        (status = 429, description = "API rate limit exceeded"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Public Repositories"
+)]
+pub async fn get_public_compose_services(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
+    Path((provider, owner, repo)): Path<(String, String, String)>,
+    Query(params): Query<PublicComposeFileQueryParams>,
+) -> Result<Json<PublicComposeServicesResponse>, Problem> {
+    let (repo_provider, repo_info) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
+
+    let target_branch = if let Some(branch) = params.branch.clone() {
+        branch
+    } else {
+        repo_info.default_branch
+    };
+
+    let file = repo_provider
+        .get_file_content(&owner, &repo, &params.path, &target_branch)
+        .await
+        .map_err(|e| map_error(e, &owner, &repo))?;
+
+    let content = decode_file_content(&file.content, &file.encoding);
+    let services = temps_presets::list_compose_services(&content)
+        .map_err(|e| {
+            problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Compose File")
+                .with_detail(format!(
+                    "Compose file '{}' could not be parsed: {}",
+                    params.path, e
+                ))
+        })?
+        .into_iter()
+        .map(|s| PublicComposeServicePreview {
+            name: s.name,
+            image: s.image,
+            depends_on: s.depends_on,
+            environment_variables: s.environment_variables,
+            looks_like_database: s.looks_like_database,
+            detected_service_type: s.detected_service_type,
+            ports: s.ports,
+        })
+        .collect();
+
+    Ok(Json(PublicComposeServicesResponse {
+        branch: target_branch,
+        path: params.path,
+        services,
+    }))
+}
+
+/// Render a redacted effective Compose preview for a public repository.
+#[utoipa::path(
+    post,
+    path = "/git/public/{provider}/{owner}/{repo}/compose-file",
+    params(
+        ("provider" = String, Path, description = "Git provider (github or gitlab)"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = PublicComposePreviewRequest,
+    responses(
+        (status = 200, description = "Effective Compose preview rendered", body = PublicComposePreviewResponse),
+        (status = 400, description = "Compose file or override is invalid"),
+        (status = 404, description = "Repository, branch, or compose file not found")
+    ),
+    tag = "Public Repositories"
+)]
+pub async fn get_public_compose_preview(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
+    Path((provider, owner, repo)): Path<(String, String, String)>,
+    Json(request): Json<PublicComposePreviewRequest>,
+) -> Result<Json<PublicComposePreviewResponse>, Problem> {
+    let (repo_provider, repo_info) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
+    let target_branch = if let Some(branch) = request.branch {
+        branch
+    } else {
+        repo_info.default_branch
+    };
+    let file = repo_provider
+        .get_file_content(&owner, &repo, &request.path, &target_branch)
+        .await
+        .map_err(|error| map_error(error, &owner, &repo))?;
+    let content = decode_file_content(&file.content, &file.encoding);
+    let preview = temps_presets::render_effective_compose_preview(
+        &content,
+        request.compose_override.as_deref(),
+        &request.excluded_services,
+    )
+    .map_err(|error| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Compose Preview")
+            .with_detail(format!(
+                "Compose preview for '{}' could not be rendered: {}",
+                request.path, error
+            ))
+    })?;
+
+    Ok(Json(PublicComposePreviewResponse {
+        branch: target_branch,
+        path: request.path,
+        effective_compose: preview.yaml,
+        enabled_services: preview.enabled_services,
+        disabled_services: preview.disabled_services,
+        redacted_values: preview.redacted_values,
+    }))
+}
+
 /// Get information about a public repository (supports GitHub and GitLab)
 #[utoipa::path(
     get,
@@ -358,6 +749,7 @@ pub async fn detect_public_presets(
     responses(
         (status = 200, description = "Repository information", body = PublicRepositoryInfo),
         (status = 400, description = "Provider not supported"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -365,27 +757,18 @@ pub async fn detect_public_presets(
     tag = "Public Repositories"
 )]
 pub async fn get_public_repository(
-    auth: Option<Extension<AuthContext>>,
     State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
 ) -> Result<Json<PublicRepositoryInfo>, Problem> {
-    // Try to get a token from any existing GitHub connection for higher rate limits
-    // (authenticated callers only — see get_github_token_from_connections)
-    let token = if provider == "github" {
-        get_github_token_from_connections(&state, auth.is_some()).await
-    } else {
-        None
-    };
-
-    // Create provider with token if available
-    let repo_provider = PublicRepoProviderFactory::create_with_token(&provider, token)
-        .map_err(|e| map_error(e, &owner, &repo))?;
-
-    // Fetch repository info
-    let repo_info = repo_provider
-        .get_repository(&owner, &repo)
-        .await
-        .map_err(|e| map_error(e, &owner, &repo))?;
+    let (_repo_provider, repo_info) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+    )
+    .await?;
 
     Ok(Json(PublicRepositoryInfo {
         owner: repo_info.owner,
@@ -416,6 +799,14 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/git/public/{provider}/{owner}/{repo}/presets",
             axum::routing::get(detect_public_presets),
         )
+        .route(
+            "/git/public/{provider}/{owner}/{repo}/env-example",
+            axum::routing::get(detect_public_env_example),
+        )
+        .route(
+            "/git/public/{provider}/{owner}/{repo}/compose-file",
+            axum::routing::get(get_public_compose_services).post(get_public_compose_preview),
+        )
 }
 
 #[derive(OpenApi)]
@@ -423,13 +814,23 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     paths(
         get_public_repository,
         get_public_branches,
-        detect_public_presets
+        detect_public_presets,
+        detect_public_env_example,
+        get_public_compose_services,
+        get_public_compose_preview
     ),
     components(
         schemas(
             PublicRepositoryInfo,
             PresetInfo,
             PublicPresetResponse,
+            EnvExampleVariable,
+            PublicEnvExampleResponse,
+            PublicComposeServicePreview,
+            ComposePortMapping,
+            PublicComposeServicesResponse,
+            PublicComposePreviewRequest,
+            PublicComposePreviewResponse,
             BranchInfo,
             BranchListResponse
         )
@@ -439,24 +840,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct PublicRepositoriesApiDoc;
-
-/// Try to get a GitHub access token from any configured GitHub connection.
-/// This avoids the 60 req/hr unauthenticated rate limit by using an existing token (5000 req/hr).
-///
-/// Only ever returns a token for authenticated callers. These routes are
-/// intentionally public (no `RequireAuth` — see module docs), but that means
-/// an anonymous internet caller must not be able to silently spend the
-/// server's own GitHub OAuth quota; unauthenticated requests fall back to
-/// GitHub's unauthenticated rate limit instead.
-async fn get_github_token_from_connections(
-    state: &AppState,
-    is_authenticated: bool,
-) -> Option<String> {
-    if !is_authenticated {
-        return None;
-    }
-    state.git_provider_manager.get_any_github_token().await
-}
 
 #[cfg(test)]
 mod tests {
@@ -769,6 +1152,18 @@ mod tests {
     }
 
     #[test]
+    fn test_private_repository_is_hidden_as_not_found() {
+        let err = PublicRepoError::RepositoryNotPublic("owner/private".to_string());
+        let problem = map_error(err, "owner", "private");
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        assert!(!problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("credential") || detail.contains("token")));
+    }
+
+    #[test]
     fn test_error_mapping_rate_limit() {
         let err = PublicRepoError::RateLimitExceeded;
         let problem = map_error(err, "owner", "repo");
@@ -776,10 +1171,49 @@ mod tests {
     }
 
     #[test]
+    fn test_error_mapping_permission_denied() {
+        let err = PublicRepoError::PermissionDenied {
+            operation: "list branches for owner/repo".to_string(),
+            required_permission: "Contents: read".to_string(),
+        };
+        let problem = map_error(err, "owner", "repo");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Git Provider Permission Required")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| detail.contains("Contents: read")));
+    }
+
+    #[test]
     fn test_error_mapping_provider_not_supported() {
         let err = PublicRepoError::ProviderNotSupported("bitbucket".to_string());
         let problem = map_error(err, "owner", "repo");
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn private_repository_is_rejected_before_shared_cache_use() {
+        let info = crate::services::public_repo::PublicRepoInfo {
+            owner: "example".to_string(),
+            name: "repository".to_string(),
+            full_name: "example/repository".to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            language: None,
+            stars: 0,
+            forks: 0,
+            is_private: true,
+        };
+
+        assert!(matches!(
+            require_public_repository(info, "example", "repository"),
+            Err(PublicRepoError::NotFound(message)) if message.contains("is private")
+        ));
     }
 
     // =============================================================================

@@ -1,9 +1,17 @@
-import { EnvironmentVariableResponse, ProjectResponse } from '@/api/client'
+import {
+  EnvironmentVariableResponse,
+  ProjectResponse,
+  listRepositoriesByConnection,
+} from '@/api/client'
 import {
   createEnvironmentVariableMutation,
   deleteEnvironmentVariableMutation,
+  detectPublicEnvExampleOptions,
   getEnvironmentsOptions,
   getEnvironmentVariablesOptions,
+  getPublicComposeServicesOptions,
+  getRepositoryComposeServicesLiveOptions,
+  getRepositoryEnvExampleLiveOptions,
   updateEnvironmentVariableMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
@@ -60,6 +68,12 @@ import {
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
 import { Link } from 'react-router'
+import { publicRepositoryProvider } from '@/lib/public-repository'
+import {
+  discoverComposeEnvironmentVariables,
+  type DiscoveredEnvironmentVariable,
+} from '@/lib/compose-environment-discovery'
+import { repositoryFilePath } from '@/lib/repository-file-path'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -120,11 +134,7 @@ function EnvironmentVariableRow({
     const request = guard.begin('value')
     setIsRevealing(true)
     try {
-      const value = await getEnvVarValue(
-        project.id,
-        variable.key,
-        variable.id
-      )
+      const value = await getEnvVarValue(project.id, variable.key, variable.id)
       if (!guard.isCurrent('value', request)) return undefined
       setRevealedValue({ value, scope: revealScope })
       return value
@@ -152,8 +162,7 @@ function EnvironmentVariableRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAllValues, isSecret, revealScope])
 
-  const dataValue =
-    credentialValueForScope(revealedValue, revealScope) ?? ''
+  const dataValue = credentialValueForScope(revealedValue, revealScope) ?? ''
 
   const toggleVisibility = async () => {
     if (isSecret) return
@@ -430,10 +439,7 @@ function EnvironmentVariableRow({
         </div>
       </div>
 
-      <Dialog
-        open={isEditModalOpen}
-        onOpenChange={handleEditDialogOpenChange}
-      >
+      <Dialog open={isEditModalOpen} onOpenChange={handleEditDialogOpenChange}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Environment Variable: {variable.key}</DialogTitle>
@@ -509,7 +515,10 @@ function EnvironmentVariableRow({
               </div>
               <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
                 <div className="flex-1 space-y-1">
-                  <Label htmlFor="edit-include-preview" className="text-sm font-medium">
+                  <Label
+                    htmlFor="edit-include-preview"
+                    className="text-sm font-medium"
+                  >
                     Include in Preview Environments
                   </Label>
                   <p className="text-sm text-muted-foreground">
@@ -525,9 +534,7 @@ function EnvironmentVariableRow({
               {!isSecret && (
                 <div
                   className={`flex items-center justify-between space-x-2 rounded-lg border p-4 ${
-                    convertToSecret
-                      ? 'border-amber-500/40 bg-amber-500/5'
-                      : ''
+                    convertToSecret ? 'border-amber-500/40 bg-amber-500/5' : ''
                   }`}
                 >
                   <div className="flex-1 space-y-1">
@@ -882,7 +889,10 @@ function AddEnvironmentVariableDialog({
             </div>
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">
-                <Label htmlFor="include-preview" className="text-sm font-medium">
+                <Label
+                  htmlFor="include-preview"
+                  className="text-sm font-medium"
+                >
                   Include in Preview Environments
                 </Label>
                 <p className="text-sm text-muted-foreground">
@@ -1046,6 +1056,43 @@ function EnvironmentVariablesLoadingState() {
   )
 }
 
+function DiscoveredEnvironmentVariableRow({
+  variable,
+}: {
+  variable: DiscoveredEnvironmentVariable
+}) {
+  return (
+    <div className="py-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+      <div className="space-y-1 min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="font-medium font-mono break-all">{variable.key}</p>
+          <span className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20">
+            Not added
+          </span>
+        </div>
+        {variable.description ? (
+          <p className="text-xs text-muted-foreground">
+            {variable.description}
+          </p>
+        ) : null}
+        <div className="flex flex-wrap gap-1.5">
+          {variable.sources.map((source) => (
+            <span
+              key={source}
+              className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+            >
+              {source}
+            </span>
+          ))}
+        </div>
+      </div>
+      <span className="font-mono text-xs text-muted-foreground break-all sm:max-w-[320px]">
+        Value required
+      </span>
+    </div>
+  )
+}
+
 export function EnvironmentVariablesSettings({
   project,
 }: EnvironmentVariablesSettingsProps) {
@@ -1093,16 +1140,109 @@ export function EnvironmentVariablesSettings({
 
   const { data: resolvedEnvVars } = useQuery({
     queryKey: ['resolved-env-vars', project.id, selectedEnvId],
-    queryFn: () =>
-      getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
+    queryFn: () => getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
     staleTime: 15_000,
     enabled: selectedEnvId !== null,
   })
 
   const resolvedByKey = useMemo(
     () => indexResolvedByKey(resolvedEnvVars),
-    [resolvedEnvVars],
+    [resolvedEnvVars]
   )
+
+  const isDockerCompose = project.preset === 'docker-compose'
+  const isPublicRepository = project.is_public_repo
+  const publicProvider = publicRepositoryProvider(project.git_url)
+  const composeConfig =
+    (project.preset_config as Record<string, unknown> | null) ?? {}
+  const composePath =
+    (composeConfig.composePath as string | undefined) ??
+    (composeConfig.compose_path as string | undefined) ??
+    'docker-compose.yml'
+  const composeRepositoryPath = repositoryFilePath(
+    project.directory,
+    composePath
+  )
+
+  const { data: repositoryData } = useQuery({
+    queryKey: [
+      'environment-variable-repository',
+      project.repo_owner,
+      project.repo_name,
+      project.git_provider_connection_id,
+    ],
+    queryFn: async () => {
+      if (
+        !project.repo_owner ||
+        !project.repo_name ||
+        !project.git_provider_connection_id
+      ) {
+        return null
+      }
+      const response = await listRepositoriesByConnection({
+        path: { connection_id: project.git_provider_connection_id },
+        query: { search: project.repo_name, per_page: 100 },
+        throwOnError: true,
+      })
+      return (
+        response.data?.repositories?.find(
+          (repository) =>
+            repository.owner === project.repo_owner &&
+            repository.name === project.repo_name
+        ) ?? null
+      )
+    },
+    enabled:
+      isDockerCompose &&
+      !isPublicRepository &&
+      !!project.repo_owner &&
+      !!project.repo_name,
+  })
+
+  const connectedEnvExample = useQuery({
+    ...getRepositoryEnvExampleLiveOptions({
+      path: { repository_id: repositoryData?.id ?? 0 },
+      query: { branch: project.main_branch },
+    }),
+    enabled: isDockerCompose && !!repositoryData?.id,
+  })
+  const publicEnvExample = useQuery({
+    ...detectPublicEnvExampleOptions({
+      path: {
+        provider: publicProvider,
+        owner: project.repo_owner ?? '',
+        repo: project.repo_name ?? '',
+      },
+      query: { branch: project.main_branch },
+    }),
+    enabled:
+      isDockerCompose &&
+      isPublicRepository &&
+      !!project.repo_owner &&
+      !!project.repo_name,
+  })
+  const connectedComposeServices = useQuery({
+    ...getRepositoryComposeServicesLiveOptions({
+      path: { repository_id: repositoryData?.id ?? 0 },
+      query: { branch: project.main_branch, path: composeRepositoryPath },
+    }),
+    enabled: isDockerCompose && !!repositoryData?.id,
+  })
+  const publicComposeServices = useQuery({
+    ...getPublicComposeServicesOptions({
+      path: {
+        provider: publicProvider,
+        owner: project.repo_owner ?? '',
+        repo: project.repo_name ?? '',
+      },
+      query: { branch: project.main_branch, path: composeRepositoryPath },
+    }),
+    enabled:
+      isDockerCompose &&
+      isPublicRepository &&
+      !!project.repo_owner &&
+      !!project.repo_name,
+  })
 
   const integrationOnlyResolved = useMemo(() => {
     if (!resolvedEnvVars) return [] as ResolvedEnvVar[]
@@ -1110,7 +1250,7 @@ export function EnvironmentVariablesSettings({
     return resolvedEnvVars
       .filter(
         (entry) =>
-          entry.source.type === 'integration' && !manualKeys.has(entry.key),
+          entry.source.type === 'integration' && !manualKeys.has(entry.key)
       )
       .sort((a, b) => a.key.localeCompare(b.key))
   }, [resolvedEnvVars, envVariables])
@@ -1189,6 +1329,55 @@ export function EnvironmentVariablesSettings({
   const existingKeys = useMemo(() => {
     return new Set((envVariables ?? []).map((v) => v.key))
   }, [envVariables])
+
+  const discoveredMissingVariables = (() => {
+    if (!isDockerCompose) return [] as DiscoveredEnvironmentVariable[]
+
+    const configuredKeys = new Set(existingKeys)
+    for (const resolved of resolvedEnvVars ?? [])
+      configuredKeys.add(resolved.key)
+
+    const envExample = isPublicRepository
+      ? publicEnvExample.data
+      : connectedEnvExample.data
+    const envExamplePath = envExample?.path ?? '.env.example'
+    const envExampleVariables = (envExample?.variables ?? []).map(
+      (variable) => {
+        const raw = variable as {
+          key: string
+          description?: string | null
+        }
+        return {
+          key: raw.key,
+          description: raw.description,
+        }
+      }
+    )
+
+    const composeServices = isPublicRepository
+      ? publicComposeServices.data?.services
+      : connectedComposeServices.data?.services
+    const serviceVariables = (composeServices ?? []).map((service) => {
+      const raw = service as {
+        name: string
+        environmentVariables?: string[]
+        environment_variables?: string[]
+      }
+      return {
+        name: raw.name,
+        environmentVariables:
+          raw.environmentVariables ?? raw.environment_variables ?? [],
+      }
+    })
+
+    return discoverComposeEnvironmentVariables({
+      configuredKeys,
+      envExamplePath,
+      envExampleVariables,
+      composePath: composeRepositoryPath,
+      composeServices: serviceVariables,
+    })
+  })()
 
   const { data: allEnvironments } = useQuery({
     ...getEnvironmentsOptions({
@@ -1294,7 +1483,9 @@ export function EnvironmentVariablesSettings({
 
   const hasManualVariables = (envVariables?.length ?? 0) > 0
   const hasIntegrationVariables = integrationOnlyResolved.length > 0
-  const hasVariables = hasManualVariables || hasIntegrationVariables
+  const hasDiscoveredVariables = discoveredMissingVariables.length > 0
+  const hasVariables =
+    hasManualVariables || hasIntegrationVariables || hasDiscoveredVariables
   const selectedCount = selectedVariables.size
   const allSelected =
     selectedCount === (envVariables?.length ?? 0) && hasManualVariables
@@ -1338,7 +1529,8 @@ export function EnvironmentVariablesSettings({
                   </SelectContent>
                 </Select>
                 <span className="text-[11px] text-muted-foreground">
-                  Linked services show <code className="font-mono">{`<project>_<env>`}</code> values.
+                  Linked services show{' '}
+                  <code className="font-mono">{`<project>_<env>`}</code> values.
                 </span>
               </div>
             ) : null}
@@ -1379,7 +1571,10 @@ export function EnvironmentVariablesSettings({
                 <Upload className="h-4 w-4 sm:mr-2" />
                 <span className="hidden sm:inline">Import .env</span>
               </Button>
-              <Button onClick={() => setIsAddDialogOpen(true)} className="flex-1 sm:flex-initial">
+              <Button
+                onClick={() => setIsAddDialogOpen(true)}
+                className="flex-1 sm:flex-initial"
+              >
                 <Plus className="h-4 w-4 mr-2" />
                 Add Variable
                 <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
@@ -1451,6 +1646,12 @@ export function EnvironmentVariablesSettings({
                     resolved={entry}
                     showAllValues={showAllValues}
                     environmentId={selectedEnvId}
+                  />
+                ))}
+                {discoveredMissingVariables.map((variable) => (
+                  <DiscoveredEnvironmentVariableRow
+                    key={`discovered-${variable.key}`}
+                    variable={variable}
                   />
                 ))}
               </div>

@@ -883,6 +883,92 @@ pub struct DockerComposeConfig {
     /// Format: `[{"service": "web", "port": 8080}, {"service": "api", "port": 3000}]`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_ports: Vec<ComposePublicPort>,
+    /// Compose service names to exclude from deployment entirely (and strip
+    /// from other services' `depends_on`) — e.g. a `postgres`/`redis` service
+    /// the user wants to skip in favor of a Temps-managed database with
+    /// backup/restore support.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_services: Vec<String>,
+    /// Snapshot of the compose file's services (name/image/DB-hint), captured
+    /// at project creation and refreshed after every successful deploy. Lets
+    /// the settings-page exclusion checklist render without a live git fetch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compose_services: Vec<ComposeServiceSnapshot>,
+    /// Compose service names granted the minimal Linux capabilities
+    /// (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) their entrypoint needs
+    /// to fix ownership on a data directory and drop from root to a service
+    /// user at container start — a pattern common to many official images,
+    /// not just databases (postgres/mysql/mariadb/mongo, but also e.g.
+    /// Gitea). Off by default: Temps drops all capabilities from every
+    /// compose service for defense in depth, and only grants this back for
+    /// a service the user has explicitly opted in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxed_capability_services: Vec<String>,
+    /// Compose services for which Temps must not inject its default runtime
+    /// sandbox (`cap_drop: ALL`, `no-new-privileges`, and the PID limit).
+    /// This is an explicit compatibility escape hatch for images whose own
+    /// startup/runtime model cannot operate inside that sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsandboxed_services: Vec<String>,
+}
+
+/// The specific well-known service family a compose service's image matches,
+/// when it matches one Temps can deploy as a managed `external_services` row
+/// instead. Drives the "deploy this as a Temps-managed service" recommendation
+/// in `GitSettings.tsx` and the deploy-log message — kept separate from
+/// `ComposeServiceSnapshot::looks_like_database` (which stays a plain bool)
+/// because that field only gates the unrelated "may need elevated Linux
+/// capabilities" warning, and S3/MinIO images need this classification
+/// without tripping that warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ComposeServiceFamily {
+    Postgres,
+    Mariadb,
+    Mongodb,
+    Redis,
+    S3,
+}
+
+/// One service parsed from a compose file, as persisted onto
+/// [`DockerComposeConfig::compose_services`]. A smaller shape than
+/// `temps_presets::ComposeServicePreview` (drops `depends_on` and environment
+/// keys, which this settings surface does not render) since `temps-entities`
+/// cannot depend on `temps-presets`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeServiceSnapshot {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub looks_like_database: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_service_type: Option<ComposeServiceFamily>,
+    /// Port mappings declared by this service after combining the repository
+    /// Compose file with the user override. `target` is the container port the
+    /// proxy must use; `published` is only Docker's optional host-side port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ComposePortMapping>,
+}
+
+/// A Docker Compose service port mapping, reduced to the information the UI
+/// needs to build a public route without confusing host and container ports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposePortMapping {
+    /// Port inside the service container. Temps routes traffic to this port.
+    pub target: u16,
+    /// Optional port published on the Docker host by Compose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<u16>,
+    /// Transport protocol. Compose defaults to TCP.
+    #[serde(default = "default_compose_port_protocol")]
+    pub protocol: String,
+}
+
+fn default_compose_port_protocol() -> String {
+    "tcp".to_string()
 }
 
 /// A port that should be exposed publicly through the proxy for a compose service.
@@ -893,6 +979,10 @@ pub struct ComposePublicPort {
     pub service: String,
     /// Container port to expose (e.g. 8123)
     pub port: u16,
+    /// Optional port published on the Docker host by Compose. The proxy uses
+    /// this port when Temps runs on the host or reaches a remote node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<u16>,
 }
 
 /// A Nixpacks build provider.
@@ -1380,6 +1470,160 @@ mod tests {
                 assert_eq!(cfg.public_ports.len(), 1);
                 assert_eq!(cfg.public_ports[0].service, "plausible");
                 assert_eq!(cfg.public_ports[0].port, 80);
+            }
+            _ => panic!("Expected DockerCompose config"),
+        }
+    }
+
+    #[test]
+    fn test_compose_service_snapshot_camel_case_round_trip() {
+        let snapshot = ComposeServiceSnapshot {
+            name: "postgres".to_string(),
+            image: Some("postgres:17-alpine".to_string()),
+            looks_like_database: true,
+            detected_service_type: None,
+            ports: vec![ComposePortMapping {
+                target: 5432,
+                published: Some(15432),
+                protocol: "tcp".to_string(),
+            }],
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "postgres",
+                "image": "postgres:17-alpine",
+                "looksLikeDatabase": true,
+                "ports": [{"target": 5432, "published": 15432, "protocol": "tcp"}]
+            })
+        );
+        let round_tripped: ComposeServiceSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, snapshot);
+    }
+
+    #[test]
+    fn test_compose_service_snapshot_omits_missing_image() {
+        let snapshot = ComposeServiceSnapshot {
+            name: "hub".to_string(),
+            image: None,
+            looks_like_database: false,
+            detected_service_type: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "name": "hub", "looksLikeDatabase": false })
+        );
+    }
+
+    #[test]
+    fn test_compose_service_snapshot_persists_detected_service_type() {
+        let snapshot = ComposeServiceSnapshot {
+            name: "db".to_string(),
+            image: Some("postgres:17-alpine".to_string()),
+            looks_like_database: true,
+            detected_service_type: Some(ComposeServiceFamily::Postgres),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "db",
+                "image": "postgres:17-alpine",
+                "looksLikeDatabase": true,
+                "detectedServiceType": "postgres"
+            })
+        );
+        let round_tripped: ComposeServiceSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, snapshot);
+    }
+
+    #[test]
+    fn test_compose_service_snapshot_omits_missing_detected_service_type() {
+        let snapshot = ComposeServiceSnapshot {
+            name: "minio".to_string(),
+            image: Some("minio/minio:latest".to_string()),
+            looks_like_database: false,
+            detected_service_type: Some(ComposeServiceFamily::S3),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "minio",
+                "image": "minio/minio:latest",
+                "looksLikeDatabase": false,
+                "detectedServiceType": "s3"
+            })
+        );
+    }
+
+    #[test]
+    fn test_docker_compose_config_persists_compose_services() {
+        let value = serde_json::json!({
+            "preset": "docker-compose",
+            "composePath": "compose.yml",
+            "excludedServices": ["postgres"],
+            "composeServices": [
+                {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
+                {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
+            ]
+        });
+        let config = PresetConfig::parse_for_preset(&Preset::DockerCompose, &value).unwrap();
+        match config {
+            PresetConfig::DockerCompose(cfg) => {
+                assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
+                assert_eq!(cfg.compose_services.len(), 2);
+                assert_eq!(cfg.compose_services[0].name, "postgres");
+                assert!(cfg.compose_services[0].looks_like_database);
+                assert!(!cfg.compose_services[1].looks_like_database);
+            }
+            _ => panic!("Expected DockerCompose config"),
+        }
+    }
+
+    #[test]
+    fn test_docker_compose_config_persists_relaxed_capability_services() {
+        let value = serde_json::json!({
+            "preset": "docker-compose",
+            "composePath": "compose.yml",
+            "relaxedCapabilityServices": ["db"]
+        });
+        let config = PresetConfig::parse_for_preset(&Preset::DockerCompose, &value).unwrap();
+        match config {
+            PresetConfig::DockerCompose(cfg) => {
+                assert_eq!(cfg.relaxed_capability_services, vec!["db".to_string()]);
+            }
+            _ => panic!("Expected DockerCompose config"),
+        }
+    }
+
+    #[test]
+    fn test_docker_compose_config_omits_empty_relaxed_capability_services() {
+        let cfg = DockerComposeConfig {
+            compose_path: Some("compose.yml".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("relaxedCapabilityServices").is_none());
+        assert!(json.get("unsandboxedServices").is_none());
+    }
+
+    #[test]
+    fn test_docker_compose_config_persists_unsandboxed_services() {
+        let value = serde_json::json!({
+            "preset": "docker-compose",
+            "composePath": "compose.yml",
+            "unsandboxedServices": ["webserver"]
+        });
+        let config = PresetConfig::parse_for_preset(&Preset::DockerCompose, &value).unwrap();
+        match config {
+            PresetConfig::DockerCompose(cfg) => {
+                assert_eq!(cfg.unsandboxed_services, vec!["webserver".to_string()]);
             }
             _ => panic!("Expected DockerCompose config"),
         }

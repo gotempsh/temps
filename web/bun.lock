@@ -47,6 +47,7 @@
         "ghostty-web": "^0.4.0",
         "highlight.js": "^11.11.1",
         "iso-3166": "^4.3.0",
+        "js-yaml": "^4.3.1",
         "lucide-react": "^1.28.0",
         "monaco-editor": "^0.56.0",
         "nanoid": "^6.0.0",

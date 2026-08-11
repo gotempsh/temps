@@ -19,7 +19,6 @@ use axum::{
 };
 use futures::stream::{self, StreamExt};
 use futures::SinkExt;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_auth::RequireAuth;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
@@ -55,7 +54,7 @@ use temps_core::problemdetails::Problem;
 // defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
 // to every handler in this file would be redundant noise: the token is already
 // rejected by the earlier `permission_guard!` call.
-fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
+fn public_url_for_hostname(settings: &AppSettings, hostname: &str, proxy_port: u16) -> String {
     let (protocol, port) = if let Some(ref external_url) = settings.external_url {
         if let Ok(parsed) = url::Url::parse(external_url) {
             (parsed.scheme().to_string(), parsed.port())
@@ -65,7 +64,10 @@ fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
             ("https".to_string(), None)
         }
     } else {
-        ("https".to_string(), None)
+        // Match DeploymentService::compute_environment_url: when no external
+        // URL is configured, the public endpoint is the local HTTP proxy and
+        // its configured listener port, not implicit HTTPS on port 443.
+        ("http".to_string(), Some(proxy_port))
     };
 
     let port =
@@ -83,14 +85,27 @@ fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Resul
     Ok(())
 }
 
-fn public_service_url(
+fn public_compose_service_url(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
     environment: &str,
     service: &str,
-) -> String {
-    let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
-    public_url_for_hostname(settings, &hostname)
+    public_ports: &[temps_entities::preset::ComposePublicPort],
+    proxy_port: u16,
+) -> Option<String> {
+    let public_port_index = public_ports
+        .iter()
+        .position(|port| port.service == service)?;
+    // The route table uses the first public port as the environment's main
+    // backend. Its Visit link must therefore use the same stable environment
+    // hostname as deployment links. Additional public services retain their
+    // explicit per-service hostnames.
+    let hostname = if public_port_index == 0 {
+        strategy.environment_hostname(&settings.preview_domain, environment)
+    } else {
+        strategy.service_hostname(&settings.preview_domain, environment, service)
+    };
+    Some(public_url_for_hostname(settings, &hostname, proxy_port))
 }
 
 #[derive(OpenApi)]
@@ -910,74 +925,34 @@ pub async fn list_containers(
         .into_iter()
         .collect();
 
-    let mut node_names: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
-    if !node_ids.is_empty() {
-        let nodes = temps_entities::nodes::Entity::find()
-            .filter(temps_entities::nodes::Column::Id.is_in(node_ids))
-            .all(state.db.as_ref())
-            .await
-            .unwrap_or_default();
-        for node in nodes {
-            node_names.insert(node.id, node.name);
-        }
-    }
-
-    // Resolve preview_domain, URL scheme, and env subdomain for per-service URLs.
-    let settings_row = temps_entities::settings::Entity::find()
-        .one(state.db.as_ref())
-        .await
-        .ok()
-        .flatten();
-    let app_settings = settings_row
-        .as_ref()
-        .map(|s| AppSettings::from_json(s.data.clone()))
-        .unwrap_or_default();
-
-    let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
-        .one(state.db.as_ref())
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.subdomain);
+    let presentation = state
+        .deployment_service
+        .container_presentation_context(project_id, environment_id, &node_ids)
+        .await?;
 
     // Resolve the hostname strategy for this instance's preview domain once,
     // before the synchronous response-building closure below.
     let hostname_strategy = state
         .hostname_resolver
-        .strategy_for(&app_settings.preview_domain)
+        .strategy_for(&presentation.app_settings.preview_domain)
         .await;
-
-    // Read public_ports from project's preset_config
-    let public_ports: Vec<temps_entities::preset::ComposePublicPort> =
-        temps_entities::projects::Entity::find_by_id(project_id)
-            .one(state.db.as_ref())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|p| p.preset_config)
-            .and_then(|pc| {
-                if let temps_entities::preset::PresetConfig::DockerCompose(cfg) = pc {
-                    Some(cfg.public_ports)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
 
     let container_responses: Vec<ContainerInfoResponse> = containers
         .into_iter()
         .map(|(info, node_id, service_name)| {
-            let node_name = node_id.and_then(|id| node_names.get(&id).cloned());
-            // Build per-service URL only for ports marked as public
+            let node_name = node_id.and_then(|id| presentation.node_names.get(&id).cloned());
+            // Build a URL only for services with a configured public port.
+            // The first public service uses the canonical environment URL;
+            // later services use their per-service route.
             let service_url = service_name.as_ref().and_then(|svc| {
-                // Check if this service has any public port configured
-                let is_public = public_ports.iter().any(|pp| pp.service == *svc);
-                if !is_public {
-                    return None;
-                }
-                env_subdomain
-                    .as_ref()
-                    .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
+                public_compose_service_url(
+                    &presentation.app_settings,
+                    hostname_strategy,
+                    &presentation.environment_subdomain,
+                    svc,
+                    &presentation.public_ports,
+                    state.config_service.proxy_port(),
+                )
             });
             ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
         })
@@ -1682,88 +1657,50 @@ pub async fn get_container_detail(
     // Resolve configured resource limits the same way the workflow does:
     // env override first, then project default. This is what was actually
     // applied to the container at deploy time, modulo Docker honoring it.
-    let resource_limits: Option<crate::handlers::types::ResourceLimitsResponse> = {
-        let env = temps_entities::environments::Entity::find_by_id(environment_id)
-            .one(state.db.as_ref())
-            .await
-            .ok()
-            .flatten();
-        let proj = temps_entities::projects::Entity::find_by_id(project_id)
-            .one(state.db.as_ref())
-            .await
-            .ok()
-            .flatten();
-        let env_cfg = env.as_ref().and_then(|e| e.deployment_config.as_ref());
-        let proj_cfg = proj.as_ref().and_then(|p| p.deployment_config.as_ref());
-        let resolve = |g: fn(
-            &temps_entities::deployment_config::DeploymentConfig,
-        ) -> Option<i32>|
-         -> Option<i32> {
-            env_cfg.and_then(g).or_else(|| proj_cfg.and_then(g))
-        };
-        let cpu_request = resolve(|c| c.cpu_request);
-        let cpu_limit = resolve(|c| c.cpu_limit);
-        let memory_request = resolve(|c| c.memory_request);
-        let memory_limit = resolve(|c| c.memory_limit);
-        if cpu_request.is_some()
-            || cpu_limit.is_some()
-            || memory_request.is_some()
-            || memory_limit.is_some()
-        {
-            Some(crate::handlers::types::ResourceLimitsResponse {
-                cpu_request,
-                cpu_limit,
-                memory_request,
-                memory_limit,
-            })
-        } else {
-            None
-        }
+    let presentation = state
+        .deployment_service
+        .container_presentation_context(
+            project_id,
+            environment_id,
+            &container.node_id.into_iter().collect::<Vec<_>>(),
+        )
+        .await?;
+    let limits = &presentation.resource_limits;
+    let resource_limits = if limits.cpu_request.is_some()
+        || limits.cpu_limit.is_some()
+        || limits.memory_request.is_some()
+        || limits.memory_limit.is_some()
+    {
+        Some(crate::handlers::types::ResourceLimitsResponse {
+            cpu_request: limits.cpu_request,
+            cpu_limit: limits.cpu_limit,
+            memory_request: limits.memory_request,
+            memory_limit: limits.memory_limit,
+        })
+    } else {
+        None
     };
 
-    // Resolve per-service URL only for ports marked as public in preset_config
+    // Resolve the public Compose URL using the same primary-service rule as
+    // the container list and route table.
     let service_url = if let Some(ref svc_name) = container.service_name {
-        // Check if this service has a public port
-        let is_public = temps_entities::projects::Entity::find_by_id(project_id)
-            .one(state.db.as_ref())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|p| p.preset_config)
-            .map(|pc| {
-                if let temps_entities::preset::PresetConfig::DockerCompose(cfg) = pc {
-                    cfg.public_ports.iter().any(|pp| pp.service == *svc_name)
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
-
-        if is_public {
-            let settings_row2 = temps_entities::settings::Entity::find()
-                .one(state.db.as_ref())
-                .await
-                .ok()
-                .flatten();
-            let app_settings = settings_row2
-                .as_ref()
-                .map(|s| AppSettings::from_json(s.data.clone()))
-                .unwrap_or_default();
-
-            let env_subdomain = temps_entities::environments::Entity::find_by_id(environment_id)
-                .one(state.db.as_ref())
-                .await
-                .ok()
-                .flatten()
-                .map(|e| e.subdomain);
-
+        if presentation
+            .public_ports
+            .iter()
+            .any(|port| port.service == *svc_name)
+        {
             let hostname_strategy = state
                 .hostname_resolver
-                .strategy_for(&app_settings.preview_domain)
+                .strategy_for(&presentation.app_settings.preview_domain)
                 .await;
-
-            env_subdomain
-                .map(|sub| public_service_url(&app_settings, hostname_strategy, &sub, svc_name))
+            public_compose_service_url(
+                &presentation.app_settings,
+                hostname_strategy,
+                &presentation.environment_subdomain,
+                svc_name,
+                &presentation.public_ports,
+                state.config_service.proxy_port(),
+            )
         } else {
             None
         }
@@ -2432,6 +2369,90 @@ mod tests {
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    #[test]
+    fn compose_visit_urls_match_environment_url_for_primary_service() {
+        let settings = AppSettings {
+            external_url: Some("http://localhost:3013".to_string()),
+            preview_domain: "localho.st".to_string(),
+            ..Default::default()
+        };
+        let ports = vec![
+            temps_entities::preset::ComposePublicPort {
+                service: "nc".to_string(),
+                port: 80,
+                ..Default::default()
+            },
+            temps_entities::preset::ComposePublicPort {
+                service: "admin".to_string(),
+                port: 8080,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            public_compose_service_url(
+                &settings,
+                PublicHostnameStrategy::Standard,
+                "awesome-compose-nextcloud-postgres-production",
+                "nc",
+                &ports,
+                8210,
+            )
+            .as_deref(),
+            Some("http://awesome-compose-nextcloud-postgres-production.localho.st:3013")
+        );
+        assert_eq!(
+            public_compose_service_url(
+                &settings,
+                PublicHostnameStrategy::Standard,
+                "awesome-compose-nextcloud-postgres-production",
+                "admin",
+                &ports,
+                8210,
+            )
+            .as_deref(),
+            Some("http://admin-awesome-compose-nextcloud-postgres-production.localho.st:3013")
+        );
+        assert_eq!(
+            public_compose_service_url(
+                &settings,
+                PublicHostnameStrategy::Standard,
+                "awesome-compose-nextcloud-postgres-production",
+                "database",
+                &ports,
+                8210,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_visit_url_uses_proxy_protocol_and_port_without_external_url() {
+        let settings = AppSettings {
+            external_url: None,
+            preview_domain: "localho.st".to_string(),
+            ..Default::default()
+        };
+        let ports = vec![temps_entities::preset::ComposePublicPort {
+            service: "nc".to_string(),
+            port: 80,
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            public_compose_service_url(
+                &settings,
+                PublicHostnameStrategy::Standard,
+                "awesome-compose-nextcloud-postgres-production",
+                "nc",
+                &ports,
+                8210,
+            )
+            .as_deref(),
+            Some("http://awesome-compose-nextcloud-postgres-production.localho.st:8210")
+        );
+    }
 
     async fn database_test_prerequisites_available() -> bool {
         if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() {

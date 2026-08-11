@@ -7,7 +7,9 @@ End-to-end + load testing CLI for a **live** Temps instance. Most commands
 `error-tracking-scenario`, `logs-scenario`, `analytics-scenario`,
 `session-replay-scenario`, `backup-restore-scenario`, `pitr-scenario`,
 `git-deploy-scenario`, `otel-quota-scenario`, `deploy-lifecycle-scenario`,
-`db-ha-failover-scenario`, `pg-upgrade-scenario`, `examples`) drive the real
+`db-ha-failover-scenario`, `pg-upgrade-scenario`, `redis-restore-scenario`,
+`mongodb-restore-scenario`, `s3-restore-scenario`, `mariadb-restore-scenario`,
+`env-vars-scenario`, `api-key-scenario`, `markdown`, `examples`) drive the real
 control-plane API directly via the shared
 [`@temps-sdk/api`](../../packages/api) client — fast, and enough to prove the
 API itself works, but they never exercise `apps/temps-cli` at all.
@@ -67,6 +69,13 @@ bun run src/index.ts scenario --image traefik/whoami:latest -n 2000 -c 50
 bun run src/index.ts scenario --with-db                          # also provision postgres
 bun run src/index.ts scenario --keep                            # leave resources up
 bun run src/index.ts scenario --json                            # machine-readable (CI)
+
+# Deploy a real app and verify Accept: text/markdown content negotiation
+# (Markdown for Agents) through the live proxy — not the crate's unit tests
+bun run src/index.ts markdown
+bun run src/index.ts markdown --image traefik/whoami:latest --port 80
+bun run src/index.ts markdown --keep                             # leave resources up
+bun run src/index.ts markdown --json                              # machine-readable (CI)
 
 # Build the repo's example projects (Go, Python, Node, …) and run the full
 # deploy/verify lifecycle for EACH — proves every example in examples/ actually
@@ -201,6 +210,32 @@ bun run src/index.ts deploy-lifecycle-scenario --keep --json    # inspect afterw
 # value) for the quota half to mean anything -- see its section below.
 bun run src/index.ts otel-quota-scenario
 bun run src/index.ts otel-quota-scenario --max-quota-batches 400 --json
+
+# redis-restore / mongodb-restore / s3-restore: backup + in-place restore of
+# each managed service via MinIO, proven by verifying pre-backup data
+# survives and post-backup-only data is erased. Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts redis-restore-scenario --registry localhost:5111
+bun run src/index.ts mongodb-restore-scenario
+bun run src/index.ts s3-restore-scenario
+
+# mariadb-restore: backup + in-place restore of a real MariaDB service --
+# insert pre-backup rows via docker exec, real backup (physical or logical,
+# engine-selected) to MinIO, insert post-backup rows, restore in place, and
+# verify via the data-browser API that only the pre-backup rows survive.
+# Needs MinIO (docker-compose.e2e.yml).
+bun run src/index.ts mariadb-restore-scenario
+
+# env-vars: create/update/delete a project env var and redeploy after each
+# change, asserting the RUNNING CONTAINER (an echo-server app, not just the
+# API response) reflects the new/updated/removed value, plus an
+# environment-scoping check.
+bun run src/index.ts env-vars-scenario --registry localhost:5111
+
+# api-key: a second low-privilege user creates a scoped API key over real
+# HTTP, the key gets 200 on an in-scope request and 403 on an out-of-scope
+# one, then revocation makes an immediate retry fail. Needs DB-direct access
+# to mint the second user's initial session, same as rbac-scenario.
+bun run src/index.ts api-key-scenario --temps-root /path/to/temps --database-url postgres://...
 ```
 
 ### `examples`
@@ -872,6 +907,95 @@ reading the rows back after it finishes, not just watching a status field flip.
     `external_services.parameters`; this checks the API-visible result
 11. teardown (deployment, project, service, S3 source)
 
+### `mariadb-restore-scenario` steps
+
+Closes the last remaining gap in the backup/restore engine parity story:
+Postgres (`backup-restore-scenario`, `pitr-scenario`, `pg-upgrade-scenario`),
+Redis, MongoDB, and S3 all have restore e2e coverage; MariaDB had the engine
+code (`crates/temps-providers/src/externalsvc/mariadb.rs`'s
+`restore_capabilities`/`restore_to_new_service`/`restore_pitr`, all fully
+wired to the trait) but no live-server proof until now.
+
+1. provision a real MariaDB service and read its root password directly off
+   the container via `docker inspect` (`MARIADB_ROOT_PASSWORD`, per
+   `MariaDbService::get_container_name`)
+2. insert 3 pre-backup rows into a real table via `docker exec mariadb -uroot
+   -p... -e ...` -- no synthetic DB rows, the same discipline every other
+   restore scenario holds itself to
+3. create a MinIO S3 source and trigger a real backup; the backup engine
+   auto-selects physical or logical (`crates/temps-backup/src/engines/dispatch.rs`)
+4. insert 2 more rows post-backup, to prove restore reverts state rather than
+   just leaving current state alone
+5. start an in-place restore and poll until it completes
+6. verify via the read-only data-browser API (not a direct DB read) that the
+   3 pre-backup rows are present with correct values, the 2 post-backup rows
+   are absent, and exactly 3 rows remain
+7. teardown (S3 source, service)
+
+### `env-vars-scenario` steps
+
+Proves environment-variable changes actually propagate into the running
+container -- not just that the API round-trips the value. App env vars have
+**no hot-reload**: a changed value only takes effect after a redeploy, so
+the scenario redeploys after every change and asserts on the live
+container's own response, never the database row.
+
+1. create a project, deploy `examples/echo-server` (its response body
+   includes `env: process.env`, so it directly surfaces the real container's
+   environment)
+2. create an env var scoped to production with a distinct marker value;
+   assert the create response round-trips it in plaintext (list responses
+   mask non-secret values as `"***"` -- only create/update return plaintext)
+3. redeploy, then poll the live container's own response until
+   `env["E2E_ENV_VAR_MARKER"]` actually equals the new value
+4. update the var to a second marker value, redeploy again, assert the
+   response reflects the NEW value (not the stale one) -- proves updates,
+   not just creates
+5. delete the var, redeploy, assert the key is genuinely absent from the
+   running container's environment
+6. lightweight, deploy-free check: a var scoped only to production must not
+   appear when `GET .../env-vars` is filtered by a second (staging)
+   environment's id, but must appear when filtered by production
+7. teardown (env vars, deployments, project)
+
+### `api-key-scenario` steps
+
+Promotes `web/e2e/authenticated/api-key-create.spec.ts` (UI-only: open
+dialog, fill name, submit, see the key once) to a real API round trip,
+covering what only an API-level test can prove: scope enforcement and
+revocation actually cutting off access, not just that api-key CRUD returns
+2xx.
+
+A real constraint shaped this scenario: `POST /api-keys` is gated by
+`SensitiveAction::CreateApiKey`, and `DefaultSensitiveActionAuthorizer`
+denies every machine (API-key-authenticated) principal outright
+(`machine_principals_are_denied_by_default`,
+`crates/temps-auth/src/sensitive_action.rs`) -- so this suite's own primary
+bearer-key identity can never call it. Same wall `rbac-scenario` already
+documented. The fix here: mint a second, low-privilege user via DB-direct
+`temps api-key` (needs `--temps-root`/`--database-url`, same as
+`rbac-scenario`), log it in for real via `POST /auth/login`, and drive key
+creation/revocation with the resulting `session` cookie via raw `fetch` --
+the SDK client always attaches a Bearer header, so it can't be used for this
+leg.
+
+1. create a project (primary bearer identity)
+2. create + log in a second, low-privilege user; capture its `session` cookie
+3. `POST /api-keys` (session-cookie authenticated) with a custom key scoped
+   to `projects:read` only; capture the plaintext key (returned only once)
+4. use the scoped key (`Authorization: Bearer tk_...`) against `GET
+   /projects/{id}` -- assert 200
+5. use the same key against `PATCH /projects/{id}` -- assert 403 with
+   `required_permission: "projects:write"`
+6. revoke the key (`POST /api-keys/{id}/deactivate`, session-cookie
+   authenticated)
+7. immediately retry the previously-200 request with the revoked key --
+   assert it now fails. Revocation is instant (`ApiKeyService::validate_api_key`
+   queries `IsActive.eq(true)` directly on every call; the only cache
+   throttles `last_used_at` write-back, never the pass/fail read), so this
+   is a single request, not a poll
+8. teardown (key, second user, project)
+
 ### `git-deploy-scenario` steps
 
 1. create a project pointed at a real public repo
@@ -1061,6 +1185,121 @@ lost forever, leaking one reconciler task per deleted cluster that logged
 (`run()` checks `is_stopped()` at the top of every loop iteration, not just
 inside the tick `select!`), so a signal is caught within one tick even if
 it arrives mid-reconcile.
+
+### `multinode-join-scenario` steps
+
+The first-ever e2e coverage for temps's direct-underlay multi-node clustering
+feature. Before this, the only coverage anywhere was Rust unit tests
+against a `MockDatabase`
+(`crates/temps-deployments/tests/multinode_integration_test.rs`) and a
+manual, non-automated dev tool (`tools/dev-cluster/`) a human has to run
+and eyeball. Nothing asserted that a second real node actually joins the
+mesh, that a deployment pinned to it actually lands there, or that drain/
+removal actually work.
+
+**Why this scenario owns its entire cluster instead of using the shared
+instance.** Every other scenario in this suite points `--url`/`--api-key`
+at an already-running `temps serve` (started via the `start-temps` skill)
+and drives it over HTTP. Multi-node clustering can't be proven that way:
+it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
+its own network identity — registering into the first node's mesh over
+single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
+topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
+scenario can need "a dedicated instance on a fixed port, not a normal dev
+slot" (see that section above) because of Pebble's hardcoded port; this
+scenario takes the same idea further: it brings up its own 2-node
+Docker-in-Docker cluster (`tools/e2e-multinode-cluster/docker-compose.yml`
+— a trimmed, re-subnetted clone of `tools/dev-cluster/`'s topology, safe to
+run alongside a developer's own dev-cluster instance or any other local
+service; see that compose file's header comment for the exact isolation
+guarantees), mints its own admin credential once the cluster is up, and
+tears the whole thing down at the end. It does NOT accept `--url`/
+`--api-key` — there is no "target instance" to point at.
+
+1. `docker compose up -d --build` the 2-node cluster. First run compiles
+   the full `temps` binary from source TWICE (once per DinD container) —
+   budget 15-20+ minutes; this is streamed to the scenario's own log output
+   line-by-line (prefixed `[compose]`) specifically so a long first build
+   is visibly progressing, not indistinguishable from a hang. Bounded by
+   `--build-timeout` (default 30 min).
+2. poll `docker inspect --format '{{.State.Health.Status}}'` on the
+   control-plane container until `healthy`.
+3. mint an admin API key directly from the DB: `docker exec ... temps
+   api-key --database-url=... --name=e2e-multinode --role=admin
+   --user-email=admin@local.dev --output-format=json` — the same DB-direct
+   pattern this README documents under "Auth" and `db-apikey.ts`/
+   `rbac-scenario` already use elsewhere in this suite. Works because
+   `role-control-plane.sh`'s `temps setup --auto` guarantees
+   `admin@local.dev` exists by the time the healthcheck passes.
+4. from here on, drive everything through the normal `@temps-sdk/api`
+   client against `http://localhost:18180`, same as every other scenario.
+5. poll `GET /internal/nodes` until a node named `worker-1` reports
+   `status: "active"` — the real proof `POST /internal/nodes/register`
+   completed a genuine registration, not a mocked one. Bounded by the same
+   generous timeout: the worker also compiles its own binary from scratch.
+   Then verify the node endpoint uses HTTPS, the worker persisted its mTLS
+   leaf/key/CA, legacy shared enrollment is disabled, and the node-bound
+   single-use enrollment token has exactly one use.
+6. create a throwaway project, resolve its production environment.
+7. `PUT /projects/{id}/environments/{id}/settings` with
+   `target_nodes: [worker_node_id]` — pins every future deploy in this
+   environment to the worker, never the control plane.
+8. deploy `traefik/whoami:latest` (same image other scenarios in this repo
+   already use for basic deploys) and poll it to a terminal state.
+9. the core assertion: `docker exec temps-e2e-mn-worker-1 docker ps` shows
+   the deployed container; `docker exec temps-e2e-mn-control-plane docker
+   ps` does not — a side channel the platform API can't fake, mirroring how
+   `db-ha-failover-scenario` proves promotion via `docker inspect`.
+10. real HTTP proof of life: hit the deployed app through the
+    control-plane's proxy (`localhost:18180`) with the app's `Host` header
+    and assert the actual `traefik/whoami` response body, not just a
+    healthy status field.
+11. deploy `nginxinc/nginx-unprivileged:alpine` as a second worker-pinned
+    application, then `docker exec` into it and `wget`
+    `http://production.<project>.temps.local`. The response must be the real
+    `whoami` body, proving app-to-app DNS from inside an application container.
+12. provision a real 1-monitor + 2-data-node Postgres HA service, link it to a
+    control-plane probe application, and replace only the injected DSN address
+    with the service member's published `.temps.local` FQDN. The probe must
+    report that DNS host and complete a real INSERT + SELECT. This catches DNS
+    records that resolve but advertise an unreachable IP/port pair.
+13. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+    `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
+    same `docker ps` side-channel check on both containers to confirm the
+    container migrated off the worker. In this 2-node cluster it has
+    nowhere to go but the control plane, so this step also implicitly
+    re-tests the `Local` scheduling fallback path.
+14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+    gone from `GET /internal/nodes`.
+15. teardown (in a `finally`, same discipline as every other scenario):
+    `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
+    workspace-target cache volumes survive for a near-instant re-run), then
+    explicitly `docker volume rm` the identity/state volumes (postgres
+    data, both containers' `/var/lib/docker` + `/var/lib/temps`, the
+    worker's `/root`) so the next run proves a genuinely fresh
+    registration/join rather than silently skipping it via one of the role
+    scripts' own idempotency marker files. `--keep` skips all of this —
+    unlike every other scenario's `--keep`, this leaves an entire running
+    2-node cluster behind, not just one container.
+
+**What makes step 9 work without a registry.** Unlike most `--registry`-
+requiring scenarios in this suite, deploying a bare public image tag to a
+remote node needs no registry at all: `ensure_image_on_remote` in
+`crates/temps-deployments/src/jobs/deploy_image.rs` has the control plane's
+own `DockerImageBuilder` pull (if needed) and `docker save` the image to a
+tar, stream it to the worker agent's `POST /agent/images/import`, and the
+agent `docker load`s it there. `image_builder` is injected into the deploy
+job per `workflow_execution_service.rs` (`builder.image_builder(...)`,
+around the node-scheduler wiring) specifically for this transfer path. So
+`traefik/whoami:latest` works exactly as described in this section's
+design with zero extra image-transfer complexity — this was verified by
+reading the actual remote-deploy code path, not assumed.
+
+```bash
+bun run src/index.ts multinode-join-scenario
+bun run src/index.ts multinode-join-scenario --keep --json    # inspect the running cluster after (CI)
+bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
+```
 
 ### `deploy-lifecycle-scenario` steps
 
@@ -1380,6 +1619,56 @@ HTTP-driven e2e run. `vercel-labs/emulate` (used elsewhere in this repo for
 mocking third-party APIs test-harness-side) can't help here either, for the
 same reason — see `web/e2e/README.md`'s "Mocking third-party services"
 section, which documents the identical constraint for the console UI tests.
+
+**Generic outbound webhooks** — same guard, same conclusion, no
+`webhook-scenario` command. `POST /projects/{project_id}/webhooks` runs every
+URL (create *and* update) through
+`WebhookService::validate_webhook_url` (`crates/temps-webhooks/src/service.rs`),
+which calls the exact same `temps_core::url_validation::validate_external_url`
+Slack goes through, then `validate_domain_async` for the DNS-resolved case.
+Unlike the DNS-01/Pebble guard in `crates/temps-dns/src/providers/pebble.rs`
+(which has an explicit `TEMPS_ALLOW_PEBBLE_PROVIDER=1` opt-in for exactly this
+kind of test), there is no dev/test bypass anywhere in the webhooks path —
+grepped `crates/temps-webhooks/` and `crates/temps-core/src/url_validation.rs`
+for `TEMPS_ALLOW*`, `debug_assertions`, `is_dev`/`dev_mode`/`test_mode`, and
+found nothing. A local receiver is also unreachable via the DNS-rebinding
+route: actual delivery in `deliver_webhook` re-resolves and pins the HTTP
+client to the validated IPs (`delivery_client_for`), so a domain that
+resolves publicly at create-time and privately at delivery-time is rejected
+too. Net effect: no loopback, RFC1918, or link-local target — including
+anything inside `docker-compose.e2e.yml`'s bridge network — can ever be a
+legal webhook URL against a real instance, create or update. The signing math
+(`sha256=` HMAC over `{timestamp}.{payload}`) is covered by
+`test_signature_generation` in `crates/temps-webhooks/src/service.rs`, which
+is the right layer for that piece, same as Slack's `wiremock` unit test one
+section up. Proving actual delivery end-to-end would need a real public receiver (e.g. a
+tunnel or hosted catcher) wired into the harness, which does not exist in
+this repo today. It was deliberately not added, and the SSRF guard was not
+weakened, for test convenience — the same call made for Slack above.
+
+### `markdown` steps
+
+1. create a project (`docker_image` source) and deploy a real HTML-serving image
+   (default `nginxinc/nginx-unprivileged:alpine` — plain `nginx:alpine` fails
+   under Temps's non-root container sandbox: it can't `chown` its cache dir)
+2. wait for the deployment, then probe HTTP until the app actually serves (not
+   the Temps console fallback)
+3. `Accept: text/markdown` -> asserts `Content-Type: text/markdown` AND a real
+   converted body — specifically that the body does **not** start with `<`,
+   which is the exact shape of the bug this guards: `response_filter` commits
+   `Content-Type: text/markdown` to the client before the body is converted
+   (Pingora sends headers before streaming the body), so a broken fallback path
+   (oversized body, conversion error) could leak raw, untouched HTML under that
+   already-sent header
+4. no `Accept` header -> stays `text/html` with an unconverted body
+5. `Accept: text/html,text/markdown;q=0.9` -> still converts (quality factors
+   on a `text/markdown` entry don't disable it)
+6. a 404 on the deployed app with `Accept: text/markdown` -> stays `text/html`
+   (the gate must cancel conversion for non-2xx responses)
+7. tear down the deployment and delete the project — even on failure, unless
+   `--keep`
+
+Exits non-zero if any step fails, so it's CI-gateable.
 
 ## Notes
 

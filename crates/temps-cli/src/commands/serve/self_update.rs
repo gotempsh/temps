@@ -62,6 +62,10 @@ struct UpdaterState {
     phase: SelfUpdatePhase,
     phase_error: Option<String>,
     last_attempt: Option<SelfUpdateAttempt>,
+    /// Live migration progress — populated while `phase == Migrating`.
+    migrations_applied: Option<u32>,
+    migrations_total: Option<u32>,
+    current_migration_name: Option<String>,
 }
 
 /// Replaces the on-disk binary and exits so the supervisor restarts it.
@@ -80,6 +84,9 @@ pub struct BinarySelfUpdater {
     /// check republishes it so the banner and the version page never disagree.
     update_status: Arc<UpdateStatusSlot>,
     state: Arc<RwLock<UpdaterState>>,
+    /// Database URL passed explicitly to the migrate child process so it works
+    /// even when the parent was started with `--database-url` (not the env var).
+    database_url: String,
 }
 
 impl BinarySelfUpdater {
@@ -87,11 +94,17 @@ impl BinarySelfUpdater {
     /// process. Never fails: a bad journal or an unresolvable binary path
     /// degrades to "self-update unavailable", which the capability endpoint
     /// reports with a reason.
+    ///
+    /// `database_url` is set explicitly on the migrate child process rather than
+    /// relying on environment inheritance, because the parent may have received
+    /// it as a `--database-url` flag (not in env) and a naively-spawned child
+    /// would then hard-fail clap's required-arg check.
     pub fn new(
         data_dir: PathBuf,
         disabled_by_flag: bool,
         topology_caveat: Option<String>,
         update_status: Arc<UpdateStatusSlot>,
+        database_url: String,
     ) -> Self {
         let binary_path = std::env::current_exe()
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
@@ -116,6 +129,7 @@ impl BinarySelfUpdater {
             topology_caveat,
             update_status,
             state: Arc::new(RwLock::new(UpdaterState::default())),
+            database_url,
         };
 
         let last_attempt = updater.reconcile_journal();
@@ -368,11 +382,21 @@ impl SelfUpdater for BinarySelfUpdater {
         // The capability also backs the version page, so it reports the
         // effective channel even when no update is pending.
         let (channel, pinned) = resolve_channel(policy.channel.as_deref(), &current_version);
-        let (phase, phase_error, last_attempt) = match self.state.read() {
+        let (
+            phase,
+            phase_error,
+            last_attempt,
+            migrations_applied,
+            migrations_total,
+            current_migration_name,
+        ) = match self.state.read() {
             Ok(state) => (
                 state.phase,
                 state.phase_error.clone(),
                 state.last_attempt.clone(),
+                state.migrations_applied,
+                state.migrations_total,
+                state.current_migration_name.clone(),
             ),
             Err(poisoned) => {
                 let state = poisoned.into_inner();
@@ -380,6 +404,9 @@ impl SelfUpdater for BinarySelfUpdater {
                     state.phase,
                     state.phase_error.clone(),
                     state.last_attempt.clone(),
+                    state.migrations_applied,
+                    state.migrations_total,
+                    state.current_migration_name.clone(),
                 )
             }
         };
@@ -399,6 +426,9 @@ impl SelfUpdater for BinarySelfUpdater {
             phase,
             phase_error,
             last_attempt,
+            migrations_applied,
+            migrations_total,
+            current_migration_name,
         }
     }
 
@@ -452,6 +482,7 @@ impl SelfUpdater for BinarySelfUpdater {
             restart_mode,
             channel,
             state: self.state.clone(),
+            database_url: self.database_url.clone(),
         };
         tokio::spawn(job.run());
 
@@ -541,6 +572,87 @@ struct UpdateJob {
     /// Channel the "newest release" lookup uses when no version is pinned.
     channel: UpgradeChannel,
     state: Arc<RwLock<UpdaterState>>,
+    /// Passed explicitly to the `temps migrate` child so the DB URL is
+    /// guaranteed to be in its environment regardless of how the parent
+    /// received it (flag vs env var).
+    database_url: String,
+}
+
+/// Failure discriminator for `UpdateJob::execute`.
+///
+/// The two variants have completely different semantics: a pre-swap failure
+/// means the running binary was never touched, while a post-swap failure means
+/// the new binary is on disk and the DB may be partially migrated — the error
+/// message and journal entry must reflect that honestly.
+#[derive(Debug)]
+enum ExecuteError {
+    /// Failed before the binary was replaced. The running binary is untouched.
+    PreSwap(anyhow::Error),
+    /// Binary was replaced with `to_version`, but `temps migrate` exited
+    /// non-zero or could not be launched. The schema may be partially migrated.
+    PostSwapMigration {
+        to_version: String,
+        backup_path: Option<String>,
+        error: String,
+        /// How many migrations completed before the failure, if known.
+        migrations_applied: Option<u32>,
+        /// Total migrations that were planned, if known.
+        migrations_total: Option<u32>,
+    },
+}
+
+impl std::fmt::Display for ExecuteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreSwap(e) => write!(f, "{e}"),
+            Self::PostSwapMigration {
+                to_version,
+                backup_path,
+                error,
+                ..
+            } => {
+                write!(
+                    f,
+                    "The binary was replaced with {to_version} but database migrations failed: \
+                     {error}. The schema may be partially migrated. {}Inspect the database and \
+                     re-run `temps migrate` to complete the upgrade before restarting.",
+                    backup_path
+                        .as_ref()
+                        .map(|p| format!(
+                            "The previous binary was kept at {p} — restore it with \
+                             `mv {p} <binary_path>` if needed. "
+                        ))
+                        .unwrap_or_default()
+                )
+            }
+        }
+    }
+}
+
+/// A single NDJSON progress line emitted by `temps migrate --progress-format=json`.
+///
+/// Field names must match what `print_progress_json` in `migrate.rs` emits exactly.
+#[derive(serde::Deserialize)]
+struct MigrateProgressLine {
+    event: String,
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    total: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    success: bool,
+    /// Present on `complete` events — total migrations applied in the run.
+    #[serde(default)]
+    migrations_applied: u32,
+    /// Present on `finished` events where `success == false` — the migration
+    /// runner's own error text (e.g. the underlying DB error). Without this,
+    /// a migrate failure is reported as only "migrate exited with code N",
+    /// leaving the operator to go hunting through logs for what actually
+    /// broke.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 impl UpdateJob {
@@ -556,70 +668,180 @@ impl UpdateJob {
         match self.execute(started_at).await {
             Ok(target) => match self.restart_mode {
                 SelfUpdateRestartMode::Automatic => {
-                    // The swap is done and the journal says `pending`. Exiting
-                    // is now the whole job: the supervisor brings us back on
-                    // the new binary and the next boot resolves the journal.
+                    // The swap is done, migrations applied, and the journal
+                    // says `pending`. Exiting is now the whole job: the
+                    // supervisor brings us back on the new binary and the next
+                    // boot resolves the journal.
                     self.set_phase(SelfUpdatePhase::Restarting, None);
                     warn!(
                         from = %self.from_version,
                         to = %target,
-                        "Binary replaced — exiting so the supervisor restarts temps on the new version"
+                        "Binary replaced and migrations applied — exiting so the supervisor \
+                         restarts temps on the new version"
                     );
                     tokio::time::sleep(RESTART_GRACE).await;
                     std::process::exit(0);
                 }
                 SelfUpdateRestartMode::Manual => {
-                    // Installed, but exiting here would take the server down
-                    // with nothing to bring it back. Keep serving the old
-                    // binary and make the outstanding restart obvious.
+                    // Installed and migrated, but exiting here would take the
+                    // server down with nothing to bring it back. Keep serving
+                    // the old binary and make the outstanding restart obvious.
                     self.set_phase(SelfUpdatePhase::PendingRestart, None);
                     warn!(
                         from = %self.from_version,
                         to = %target,
-                        "Binary replaced, but no supervisor was detected — temps is STILL RUNNING \
-                         {} and will pick up {} when you restart it",
+                        "Binary replaced and migrations applied, but no supervisor was detected \
+                         — temps is STILL RUNNING {} and will pick up {} when you restart it",
                         self.from_version,
                         target
                     );
                 }
             },
             Err(e) => {
+                // `Display` is the single source of truth for the operator
+                // -facing message in both variants — building it separately
+                // here would drift from `ExecuteError`'s own wording.
                 let message = e.to_string();
-                error!(
-                    from = %self.from_version,
-                    error = %message,
-                    "Self-update failed; the running binary was left untouched"
-                );
-                // Record the failure so it survives to the UI even if the
-                // operator's tab was closed when it happened.
-                let attempt = SelfUpdateAttempt {
-                    from_version: self.from_version.clone(),
-                    to_version: None,
-                    status: SelfUpdateStatus::Failed,
-                    started_at,
-                    finished_at: Some(Utc::now()),
-                    triggered_by_user_id: self.triggered_by_user_id,
-                    error: Some(message.clone()),
-                    previous_binary_path: None,
-                };
-                if let Err(e) = write_journal(&self.journal_path, &attempt) {
-                    warn!("Could not persist failed self-update attempt: {}", e);
-                }
-                if let Ok(mut state) = self.state.write() {
-                    state.phase = SelfUpdatePhase::Failed;
-                    state.phase_error = Some(message);
-                    state.last_attempt = Some(attempt);
+                match e {
+                    ExecuteError::PreSwap(_) => {
+                        error!(
+                            from = %self.from_version,
+                            error = %message,
+                            "Self-update failed; the running binary was left untouched"
+                        );
+                        // Record the failure so it survives to the UI even if
+                        // the operator's tab was closed when it happened.
+                        let attempt = SelfUpdateAttempt {
+                            from_version: self.from_version.clone(),
+                            to_version: None,
+                            status: SelfUpdateStatus::Failed,
+                            started_at,
+                            finished_at: Some(Utc::now()),
+                            triggered_by_user_id: self.triggered_by_user_id,
+                            error: Some(message.clone()),
+                            previous_binary_path: None,
+                            migrations_applied: None,
+                            migrations_total: None,
+                        };
+                        if let Err(e) = write_journal(&self.journal_path, &attempt) {
+                            warn!("Could not persist failed self-update attempt: {}", e);
+                        }
+                        if let Ok(mut state) = self.state.write() {
+                            state.phase = SelfUpdatePhase::Failed;
+                            state.phase_error = Some(message);
+                            state.last_attempt = Some(attempt);
+                        }
+                    }
+                    ExecuteError::PostSwapMigration {
+                        to_version,
+                        backup_path,
+                        migrations_applied,
+                        migrations_total,
+                        ..
+                    } => {
+                        // The binary IS the new version on disk. `message`
+                        // (built above from `Display`) never says "the
+                        // running binary was left untouched" for this variant
+                        // — it was replaced. The operator needs to know the
+                        // exact state so they can decide whether to run
+                        // `temps migrate` themselves before restarting.
+                        error!(
+                            from = %self.from_version,
+                            to = %to_version,
+                            error = %message,
+                            "Binary swapped but migrations failed; schema may be partially migrated"
+                        );
+                        let attempt = SelfUpdateAttempt {
+                            from_version: self.from_version.clone(),
+                            to_version: Some(to_version),
+                            status: SelfUpdateStatus::Failed,
+                            started_at,
+                            finished_at: Some(Utc::now()),
+                            triggered_by_user_id: self.triggered_by_user_id,
+                            error: Some(message.clone()),
+                            previous_binary_path: backup_path,
+                            migrations_applied,
+                            migrations_total,
+                        };
+                        if let Err(e) = write_journal(&self.journal_path, &attempt) {
+                            warn!("Could not persist failed self-update attempt: {}", e);
+                        }
+                        if let Ok(mut state) = self.state.write() {
+                            // Clear live migration progress — it's now in the journal.
+                            state.migrations_applied = None;
+                            state.migrations_total = None;
+                            state.current_migration_name = None;
+                            state.phase = SelfUpdatePhase::Failed;
+                            state.phase_error = Some(message);
+                            state.last_attempt = Some(attempt);
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Download, verify and install. Returns the version now on disk.
+    /// Download, verify, swap the binary and run database migrations.
     ///
-    /// Every failure here leaves the running binary untouched: the new bytes go
-    /// to a temp file and are only moved into place after the checksum matches
-    /// AND the new binary answers `--version`.
-    async fn execute(&self, started_at: chrono::DateTime<Utc>) -> anyhow::Result<String> {
+    /// Everything up to and including `replace_binary` is the "pre-swap" zone:
+    /// a failure there leaves the running binary untouched and is returned as
+    /// `ExecuteError::PreSwap`. Once the binary is on disk, any failure is
+    /// `ExecuteError::PostSwapMigration` — the operator is told exactly what
+    /// state the install is in and what to do next.
+    async fn execute(&self, started_at: chrono::DateTime<Utc>) -> Result<String, ExecuteError> {
+        let (to_version, backup_path) = self
+            .download_verify_swap()
+            .await
+            .map_err(ExecuteError::PreSwap)?;
+
+        let backup_str = backup_path.map(|p| p.display().to_string());
+
+        // Run the new binary's migrator so the schema is up to date before
+        // anything restarts. This MUST use the new binary (not in-process) so
+        // it applies migrations compiled into the new version, not the old one.
+        let (migrations_applied, migrations_total) =
+            self.run_migration_step(&to_version, &backup_str).await?;
+
+        // Written BEFORE the exit: once the process is gone there is no second
+        // chance to record what it was doing.
+        let attempt = SelfUpdateAttempt {
+            from_version: self.from_version.clone(),
+            to_version: Some(to_version.clone()),
+            // `Pending` means "we are about to exit, resolve this on the next
+            // boot". In manual mode nothing exits, so the attempt is already
+            // as finished as it can get until the operator restarts.
+            status: match self.restart_mode {
+                SelfUpdateRestartMode::Automatic => SelfUpdateStatus::Pending,
+                SelfUpdateRestartMode::Manual => SelfUpdateStatus::InstalledPendingRestart,
+            },
+            started_at,
+            finished_at: match self.restart_mode {
+                SelfUpdateRestartMode::Automatic => None,
+                SelfUpdateRestartMode::Manual => Some(Utc::now()),
+            },
+            triggered_by_user_id: self.triggered_by_user_id,
+            error: None,
+            previous_binary_path: backup_str,
+            migrations_applied: Some(migrations_applied),
+            migrations_total: Some(migrations_total),
+        };
+        write_journal(&self.journal_path, &attempt).map_err(ExecuteError::PreSwap)?;
+        if let Ok(mut state) = self.state.write() {
+            // Clear live migration progress now that it's recorded in the journal.
+            state.migrations_applied = None;
+            state.migrations_total = None;
+            state.current_migration_name = None;
+            state.last_attempt = Some(attempt);
+        }
+
+        Ok(to_version)
+    }
+
+    /// Everything from "resolve release" through "replace binary on disk".
+    ///
+    /// A failure at any point here leaves the running binary untouched and is
+    /// safe to propagate as `PreSwap`. Returns `(to_version, backup_path)`.
+    async fn download_verify_swap(&self) -> anyhow::Result<(String, Option<PathBuf>)> {
         let target = platform_target()?;
 
         let release = self.resolve_release().await?;
@@ -687,33 +909,186 @@ impl UpdateJob {
         let backup_path = backup_current_binary(&self.binary_path)?;
         replace_binary(&self.binary_path, &new_binary)?;
 
-        // Written BEFORE the exit: once the process is gone there is no second
-        // chance to record what it was doing.
-        let attempt = SelfUpdateAttempt {
-            from_version: self.from_version.clone(),
-            to_version: Some(to_version.clone()),
-            // `Pending` means "we are about to exit, resolve this on the next
-            // boot". In manual mode nothing exits, so the attempt is already
-            // as finished as it can get until the operator restarts.
-            status: match self.restart_mode {
-                SelfUpdateRestartMode::Automatic => SelfUpdateStatus::Pending,
-                SelfUpdateRestartMode::Manual => SelfUpdateStatus::InstalledPendingRestart,
-            },
-            started_at,
-            finished_at: match self.restart_mode {
-                SelfUpdateRestartMode::Automatic => None,
-                SelfUpdateRestartMode::Manual => Some(Utc::now()),
-            },
-            triggered_by_user_id: self.triggered_by_user_id,
-            error: None,
-            previous_binary_path: backup_path.map(|p| p.display().to_string()),
+        Ok((to_version, backup_path))
+    }
+
+    /// Spawn `<new_binary> migrate --yes --progress-format=json`, stream its
+    /// NDJSON stdout into the shared state for live polling, and return the
+    /// applied/total migration counts on success.
+    ///
+    /// On any failure (launch error, non-zero exit) this returns
+    /// `ExecuteError::PostSwapMigration` — the swap has already happened so the
+    /// caller must NOT describe the error as "the running binary was untouched".
+    async fn run_migration_step(
+        &self,
+        to_version: &str,
+        backup_path: &Option<String>,
+    ) -> Result<(u32, u32), ExecuteError> {
+        use tokio::io::AsyncBufReadExt;
+
+        self.set_phase(SelfUpdatePhase::Migrating, None);
+        info!(
+            to = %to_version,
+            binary = %self.binary_path.display(),
+            "Running database migrations with the new binary"
+        );
+
+        let post_swap_err = |error: String| ExecuteError::PostSwapMigration {
+            to_version: to_version.to_string(),
+            backup_path: backup_path.clone(),
+            error,
+            // Counts captured from state at the moment of failure.
+            migrations_applied: self.state.read().ok().and_then(|s| s.migrations_applied),
+            migrations_total: self.state.read().ok().and_then(|s| s.migrations_total),
         };
-        write_journal(&self.journal_path, &attempt)?;
-        if let Ok(mut state) = self.state.write() {
-            state.last_attempt = Some(attempt);
+
+        let mut child = tokio::process::Command::new(&self.binary_path)
+            .arg("migrate")
+            .arg("--yes")
+            .arg("--progress-format=json")
+            // Explicit env set: if the parent received the DB URL as a
+            // `--database-url` flag it is not in the environment, so a naive
+            // child spawn would fail clap's required-arg check.
+            .env("TEMPS_DATABASE_URL", &self.database_url)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| post_swap_err(format!("Failed to launch migrate subprocess: {e}")))?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            post_swap_err("migrate subprocess stdout was not captured".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            post_swap_err("migrate subprocess stderr was not captured".to_string())
+        })?;
+
+        // Drain stderr concurrently with stdout. If nothing reads it, a child
+        // that writes more than the OS pipe buffer (64KB on Linux) to stderr
+        // blocks on the write while we block reading stdout — a deadlock ends
+        // an update that would otherwise have succeeded.
+        //
+        // Piped rather than inherited so this can be logged deliberately: the
+        // child has `TEMPS_DATABASE_URL` in its environment, and a
+        // connection-failure message from sqlx/libpq can embed the full DSN
+        // (including the password). Piping does NOT by itself keep the
+        // credential out of the parent's own log stream — `warn!` below IS
+        // the parent's log stream, same as `Stdio::inherit()` would have
+        // been, just structured instead of raw. `redact_dsn` is what
+        // actually prevents the leak, by stripping any `scheme://user:pass@`
+        // prefix before the line is logged.
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    warn!(
+                        target: "temps_cli::self_update::migrate_stderr",
+                        "{}",
+                        redact_dsn(&line)
+                    );
+                }
+            }
+        });
+
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut applied: u32 = 0;
+        let mut total: u32 = 0;
+        // The migration that failed and why, if any `finished` event reports
+        // `success: false` — carried into the final error so the operator
+        // sees the actual DB failure instead of just an exit code.
+        let mut last_failure: Option<(String, String)> = None;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(event) = serde_json::from_str::<MigrateProgressLine>(&line) {
+                match event.event.as_str() {
+                    "started" => {
+                        total = event.total;
+                        if let Ok(mut state) = self.state.write() {
+                            state.migrations_total = Some(total);
+                            state.current_migration_name = Some(event.name.clone());
+                        }
+                        info!(
+                            index = event.index,
+                            total = event.total,
+                            name = %event.name,
+                            "Applying migration"
+                        );
+                    }
+                    "finished" => {
+                        if event.success {
+                            applied += 1;
+                        } else {
+                            last_failure = Some((
+                                event.name.clone(),
+                                event
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "no error detail reported".to_string()),
+                            ));
+                        }
+                        if let Ok(mut state) = self.state.write() {
+                            state.migrations_applied = Some(applied);
+                            state.current_migration_name = None;
+                        }
+                        info!(
+                            index = event.index,
+                            total = event.total,
+                            name = %event.name,
+                            success = event.success,
+                            error = event.error.as_deref().unwrap_or(""),
+                            "Migration step finished"
+                        );
+                    }
+                    "complete" => {
+                        // Authoritative count from the child — use it if
+                        // higher than our per-event counter (defensive).
+                        if event.migrations_applied > applied {
+                            applied = event.migrations_applied;
+                            if let Ok(mut state) = self.state.write() {
+                                state.migrations_applied = Some(applied);
+                            }
+                        }
+                    }
+                    "up_to_date" => {
+                        // No migrations needed — counts stay at zero.
+                        info!("Database already up to date; no migrations to apply");
+                    }
+                    _ => {}
+                }
+            }
         }
 
-        Ok(to_version)
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| post_swap_err(format!("Failed to wait for migrate subprocess: {e}")))?;
+        // Exiting closes the child's stderr, so this drains any remaining
+        // buffered lines and then returns; best-effort, a panicked drain task
+        // must not fail an otherwise-successful migration.
+        let _ = stderr_task.await;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            let error = match &last_failure {
+                Some((name, detail)) => {
+                    format!("migration '{name}' failed: {detail} (migrate exited with code {code})")
+                }
+                None => format!("migrate exited with code {code}"),
+            };
+            return Err(ExecuteError::PostSwapMigration {
+                to_version: to_version.to_string(),
+                backup_path: backup_path.clone(),
+                error,
+                migrations_applied: Some(applied),
+                migrations_total: Some(total),
+            });
+        }
+
+        info!(
+            applied = applied,
+            total = total,
+            "Database migrations completed successfully"
+        );
+        Ok((applied, total))
     }
 
     /// The release to install: an explicit pin, or the newest one on the channel
@@ -724,6 +1099,47 @@ impl UpdateJob {
             Some(version) => fetch_specific_release(version).await,
             None => fetch_latest_release_in_channel(self.channel).await,
         }
+    }
+}
+
+/// Strip `scheme://user:pass@` credentials from a line before it is logged.
+///
+/// Defense in depth for the `migrate` child's stderr: that child has
+/// `TEMPS_DATABASE_URL` in its environment, and a connection-failure message
+/// from sqlx/libpq is not guaranteed never to embed the DSN (including the
+/// password) in its `Display` output. Piping stderr into `warn!` instead of
+/// inheriting it only changes WHERE the line goes, not whether it contains a
+/// credential — this is what actually keeps one out of the log.
+fn redact_dsn(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains("://") {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut result = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut redacted_any = false;
+    while let Some(scheme_pos) = rest.find("://") {
+        let (before, after_marker) = rest.split_at(scheme_pos + 3);
+        result.push_str(before);
+        // The userinfo component, if present, ends at the next '/' or
+        // whitespace — scan only that span for a trailing '@'.
+        let boundary = after_marker
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(after_marker.len());
+        let candidate = &after_marker[..boundary];
+        if let Some(at_pos) = candidate.rfind('@') {
+            result.push_str("***@");
+            redacted_any = true;
+            rest = &after_marker[at_pos + 1..];
+        } else {
+            result.push_str(candidate);
+            rest = &after_marker[boundary..];
+        }
+    }
+    result.push_str(rest);
+    if redacted_any {
+        std::borrow::Cow::Owned(result)
+    } else {
+        std::borrow::Cow::Borrowed(line)
     }
 }
 
@@ -896,6 +1312,39 @@ fn write_journal(path: &Path, attempt: &SelfUpdateAttempt) -> anyhow::Result<()>
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_redact_dsn_strips_credentials() {
+        let line = "error connecting to postgresql://app:hunter2@db:5432/temps: connection refused";
+        let redacted = redact_dsn(line);
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(!redacted.contains("app:"), "{redacted}");
+        assert!(redacted.contains("***@db:5432/temps"), "{redacted}");
+    }
+
+    #[test]
+    fn test_redact_dsn_leaves_credential_free_lines_untouched() {
+        let line = "FATAL: password authentication failed for user \"app\"";
+        assert_eq!(redact_dsn(line), line);
+    }
+
+    #[test]
+    fn test_redact_dsn_leaves_url_without_userinfo_untouched() {
+        let line = "fetching https://example.com/releases/latest";
+        assert_eq!(redact_dsn(line), line);
+    }
+
+    #[test]
+    fn test_redact_dsn_handles_multiple_urls_in_one_line() {
+        let line = "postgres://a:b@host1/db and postgres://c:d@host2/db";
+        let redacted = redact_dsn(line);
+        assert!(!redacted.contains("a:b"), "{redacted}");
+        assert!(!redacted.contains("c:d"), "{redacted}");
+        assert_eq!(
+            redacted,
+            "postgres://***@host1/db and postgres://***@host2/db"
+        );
+    }
+
     fn updater(
         dir: &Path,
         disabled_by_flag: bool,
@@ -911,6 +1360,9 @@ mod tests {
             topology_caveat: None,
             update_status: Arc::new(UpdateStatusSlot::new()),
             state: Arc::new(RwLock::new(UpdaterState::default())),
+            // Tests don't exercise the migrate subprocess, so the URL value
+            // doesn't matter — it only needs to be present in the struct.
+            database_url: String::new(),
         }
     }
 
@@ -1149,6 +1601,8 @@ mod tests {
             triggered_by_user_id: Some(3),
             error: None,
             previous_binary_path: None,
+            migrations_applied: None,
+            migrations_total: None,
         };
         let path = dir.join(SELF_UPDATE_JOURNAL_FILE);
         write_journal(&path, &attempt).expect("write journal");
@@ -1177,6 +1631,8 @@ mod tests {
             triggered_by_user_id: None,
             error: None,
             previous_binary_path: Some("/usr/local/bin/temps.bak".to_string()),
+            migrations_applied: None,
+            migrations_total: None,
         };
         write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
 
@@ -1206,6 +1662,8 @@ mod tests {
             triggered_by_user_id: None,
             error: None,
             previous_binary_path: None,
+            migrations_applied: Some(2),
+            migrations_total: Some(2),
         };
         write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
         let resolved = updater(&dir, false, SupervisorKind::Systemd)
@@ -1231,6 +1689,8 @@ mod tests {
             triggered_by_user_id: Some(1),
             error: None,
             previous_binary_path: None,
+            migrations_applied: Some(0),
+            migrations_total: Some(0),
         };
         write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
 
@@ -1255,6 +1715,8 @@ mod tests {
             triggered_by_user_id: Some(1),
             error: None,
             previous_binary_path: None,
+            migrations_applied: Some(1),
+            migrations_total: Some(1),
         };
         write_journal(&dir.join(SELF_UPDATE_JOURNAL_FILE), &attempt).expect("write journal");
 
@@ -1311,6 +1773,75 @@ mod tests {
         assert_eq!(
             std::fs::read(&binary).unwrap(),
             std::fs::read(&backup).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_post_swap_migration_error_carries_to_version_and_backup_path() {
+        // This is the one failure mode that did not exist before migrations were
+        // added to the update flow: a failure AFTER the binary was replaced.
+        // The error must carry the `to_version` so the journal entry can record
+        // what binary is now on disk (not None, which would be wrong), and the
+        // `backup_path` so the operator knows how to recover.
+        let err = ExecuteError::PostSwapMigration {
+            to_version: "v0.2.0".to_string(),
+            backup_path: Some("/usr/local/bin/temps.bak".to_string()),
+            error: "migrate exited with code 1".to_string(),
+            migrations_applied: Some(2),
+            migrations_total: Some(5),
+        };
+
+        let msg = err.to_string();
+        // Must name the version that is now on disk.
+        assert!(msg.contains("v0.2.0"), "error message: {msg}");
+        // Must tell the operator where the old binary is.
+        assert!(msg.contains("temps.bak"), "error message: {msg}");
+        // Must NOT claim the running binary was untouched.
+        assert!(!msg.contains("left untouched"), "error message: {msg}");
+        // Must tell the operator to run migrate themselves.
+        assert!(
+            msg.contains("temps migrate") || msg.contains("migrate"),
+            "error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_migrating_phase_blocks_a_concurrent_trigger() {
+        // `Migrating` must be active (i.e. block a second trigger) so two
+        // concurrent updates can't race the migrate step against the same schema.
+        let dir = temp_dir("migrating-blocks");
+        let u = updater(&dir, false, SupervisorKind::Systemd);
+        u.set_phase(SelfUpdatePhase::Migrating, None);
+        let err = u
+            .start(None, Some(1), &policy(true))
+            .expect_err("must refuse while migrating");
+        assert!(matches!(err, SelfUpdateError::AlreadyRunning { .. }));
+        let cap = u.capability(&policy(true));
+        assert_eq!(cap.phase, SelfUpdatePhase::Migrating);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capability_reports_migration_progress_from_state() {
+        // While migrating, the live progress fields should be visible in the
+        // capability so the frontend can show "2 of 5 migrations applied".
+        let dir = temp_dir("migration-progress");
+        let u = updater(&dir, false, SupervisorKind::Systemd);
+        {
+            let mut state = u.state.write().expect("write lock");
+            state.phase = SelfUpdatePhase::Migrating;
+            state.migrations_applied = Some(2);
+            state.migrations_total = Some(5);
+            state.current_migration_name = Some("m20260811_add_column".to_string());
+        }
+        let cap = u.capability(&policy(true));
+        assert_eq!(cap.phase, SelfUpdatePhase::Migrating);
+        assert_eq!(cap.migrations_applied, Some(2));
+        assert_eq!(cap.migrations_total, Some(5));
+        assert_eq!(
+            cap.current_migration_name.as_deref(),
+            Some("m20260811_add_column")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

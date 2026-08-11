@@ -3,6 +3,7 @@
 //! This module provides a generic interface for fetching data from public repositories
 //! across different Git providers (GitHub, GitLab, etc.) without requiring authentication.
 
+use crate::services::git_provider::FileContent;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,8 +14,19 @@ pub enum PublicRepoError {
     #[error("Repository not found: {0}")]
     NotFound(String),
 
+    #[error("Repository is not public: {0}")]
+    RepositoryNotPublic(String),
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
+
+    #[error(
+        "Permission denied while trying to {operation}. Required permission: {required_permission}"
+    )]
+    PermissionDenied {
+        operation: String,
+        required_permission: String,
+    },
 
     #[error("API error: {0}")]
     ApiError(String),
@@ -40,6 +52,10 @@ pub struct PublicRepoInfo {
     pub language: Option<String>,
     pub stars: i32,
     pub forks: i32,
+    /// Whether an authenticated provider reported that this repository is
+    /// private. Credential-backed public routes must reject these repositories
+    /// before their data can enter shared public caches.
+    pub is_private: bool,
 }
 
 /// Branch information
@@ -89,13 +105,48 @@ pub trait PublicRepoProvider: Send + Sync {
         repo: &str,
         reference: &str,
     ) -> Result<Vec<String>, PublicRepoError>;
+
+    /// Get the raw content of a single file (e.g. a `.env.example` path
+    /// found via [`Self::get_file_tree`]).
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError>;
 }
 
 /// GitHub public repository provider
 pub struct GitHubPublicProvider {
     client: reqwest::Client,
-    /// Optional auth token to avoid rate limits (from any configured GitHub connection)
+    api_url: String,
+    /// Optional auth token to avoid rate limits. Callers must only provide a
+    /// credential owned by the authenticated request user.
     token: Option<String>,
+}
+
+fn github_rate_limit_remaining(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn ensure_repository_is_public(
+    is_public: bool,
+    owner: &str,
+    repo: &str,
+) -> Result<(), PublicRepoError> {
+    if is_public {
+        Ok(())
+    } else {
+        Err(PublicRepoError::RepositoryNotPublic(format!(
+            "{}/{}",
+            owner, repo
+        )))
+    }
 }
 
 impl GitHubPublicProvider {
@@ -108,6 +159,7 @@ impl GitHubPublicProvider {
 
         Self {
             client,
+            api_url: "https://api.github.com".to_string(),
             token: None,
         }
     }
@@ -122,8 +174,16 @@ impl GitHubPublicProvider {
 
         Self {
             client,
+            api_url: "https://api.github.com".to_string(),
             token: Some(token),
         }
+    }
+
+    #[cfg(test)]
+    fn with_token_and_api_url(token: String, api_url: String) -> Self {
+        let mut provider = Self::with_token(token);
+        provider.api_url = api_url;
+        provider
     }
 
     /// Apply auth header if token is available
@@ -179,12 +239,24 @@ impl GitHubPublicProvider {
 
     fn check_response_status(
         status: reqwest::StatusCode,
+        rate_limit_remaining: Option<u64>,
+        authenticated: bool,
         context: &str,
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            429 => Err(PublicRepoError::RateLimitExceeded),
+            403 if rate_limit_remaining == Some(0) => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: if authenticated {
+                    "Contents: read and access to the target repository".to_string()
+                } else {
+                    "authenticate with a token that has Contents: read and access to the target repository"
+                        .to_string()
+                },
+            }),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -210,11 +282,16 @@ impl PublicRepoProvider for GitHubPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError> {
-        let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+        let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
         let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
-        Self::check_response_status(response.status(), &format!("Repository {}/{}", owner, repo))?;
+        Self::check_response_status(
+            response.status(),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read repository {}/{}", owner, repo),
+        )?;
 
         #[derive(Deserialize)]
         struct GitHubRepo {
@@ -226,6 +303,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             stargazers_count: Option<u32>,
             forks_count: Option<u32>,
             owner: Option<GitHubOwner>,
+            #[serde(default)]
+            private: bool,
         }
 
         #[derive(Deserialize)]
@@ -237,6 +316,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .json()
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        ensure_repository_is_public(!repo_data.private, owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: repo_data
@@ -254,6 +335,7 @@ impl PublicRepoProvider for GitHubPublicProvider {
                 .and_then(|v| v.as_str().map(|s| s.to_string())),
             stars: repo_data.stargazers_count.unwrap_or(0) as i32,
             forks: repo_data.forks_count.unwrap_or(0) as i32,
+            is_private: repo_data.private,
         })
     }
 
@@ -280,15 +362,17 @@ impl PublicRepoProvider for GitHubPublicProvider {
 
         loop {
             let url = format!(
-                "https://api.github.com/repos/{}/{}/branches?per_page={}&page={}",
-                owner, repo, per_page, page
+                "{}/repos/{}/{}/branches?per_page={}&page={}",
+                self.api_url, owner, repo, per_page, page
             );
 
             let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
             Self::check_response_status(
                 response.status(),
-                &format!("Branches for {}/{}", owner, repo),
+                github_rate_limit_remaining(&response),
+                self.token.is_some(),
+                &format!("list branches for {}/{}", owner, repo),
             )?;
 
             let branches: Vec<GitHubBranch> = response.json().await.map_err(|e| {
@@ -319,15 +403,17 @@ impl PublicRepoProvider for GitHubPublicProvider {
         reference: &str,
     ) -> Result<Vec<String>, PublicRepoError> {
         let url = format!(
-            "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-            owner, repo, reference
+            "{}/repos/{}/{}/git/trees/{}?recursive=1",
+            self.api_url, owner, repo, reference
         );
 
         let response = self.send_with_retry(|| self.client.get(&url)).await?;
 
         Self::check_response_status(
             response.status(),
-            &format!("File tree for {}/{} at {}", owner, repo, reference),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read the file tree for {}/{} at {}", owner, repo, reference),
         )?;
 
         #[derive(Deserialize)]
@@ -354,6 +440,56 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .filter(|entry| entry.entry_type == "blob")
             .map(|entry| entry.path)
             .collect())
+    }
+
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError> {
+        // Percent-encode each path segment individually so the `/` separators
+        // are preserved (mirrors the authenticated GitHubProvider impl).
+        let encoded_path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}?ref={}",
+            self.api_url,
+            owner,
+            repo,
+            encoded_path,
+            urlencoding::encode(reference)
+        );
+
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+
+        Self::check_response_status(
+            response.status(),
+            github_rate_limit_remaining(&response),
+            self.token.is_some(),
+            &format!("read file {} in {}/{} at {}", path, owner, repo, reference),
+        )?;
+
+        #[derive(Deserialize)]
+        struct GitHubFile {
+            path: String,
+            content: String,
+            encoding: String,
+        }
+
+        let file: GitHubFile = response.json().await.map_err(|e| {
+            PublicRepoError::ApiError(format!("Failed to parse file content: {}", e))
+        })?;
+
+        Ok(FileContent {
+            path: file.path,
+            content: file.content,
+            encoding: file.encoding,
+        })
     }
 }
 
@@ -429,7 +565,11 @@ impl GitLabPublicProvider {
         match status.as_u16() {
             200..=299 => Ok(()),
             404 => Err(PublicRepoError::NotFound(context.to_string())),
-            403 | 429 => Err(PublicRepoError::RateLimitExceeded),
+            403 => Err(PublicRepoError::PermissionDenied {
+                operation: context.to_string(),
+                required_permission: "read_api and read_repository".to_string(),
+            }),
+            429 => Err(PublicRepoError::RateLimitExceeded),
             _ => Err(PublicRepoError::ApiError(format!(
                 "{}: HTTP {}",
                 context, status
@@ -475,6 +615,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
             star_count: Option<i32>,
             forks_count: Option<i32>,
             namespace: Option<GitLabNamespace>,
+            visibility: String,
         }
 
         #[derive(Deserialize)]
@@ -486,6 +627,8 @@ impl PublicRepoProvider for GitLabPublicProvider {
             .json()
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        ensure_repository_is_public(project.visibility == "public", owner, repo)?;
 
         Ok(PublicRepoInfo {
             owner: project
@@ -499,6 +642,9 @@ impl PublicRepoProvider for GitLabPublicProvider {
             language: None, // GitLab doesn't return primary language in basic project info
             stars: project.star_count.unwrap_or(0),
             forks: project.forks_count.unwrap_or(0),
+            // GitLab's public provider is intentionally unauthenticated, so a
+            // successful response cannot represent a private project.
+            is_private: false,
         })
     }
 
@@ -620,6 +766,48 @@ impl PublicRepoProvider for GitLabPublicProvider {
 
         Ok(all_files)
     }
+
+    async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<FileContent, PublicRepoError> {
+        let encoded_project = Self::encode_project_path(owner, repo);
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/files/{}?ref={}",
+            self.base_url,
+            encoded_project,
+            encoded_path,
+            urlencoding::encode(reference)
+        );
+
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+
+        Self::check_response_status(
+            response.status(),
+            &format!("File {} in {}/{} at {}", path, owner, repo, reference),
+        )?;
+
+        #[derive(Deserialize)]
+        struct GitLabFile {
+            file_path: String,
+            content: String,
+            encoding: String,
+        }
+
+        let file: GitLabFile = response.json().await.map_err(|e| {
+            PublicRepoError::ApiError(format!("Failed to parse file content: {}", e))
+        })?;
+
+        Ok(FileContent {
+            path: file.file_path,
+            content: file.content,
+            encoding: file.encoding,
+        })
+    }
 }
 
 /// Factory for creating public repo providers
@@ -709,6 +897,43 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn authenticated_public_provider_rejects_private_repository_metadata() {
+        let error = ensure_repository_is_public(false, "owner", "private")
+            .expect_err("private repositories must never pass through public endpoints");
+        assert!(matches!(
+            error,
+            PublicRepoError::RepositoryNotPublic(name) if name == "owner/private"
+        ));
+    }
+
+    #[test]
+    fn github_forbidden_response_is_not_misreported_as_rate_limit() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(4_999),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("a non-rate-limited 403 must report the missing permission");
+
+        assert!(matches!(error, PublicRepoError::PermissionDenied { .. }));
+        assert!(error.to_string().contains("Contents: read"));
+    }
+
+    #[test]
+    fn github_exhausted_rate_limit_remains_rate_limit_error() {
+        let error = GitHubPublicProvider::check_response_status(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(0),
+            true,
+            "list branches for owner/repo",
+        )
+        .expect_err("an exhausted GitHub limit must report rate limiting");
+
+        assert!(matches!(error, PublicRepoError::RateLimitExceeded));
+    }
+
     // =============================================================================
     // Unit Tests - Provider Factory
     // =============================================================================
@@ -784,6 +1009,7 @@ mod tests {
             language: Some("JavaScript".to_string()),
             stars: 200000,
             forks: 40000,
+            is_private: false,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -793,6 +1019,44 @@ mod tests {
         let deserialized: PublicRepoInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.owner, "facebook");
         assert_eq!(deserialized.stars, 200000);
+    }
+
+    #[tokio::test]
+    async fn github_repository_lookup_uses_token_and_reports_private_visibility() {
+        let mut server = mockito::Server::new_async().await;
+        let repository = server
+            .mock("GET", "/repos/example/private-repository")
+            .match_header("authorization", "token request-user-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "name": "private-repository",
+                    "full_name": "example/private-repository",
+                    "description": null,
+                    "default_branch": "main",
+                    "language": "Rust",
+                    "stargazers_count": 0,
+                    "forks_count": 0,
+                    "private": true,
+                    "owner": { "login": "example" }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let provider = GitHubPublicProvider::with_token_and_api_url(
+            "request-user-token".to_string(),
+            server.url(),
+        );
+
+        let info = provider
+            .get_repository("example", "private-repository")
+            .await
+            .expect("authenticated repository lookup should succeed");
+
+        assert!(info.is_private);
+        repository.assert_async().await;
     }
 
     #[test]

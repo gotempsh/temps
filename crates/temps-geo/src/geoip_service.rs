@@ -184,6 +184,38 @@ pub enum GeoIpService {
     Mock(MockGeoIpService),
 }
 
+/// Resolves an mmdb filename the same way `validate_geolite2_database`
+/// (temps-cli's serve startup check) does: current working directory first,
+/// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
+/// two resolution orders must stay in sync -- when they diverged (this
+/// function previously only checked CWD), `temps serve` could pass its own
+/// startup validation (which checks + downloads to `TEMPS_DATA_DIR`) and
+/// then fail to actually open the database here, because a process whose
+/// working directory isn't its data directory (e.g. any Docker/systemd
+/// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
+/// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
+    resolve_mmdb_path_from(filename, &cwd, data_dir.as_deref())
+}
+
+fn resolve_mmdb_path_from(
+    filename: &str,
+    cwd: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let cwd_path = cwd.join(filename);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    // When neither file exists yet, prefer the configured data directory:
+    // startup downloads there. Returning the absent CWD candidate would make
+    // the plugin wait loop watch a path that can never receive the download.
+    data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
@@ -196,7 +228,7 @@ impl GeoIpService {
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
 
-        let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
+        let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         debug!("Loading MaxMind database from: {:?}", db_path);
         let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
             GeoIpError::Other(format!(
@@ -210,7 +242,7 @@ impl GeoIpService {
         // (asn_org/is_hosting_provider stay None) rather than failing startup when
         // the operator hasn't provisioned it, same as the City database's own
         // optional-file convention in Dockerfile/docker-compose.
-        let asn_db_path = std::env::current_dir()?.join("GeoLite2-ASN.mmdb");
+        let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
         let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
             Ok(reader) => {
                 info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
@@ -423,5 +455,40 @@ mod tests {
     fn test_case_insensitive_match() {
         assert!(is_hosting_org("SUBNET DIGITAL LLC"));
         assert!(is_hosting_org("subnet digital llc"));
+    }
+
+    #[test]
+    fn mmdb_resolution_watches_data_dir_when_download_is_pending() {
+        let unique = format!(
+            "temps-geo-resolution-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let cwd = std::env::temp_dir().join(&unique).join("cwd");
+        let data_dir = std::env::temp_dir().join(&unique).join("data");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            data_dir.join("GeoLite2-City.mmdb")
+        );
+    }
+
+    #[test]
+    fn mmdb_resolution_keeps_existing_cwd_file_precedence() {
+        let root = std::env::temp_dir().join(format!("temps-geo-existing-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let cwd_file = cwd.join("GeoLite2-City.mmdb");
+        std::fs::write(&cwd_file, b"test").expect("write test mmdb placeholder");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            cwd_file
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove test directories");
     }
 }

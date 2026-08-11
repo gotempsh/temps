@@ -91,6 +91,7 @@ impl DSNService {
             created_at: dsn_model.created_at,
             is_active: dsn_model.is_active,
             event_count: dsn_model.event_count,
+            rate_limit_per_minute: dsn_model.rate_limit_per_minute,
         })
     }
 
@@ -135,6 +136,7 @@ impl DSNService {
                 created_at: existing_dsn.created_at,
                 is_active: existing_dsn.is_active,
                 event_count: existing_dsn.event_count,
+                rate_limit_per_minute: existing_dsn.rate_limit_per_minute,
             });
         }
 
@@ -275,6 +277,7 @@ impl DSNService {
             created_at: dsn_record.created_at,
             is_active: dsn_record.is_active,
             event_count: dsn_record.event_count,
+            rate_limit_per_minute: dsn_record.rate_limit_per_minute,
         })
     }
 
@@ -333,6 +336,7 @@ impl DSNService {
             created_at: updated_dsn.created_at,
             is_active: updated_dsn.is_active,
             event_count: updated_dsn.event_count,
+            rate_limit_per_minute: updated_dsn.rate_limit_per_minute,
         })
     }
 
@@ -373,6 +377,7 @@ impl DSNService {
                 created_at: dsn.created_at,
                 is_active: dsn.is_active,
                 event_count: dsn.event_count,
+                rate_limit_per_minute: dsn.rate_limit_per_minute,
             })
             .collect())
     }

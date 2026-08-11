@@ -434,6 +434,19 @@ impl WorkflowPlanner {
                         if let Some(public_var) = public_sentry_dsn_var(project.preset) {
                             env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
                         }
+
+                        // Add the same-origin tunnel path browser SDKs should pass as
+                        // `Sentry.init({ tunnel })`. The value is a constant (not
+                        // project-specific), but injecting it as an env var — rather
+                        // than hardcoding it in every framework's setup snippet — means
+                        // the path can change in one place (here) without touching
+                        // deployed apps' source or docs.
+                        if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
+                            env_vars_map.insert(
+                                tunnel_var.to_string(),
+                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
+                            );
+                        }
                     }
                     Err(e) => {
                         // Warn about Sentry DSN failure but don't fail the deployment
@@ -753,14 +766,15 @@ impl WorkflowPlanner {
                     for (key, value) in remote_vars.iter_mut() {
                         // Replace container_name:internal_port → private_address:host_port
                         if value.contains(&container_name) {
-                            let old_value = value.clone();
                             *value = value
                                 .replace(
                                     &format!("{}:{}", container_name, internal_port),
                                     &format!("{}:{}", private_address, host_port),
                                 )
                                 .replace(&container_name, &private_address);
-                            info!("Rewrote {}={} -> {}", key, old_value, value);
+                            // Connection strings contain credentials. Log the
+                            // affected key, never either secret-bearing value.
+                            info!("Rewrote environment variable {} for remote deployment", key);
                             rewritten_count += 1;
                         }
                     }
@@ -2347,6 +2361,45 @@ pub(crate) fn public_sentry_dsn_var(
     }
 }
 
+/// Public-prefix env var carrying the same-origin Sentry tunnel path for
+/// browser presets (see `temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH` for
+/// what it points at and why). Mirrors `public_sentry_dsn_var`'s preset
+/// groups exactly — a browser bundle that gets the DSN gets the tunnel path
+/// too, under the same public prefix, so both env vars land in the same
+/// `Sentry.init({ dsn, tunnel })` call. `None` for the same presets that get
+/// no public DSN var (server-only, or no build-time public-prefix
+/// convention).
+pub(crate) fn public_sentry_tunnel_var(
+    preset: temps_entities::preset::Preset,
+) -> Option<&'static str> {
+    use temps_entities::preset::Preset;
+    match preset {
+        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_TUNNEL"),
+        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_TUNNEL"),
+        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
+            Some("VITE_SENTRY_TUNNEL")
+        }
+        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_TUNNEL"),
+        Preset::Docusaurus => Some("REACT_APP_SENTRY_TUNNEL"),
+        Preset::Angular
+        | Preset::Python
+        | Preset::FastApi
+        | Preset::Flask
+        | Preset::Django
+        | Preset::Rails
+        | Preset::Go
+        | Preset::Rust
+        | Preset::Java
+        | Preset::Laravel
+        | Preset::NodeJs
+        | Preset::Dockerfile
+        | Preset::DockerCompose
+        | Preset::Nixpacks
+        | Preset::Autopack
+        | Preset::Static => None,
+    }
+}
+
 /// Extract a release identifier (tag or digest) from a container image
 /// reference. This is the deployed artifact's identity for image deploys —
 /// used as SENTRY_RELEASE / OTEL_SERVICE_VERSION.
@@ -3337,6 +3390,69 @@ mod tests {
                 public_sentry_dsn_var(preset),
                 None,
                 "expected no public DSN var for {:?}",
+                preset
+            );
+        }
+    }
+
+    #[test]
+    fn public_sentry_tunnel_var_mirrors_dsn_var_presets() {
+        use temps_entities::preset::Preset;
+
+        // Every preset that gets a public DSN var must also get a tunnel
+        // var, under the same public prefix — they're both read by the same
+        // `Sentry.init({ dsn, tunnel })` call in the browser bundle.
+        for preset in [
+            Preset::NextJs,
+            Preset::Nuxt,
+            Preset::Vite,
+            Preset::React,
+            Preset::Vue,
+            Preset::SolidStart,
+            Preset::Remix,
+            Preset::SvelteKit,
+            Preset::Astro,
+            Preset::Rsbuild,
+            Preset::Docusaurus,
+        ] {
+            let dsn_var = public_sentry_dsn_var(preset);
+            let tunnel_var = public_sentry_tunnel_var(preset);
+            assert!(
+                dsn_var.is_some() && tunnel_var.is_some(),
+                "expected both DSN and tunnel vars for {:?}",
+                preset
+            );
+            assert_eq!(
+                dsn_var.unwrap().replace("_DSN", "_TUNNEL"),
+                tunnel_var.unwrap(),
+                "tunnel var must share the DSN var's public prefix for {:?}",
+                preset
+            );
+        }
+
+        // Presets with no public DSN var get no tunnel var either.
+        for preset in [
+            Preset::Angular,
+            Preset::Python,
+            Preset::FastApi,
+            Preset::Flask,
+            Preset::Django,
+            Preset::Rails,
+            Preset::Go,
+            Preset::Rust,
+            Preset::Java,
+            Preset::Laravel,
+            Preset::NodeJs,
+            Preset::Dockerfile,
+            Preset::DockerCompose,
+            Preset::Nixpacks,
+            Preset::Autopack,
+            Preset::Static,
+        ] {
+            assert_eq!(
+                public_sentry_tunnel_var(preset),
+                None,
+                "expected no tunnel var for {:?}",
                 preset
             );
         }

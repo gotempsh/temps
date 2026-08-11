@@ -8,14 +8,23 @@
 //! The actual lifecycle management, proxying, and API handlers live in the
 //! `temps-external-plugins` crate.
 
+pub mod actor;
 pub mod channel;
+pub mod headers;
 pub mod manifest;
 
+pub use actor::{
+    encode_plugin_actor_token, verify_plugin_actor_token, ActorPrincipal, PluginActorError,
+    VerifiedActor, PLUGIN_ACTOR_TOKEN_TTL, PLUGIN_ACTOR_TOKEN_VERSION,
+};
 pub use channel::{
-    ChannelError, ChannelErrorCode, ChannelEvent, ChannelMessage, ChannelRequest, ChannelResponse,
-    DeploymentInfo, EnvironmentInfo, ProjectInfo, PLUGIN_CHANNEL_PATH,
+    ActorToken, ApiCall, ApiCallResult, CallOutcome, ChannelError, ChannelErrorCode, ChannelEvent,
+    ChannelMessage, ChannelRequest, ChannelResponse, DeploymentInfo, EnvironmentInfo, HttpMethod,
+    JsonBody, JsonBodyError, PlatformCall, PlatformCallRequest, PlatformCallResponse, ProjectInfo,
+    ProtocolMismatch, VerifiedPluginApiCaller, PLUGIN_CHANNEL_PATH,
 };
 pub use manifest::{
-    HandshakeMessage, NavEntry, NavSection, PluginEvent, PluginManifest, PluginManifestBuilder,
-    PluginReady, UiManifest, UiRoute, PLUGIN_EVENTS_PATH,
+    HandshakeMessage, NavEntry, NavSection, PluginCapability, PluginEvent, PluginHello,
+    PluginLaunchConfig, PluginManifest, PluginManifestBuilder, PluginReady, UiManifest, UiRoute,
+    EXTERNAL_PLUGIN_PROTOCOL_VERSION, PLUGIN_EVENTS_PATH,
 };

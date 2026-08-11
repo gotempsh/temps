@@ -94,6 +94,35 @@ pub struct DomainEnvironment {
     pub slug: String,
 }
 
+/// Build a browser-reachable URL for a preview-domain hostname.
+///
+/// `external_url` is the public origin of the Temps instance, so its scheme
+/// and explicit port are authoritative. The hostname itself remains the
+/// environment/custom-domain hostname supplied by the caller.
+fn format_public_url(host: &str, external_url: Option<&str>, proxy_port: u16) -> String {
+    let (protocol, port) = match external_url {
+        Some(origin) => match origin.parse::<http::Uri>() {
+            Ok(uri) => (
+                uri.scheme_str().unwrap_or("https").to_owned(),
+                uri.authority().and_then(http::uri::Authority::port_u16),
+            ),
+            Err(_) if origin.starts_with("http://") => ("http".to_owned(), None),
+            Err(_) => ("https".to_owned(), None),
+        },
+        None => ("http".to_owned(), Some(proxy_port)),
+    };
+    let is_default_port = matches!(
+        (protocol.as_str(), port),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    let port_suffix = match port {
+        Some(_) if is_default_port => String::new(),
+        Some(port) => format!(":{port}"),
+        None => String::new(),
+    };
+    format!("{protocol}://{host}{port_suffix}")
+}
+
 #[derive(Clone)]
 pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
@@ -135,45 +164,11 @@ impl EnvironmentService {
         let domain = PublicHostnameStrategy::Standard
             .environment_hostname(&settings.preview_domain, environment_slug);
 
-        // Determine protocol - use https if external_url is configured, otherwise http
-        let protocol = if settings.external_url.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-
-        // Append the proxy port when it isn't the protocol's default — the
-        // proxy listens on `ServerConfig.address` (e.g. `:8080`), so without
-        // this the URL points at :80/:443 and is unreachable on a local /
-        // non-standard-port instance. Only applies to the preview-domain path:
-        // when `external_url` is set, that URL already encodes the real public
-        // host/port (typically 443) and the internal proxy port is irrelevant.
-        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
-
-        // <scheme>://<slug>.<preview_domain>[:port]
-        format!("{}://{}{}", protocol, domain, port_suffix)
-    }
-
-    /// Returns `:<port>` when the proxy listens on a non-default port for the
-    /// given scheme (i.e. not 80 for http, not 443 for https), otherwise an
-    /// empty string. The port comes from the Rust proxy listener address via
-    /// [`ConfigService::proxy_port`] — the single source of truth — rather than
-    /// being parsed out of `preview_domain`.
-    ///
-    /// `external_url_set` short-circuits to no suffix: behind a reverse proxy /
-    /// public domain the externally-visible port is whatever `external_url`
-    /// uses, not the internal proxy listener port.
-    fn port_suffix(&self, protocol: &str, external_url_set: bool) -> String {
-        if external_url_set {
-            return String::new();
-        }
-        let port = self.config_service.proxy_port();
-        let is_default = (protocol == "http" && port == 80) || (protocol == "https" && port == 443);
-        if is_default {
-            String::new()
-        } else {
-            format!(":{}", port)
-        }
+        format_public_url(
+            &domain,
+            settings.external_url.as_deref(),
+            self.config_service.proxy_port(),
+        )
     }
 
     /// Compute the full FQDN for an environment (without protocol)
@@ -188,13 +183,11 @@ impl EnvironmentService {
     /// the input is expected to already be a fully-qualified hostname.
     pub async fn compute_custom_domain_url(&self, domain: &str) -> String {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-        let protocol = if settings.external_url.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
-        format!("{}://{}{}", protocol, domain, port_suffix)
+        format_public_url(
+            domain,
+            settings.external_url.as_deref(),
+            self.config_service.proxy_port(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1109,6 +1102,38 @@ impl EnvironmentService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn public_url_preserves_external_http_scheme_and_non_default_port() {
+        assert_eq!(
+            format_public_url(
+                "app-production.example.test",
+                Some("http://example.test:8240"),
+                8240,
+            ),
+            "http://app-production.example.test:8240"
+        );
+    }
+
+    #[test]
+    fn public_url_preserves_external_https_custom_port() {
+        assert_eq!(
+            format_public_url(
+                "app-production.example.test",
+                Some("https://temps.example.test:8443"),
+                8080,
+            ),
+            "https://app-production.example.test:8443"
+        );
+    }
+
+    #[test]
+    fn public_url_uses_proxy_port_without_external_origin() {
+        assert_eq!(
+            format_public_url("app-production.localho.st", None, 8240),
+            "http://app-production.localho.st:8240"
+        );
+    }
 
     fn make_service(db: sea_orm::DatabaseConnection) -> EnvironmentService {
         let server_config = temps_config::ServerConfig::new(

@@ -163,10 +163,11 @@ export function ContainerHeaderBar({
                   href={selectedContainer.service_url}
                   target="_blank"
                   rel="noopener noreferrer"
+                  title={selectedContainer.service_url}
                   className="inline-flex items-center gap-1.5 text-neutral-900 hover:underline dark:text-white"
                 >
                   <span className="truncate max-w-[18rem]">
-                    {selectedContainer.service_url.replace('https://', '')}
+                    {selectedContainer.service_url}
                   </span>
                   <ExternalLink className="size-3" aria-hidden="true" />
                 </a>

@@ -205,6 +205,8 @@ export function ImportProject() {
                 selectedRepository.updated_at || new Date().toISOString(),
               git_provider_connection_id:
                 selectedRepository.git_provider_connection_id,
+              clone_url: selectedRepository.clone_url,
+              ssh_url: selectedRepository.ssh_url,
             }}
             connectionId={selectedConnectionId!}
             branches={branchesData?.branches}
@@ -237,7 +239,18 @@ export function ImportProject() {
                       data.preset === 'dockerfile' && data.dockerfilePath
                         ? { dockerfilePath: data.dockerfilePath }
                         : data.preset === 'docker-compose'
-                          ? { composePath: (data as any).composePath || 'docker-compose.yml' }
+                          ? {
+                              composePath:
+                                (data as any).composePath || 'docker-compose.yml',
+                              ...(data.excludedServices &&
+                              data.excludedServices.length > 0
+                                ? { excludedServices: data.excludedServices }
+                                : {}),
+                              ...(data.composeServices &&
+                              data.composeServices.length > 0
+                                ? { composeServices: data.composeServices }
+                                : {}),
+                            }
                           : undefined,
                     exposed_port: data.preset === 'docker-compose' ? undefined : data.port,
                   },

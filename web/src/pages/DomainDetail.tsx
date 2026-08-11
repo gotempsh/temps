@@ -7,6 +7,7 @@ import {
   getHttpChallengeDebugOptions,
   getPublicIpOptions,
   listDnsProvidersOptions as listProvidersOptions,
+  listRenewalAttemptsOptions,
   renewDomainMutation,
   setupDnsChallengeMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -50,9 +51,12 @@ import {
   Calendar,
   CheckCircle,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   ExternalLink,
   Globe,
+  History,
   Info,
   Loader2,
   MoreHorizontal,
@@ -910,6 +914,9 @@ export function DomainDetail() {
           </Card>
         )}
       </div>
+      <div className="lg:col-span-3">
+        <RenewalAttemptsTimeline domainName={domain.domain} />
+      </div>
     </div>
   )
 
@@ -1044,6 +1051,117 @@ export function DomainDetail() {
           )}
       </div>
     </div>
+  )
+}
+
+const RENEWAL_ATTEMPTS_PAGE_SIZE = 10
+
+function RenewalAttemptsTimeline({ domainName }: { domainName: string }) {
+  const [page, setPage] = useState(1)
+
+  const { data, isLoading } = useQuery({
+    ...listRenewalAttemptsOptions({
+      path: { domain: domainName },
+      query: { page, page_size: RENEWAL_ATTEMPTS_PAGE_SIZE },
+    }),
+    enabled: !!domainName,
+  })
+
+  const attempts = data?.attempts ?? []
+  const total = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / RENEWAL_ATTEMPTS_PAGE_SIZE))
+
+  return (
+    <Card>
+      <div className="p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <History className="size-4 text-muted-foreground" />
+            <h2 className="text-sm font-semibold">Renewal history</h2>
+          </div>
+          {total > 0 && (
+            <span className="text-xs text-muted-foreground">
+              {total} attempt{total === 1 ? '' : 's'}
+            </span>
+          )}
+        </div>
+
+        {isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground py-6 justify-center">
+            <Loader2 className="size-4 animate-spin" />
+            Loading renewal history...
+          </div>
+        ) : attempts.length === 0 ? (
+          <p className="text-sm text-muted-foreground py-6 text-center">
+            No renewal attempts recorded yet.
+          </p>
+        ) : (
+          <div className="divide-y divide-border rounded-lg border border-gray-950/10">
+            {attempts.map((attempt) => (
+              <div
+                key={attempt.id}
+                className="flex items-start gap-3 px-4 py-3"
+              >
+                {attempt.outcome === 'success' ? (
+                  <CheckCircle className="size-4 text-green-600 mt-0.5 shrink-0" />
+                ) : (
+                  <XCircle className="size-4 text-destructive mt-0.5 shrink-0" />
+                )}
+                <div className="flex-1 min-w-0 space-y-0.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-medium">
+                      {attempt.stage === 'request_challenge'
+                        ? 'Order creation'
+                        : 'Challenge completion'}
+                    </span>
+                    <Badge variant="outline" className="text-xs">
+                      {attempt.verification_method}
+                    </Badge>
+                    {attempt.error_type && (
+                      <Badge variant="outline" className="text-xs text-muted-foreground">
+                        {attempt.error_type}
+                      </Badge>
+                    )}
+                  </div>
+                  {attempt.error && (
+                    <p className="text-xs text-destructive break-words">{attempt.error}</p>
+                  )}
+                  <p className="text-xs text-muted-foreground" title={formatUTCDate(attempt.created_at)}>
+                    {formatLocalDateTime(attempt.created_at)}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {total > RENEWAL_ATTEMPTS_PAGE_SIZE && (
+          <div className="flex items-center justify-between pt-1">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeft className="size-4" />
+              Previous
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Page {page} of {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              Next
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
+        )}
+      </div>
+    </Card>
   )
 }
 
