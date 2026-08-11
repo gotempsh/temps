@@ -126,12 +126,20 @@ pub enum SelfUpdatePhase {
     Verifying,
     /// Swapping the binary on disk (previous one kept as a `.bak` sibling).
     Installing,
-    /// Binary swapped; the process is shutting down so the supervisor restarts it.
+    /// Binary swapped; the new binary is running database migrations before
+    /// temps restarts on it. Progress is available in `migrations_applied`,
+    /// `migrations_total`, and `current_migration_name` on the capability.
+    Migrating,
+    /// Migrations done; the process is shutting down so the supervisor restarts it.
     Restarting,
-    /// Binary swapped, but nothing will restart temps automatically — it is
-    /// still serving the old version until the operator restarts it.
+    /// Binary swapped and migrations applied, but nothing will restart temps
+    /// automatically — it is still serving the old version until the operator
+    /// restarts it.
     PendingRestart,
-    /// The attempt failed. The running binary was left untouched.
+    /// The attempt failed. `Failed` before the swap means the running binary was
+    /// left untouched. `Failed` after the swap (during migrations) means the new
+    /// binary is on disk but the schema may be partially migrated — see `error`
+    /// for recovery instructions including the `.bak` path.
     Failed,
 }
 
@@ -140,7 +148,11 @@ impl SelfUpdatePhase {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Resolving | Self::Downloading | Self::Verifying | Self::Installing
+            Self::Resolving
+                | Self::Downloading
+                | Self::Verifying
+                | Self::Installing
+                | Self::Migrating
         )
     }
 
@@ -151,6 +163,7 @@ impl SelfUpdatePhase {
             Self::Downloading => "downloading",
             Self::Verifying => "verifying",
             Self::Installing => "installing",
+            Self::Migrating => "migrating",
             Self::Restarting => "restarting",
             Self::PendingRestart => "pending_restart",
             Self::Failed => "failed",
@@ -197,6 +210,15 @@ pub struct SelfUpdateAttempt {
     /// Where the replaced binary was kept, so a bad release can be reverted by
     /// hand (`mv <path> <binary>`). Set once the swap completes.
     pub previous_binary_path: Option<String>,
+    /// Number of database migrations that were successfully applied during
+    /// this attempt. Set at completion (success or migration failure). `None`
+    /// if migrations were never reached (pre-swap failure).
+    #[serde(default)]
+    pub migrations_applied: Option<u32>,
+    /// Total number of database migrations that were planned. Set at the same
+    /// time as `migrations_applied`. `None` if migrations were never reached.
+    #[serde(default)]
+    pub migrations_total: Option<u32>,
 }
 
 /// Everything the console needs to render the update control honestly: whether
@@ -240,6 +262,14 @@ pub struct SelfUpdateCapability {
     pub phase_error: Option<String>,
     /// The most recent attempt, including one resolved on this boot.
     pub last_attempt: Option<SelfUpdateAttempt>,
+    /// Number of migrations applied so far. `Some` while `phase == migrating`.
+    pub migrations_applied: Option<u32>,
+    /// Total migrations to be applied. `Some` once the migrate child has
+    /// reported its first `started` event.
+    pub migrations_total: Option<u32>,
+    /// Name of the migration currently running. `Some` while `phase == migrating`
+    /// and a migration step is in flight.
+    pub current_migration_name: Option<String>,
 }
 
 /// Accepted-update receipt returned by `start`.
@@ -387,6 +417,9 @@ mod tests {
             SelfUpdatePhase::Downloading,
             SelfUpdatePhase::Verifying,
             SelfUpdatePhase::Installing,
+            // Migrating is active: a second trigger while migrations are running
+            // would race the same binary and may corrupt the schema.
+            SelfUpdatePhase::Migrating,
         ] {
             assert!(phase.is_active(), "{phase:?} should occupy the updater");
         }
@@ -431,9 +464,30 @@ mod tests {
             triggered_by_user_id: Some(7),
             error: None,
             previous_binary_path: Some("/usr/local/bin/temps.bak".to_string()),
+            migrations_applied: Some(3),
+            migrations_total: Some(5),
         };
         let json = serde_json::to_string(&attempt).expect("serialize");
         let parsed: SelfUpdateAttempt = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, attempt);
+    }
+
+    #[test]
+    fn test_attempt_with_no_migration_fields_roundtrips_through_json() {
+        // Existing journals on disk written before the migration fields were
+        // added must still deserialize correctly (missing fields → None).
+        let json = r#"{
+            "from_version": "v0.1.0",
+            "to_version": "v0.2.0",
+            "status": "succeeded",
+            "started_at": "2026-08-11T10:00:00Z",
+            "finished_at": "2026-08-11T10:01:00Z",
+            "triggered_by_user_id": null,
+            "error": null,
+            "previous_binary_path": null
+        }"#;
+        let parsed: SelfUpdateAttempt = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.migrations_applied, None);
+        assert_eq!(parsed.migrations_total, None);
     }
 }

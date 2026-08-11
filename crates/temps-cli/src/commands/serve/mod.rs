@@ -388,6 +388,7 @@ impl ServeCommand {
             self.disable_self_update,
             self_update_caveat,
             update_status.clone(),
+            self.database_url.clone(),
         ));
 
         // Connect to Docker once and share the handle between:

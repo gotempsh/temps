@@ -14632,6 +14632,16 @@ export type SelfUpdateAttempt = {
      */
     from_version: string;
     /**
+     * Number of database migrations that were successfully applied during
+     * this attempt. `None` if migrations were never reached (pre-swap failure).
+     */
+    migrations_applied?: number | null;
+    /**
+     * Total number of database migrations that were planned. `None` if
+     * migrations were never reached (pre-swap failure).
+     */
+    migrations_total?: number | null;
+    /**
      * Where the replaced binary was kept, so a bad release can be reverted by
      * hand (`mv <path> <binary>`). Set once the swap completes.
      */
@@ -14659,7 +14669,7 @@ export type SelfUpdateBlocker = 'disabled_by_flag' | 'disabled_by_setting' | 'no
  * Where an in-flight update has got to. Polled by the console so a long
  * download shows progress instead of an indefinite spinner.
  */
-export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'restarting' | 'pending_restart' | 'failed';
+export type SelfUpdatePhase = 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'migrating' | 'restarting' | 'pending_restart' | 'failed';
 
 /**
  * What happens to the running process once the new binary is in place.
@@ -17577,6 +17587,20 @@ export type UpdateCapabilityResponse = {
      * The equivalent command to run by hand. Always present.
      */
     manual_command: string;
+    /**
+     * Name of the migration currently running. Set while `phase` is `migrating`
+     * and a migration step is in flight.
+     */
+    current_migration_name?: string | null;
+    /**
+     * Number of migrations applied so far. Set while `phase` is `migrating`.
+     */
+    migrations_applied?: number | null;
+    /**
+     * Total migrations to be applied. Set once the migrate child has reported
+     * its first `started` event.
+     */
+    migrations_total?: number | null;
     /**
      * Phase of an in-flight attempt: `idle` when none is running.
      */

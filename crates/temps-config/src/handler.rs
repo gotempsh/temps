@@ -935,6 +935,14 @@ pub struct UpdateCapabilityResponse {
     /// Most recent attempt, including one resolved during this boot — this is
     /// how the console reports the outcome of an update that restarted it.
     pub last_attempt: Option<temps_core::SelfUpdateAttempt>,
+    /// Number of migrations applied so far. `Some` while `phase` is `migrating`.
+    pub migrations_applied: Option<u32>,
+    /// Total migrations to be applied. `Some` once the migrate child has
+    /// reported its first `started` event.
+    pub migrations_total: Option<u32>,
+    /// Name of the migration currently running. `Some` while `phase` is
+    /// `migrating` and a migration step is in flight.
+    pub current_migration_name: Option<String>,
 }
 
 /// Optional pin for the version to install.
@@ -1008,6 +1016,9 @@ fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
         phase: temps_core::SelfUpdatePhase::Idle,
         phase_error: None,
         last_attempt: None,
+        migrations_applied: None,
+        migrations_total: None,
+        current_migration_name: None,
     }
 }
 
@@ -1109,6 +1120,9 @@ async fn get_update_capability(
         phase: capability.phase,
         phase_error: capability.phase_error,
         last_attempt: capability.last_attempt,
+        migrations_applied: capability.migrations_applied,
+        migrations_total: capability.migrations_total,
+        current_migration_name: capability.current_migration_name,
     }))
 }
 
