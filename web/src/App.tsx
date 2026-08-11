@@ -909,21 +909,31 @@ const getErrorTitle = (
 }
 
 const queryClient = new QueryClient({
-  // A 401 from any query (not just the auth check itself) means the
-  // session died mid-session -- e.g. a page like onboarding that reads
-  // cached localStorage state and keeps rendering from it even though its
-  // own API calls are silently failing. Re-checking the current-user query
-  // here forces AuthContext into its error state so ProtectedLayout sees
-  // the expired session and redirects to login, instead of leaving the
-  // user stuck on whatever screen happened to be open.
   queryCache: new QueryCache({
-    onError: (error) => {
+    onError: (error, query) => {
       const status = (error as { status?: number })?.status
-      if (status === 401) {
-        queryClient.invalidateQueries({
-          queryKey: getCurrentUserOptions({}).queryKey,
-        })
+      if (status !== 401) return
+
+      // The current-user query already surfaces its own 401 straight to
+      // AuthContext (see below). Reacting to it here too would invalidate
+      // it, trigger an immediate refetch (it's always mounted), get 401
+      // again, and invalidate again -- a loop that never settles and
+      // hammers the API for every logged-out visitor. Only react to a 401
+      // discovered by some *other* query.
+      const currentUserKey = getCurrentUserOptions({}).queryKey
+      if (JSON.stringify(query.queryKey) === JSON.stringify(currentUserKey)) {
+        return
       }
+
+      // A 401 from any other query means the session died mid-session --
+      // e.g. a page like onboarding that reads cached localStorage state
+      // and keeps rendering from it even though its own API calls are
+      // silently failing. Clear the cache so stale data from the dead
+      // session doesn't linger, which also forces the current-user query
+      // to refetch, transitioning AuthContext into its error state so
+      // ProtectedLayout redirects to login instead of leaving the user
+      // stuck on whatever screen happened to be open.
+      queryClient.clear()
     },
   }),
   defaultOptions: {
