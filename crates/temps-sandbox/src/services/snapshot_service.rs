@@ -102,8 +102,37 @@ impl SnapshotService {
         // ── Quota check (serialized to close TOCTOU race) ────────────────────
         // Hold the service-level lock across the storage-read + row-insert so
         // two concurrent creates can't both pass the quota check and both write.
+        //
+        // TOCTOU close strategy: we cap concurrent `creating` rows per user to
+        // exactly 1. The lock alone prevents in-process concurrent races, but
+        // between the lock release (after insert) and the `take_snapshot` call
+        // (which runs outside the lock and can take many seconds), another
+        // request could enter the critical section with 0 bytes of storage used
+        // (because the creating row hasn't been finalized yet). By rejecting any
+        // new create while a `creating` row already exists for this user we
+        // close that window completely with a single cheap COUNT query, at the
+        // cost of serializing snapshot creation per user (which is already the
+        // expected access pattern — users rarely snapshot the same sandbox
+        // twice simultaneously, and if they do, the second call returns 422
+        // immediately rather than silently racing past the quota).
         let row = {
             let _quota_guard = self.quota_lock.lock().await;
+
+            // Reject if any in-flight creating row exists for this user.
+            // This closes the TOCTOU window: a creating row that hasn't been
+            // finalized yet (size_bytes = 0) cannot be counted in the byte
+            // total, so without this guard a flood of sequential requests
+            // could each pass the quota check before any of them commits.
+            let in_flight_count = sandbox_snapshots::Entity::find()
+                .filter(sandbox_snapshots::Column::UserId.eq(user_id))
+                .filter(sandbox_snapshots::Column::Status.eq("creating"))
+                .count(self.db.as_ref())
+                .await
+                .map_err(SandboxSnapshotError::Database)?;
+
+            if in_flight_count > 0 {
+                return Err(SandboxSnapshotError::SnapshotInProgress { user_id });
+            }
 
             let storage = self.storage_summary(user_id).await?;
             if storage.total_bytes >= self.quota_bytes {
@@ -164,6 +193,26 @@ impl SnapshotService {
                 })?;
             sb.status == "running"
         };
+
+        // ── Guard: v1 only supports running sandboxes ─────────────────────────
+        // The shred step (exec_as_root) requires a live container. Stopped
+        // sandboxes would fail with a Docker-level "container is not running"
+        // error that would surface as ScrubFailed — a misleading error that
+        // implies a security issue rather than a lifecycle constraint.
+        // Returning a clear SandboxNotRunning here lets the caller fix the
+        // actual problem (resume the sandbox) instead of debugging a false
+        // ScrubFailed. ADR-037 v1: only running sandboxes are supported.
+        if !was_running {
+            let _ = self
+                .mark_failed(
+                    row.id,
+                    "snapshot rejected: sandbox is not running (v1 requires a running sandbox)",
+                )
+                .await;
+            return Err(SandboxSnapshotError::SandboxNotRunning {
+                sandbox_id: sandbox_public_id.to_string(),
+            });
+        }
 
         // ── Step 1 of security protocol: shred credential file BEFORE stop ────
         // The credential-daemon env file contains the git-provider token; it
@@ -573,7 +622,9 @@ impl SnapshotService {
             }
         }
 
-        if !content_path.exists() {
+        // Use async I/O for the existence check (consistent with the rest of
+        // this crate — blocking fs calls on the async runtime are forbidden).
+        if !tokio::fs::try_exists(&content_path).await.unwrap_or(false) {
             return Err(SandboxSnapshotError::ArtifactMissing {
                 path: row.content_path.clone(),
             });
@@ -605,30 +656,26 @@ pub struct StorageSummary {
     pub snapshot_count: u32,
     /// Per-user quota in bytes.
     pub quota_bytes: u64,
-    /// Available bytes on the snapshots filesystem.
-    pub available_disk_bytes: u64,
+    /// Available bytes on the snapshots filesystem, or `null` when the
+    /// platform check is not yet implemented (deferred — see `available_disk_space()`).
+    /// API consumers MUST treat `null` as "unknown" rather than "zero bytes
+    /// available". A `Some(0)` would incorrectly block snapshot creation.
+    pub available_disk_bytes: Option<u64>,
 }
 
 /// Best-effort check of available disk space on the snapshots directory.
-/// Returns 0 if the directory doesn't exist or the check fails.
-fn available_disk_space() -> u64 {
-    let dir = std::env::var("TEMPS_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(".temps")
-        })
-        .join("snapshots");
-
-    // statvfs-style check via std::fs. Use a simple read of the fs stats.
-    // On platforms where this isn't available, return 0.
-    // We can't call statvfs from std directly without a native dependency.
-    // Report 0 (safe default — UI can show "unknown" instead of claiming space
-    // that may not exist). A future version can use the `nix` crate's statvfs.
-    let _ = dir;
-    0
+///
+/// Returns `None` while the real `statvfs`-based implementation is deferred
+/// (requires the `nix` crate or a platform-specific syscall). Callers MUST
+/// treat `None` as "unknown" — not "zero bytes available" — so the UI can
+/// display "unknown" rather than incorrectly blocking snapshot creation.
+///
+/// A future version should use `nix::sys::statvfs::statvfs` or equivalent
+/// to return `Some(available_bytes)`.
+fn available_disk_space() -> Option<u64> {
+    // Implementation deferred: no platform-independent statvfs in std.
+    // Return None so API consumers see "unknown" rather than "0 bytes".
+    None
 }
 
 #[cfg(test)]
@@ -648,12 +695,17 @@ mod tests {
     // ── Test provider ─────────────────────────────────────────────────────────
 
     /// A minimal fake provider that supports the full create_snapshot
-    /// lifecycle (exec, stop, take_snapshot, start). Knobs: fail_take_snapshot
-    /// and fail_exec_as_root allow individual tests to trigger specific error
-    /// paths in SnapshotService.
+    /// lifecycle (exec, stop, take_snapshot, start).
+    ///
+    /// Knobs:
+    /// - `fail_take_snapshot`: simulates a provider-level snapshot failure.
+    /// - `fail_exec_as_root`: simulates a shred/exec failure.
+    /// - `fail_delete_image`: simulates a best-effort image cleanup failure
+    ///   (used to verify delete_snapshot still returns Ok on image removal errors).
     struct FakeSnapshotProvider {
         fail_take_snapshot: bool,
         fail_exec_as_root: bool,
+        fail_delete_image: bool,
     }
 
     impl FakeSnapshotProvider {
@@ -661,6 +713,7 @@ mod tests {
             Self {
                 fail_take_snapshot: false,
                 fail_exec_as_root: false,
+                fail_delete_image: false,
             }
         }
     }
@@ -802,6 +855,17 @@ mod tests {
                 image_ref: Some("temps-snapshot/test:latest".to_string()),
             })
         }
+
+        async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+            if self.fail_delete_image {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: image_ref.to_string(),
+                    reason: "delete_image: provider failed (fake knob)".into(),
+                });
+            }
+            Ok(())
+        }
     }
 
     /// Build a SnapshotService that uses the given provider.
@@ -850,7 +914,7 @@ mod tests {
             total_bytes: 1024,
             snapshot_count: 1,
             quota_bytes: DEFAULT_SNAPSHOT_QUOTA_BYTES,
-            available_disk_bytes: 0,
+            available_disk_bytes: None,
         };
         assert_eq!(s.total_bytes, 1024);
         assert_eq!(s.snapshot_count, 1);
@@ -996,7 +1060,7 @@ mod tests {
             total_bytes: 100,
             snapshot_count: 1,
             quota_bytes: 100,
-            available_disk_bytes: 0,
+            available_disk_bytes: None,
         };
         // At exactly the quota the check should trigger (used >= quota).
         assert!(
@@ -1112,9 +1176,24 @@ mod tests {
 
     // ── create_snapshot ───────────────────────────────────────────────────────
 
+    /// Build a MockDatabase COUNT row for the `creating` rows check.
+    ///
+    /// The TOCTOU fix added a `COUNT(*)` query as the very first query inside
+    /// the quota lock. All create_snapshot tests must prepend this mock row.
+    /// `n` is the count to return (0 = no in-flight snapshot, 1+ = reject).
+    fn make_creating_count_row(n: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        let mut row = std::collections::BTreeMap::new();
+        row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(n)));
+        row
+    }
+
     /// Major 6: over-quota rejection. No provider interaction needed — the
     /// service short-circuits at the storage_summary check before touching
     /// the registry.
+    ///
+    /// DB sequence:
+    ///   1. COUNT creating rows → 0 (no in-flight snapshot)
+    ///   2. storage_summary SELECT → row at quota
     #[tokio::test]
     async fn create_snapshot_rejects_over_quota() {
         // storage_summary: one ready row at exactly the default quota
@@ -1128,6 +1207,9 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
                 .append_query_results(vec![vec![at_quota]])
                 .into_connection(),
         );
@@ -1151,6 +1233,10 @@ mod tests {
 
     /// Major 6: over-quota — even slightly under the byte boundary passes,
     /// confirming the comparison is `>=` not `>`.
+    ///
+    /// DB sequence:
+    ///   1. COUNT creating rows → 0
+    ///   2. storage_summary SELECT → row just under quota
     #[tokio::test]
     async fn create_snapshot_rejects_at_quota_boundary() {
         let nearly_full = make_snapshot_model(
@@ -1163,6 +1249,9 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
                 .append_query_results(vec![vec![nearly_full]])
                 .into_connection(),
         );
@@ -1189,11 +1278,12 @@ mod tests {
     /// hard-abort on shred failure.
     ///
     /// DB sequence:
-    ///   1. storage_summary SELECT (empty → under quota)
-    ///   2. INSERT new row RETURNING
-    ///   3. sandboxes::find_by_id (for was_running)
-    ///   4. mark_failed: find_by_id(row.id) RETURNING
-    ///   5. mark_failed: UPDATE RETURNING
+    ///   1. COUNT creating rows → 0
+    ///   2. storage_summary SELECT (empty → under quota)
+    ///   3. INSERT new row RETURNING
+    ///   4. sandboxes::find_by_id (for was_running)
+    ///   5. mark_failed: find_by_id(row.id) RETURNING
+    ///   6. mark_failed: UPDATE RETURNING
     #[tokio::test]
     async fn create_snapshot_shred_failure_returns_scrub_failed() {
         let creating = make_snapshot_model(1, "snap_shred000011112222", 3, "creating", 0);
@@ -1206,15 +1296,17 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // 1. storage_summary — empty
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary — empty
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
-                // 2. INSERT row RETURNING
+                // 3. INSERT row RETURNING
                 .append_query_results(vec![vec![creating.clone()]])
-                // 3. sandboxes::find_by_id
+                // 4. sandboxes::find_by_id
                 .append_query_results(vec![vec![sandbox]])
-                // 4. mark_failed find_by_id
+                // 5. mark_failed find_by_id
                 .append_query_results(vec![vec![creating]])
-                // 5. mark_failed UPDATE RETURNING
+                // 6. mark_failed UPDATE RETURNING
                 .append_query_results(vec![vec![failed]])
                 .into_connection(),
         );
@@ -1222,6 +1314,7 @@ mod tests {
         let provider = FakeSnapshotProvider {
             fail_exec_as_root: true,
             fail_take_snapshot: false,
+            fail_delete_image: false,
         };
         let svc = make_service_with_provider(db, provider);
 
@@ -1240,11 +1333,12 @@ mod tests {
     /// and returns a Provider error (never proceeds to commit).
     ///
     /// DB sequence:
-    ///   1. storage_summary SELECT (empty)
-    ///   2. INSERT row RETURNING
-    ///   3. sandboxes::find_by_id (running)
-    ///   4. mark_failed: find_by_id RETURNING
-    ///   5. mark_failed: UPDATE RETURNING
+    ///   1. COUNT creating rows → 0
+    ///   2. storage_summary SELECT (empty)
+    ///   3. INSERT row RETURNING
+    ///   4. sandboxes::find_by_id (running)
+    ///   5. mark_failed: find_by_id RETURNING
+    ///   6. mark_failed: UPDATE RETURNING
     #[tokio::test]
     async fn create_snapshot_provider_failure_marks_row_failed() {
         let creating = make_snapshot_model(1, "snap_provfail11112222", 5, "creating", 0);
@@ -1257,15 +1351,17 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // 1. storage_summary
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
-                // 2. INSERT
+                // 3. INSERT
                 .append_query_results(vec![vec![creating.clone()]])
-                // 3. sandboxes lookup
+                // 4. sandboxes lookup
                 .append_query_results(vec![vec![sandbox]])
-                // 4. mark_failed find_by_id
+                // 5. mark_failed find_by_id
                 .append_query_results(vec![vec![creating]])
-                // 5. mark_failed update
+                // 6. mark_failed update
                 .append_query_results(vec![vec![failed]])
                 .into_connection(),
         );
@@ -1273,6 +1369,7 @@ mod tests {
         let provider = FakeSnapshotProvider {
             fail_take_snapshot: true,
             fail_exec_as_root: false,
+            fail_delete_image: false,
         };
         let svc = make_service_with_provider(db, provider);
 
@@ -1290,12 +1387,13 @@ mod tests {
     /// Major 6: happy path — create_snapshot succeeds end-to-end.
     ///
     /// DB sequence:
-    ///   1. storage_summary SELECT (empty)
-    ///   2. INSERT row RETURNING (creating)
-    ///   3. sandboxes::find_by_id (running)
-    ///   4. dedup check (none)
-    ///   5. finalize_row find_by_id RETURNING
-    ///   6. finalize_row UPDATE RETURNING (ready)
+    ///   1. COUNT creating rows → 0
+    ///   2. storage_summary SELECT (empty)
+    ///   3. INSERT row RETURNING (creating)
+    ///   4. sandboxes::find_by_id (running)
+    ///   5. dedup check (none)
+    ///   6. finalize_row find_by_id RETURNING
+    ///   7. finalize_row UPDATE RETURNING (ready)
     #[tokio::test]
     async fn create_snapshot_happy_path() {
         let creating = make_snapshot_model(1, "snap_happypath111222", 6, "creating", 0);
@@ -1312,17 +1410,19 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // 1. storage_summary
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
-                // 2. INSERT
+                // 3. INSERT
                 .append_query_results(vec![vec![creating.clone()]])
-                // 3. sandboxes lookup
+                // 4. sandboxes lookup
                 .append_query_results(vec![vec![sandbox]])
-                // 4. dedup check → no match
+                // 5. dedup check → no match
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
-                // 5. finalize find_by_id
+                // 6. finalize find_by_id
                 .append_query_results(vec![vec![creating]])
-                // 6. finalize UPDATE
+                // 7. finalize UPDATE
                 .append_query_results(vec![vec![ready.clone()]])
                 .into_connection(),
         );
@@ -1344,12 +1444,13 @@ mod tests {
     /// point at the existing artifact instead of writing a new one.
     ///
     /// DB sequence:
-    ///   1. storage_summary SELECT (empty)
-    ///   2. INSERT row RETURNING (creating)
-    ///   3. sandboxes::find_by_id (running)
-    ///   4. dedup check → existing ready row with same digest
-    ///   5. finalize_row find_by_id RETURNING (creating)
-    ///   6. finalize_row UPDATE RETURNING (ready, pointing at existing path)
+    ///   1. COUNT creating rows → 0
+    ///   2. storage_summary SELECT (empty)
+    ///   3. INSERT row RETURNING (creating)
+    ///   4. sandboxes::find_by_id (running)
+    ///   5. dedup check → existing ready row with same digest
+    ///   6. finalize_row find_by_id RETURNING (creating)
+    ///   7. finalize_row UPDATE RETURNING (ready, pointing at existing path)
     #[tokio::test]
     async fn create_snapshot_dedup_reuses_existing_artifact() {
         let creating = make_snapshot_model(2, "snap_dedup000011112222", 9, "creating", 0);
@@ -1374,17 +1475,19 @@ mod tests {
 
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                // 1. storage_summary
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
-                // 2. INSERT creating row
+                // 3. INSERT creating row
                 .append_query_results(vec![vec![creating.clone()]])
-                // 3. sandboxes lookup
+                // 4. sandboxes lookup
                 .append_query_results(vec![vec![sandbox]])
-                // 4. dedup check → existing ready row
+                // 5. dedup check → existing ready row
                 .append_query_results(vec![vec![existing_ready]])
-                // 5. finalize find_by_id
+                // 6. finalize find_by_id
                 .append_query_results(vec![vec![creating]])
-                // 6. finalize UPDATE RETURNING
+                // 7. finalize UPDATE RETURNING
                 .append_query_results(vec![vec![deduped_ready.clone()]])
                 .into_connection(),
         );
@@ -1437,5 +1540,197 @@ mod tests {
         let (items, total) = result.unwrap();
         assert_eq!(total, 2);
         assert_eq!(items.len(), 2);
+    }
+
+    // ── HIGH: TOCTOU quota race ───────────────────────────────────────────────
+
+    /// While one snapshot is in `creating` status a second create request for
+    /// the same user must be rejected with SnapshotInProgress (409). This
+    /// closes the TOCTOU window: creating rows have size_bytes = 0, so without
+    /// this guard a sequential flood would each pass the quota check before any
+    /// of them finalize.
+    ///
+    /// DB sequence:
+    ///   1. COUNT creating rows for user → 1 (in-flight row exists)
+    ///   (no further DB calls — returns SnapshotInProgress immediately)
+    #[tokio::test]
+    async fn create_snapshot_rejected_while_creating_row_in_flight() {
+        // MockDatabase: the COUNT query for `creating` rows returns 1.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_creating_count_row(1)]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(1, "sbx_inflight0000001122", 42, None, None)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SandboxSnapshotError::SnapshotInProgress { user_id: 42 })
+            ),
+            "second create while one is creating must return SnapshotInProgress(42), got {:?}",
+            result
+        );
+    }
+
+    // ── MEDIUM: stopped-sandbox guard ────────────────────────────────────────
+
+    /// When the sandbox is stopped (`was_running = false`), create_snapshot
+    /// must return SandboxNotRunning immediately, before attempting the shred
+    /// exec. Without this guard the exec would fail with "container is not
+    /// running" and surface as ScrubFailed — a misleading error.
+    ///
+    /// DB sequence:
+    ///   1. COUNT creating rows → 0 (no in-flight snapshot)
+    ///   2. storage_summary SELECT (empty → under quota)
+    ///   3. INSERT creating row RETURNING
+    ///   4. sandboxes::find_by_id → status = "stopped"
+    ///   5. mark_failed find_by_id RETURNING (creating)
+    ///   6. mark_failed UPDATE RETURNING (failed)
+    #[tokio::test]
+    async fn create_snapshot_returns_not_running_for_stopped_sandbox() {
+        let creating = make_snapshot_model(1, "snap_stopped00011112222", 11, "creating", 0);
+        let sandbox_stopped = make_sandbox_row(50, "sbx_stopped00011112222", "stopped");
+        let failed = {
+            let mut m = creating.clone();
+            m.status = "failed".to_string();
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. COUNT creating rows → 0
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                // 2. storage_summary
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                // 3. INSERT
+                .append_query_results(vec![vec![creating.clone()]])
+                // 4. sandboxes lookup → stopped
+                .append_query_results(vec![vec![sandbox_stopped]])
+                // 5. mark_failed find_by_id
+                .append_query_results(vec![vec![creating]])
+                // 6. mark_failed UPDATE
+                .append_query_results(vec![vec![failed]])
+                .into_connection(),
+        );
+
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(50, "sbx_stopped00011112222", 11, None, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::SandboxNotRunning { .. })),
+            "stopped sandbox must return SandboxNotRunning, not ScrubFailed; got {:?}",
+            result
+        );
+    }
+
+    // ── MINOR: IDOR regression tests ─────────────────────────────────────────
+
+    /// delete_snapshot called with a snapshot owned by a different user must
+    /// return NotFound (same behaviour as get_snapshot), not actually delete
+    /// the row. This mirrors the existing get_snapshot_returns_not_found_for_wrong_owner
+    /// test but exercises the delete_snapshot code path end-to-end.
+    #[tokio::test]
+    async fn delete_snapshot_returns_not_found_for_wrong_owner() {
+        // Row is owned by user 99, caller is user 1.
+        let model = make_snapshot_model(1, "snap_wrongowner111222", 99, "ready", 1_000_000);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .into_connection(),
+        );
+        let svc = make_service(db);
+
+        let result = svc.delete_snapshot(1, "snap_wrongowner111222").await;
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::NotFound { .. })),
+            "wrong-owner delete must look like NotFound, got {:?}",
+            result
+        );
+    }
+
+    /// resolve_for_restore called with a snapshot owned by a different user
+    /// must return NotFound (IDOR guard). Mirrors delete_snapshot_returns_not_found_for_wrong_owner.
+    #[tokio::test]
+    async fn resolve_for_restore_returns_not_found_for_wrong_owner() {
+        // Row is owned by user 77, caller is user 1.
+        let model = make_snapshot_model(2, "snap_wrongowner777888", 77, "ready", 2_000_000);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .into_connection(),
+        );
+        let svc = make_service(db);
+
+        let result = svc
+            .resolve_for_restore(1, "snap_wrongowner777888", "docker")
+            .await;
+        assert!(
+            matches!(result, Err(SandboxSnapshotError::NotFound { .. })),
+            "wrong-owner resolve_for_restore must look like NotFound, got {:?}",
+            result
+        );
+    }
+
+    // ── NIT: delete_image best-effort-on-failure ──────────────────────────────
+
+    /// When the provider's delete_image call fails, delete_snapshot must still
+    /// return Ok (soft-deleted the row). The image removal is explicitly
+    /// best-effort and must never fail the delete operation.
+    ///
+    /// DB sequence:
+    ///   1. get_snapshot SELECT → ready row with image_ref
+    ///   2. COUNT sharing_count → 0 (no other row shares digest)
+    ///   3. soft-delete UPDATE RETURNING
+    ///   (delete_image call errors — result is Ok regardless)
+    #[tokio::test]
+    async fn delete_snapshot_succeeds_even_when_delete_image_fails() {
+        let mut model = make_snapshot_model(1, "snap_imgfail00011112222", 5, "ready", 1_000_000);
+        model.image_ref = Some("temps-snapshot/my-snap:latest".to_string());
+
+        // COUNT query for sharing check
+        use sea_orm::Value;
+        use std::collections::BTreeMap;
+        let mut count_row: BTreeMap<String, Value> = BTreeMap::new();
+        count_row.insert("num_items".to_string(), Value::BigInt(Some(0)));
+
+        let deleted = {
+            let mut m = model.clone();
+            m.status = "deleted".to_string();
+            m
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. get_snapshot SELECT
+                .append_query_results(vec![vec![model]])
+                // 2. sharing_count COUNT
+                .append_query_results(vec![vec![count_row]])
+                // 3. soft-delete UPDATE RETURNING
+                .append_query_results(vec![vec![deleted]])
+                .into_connection(),
+        );
+
+        let provider = FakeSnapshotProvider {
+            fail_take_snapshot: false,
+            fail_exec_as_root: false,
+            fail_delete_image: true, // provider will fail image cleanup
+        };
+        let svc = make_service_with_provider(db, provider);
+
+        let result = svc.delete_snapshot(5, "snap_imgfail00011112222").await;
+        assert!(
+            result.is_ok(),
+            "delete_snapshot must return Ok even when delete_image fails (best-effort), got {:?}",
+            result
+        );
     }
 }

@@ -32,6 +32,10 @@ pub struct SandboxAppState {
     /// teams plugin), in which case `project_access_guard!` is a no-op
     /// and ownership/scope checks alone apply.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Audit logger for write operations. `None` when no audit plugin is
+    /// registered (e.g. some test builds). Audit failures must not fail
+    /// the primary request — log the error and continue.
+    pub audit_service: Option<Arc<dyn temps_core::AuditLogger>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.

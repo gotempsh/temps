@@ -17,6 +17,7 @@ temps-git = { path = "../temps-git" }
 # Frame codec for the in-sandbox PTY agent (ADR-008). Library half only —
 # the binary is built into the sandbox image, not linked here.
 temps-pty-agent = { path = "../temps-pty-agent" }
+anyhow = { workspace = true }
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 tokio = { workspace = true }

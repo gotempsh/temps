@@ -1304,7 +1304,8 @@ interface SnapshotResponse {
   content_digest: string
   size_bytes: number
   image_ref: string | null
-  source_sandbox_id: number | null
+  // source_sandbox_id intentionally omitted: the backend omits the raw
+  // internal DB integer to avoid leaking the source sandbox's sequential ID.
   project_id: number | null
   created_at: string
   updated_at: string
@@ -1321,7 +1322,9 @@ interface StorageSummaryResponse {
   total_bytes: number
   snapshot_count: number
   quota_bytes: number
-  available_disk_bytes: number
+  // null when the platform disk-space check is not yet implemented (deferred).
+  // Treat null as "unknown", not "zero bytes available".
+  available_disk_bytes: number | null
 }
 
 async function snapshotApiRequest<T>(
@@ -1482,7 +1485,6 @@ async function snapshotShowAction(snapId: string, options: { json?: boolean }): 
   keyValue('Size', formatBytes(snap.size_bytes))
   keyValue('Digest', snap.content_digest)
   if (snap.image_ref) keyValue('Image ref', snap.image_ref)
-  if (snap.source_sandbox_id !== null) keyValue('Source sandbox ID', String(snap.source_sandbox_id))
   keyValue('Created', snap.created_at)
   keyValue('Updated', snap.updated_at)
   newline()
@@ -1524,7 +1526,10 @@ async function snapshotStorageAction(options: { json?: boolean }): Promise<void>
   newline()
   keyValue('Snapshots', String(summary.snapshot_count))
   keyValue('Used', `${formatBytes(summary.total_bytes)} / ${formatBytes(summary.quota_bytes)}`)
-  keyValue('Available on disk', formatBytes(summary.available_disk_bytes))
+  keyValue(
+    'Available on disk',
+    summary.available_disk_bytes !== null ? formatBytes(summary.available_disk_bytes) : 'unknown',
+  )
   const pct = summary.quota_bytes > 0
     ? ((summary.total_bytes / summary.quota_bytes) * 100).toFixed(1)
     : '0.0'

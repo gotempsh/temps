@@ -23,10 +23,64 @@ use utoipa::ToSchema;
 
 use temps_auth::{permissions::Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::{AuditContext, AuditOperation};
 
 use crate::error::SandboxSnapshotError;
 use crate::handlers::SandboxAppState;
 use crate::services::snapshot_service::StorageSummary;
+
+// ── Audit events ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotCreatedAudit {
+    context: AuditContext,
+    snapshot_id: String,
+    sandbox_id: String,
+}
+
+impl AuditOperation for SnapshotCreatedAudit {
+    fn operation_type(&self) -> String {
+        "SANDBOX_SNAPSHOT_CREATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize SnapshotCreatedAudit: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SnapshotDeletedAudit {
+    context: AuditContext,
+    snapshot_id: String,
+}
+
+impl AuditOperation for SnapshotDeletedAudit {
+    fn operation_type(&self) -> String {
+        "SANDBOX_SNAPSHOT_DELETED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize SnapshotDeletedAudit: {}", e))
+    }
+}
 
 // ── Error → Problem conversion ───────────────────────────────────────────────
 
@@ -51,6 +105,11 @@ impl From<SandboxSnapshotError> for Problem {
                     .with_title("Snapshots Not Supported")
                     .with_detail(error.to_string())
             }
+            SandboxSnapshotError::SnapshotInProgress { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Snapshot In Progress")
+                    .with_detail(error.to_string())
+            }
             SandboxSnapshotError::QuotaExceeded { .. } => {
                 problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                     .with_title("Snapshot Quota Exceeded")
@@ -64,6 +123,11 @@ impl From<SandboxSnapshotError> for Problem {
             SandboxSnapshotError::SandboxNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Sandbox Not Found")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::SandboxNotRunning { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Sandbox Not Running")
                     .with_detail(error.to_string())
             }
             SandboxSnapshotError::ScrubFailed { .. } => {
@@ -166,6 +230,24 @@ pub struct ListSnapshotsQuery {
     pub page_size: Option<u64>,
 }
 
+// ── Validation ────────────────────────────────────────────────────────────────
+
+/// Validate a snapshot label.
+///
+/// An empty or all-whitespace label would produce an invalid Docker image tag
+/// component and cause `take_snapshot` to fail deep inside the provider with
+/// a confusing error. We reject it here so the caller gets a 400 instead of
+/// a 500. Both the handler and the unit test call this function directly so
+/// the test exercises the real code path rather than reimplementing the check.
+pub(crate) fn validate_snapshot_label(label: &str) -> Result<(), Problem> {
+    if label.trim().is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Label")
+            .with_detail("snapshot label must not be empty or whitespace-only"));
+    }
+    Ok(())
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 /// `POST /v1/sandboxes/{id}/snapshots`
@@ -223,11 +305,7 @@ pub async fn create_snapshot(
     // image tag component and would make `take_snapshot` fail deep inside
     // the provider.
     if let Some(ref label) = body.label {
-        if label.trim().is_empty() {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid Label")
-                .with_detail("snapshot label must not be empty or whitespace-only"));
-        }
+        validate_snapshot_label(label)?;
     }
 
     let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
@@ -255,6 +333,27 @@ pub async fn create_snapshot(
         snapshot_id = %snap.public_id,
         "snapshot: created"
     );
+
+    // Audit log — failure must not fail the request.
+    if let Some(ref audit) = state.audit_service {
+        let event = SnapshotCreatedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: None,
+                user_agent: String::new(),
+            },
+            snapshot_id: snap.public_id.clone(),
+            sandbox_id: sandbox_id.clone(),
+        };
+        if let Err(e) = audit.create_audit_log(&event).await {
+            tracing::error!(
+                user_id = %user_id,
+                snapshot_id = %snap.public_id,
+                "snapshot: failed to write audit log: {}",
+                e
+            );
+        }
+    }
 
     let resp = SnapshotResponse::from(snap);
     Ok((
@@ -417,7 +516,6 @@ pub async fn delete_snapshot(
         })
     })?;
 
-    // Audit: log before delete so we have a record even on failure.
     tracing::info!(
         user_id = %user_id,
         snapshot_id = %snap_id,
@@ -428,6 +526,26 @@ pub async fn delete_snapshot(
         .delete_snapshot(user_id, &snap_id)
         .await
         .map_err(Problem::from)?;
+
+    // Audit log — failure must not fail the request.
+    if let Some(ref audit) = state.audit_service {
+        let event = SnapshotDeletedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: None,
+                user_agent: String::new(),
+            },
+            snapshot_id: snap_id.clone(),
+        };
+        if let Err(e) = audit.create_audit_log(&event).await {
+            tracing::error!(
+                user_id = %user_id,
+                snapshot_id = %snap_id,
+                "snapshot delete: failed to write audit log: {}",
+                e
+            );
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -502,30 +620,64 @@ mod tests {
 
     /// Handler-level label validation: an empty string label must produce a
     /// 400 at the handler boundary, not pass through to the provider where it
-    /// would surface as a 500. Tests the guard added for Minor 5.
+    /// would surface as a 500. The test calls `validate_snapshot_label`
+    /// directly (the same function the handler calls) so it exercises the
+    /// real code path, not a reimplementation of the check.
     #[test]
     fn empty_label_is_rejected_at_handler_boundary() {
-        // Simulate the label validation logic that lives in the handler.
-        // We can't call the async handler in a unit test without an axum
-        // router, so we mirror the exact predicate the handler uses.
         let bad_labels = ["", "   ", "\t", "\n"];
         let good_labels = ["my-snap", "v1", "release-2026"];
 
         for label in bad_labels {
+            let result = validate_snapshot_label(label);
             assert!(
-                label.trim().is_empty(),
-                "label '{}' should be detected as empty/whitespace-only by the handler guard",
+                result.is_err(),
+                "label {:?} should be rejected by validate_snapshot_label",
+                label
+            );
+            // Verify it's a 400
+            let prob = result.unwrap_err();
+            assert_eq!(
+                prob.status_code.as_u16(),
+                400,
+                "label {:?} must produce 400",
                 label
             );
         }
 
         for label in good_labels {
+            let result = validate_snapshot_label(label);
             assert!(
-                !label.trim().is_empty(),
-                "label '{}' should pass the handler guard",
-                label
+                result.is_ok(),
+                "label {:?} should pass validate_snapshot_label, got {:?}",
+                label,
+                result
             );
         }
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_sandbox_not_running_to_409() {
+        let err = SandboxSnapshotError::SandboxNotRunning {
+            sandbox_id: "sbx_stopped".to_string(),
+        };
+        let prob = Problem::from(err);
+        assert_eq!(
+            prob.status_code.as_u16(),
+            409,
+            "SandboxNotRunning must map to 409 Conflict"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_snapshot_in_progress_to_409() {
+        let err = SandboxSnapshotError::SnapshotInProgress { user_id: 42 };
+        let prob = Problem::from(err);
+        assert_eq!(
+            prob.status_code.as_u16(),
+            409,
+            "SnapshotInProgress must map to 409 Conflict"
+        );
     }
 
     #[test]

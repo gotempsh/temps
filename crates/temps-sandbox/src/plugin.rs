@@ -273,10 +273,16 @@ impl TempsPlugin for SandboxPlugin {
         // Handlers check `Option<Arc<SnapshotService>>` and return 501 when None.
         let snapshot_service = context.get_service::<SnapshotService>();
 
+        // Audit service is optional — absent in OSS builds without the audit
+        // plugin. Handlers log a warning on audit failure but never fail the
+        // primary request because of it.
+        let audit_service = context.get_service::<dyn temps_core::AuditLogger>();
+
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,
             snapshot_service,
             project_access_checker,
+            audit_service,
         });
         let router = configure_routes().with_state(app_state);
         Some(PluginRoutes::new(router))

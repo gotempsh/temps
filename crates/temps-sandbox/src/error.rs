@@ -39,6 +39,19 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot is not supported by backend '{backend}'")]
     NotSupported { backend: String },
 
+    /// A snapshot for this user is already in progress (`creating` status).
+    ///
+    /// Only one snapshot per user may be in flight at a time to prevent the
+    /// TOCTOU race in the quota check (creating rows have size_bytes = 0 until
+    /// they finalize, so multiple concurrent creates could bypass the byte cap).
+    /// The caller should wait for the in-flight snapshot to reach `ready` or
+    /// `failed` before retrying.
+    #[error(
+        "A snapshot for user {user_id} is already in progress; \
+         wait for it to reach 'ready' or 'failed' before creating another"
+    )]
+    SnapshotInProgress { user_id: i32 },
+
     /// The user's total snapshot storage would exceed their quota.
     #[error(
         "Snapshot quota exceeded for user {user_id}: used {used_bytes} bytes, \
@@ -66,6 +79,16 @@ pub enum SandboxSnapshotError {
     /// The source sandbox doesn't exist or was already destroyed.
     #[error("Sandbox {sandbox_id} not found")]
     SandboxNotFound { sandbox_id: String },
+
+    /// The sandbox is not running — snapshots require a live container.
+    ///
+    /// v1 only supports snapshotting running sandboxes. Resume the sandbox
+    /// first (PUT /v1/sandboxes/{id}/resume), then retry the snapshot.
+    #[error(
+        "Sandbox {sandbox_id} is not running; snapshots require a running sandbox \
+         — resume it first"
+    )]
+    SandboxNotRunning { sandbox_id: String },
 
     /// The sandbox is in a state that doesn't allow snapshotting.
     #[error("Sandbox {sandbox_id} is in state '{state}' — cannot {operation}")]

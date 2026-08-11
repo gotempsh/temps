@@ -2808,13 +2808,45 @@ impl SandboxProvider for DockerSandboxProvider {
         // file, then rename atomically. All file I/O uses tokio::fs so we
         // never block the async runtime on a potentially multi-GB write.
         let tmp_path = snapshots_dir.join(format!(".tmp-{}", short_id));
-        let mut tmp_file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-            AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: failed to create temp file: {}", e),
+
+        // Helper: best-effort cleanup on failure — remove the staged Docker
+        // image (same pattern the earlier branches use) and unlink the temp
+        // file if it was created. Both are best-effort: a cleanup failure
+        // should not mask the original error.
+        let cleanup_on_err = {
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            let tmp = tmp_path.clone();
+            move || {
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                    // Best-effort unlink of the partially-written temp file.
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                });
             }
-        })?;
+        };
+
+        let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: failed to create temp file: {}", e),
+                });
+            }
+        };
 
         let mut hasher = Sha256::new();
         let mut size_bytes: u64 = 0;
@@ -2822,32 +2854,41 @@ impl SandboxProvider for DockerSandboxProvider {
         {
             let mut export_stream = self.docker.export_image(&committed_image_id);
             while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
-                let chunk = chunk.map_err(|e| AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!("snapshot: image export stream error: {}", e),
-                })?;
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(tmp_file);
+                        cleanup_on_err();
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: container_id.clone(),
+                            reason: format!("snapshot: image export stream error: {}", e),
+                        });
+                    }
+                };
                 hasher.update(&chunk);
                 size_bytes += chunk.len() as u64;
-                tmp_file
-                    .write_all(&chunk)
-                    .await
-                    .map_err(|e| AgentError::SandboxExecFailed {
+                if let Err(e) = tmp_file.write_all(&chunk).await {
+                    drop(tmp_file);
+                    cleanup_on_err();
+                    return Err(AgentError::SandboxExecFailed {
                         run_id: 0,
                         sandbox_id: container_id.clone(),
                         reason: format!("snapshot: failed to write to temp file: {}", e),
-                    })?;
+                    });
+                }
             }
         }
 
-        tmp_file
-            .flush()
-            .await
-            .map_err(|e| AgentError::SandboxExecFailed {
+        if let Err(e) = tmp_file.flush().await {
+            drop(tmp_file);
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: container_id.clone(),
                 reason: format!("snapshot: failed to flush temp file: {}", e),
-            })?;
+            });
+        }
         drop(tmp_file);
 
         let digest_hex = hex::encode(hasher.finalize());
@@ -2855,13 +2896,14 @@ impl SandboxProvider for DockerSandboxProvider {
 
         // Atomic rename — the file is only visible at the final path once
         // fully written, so a concurrent reader never sees a partial write.
-        tokio::fs::rename(&tmp_path, &final_path)
-            .await
-            .map_err(|e| AgentError::SandboxExecFailed {
+        if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: container_id.clone(),
                 reason: format!("snapshot: atomic rename failed: {}", e),
-            })?;
+            });
+        }
 
         // ── Tag the committed image with the public-facing name ───────────────
         // Derive an image_ref from the label if provided, otherwise use digest.
