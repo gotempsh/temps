@@ -45,7 +45,13 @@ content/
 __pycache__
 
 .claude
-.agents
+.agents/*
+!.agents/skills
+.agents/skills/*
+# First-party contributor-facing dev skills that ship with the repo (for
+# Claude Code / Codex / etc.) live here and are tracked; everything else
+# under .agents (personal marketplace-installed skills) stays ignored.
+!.agents/skills/start-temps
 skills-lock.json
 
 # MaxMind GeoLite2 database — has restrictive license, do not commit.
