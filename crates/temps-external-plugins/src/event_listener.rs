@@ -303,11 +303,14 @@ impl PluginEventListener {
 
         for manifest in manifests {
             if Self::manifest_subscribes_to(&manifest, event_type) {
-                if let Some(socket_path) = manager.socket_path_for(&manifest.name).await {
+                if let (Some(socket_path), Some(auth_secret)) = (
+                    manager.socket_path_for(&manifest.name).await,
+                    manager.auth_secret_for(&manifest.name).await,
+                ) {
                     targets.push(PluginTarget {
                         name: manifest.name.clone(),
                         socket_path,
-                        auth_secret: manager.auth_secret().to_string(),
+                        auth_secret,
                     });
                 }
             }

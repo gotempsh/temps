@@ -52,6 +52,8 @@
 //! temps_plugin_sdk::main!(MyPlugin);
 //! ```
 
+pub mod api;
+pub mod auth;
 pub mod client;
 pub mod context;
 pub mod error;
@@ -59,20 +61,26 @@ pub mod manifest;
 pub mod protocol;
 pub mod runtime;
 
+pub use api::PlatformApi;
+pub use auth::{AuthenticatedCaller, OptionalCaller, PluginPermission, PluginRole};
 pub use client::TempsClient;
 pub use context::PluginContext;
 pub use error::PluginSdkError;
 pub use manifest::{
-    NavEntry, NavSection, PluginEvent, PluginManifest, PluginManifestBuilder, UiManifest,
-    PLUGIN_EVENTS_PATH,
+    NavEntry, NavSection, PluginCapability, PluginEvent, PluginManifest, PluginManifestBuilder,
+    UiManifest, PLUGIN_EVENTS_PATH,
 };
 
 /// Re-export commonly used types
 pub mod prelude {
+    pub use crate::api::PlatformApi;
+    pub use crate::auth::{AuthenticatedCaller, OptionalCaller, PluginPermission, PluginRole};
     pub use crate::client::TempsClient;
     pub use crate::context::PluginContext;
     pub use crate::error::PluginSdkError;
-    pub use crate::manifest::{NavEntry, NavSection, PluginEvent, PluginManifest, UiManifest};
+    pub use crate::manifest::{
+        NavEntry, NavSection, PluginCapability, PluginEvent, PluginManifest, UiManifest,
+    };
     pub use crate::ExternalPlugin;
 
     // Re-export common dependencies for convenience

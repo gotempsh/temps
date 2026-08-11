@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use clap::Parser;
 use hyper_util::rt::TokioIo;
 use temps_core::external_plugin::{PluginEvent, PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
+use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
 use tower::{Service, ServiceExt};
 use tracing::{debug, error, info, warn};
@@ -62,12 +63,42 @@ pub fn run_plugin<P: ExternalPlugin + Default>(plugin: P) {
 
 async fn run_plugin_async<P: ExternalPlugin>(
     plugin: P,
-    args: PluginArgs,
+    mut args: PluginArgs,
 ) -> Result<(), crate::error::PluginSdkError> {
     let manifest = plugin.manifest();
     let plugin_name = manifest.name.clone();
 
     info!(plugin = %plugin_name, "Starting external plugin");
+
+    let auth_secret = match args.auth_secret.take() {
+        Some(secret) if !secret.trim().is_empty() => secret,
+        Some(_) => {
+            return Err(crate::error::PluginSdkError::Initialization {
+                plugin_name,
+                reason: "Temps supplied an empty request-assertion secret".to_string(),
+            });
+        }
+        None => {
+            let mut secret = String::new();
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            stdin.read_line(&mut secret).await.map_err(|error| {
+                crate::error::PluginSdkError::Initialization {
+                    plugin_name: plugin_name.clone(),
+                    reason: format!(
+                        "Failed to read the request-assertion secret from the host pipe: {error}"
+                    ),
+                }
+            })?;
+            let secret = secret.trim_end_matches(['\r', '\n']).to_string();
+            if secret.is_empty() {
+                return Err(crate::error::PluginSdkError::Initialization {
+                    plugin_name,
+                    reason: "Temps closed the request-assertion pipe without a secret".to_string(),
+                });
+            }
+            secret
+        }
+    };
 
     // Step 1: Write manifest to stdout (handshake phase 1)
     // IMPORTANT: stdout is ONLY for handshake messages. Logs go to stderr.
@@ -267,14 +298,27 @@ async fn run_plugin_async<P: ExternalPlugin>(
         temps_client,
         plugin_name.clone(),
         data_dir,
-        args.auth_secret.clone(),
+        args.host_data_dir.as_deref().map(std::path::PathBuf::from),
+        args.host_api_url.clone(),
+        auth_secret.clone(),
     );
 
     // Step 10: Call on_start hook
     plugin.on_start(&ctx)?;
 
     // Step 11: Build the full router with plugin routes
-    let plugin_router = plugin.router(ctx.clone());
+    let plugin_router = plugin.router(ctx.clone()).layer(axum::middleware::from_fn({
+        let auth_secret = auth_secret.clone();
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let auth_secret = auth_secret.clone();
+            async move {
+                match crate::auth::verify_proxy_headers(&mut request, &auth_secret) {
+                    Ok(_) => next.run(request).await,
+                    Err(rejection) => rejection.into_response(),
+                }
+            }
+        }
+    }));
 
     // Build the events handler if needed
     let event_state = EventHandlerState {
@@ -528,6 +572,12 @@ fn tungstenite_msg_to_axum(
     }
 }
 
+/// Pull the actor token and its user out of the platform's headers.
+///
+/// Both must be present and agree: a token with no user id cannot be filed
+/// under anyone, and a user id with no token is nothing to remember. Absent
+/// on `public_paths` routes and on plugins that declare no API capability,
+/// which is why this silently does nothing rather than warning.
 #[cfg(test)]
 mod tests {
     use super::*;

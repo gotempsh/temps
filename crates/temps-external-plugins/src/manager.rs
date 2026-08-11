@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use temps_core::external_plugin::{HandshakeMessage, PluginManifest};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -28,6 +28,9 @@ pub struct ExternalPluginProcess {
     pub binary_path: PathBuf,
     /// Unix socket path for communication
     pub socket_path: PathBuf,
+    /// Per-process secret used to authenticate proxy assertions to this
+    /// plugin. It must never be shared with another installed plugin.
+    auth_secret: String,
     /// Path to the PID file for this process
     pid_file_path: PathBuf,
     /// The child process handle
@@ -90,6 +93,15 @@ pub struct ExternalPluginConfig {
     pub sockets_dir: PathBuf,
     /// Directory for plugin data files
     pub data_dir: PathBuf,
+    /// The instance's own data root — the parent of all the directories
+    /// above. Passed to plugins as `--host-data-dir` so a plugin that also
+    /// receives `--database-url` can reach the platform state that lives on
+    /// disk rather than in the database (sandbox roots, key material).
+    pub host_data_dir: PathBuf,
+    /// Base URL at which this instance's API answers, passed to plugins as
+    /// `--host-api-url`. `None` when the caller did not supply one, in which
+    /// case plugins are told nothing rather than guessing.
+    pub host_api_url: Option<String>,
     /// Directory to extract plugin UI assets into
     pub ui_assets_dir: PathBuf,
     /// Directory for PID files (one per running plugin process)
@@ -108,6 +120,10 @@ pub struct ExternalPluginConfig {
 const SUN_PATH_MAX: usize = 104;
 #[cfg(not(target_os = "macos"))]
 const SUN_PATH_MAX: usize = 108;
+
+fn generate_plugin_auth_secret() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 impl ExternalPluginConfig {
     /// Create a config with default settings for a given data directory.
@@ -135,10 +151,34 @@ impl ExternalPluginConfig {
             pids_dir: data_dir.join("run").join("plugin-pids"),
             data_dir: data_dir.join("plugin-data"),
             ui_assets_dir: data_dir.join("plugin-ui"),
+            host_data_dir: data_dir,
+            host_api_url: None,
             database_url,
             handshake_timeout: Duration::from_secs(30),
             health_check_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Record where the proxy listens, so plugins can be told their own
+    /// externally-reachable base URL.
+    ///
+    /// A bind address is not a URL: `0.0.0.0` means "every interface" to a
+    /// listener but nothing to a client, so it is rewritten to loopback.
+    /// Callers that terminate TLS or sit behind another proxy should set the
+    /// instance's public URL in settings instead of relying on this.
+    pub fn with_proxy_address(mut self, address: &str) -> Self {
+        let address = address.trim();
+        if address.is_empty() {
+            return self;
+        }
+        let host_port = match address.rsplit_once(':') {
+            Some((host, port)) if host == "0.0.0.0" || host == "[::]" || host.is_empty() => {
+                format!("127.0.0.1:{port}")
+            }
+            _ => address.to_string(),
+        };
+        self.host_api_url = Some(format!("http://{host_port}"));
+        self
     }
 }
 
@@ -155,22 +195,43 @@ pub struct ExternalPluginManager {
     config: ExternalPluginConfig,
     /// Running plugin processes, keyed by plugin name
     plugins: Arc<RwLock<HashMap<String, ExternalPluginProcess>>>,
-    /// HMAC auth secret for signing proxied requests
-    auth_secret: String,
     /// Database connection for serving channel requests
     db: Arc<DatabaseConnection>,
+    /// Late-bound bridge into the platform's own HTTP router, shared with
+    /// every channel. Empty until the console finishes assembling the
+    /// router — see [`crate::channel::HostApiSlot`].
+    host_api: Arc<crate::channel::HostApiSlot>,
+    /// Instance key material for minting per-caller actor tokens. Set by the
+    /// console; `None` leaves plugins without one, so their API calls fail
+    /// closed rather than being attributed to nobody.
+    actor_crypto: crate::proxy::ActorCryptoSlot,
 }
 
 impl ExternalPluginManager {
     pub fn new(config: ExternalPluginConfig, db: Arc<DatabaseConnection>) -> Self {
-        let auth_secret = uuid::Uuid::new_v4().to_string();
-
         Self {
             config,
             plugins: Arc::new(RwLock::new(HashMap::new())),
-            auth_secret,
             db,
+            host_api: Arc::new(crate::channel::HostApiSlot::new(None)),
+            actor_crypto: crate::proxy::ActorCryptoSlot::default(),
         }
+    }
+
+    /// Install the bridge plugins use to call the platform's own HTTP API.
+    ///
+    /// Called by the console once its router is assembled. Until then the
+    /// slot is empty and an `ApiCall` is answered with an error naming the
+    /// gap, rather than being silently dropped.
+    pub async fn set_host_api(&self, bridge: Arc<dyn crate::channel::HostApiBridge>) {
+        *self.host_api.write().await = Some(bridge);
+    }
+
+    /// Supply the key material used to mint per-caller actor tokens.
+    pub async fn set_actor_crypto(&self, crypto: Arc<temps_core::CookieCrypto>) {
+        // Every proxy already holds a clone of this slot, so mounted routes
+        // start minting immediately — no rebuild, no ordering requirement.
+        self.actor_crypto.set(crypto);
     }
 
     /// Discover and start all plugins in the plugins directory.
@@ -388,6 +449,10 @@ impl ExternalPluginManager {
             .sockets_dir
             .join(format!("{}.sock", binary_name));
         let plugin_data_dir = self.config.data_dir.join(binary_name);
+        // A compromised plugin must not be able to forge caller assertions
+        // to a sibling plugin. Generate this before spawn and retain it only
+        // with this process's proxy state.
+        let auth_secret = generate_plugin_auth_secret();
 
         // Validate that the socket path fits within the OS limit.
         let socket_path_len = socket_path.as_os_str().len();
@@ -414,14 +479,57 @@ impl ExternalPluginManager {
             .arg(socket_path.to_str().unwrap_or_default())
             .arg("--database-url")
             .arg(&self.config.database_url)
-            .arg("--auth-secret")
-            .arg(&self.auth_secret)
             .arg("--data-dir")
             .arg(plugin_data_dir.to_str().unwrap_or_default())
+            // The platform's own data root, alongside its own database URL.
+            //
+            // `--data-dir` is the plugin's private corner
+            // (`<root>/plugin-data/<binary>`); this is the root itself, where
+            // the instance keeps the state a plugin needs to act *as* the
+            // platform rather than beside it: the sandbox data root, and the
+            // key material that makes the database's encrypted columns and
+            // session cookies readable.
+            //
+            // Only plugins that already receive `--database-url` get anything
+            // new here — with the database alone a plugin holds every
+            // ciphertext but no key. Treat installing a plugin as trusting it
+            // with the instance.
+            .arg("--host-data-dir")
+            .arg(self.config.host_data_dir.to_str().unwrap_or_default())
+            .args(
+                self.config
+                    .host_api_url
+                    .iter()
+                    .flat_map(|url| ["--host-api-url", url.as_str()]),
+            )
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn {}: {}", binary_name, e))?;
+
+        // Deliver the per-process assertion secret through a one-shot pipe,
+        // never argv or environment. Plugins share the host OS user today,
+        // so command-line visibility would collapse per-plugin isolation.
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Failed to open the authentication pipe for {binary_name}"))?;
+        if let Err(error) = child_stdin
+            .write_all(format!("{auth_secret}\n").as_bytes())
+            .await
+        {
+            let _ = child.start_kill();
+            return Err(format!(
+                "Failed to deliver the request-assertion secret to {binary_name}: {error}"
+            ));
+        }
+        if let Err(error) = child_stdin.shutdown().await {
+            let _ = child.start_kill();
+            return Err(format!(
+                "Failed to close the authentication pipe for {binary_name}: {error}"
+            ));
+        }
 
         // Write PID file so we can clean up stale processes on restart
         if let Some(pid) = child.id() {
@@ -613,13 +721,20 @@ impl ExternalPluginManager {
         // Open the platform channel (WebSocket to plugin for queries + events).
         // This is non-fatal: older plugins that don't serve /_temps/channel
         // will simply not get a channel (they can still use POST /_events).
-        let channel =
-            PluginChannel::connect(&socket_path, manifest.name.clone(), self.db.clone()).await;
+        let channel = PluginChannel::connect(
+            &socket_path,
+            manifest.name.clone(),
+            self.db.clone(),
+            self.host_api.clone(),
+            manifest.capabilities.clone(),
+        )
+        .await;
 
         let process = ExternalPluginProcess {
             manifest,
             binary_path: binary_path.to_path_buf(),
             socket_path,
+            auth_secret,
             pid_file_path,
             child,
             has_ui,
@@ -669,7 +784,12 @@ impl ExternalPluginManager {
             PluginProxy::new(
                 process.socket_path.clone(),
                 process.manifest.name.clone(),
-                self.auth_secret.clone(),
+                process.auth_secret.clone(),
+            )
+            .with_public_paths(process.manifest.public_paths.clone())
+            .with_actor_minting(
+                self.actor_crypto.clone(),
+                !process.manifest.capabilities.is_empty(),
             )
         })
     }
@@ -681,6 +801,15 @@ impl ExternalPluginManager {
             .await
             .get(plugin_name)
             .map(|p| p.socket_path.clone())
+    }
+
+    /// Per-process assertion secret for internal event delivery.
+    pub(crate) async fn auth_secret_for(&self, plugin_name: &str) -> Option<String> {
+        self.plugins
+            .read()
+            .await
+            .get(plugin_name)
+            .map(|process| process.auth_secret.clone())
     }
 
     /// Send an event to a specific plugin over its channel.
@@ -772,11 +901,6 @@ impl ExternalPluginManager {
         self.start_plugin(&binary_path).await
     }
 
-    /// Get the auth secret (for creating proxies externally).
-    pub fn auth_secret(&self) -> &str {
-        &self.auth_secret
-    }
-
     /// Get the config.
     pub fn config(&self) -> &ExternalPluginConfig {
         &self.config
@@ -801,7 +925,16 @@ mod tests {
         let manager = ExternalPluginManager::new(config, mock_db());
 
         assert!(manager.manifests().await.is_empty());
-        assert!(!manager.auth_secret().is_empty());
+    }
+
+    #[test]
+    fn plugin_processes_receive_distinct_auth_secrets() {
+        let first = generate_plugin_auth_secret();
+        let second = generate_plugin_auth_secret();
+
+        assert_ne!(first, second);
+        assert!(!first.is_empty());
+        assert!(!second.is_empty());
     }
 
     #[tokio::test]

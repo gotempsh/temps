@@ -36,6 +36,25 @@ pub struct ExternalServiceEnvironmentVariableRevealedAudit {
     pub variable_name: String,
 }
 
+/// Live connection credentials were issued for a service in an environment,
+/// and the per-tenant database was provisioned if it did not exist.
+///
+/// Separate from [`ExternalServiceEnvironmentVariableRevealedAudit`] because
+/// it is a stronger event: that one reveals a single named variable a human
+/// asked for, this one hands out the whole connection — including the
+/// password — and creates a database as a side effect. The variable *names*
+/// are recorded so an auditor can see what was handed over; the values
+/// obviously are not.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceRuntimeCredentialsIssuedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    /// Names only, sorted. Never the values.
+    pub variable_names: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceDeletedAudit {
     pub context: AuditContext,
@@ -280,6 +299,29 @@ impl AuditOperation for ExternalServiceParameterRevealedAudit {
 impl AuditOperation for ExternalServiceEnvironmentVariableRevealedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_ENVIRONMENT_VARIABLE_REVEALED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceRuntimeCredentialsIssuedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_RUNTIME_CREDENTIALS_ISSUED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {
