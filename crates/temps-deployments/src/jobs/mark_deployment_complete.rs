@@ -47,14 +47,6 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// log and move on — the container row is left for the next sweep to retry.
 const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
-/// A deployment is not complete merely because its containers are running and
-/// the route table contains an entry. Prove that the same public URL users will
-/// open answers through the proxy before publishing `completed`.
-const PUBLIC_READINESS_TIMEOUT_SECS: u64 = 60;
-const PUBLIC_READINESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const PUBLIC_READINESS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const PUBLIC_READINESS_REQUIRED_SUCCESSES: u8 = 2;
-
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkCompleteOutput {
@@ -133,204 +125,6 @@ impl MarkDeploymentCompleteJob {
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         Ok(())
-    }
-
-    /// Resolve the exact public URL whose usability gates completion. Custom
-    /// hosts take precedence, matching the URL emitted in DeploymentSucceeded;
-    /// otherwise use the instance preview domain.
-    async fn public_readiness_url(
-        &self,
-        environment: &environments::Model,
-        health_check_path: Option<&str>,
-    ) -> Result<String, String> {
-        let config_service = self.config_service.as_ref().ok_or_else(|| {
-            format!(
-                "Cannot verify public readiness for environment {}: config service is unavailable",
-                environment.id
-            )
-        })?;
-
-        let base_url = if !environment.host.is_empty() {
-            let scheme = config_service.get_url_scheme().await.map_err(|e| {
-                format!(
-                    "Failed to resolve URL scheme for environment {} host '{}': {}",
-                    environment.id, environment.host, e
-                )
-            })?;
-            format!("{}://{}", scheme, environment.host)
-        } else if !environment.subdomain.is_empty() {
-            config_service
-                .get_deployment_url_by_slug(&environment.subdomain)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to resolve public URL for environment {} subdomain '{}': {}",
-                        environment.id, environment.subdomain, e
-                    )
-                })?
-        } else {
-            return Err(format!(
-                "Cannot verify public readiness for environment {}: it has neither a host nor a subdomain",
-                environment.id
-            ));
-        };
-
-        match health_check_path {
-            Some(path) if !path.is_empty() && path != "/" => {
-                Self::validate_public_health_check_path(path)?;
-                Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
-            }
-            _ => Ok(base_url),
-        }
-    }
-
-    fn validate_public_health_check_path(path: &str) -> Result<(), String> {
-        if path.len() > 2048 {
-            return Err(format!(
-                "Health-check path length {} exceeds the 2048-byte limit",
-                path.len()
-            ));
-        }
-        if !path.starts_with('/') {
-            return Err("Health-check path must start with '/'".to_string());
-        }
-        if path.contains('@') || path.contains("://") {
-            return Err(
-                "Health-check path must not contain URL authority or scheme syntax".to_string(),
-            );
-        }
-        if path.contains('?') || path.contains('#') {
-            return Err(
-                "Health-check path must not contain query parameters or fragments; use a secret-free path"
-                    .to_string(),
-            );
-        }
-        if path.chars().any(char::is_control) {
-            return Err("Health-check path must not contain control characters".to_string());
-        }
-        Ok(())
-    }
-
-    fn readiness_url_for_diagnostics(url: &str) -> String {
-        let Ok(mut parsed) = reqwest::Url::parse(url) else {
-            return "<invalid public readiness URL>".to_string();
-        };
-        if parsed.query().is_some() {
-            parsed.set_query(Some("<redacted>"));
-        }
-        parsed.set_fragment(None);
-        parsed.to_string()
-    }
-
-    /// Poll the public route until two consecutive requests prove it is
-    /// serving. The hostname is pinned to the local Temps proxy listener, so a
-    /// custom domain can never turn this control-plane probe into an SSRF.
-    async fn wait_for_public_url_ready(
-        url: &str,
-        proxy_port: u16,
-        timeout: std::time::Duration,
-        poll_interval: std::time::Duration,
-        request_timeout: std::time::Duration,
-        required_successes: u8,
-    ) -> Result<(), String> {
-        let diagnostic_url = Self::readiness_url_for_diagnostics(url);
-        let parsed_url = reqwest::Url::parse(url).map_err(|error| {
-            format!("Public readiness URL '{diagnostic_url}' is invalid: {error}")
-        })?;
-        let hostname = parsed_url
-            .host_str()
-            .ok_or_else(|| format!("Public readiness URL '{diagnostic_url}' has no hostname"))?;
-        let proxy_address = std::net::SocketAddr::from(([127, 0, 0, 1], proxy_port));
-        // reqwest's DNS override is intentionally bypassed for IP-literal
-        // hosts. Rewrite those URLs to loopback explicitly while retaining
-        // the original Host header, otherwise a custom host such as a cloud
-        // metadata address would still be reachable.
-        let is_ip_literal = hostname.parse::<std::net::IpAddr>().is_ok();
-        let original_authority = parsed_url
-            .port()
-            .map_or_else(|| hostname.to_string(), |port| format!("{hostname}:{port}"));
-        let mut probe_url = parsed_url.clone();
-        // `proxy_port` is the plaintext Pingora listener. TLS is terminated at
-        // the public edge (or on the separate TLS listener), so carrying an
-        // external `https` scheme into this pinned local request attempts a TLS
-        // handshake against an HTTP socket and can never succeed. Probe the
-        // same host and path over the local HTTP listener; redirects are usable
-        // responses and the public certificate is covered independently.
-        probe_url.set_scheme("http").map_err(|_| {
-            format!("Public readiness URL '{diagnostic_url}' has an unsupported scheme")
-        })?;
-        if is_ip_literal {
-            probe_url.set_host(Some("127.0.0.1")).map_err(|_| {
-                format!("Public readiness URL '{diagnostic_url}' has an invalid hostname")
-            })?;
-            probe_url.set_port(Some(proxy_port)).map_err(|_| {
-                format!("Public readiness URL '{diagnostic_url}' has an invalid port")
-            })?;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            // This is a control-plane probe that must always hit the local
-            // Temps proxy selected by `resolve` below. Inheriting HTTP(S)_PROXY
-            // would route the request through an external proxy instead,
-            // bypassing the DNS pin and making readiness depend on runner or
-            // operator proxy settings.
-            .no_proxy()
-            .resolve(hostname, proxy_address)
-            .build()
-            .map_err(|e| format!("Failed to build public readiness HTTP client: {e}"))?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut consecutive_successes = 0_u8;
-        let mut last_observation = "no response received".to_string();
-
-        loop {
-            let mut request = client.get(probe_url.clone());
-            if is_ip_literal {
-                request = request.header(reqwest::header::HOST, &original_authority);
-            }
-            let response = tokio::time::timeout_at(deadline, request.send()).await;
-            match response {
-                Ok(Ok(response)) => {
-                    let status = response.status();
-                    if Self::is_usable_public_status(status) {
-                        consecutive_successes = consecutive_successes.saturating_add(1);
-                        if consecutive_successes >= required_successes.max(1) {
-                            return Ok(());
-                        }
-                        last_observation = format!(
-                            "HTTP {status} ({consecutive_successes}/{required_successes} consecutive successes)"
-                        );
-                    } else {
-                        consecutive_successes = 0;
-                        last_observation = format!("HTTP {status}");
-                    }
-                }
-                Ok(Err(error)) => {
-                    consecutive_successes = 0;
-                    last_observation = format!("request failed: {error}");
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "Public URL '{diagnostic_url}' did not become usable within {}s (last result: {last_observation})",
-                        timeout.as_secs()
-                    ));
-                }
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "Public URL '{diagnostic_url}' did not become usable within {}s (last result: {last_observation})",
-                    timeout.as_secs()
-                ));
-            }
-
-            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll_interval))
-                .await;
-        }
-    }
-
-    fn is_usable_public_status(status: reqwest::StatusCode) -> bool {
-        status.is_success() || status.is_redirection()
     }
 
     /// Restore the last known-good route and persist a contextual failure in a
@@ -1037,75 +831,64 @@ impl MarkDeploymentCompleteJob {
                 .await?;
         }
 
-        // ── Phase 2.75: Prove the user-facing URL works ──────────────────
-        // Container state and route-table propagation are necessary but not
-        // sufficient. Request the same public URL the uptime monitor uses and
-        // require two consecutive usable responses before writing completed.
-        let public_readiness_url = match self
-            .public_readiness_url(&environment, health_check_path.as_deref())
-            .await
-        {
-            Ok(url) => url,
-            Err(reason) => {
-                self.log(format!(
-                    "Public readiness URL could not be resolved ({reason}) — reverting to the last usable deployment"
-                ))
-                .await?;
-                self.reject_unusable_deployment(
-                    environment_id,
-                    last_successful_deployment_id,
-                    &reason,
-                )
-                .await?;
-                return Err(WorkflowError::JobExecutionFailed(format!(
-                    "{reason} — deployment rolled back"
-                )));
-            }
-        };
-
-        let public_readiness_diagnostic_url =
-            Self::readiness_url_for_diagnostics(&public_readiness_url);
-        self.log(format!(
-            "Route propagated — verifying public readiness at {public_readiness_diagnostic_url}..."
-        ))
-        .await?;
-        if let Err(reason) = Self::wait_for_public_url_ready(
-            &public_readiness_url,
-            self.config_service
-                .as_ref()
-                .map(|service| service.proxy_port())
+        // ── Pre-completion staleness check ────────────────────────────────
+        //
+        // A concurrent rollback may have called stop_environment_containers
+        // while we were waiting inside Phase 2 / Phase 2.5. That function
+        // killed our containers AND atomically flipped our state to "stopped"
+        // (CAS: only from "running") to signal supersession. If we let
+        // Phase 3 write "completed" now, it would clobber that "stopped"
+        // marker even though we were intentionally superseded. Detect that
+        // here: re-read our state and abort cleanly when already "stopped".
+        //
+        // We do NOT call reject_unusable_deployment in this branch because
+        // the rollback's own MarkDeploymentCompleteJob will set
+        // env.current_deployment_id to the new rollback deployment once it
+        // acquires this environment's lock (which we hold, and will release
+        // momentarily when mark_complete_inner returns).
+        let deployment_state_before_completion =
+            deployments::Entity::find_by_id(self.deployment_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to re-check deployment {} state before completion: {}",
+                        self.deployment_id, e
+                    ))
+                })?
                 .ok_or_else(|| {
                     WorkflowError::JobExecutionFailed(format!(
-                        "Cannot verify public readiness for deployment {}: config service is unavailable",
+                        "Deployment {} disappeared before completion",
                         self.deployment_id
                     ))
-                })?,
-            std::time::Duration::from_secs(PUBLIC_READINESS_TIMEOUT_SECS),
-            PUBLIC_READINESS_POLL_INTERVAL,
-            PUBLIC_READINESS_REQUEST_TIMEOUT,
-            PUBLIC_READINESS_REQUIRED_SUCCESSES,
-        )
-        .await
-        {
-            tracing::error!(
+                })?;
+
+        if deployment_state_before_completion.state == "stopped" {
+            // A concurrent rollback superseded this deployment while we were
+            // propagating routes. The rollback already killed our containers
+            // and marked us "stopped". Abort here — writing "completed" now
+            // would wrongly clobber that marker. The rollback's own
+            // MarkDeploymentCompleteJob will fix up env.current_deployment_id
+            // once it acquires this lock.
+            info!(
                 deployment_id = self.deployment_id,
                 environment_id,
-                url = %public_readiness_diagnostic_url,
-                reason = %reason,
-                "Public readiness gate failed"
+                "Deployment was superseded by a concurrent rollback during route \
+                 propagation — aborting completion cleanly (state: stopped)"
             );
-            self.log(format!(
-                "Public readiness failed ({reason}) — reverting to the last usable deployment"
-            ))
-            .await?;
-            self.reject_unusable_deployment(environment_id, last_successful_deployment_id, &reason)
-                .await?;
+            self.log(
+                "Deployment superseded by a concurrent rollback — aborting \
+                 completion; state already set to 'stopped'"
+                    .to_string(),
+            )
+            .await
+            .ok();
             return Err(WorkflowError::JobExecutionFailed(format!(
-                "{reason} — deployment rolled back"
+                "Deployment {} was superseded by a concurrent rollback \
+                 (state: stopped) — completion aborted",
+                self.deployment_id
             )));
         }
-        self.log("Public readiness confirmed with two consecutive successful requests".to_string())
-            .await?;
 
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
@@ -2438,7 +2221,6 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Minimal ContainerDeployer that records stop/remove calls and otherwise
     /// no-ops. Used to assert that teardown stopped the expected containers
@@ -2607,148 +2389,6 @@ mod teardown_tests {
                 "test-password",
             )),
         )
-    }
-
-    async fn spawn_status_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let mut index = 0_usize;
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = [0_u8; 1024];
-                let _ = stream.read(&mut request).await;
-                let status = statuses[index.min(statuses.len() - 1)];
-                index = index.saturating_add(1);
-                let reason = match status {
-                    200 => "OK",
-                    302 => "Found",
-                    503 => "Service Unavailable",
-                    _ => "Test Status",
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        (format!("http://{address}/"), handle)
-    }
-
-    #[tokio::test]
-    async fn test_public_readiness_requires_consecutive_usable_responses() {
-        let (url, server) = spawn_status_server(vec![200, 503, 302, 200]).await;
-
-        let result = MarkDeploymentCompleteJob::wait_for_public_url_ready(
-            &url,
-            url.parse::<reqwest::Url>().unwrap().port().unwrap(),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(100),
-            2,
-        )
-        .await;
-
-        server.abort();
-        assert!(
-            result.is_ok(),
-            "public route should become usable: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_public_readiness_rejects_persistent_server_errors() {
-        let (url, server) = spawn_status_server(vec![503]).await;
-
-        let error = MarkDeploymentCompleteJob::wait_for_public_url_ready(
-            &url,
-            url.parse::<reqwest::Url>().unwrap().port().unwrap(),
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(20),
-            2,
-        )
-        .await
-        .unwrap_err();
-
-        server.abort();
-        assert!(error.contains("did not become usable"));
-        assert!(error.contains("HTTP 503"));
-    }
-
-    #[test]
-    fn test_public_readiness_does_not_treat_missing_or_unsupported_routes_as_usable() {
-        assert!(MarkDeploymentCompleteJob::is_usable_public_status(
-            reqwest::StatusCode::OK
-        ));
-        assert!(MarkDeploymentCompleteJob::is_usable_public_status(
-            reqwest::StatusCode::FOUND
-        ));
-        assert!(!MarkDeploymentCompleteJob::is_usable_public_status(
-            reqwest::StatusCode::NOT_FOUND
-        ));
-        assert!(!MarkDeploymentCompleteJob::is_usable_public_status(
-            reqwest::StatusCode::METHOD_NOT_ALLOWED
-        ));
-    }
-
-    #[test]
-    fn public_readiness_rejects_and_redacts_query_secrets() {
-        let error = MarkDeploymentCompleteJob::validate_public_health_check_path(
-            "/health?token=super-secret",
-        )
-        .unwrap_err();
-        assert!(error.contains("must not contain query"));
-
-        let diagnostic = MarkDeploymentCompleteJob::readiness_url_for_diagnostics(
-            "https://example.test/health?token=super-secret#details",
-        );
-        assert!(!diagnostic.contains("super-secret"));
-        assert!(!diagnostic.contains("details"));
-        assert!(diagnostic.contains("redacted"));
-    }
-
-    #[tokio::test]
-    async fn test_public_readiness_pins_untrusted_hostname_to_local_proxy() {
-        let (local_url, server) = spawn_status_server(vec![200, 200]).await;
-        let proxy_port = local_url.parse::<reqwest::Url>().unwrap().port().unwrap();
-
-        let result = MarkDeploymentCompleteJob::wait_for_public_url_ready(
-            "http://169.254.169.254/latest/meta-data",
-            proxy_port,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(100),
-            2,
-        )
-        .await;
-
-        server.abort();
-        assert!(result.is_ok(), "probe must use local proxy: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn test_https_public_readiness_uses_plaintext_local_proxy_listener() {
-        let (local_url, server) = spawn_status_server(vec![200, 200]).await;
-        let proxy_port = local_url.parse::<reqwest::Url>().unwrap().port().unwrap();
-
-        let result = MarkDeploymentCompleteJob::wait_for_public_url_ready(
-            "https://app.example.test/health",
-            proxy_port,
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(100),
-            2,
-        )
-        .await;
-
-        server.abort();
-        assert!(
-            result.is_ok(),
-            "HTTPS public URLs must probe the local HTTP listener: {result:?}"
-        );
     }
 
     #[tokio::test]

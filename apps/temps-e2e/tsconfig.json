@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["src"]
+  "include": ["src", "evals/**/*.ts"]
 }

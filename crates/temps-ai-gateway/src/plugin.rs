@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
@@ -11,7 +13,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
-    services::{GatewayService, ProviderKeyService, UsageService},
+    services::{GatewayService, ProviderKeyService, ProviderPreferenceService, UsageService},
 };
 
 pub struct AiGatewayPlugin;
@@ -45,15 +47,72 @@ impl TempsPlugin for AiGatewayPlugin {
                 Arc::new(ProviderKeyService::new(db.clone(), encryption_service));
             context.register_service(provider_key_service.clone());
 
+            let provider_preference_service = Arc::new(ProviderPreferenceService::new(
+                db.clone(),
+                provider_key_service.clone(),
+            ));
+            context.register_service(provider_preference_service.clone());
+
             let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
             context.register_service(gateway_service.clone());
 
             // ADR-022: register the general AI foundation so any feature can get
             // text or typed/structured output from the configured model through
             // one governed seam. Best-effort + self-gating, safe to always register.
-            let ai_service = Arc::new(crate::services::GatewayAiService::new(
-                gateway_service.clone(),
-                db.clone(),
+            //
+            // The provider registry routes every normalized AI capability to
+            // the selected adapter. Gateway keys use native function calling;
+            // host harnesses receive the same scoped tools through the
+            // turn-local MCP bridge. Chat and feature code never branches on
+            // provider transport.
+            let gateway_ai_service: Arc<dyn temps_ai::AiService> = Arc::new(
+                crate::services::GatewayAiService::new(gateway_service.clone(), db.clone()),
+            );
+
+            // One AgentCliAiService per catalog entry (Claude Code, Codex,
+            // OpenCode), built once here rather than per-request — each is
+            // just a thin handle around a zero-arg `AiCliProvider` plus a
+            // shared scratch dir/semaphore, so building the whole catalog
+            // upfront is cheap and keeps DispatchingAiService's routing a
+            // synchronous HashMap lookup.
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let ai_cli_scratch_dir = config_service.get_data_subdir("ai-cli-scratch");
+            if let Err(e) = tokio::fs::create_dir_all(&ai_cli_scratch_dir).await {
+                tracing::error!(
+                    scratch_dir = %ai_cli_scratch_dir.display(),
+                    error = %e,
+                    "Failed to create AI CLI scratch directory — agent-CLI-backed AI requests will fail until this is fixed"
+                );
+            }
+            // ADR-037 §5 recommended defaults: 30s per-call timeout, 2
+            // concurrent CLI subprocesses on the host.
+            const AI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+            const AI_CLI_CONCURRENCY: usize = 2;
+
+            let mut agent_cli_services: HashMap<String, Arc<dyn temps_ai::AiService>> =
+                HashMap::new();
+            for registration in temps_agents::ai_cli::PROVIDER_CATALOG {
+                if let Some(provider) = temps_agents::ai_cli::create_provider(registration.id) {
+                    let provider: Arc<dyn temps_agents::ai_cli::AiCliProvider> = provider.into();
+                    let svc = Arc::new(temps_ai_agent_cli::AgentCliAiService::new(
+                        provider,
+                        ai_cli_scratch_dir.clone(),
+                        AI_CLI_TIMEOUT,
+                        AI_CLI_CONCURRENCY,
+                    ));
+                    agent_cli_services.insert(
+                        registration.id.to_string(),
+                        svc as Arc<dyn temps_ai::AiService>,
+                    );
+                }
+            }
+
+            let preference_reader: Arc<dyn temps_ai_agent_cli::ActiveProviderReader> =
+                provider_preference_service.clone();
+            let ai_service = Arc::new(temps_ai_agent_cli::AiProviderRegistry::with_providers(
+                gateway_ai_service,
+                preference_reader,
+                agent_cli_services,
             ));
             context.register_service(ai_service as Arc<dyn temps_ai::AiService>);
 
@@ -71,6 +130,7 @@ impl TempsPlugin for AiGatewayPlugin {
             let app_state = create_ai_gateway_app_state(
                 gateway_service,
                 provider_key_service,
+                provider_preference_service,
                 usage_service,
                 audit_service,
                 telemetry,
@@ -94,6 +154,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_usage_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
+            .merge(handlers::configure_provider_status_routes())
             .with_state(app_state);
 
         Some(PluginRoutes::new(routes))
@@ -107,6 +168,9 @@ impl TempsPlugin for AiGatewayPlugin {
         schema.merge(usage_schema);
         let pricing_schema = <handlers::pricing::AiGatewayPricingApiDoc as OpenApiTrait>::openapi();
         schema.merge(pricing_schema);
+        let provider_status_schema =
+            <handlers::provider_status::AiProviderStatusApiDoc as OpenApiTrait>::openapi();
+        schema.merge(provider_status_schema);
         Some(schema)
     }
 }

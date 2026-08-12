@@ -1,0 +1,25 @@
+[package]
+name = "temps-ai-agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Bridge between AiService and AiCliProvider for subscription-backed AI workloads (ADR-037)"
+
+[dependencies]
+temps-ai = { path = "../temps-ai" }
+temps-agents = { path = "../temps-agents" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -918,13 +918,35 @@ impl WorkflowExecutionService {
                         deployment_id, e
                     );
 
-                    // Update deployment status to failed with reason
-                    self.update_deployment_status_with_reason(
-                        deployment_id,
-                        temps_entities::types::PipelineStatus::Failed,
-                        Some(error_message),
-                    )
-                    .await?;
+                    // Re-read the deployment state before writing "failed".
+                    // A concurrent rollback may have called
+                    // stop_environment_containers which atomically flips a
+                    // mid-flight deployment from "running" to "stopped" to
+                    // signal supersession. Overwriting "stopped" with "failed"
+                    // here would prevent promote/rollback from reusing this
+                    // deployment's image later. Skip the write when already
+                    // in a stable terminal state set by the control plane.
+                    let current_state = self
+                        .get_deployment(deployment_id)
+                        .await
+                        .map(|d| d.state)
+                        .unwrap_or_default();
+                    if current_state == "stopped" {
+                        info!(
+                            "Workflow for deployment {} ended with an error but \
+                             the deployment was already marked 'stopped' by a \
+                             concurrent rollback — preserving 'stopped'",
+                            deployment_id
+                        );
+                    } else {
+                        // Update deployment status to failed with reason
+                        self.update_deployment_status_with_reason(
+                            deployment_id,
+                            temps_entities::types::PipelineStatus::Failed,
+                            Some(error_message),
+                        )
+                        .await?;
+                    }
                 }
 
                 Err(WorkflowExecutionError::WorkflowFailed(e))

@@ -1290,13 +1290,41 @@ mod tests {
     /// the success path, so `cleanup()`/`cleanup_terminal_resources` had
     /// nothing to remove and `/tmp/temps-deployments/deployment-*` leaked
     /// forever on every failed download.
+    // Serialized against `test_download_repository_keeps_temp_dir_on_early_failure_when_debug_flag_set`:
+    // both tests read/write the process-wide `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES`
+    // env var, and cargo's default parallel test execution can interleave them
+    // -- this test's `create_temp_dir()` call can observe the other test's `set_var("1")`
+    // mid-flight, making its guard think cleanup should be skipped and leaking
+    // a directory that then fails the assertion below.
     #[tokio::test]
+    #[serial_test::serial(deployment_temp_dir_env_var)]
     async fn test_download_repository_cleans_up_temp_dir_on_early_failure() {
         let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
 
         // A distinctive deployment ID keeps this test's glob isolated from
         // any other directories that might exist under /tmp/temps-deployments.
         let deployment_id = 918_273_645;
+
+        // Pre-test cleanup: remove any dirs left by a previous run of this
+        // test that was killed before its `TempDirGuard::drop` could run
+        // (e.g. `cargo test` interrupted mid-suite) — a stale dir would
+        // otherwise fail the assertion below spuriously. This test DOES
+        // create a temp dir itself (`create_temp_dir()` runs before the
+        // `validate_git_url` check that fails it); the `#[serial]` attribute
+        // above is what actually prevents cross-test contamination via the
+        // shared `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` env var.
+        if let Ok(entries) = std::fs::read_dir("/tmp/temps-deployments") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("deployment-{deployment_id}-"))
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+
         let job = DownloadRepoJob::new_public(
             "test".to_string(),
             "owner".to_string(),
@@ -1333,7 +1361,12 @@ mod tests {
         );
     }
 
+    // See the matching `#[serial]` note on
+    // `test_download_repository_cleans_up_temp_dir_on_early_failure` above --
+    // both tests mutate the process-wide `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES`
+    // env var and must not run concurrently with each other.
     #[tokio::test]
+    #[serial_test::serial(deployment_temp_dir_env_var)]
     async fn test_download_repository_keeps_temp_dir_on_early_failure_when_debug_flag_set() {
         let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
 

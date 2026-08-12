@@ -286,6 +286,7 @@ async fn create_provider_key(
             request.default_model.as_deref(),
         )
         .await?;
+    app_state.provider_status_cache.invalidate().await;
 
     Ok((StatusCode::CREATED, Json(ProviderKeyResponse::from(key))))
 }
@@ -323,6 +324,7 @@ async fn update_provider_key(
             request.is_active,
         )
         .await?;
+    app_state.provider_status_cache.invalidate().await;
 
     Ok(Json(ProviderKeyResponse::from(key)))
 }
@@ -347,6 +349,7 @@ async fn delete_provider_key(
     permission_guard!(auth, AiGatewayWrite);
 
     app_state.provider_key_service.delete(id).await?;
+    app_state.provider_status_cache.invalidate().await;
 
     Ok(StatusCode::NO_CONTENT)
 }

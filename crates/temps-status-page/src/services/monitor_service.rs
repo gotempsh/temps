@@ -339,6 +339,7 @@ impl MonitorService {
             project_id: i32,
             monitor_count: i64,
             operational_count: i64,
+            major_outage_count: i64,
         }
 
         // Single query: for each project, get latest check status of production monitors.
@@ -359,7 +360,8 @@ impl MonitorService {
             SELECT
                 sm.project_id,
                 COUNT(sm.id) as monitor_count,
-                COUNT(lc.status) FILTER (WHERE lc.status = 'operational') as operational_count
+                COUNT(lc.status) FILTER (WHERE lc.status = 'operational') as operational_count,
+                COUNT(*) FILTER (WHERE lc.status = 'major_outage' OR lc.status IS NULL) as major_outage_count
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
                 AND e.name = 'production'
@@ -393,11 +395,15 @@ impl MonitorService {
             std::collections::HashMap::new();
 
         for r in results {
+            // "down" is reserved for monitors that are hard-down (major_outage or no
+            // recent check at all) across the board; a monitor merely returning a
+            // soft client error (degraded/partial_outage) should not paint the whole
+            // project red -- see health_check_service.rs for the per-monitor statuses.
             let status = if r.monitor_count == 0 {
                 "no_monitors".to_string()
             } else if r.operational_count == r.monitor_count {
                 "operational".to_string()
-            } else if r.operational_count == 0 {
+            } else if r.major_outage_count == r.monitor_count {
                 "down".to_string()
             } else {
                 "degraded".to_string()
@@ -1346,5 +1352,108 @@ mod tests {
         if !monitor.monitor_url.is_empty() {
             assert!(monitor.monitor_url.ends_with("/health"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_project_health_degraded_monitor_is_not_reported_as_down() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+
+        // get_projects_monitor_health only looks at "production" environments.
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-prod-{}", nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set(subdomain.clone()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.local", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let request = CreateMonitorRequest {
+            name: "Production Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+        let monitor = service.create_monitor(project.id, request).await.unwrap();
+
+        // A monitor that's merely degraded (e.g. a soft 4xx) should not be
+        // indistinguishable from a fully unreachable one at the project level.
+        service
+            .record_check(monitor.id, "degraded".to_string(), Some(120), None)
+            .await
+            .unwrap();
+
+        let health = service
+            .get_projects_monitor_health(&[project.id])
+            .await
+            .unwrap();
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].project_id, project.id);
+        assert_eq!(health[0].status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_project_health_major_outage_monitor_is_reported_as_down() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-prod-{}", nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set(subdomain.clone()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.local", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let request = CreateMonitorRequest {
+            name: "Production Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+        let monitor = service.create_monitor(project.id, request).await.unwrap();
+
+        service
+            .record_check(
+                monitor.id,
+                "major_outage".to_string(),
+                None,
+                Some("connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let health = service
+            .get_projects_monitor_health(&[project.id])
+            .await
+            .unwrap();
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].status, "down");
     }
 }

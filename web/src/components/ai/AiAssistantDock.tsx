@@ -51,10 +51,15 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
+import {
+  conversationListNeedsRefresh,
+  createProjectChat,
+  resolvePageChat,
+} from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
 
 interface ActiveChat {
@@ -153,7 +158,12 @@ function loadActiveChat(): ActiveChat | null {
     const raw = localStorage.getItem(ACTIVE_CHAT_KEY)
     if (!raw) return null
     const a = JSON.parse(raw) as ActiveChat
-    if (a && typeof a.projectId === 'number' && a.contextType && a.contextId != null) {
+    if (
+      a &&
+      typeof a.projectId === 'number' &&
+      a.contextType &&
+      a.contextId != null
+    ) {
       return { ...a, autoStart: false }
     }
   } catch {
@@ -166,7 +176,10 @@ function saveActiveChat(a: ActiveChat | null) {
   try {
     if (a) {
       // Never re-trigger the one-shot auto-diagnosis when restoring.
-      localStorage.setItem(ACTIVE_CHAT_KEY, JSON.stringify({ ...a, autoStart: false }))
+      localStorage.setItem(
+        ACTIVE_CHAT_KEY,
+        JSON.stringify({ ...a, autoStart: false })
+      )
     } else {
       localStorage.removeItem(ACTIVE_CHAT_KEY)
     }
@@ -243,23 +256,42 @@ export function DockBody({
     if (typeof window !== 'undefined' && window.innerWidth < 1024) onClose()
   }
 
-  const [active, setActive] = useState<ActiveChat | null>(() =>
-    initialContext && openedProjectId != null
-      ? {
-          projectId: openedProjectId,
-          projectSlug: initialContext.projectSlug,
-          projectName: initialContext.projectName,
-          contextType: initialContext.contextType,
-          contextId: initialContext.contextId,
-          title: initialContext.title,
-          description: initialContext.description,
-          startPrompt: initialContext.startPrompt,
-          autoStart: true,
-        }
-      : // No explicit target → resume the last chat the user was in (across
-        // close/reopen and reloads), falling back to the conversation list.
-        loadActiveChat()
-  )
+  // Full-screen only (`/chat`) — the dock is layered on arbitrary console
+  // pages and shouldn't hijack that page's URL. `?chat=<publicId>` is set
+  // whenever the open conversation resolves (see the sync effect below), so
+  // reloading `/chat?chat=...` (F5) lands back on the same conversation
+  // instead of the list — more explicit than the dock's own localStorage
+  // fallback, and correct per-tab where a shared localStorage key isn't.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const urlChatId = layout === 'page' ? searchParams.get('chat') : null
+
+  const [active, setActive] = useState<ActiveChat | null>(() => {
+    if (initialContext && openedProjectId != null) {
+      return {
+        projectId: openedProjectId,
+        projectSlug: initialContext.projectSlug,
+        projectName: initialContext.projectName,
+        contextType: initialContext.contextType,
+        contextId: initialContext.contextId,
+        title: initialContext.title,
+        description: initialContext.description,
+        startPrompt: initialContext.startPrompt,
+        // Opening the contextual dock is still a new conversation: pause at
+        // the start state so the user can choose provider/model/reasoning and
+        // permissions before those immutable conversation fields are pinned.
+        autoStart: false,
+      }
+    }
+    // Page layout (`/chat`) always resolves via URL: either an existing
+    // `?chat=` param (resolution effect below) or, if bare, a redirect to a
+    // deterministic chat (redirect effect below) — never the dock's
+    // localStorage guess, which can silently diverge from what's on screen
+    // across tabs/reloads.
+    if (layout === 'page') return null
+    // Dock: resume the last chat the user was in (across close/reopen and
+    // reloads), falling back to the conversation list.
+    return loadActiveChat()
+  })
 
   // Persist the open chat so reopening the dock returns to it.
   useEffect(() => {
@@ -269,6 +301,11 @@ export function DockBody({
     GlobalConversationResponse[]
   >([])
   const [loadingList, setLoadingList] = useState(false)
+  // Set once the first list fetch settles (success or failure) — distinct
+  // from `loadingList` (which starts `false` before the fetch is even
+  // scheduled) so the URL-resolution effect below can tell "haven't tried
+  // yet" apart from "tried and finished" without a race on mount.
+  const [listReady, setListReady] = useState(false)
   const [activePublicId, setActivePublicId] = useState<string | null>(null)
   const [resetKey, setResetKey] = useState(0)
   const [pendingDelete, setPendingDelete] = useState<{
@@ -285,6 +322,7 @@ export function DockBody({
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
+  const [railOpen, setRailOpen] = useState(true)
 
   // Unified list across every project.
   const loadList = useCallback(() => {
@@ -292,8 +330,26 @@ export function DockBody({
     listAllConversations()
       .then(({ data }) => setConversations(data ?? []))
       .catch(() => setConversations([]))
-      .finally(() => setLoadingList(false))
+      .finally(() => {
+        setLoadingList(false)
+        setListReady(true)
+      })
   }, [])
+
+  // A project chat is created lazily by DebugChatPanel when its first message
+  // is sent. Until that point the list is necessarily a pre-creation snapshot.
+  // Reconcile the parent as one transition: select the new conversation,
+  // reveal the page rail, and fetch the row so it appears there immediately.
+  // Existing conversations are already present and do not need another fetch.
+  const handleConversationChange = useCallback(
+    (publicId: string | null) => {
+      setActivePublicId(publicId)
+      if (!conversationListNeedsRefresh(publicId, conversations)) return
+      setRailOpen(true)
+      loadList()
+    },
+    [conversations, loadList]
+  )
 
   useEffect(() => {
     if (initialContext) return
@@ -309,8 +365,12 @@ export function DockBody({
     }
   }, [initialContext, loadList])
 
-  const openConversation = (c: GlobalConversationResponse) => {
-    setActivePublicId(null)
+  const openConversation = useCallback((c: GlobalConversationResponse) => {
+    // The list already knows this id. Setting it immediately avoids an
+    // intermediate render where URL synchronization can mistake a resolved
+    // conversation for an unsaved draft.
+    setActivePublicId(c.public_id)
+    setPicking(false)
     setActive({
       projectId: c.project_id,
       projectSlug: c.project_slug ?? undefined,
@@ -320,7 +380,61 @@ export function DockBody({
       title: c.title ?? undefined,
       autoStart: false,
     })
-  }
+  }, [])
+
+  // Resolve the initial full-page route exactly once after the list arrives.
+  // A valid `?chat=` is restored; bare or stale routes are replaced with the
+  // API's first (most recently active) conversation. Keeping this separate
+  // from ongoing URL synchronization prevents the mount-time race where a
+  // still-null active id removed a valid URL before it could be resolved.
+  const initialPageRouteResolvedRef = useRef(false)
+  useEffect(() => {
+    if (layout !== 'page' || initialContext) return
+    if (initialPageRouteResolvedRef.current || !listReady) return
+
+    const conversation = resolvePageChat(urlChatId, conversations)
+    if (!conversation) return
+
+    // Defer the state transition out of the effect body. The cancellation
+    // guard keeps React Strict Mode's setup/cleanup replay from consuming the
+    // one-shot ref without ever opening the resolved conversation.
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      initialPageRouteResolvedRef.current = true
+      openConversation(conversation)
+      if (urlChatId !== conversation.public_id) {
+        const next = new URLSearchParams(searchParams)
+        next.set('chat', conversation.public_id)
+        setSearchParams(next, { replace: true })
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    layout,
+    initialContext,
+    urlChatId,
+    listReady,
+    conversations,
+    openConversation,
+    searchParams,
+    setSearchParams,
+  ])
+
+  // Keep `?chat=` in sync with whatever conversation is actually open, so
+  // reloading always lands back on it. `activePublicId` is the single source
+  // of truth here — every path that opens/creates/leaves a conversation
+  // already updates it (see `openConversation`, `onConversationChange`,
+  // `backToList`).
+  useEffect(() => {
+    if (layout !== 'page') return
+    const next = new URLSearchParams(searchParams)
+    if (!activePublicId || next.get('chat') === activePublicId) return
+    next.set('chat', activePublicId)
+    setSearchParams(next, { replace: true })
+  }, [layout, activePublicId, searchParams, setSearchParams])
 
   // Start a brand-new project-scoped chat (a fresh thread). The context_id is a
   // client-generated uuid so a project can have many independent chats; the
@@ -336,17 +450,17 @@ export function DockBody({
       typeof crypto !== 'undefined' && 'randomUUID' in crypto
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    setActive({
-      projectId: p.id,
-      projectSlug: p.slug ?? undefined,
-      projectName: p.name,
-      contextType: 'project',
-      contextId,
-      // Matches the title the backend seeds (ProjectChatProvider) so the header
-      // and the post-creation list entry show the same name.
-      title: 'Project chat',
-      autoStart: false,
-    })
+    setActive(createProjectChat(p, contextId))
+
+    // The old conversation id must not remain in the address bar while a new
+    // lazy-created chat is open. Once its first message creates a conversation,
+    // `onConversationChange` supplies the new public id and the sync effect
+    // below writes it back to the URL.
+    if (layout === 'page' && searchParams.has('chat')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('chat')
+      setSearchParams(next, { replace: true })
+    }
   }
 
   const backToList = () => {
@@ -356,8 +470,10 @@ export function DockBody({
     loadList()
   }
 
-  // Reset = archive the current conversation and start a fresh one for the same
-  // source (re-seeds + re-diagnoses).
+  // Reset = archive the current conversation and start a truly blank one for
+  // the same source. Deliberately does NOT auto-resend the original
+  // startPrompt (e.g. "Diagnose this and suggest concrete next steps") —
+  // "reset" means start fresh, not replay the same message again.
   const resetConversation = async () => {
     if (active && activePublicId) {
       await archiveConversation({
@@ -365,7 +481,7 @@ export function DockBody({
       }).catch(() => {})
     }
     setActivePublicId(null)
-    setActive((a) => (a ? { ...a, autoStart: true } : a))
+    setActive((a) => (a ? { ...a, autoStart: false } : a))
     setResetKey((k) => k + 1)
   }
 
@@ -404,8 +520,8 @@ export function DockBody({
       const newTitle = data?.title ?? title
       setConversations((prev) =>
         prev.map((c) =>
-          c.public_id === r.publicId ? { ...c, title: newTitle } : c,
-        ),
+          c.public_id === r.publicId ? { ...c, title: newTitle } : c
+        )
       )
       toast.success('Chat renamed')
       setPendingRename(null)
@@ -417,7 +533,6 @@ export function DockBody({
   }
 
   const isPage = layout === 'page'
-  const [railOpen, setRailOpen] = useState(true)
 
   // Dock -> `/chat`. The open conversation is handed over through the provider
   // so the full-screen view lands on the same thread rather than dumping the
@@ -435,7 +550,11 @@ export function DockBody({
         },
       })
     }
-    navigate('/chat')
+    navigate(
+      activePublicId
+        ? `/chat?chat=${encodeURIComponent(activePublicId)}`
+        : '/chat'
+    )
     onClose()
   }
   const inConversation = active !== null
@@ -492,275 +611,298 @@ export function DockBody({
           !isPage && 'contents'
         )}
       >
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 space-y-1">
-          <div className="flex items-center gap-2">
-            {isPage ? (
-              <button
-                type="button"
-                onClick={() => setRailOpen((v) => !v)}
-                className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
-                title={railOpen ? 'Hide chat list' : 'Show chat list'}
-              >
-                <PanelLeft className="h-4 w-4" />
-              </button>
-            ) : inConversation || picking ? (
-              <button
-                type="button"
-                onClick={inConversation ? backToList : () => setPicking(false)}
-                className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                aria-label="Back to all conversations"
-                title="All chats"
-              >
-                <ChevronLeft className="h-4 w-4" />
-              </button>
-            ) : (
-              <Sparkles className="h-5 w-5 text-primary" />
-            )}
-            {inConversation && active && (
-              <ContextAvatar
-                projectId={active.projectId}
-                projectName={active.projectName}
-                contextType={active.contextType}
-                className="size-7"
-              />
-            )}
-            <h2 className="min-w-0 truncate text-lg font-semibold">
-              {inConversation
-                ? (active?.title ?? 'AI chat')
-                : picking
-                  ? 'New project chat'
-                  : 'AI assistant'}
-            </h2>
-          </div>
-          {inConversation ? (
-            <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
-              <span>{sourceLabel}</span>
-              {href && (
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0 space-y-1">
+            <div className="flex items-center gap-2">
+              {isPage ? (
                 <button
                   type="button"
-                  onClick={() => goToSource(href)}
-                  className="inline-flex items-center gap-0.5 text-primary hover:underline"
+                  onClick={() => setRailOpen((v) => !v)}
+                  className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
+                  title={railOpen ? 'Hide chat list' : 'Show chat list'}
                 >
-                  View source
-                  <ExternalLink className="h-3 w-3" />
+                  <PanelLeft className="h-4 w-4" />
                 </button>
-              )}
-            </p>
-          ) : picking ? (
-            <p className="text-sm text-muted-foreground">
-              Choose a project to start a general chat about it.
-            </p>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              Resume any AI conversation across your projects, or start a new
-              chat for a project.
-            </p>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-0.5">
-          {!inConversation &&
-            !picking &&
-            (currentProject ? (
-              // On a project page: start a chat for it in one click, with a
-              // caret to pick a different project instead.
-              <div className="mr-1 flex items-center">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => startProjectChat(currentProject)}
-                  className="h-8 gap-1 rounded-r-none border-r-0"
-                  title={`New chat in ${currentProject.name}`}
+              ) : inConversation || picking ? (
+                <button
+                  type="button"
+                  onClick={
+                    inConversation ? backToList : () => setPicking(false)
+                  }
+                  className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  aria-label="Back to all conversations"
+                  title="All chats"
                 >
-                  <Plus className="h-4 w-4" />
-                  New chat
-                </Button>
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+              ) : (
+                <Sparkles className="h-5 w-5 text-primary" />
+              )}
+              {inConversation && active && (
+                <ContextAvatar
+                  projectId={active.projectId}
+                  projectName={active.projectName}
+                  contextType={active.contextType}
+                  className="size-7"
+                />
+              )}
+              <h2 className="min-w-0 truncate text-lg font-semibold">
+                {inConversation
+                  ? (active?.title ?? 'AI chat')
+                  : picking
+                    ? 'New project chat'
+                    : 'AI assistant'}
+              </h2>
+            </div>
+            {inConversation ? (
+              <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
+                <span>{sourceLabel}</span>
+                {href && (
+                  <button
+                    type="button"
+                    onClick={() => goToSource(href)}
+                    className="inline-flex items-center gap-0.5 text-primary hover:underline"
+                  >
+                    View source
+                    <ExternalLink className="h-3 w-3" />
+                  </button>
+                )}
+              </p>
+            ) : picking ? (
+              <p className="text-sm text-muted-foreground">
+                Choose a project to start a general chat about it.
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Resume any AI conversation across your projects, or start a new
+                chat for a project.
+              </p>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-0.5">
+            {!inConversation &&
+              !picking &&
+              (currentProject ? (
+                // On a project page: start a chat for it in one click, with a
+                // caret to pick a different project instead.
+                <div className="mr-1 flex items-center">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => startProjectChat(currentProject)}
+                    className="h-8 gap-1 rounded-r-none border-r-0"
+                    title={`New chat in ${currentProject.name}`}
+                  >
+                    <Plus className="h-4 w-4" />
+                    New chat
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setPicking(true)}
+                    className="h-8 rounded-l-none px-1.5"
+                    title="New chat in another project"
+                    aria-label="New chat in another project"
+                  >
+                    <ChevronDown className="h-4 w-4" />
+                  </Button>
+                </div>
+              ) : (
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={() => setPicking(true)}
-                  className="h-8 rounded-l-none px-1.5"
-                  title="New chat in another project"
-                  aria-label="New chat in another project"
+                  className="mr-1 h-8 gap-1"
                 >
-                  <ChevronDown className="h-4 w-4" />
+                  <Plus className="h-4 w-4" />
+                  New chat
                 </Button>
-              </div>
-            ) : (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setPicking(true)}
-                className="mr-1 h-8 gap-1"
+              ))}
+            {!isPage && (
+              <button
+                type="button"
+                onClick={goFullScreen}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="Open full screen"
+                aria-label="Open chat full screen"
+              >
+                <Maximize2 className="h-4 w-4" />
+              </button>
+            )}
+            {inConversation && active && (
+              <button
+                type="button"
+                onClick={() =>
+                  startProjectChat({
+                    id: active.projectId,
+                    slug: active.projectSlug,
+                    name: active.projectName ?? 'Project',
+                  })
+                }
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="New chat"
+                aria-label="New chat"
               >
                 <Plus className="h-4 w-4" />
-                New chat
-              </Button>
-            ))}
-          {!isPage && (
+              </button>
+            )}
+            {inConversation && (
+              <button
+                type="button"
+                onClick={resetConversation}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="Reset — archive this chat and start a new blank one"
+                aria-label="Reset conversation"
+              >
+                <RotateCcw className="h-4 w-4" />
+              </button>
+            )}
+            {inConversation && activePublicId && (
+              <button
+                type="button"
+                onClick={() =>
+                  setPendingDelete({
+                    projectId: active!.projectId,
+                    publicId: activePublicId,
+                    title: active!.title ?? 'this chat',
+                  })
+                }
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+                title="Delete this chat"
+                aria-label="Delete conversation"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            )}
             <button
               type="button"
-              onClick={goFullScreen}
+              onClick={onClose}
               className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              title="Open full screen"
-              aria-label="Open chat full screen"
+              aria-label="Close AI assistant"
             >
-              <Maximize2 className="h-4 w-4" />
+              <X className="h-4 w-4" />
             </button>
-          )}
-          {inConversation && (
-            <button
-              type="button"
-              onClick={resetConversation}
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              title="Reset — archive this chat and start a new one"
-              aria-label="Reset conversation"
-            >
-              <RotateCcw className="h-4 w-4" />
-            </button>
-          )}
-          {inConversation && activePublicId && (
-            <button
-              type="button"
-              onClick={() =>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1">
+          {inConversation ? (
+            <DebugChatPanel
+              key={`${active!.contextType}:${active!.contextId}:${resetKey}`}
+              projectId={active!.projectId}
+              contextType={active!.contextType}
+              contextId={active!.contextId}
+              startPrompt={
+                active!.startPrompt ??
+                'Diagnose this and suggest concrete next steps.'
+              }
+              autoStart={active!.autoStart}
+              lazyCreate={active!.contextType === 'project'}
+              emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
+              placeholder={
+                active!.contextType === 'project'
+                  ? 'Ask about this project…'
+                  : 'Ask a follow-up…'
+              }
+              onConversationChange={handleConversationChange}
+            />
+          ) : picking ? (
+            <ProjectPicker onSelect={startProjectChat} />
+          ) : (
+            <ConversationList
+              loading={loadingList}
+              conversations={conversations}
+              onOpen={openConversation}
+              onOpenSource={(c) => {
+                const h = sourceHref({
+                  contextType: c.context_type,
+                  contextId: c.context_id,
+                  projectSlug: c.project_slug ?? undefined,
+                })
+                if (h) goToSource(h)
+              }}
+              onRename={startRename}
+              onDelete={(c) =>
                 setPendingDelete({
-                  projectId: active!.projectId,
-                  publicId: activePublicId,
-                  title: active!.title ?? 'this chat',
+                  projectId: c.project_id,
+                  publicId: c.public_id,
+                  title:
+                    c.title ??
+                    `${metaFor(c.context_type).label} ${c.context_id}`,
                 })
               }
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-              title="Delete this chat"
-              aria-label="Delete conversation"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            aria-label="Close AI assistant"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1">
-        {inConversation ? (
-          <DebugChatPanel
-            key={`${active!.contextType}:${active!.contextId}:${resetKey}`}
-            projectId={active!.projectId}
-            contextType={active!.contextType}
-            contextId={active!.contextId}
-            startPrompt={
-              active!.startPrompt ??
-              'Diagnose this and suggest concrete next steps.'
-            }
-            autoStart={active!.autoStart}
-            lazyCreate={active!.contextType === 'project'}
-            emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
-            placeholder={
-              active!.contextType === 'project'
-                ? 'Ask about this project…'
-                : 'Ask a follow-up…'
-            }
-            onConversationChange={setActivePublicId}
-          />
-        ) : picking ? (
-          <ProjectPicker onSelect={startProjectChat} />
-        ) : (
-          <ConversationList
-            loading={loadingList}
-            conversations={conversations}
-            onOpen={openConversation}
-            onOpenSource={(c) => {
-              const h = sourceHref({
-                contextType: c.context_type,
-                contextId: c.context_id,
-                projectSlug: c.project_slug ?? undefined,
-              })
-              if (h) goToSource(h)
-            }}
-            onRename={startRename}
-            onDelete={(c) =>
-              setPendingDelete({
-                projectId: c.project_id,
-                publicId: c.public_id,
-                title:
-                  c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
-              })
-            }
-          />
-        )}
-      </div>
-
-      <AlertDialog
-        open={pendingDelete !== null}
-        onOpenChange={(o) => !o && setPendingDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this chat?</AlertDialogTitle>
-            <AlertDialogDescription>
-              “{pendingDelete?.title}” will be removed from your list. This
-              can&apos;t be undone from here.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={confirmDelete}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <Dialog
-        open={pendingRename !== null}
-        onOpenChange={(o) => !o && setPendingRename(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Rename chat</DialogTitle>
-            <DialogDescription>
-              Give this conversation a name so it&apos;s easy to find later.
-            </DialogDescription>
-          </DialogHeader>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              void confirmRename()
-            }}
-          >
-            <Input
-              autoFocus
-              value={renameValue}
-              maxLength={200}
-              placeholder="e.g. Prod memory tuning"
-              onChange={(e) => setRenameValue(e.target.value)}
             />
-            <DialogFooter className="mt-4">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setPendingRename(null)}
+          )}
+        </div>
+
+        <AlertDialog
+          open={pendingDelete !== null}
+          onOpenChange={(o) => !o && setPendingDelete(null)}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete this chat?</AlertDialogTitle>
+              <AlertDialogDescription>
+                “{pendingDelete?.title}” will be removed from your list. This
+                can&apos;t be undone from here.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={confirmDelete}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               >
-                Cancel
-              </Button>
-              <Button type="submit" disabled={!renameValue.trim() || renaming}>
-                {renaming && <Loader2 className="h-4 w-4 animate-spin" />}
-                Save
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+                Delete
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <Dialog
+          open={pendingRename !== null}
+          onOpenChange={(o) => !o && setPendingRename(null)}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Rename chat</DialogTitle>
+              <DialogDescription>
+                Give this conversation a name so it&apos;s easy to find later.
+              </DialogDescription>
+            </DialogHeader>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                void confirmRename()
+              }}
+            >
+              <Input
+                autoFocus
+                value={renameValue}
+                maxLength={200}
+                placeholder="e.g. Prod memory tuning"
+                onChange={(e) => setRenameValue(e.target.value)}
+              />
+              <DialogFooter className="mt-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setPendingRename(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={!renameValue.trim() || renaming}
+                >
+                  {renaming && <Loader2 className="h-4 w-4 animate-spin" />}
+                  Save
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   )
@@ -1052,8 +1194,8 @@ function ProjectPicker({
           ))}
           {truncated && (
             <p className="px-2 pt-1 text-xs text-muted-foreground">
-              Showing the 100 most recent projects. If you don't see yours, open
-              it and start the chat from there.
+              Showing the 100 most recent projects. If you don&apos;t see yours,
+              open it and start the chat from there.
             </p>
           )}
         </div>

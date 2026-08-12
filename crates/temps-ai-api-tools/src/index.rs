@@ -707,7 +707,14 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
     let mut params = Vec::new();
     for (prop_name, prop_schema) in &obj.properties {
         let required = obj.required.contains(prop_name);
-        let (ty, enum_values) = extract_type_and_enum(Some(prop_schema));
+        // Body fields are frequently `$ref`s to scalar enum components. Resolve
+        // them before extracting their type; treating a string enum as an opaque
+        // object makes the CLI tell the model to JSON-encode a value that the API
+        // actually expects as a plain string.
+        let (ty, enum_values) = match deref_schema(prop_schema, openapi) {
+            Some(schema) => extract_schema_type_and_enum(schema),
+            None => ("string".to_string(), vec![]),
+        };
         let object_shape =
             resolve_object_shape(prop_schema, openapi).filter(ObjectShape::is_informative);
 
@@ -916,8 +923,11 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
         return ("string".to_string(), vec![]);
     };
 
-    let Schema::Object(obj) = ref_or.as_schema() else {
-        // RefOr::Ref or a non-Object schema — cannot introspect safely.
+    extract_schema_type_and_enum(ref_or.as_schema())
+}
+
+fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
+    let Schema::Object(obj) = schema else {
         return ("string".to_string(), vec![]);
     };
 
@@ -1124,12 +1134,27 @@ mod tests {
                             .build(),
                     )),
                 )
+                .property(
+                    "service_type",
+                    RefOr::Ref(utoipa::openapi::schema::Ref::from_schema_name(
+                        "ServiceType",
+                    )),
+                )
                 .required("name")
+                .required("service_type")
+                .build(),
+        );
+
+        let service_type_schema = Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Type(Type::String))
+                .enum_values(Some(["postgres", "redis"]))
                 .build(),
         );
 
         let components = ComponentsBuilder::new()
             .schema("CreateProjectRequest", RefOr::T(create_req_schema))
+            .schema("ServiceType", RefOr::T(service_type_schema))
             .build();
 
         // POST /projects — body is a $ref to CreateProjectRequest
@@ -1463,6 +1488,14 @@ mod tests {
             .expect("description param");
         assert!(!desc_param.required, "description should be optional");
         assert_eq!(desc_param.ty, "string");
+
+        let service_type = body_params
+            .iter()
+            .find(|p| p.name == "service_type")
+            .expect("service_type param");
+        assert!(service_type.required);
+        assert_eq!(service_type.ty, "string");
+        assert_eq!(service_type.enum_values, vec!["postgres", "redis"]);
     }
 
     #[test]

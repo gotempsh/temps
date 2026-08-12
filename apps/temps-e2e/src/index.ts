@@ -35,6 +35,7 @@ import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
 import { markdownCommand } from './commands/markdown.ts'
+import { aiChatPromptsCommand } from './commands/ai-chat-prompts.ts'
 
 const program = new Command()
 
@@ -69,6 +70,16 @@ program
       process.stdout.write(`OK — connected. ${data.total ?? 0} project(s) visible.\n`)
     }
   })
+
+program
+  .command('ai-chat-prompts')
+  .description(
+    'Print the provider-neutral AI chat acceptance prompts, expected tool actions, assertions, and cleanup steps',
+  )
+  .option('--category <category>', 'filter by read, service, linking, routing, domain, permissions, or runtime')
+  .option('--destructive-only', 'show only prompts that create or change infrastructure')
+  .option('--json', 'machine-readable prompt catalog')
+  .action(aiChatPromptsCommand)
 
 program
   .command('load')

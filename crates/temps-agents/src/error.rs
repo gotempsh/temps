@@ -37,6 +37,9 @@ pub enum AgentError {
         stderr: String,
     },
 
+    #[error("AI CLI '{provider}' reported an error: {message}")]
+    AiCliReportedError { provider: String, message: String },
+
     #[error("AI CLI '{provider}' timed out after {timeout_secs} seconds")]
     AiCliTimeout { provider: String, timeout_secs: u64 },
 

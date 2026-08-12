@@ -75,6 +75,7 @@ members = [
     "crates/temps-embeddings",
     "crates/temps-plugin-sdk",
     "crates/temps-wireguard",
+    "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
     "crates/temps-agents",
     "crates/temps-agents-mcp-proxy",

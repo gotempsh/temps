@@ -19,6 +19,17 @@ pub struct Model {
     pub max_cost_per_month_microcents: Option<i64>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// Routing preference for this scope: `"gateway"` (BYOK, default) or
+    /// `"agent_cli"` (subscription-backed CLI via ADR-037).
+    pub provider_type: String,
+    /// Catalog id of the agent CLI to use when `provider_type = "agent_cli"`.
+    /// `NULL` when `provider_type = "gateway"`.
+    pub agent_cli_provider_id: Option<String>,
+    /// When `true` (and `provider_type = "agent_cli"`, `agent_cli_provider_id = "claude_cli"`),
+    /// `ConversationService` uses the long-lived `--permission-prompt-tool stdio` interactive
+    /// path instead of the one-shot `--dangerously-skip-permissions` path (ADR-038 Phase 2).
+    /// Opt-in: defaults to `false` so existing deployments are unaffected.
+    pub interactive_bridge_enabled: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
