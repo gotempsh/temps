@@ -2558,6 +2558,31 @@ mod resolve_customer_io_timeout_tests {
         );
     }
 
+    /// Same guarantee as above, but for the SSE and WebSocket arms — each
+    /// traffic kind reads a different `DeploymentConfig` field, so the ceiling
+    /// clamp needs to be proven for all three, not just HTTP.
+    #[test]
+    fn global_hard_ceiling_wins_over_an_explicit_override_for_sse_and_websocket() {
+        let config = DeploymentConfig {
+            sse_idle_timeout_seconds: Some(9000),
+            websocket_idle_timeout_seconds: Some(9000),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
     #[test]
     fn global_hard_ceiling_also_clamps_the_unconfigured_default() {
         let config = DeploymentConfig::default();

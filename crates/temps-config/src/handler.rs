@@ -2261,11 +2261,32 @@ mod tests {
 
     #[test]
     fn request_timeouts_zero_default_is_rejected() {
-        let timeouts = RequestTimeoutSettings {
+        let sse_zero = RequestTimeoutSettings {
             default_sse_idle_timeout_seconds: 0,
             ..RequestTimeoutSettings::default()
         };
-        assert!(validate_request_timeouts(&timeouts).is_err());
+        assert!(
+            validate_request_timeouts(&sse_zero).is_err(),
+            "zero SSE default should be rejected"
+        );
+
+        let http_zero = RequestTimeoutSettings {
+            default_http_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&http_zero).is_err(),
+            "zero HTTP default should be rejected"
+        );
+
+        let websocket_zero = RequestTimeoutSettings {
+            default_websocket_idle_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&websocket_zero).is_err(),
+            "zero WebSocket default should be rejected"
+        );
     }
 
     #[test]
