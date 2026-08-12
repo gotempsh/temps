@@ -30,7 +30,6 @@ import {
 import { dropErrorMessage } from '@/lib/drop-files'
 import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
 import { cn } from '@/lib/utils'
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Loader2, UploadCloud, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -79,7 +78,6 @@ function stageLabel(
  */
 export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const navigate = useNavigate()
-  const reduceMotion = useReducedMotion()
   const [files, setFiles] = useState<DropFile[]>([])
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<Stage>('idle')
@@ -101,9 +99,6 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const hasRootIndex = htmlPages.some((p) => p.toLowerCase() === 'index.html')
   const isArchive = files.length === 1 && isDropArchive(files[0].file.name)
   const candidate = inspection?.candidates[Number(candidateIndex)]
-  const transition = reduceMotion
-    ? { duration: 0 }
-    : { duration: 0.32, ease: [0.22, 1, 0.36, 1] as const }
 
   // Environments are needed before the first deploy; production is the sane
   // default so the common case is zero clicks.
@@ -292,31 +287,18 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
       </header>
 
       <div className="grid gap-6">
-        <AnimatePresence mode="wait" initial={false}>
+        <>
           {files.length === 0 ? (
-            <motion.div
-              key="drop-target"
-              initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: reduceMotion ? 1 : 0.985 }}
-              transition={transition}
-            >
+            <div className="animate-in fade-in-0 zoom-in-95 motion-reduce:animate-none">
               <DropZone
                 files={files}
                 onSelect={select}
                 onError={setError}
                 disabled={isBusy}
               />
-            </motion.div>
+            </div>
           ) : (
-            <motion.aside
-              key="configuration"
-              initial={{ opacity: 0, x: reduceMotion ? 0 : 18 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: reduceMotion ? 0 : -12 }}
-              transition={transition}
-              className="relative flex min-h-[28rem] flex-col rounded-[2rem] border bg-card p-6 shadow-sm sm:p-7"
-            >
+            <aside className="relative flex min-h-[28rem] animate-in flex-col rounded-[2rem] border bg-card p-6 shadow-sm fade-in-0 motion-reduce:animate-none sm:p-7">
               <button
                 type="button"
                 className="absolute right-5 top-5 z-10 rounded-full border bg-background p-2 text-muted-foreground transition-colors hover:text-foreground"
@@ -461,9 +443,9 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                 )}
                 {stageLabel(stage, candidate?.label, files.length > 0)}
               </Button>
-            </motion.aside>
+            </aside>
           )}
-        </AnimatePresence>
+        </>
       </div>
     </div>
   )

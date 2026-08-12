@@ -80,7 +80,7 @@ temp-dir = "0.2"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = { workspace = true }
-tower = "0.4"
+tower = "0.5"
 anyhow = "1.0"
 lazy_static = "1.4"
 temps-presets = { path = "../temps-presets" }

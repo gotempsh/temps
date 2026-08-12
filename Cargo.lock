@@ -328,7 +328,7 @@ dependencies = [
  "nom 7.1.3",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -416,9 +416,9 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -470,7 +470,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "toml 0.8.23",
  "tracing",
  "walkdir",
@@ -512,7 +512,7 @@ dependencies = [
  "num-traits",
  "pastey",
  "rayon",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "v_frame",
  "y4m",
 ]
@@ -915,7 +915,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
+ "tower",
  "tracing",
 ]
 
@@ -1098,8 +1098,8 @@ dependencies = [
  "sha1 0.10.6",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
- "tower 0.5.3",
+ "tokio-tungstenite 0.29.0",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -1160,7 +1160,7 @@ dependencies = [
  "serde_urlencoded",
  "smallvec",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "url",
 ]
 
@@ -1220,9 +1220,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -1398,7 +1398,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-stream",
@@ -1533,7 +1533,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "simdutf8",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "uuid",
 ]
@@ -1686,7 +1686,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1700,7 +1700,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1849,9 +1849,9 @@ checksum = "93a719913643003b84bd13022b4b7e703c09342cd03b679c4641c7d2e50dc34d"
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1859,9 +1859,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1909,7 +1909,7 @@ dependencies = [
  "polonius-the-crab",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -1935,7 +1935,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30a5efddc880ce9e2573bd867413d9056fa2bea0206af88dec21e72178b9dc74"
 dependencies = [
  "bytes",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1951,7 +1951,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_with",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "url",
  "urlencoding",
  "uuid",
@@ -1969,7 +1969,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_with",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "url",
  "urlencoding",
  "uuid",
@@ -2678,7 +2678,7 @@ dependencies = [
  "parking_lot",
  "ring",
  "socket2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
  "uniffi",
  "untrusted 0.9.0",
@@ -2704,7 +2704,7 @@ dependencies = [
  "netlink-sys",
  "regex",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "windows 0.62.2",
  "wireguard-nt",
  "x25519-dalek 3.0.0",
@@ -3267,7 +3267,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "typetag",
  "uuid",
 ]
@@ -3918,8 +3918,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.19",
- "tungstenite",
+ "thiserror 2.0.20",
+ "tungstenite 0.29.0",
  "ureq",
  "url",
  "walkdir",
@@ -3969,7 +3969,7 @@ dependencies = [
  "ipnet",
  "jni",
  "rand 0.10.2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tinyvec",
  "tokio",
  "tracing",
@@ -3991,7 +3991,7 @@ dependencies = [
  "rand 0.10.2",
  "ring",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "url",
@@ -4018,7 +4018,7 @@ dependencies = [
  "resolv-conf",
  "smallvec",
  "system-configuration",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -4039,7 +4039,7 @@ dependencies = [
  "ipnet",
  "prefix-trie",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -4204,6 +4204,16 @@ name = "http-range-header"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
+name = "http-serde"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f056c8559e3757392c8d091e796416e4649d8e49e88b8d76df6c002f05027fd"
+dependencies = [
+ "http 1.5.0",
+ "serde",
+]
 
 [[package]]
 name = "httparse"
@@ -4663,7 +4673,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -4724,9 +4734,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 dependencies = [
  "serde",
 ]
@@ -4803,7 +4813,7 @@ dependencies = [
  "jni-sys",
  "log",
  "simd_cesu8",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "walkdir",
  "windows-link",
 ]
@@ -4886,7 +4896,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -4910,7 +4920,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -4964,12 +4974,12 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "lettre"
-version = "0.11.22"
+version = "0.11.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
+checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "email-encoding",
  "email_address",
  "fastrand",
@@ -5157,7 +5167,7 @@ dependencies = [
  "mime",
  "precomputed-hash",
  "selectors 0.37.0",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5338,7 +5348,7 @@ dependencies = [
  "ipnetwork",
  "memchr",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5451,7 +5461,7 @@ dependencies = [
  "prost 0.13.5",
  "range-map",
  "scroll",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "uuid",
@@ -5628,7 +5638,7 @@ dependencies = [
  "stringprep",
  "strsim",
  "take_mut",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -5758,9 +5768,9 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-core"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3463cbb78394cb0141e2c926b93fc2197e473394b761986eca3b9da2c63ae0f4"
+checksum = "b897d7bd4f0af82e68d40d0344cf37e97f9c97ddf74a098de3e4da05e96ca395"
 dependencies = [
  "paste",
 ]
@@ -5806,7 +5816,7 @@ checksum = "3176f18d11a1ae46053e59ec89d46ba318ae1343615bd3f8c908bfc84edae35c"
 dependencies = [
  "byteorder",
  "pastey",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5833,7 +5843,7 @@ dependencies = [
  "log",
  "netlink-packet-core",
  "netlink-sys",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6156,9 +6166,9 @@ dependencies = [
 
 [[package]]
 name = "octocrab"
-version = "0.49.9"
+version = "0.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ddbc3bb87e8c680febf16f56855bbd8b44a38e18c913334213ab34908e71a09"
+checksum = "432fad6f447c52acda76a7a0660f022b21f4c42f373bbdc29f04332ba19a89bf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6167,21 +6177,21 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "cfg-if",
  "chrono",
- "either",
  "futures",
  "futures-util",
  "getrandom 0.2.17",
  "http 1.5.0",
  "http-body 1.0.1",
  "http-body-util",
+ "http-serde",
  "hyper",
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
  "jsonwebtoken 10.4.0",
- "once_cell",
  "percent-encoding",
  "pin-project",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -6189,8 +6199,8 @@ dependencies = [
  "serde_urlencoded",
  "snafu",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tracing",
  "url",
  "web-time",
@@ -6355,7 +6365,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -6383,7 +6393,7 @@ dependencies = [
  "opentelemetry",
  "percent-encoding",
  "rand 0.9.4",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6574,6 +6584,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
  "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
  "serde_core",
 ]
 
@@ -7581,7 +7601,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "web-time",
@@ -7602,7 +7622,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "web-time",
@@ -7770,7 +7790,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "simd_helpers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "v_frame",
  "wasm-bindgen",
 ]
@@ -7828,7 +7848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
  "aws-lc-rs",
- "pem",
+ "pem 3.0.6",
  "ring",
  "rustls-pki-types",
  "time",
@@ -7890,7 +7910,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7957,7 +7977,7 @@ dependencies = [
  "relay-common",
  "relay-protocol",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8020,7 +8040,7 @@ dependencies = [
  "sentry-release-parser",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "url",
  "uuid",
 ]
@@ -8046,7 +8066,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "unicase",
  "uuid",
 ]
@@ -8108,8 +8128,8 @@ dependencies = [
  "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -8145,8 +8165,8 @@ dependencies = [
  "serde_json",
  "sync_wrapper",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -8160,7 +8180,7 @@ version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94070964579245eb2f76e62a7668fe87bd9969ed6c41256f3bf614e3323dd3cc"
 dependencies = [
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8355,7 +8375,7 @@ dependencies = [
  "http 1.5.0",
  "mime",
  "rand 0.9.4",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8671,7 +8691,7 @@ dependencies = [
  "serde_json",
  "sqlx 0.8.6",
  "strum",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "url",
@@ -8771,7 +8791,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8920,7 +8940,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "url",
  "uuid",
@@ -9294,7 +9314,7 @@ checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -9501,7 +9521,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-stream",
@@ -9538,7 +9558,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -9617,7 +9637,7 @@ dependencies = [
  "sqlx-postgres 0.9.0",
  "sqlx-sqlite 0.9.0",
  "syn 2.0.117",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]
@@ -9662,7 +9682,7 @@ dependencies = [
  "smallvec",
  "sqlx-core 0.8.6",
  "stringprep",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "uuid",
@@ -9691,7 +9711,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sqlx-core 0.9.0",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -9731,7 +9751,7 @@ dependencies = [
  "smallvec",
  "sqlx-core 0.8.6",
  "stringprep",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "uuid",
@@ -9768,7 +9788,7 @@ dependencies = [
  "smallvec",
  "sqlx-core 0.9.0",
  "stringprep",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
  "whoami 2.1.2",
 ]
@@ -9793,7 +9813,7 @@ dependencies = [
  "serde",
  "serde_urlencoded",
  "sqlx-core 0.8.6",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "url",
@@ -9819,7 +9839,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sqlx-core 0.9.0",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
  "url",
 ]
@@ -10094,11 +10114,11 @@ dependencies = [
  "temps-deployer",
  "temps-dns-resolver",
  "temps-network",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",
@@ -10144,7 +10164,7 @@ dependencies = [
  "temps-git",
  "temps-notifications",
  "temps-vm-agent",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10168,7 +10188,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -10188,9 +10208,9 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -10204,7 +10224,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "futures-util",
@@ -10219,7 +10239,7 @@ dependencies = [
  "temps-entities",
  "temps-git",
  "temps-logs",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10248,10 +10268,10 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -10277,7 +10297,7 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -10298,7 +10318,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -10327,9 +10347,9 @@ dependencies = [
  "temps-migrations",
  "temps-proxy",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -10352,7 +10372,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10375,7 +10395,7 @@ dependencies = [
  "temps-entities",
  "temps-geo",
  "temps-routes",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10390,7 +10410,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "flate2",
  "sea-orm",
@@ -10401,7 +10421,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-routes",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10424,7 +10444,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-geo",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -10440,7 +10460,7 @@ dependencies = [
  "axum",
  "axum-macros",
  "base32",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cookie",
  "hex",
@@ -10459,11 +10479,11 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-migrations",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "totp-rs",
- "tower 0.5.3",
+ "tower",
  "tower-cookies",
  "tracing",
  "urlencoding",
@@ -10487,7 +10507,7 @@ dependencies = [
  "cron",
  "flate2",
  "futures",
- "pem",
+ "pem 4.0.0",
  "sea-orm",
  "serde",
  "serde_derive",
@@ -10506,7 +10526,7 @@ dependencies = [
  "temps-notifications",
  "temps-providers",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -10531,7 +10551,7 @@ dependencies = [
  "serde_json",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -10566,10 +10586,10 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -10685,11 +10705,11 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -10706,7 +10726,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "config",
  "dirs",
@@ -10724,7 +10744,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -10741,7 +10761,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cookie",
  "futures",
@@ -10759,10 +10779,10 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "temps-memory",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "url",
  "utoipa",
@@ -10820,7 +10840,7 @@ dependencies = [
  "temps-core",
  "temps-dns",
  "temps-network",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tokio-util",
@@ -10886,12 +10906,12 @@ dependencies = [
  "temps-screenshots",
  "temps-vulnerability-scanner",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "urlencoding",
@@ -10908,7 +10928,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-macros",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "cloudflare 0.14.0",
  "futures",
@@ -10932,10 +10952,10 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -10957,7 +10977,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -10972,7 +10992,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-test",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -11004,11 +11024,11 @@ dependencies = [
  "temps-dns",
  "temps-entities",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -11024,7 +11044,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "dirs",
@@ -11049,10 +11069,10 @@ dependencies = [
  "tempfile",
  "temps-core",
  "temps-file-store",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "x25519-dalek 3.0.0",
@@ -11088,11 +11108,11 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-socks",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -11105,7 +11125,7 @@ version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "hex",
  "hmac 0.13.0",
@@ -11125,7 +11145,7 @@ dependencies = [
  "temps-email",
  "temps-entities",
  "temps-migrations",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -11141,7 +11161,7 @@ name = "temps-embeddings"
 version = "0.1.0-beta.55"
 dependencies = [
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tiktoken-rs",
  "tokenizers",
  "tokio",
@@ -11156,7 +11176,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "utoipa",
  "uuid",
 ]
@@ -11184,7 +11204,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11230,11 +11250,11 @@ dependencies = [
  "temps-projects",
  "temps-proxy",
  "temps-routes",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-test",
- "tower-http",
+ "tower-http 0.7.0",
  "tracing",
  "url",
  "utoipa",
@@ -11256,7 +11276,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-plugin-sdk",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11286,8 +11306,8 @@ dependencies = [
  "temps-entities",
  "temps-presets",
  "tokio",
- "tokio-tungstenite",
- "tower 0.5.3",
+ "tokio-tungstenite 0.30.0",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -11302,7 +11322,7 @@ dependencies = [
  "hex",
  "sha2 0.11.0",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -11325,7 +11345,7 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11349,7 +11369,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11362,7 +11382,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -11397,7 +11417,7 @@ dependencies = [
  "temps-entities",
  "temps-presets",
  "temps-queue",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11416,7 +11436,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -11427,7 +11447,7 @@ name = "temps-google-indexing-plugin"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "include_dir",
  "jsonwebtoken 11.0.0",
@@ -11439,7 +11459,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-plugin-sdk",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11478,7 +11498,7 @@ dependencies = [
  "temps-presets",
  "temps-projects",
  "temps-providers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11501,7 +11521,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11522,7 +11542,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11546,7 +11566,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -11567,7 +11587,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11588,7 +11608,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11599,7 +11619,7 @@ name = "temps-import-kubernetes"
 version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "reqwest 0.12.28",
  "sea-orm",
@@ -11611,7 +11631,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11632,7 +11652,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11647,7 +11667,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "utoipa",
  "validator",
 ]
@@ -11667,7 +11687,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-plugin-sdk",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -11694,7 +11714,7 @@ dependencies = [
  "temps-core",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
 ]
@@ -11723,9 +11743,9 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-providers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -11745,7 +11765,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-plugin-sdk",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11777,7 +11797,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -11801,7 +11821,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11812,7 +11832,7 @@ name = "temps-memory"
 version = "0.1.0-beta.55"
 dependencies = [
  "async-trait",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -11829,7 +11849,7 @@ dependencies = [
  "clickhouse",
  "libc",
  "mongodb",
- "pem",
+ "pem 4.0.0",
  "redis",
  "reqwest 0.12.28",
  "sea-orm",
@@ -11839,7 +11859,7 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -11880,7 +11900,7 @@ dependencies = [
  "temps-deployer",
  "temps-entities",
  "temps-metrics",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -11910,7 +11930,7 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -11937,10 +11957,10 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tower 0.4.13",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -11954,7 +11974,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "clickhouse",
  "http 1.5.0",
@@ -11971,7 +11991,7 @@ dependencies = [
  "temps-otel",
  "temps-proxy",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -12016,11 +12036,11 @@ dependencies = [
  "temps-migrations",
  "temps-monitoring",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "utoipa",
  "uuid",
@@ -12042,11 +12062,11 @@ dependencies = [
  "subtle",
  "tar",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite",
- "tower 0.5.3",
+ "tokio-tungstenite 0.30.0",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "utoipa",
@@ -12068,7 +12088,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
@@ -12116,7 +12136,7 @@ dependencies = [
  "temps-presets",
  "temps-providers",
  "temps-queue",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -12134,7 +12154,7 @@ dependencies = [
  "aws-smithy-runtime",
  "axum",
  "axum-macros",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -12172,7 +12192,7 @@ dependencies = [
  "temps-query-redis",
  "temps-query-s3",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
  "tokio-test",
@@ -12191,7 +12211,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clickhouse",
@@ -12247,10 +12267,10 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tower 0.4.13",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -12269,7 +12289,7 @@ dependencies = [
  "nix 0.31.3",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -12287,7 +12307,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -12306,7 +12326,7 @@ dependencies = [
  "serde_json",
  "temps-query",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -12322,7 +12342,7 @@ dependencies = [
  "serde_json",
  "temps-query",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -12343,7 +12363,7 @@ dependencies = [
  "serde_json",
  "temps-query",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -12365,7 +12385,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-query",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -12378,7 +12398,7 @@ dependencies = [
  "log",
  "serde",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -12391,7 +12411,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "csv",
@@ -12410,7 +12430,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-migrations",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -12452,7 +12472,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "flate2",
  "futures",
@@ -12470,11 +12490,11 @@ dependencies = [
  "temps-entities",
  "temps-git",
  "temps-pty-agent",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -12487,7 +12507,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "headless_chrome",
  "mockito",
  "reqwest 0.12.28",
@@ -12498,7 +12518,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -12543,7 +12563,7 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "temps-projects",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -12567,7 +12587,7 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-entities",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -12585,7 +12605,7 @@ dependencies = [
  "serde_json",
  "temps-config",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -12625,7 +12645,7 @@ dependencies = [
  "temps-entities",
  "temps-projects",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
  "tracing",
@@ -12654,10 +12674,10 @@ dependencies = [
  "temps-entities",
  "temps-queue",
  "testcontainers",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -12668,12 +12688,12 @@ dependencies = [
 name = "temps-wireguard"
 version = "0.1.0-beta.55"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "defguard_wireguard_rs",
  "serde",
  "serde_json",
  "temps-core",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "x25519-dalek 3.0.0",
@@ -12720,7 +12740,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -12747,11 +12767,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -12767,9 +12787,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12846,9 +12866,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.54"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "js-sys",
@@ -12958,7 +12978,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
@@ -13107,11 +13127,23 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "tokio",
+ "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
  "rustls",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite",
+ "tungstenite 0.30.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -13243,7 +13275,7 @@ dependencies = [
  "prost 0.13.5",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -13272,7 +13304,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -13300,21 +13332,6 @@ dependencies = [
  "hmac 0.12.1",
  "sha1 0.10.6",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "tower"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
-dependencies = [
- "futures-core",
- "futures-util",
- "pin-project",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -13360,6 +13377,25 @@ checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "bitflags 2.11.1",
  "bytes",
+ "futures-util",
+ "http 1.5.0",
+ "http-body 1.0.1",
+ "pin-project-lite",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytes",
  "futures-core",
  "futures-util",
  "http 1.5.0",
@@ -13373,11 +13409,9 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -13504,10 +13538,26 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
+ "sha1 0.10.6",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
+ "log",
+ "rand 0.10.2",
  "rustls",
  "rustls-pki-types",
- "sha1 0.10.6",
- "thiserror 2.0.19",
+ "sha1 0.11.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -15033,7 +15083,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
 ]
 

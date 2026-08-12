@@ -6219,7 +6219,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let validate_token = server
-            .mock("GET", "/user")
+            .mock("GET", "/rate_limit")
             .match_header("authorization", "Bearer owned-github-token")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -6378,7 +6378,7 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let validate_token = server
-            .mock("GET", "/user")
+            .mock("GET", "/rate_limit")
             .match_header("authorization", "Bearer test-access-token")
             .with_status(200)
             .with_header("content-type", "application/json")

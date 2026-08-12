@@ -68,10 +68,10 @@ jobs:
           - vite/react
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Check out the starters
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
         with:
           repository: gotempsh/temps-examples
           path: temps-examples
@@ -87,7 +87,7 @@ jobs:
           # evicts main's entry from the repository's single LRU pool.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build, run and serve
         env:
@@ -113,10 +113,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Check out the starters
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
         with:
           repository: gotempsh/temps-examples
           path: temps-examples
@@ -128,7 +128,7 @@ jobs:
           shared-key: starters
           save-if: false
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build, run and serve
         continue-on-error: true

@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/cli",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "description": "CLI for Temps deployment platform",
   "type": "module",
   "bin": {
@@ -21,6 +21,7 @@
     "generate:docs": "bun run scripts/generate-docs.ts",
     "generate:docs:mdx": "bun run scripts/generate-docs.ts --format mdx",
     "generate:docs:json": "bun run scripts/generate-docs.ts --format json",
+    "generate:skill-docs": "bun run src/index.ts docs --format markdown --output ../../skills/temps-cli/references/COMMANDS.md",
     "typecheck": "tsc --noEmit",
     "link": "bun link"
   },

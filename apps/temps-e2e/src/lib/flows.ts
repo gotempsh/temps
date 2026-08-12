@@ -47,7 +47,7 @@ import tls, { type TLSSocket } from 'node:tls'
 import { unwrap, normalizeApiUrl } from './client.ts'
 
 /** Terminal-success deployment states (see ADR / generated DeploymentResponse.state). */
-const DEPLOY_SUCCESS = new Set(['completed', 'succeeded', 'running', 'active'])
+const DEPLOY_SUCCESS = new Set(['completed', 'succeeded', 'active'])
 const DEPLOY_FAILED = new Set(['failed', 'cancelled', 'errored', 'error'])
 
 /**
