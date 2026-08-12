@@ -191,6 +191,9 @@ Update deployment configuration (resources, replicas)
 | `--memory-limit <limit>` | Memory limit in MB | - | No |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
+| `--request-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
+| `--sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
+| `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 

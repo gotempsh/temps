@@ -14,7 +14,11 @@ import {
   useConsoleExtensions,
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
-import { QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  QueryCache,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
@@ -281,6 +285,11 @@ const SecurityPage = lazy(() =>
 const RateLimitingPage = lazy(() =>
   import('./pages/settings/RateLimitingPage').then((m) => ({
     default: m.RateLimitingPage,
+  }))
+)
+const RequestTimeoutsPage = lazy(() =>
+  import('./pages/settings/RequestTimeoutsPage').then((m) => ({
+    default: m.RequestTimeoutsPage,
   }))
 )
 const DiskMonitoringPage = lazy(() =>
@@ -612,6 +621,10 @@ const FullAppRoutes = () => {
                         element={<BuildLimitsPage />}
                       />
                       <Route
+                        path="request-timeouts"
+                        element={<RequestTimeoutsPage />}
+                      />
+                      <Route
                         path="metrics-monitoring"
                         element={<MetricsMonitoringPage />}
                       />
@@ -921,7 +934,8 @@ const queryClient = new QueryClient({
       // to decide whether to show the login screen -- match it the same way.
       const problem = error as { title?: string } | null
       const isUnauthorized =
-        problem?.title === 'Authentication Required' || problem?.title === 'Unauthorized'
+        problem?.title === 'Authentication Required' ||
+        problem?.title === 'Unauthorized'
       if (!isUnauthorized) return
 
       // The current-user query already surfaces its own auth error straight

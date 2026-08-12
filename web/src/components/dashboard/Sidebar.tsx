@@ -204,6 +204,11 @@ const settingsGroups: SettingsGroupDef[] = [
         icon: Boxes,
       },
       { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
+      {
+        title: 'Request Timeouts',
+        url: '/settings/request-timeouts',
+        icon: Clock,
+      },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
     ],

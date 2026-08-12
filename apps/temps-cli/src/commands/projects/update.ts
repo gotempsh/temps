@@ -378,6 +378,9 @@ export async function updateConfigAction(
     cpuLimit?: string
     memoryLimit?: string
     autoDeploy?: boolean
+    requestTimeout?: string
+    sseIdleTimeout?: string
+    websocketIdleTimeout?: string
     json?: boolean
     yes?: boolean
   }
@@ -424,9 +427,23 @@ export async function updateConfigAction(
   let cpuLimit = options.cpuLimit ? parseFloat(options.cpuLimit) : undefined
   let memoryLimit = options.memoryLimit ? parseInt(options.memoryLimit, 10) : undefined
   let autoDeploy = options.autoDeploy
+  const requestTimeoutSeconds = options.requestTimeout ? parseInt(options.requestTimeout, 10) : undefined
+  const sseIdleTimeoutSeconds = options.sseIdleTimeout ? parseInt(options.sseIdleTimeout, 10) : undefined
+  const websocketIdleTimeoutSeconds = options.websocketIdleTimeout
+    ? parseInt(options.websocketIdleTimeout, 10)
+    : undefined
 
   // Only prompt if no flags provided AND not in automation mode
-  if (replicas === undefined && cpuLimit === undefined && memoryLimit === undefined && autoDeploy === undefined && !options.yes) {
+  if (
+    replicas === undefined &&
+    cpuLimit === undefined &&
+    memoryLimit === undefined &&
+    autoDeploy === undefined &&
+    requestTimeoutSeconds === undefined &&
+    sseIdleTimeoutSeconds === undefined &&
+    websocketIdleTimeoutSeconds === undefined &&
+    !options.yes
+  ) {
     newline()
     header('Update Deployment Configuration')
     info(`Deployment config for "${project.name}"`)
@@ -465,6 +482,9 @@ export async function updateConfigAction(
         cpuLimit: cpuLimit ?? undefined,
         memoryLimit: memoryLimit ?? undefined,
         automaticDeploy: autoDeploy ?? undefined,
+        requestTimeoutSeconds: requestTimeoutSeconds ?? undefined,
+        sseIdleTimeoutSeconds: sseIdleTimeoutSeconds ?? undefined,
+        websocketIdleTimeoutSeconds: websocketIdleTimeoutSeconds ?? undefined,
       },
     })
     if (error) {
@@ -483,4 +503,7 @@ export async function updateConfigAction(
   if (cpuLimit !== undefined) keyValue('CPU Limit', `${cpuLimit} cores`)
   if (memoryLimit !== undefined) keyValue('Memory Limit', `${memoryLimit} MB`)
   if (autoDeploy !== undefined) keyValue('Auto Deploy', autoDeploy ? colors.success('Enabled') : colors.muted('Disabled'))
+  if (requestTimeoutSeconds !== undefined) keyValue('Request Timeout', `${requestTimeoutSeconds}s`)
+  if (sseIdleTimeoutSeconds !== undefined) keyValue('SSE Idle Timeout', `${sseIdleTimeoutSeconds}s`)
+  if (websocketIdleTimeoutSeconds !== undefined) keyValue('WebSocket Idle Timeout', `${websocketIdleTimeoutSeconds}s`)
 }

@@ -1090,6 +1090,13 @@ export type AppSettings = {
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     /**
+     * Upstream request/connection timeouts applied by the proxy to customer
+     * app traffic. Provides a global hard ceiling plus global defaults for
+     * regular HTTP, SSE, and WebSocket traffic; projects and environments
+     * may set a shorter value but never exceed the ceiling here.
+     */
+    request_timeouts?: RequestTimeoutSettings;
+    /**
      * When `true`, any user holding the `Admin` role must have MFA enrolled
      * (`users.mfa_enabled = true`) to complete a **password** login. Users
      * without MFA enrolled are rejected with a typed error instructing them
@@ -1191,6 +1198,11 @@ export type AppSettingsResponse = {
      */
     proxy_port: number;
     rate_limiting: RateLimitSettings;
+    /**
+     * Upstream request/connection timeouts (hard ceiling + defaults) applied
+     * by the proxy to customer app traffic. No sensitive content.
+     */
+    request_timeouts: RequestTimeoutSettings;
     /**
      * When enabled, Admin-role accounts without MFA enrolled are rejected
      * at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
@@ -3983,6 +3995,17 @@ export type CreateSandboxBody = {
         [key: string]: string;
     };
     /**
+     * Create the sandbox from a snapshot (ADR-037).
+     *
+     * Mutually exclusive with `image`: if both are set the request fails
+     * with 400. When set, the sandbox is created with the snapshotted
+     * filesystem rather than a base image, giving users a reproducible
+     * starting point.
+     *
+     * The snapshot must be in `ready` status and belong to the calling user.
+     */
+    from_snapshot?: string | null;
+    /**
      * Docker image override. `null` uses the platform default.
      */
     image?: string | null;
@@ -4051,6 +4074,16 @@ export type CreateSlackProviderRequest = {
     config: SlackConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+/**
+ * Request body for `POST /v1/sandboxes/{id}/snapshots`.
+ */
+export type CreateSnapshotBody = {
+    /**
+     * Optional human-readable label for the snapshot.
+     */
+    label?: string | null;
 };
 
 export type CreateTeamMemberRequest = {
@@ -4598,11 +4631,27 @@ export type DeploymentConfig = {
      * Defaults to 1 replica
      */
     replicas?: number;
+    /**
+     * Override for the proxy's upstream timeout on regular (non-streaming)
+     * HTTP requests to this project/environment, in seconds.
+     * `None` = inherit the global `request_timeouts.default_http_timeout_seconds`.
+     * Always clamped to the global hard ceiling
+     * (`request_timeouts.max_request_timeout_seconds`) at resolution time,
+     * regardless of what's set here.
+     */
+    requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     /**
      * Enable session recording for analytics
      */
     sessionRecordingEnabled?: boolean;
+    /**
+     * Override for the proxy's idle timeout on Server-Sent Events streams to
+     * this project/environment, in seconds. `None` = inherit the global
+     * `request_timeouts.default_sse_idle_timeout_seconds`. Always clamped to
+     * the global hard ceiling at resolution time.
+     */
+    sseIdleTimeoutSeconds?: number | null;
     /**
      * Label selector for node-based scheduling. Replicas are only deployed to
      * nodes whose labels match the selector.
@@ -4628,6 +4677,13 @@ export type DeploymentConfig = {
      * Requests return 503 if exceeded. Default: 30.
      */
     wakeTimeoutSeconds?: number;
+    /**
+     * Override for the proxy's idle timeout on WebSocket connections to this
+     * project/environment, in seconds. `None` = inherit the global
+     * `request_timeouts.default_websocket_idle_timeout_seconds`. Always
+     * clamped to the global hard ceiling at resolution time.
+     */
+    websocketIdleTimeoutSeconds?: number | null;
 };
 
 /**
@@ -9453,6 +9509,16 @@ export type ListSkillsResponse = {
 };
 
 /**
+ * Paginated list of snapshots.
+ */
+export type ListSnapshotsResponse = {
+    page: number;
+    page_size: number;
+    snapshots: Array<SnapshotResponse>;
+    total: number;
+};
+
+/**
  * Response for listing tags
  */
 export type ListTagsResponse = {
@@ -13781,6 +13847,47 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+/**
+ * Upstream request/connection timeouts for customer app traffic.
+ *
+ * The proxy previously hardcoded these (60s for regular HTTP, 3600s for
+ * WebSocket upgrades) with no SSE-specific handling at all — an idle SSE
+ * stream got RST'd at the 60s HTTP default, since only the `Upgrade:
+ * websocket` header extended the timeout. This settings struct makes all
+ * three configurable while keeping the same defaults, so upgrading
+ * installs see no behavior change until an operator opts in — except the
+ * SSE default, which is the actual fix for the RST-on-idle bug.
+ *
+ * `max_request_timeout_seconds` is a hard ceiling: whatever a project or
+ * environment configures (`DeploymentConfig::request_timeout_seconds` /
+ * `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`) is always
+ * clamped to it, so lowering the ceiling here takes effect immediately
+ * without needing every environment row re-saved.
+ */
+export type RequestTimeoutSettings = {
+    /**
+     * Default timeout for regular (non-streaming) HTTP requests, in
+     * seconds. Used when a project/environment hasn't set
+     * `request_timeout_seconds`.
+     */
+    default_http_timeout_seconds?: number;
+    /**
+     * Default idle timeout for Server-Sent Events streams, in seconds. Used
+     * when a project/environment hasn't set `sse_idle_timeout_seconds`.
+     */
+    default_sse_idle_timeout_seconds?: number;
+    /**
+     * Default idle timeout for WebSocket connections, in seconds. Used when
+     * a project/environment hasn't set `websocket_idle_timeout_seconds`.
+     */
+    default_websocket_idle_timeout_seconds?: number;
+    /**
+     * Hard ceiling, in seconds. No project/environment override — and no
+     * resolved default — can exceed this value.
+     */
+    max_request_timeout_seconds?: number;
+};
+
 export type RequiredPasswordChangeRequest = {
     new_password: string;
 };
@@ -14980,12 +15087,13 @@ export type SelfUpdateAttempt = {
     from_version: string;
     /**
      * Number of database migrations that were successfully applied during
-     * this attempt. `None` if migrations were never reached (pre-swap failure).
+     * this attempt. Set at completion (success or migration failure). `None`
+     * if migrations were never reached (pre-swap failure).
      */
     migrations_applied?: number | null;
     /**
-     * Total number of database migrations that were planned. `None` if
-     * migrations were never reached (pre-swap failure).
+     * Total number of database migrations that were planned. Set at the same
+     * time as `migrations_applied`. `None` if migrations were never reached.
      */
     migrations_total?: number | null;
     /**
@@ -16232,6 +16340,22 @@ export type SmtpResult = {
     is_disabled: boolean;
 };
 
+/**
+ * Single snapshot as returned by the API.
+ */
+export type SnapshotResponse = {
+    backend: string;
+    content_digest: string;
+    created_at: string;
+    id: string;
+    image_ref?: string | null;
+    label?: string | null;
+    project_id?: number | null;
+    size_bytes: number;
+    status: string;
+    updated_at: string;
+};
+
 export type SourceArchiveUpload = {
     file: Blob | File;
 };
@@ -16923,6 +17047,31 @@ export type StorageQuota = {
     total_bytes: number;
     traces_bytes: number;
     usage_pct: number;
+};
+
+/**
+ * Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.
+ */
+export type StorageSummary = {
+    /**
+     * Available bytes on the snapshots filesystem, or `null` when the
+     * platform check is not yet implemented (deferred — see `available_disk_space()`).
+     * API consumers MUST treat `null` as "unknown" rather than "zero bytes
+     * available". A `Some(0)` would incorrectly block snapshot creation.
+     */
+    available_disk_bytes?: number | null;
+    /**
+     * Per-user quota in bytes.
+     */
+    quota_bytes: number;
+    /**
+     * Number of `ready` snapshots.
+     */
+    snapshot_count: number;
+    /**
+     * Total bytes used by all `ready` snapshots for this user.
+     */
+    total_bytes: number;
 };
 
 export type StripeConfig = {
@@ -17925,6 +18074,11 @@ export type UpdateCapabilityResponse = {
      */
     channel_is_pinned: boolean;
     /**
+     * Name of the migration currently running. `Some` while `phase` is
+     * `migrating` and a migration step is in flight.
+     */
+    current_migration_name?: string | null;
+    /**
      * Version tag of the running binary. Always present — the version page
      * needs it whether or not an update exists.
      */
@@ -17935,17 +18089,12 @@ export type UpdateCapabilityResponse = {
      */
     manual_command: string;
     /**
-     * Name of the migration currently running. Set while `phase` is `migrating`
-     * and a migration step is in flight.
-     */
-    current_migration_name?: string | null;
-    /**
-     * Number of migrations applied so far. Set while `phase` is `migrating`.
+     * Number of migrations applied so far. `Some` while `phase` is `migrating`.
      */
     migrations_applied?: number | null;
     /**
-     * Total migrations to be applied. Set once the migrate child has reported
-     * its first `started` event.
+     * Total migrations to be applied. `Some` once the migrate child has
+     * reported its first `started` event.
      */
     migrations_total?: number | null;
     /**
@@ -18015,8 +18164,29 @@ export type UpdateDeploymentConfigRequest = {
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
     replicas?: number | null;
+    /**
+     * Project-level default timeout for regular (non-streaming) HTTP
+     * requests, in seconds (1-86400). Environments may override this; always
+     * clamped to the operator's global hard ceiling regardless of what's set
+     * here. Absent leaves the current value unchanged.
+     */
+    requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
+    /**
+     * Project-level default idle timeout for Server-Sent Events streams, in
+     * seconds (1-86400). Environments may override this; always clamped to
+     * the operator's global hard ceiling. Absent leaves the current value
+     * unchanged.
+     */
+    sseIdleTimeoutSeconds?: number | null;
+    /**
+     * Project-level default idle timeout for WebSocket connections, in
+     * seconds (1-86400). Environments may override this; always clamped to
+     * the operator's global hard ceiling. Absent leaves the current value
+     * unchanged.
+     */
+    websocketIdleTimeoutSeconds?: number | null;
 };
 
 export type UpdateDeploymentTokenRequest = {
@@ -18164,11 +18334,26 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     protected?: boolean | null;
     replicas?: number | null;
+    /**
+     * Override the proxy's timeout for regular (non-streaming) HTTP requests
+     * to this environment, in seconds (1-86400). Always clamped to the
+     * operator's global hard ceiling regardless of what's set here.
+     * Absent leaves the current value unchanged. Send JSON `null` to clear
+     * the override (inherit the project/global default).
+     */
+    request_timeout_seconds?: number | null;
     security?: null | SecurityConfig;
     /**
      * Enable/disable session recording
      */
     session_recording_enabled?: boolean | null;
+    /**
+     * Override the proxy's idle timeout for Server-Sent Events streams to
+     * this environment, in seconds (1-86400). Always clamped to the
+     * operator's global hard ceiling. Absent leaves the current value
+     * unchanged. Send JSON `null` to clear the override.
+     */
+    sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
      * Same key with array value -> OR, different keys -> AND.
@@ -18183,6 +18368,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Max seconds to wait for containers to start on wake (5-120). Default: 30.
      */
     wake_timeout_seconds?: number | null;
+    /**
+     * Override the proxy's idle timeout for WebSocket connections to this
+     * environment, in seconds (1-86400). Always clamped to the operator's
+     * global hard ceiling. Absent leaves the current value unchanged. Send
+     * JSON `null` to clear the override.
+     */
+    websocket_idle_timeout_seconds?: number | null;
 };
 
 /**
@@ -49712,6 +49904,137 @@ export type RemoveRoleResponses = {
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
 
+export type ListSnapshotsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project
+         */
+        project_id?: number;
+        /**
+         * Filter by status
+         */
+        status?: string;
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Page size (max 100)
+         */
+        page_size?: number;
+    };
+    url: '/v1/sandbox-snapshots';
+};
+
+export type ListSnapshotsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type ListSnapshotsResponses = {
+    /**
+     * List of snapshots
+     */
+    200: ListSnapshotsResponse;
+};
+
+export type ListSnapshotsResponse2 = ListSnapshotsResponses[keyof ListSnapshotsResponses];
+
+export type StorageSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandbox-snapshots/storage-summary';
+};
+
+export type StorageSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type StorageSummaryResponses = {
+    /**
+     * Storage usage summary
+     */
+    200: StorageSummary;
+};
+
+export type StorageSummaryResponse = StorageSummaryResponses[keyof StorageSummaryResponses];
+
+export type DeleteSnapshotData = {
+    body?: never;
+    path: {
+        /**
+         * Snapshot public ID
+         */
+        snap_id: string;
+    };
+    query?: never;
+    url: '/v1/sandbox-snapshots/{snap_id}';
+};
+
+export type DeleteSnapshotErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DeleteSnapshotResponses = {
+    /**
+     * Snapshot deleted
+     */
+    204: void;
+};
+
+export type DeleteSnapshotResponse = DeleteSnapshotResponses[keyof DeleteSnapshotResponses];
+
+export type GetSnapshotData = {
+    body?: never;
+    path: {
+        /**
+         * Snapshot public ID
+         */
+        snap_id: string;
+    };
+    query?: never;
+    url: '/v1/sandbox-snapshots/{snap_id}';
+};
+
+export type GetSnapshotErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type GetSnapshotResponses = {
+    /**
+     * Snapshot detail
+     */
+    200: SnapshotResponse;
+};
+
+export type GetSnapshotResponse = GetSnapshotResponses[keyof GetSnapshotResponses];
+
 export type ListSandboxesData = {
     body?: never;
     path?: never;
@@ -50525,6 +50848,58 @@ export type ResumeSandboxResponses = {
 };
 
 export type ResumeSandboxResponse = ResumeSandboxResponses[keyof ResumeSandboxResponses];
+
+export type CreateSnapshotData = {
+    body: CreateSnapshotBody;
+    path: {
+        /**
+         * Sandbox public ID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/snapshots';
+};
+
+export type CreateSnapshotErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Quota exceeded or invalid state
+     */
+    422: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+    /**
+     * Snapshots not supported by backend
+     */
+    501: unknown;
+};
+
+export type CreateSnapshotResponses = {
+    /**
+     * Snapshot initiated
+     */
+    202: SnapshotResponse;
+};
+
+export type CreateSnapshotResponse = CreateSnapshotResponses[keyof CreateSnapshotResponses];
 
 export type SourceSandboxData = {
     body: SourceBody;

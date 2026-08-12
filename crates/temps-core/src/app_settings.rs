@@ -68,6 +68,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub ai_chat_limits: AiChatLimitsSettings,
 
+    /// Upstream request/connection timeouts applied by the proxy to customer
+    /// app traffic. Provides a global hard ceiling plus global defaults for
+    /// regular HTTP, SSE, and WebSocket traffic; projects and environments
+    /// may set a shorter value but never exceed the ceiling here.
+    #[serde(default)]
+    pub request_timeouts: RequestTimeoutSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -240,6 +247,83 @@ impl AiChatLimitsSettings {
             self.turn_timeout_secs
                 .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
         )
+    }
+}
+
+/// Upstream request/connection timeouts for customer app traffic.
+///
+/// The proxy previously hardcoded these (60s for regular HTTP, 3600s for
+/// WebSocket upgrades) with no SSE-specific handling at all — an idle SSE
+/// stream got RST'd at the 60s HTTP default, since only the `Upgrade:
+/// websocket` header extended the timeout. This settings struct makes all
+/// three configurable while keeping the same defaults, so upgrading
+/// installs see no behavior change until an operator opts in — except the
+/// SSE default, which is the actual fix for the RST-on-idle bug.
+///
+/// `max_request_timeout_seconds` is a hard ceiling: whatever a project or
+/// environment configures (`DeploymentConfig::request_timeout_seconds` /
+/// `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`) is always
+/// clamped to it, so lowering the ceiling here takes effect immediately
+/// without needing every environment row re-saved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct RequestTimeoutSettings {
+    /// Hard ceiling, in seconds. No project/environment override — and no
+    /// resolved default — can exceed this value.
+    #[schema(minimum = 5, maximum = 86400, example = 3600)]
+    pub max_request_timeout_seconds: u32,
+
+    /// Default timeout for regular (non-streaming) HTTP requests, in
+    /// seconds. Used when a project/environment hasn't set
+    /// `request_timeout_seconds`.
+    #[schema(minimum = 1, example = 60)]
+    pub default_http_timeout_seconds: u32,
+
+    /// Default idle timeout for Server-Sent Events streams, in seconds. Used
+    /// when a project/environment hasn't set `sse_idle_timeout_seconds`.
+    #[schema(minimum = 1, example = 3600)]
+    pub default_sse_idle_timeout_seconds: u32,
+
+    /// Default idle timeout for WebSocket connections, in seconds. Used when
+    /// a project/environment hasn't set `websocket_idle_timeout_seconds`.
+    #[schema(minimum = 1, example = 3600)]
+    pub default_websocket_idle_timeout_seconds: u32,
+}
+
+impl RequestTimeoutSettings {
+    /// Lower bound for `max_request_timeout_seconds`: below this, ordinary
+    /// requests to a slow-starting app would routinely fail.
+    pub const MIN_CEILING_SECS: u32 = 5;
+    /// Upper bound for `max_request_timeout_seconds`: a day-long single
+    /// upstream connection is already far past anything a proxy should hold
+    /// open.
+    pub const MAX_CEILING_SECS: u32 = 86400;
+
+    /// The configured ceiling, clamped to the supported range. Clamped
+    /// rather than trusted for the same reason as `AiChatLimitsSettings`:
+    /// the settings row is JSON any admin can write, and an unclamped 0
+    /// would mean "every request times out instantly".
+    pub fn ceiling(&self) -> u32 {
+        self.max_request_timeout_seconds
+            .clamp(Self::MIN_CEILING_SECS, Self::MAX_CEILING_SECS)
+    }
+
+    /// Clamp a resolved per-request timeout (already merged from
+    /// project/environment overrides or one of the defaults above) down to
+    /// the hard ceiling. The ceiling always wins.
+    pub fn clamp_to_ceiling(&self, seconds: u32) -> u32 {
+        seconds.min(self.ceiling())
+    }
+}
+
+impl Default for RequestTimeoutSettings {
+    fn default() -> Self {
+        Self {
+            max_request_timeout_seconds: 3600,
+            default_http_timeout_seconds: 60,
+            default_sse_idle_timeout_seconds: 3600,
+            default_websocket_idle_timeout_seconds: 3600,
+        }
     }
 }
 
@@ -915,6 +999,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             ai_chat_limits: AiChatLimitsSettings::default(),
+            request_timeouts: RequestTimeoutSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
@@ -1487,6 +1572,71 @@ mod tests {
         let parsed = AppSettings::from_json(settings.to_json());
         assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
         assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
+    }
+
+    #[test]
+    fn request_timeouts_default_matches_previously_hardcoded_proxy_values() {
+        // Regular HTTP and WebSocket defaults must match what the proxy used
+        // to hardcode, so upgrading installs see zero behavior change until
+        // an operator opts in. SSE previously had no dedicated timeout at
+        // all (it fell through to the 60s HTTP default and got RST'd on
+        // idle); its new default fixes that, matching the WS idle window.
+        let s = RequestTimeoutSettings::default();
+        assert_eq!(s.max_request_timeout_seconds, 3600);
+        assert_eq!(s.default_http_timeout_seconds, 60);
+        assert_eq!(s.default_sse_idle_timeout_seconds, 3600);
+        assert_eq!(s.default_websocket_idle_timeout_seconds, 3600);
+    }
+
+    #[test]
+    fn request_timeouts_ceiling_clamps_out_of_range_values() {
+        let mut s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MIN_CEILING_SECS);
+
+        s.max_request_timeout_seconds = u32::MAX;
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MAX_CEILING_SECS);
+    }
+
+    #[test]
+    fn request_timeouts_clamp_to_ceiling_never_exceeds_ceiling() {
+        let s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.clamp_to_ceiling(30), 30, "below ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(120), 120, "at ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(9000), 120, "above ceiling: clamped");
+    }
+
+    #[test]
+    fn legacy_settings_json_without_request_timeouts_deserializes() {
+        // An old `settings.data` row written before this feature shipped has
+        // no `request_timeouts` key. `#[serde(default)]` must fill it in
+        // with the pre-existing hardcoded values so pre-migration rows keep
+        // loading with identical proxy behavior.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(parsed.request_timeouts, RequestTimeoutSettings::default());
+    }
+
+    #[test]
+    fn request_timeouts_round_trip_through_json() {
+        let mut settings = AppSettings::default();
+        settings.request_timeouts.max_request_timeout_seconds = 120;
+        settings.request_timeouts.default_http_timeout_seconds = 30;
+        settings.request_timeouts.default_sse_idle_timeout_seconds = 90;
+        settings
+            .request_timeouts
+            .default_websocket_idle_timeout_seconds = 90;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.request_timeouts, settings.request_timeouts);
     }
 
     /// Regression: a settings save must not delete the `admin_gate`

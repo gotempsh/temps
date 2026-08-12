@@ -18,7 +18,8 @@ use temps_core::{
     AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    RateLimitSettings, RequestMetadata, RequestTimeoutSettings, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -216,6 +217,9 @@ pub struct AppSettingsResponse {
 
     /// Per-turn limits for the AI chat. No sensitive content.
     pub ai_chat_limits: AiChatLimitsSettings,
+    /// Upstream request/connection timeouts (hard ceiling + defaults) applied
+    /// by the proxy to customer app traffic. No sensitive content.
+    pub request_timeouts: RequestTimeoutSettings,
     /// Whether admins may apply a release from the console. This is the
     /// database-backed toggle only — a server started with
     /// `--disable-self-update` refuses regardless of what this says, which
@@ -442,6 +446,7 @@ impl From<AppSettings> for AppSettingsResponse {
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
+            request_timeouts: settings.request_timeouts,
             self_update,
         }
     }
@@ -1491,6 +1496,51 @@ fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem>
     Ok(())
 }
 
+/// Reject a request-timeout ceiling outside the supported range, or a
+/// default timeout of zero (which would mean "every request times out
+/// instantly").
+///
+/// The proxy already clamps a stored out-of-range ceiling on read
+/// (`RequestTimeoutSettings::ceiling`) — but storing one anyway would mean
+/// the settings API echoes back a ceiling that isn't actually enforced, and
+/// the form would show the operator a limit that isn't real.
+fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Problem> {
+    let min = RequestTimeoutSettings::MIN_CEILING_SECS;
+    let max = RequestTimeoutSettings::MAX_CEILING_SECS;
+    if !(min..=max).contains(&timeouts.max_request_timeout_seconds) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "request_timeouts.max_request_timeout_seconds must be between {min} and {max} \
+                 seconds (got {})",
+                timeouts.max_request_timeout_seconds
+            ))
+            .build());
+    }
+    for (name, value) in [
+        (
+            "default_http_timeout_seconds",
+            timeouts.default_http_timeout_seconds,
+        ),
+        (
+            "default_sse_idle_timeout_seconds",
+            timeouts.default_sse_idle_timeout_seconds,
+        ),
+        (
+            "default_websocket_idle_timeout_seconds",
+            timeouts.default_websocket_idle_timeout_seconds,
+        ),
+    ] {
+        if value == 0 {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Validation Error")
+                .detail(format!("request_timeouts.{name} must be greater than 0"))
+                .build());
+        }
+    }
+    Ok(())
+}
+
 fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
     if monitoring.scrape_interval_secs < 15 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -1742,6 +1792,7 @@ async fn update_settings(
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
+    validate_request_timeouts(&settings.request_timeouts)?;
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
@@ -2192,6 +2243,34 @@ mod tests {
                 "{ok}s should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn request_timeouts_ceiling_outside_the_supported_range_is_rejected() {
+        for bad in [0, 4, 86_401, 999_999] {
+            let timeouts = RequestTimeoutSettings {
+                max_request_timeout_seconds: bad,
+                ..RequestTimeoutSettings::default()
+            };
+            assert!(
+                validate_request_timeouts(&timeouts).is_err(),
+                "ceiling {bad}s should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_timeouts_zero_default_is_rejected() {
+        let timeouts = RequestTimeoutSettings {
+            default_sse_idle_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(validate_request_timeouts(&timeouts).is_err());
+    }
+
+    #[test]
+    fn request_timeouts_defaults_are_accepted() {
+        assert!(validate_request_timeouts(&RequestTimeoutSettings::default()).is_ok());
     }
 
     /// The bounds the form advertises must be the bounds the server enforces,

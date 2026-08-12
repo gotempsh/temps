@@ -692,6 +692,19 @@ impl EnvironmentService {
         if let Some(wake_timeout_seconds) = settings.wake_timeout_seconds {
             deployment_config.wake_timeout_seconds = wake_timeout_seconds;
         }
+        // Double-Option semantics, like cpu_request/cpu_limit above: outer
+        // `Some` applies the change (inner `None` clears the override so the
+        // environment inherits the project/global value again, inner
+        // `Some(n)` sets it); outer `None` leaves the current value unchanged.
+        if let Some(request_timeout_seconds) = settings.request_timeout_seconds {
+            deployment_config.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(sse_idle_timeout_seconds) = settings.sse_idle_timeout_seconds {
+            deployment_config.sse_idle_timeout_seconds = sse_idle_timeout_seconds;
+        }
+        if let Some(websocket_idle_timeout_seconds) = settings.websocket_idle_timeout_seconds {
+            deployment_config.websocket_idle_timeout_seconds = websocket_idle_timeout_seconds;
+        }
 
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
@@ -1338,6 +1351,9 @@ mod tests {
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
+                    request_timeout_seconds: None,
+                    sse_idle_timeout_seconds: None,
+                    websocket_idle_timeout_seconds: None,
                     password: None,
                 },
             )

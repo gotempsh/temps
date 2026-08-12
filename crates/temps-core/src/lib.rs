@@ -102,8 +102,8 @@ pub use app_settings::{
     ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
     DockerRegistrySettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
     MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, ScreenshotSettings,
-    SecurityHeadersSettings, SelfUpdateSettings,
+    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
 };
 pub use async_trait;
 pub use chrono;

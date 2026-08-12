@@ -2388,6 +2388,20 @@
               }
             ]
           },
+          "request_timeouts": {
+            "default": {
+              "default_http_timeout_seconds": 60,
+              "default_sse_idle_timeout_seconds": 3600,
+              "default_websocket_idle_timeout_seconds": 3600,
+              "max_request_timeout_seconds": 3600
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestTimeoutSettings",
+                "description": "Upstream request/connection timeouts applied by the proxy to customer\napp traffic. Provides a global hard ceiling plus global defaults for\nregular HTTP, SSE, and WebSocket traffic; projects and environments\nmay set a shorter value but never exceed the ceiling here."
+              }
+            ]
+          },
           "require_mfa_for_admins": {
             "default": false,
             "description": "When `true`, any user holding the `Admin` role must have MFA enrolled\n(`users.mfa_enabled = true`) to complete a **password** login. Users\nwithout MFA enrolled are rejected with a typed error instructing them\nto enroll before retrying. This only gates the password-login path\n(`AuthService::login`) -- SSO/OIDC logins are handled by a separate\ncode path (`OidcService::resolve_user` + `oidc_handler`) and are\nintentionally unaffected, since federating identity to a\nproperly-hardened IdP is itself an acceptable alternative to local\nTOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so\nan operator can flip it at runtime via the Settings API without\nrestarting the binary.",
@@ -2547,6 +2561,10 @@
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
           },
+          "request_timeouts": {
+            "$ref": "#/components/schemas/RequestTimeoutSettings",
+            "description": "Upstream request/connection timeouts (hard ceiling + defaults) applied\nby the proxy to customer app traffic. No sensitive content."
+          },
           "require_mfa_for_admins": {
             "description": "When enabled, Admin-role accounts without MFA enrolled are rejected\nat password login (bherila/temps#32). SSO/OIDC logins are unaffected.",
             "type": "boolean"
@@ -2592,6 +2610,7 @@
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
+          "request_timeouts",
           "self_update"
         ],
         "type": "object"
@@ -8291,6 +8310,13 @@
             },
             "type": "object"
           },
+          "from_snapshot": {
+            "description": "Create the sandbox from a snapshot (ADR-037).\n\nMutually exclusive with `image`: if both are set the request fails\nwith 400. When set, the sandbox is created with the snapshotted\nfilesystem rather than a base image, giving users a reproducible\nstarting point.\n\nThe snapshot must be in `ready` status and belong to the calling user.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "image": {
             "description": "Docker image override. `null` uses the platform default.",
             "type": [
@@ -8444,6 +8470,19 @@
           "name",
           "config"
         ],
+        "type": "object"
+      },
+      "CreateSnapshotBody": {
+        "description": "Request body for `POST /v1/sandboxes/{id}/snapshots`.",
+        "properties": {
+          "label": {
+            "description": "Optional human-readable label for the snapshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateTeamMemberRequest": {
@@ -9423,6 +9462,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "requestTimeoutSeconds": {
+            "description": "Override for the proxy's upstream timeout on regular (non-streaming)\nHTTP requests to this project/environment, in seconds.\n`None` = inherit the global `request_timeouts.default_http_timeout_seconds`.\nAlways clamped to the global hard ceiling\n(`request_timeouts.max_request_timeout_seconds`) at resolution time,\nregardless of what's set here.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -9437,6 +9484,14 @@
           "sessionRecordingEnabled": {
             "description": "Enable session recording for analytics",
             "type": "boolean"
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. Always clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "targetLabels": {
             "description": "Label selector for node-based scheduling. Replicas are only deployed to\nnodes whose labels match the selector.\n\nMatching rules:\n- **Same key, array value** → OR: node must match any value\n- **Different keys** → AND: node must satisfy all keys\n\nExample: `{\"region\": [\"us\", \"asia\"], \"gpu\": \"true\"}`\n→ (region=us OR region=asia) AND gpu=true\n\nApplied after `target_nodes` filtering (they stack)."
@@ -9456,6 +9511,14 @@
             "description": "Max seconds to wait for containers to start when waking from on-demand sleep.\nRequests return 503 if exceeded. Default: 30.",
             "format": "int32",
             "type": "integer"
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on WebSocket connections to this\nproject/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_websocket_idle_timeout_seconds`. Always\nclamped to the global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -20650,6 +20713,39 @@
         ],
         "type": "object"
       },
+      "ListSnapshotsResponse": {
+        "description": "Paginated list of snapshots.",
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/SnapshotResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "snapshots",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "ListTagsResponse": {
         "description": "Response for listing tags",
         "properties": {
@@ -30526,6 +30622,45 @@
         ],
         "type": "object"
       },
+      "RequestTimeoutSettings": {
+        "description": "Upstream request/connection timeouts for customer app traffic.\n\nThe proxy previously hardcoded these (60s for regular HTTP, 3600s for\nWebSocket upgrades) with no SSE-specific handling at all — an idle SSE\nstream got RST'd at the 60s HTTP default, since only the `Upgrade:\nwebsocket` header extended the timeout. This settings struct makes all\nthree configurable while keeping the same defaults, so upgrading\ninstalls see no behavior change until an operator opts in — except the\nSSE default, which is the actual fix for the RST-on-idle bug.\n\n`max_request_timeout_seconds` is a hard ceiling: whatever a project or\nenvironment configures (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`) is always\nclamped to it, so lowering the ceiling here takes effect immediately\nwithout needing every environment row re-saved.",
+        "properties": {
+          "default_http_timeout_seconds": {
+            "default": 60,
+            "description": "Default timeout for regular (non-streaming) HTTP requests, in\nseconds. Used when a project/environment hasn't set\n`request_timeout_seconds`.",
+            "example": 60,
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "default_sse_idle_timeout_seconds": {
+            "default": 3600,
+            "description": "Default idle timeout for Server-Sent Events streams, in seconds. Used\nwhen a project/environment hasn't set `sse_idle_timeout_seconds`.",
+            "example": 3600,
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "default_websocket_idle_timeout_seconds": {
+            "default": 3600,
+            "description": "Default idle timeout for WebSocket connections, in seconds. Used when\na project/environment hasn't set `websocket_idle_timeout_seconds`.",
+            "example": 3600,
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_request_timeout_seconds": {
+            "default": 3600,
+            "description": "Hard ceiling, in seconds. No project/environment override — and no\nresolved default — can exceed this value.",
+            "example": 3600,
+            "format": "int32",
+            "maximum": 86400,
+            "minimum": 5,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "RequiredPasswordChangeRequest": {
         "properties": {
           "new_password": {
@@ -33038,6 +33173,24 @@
             "description": "Version the attempt started from.",
             "type": "string"
           },
+          "migrations_applied": {
+            "description": "Number of database migrations that were successfully applied during\nthis attempt. Set at completion (success or migration failure). `None`\nif migrations were never reached (pre-swap failure).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total number of database migrations that were planned. Set at the same\ntime as `migrations_applied`. `None` if migrations were never reached.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "previous_binary_path": {
             "description": "Where the replaced binary was kept, so a bad release can be reverted by\nhand (`mv <path> <binary>`). Set once the swap completes.",
             "type": [
@@ -33096,6 +33249,7 @@
           "downloading",
           "verifying",
           "installing",
+          "migrating",
           "restarting",
           "pending_restart",
           "failed"
@@ -35955,6 +36109,62 @@
         ],
         "type": "object"
       },
+      "SnapshotResponse": {
+        "description": "Single snapshot as returned by the API.",
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "backend",
+          "content_digest",
+          "size_bytes",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "SourceArchiveUpload": {
         "properties": {
           "file": {
@@ -37582,6 +37792,44 @@
           "total_bytes",
           "limit_bytes",
           "usage_pct"
+        ],
+        "type": "object"
+      },
+      "StorageSummary": {
+        "description": "Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.",
+        "properties": {
+          "available_disk_bytes": {
+            "description": "Available bytes on the snapshots filesystem, or `null` when the\nplatform check is not yet implemented (deferred — see `available_disk_space()`).\nAPI consumers MUST treat `null` as \"unknown\" rather than \"zero bytes\navailable\". A `Some(0)` would incorrectly block snapshot creation.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "quota_bytes": {
+            "description": "Per-user quota in bytes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshot_count": {
+            "description": "Number of `ready` snapshots.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_bytes": {
+            "description": "Total bytes used by all `ready` snapshots for this user.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_bytes",
+          "snapshot_count",
+          "quota_bytes"
         ],
         "type": "object"
       },
@@ -39570,6 +39818,13 @@
             "description": "True when `channel` was set explicitly in settings rather than inferred.",
             "type": "boolean"
           },
+          "current_migration_name": {
+            "description": "Name of the migration currently running. `Some` while `phase` is\n`migrating` and a migration step is in flight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "current_version": {
             "description": "Version tag of the running binary. Always present — the version page\nneeds it whether or not an update exists.",
             "type": "string"
@@ -39588,6 +39843,24 @@
           "manual_command": {
             "description": "The equivalent command to run by hand. Always present.",
             "type": "string"
+          },
+          "migrations_applied": {
+            "description": "Number of migrations applied so far. `Some` while `phase` is `migrating`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total migrations to be applied. `Some` once the migrate child has\nreported its first `started` event.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "phase": {
             "$ref": "#/components/schemas/SelfUpdatePhase",
@@ -39797,6 +40070,14 @@
               "null"
             ]
           },
+          "requestTimeoutSeconds": {
+            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (1-86400). Environments may override this; always\nclamped to the operator's global hard ceiling regardless of what's set\nhere. Absent leaves the current value unchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -39810,6 +40091,22 @@
           "sessionRecordingEnabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -40082,6 +40379,14 @@
               "null"
             ]
           },
+          "request_timeout_seconds": {
+            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -40097,6 +40402,14 @@
             "description": "Enable/disable session recording",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sse_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -40116,6 +40429,14 @@
           },
           "wake_timeout_seconds": {
             "description": "Max seconds to wait for containers to start on wake (5-120). Default: 30.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocket_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
@@ -91244,6 +91565,187 @@
         ]
       }
     },
+    "/v1/sandbox-snapshots": {
+      "get": {
+        "operationId": "list_snapshots",
+        "parameters": [
+          {
+            "description": "Filter by project",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by status",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSnapshotsResponse"
+                }
+              }
+            },
+            "description": "List of snapshots"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/storage-summary": {
+      "get": {
+        "operationId": "storage_summary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSummary"
+                }
+              }
+            },
+            "description": "Storage usage summary"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/storage-summary`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/{snap_id}": {
+      "delete": {
+        "operationId": "delete_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Snapshot deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`DELETE /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      },
+      "get": {
+        "operationId": "get_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot detail"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
     "/v1/sandboxes": {
       "get": {
         "operationId": "list_sandboxes",
@@ -92560,6 +93062,75 @@
         ],
         "tags": [
           "Sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{id}/snapshots": {
+      "post": {
+        "description": "Initiates a snapshot of the sandbox. The response is **202 Accepted**\nwith the snapshot row in `creating` status. The caller should poll\n`GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or\n`failed`.\n\nThe sandbox is stopped for the duration of the snapshot and restarted\nautomatically when it completes (unless it was already stopped).",
+        "operationId": "create_snapshot",
+        "parameters": [
+          {
+            "description": "Sandbox public ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot initiated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "422": {
+            "description": "Quota exceeded or invalid state"
+          },
+          "500": {
+            "description": "Internal error"
+          },
+          "501": {
+            "description": "Snapshots not supported by backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`POST /v1/sandboxes/{id}/snapshots`",
+        "tags": [
+          "Snapshots"
         ]
       }
     },
@@ -94140,6 +94711,10 @@
     {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
       "name": "Sandboxes"
+    },
+    {
+      "description": "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots.",
+      "name": "Snapshots"
     },
     {
       "description": "Log search, context, live tail, and retention management",
