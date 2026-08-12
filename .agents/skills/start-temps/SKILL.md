@@ -69,8 +69,9 @@ Rules:
   `http://localhost:3000` / `:8080` belong to whichever worktree you started
   first (usually your primary clone).
 - Every other checkout gets the lowest free slot ≥ 1, and **keeps it** — the
-  claim is recorded in `~/.temps-dev/slot-<N>.env`, so restarting temps in the
-  same worktree always lands on the same ports. Existing claims remain
+  claim is recorded atomically in `~/.temps-dev/slot-<N>.claim/` with its
+  mode-0600 state in `slot-<N>.env`, so restarting temps in the same worktree
+  always lands on the same ports. Existing claims remain
   reserved until explicitly released with step 7, even while their server is
   stopped.
 - The kill step verifies the listening process's cwd is inside *this*
@@ -134,19 +135,25 @@ for f in "$HOME"/.temps-dev/slot-*.env; do
     SLOT=${f##*/slot-}; SLOT=${SLOT%.env}; break
   fi
 done
-# 2. Otherwise take the lowest slot (>= 0) that is unclaimed and not listening.
+# 2. Otherwise atomically claim the lowest slot (>= 0) that is unclaimed and
+#    not listening. `mkdir` is the exclusion primitive: two concurrent agents
+#    cannot both create the same claim directory.
 #    Claims remain reserved until step 7 releases them. A stopped server or
 #    temporarily unavailable checkout is not proof its migration DB is stale.
 if [ -z "$SLOT" ]; then
   for i in $(seq 0 29); do
     f="$HOME/.temps-dev/slot-$i.env"
-    [ -e "$f" ] && continue
+    claim="$HOME/.temps-dev/slot-$i.claim"
+    { [ -e "$f" ] || [ -e "$claim" ]; } && continue
     busy=0
     for p in $((3000+i)) $((8080+i*10)) $((8081+i*10)) $((8443+i*10)); do
       lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1 && busy=1
     done
     [ "$busy" -eq 1 ] && continue
-    SLOT=$i; break
+    mkdir "$claim" 2>/dev/null || continue
+    printf '%s\n' "$TEMPS_ROOT_ID" > "$claim/root-id"
+    chmod 600 "$claim/root-id"
+    SLOT=$i; CLAIM_DIR="$claim"; break
   done
 fi
 [ -z "$SLOT" ] && { echo "ERROR: no free slot in 0..29 — stop some servers first"; exit 1; }
@@ -405,6 +412,7 @@ EXPECTED_ROOT=$(git -C "$TEMPS_ROOT" rev-parse --show-toplevel 2>/dev/null) || {
 }
 EXPECTED_DATA_DIR="$EXPECTED_ROOT/crates/temps-cli/temps_data"
 EXPECTED_PASSWORD_FILE="$HOME/.temps-dev/slot-$TEMPS_SLOT.admin-password"
+EXPECTED_CLAIM_DIR="$HOME/.temps-dev/slot-$TEMPS_SLOT.claim"
 [ "$TEMPS_ROOT" = "$EXPECTED_ROOT" ] && [ -f "$TEMPS_ROOT/Cargo.toml" ] && \
   [ -d "$TEMPS_ROOT/crates/temps-cli" ] || {
   echo "REFUSING cleanup: invalid Temps workspace root"; exit 1;
@@ -414,6 +422,10 @@ EXPECTED_PASSWORD_FILE="$HOME/.temps-dev/slot-$TEMPS_SLOT.admin-password"
 }
 [ "$TEMPS_ADMIN_PASSWORD_FILE" = "$EXPECTED_PASSWORD_FILE" ] || {
   echo "REFUSING cleanup: password file is outside the expected slot path"; exit 1;
+}
+[ -f "$EXPECTED_CLAIM_DIR/root-id" ] && \
+  grep -qxF "$TEMPS_ROOT_ID" "$EXPECTED_CLAIM_DIR/root-id" || {
+  echo "REFUSING cleanup: slot claim is missing or belongs to another checkout"; exit 1;
 }
 case "$TEMPS_SLOT" in
   0) EXPECTED_DB_NAME=temps ;;
@@ -428,6 +440,8 @@ if [ "$TEMPS_SLOT" != 0 ]; then
 fi
 rm -rf -- "$TEMPS_DATA_DIR"
 rm -f "$TEMPS_ADMIN_PASSWORD_FILE" "$HOME/.temps-dev/slot-$TEMPS_SLOT.env"
+rm -f "$EXPECTED_CLAIM_DIR/root-id"
+rmdir "$EXPECTED_CLAIM_DIR"
 echo "slot $TEMPS_SLOT released"
 ```
 
