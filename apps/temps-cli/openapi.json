@@ -8291,6 +8291,13 @@
             },
             "type": "object"
           },
+          "from_snapshot": {
+            "description": "Create the sandbox from a snapshot (ADR-037).\n\nMutually exclusive with `image`: if both are set the request fails\nwith 400. When set, the sandbox is created with the snapshotted\nfilesystem rather than a base image, giving users a reproducible\nstarting point.\n\nThe snapshot must be in `ready` status and belong to the calling user.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "image": {
             "description": "Docker image override. `null` uses the platform default.",
             "type": [
@@ -8444,6 +8451,19 @@
           "name",
           "config"
         ],
+        "type": "object"
+      },
+      "CreateSnapshotBody": {
+        "description": "Request body for `POST /v1/sandboxes/{id}/snapshots`.",
+        "properties": {
+          "label": {
+            "description": "Optional human-readable label for the snapshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateTeamMemberRequest": {
@@ -18167,6 +18187,17 @@
         ],
         "type": "object"
       },
+      "HasTracesResponse": {
+        "properties": {
+          "has_traces": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "has_traces"
+        ],
+        "type": "object"
+      },
       "HealthCheckConfiguration": {
         "description": "Health check configuration",
         "properties": {
@@ -20647,6 +20678,39 @@
         "required": [
           "items",
           "total"
+        ],
+        "type": "object"
+      },
+      "ListSnapshotsResponse": {
+        "description": "Paginated list of snapshots.",
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/SnapshotResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "snapshots",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -33038,6 +33102,24 @@
             "description": "Version the attempt started from.",
             "type": "string"
           },
+          "migrations_applied": {
+            "description": "Number of database migrations that were successfully applied during\nthis attempt. Set at completion (success or migration failure). `None`\nif migrations were never reached (pre-swap failure).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total number of database migrations that were planned. Set at the same\ntime as `migrations_applied`. `None` if migrations were never reached.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "previous_binary_path": {
             "description": "Where the replaced binary was kept, so a bad release can be reverted by\nhand (`mv <path> <binary>`). Set once the swap completes.",
             "type": [
@@ -33096,6 +33178,7 @@
           "downloading",
           "verifying",
           "installing",
+          "migrating",
           "restarting",
           "pending_restart",
           "failed"
@@ -35955,6 +36038,62 @@
         ],
         "type": "object"
       },
+      "SnapshotResponse": {
+        "description": "Single snapshot as returned by the API.",
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "backend",
+          "content_digest",
+          "size_bytes",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "SourceArchiveUpload": {
         "properties": {
           "file": {
@@ -37582,6 +37721,44 @@
           "total_bytes",
           "limit_bytes",
           "usage_pct"
+        ],
+        "type": "object"
+      },
+      "StorageSummary": {
+        "description": "Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.",
+        "properties": {
+          "available_disk_bytes": {
+            "description": "Available bytes on the snapshots filesystem, or `null` when the\nplatform check is not yet implemented (deferred — see `available_disk_space()`).\nAPI consumers MUST treat `null` as \"unknown\" rather than \"zero bytes\navailable\". A `Some(0)` would incorrectly block snapshot creation.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "quota_bytes": {
+            "description": "Per-user quota in bytes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshot_count": {
+            "description": "Number of `ready` snapshots.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_bytes": {
+            "description": "Total bytes used by all `ready` snapshots for this user.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_bytes",
+          "snapshot_count",
+          "quota_bytes"
         ],
         "type": "object"
       },
@@ -39570,6 +39747,13 @@
             "description": "True when `channel` was set explicitly in settings rather than inferred.",
             "type": "boolean"
           },
+          "current_migration_name": {
+            "description": "Name of the migration currently running. `Some` while `phase` is\n`migrating` and a migration step is in flight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "current_version": {
             "description": "Version tag of the running binary. Always present — the version page\nneeds it whether or not an update exists.",
             "type": "string"
@@ -39588,6 +39772,24 @@
           "manual_command": {
             "description": "The equivalent command to run by hand. Always present.",
             "type": "string"
+          },
+          "migrations_applied": {
+            "description": "Number of migrations applied so far. `Some` while `phase` is `migrating`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total migrations to be applied. `Some` once the migrate child has\nreported its first `started` event.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "phase": {
             "$ref": "#/components/schemas/SelfUpdatePhase",
@@ -67449,6 +67651,75 @@
         ]
       }
     },
+    "/otel/has-traces/{project_id}": {
+      "get": {
+        "description": "A pure existence check for onboarding/setup UI (e.g. \"has this project\nset up OpenTelemetry yet?\"). Deliberately not `/otel/trace-summaries`\nwith `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,\n`argMax`) and, without a time bound, that aggregation runs over every\nspan the project has ever ingested. This endpoint answers the same\nyes/no question in O(1) — see `OtelStorage::has_traces`.",
+        "operationId": "has_traces",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HasTracesResponse"
+                }
+              }
+            },
+            "description": "Trace existence check"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether a project has ever received at least one trace span.",
+        "tags": [
+          "OTel"
+        ]
+      }
+    },
     "/otel/health/{project_id}": {
       "get": {
         "operationId": "get_health",
@@ -91244,6 +91515,187 @@
         ]
       }
     },
+    "/v1/sandbox-snapshots": {
+      "get": {
+        "operationId": "list_snapshots",
+        "parameters": [
+          {
+            "description": "Filter by project",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by status",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSnapshotsResponse"
+                }
+              }
+            },
+            "description": "List of snapshots"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/storage-summary": {
+      "get": {
+        "operationId": "storage_summary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSummary"
+                }
+              }
+            },
+            "description": "Storage usage summary"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/storage-summary`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/{snap_id}": {
+      "delete": {
+        "operationId": "delete_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Snapshot deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`DELETE /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      },
+      "get": {
+        "operationId": "get_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot detail"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
     "/v1/sandboxes": {
       "get": {
         "operationId": "list_sandboxes",
@@ -92560,6 +93012,75 @@
         ],
         "tags": [
           "Sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{id}/snapshots": {
+      "post": {
+        "description": "Initiates a snapshot of the sandbox. The response is **202 Accepted**\nwith the snapshot row in `creating` status. The caller should poll\n`GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or\n`failed`.\n\nThe sandbox is stopped for the duration of the snapshot and restarted\nautomatically when it completes (unless it was already stopped).",
+        "operationId": "create_snapshot",
+        "parameters": [
+          {
+            "description": "Sandbox public ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot initiated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "422": {
+            "description": "Quota exceeded or invalid state"
+          },
+          "500": {
+            "description": "Internal error"
+          },
+          "501": {
+            "description": "Snapshots not supported by backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`POST /v1/sandboxes/{id}/snapshots`",
+        "tags": [
+          "Snapshots"
         ]
       }
     },
@@ -94140,6 +94661,10 @@
     {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
       "name": "Sandboxes"
+    },
+    {
+      "description": "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots.",
+      "name": "Snapshots"
     },
     {
       "description": "Log search, context, live tail, and retention management",

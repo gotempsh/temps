@@ -103,6 +103,12 @@ pub trait OtelStorage: Send + Sync {
     /// Count distinct traces matching the given filters (for pagination).
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64>;
 
+    /// Whether `project_id` has ever received at least one span. A pure
+    /// existence check for onboarding/setup UI — cheap on both backends
+    /// because it needs no aggregation, no time bound, and no sorting;
+    /// see the implementations for why each is O(1) rather than a scan.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool>;
+
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
