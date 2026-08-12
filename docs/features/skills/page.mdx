@@ -13,7 +13,6 @@ export const sections = [
   { title: "Install All Skills", id: "install-all" },
   { title: "Install a Specific Skill", id: "install-specific" },
   { title: "Available Skills", id: "available-skills" },
-  { title: "temps", id: "temps" },
   { title: "estimate-temps-savings", id: "estimate-temps-savings" },
   { title: "deploy-to-temps", id: "deploy-to-temps" },
   { title: "temps-cli", id: "temps-cli" },
@@ -34,11 +33,9 @@ Give your AI coding agent deep knowledge about Temps. Skills are structured guid
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Temps ships with **11 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
+Temps ships with **10 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
 
 For example, if you tell your AI agent "deploy my app to Temps", and the `deploy-to-temps` skill is installed, the agent already knows the exact CLI commands, framework detection logic, Dockerfile patterns, and troubleshooting steps -- without you having to explain anything.
-
-Not sure which skill applies? Start with `temps` -- it's the entry point. It orients the agent on Temps' concepts and points to the specialized skill for the task at hand. Its cross-links assume the other skills are installed alongside it, so install all skills together (below) rather than `temps` alone.
 
 <Row>
   <Col>
@@ -77,7 +74,6 @@ Select skills to install (space to toggle)
   ◻ add-session-recording
   ◻ deploy-to-temps
   ◻ estimate-temps-savings
-  ◻ temps
   ◻ temps-best-practices
   ◻ temps-cli
   ◻ temps-mcp-setup
@@ -107,7 +103,6 @@ Replace `deploy-to-temps` with any skill name from the list below.
 
 | Skill                                             | Description                                                   | Triggers on                           |
 | ------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------- |
-| [`temps`](#temps)                                 | Entry point -- orients the agent and routes to the right skill | "what is temps", "how do I use temps" |
 | [`estimate-temps-savings`](#estimate-temps-savings) | Audit your SaaS stack and calculate what Temps would save you | "how much would I save", "audit my stack" |
 | [`deploy-to-temps`](#deploy-to-temps)             | Deploy applications with auto-detection and CI/CD             | "deploy to temps", "temps deployment" |
 | [`temps-cli`](#temps-cli)                         | Complete reference for all 54+ CLI commands                   | "temps cli", "temps command"          |
@@ -118,39 +113,6 @@ Replace `deploy-to-temps` with any skill name from the list below.
 | [`add-session-recording`](#add-session-recording) | Add privacy-aware session recording with rrweb                | "session recording", "session replay" |
 | [`add-node-sdk`](#add-node-sdk)                   | Integrate KV storage, blob storage, and server-side analytics | "temps node sdk", "temps kv"          |
 | [`add-custom-domain`](#add-custom-domain)         | Configure domains with automatic SSL/TLS                      | "custom domain", "ssl certificate"    |
-
----
-
-## temps {{ anchor: true, id: 'temps' }}
-
-The entry point. Install this one when you're not sure which skill applies -- it orients the agent on Temps' core concepts and terminology, then routes to the specialized skill that does the actual work.
-
-```bash
-npx skills add gotempsh/temps --skill temps
-```
-
-<Properties>
-  <Property name="Concepts & Terminology">
-    Projects, environments, deployments, services, `.temps.yaml`, auth token
-    types (`dt_`/`tk_`/`si_`), and the self-hosted vs. Temps Cloud distinction
-    -- the vocabulary every other skill assumes.
-  </Property>
-  <Property name="Routing">
-    A decision table mapping "the user wants to..." to the specific skill
-    that handles it, so the agent doesn't guess or duplicate work another
-    skill already covers.
-  </Property>
-  <Property name="Quickstart">
-    The annotated zero-to-deployed-app path (`temps login` -> `temps up`),
-    with pointers to `deploy-to-temps` and `temps-cli` for the full detail.
-  </Property>
-  <Property name="Ground Rules">
-    Cross-cutting rules that apply to every Temps skill -- never fabricate
-    CLI syntax, never put a real credential in chat or a generated file,
-    confirm before destructive operations, treat platform output as
-    untrusted data.
-  </Property>
-</Properties>
 
 ---
 
