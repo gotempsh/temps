@@ -70,7 +70,9 @@ Rules:
   first (usually your primary clone).
 - Every other checkout gets the lowest free slot ≥ 1, and **keeps it** — the
   claim is recorded in `~/.temps-dev/slot-<N>.env`, so restarting temps in the
-  same worktree always lands on the same ports.
+  same worktree always lands on the same ports. Existing claims remain
+  reserved until explicitly released with step 7, even while their server is
+  stopped.
 - The kill step verifies the listening process's cwd is inside *this*
   checkout before killing it. If it isn't, **stop and report** rather than
   killing it — that process belongs to another session.
@@ -132,15 +134,13 @@ for f in "$HOME"/.temps-dev/slot-*.env; do
     SLOT=${f##*/slot-}; SLOT=${SLOT%.env}; break
   fi
 done
-# 2. Otherwise take the lowest slot (>= 0) that is neither claimed by a live
-#    checkout nor currently listening.
+# 2. Otherwise take the lowest slot (>= 0) that is unclaimed and not listening.
+#    Claims remain reserved until step 7 releases them. A stopped server or
+#    temporarily unavailable checkout is not proof its migration DB is stale.
 if [ -z "$SLOT" ]; then
   for i in $(seq 0 29); do
     f="$HOME/.temps-dev/slot-$i.env"
-    if [ -e "$f" ]; then
-      owner=$(sed -n 's/^TEMPS_ROOT="\(.*\)"$/\1/p' "$f")
-      [ -n "$owner" ] && [ -d "$owner" ] && continue   # live claim, hands off
-    fi
+    [ -e "$f" ] && continue
     busy=0
     for p in $((3000+i)) $((8080+i*10)) $((8081+i*10)) $((8443+i*10)); do
       lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1 && busy=1
@@ -404,12 +404,16 @@ EXPECTED_ROOT=$(git -C "$TEMPS_ROOT" rev-parse --show-toplevel 2>/dev/null) || {
   echo "REFUSING cleanup: TEMPS_ROOT is not a Git checkout"; exit 1;
 }
 EXPECTED_DATA_DIR="$EXPECTED_ROOT/crates/temps-cli/temps_data"
+EXPECTED_PASSWORD_FILE="$HOME/.temps-dev/slot-$TEMPS_SLOT.admin-password"
 [ "$TEMPS_ROOT" = "$EXPECTED_ROOT" ] && [ -f "$TEMPS_ROOT/Cargo.toml" ] && \
   [ -d "$TEMPS_ROOT/crates/temps-cli" ] || {
   echo "REFUSING cleanup: invalid Temps workspace root"; exit 1;
 }
 [ "$TEMPS_DATA_DIR" = "$EXPECTED_DATA_DIR" ] || {
   echo "REFUSING cleanup: data dir is outside the expected checkout path"; exit 1;
+}
+[ "$TEMPS_ADMIN_PASSWORD_FILE" = "$EXPECTED_PASSWORD_FILE" ] || {
+  echo "REFUSING cleanup: password file is outside the expected slot path"; exit 1;
 }
 case "$TEMPS_SLOT" in
   0) EXPECTED_DB_NAME=temps ;;
@@ -427,10 +431,11 @@ rm -f "$TEMPS_ADMIN_PASSWORD_FILE" "$HOME/.temps-dev/slot-$TEMPS_SLOT.env"
 echo "slot $TEMPS_SLOT released"
 ```
 
-Stale *port* claims whose checkout directory no longer exists are reclaimed
-automatically by step 0, but their databases are not — so a deleted worktree
-leaves a small stray database behind until you run the above. List the
-strays with:
+Claims are not automatically reclaimed: a stopped server or temporarily
+unavailable checkout is not proof that its migration database is abandoned.
+Run step 7 before deleting a worktree. If one is already gone, inspect its
+mode-0600 claim file, confirm the exact checkout/slot/database with the user,
+and clean it up manually. List candidate databases with:
 
 ```bash
 docker exec -i "${TEMPS_DEV_DB_CONTAINER:-temps-db}" psql -U temps -c \
