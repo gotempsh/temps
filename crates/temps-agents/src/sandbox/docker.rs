@@ -131,29 +131,46 @@ pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
         .any(|pat| key_upper.contains(pat))
 }
 
-/// Strip sensitive entries from a `KEY=VALUE` env list.
+/// Build Dockerfile-style `ENV KEY=` change instructions for every sensitive
+/// entry found in a `KEY=VALUE` env list.
 ///
-/// Every entry whose key matches [`is_sensitive_env_key`] is **removed**
-/// from the list entirely (not zeroed to `KEY=`). Removing the entry ensures
-/// that neither the credential name nor its value appears in the committed
-/// image config — zeroing to `KEY=` would leave the key name visible, which
-/// leaks which secrets the sandbox was configured with.
+/// For each entry whose key matches [`is_sensitive_env_key`], produces a
+/// `"ENV KEY="` string (empty value). These strings are passed to
+/// `CommitContainerOptionsBuilder::changes()`, which maps to Docker's
+/// `changes` query parameter — the **only** mechanism that actually overwrites
+/// env-var values in the committed image's `Config.Env`.
 ///
-/// Non-sensitive entries are left unchanged. The result is passed as
-/// `ContainerConfig.env` to `docker commit`.
-pub(crate) fn scrub_env_vars(env: &[String]) -> Vec<String> {
+/// **Why zeroing rather than removal:** Docker's commit API has no mechanism
+/// to delete an env entry; it can only overwrite the value. `ENV KEY=` sets
+/// the key to an empty string in the committed image. This was verified
+/// against a real Docker daemon using `docker commit --change 'ENV KEY='`.
+/// The `ContainerConfig` body's `env` field (the previous approach) is
+/// silently ignored by the Docker Engine and has zero effect on the committed
+/// image — a confirmed no-op, not a design choice.
+///
+/// Non-sensitive entries are not included in the result — only the change
+/// instructions for the keys that need scrubbing are returned.
+pub(crate) fn build_env_scrub_changes(env: &[String]) -> Vec<String> {
     env.iter()
-        .filter(|kv| {
+        .filter_map(|kv| {
             let key = kv.split('=').next().unwrap_or("");
-            !is_sensitive_env_key(key)
+            if is_sensitive_env_key(key) {
+                Some(format!("ENV {}=", key))
+            } else {
+                None
+            }
         })
-        .cloned()
         .collect()
 }
 
-/// Returns the keys of any env entries that are sensitive (key presence alone
-/// is the failure condition — the scrubber removes entries entirely, so any
-/// surviving sensitive key means scrubbing failed).
+/// Returns the keys of any env entries that are sensitive AND have a non-empty
+/// value after `=` (i.e. were not successfully zeroed by the scrubbing step).
+///
+/// A sensitive key with an **empty** value (`KEY=`) has been successfully
+/// zeroed by `docker commit --change 'ENV KEY='` and is NOT a survivor.
+/// A sensitive key with a **non-empty** value (`KEY=actual-secret`) means
+/// the Docker `changes` mechanism was bypassed or failed and the value leaked
+/// into the committed image — this is the real failure condition.
 ///
 /// Called after `docker commit` to verify the scrubbing worked. An empty
 /// return means the image config is clean. A non-empty return triggers an
@@ -161,11 +178,14 @@ pub(crate) fn scrub_env_vars(env: &[String]) -> Vec<String> {
 pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
     env.iter()
         .filter_map(|kv| {
-            let key = kv.split('=').next().unwrap_or("");
-            // Key presence alone is the failure condition — scrub_env_vars
-            // removes entries entirely, so any surviving sensitive key means
-            // the commit's env override was ignored or bypassed.
-            if is_sensitive_env_key(key) {
+            let mut parts = kv.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            // A sensitive key with an empty value has been zeroed by the
+            // `ENV KEY=` change instruction — that is the expected post-commit
+            // state and is NOT a failure. Only a non-empty value means the
+            // secret survived into the committed image.
+            if is_sensitive_env_key(key) && !value.is_empty() {
                 Some(key.to_string())
             } else {
                 None
@@ -2597,12 +2617,18 @@ impl SandboxProvider for DockerSandboxProvider {
     ///
     /// This method then executes two additional scrubbing steps:
     ///
-    /// 1. Inspect the stopped container's `Config.Env` and remove every
-    ///    known-sensitive env-var key from the committed image config. Entries
-    ///    are removed entirely (not zeroed) so key names don't leak either.
+    /// 1. Inspect the stopped container's `Config.Env` and zero every
+    ///    known-sensitive env-var value in the committed image config via
+    ///    Docker's `--change "ENV KEY="` mechanism. Each sensitive key is set
+    ///    to an empty value (`KEY=`) — this is the only mechanism the Docker
+    ///    commit API actually supports; deletion is not possible. Verified
+    ///    against a real Docker daemon. The `ContainerConfig` body's `env`
+    ///    field (the previous approach) is silently ignored by the Docker
+    ///    Engine and has no effect on the committed image — confirmed no-op.
     /// 2. Inspect the committed image's `Config.Env` and reject the snapshot —
     ///    removing the committed image and returning `SandboxExecFailed` — if
-    ///    any known-sensitive key pattern survives.
+    ///    any known-sensitive key has a non-empty value (i.e. the zeroing
+    ///    did not take effect for that key).
     ///
     /// The sandbox must be stopped by the caller before this is called for
     /// filesystem consistency.
@@ -2658,17 +2684,21 @@ impl SandboxProvider for DockerSandboxProvider {
             .map(|env| env.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
-        // Count sensitive keys for telemetry. The actual scrubbing removes
-        // entries entirely (not zeroed) via `scrub_env_vars` below.
-        let scrubbed_key_count = container_env
-            .iter()
-            .filter(|kv| {
-                let key = kv.split('=').next().unwrap_or("");
-                is_sensitive_env_key(key)
-            })
-            .count();
+        // Build Dockerfile-style "ENV KEY=" change instructions for each
+        // sensitive key, then count for telemetry.
+        //
+        // IMPORTANT: The ContainerConfig body's `env` field is NOT used for
+        // scrubbing. Live testing against a real Docker daemon confirmed that
+        // passing `ContainerConfig { env: Some(scrubbed_env), .. }` to
+        // `commit_container` has zero effect — the Docker Engine silently
+        // ignores/merges the body's Env field rather than replacing the
+        // committed image's Config.Env. The `changes` query parameter (i.e.
+        // `docker commit --change 'ENV KEY='`) is the only mechanism that
+        // actually zeroes values in the committed image, verified directly.
+        let scrub_changes = build_env_scrub_changes(&container_env);
+        let scrubbed_key_count = scrub_changes.len();
 
-        // ── Step 1b: commit the container with sensitive env vars removed ──────
+        // ── Step 1b: commit the container with sensitive env vars zeroed ───────
         // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
         // during the commit phase; we rename it to the public_id tag after
         // digest verification. Using the container_id avoids a race if two
@@ -2683,22 +2713,30 @@ impl SandboxProvider for DockerSandboxProvider {
             "snapshot: committing container image"
         );
 
-        let commit_opts = bollard::query_parameters::CommitContainerOptionsBuilder::new()
-            .container(container_id.as_str())
-            .repo(commit_tag.as_str())
-            .tag("latest")
-            .build();
+        // Pass `ENV KEY=` change instructions via the `changes` parameter —
+        // this is Docker's `--change` flag, which is the only API mechanism
+        // that actually overwrites env-var values in the committed image's
+        // Config.Env. Each sensitive key is set to an empty value; Docker's
+        // commit API cannot delete entries, only overwrite them.
+        //
+        // bollard's `CommitContainerOptionsBuilder::changes()` takes a single
+        // `&str`; multiple Dockerfile instructions are separated by newlines.
+        let changes_str = scrub_changes.join("\n");
+        let mut commit_opts_builder =
+            bollard::query_parameters::CommitContainerOptionsBuilder::new()
+                .container(container_id.as_str())
+                .repo(commit_tag.as_str())
+                .tag("latest");
+        if !changes_str.is_empty() {
+            commit_opts_builder = commit_opts_builder.changes(&changes_str);
+        }
+        let commit_opts = commit_opts_builder.build();
 
-        // Build the Config override: remove sensitive env var entries entirely
-        // via the module-level `scrub_env_vars` helper (tested independently of
-        // Docker). Removing entries (rather than zeroing them) ensures neither
-        // the key name nor its value appears in the committed image config.
-        let scrubbed_env = scrub_env_vars(&container_env);
-
-        let config_override = bollard::models::ContainerConfig {
-            env: Some(scrubbed_env),
-            ..Default::default()
-        };
+        // The ContainerConfig body is passed as required by bollard's API
+        // signature but left at defaults — its `env` field does nothing (the
+        // Docker Engine ignores it; only the `changes` query parameter above
+        // is effective, as confirmed against a live Docker daemon).
+        let config_override = bollard::models::ContainerConfig::default();
 
         let commit_resp = self
             .docker
@@ -4711,8 +4749,10 @@ mod tests {
     // ── Credential-scrubbing tests (ADR-037 §4) ───────────────────────────────
     //
     // These tests verify the scrubbing helpers in isolation — no Docker daemon
-    // is required. The security invariant is: after `scrub_env_vars`, no entry
-    // in the result should trigger `is_sensitive_env_key` with a non-empty value.
+    // is required. The security invariant is: after applying the change
+    // instructions produced by `build_env_scrub_changes`, every sensitive key
+    // in the committed image has an empty value, and
+    // `find_surviving_sensitive_keys` returns an empty list.
 
     #[test]
     fn is_sensitive_env_key_detects_anthropic_api_key() {
@@ -4746,9 +4786,11 @@ mod tests {
     }
 
     #[test]
-    fn scrub_env_vars_removes_sensitive_entries_entirely() {
-        // scrub_env_vars must REMOVE sensitive entries (not zero them), so that
-        // neither the key name nor the value appears in the committed image config.
+    fn build_env_scrub_changes_returns_change_instructions_for_sensitive_keys() {
+        // build_env_scrub_changes must produce `ENV KEY=` Dockerfile-style
+        // change instructions for each sensitive key — these are passed to
+        // `docker commit --change` which zeroes the values in the committed
+        // image. Non-sensitive keys must not appear in the output.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
             "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
@@ -4757,44 +4799,66 @@ mod tests {
             "NODE_VERSION=20".to_string(),
         ];
 
-        let scrubbed = scrub_env_vars(&env);
+        let changes = build_env_scrub_changes(&env);
 
-        // Safe vars unchanged.
+        // Must produce exactly one change instruction per sensitive key.
         assert!(
-            scrubbed.contains(&"PATH=/usr/bin:/bin".to_string()),
-            "PATH should be unchanged"
+            changes.contains(&"ENV ANTHROPIC_API_KEY=".to_string()),
+            "expected ENV ANTHROPIC_API_KEY= change instruction; got: {:?}",
+            changes
         );
         assert!(
-            scrubbed.contains(&"HOME=/home/temps".to_string()),
-            "HOME should be unchanged"
-        );
-        assert!(
-            scrubbed.contains(&"NODE_VERSION=20".to_string()),
-            "NODE_VERSION should be unchanged"
+            changes.contains(&"ENV GITHUB_TOKEN=".to_string()),
+            "expected ENV GITHUB_TOKEN= change instruction; got: {:?}",
+            changes
         );
 
-        // Sensitive entries removed entirely — not zeroed but gone.
+        // Safe keys must NOT appear in the changes list.
         assert!(
-            !scrubbed.iter().any(|e| e.starts_with("ANTHROPIC_API_KEY")),
-            "ANTHROPIC_API_KEY entry must be removed entirely, not zeroed"
+            !changes.iter().any(|c| c.contains("PATH")),
+            "PATH must not appear in change instructions: {:?}",
+            changes
         );
         assert!(
-            !scrubbed.iter().any(|e| e.starts_with("GITHUB_TOKEN")),
-            "GITHUB_TOKEN entry must be removed entirely, not zeroed"
+            !changes.iter().any(|c| c.contains("HOME")),
+            "HOME must not appear in change instructions: {:?}",
+            changes
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("NODE_VERSION")),
+            "NODE_VERSION must not appear in change instructions: {:?}",
+            changes
         );
 
-        // Fewer entries after scrubbing — sensitive ones were removed.
+        // Exactly 2 sensitive keys → 2 change instructions.
         assert_eq!(
-            scrubbed.len(),
-            3,
-            "3 safe entries should remain; got {:?}",
-            scrubbed
+            changes.len(),
+            2,
+            "expected 2 change instructions; got {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn build_env_scrub_changes_empty_env_returns_no_changes() {
+        let changes = build_env_scrub_changes(&[]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn build_env_scrub_changes_no_sensitive_keys_returns_no_changes() {
+        let env = vec!["PATH=/usr/bin".to_string(), "HOME=/home/temps".to_string()];
+        let changes = build_env_scrub_changes(&env);
+        assert!(
+            changes.is_empty(),
+            "no sensitive keys → no change instructions; got: {:?}",
+            changes
         );
     }
 
     #[test]
     fn find_surviving_sensitive_keys_returns_empty_for_clean_env() {
-        // After scrub_env_vars, no sensitive keys should be present at all.
+        // A committed image with no sensitive keys at all — clean.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
             "HOME=/home/temps".to_string(),
@@ -4809,37 +4873,67 @@ mod tests {
     }
 
     #[test]
-    fn find_surviving_sensitive_keys_catches_present_secret_key() {
-        // A committed image where scrubbing somehow missed a key (key still present).
+    fn find_surviving_sensitive_keys_zeroed_key_is_not_a_survivor() {
+        // A zeroed entry (KEY=) has been successfully scrubbed by the Docker
+        // `--change "ENV KEY="` mechanism. An empty value is the expected
+        // post-commit state and must NOT be flagged as a survivor.
         let env = vec![
             "PATH=/usr/bin".to_string(),
-            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // not removed
-        ];
-
-        let survivors = find_surviving_sensitive_keys(&env);
-        assert_eq!(survivors, vec!["ANTHROPIC_API_KEY"]);
-    }
-
-    #[test]
-    fn find_surviving_sensitive_keys_rejects_zeroed_key_as_surviving() {
-        // A zeroed entry (KEY=) still counts as surviving since the key name
-        // itself is sensitive and should have been removed entirely.
-        let env = vec![
-            "PATH=/usr/bin".to_string(),
-            "GITHUB_TOKEN=".to_string(), // zeroed but still present as a key
+            "GITHUB_TOKEN=".to_string(), // zeroed — successfully scrubbed
+            "ANTHROPIC_API_KEY=".to_string(), // zeroed — successfully scrubbed
         ];
 
         let survivors = find_surviving_sensitive_keys(&env);
         assert!(
-            survivors.contains(&"GITHUB_TOKEN".to_string()),
-            "a zeroed-but-present sensitive key counts as surviving: {:?}",
+            survivors.is_empty(),
+            "zeroed sensitive keys (KEY=) must not be flagged as survivors; got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_catches_non_empty_secret_value() {
+        // A committed image where scrubbing failed — the key has a real value.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // not zeroed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert_eq!(
+            survivors,
+            vec!["ANTHROPIC_API_KEY"],
+            "a sensitive key with a non-empty value must be flagged as a survivor"
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_mixed_zeroed_and_live() {
+        // Mix of zeroed (scrubbed) and still-live (failure case) sensitive keys.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(),                   // zeroed — OK
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // live — failure
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.contains(&"ANTHROPIC_API_KEY".to_string()),
+            "live sensitive key must be flagged; got: {:?}",
+            survivors
+        );
+        assert!(
+            !survivors.contains(&"GITHUB_TOKEN".to_string()),
+            "zeroed sensitive key must not be flagged; got: {:?}",
             survivors
         );
     }
 
     #[test]
     fn scrub_then_verify_leaves_no_survivors() {
-        // Property: find_surviving_sensitive_keys(scrub_env_vars(env)) = ∅.
+        // End-to-end property: after applying the change instructions produced
+        // by `build_env_scrub_changes`, simulating Docker zeroing the values,
+        // `find_surviving_sensitive_keys` must return an empty list.
         let env = vec![
             "PATH=/usr/bin:/bin".to_string(),
             "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
@@ -4850,12 +4944,30 @@ mod tests {
             "TEMPS_CREDENTIAL_TOKEN=tok_internal".to_string(),
         ];
 
-        let scrubbed = scrub_env_vars(&env);
-        let survivors = find_surviving_sensitive_keys(&scrubbed);
+        // Get the change instructions that would be passed to docker commit.
+        let changes = build_env_scrub_changes(&env);
 
+        // Simulate what Docker does when applying `ENV KEY=` change instructions:
+        // it overwrites the matching env entry's value to an empty string.
+        let mut simulated_env = env.clone();
+        for change in &changes {
+            // Each change is "ENV KEY=" — strip the "ENV " prefix and the
+            // trailing "=" to get the key name.
+            if let Some(rest) = change.strip_prefix("ENV ") {
+                let key = rest.trim_end_matches('=');
+                for entry in simulated_env.iter_mut() {
+                    if entry.starts_with(&format!("{}=", key)) {
+                        *entry = format!("{}=", key);
+                    }
+                }
+            }
+        }
+
+        let survivors = find_surviving_sensitive_keys(&simulated_env);
         assert!(
             survivors.is_empty(),
-            "scrub_env_vars must leave no surviving sensitive keys, but found: {:?}",
+            "after applying change instructions, find_surviving_sensitive_keys \
+             must return empty; found survivors: {:?}",
             survivors
         );
     }
