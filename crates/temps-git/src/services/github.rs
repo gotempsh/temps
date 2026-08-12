@@ -16,6 +16,39 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+/// Create a GitHub App JWT signed with RS256.
+///
+/// Replicates the semantics of `octocrab::auth::create_jwt` without crossing
+/// the jsonwebtoken v10/v11 type boundary imposed by octocrab's public API:
+///   - `iss` = numeric app ID
+///   - `iat` = now − 60 s  (absorb clock skew)
+///   - `exp` = now + 540 s (9 min; GitHub hard-cap is 10 min)
+fn create_github_app_jwt(
+    app_id: u64,
+    key: &jsonwebtoken::EncodingKey,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        iss: u64,
+        iat: u64,
+        exp: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_secs();
+
+    let claims = Claims {
+        iss: app_id,
+        iat: now.saturating_sub(60),
+        exp: now + (9 * 60),
+    };
+
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, key)
+}
+
 #[derive(Error, Debug)]
 pub enum GithubAppServiceError {
     #[error("Database error: {0}")]
@@ -314,7 +347,7 @@ impl GithubAppService {
             .map_err(|e| GithubAppServiceError::PrivateKeyCreationFailed(e.to_string()))?;
 
         let app_id_param = AppId(app_id as u64);
-        let token = octocrab::auth::create_jwt(app_id_param, &key)
+        let token = create_github_app_jwt(app_id_param.0, &key)
             .map_err(|e| GithubAppServiceError::GithubApiError(e.to_string()))?;
         let octocrab = Octocrab::builder()
             .personal_token(token)
@@ -398,7 +431,7 @@ impl GithubAppService {
             .map_err(|e| GithubAppServiceError::PrivateKeyCreationFailed(e.to_string()))?;
 
         let app_id_param = AppId(app_data.app_id as u64);
-        let token = octocrab::auth::create_jwt(app_id_param, &key)
+        let token = create_github_app_jwt(app_id_param.0, &key)
             .map_err(|e| GithubAppServiceError::GithubApiError(e.to_string()))?;
         let octocrab = Octocrab::builder()
             .personal_token(token)
@@ -1799,8 +1832,15 @@ impl GithubAppService {
                 ))
             })?;
 
+        // Pre-compute the GitHub App JWT with v11 and pass it as a personal token.
+        // Octocrab's `.app(key)` expects a v10 EncodingKey, so we replicate its
+        // JWT creation ourselves to stay within the v11 type boundary.
+        let jwt = create_github_app_jwt(app_data.app_id as u64, &key).map_err(|e| {
+            GithubAppServiceError::GithubApiError(format!("Failed to create GitHub App JWT: {}", e))
+        })?;
+
         let octocrab = Octocrab::builder()
-            .app(AppId::from(app_data.app_id as u64), key)
+            .personal_token(jwt)
             .build()
             .map_err(|e| {
                 GithubAppServiceError::GithubApiError(format!(
