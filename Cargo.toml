@@ -176,7 +176,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6.2", features = ["cors", "fs", "catch-panic", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs", "catch-panic", "trace"] }
 tower-cookies = "0.11"
 cookie = "0.18"
 http = "1.3.1"
@@ -277,7 +277,7 @@ redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager"] }
 lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "tokio1-native-tls"] }
 
 # Git Providers (GitHub, GitLab)
-octocrab = "0.49.5"
+octocrab = "0.54.1"
 
 # ============================================================================
 # Container Management (Docker)

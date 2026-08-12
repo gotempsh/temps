@@ -317,6 +317,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
             .await
             .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse response: {}", e)))?;
 
+        ensure_repository_is_public(!repo_data.private, owner, repo)?;
+
         Ok(PublicRepoInfo {
             owner: repo_data
                 .owner
@@ -1020,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_repository_lookup_uses_token_and_reports_private_visibility() {
+    async fn github_repository_lookup_uses_token_and_rejects_private_repository() {
         let mut server = mockito::Server::new_async().await;
         let repository = server
             .mock("GET", "/repos/example/private-repository")
@@ -1048,12 +1050,16 @@ mod tests {
             server.url(),
         );
 
-        let info = provider
+        let error = provider
             .get_repository("example", "private-repository")
             .await
-            .expect("authenticated repository lookup should succeed");
+            .expect_err("public repository endpoints must reject private repositories");
 
-        assert!(info.is_private);
+        assert!(matches!(
+            error,
+            PublicRepoError::RepositoryNotPublic(name)
+                if name == "example/private-repository"
+        ));
         repository.assert_async().await;
     }
 

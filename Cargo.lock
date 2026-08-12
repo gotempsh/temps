@@ -915,7 +915,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
+ "tower",
  "tracing",
 ]
 
@@ -1099,7 +1099,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-tungstenite",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -1160,7 +1160,7 @@ dependencies = [
  "serde_urlencoded",
  "smallvec",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "url",
 ]
 
@@ -4206,6 +4206,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
 
 [[package]]
+name = "http-serde"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f056c8559e3757392c8d091e796416e4649d8e49e88b8d76df6c002f05027fd"
+dependencies = [
+ "http 1.5.0",
+ "serde",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4886,7 +4896,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -4910,7 +4920,7 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa",
  "serde",
@@ -6156,9 +6166,9 @@ dependencies = [
 
 [[package]]
 name = "octocrab"
-version = "0.49.9"
+version = "0.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ddbc3bb87e8c680febf16f56855bbd8b44a38e18c913334213ab34908e71a09"
+checksum = "432fad6f447c52acda76a7a0660f022b21f4c42f373bbdc29f04332ba19a89bf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6167,21 +6177,21 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "cfg-if",
  "chrono",
- "either",
  "futures",
  "futures-util",
  "getrandom 0.2.17",
  "http 1.5.0",
  "http-body 1.0.1",
  "http-body-util",
+ "http-serde",
  "hyper",
  "hyper-rustls",
  "hyper-timeout",
  "hyper-util",
  "jsonwebtoken 10.4.0",
- "once_cell",
  "percent-encoding",
  "pin-project",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -6189,8 +6199,8 @@ dependencies = [
  "serde_urlencoded",
  "snafu",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tracing",
  "url",
  "web-time",
@@ -6574,6 +6584,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
  "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.0",
  "serde_core",
 ]
 
@@ -7828,7 +7848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
  "aws-lc-rs",
- "pem",
+ "pem 3.0.6",
  "ring",
  "rustls-pki-types",
  "time",
@@ -8108,8 +8128,8 @@ dependencies = [
  "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -8145,8 +8165,8 @@ dependencies = [
  "serde_json",
  "sync_wrapper",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -10097,8 +10117,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",
@@ -10189,7 +10209,7 @@ dependencies = [
  "temps-entities",
  "thiserror 2.0.19",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -10250,7 +10270,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -10328,7 +10348,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.19",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -10462,7 +10482,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "totp-rs",
- "tower 0.5.3",
+ "tower",
  "tower-cookies",
  "tracing",
  "urlencoding",
@@ -10486,7 +10506,7 @@ dependencies = [
  "cron",
  "flate2",
  "futures",
- "pem",
+ "pem 4.0.0",
  "sea-orm",
  "serde",
  "serde_derive",
@@ -10568,7 +10588,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -10688,7 +10708,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -10760,8 +10780,8 @@ dependencies = [
  "temps-memory",
  "thiserror 2.0.19",
  "tokio",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "url",
  "utoipa",
@@ -10891,7 +10911,7 @@ dependencies = [
  "tokio-test",
  "tokio-tungstenite",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "urlencoding",
@@ -10935,7 +10955,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -11008,7 +11028,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -11052,7 +11072,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "x25519-dalek 3.0.0",
@@ -11092,7 +11112,7 @@ dependencies = [
  "tokio",
  "tokio-socks",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -11234,7 +11254,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-test",
- "tower-http",
+ "tower-http 0.7.0",
  "tracing",
  "url",
  "utoipa",
@@ -11287,7 +11307,7 @@ dependencies = [
  "temps-presets",
  "tokio",
  "tokio-tungstenite",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -11694,7 +11714,7 @@ dependencies = [
  "temps-core",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "utoipa",
 ]
@@ -11725,7 +11745,7 @@ dependencies = [
  "temps-providers",
  "thiserror 2.0.19",
  "tokio",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "urlencoding",
  "utoipa",
@@ -11829,7 +11849,7 @@ dependencies = [
  "clickhouse",
  "libc",
  "mongodb",
- "pem",
+ "pem 4.0.0",
  "redis",
  "reqwest 0.12.28",
  "sea-orm",
@@ -11940,7 +11960,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-test",
- "tower 0.4.13",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -12019,8 +12039,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
- "tower-http",
+ "tower",
+ "tower-http 0.7.0",
  "tracing",
  "utoipa",
  "uuid",
@@ -12046,7 +12066,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "utoipa",
@@ -12250,7 +12270,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-test",
- "tower 0.4.13",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -12473,7 +12493,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -12656,7 +12676,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-test",
- "tower 0.5.3",
+ "tower",
  "tracing",
  "url",
  "utoipa",
@@ -13242,7 +13262,7 @@ dependencies = [
  "prost 0.13.5",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -13271,7 +13291,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -13299,21 +13319,6 @@ dependencies = [
  "hmac 0.12.1",
  "sha1 0.10.6",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "tower"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
-dependencies = [
- "futures-core",
- "futures-util",
- "pin-project",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -13359,6 +13364,25 @@ checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "bitflags 2.11.1",
  "bytes",
+ "futures-util",
+ "http 1.5.0",
+ "http-body 1.0.1",
+ "pin-project-lite",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytes",
  "futures-core",
  "futures-util",
  "http 1.5.0",
@@ -13372,11 +13396,9 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
- "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "tracing",
- "url",
 ]
 
 [[package]]

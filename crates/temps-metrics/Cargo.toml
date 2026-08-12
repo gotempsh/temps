@@ -43,7 +43,7 @@ aws-config = { workspace = true }
 aws-credential-types = "1.2"
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
 webpki-root-certs = "1.0"
-pem = "3"
+pem = "4"
 reqwest = { workspace = true }
 
 # Node collector (Linux /proc + statvfs)
