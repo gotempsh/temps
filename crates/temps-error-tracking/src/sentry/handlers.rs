@@ -797,7 +797,7 @@ mod tests {
     async fn test_envelope_endpoint_with_valid_error_event() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // Create a valid Sentry SDK error envelope
         let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"sent_at\":\"2023-06-28T14:30:00.000Z\"}\n{\"type\":\"event\"}\n{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"timestamp\":1687962600.0,\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{\"values\":[{\"type\":\"Error\",\"value\":\"Test error message\",\"stacktrace\":{\"frames\":[{\"filename\":\"app.js\",\"function\":\"onClick\",\"lineno\":42,\"colno\":15}]}}]},\"environment\":\"production\",\"release\":\"1.0.0\"}\n";
@@ -828,7 +828,7 @@ mod tests {
     async fn test_envelope_endpoint_with_invalid_envelope() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // Send invalid envelope data (but with valid auth)
         let invalid_data = "not a valid envelope";
@@ -853,7 +853,7 @@ mod tests {
     async fn test_envelope_endpoint_with_session() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // Create a valid session envelope
         let envelope_data = "{\"event_id\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"}\n{\"type\":\"session\"}\n{\"sid\":\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\",\"init\":true,\"started\":\"2023-06-28T14:30:00.000Z\",\"status\":\"ok\",\"attrs\":{\"release\":\"1.0.0\",\"environment\":\"production\"}}\n";
@@ -883,7 +883,7 @@ mod tests {
     async fn test_envelope_endpoint_with_auth_header() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"timestamp\":1687962600.0,\"platform\":\"javascript\",\"level\":\"info\",\"message\":\"Test\"}\n";
         let auth_header = format!("Sentry sentry_key={},sentry_version=7", ctx.dsn_key);
@@ -912,7 +912,7 @@ mod tests {
     async fn test_envelope_endpoint_missing_newlines() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // Envelope without proper newlines should fail
         let invalid_envelope = "{\"event_id\":\"test\"}{\"type\":\"event\"}{\"message\":\"test\"}";
@@ -994,7 +994,7 @@ mod tests {
 
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // Create a valid envelope
         let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"sent_at\":\"2023-06-28T14:30:00.000Z\"}\n{\"type\":\"event\"}\n{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"timestamp\":1687962600.0,\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{\"values\":[{\"type\":\"Error\",\"value\":\"Test error\"}]}}\n";
@@ -1185,7 +1185,7 @@ mod tests {
     async fn test_envelope_endpoint_client_report_only_returns_ok() {
         let ctx = create_test_context().await;
         let app = configure_routes().with_state(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // A real client_report envelope — no `event`/`transaction` item at all.
         // Before the fix, `parse_events` errored with "No valid events found in
@@ -1243,7 +1243,7 @@ mod tests {
     async fn test_tunnel_endpoint_unknown_host_returns_404() {
         let ctx = create_test_context().await;
         let app = configure_tunnel_test_router(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         let response = server
             .post(SENTRY_TUNNEL_ROUTE_PATH)
@@ -1269,7 +1269,7 @@ mod tests {
         ctx.route_table
             .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
         let app = configure_tunnel_test_router(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         let response = server
             .post(SENTRY_TUNNEL_ROUTE_PATH)
@@ -1295,7 +1295,7 @@ mod tests {
         ctx.route_table
             .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
         let app = configure_tunnel_test_router(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         // No Origin, no Referer — must default-deny, not fail open.
         let response = server
@@ -1318,7 +1318,7 @@ mod tests {
         ctx.route_table
             .insert_route_for_test("app.example.com", test_route_info(ctx.project.clone()));
         let app = configure_tunnel_test_router(ctx.app_state);
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
 
         let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"timestamp\":1687962600.0,\"platform\":\"javascript\",\"level\":\"error\",\"exception\":{\"values\":[{\"type\":\"Error\",\"value\":\"Tunneled test error\"}]}}\n";
 

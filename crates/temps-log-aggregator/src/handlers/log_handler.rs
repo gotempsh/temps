@@ -826,7 +826,7 @@ mod tests {
             .layer(auth_middleware)
             .with_state(app_state);
 
-        TestServer::new(app).expect("Failed to create test server")
+        TestServer::new(app)
     }
 
     /// Create a test log line with the given parameters.
@@ -1676,7 +1676,7 @@ mod tests {
         let ctx = create_test_context().await;
 
         let app = configure_routes().with_state(ctx.app_state.clone());
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
         let now = Utc::now();
 
         let response = server
