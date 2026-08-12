@@ -5059,4 +5059,263 @@ mod tests {
             );
         }
     }
+
+    // ── Real-Docker regression: credential-scrub mechanism ────────────────────
+    //
+    // This test exercises `take_snapshot` end-to-end against a real running
+    // Docker daemon. It would have caught the bug that shipped undetected
+    // through multiple review rounds: the old implementation passed sensitive
+    // env vars to `docker commit` via the `ContainerConfig` body's `env`
+    // field, which the Docker Engine silently ignores — the committed image
+    // retained the original secret values unchanged. The fix switches to
+    // `CommitContainerOptionsBuilder::changes()` ("ENV KEY=" Dockerfile
+    // instructions), which is the only API mechanism that actually zeroes
+    // values in the committed image's `Config.Env`.
+    //
+    // The absence of this test (only unit tests on standalone functions, no
+    // real Docker integration) was the root reason the bug shipped.
+
+    /// Regression test: `take_snapshot` must zero all sensitive env-var values
+    /// in the committed Docker image via `--change 'ENV KEY='`.
+    ///
+    /// This test creates a real container with credential-shaped env vars
+    /// (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SAFE_VAR`), calls
+    /// the real `DockerSandboxProvider::take_snapshot`, then inspects the
+    /// committed image's `Config.Env` to assert that sensitive keys are
+    /// present with an **empty** value (`KEY=`) and the safe key survived
+    /// unchanged.
+    ///
+    /// The exact assertion (`ANTHROPIC_API_KEY=`) is what the old broken code
+    /// failed: it produced `ANTHROPIC_API_KEY=sk-ant-...` in the committed
+    /// image, meaning the secret was baked into every snapshot. A test that
+    /// only checked "the key isn't present at all" would have missed the bug
+    /// because Docker's commit never removes keys — it can only overwrite them.
+    ///
+    /// Skips gracefully (prints a message and returns) when Docker is not
+    /// available in the test environment, per CLAUDE.md convention.
+    #[tokio::test]
+    async fn test_take_snapshot_scrubs_credentials_against_real_docker() {
+        // Connect to Docker — skip gracefully if unavailable (CI without Docker,
+        // macOS without Docker Desktop running, etc.).
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        // alpine:3.20 — small image that is always available. No provisioned
+        // `temps` user or AI CLI needed: this test only exercises the env-var
+        // scrubbing path, not the full workspace boot sequence.
+        let base_image = "alpine:3.20";
+        if docker.inspect_image(base_image).await.is_err() {
+            let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                .from_image(base_image)
+                .build();
+            let mut stream = docker.create_image(Some(options), None, None);
+            while let Some(result) = stream.next().await {
+                if let Err(e) = result {
+                    println!("Cannot pull {}, skipping test: {}", base_image, e);
+                    return;
+                }
+            }
+        }
+
+        // Use a fixed container name so stale containers from a previous
+        // interrupted run are cleaned up automatically.
+        let container_name = "temps-snapshot-scrub-regression-test";
+
+        // Best-effort removal of any leftover from a previous test run.
+        let _ = docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // Create a container with env vars that mimic real injected credentials.
+        // The values are synthetic but structurally real: the assertion below
+        // checks that these specific non-empty values are replaced with "".
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(base_image.to_string()),
+            cmd: Some(vec!["sleep".to_string(), "60".to_string()]),
+            env: Some(vec![
+                // Sensitive: injected by executor.rs for Anthropic API auth
+                "ANTHROPIC_API_KEY=sk-ant-real-secret-must-be-scrubbed".to_string(),
+                // Sensitive: injected by executor.rs/trigger.rs for Claude subscription auth
+                "CLAUDE_CODE_OAUTH_TOKEN=tok-oauth-real-secret-must-be-scrubbed".to_string(),
+                // Non-sensitive: must survive in the snapshot unchanged
+                "SAFE_VAR=keep-me".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(container_name)
+                        .build(),
+                ),
+                container_config,
+            )
+            .await
+            .expect("failed to create regression test container");
+
+        let container_id = container.id.clone();
+
+        // Start the container so it has a fully-initialized state that Docker
+        // can commit (an un-started container has no `Config.Env` snapshot).
+        docker
+            .start_container(
+                &container_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("failed to start regression test container");
+
+        // Stop it — take_snapshot documents that the container must be stopped
+        // before commit so the filesystem is in a consistent state.
+        docker
+            .stop_container(
+                &container_id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(5),
+                    signal: None,
+                }),
+            )
+            .await
+            .expect("failed to stop regression test container");
+
+        // Construct a SandboxHandle pointing at the container.
+        // The same construction the throwaway harness used (which caught the
+        // original bug on first manual run and motivated this permanent test).
+        let handle = SandboxHandle {
+            sandbox_id: container_id.clone(),
+            sandbox_name: container_name.to_string(),
+            work_dir: "/home/temps/workspace".into(),
+            backend: crate::sandbox::SandboxBackend::Docker,
+            image: base_image.to_string(),
+        };
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+
+        // Call the real take_snapshot — the path that was broken by the
+        // ContainerConfig.env body (silently ignored by the Docker Engine)
+        // and fixed by switching to CommitContainerOptionsBuilder::changes().
+        let artifact = provider
+            .take_snapshot(&handle, Some("scrub-regression-test".to_string()))
+            .await
+            .expect("take_snapshot failed");
+
+        // Capture what we need to clean up before asserting, so we know what
+        // to remove even if an assertion panics.
+        let snapshot_image_ref = artifact.image_ref.clone();
+        let snapshot_path = artifact.content_path.clone();
+
+        // ── Core assertion: inspect the committed image's Config.Env ─────────
+        // This is the exact check that would have caught the bug. The old
+        // code using ContainerConfig.env left ANTHROPIC_API_KEY with its
+        // original "sk-ant-..." value. The fix produces "ANTHROPIC_API_KEY="
+        // (zeroed, empty value) via `ENV KEY=` Dockerfile change instructions.
+
+        let image_ref_str = snapshot_image_ref
+            .as_deref()
+            .expect("take_snapshot must populate image_ref for Docker backend");
+
+        let inspect = docker
+            .inspect_image(image_ref_str)
+            .await
+            .expect("failed to inspect committed snapshot image");
+
+        let committed_env: Vec<String> = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // ANTHROPIC_API_KEY must be present with an EMPTY value — this is
+        // the "zeroed" post-commit state that the `--change 'ENV KEY='`
+        // mechanism produces. The original value must not appear anywhere.
+        assert!(
+            committed_env.contains(&"ANTHROPIC_API_KEY=".to_string()),
+            "ANTHROPIC_API_KEY must be zeroed ('KEY=') in the committed image — \
+             the old ContainerConfig.env path left the original secret intact. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // CLAUDE_CODE_OAUTH_TOKEN must be zeroed — this key is what subscription
+        // users have injected, making the scrub coverage especially critical.
+        assert!(
+            committed_env.contains(&"CLAUDE_CODE_OAUTH_TOKEN=".to_string()),
+            "CLAUDE_CODE_OAUTH_TOKEN must be zeroed ('KEY=') in the committed image. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // SAFE_VAR must survive unchanged — the scrubber must not strip safe keys.
+        assert!(
+            committed_env.contains(&"SAFE_VAR=keep-me".to_string()),
+            "SAFE_VAR=keep-me must survive in the committed image unchanged. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // Belt-and-suspenders: the literal original secret values must not
+        // appear anywhere in the committed env (as a substring of any entry).
+        let leaked: Vec<_> = committed_env
+            .iter()
+            .filter(|e| {
+                e.contains("sk-ant-real-secret-must-be-scrubbed")
+                    || e.contains("tok-oauth-real-secret-must-be-scrubbed")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "original secret values must not appear in the committed image; leaked: {:?}",
+            leaked
+        );
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        // Best-effort: don't panic on cleanup failure, but do attempt it so
+        // repeated test runs don't accumulate test images and containers.
+        let _ = docker
+            .remove_container(
+                &container_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Some(ref img) = snapshot_image_ref {
+            let _ = docker
+                .remove_image(
+                    img,
+                    Some(
+                        bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                            .force(true)
+                            .build(),
+                    ),
+                    None,
+                )
+                .await;
+        }
+
+        // Remove the snapshot tarball written by take_snapshot to avoid
+        // accumulating test artifacts in ~/.temps/snapshots/.
+        let _ = tokio::fs::remove_file(&snapshot_path).await;
+    }
 }
