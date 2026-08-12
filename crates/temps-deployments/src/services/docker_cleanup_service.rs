@@ -101,6 +101,138 @@ impl DockerClient for DefaultDockerClient {
     }
 }
 
+/// Calculate seconds until the next occurrence of `cleanup_hour` (UTC).
+/// Shared by `DockerCleanupService` (console) and `DockerOnlyCleanupScheduler`
+/// (worker agents) so both run on the same nightly cadence.
+fn seconds_until_next_cleanup(cleanup_hour: u32) -> u64 {
+    let now = chrono::Utc::now();
+
+    // Calculate target time (today at cleanup_hour)
+    let target_time = now
+        .with_hour(cleanup_hour)
+        .and_then(|t| t.with_minute(0))
+        .and_then(|t| t.with_second(0))
+        .expect("Failed to calculate target cleanup time");
+
+    let next_cleanup = if target_time > now {
+        // Cleanup time hasn't passed today
+        target_time
+    } else {
+        // Cleanup time already passed today, schedule for tomorrow
+        target_time + chrono::Duration::days(1)
+    };
+
+    let duration = next_cleanup - now;
+    duration.num_seconds().max(0) as u64
+}
+
+/// Prune unused Docker images and stale build cache via `docker_client`.
+/// Shared by `DockerCleanupService` (console, which also cleans up the
+/// DB-backed static asset cache) and `DockerOnlyCleanupScheduler` (worker
+/// agents, which have no database connection).
+async fn perform_docker_prune(docker_client: &Arc<dyn DockerClient>, max_cache_age_days: i64) {
+    // Cleanup unused images
+    match docker_client.prune_images(true).await {
+        Ok(stats) => {
+            if stats.images_deleted > 0 {
+                info!(
+                    "✅ Removed {} unused Docker images, freed {} MB",
+                    stats.images_deleted, stats.space_reclaimed_mb
+                );
+            } else {
+                info!("✅ No unused Docker images to remove");
+            }
+        }
+        Err(e) => {
+            error!("❌ Failed to prune Docker images: {}", e);
+        }
+    }
+
+    // Cleanup old build cache
+    match docker_client.prune_builder_cache(max_cache_age_days).await {
+        Ok(output) => {
+            // Parse output for statistics
+            if output.contains("freed") || output.contains("removed") {
+                info!("✅ Docker build cache cleanup completed: {}", output.trim());
+            } else if output.is_empty() {
+                info!("✅ No old Docker build cache to remove");
+            } else {
+                debug!("Docker build cache cleanup output: {}", output);
+            }
+        }
+        Err(e) => {
+            // Builder prune might not be available in all Docker versions
+            warn!(
+                "⚠️ Failed to prune Docker builder cache (may not be available): {}",
+                e
+            );
+        }
+    }
+}
+
+/// Lightweight Docker-only cleanup scheduler for hosts without a database
+/// connection — namely worker agent nodes (`temps agent`), which are a
+/// separate process from the console and never register the plugin system
+/// that wires up `DockerCleanupService`. Worker nodes still build images
+/// and accumulate build cache locally, so they need the same nightly
+/// image + build-cache prune; they just skip the DB-backed static asset
+/// cache and chunk cleanup steps, which are console-only concerns.
+pub struct DockerOnlyCleanupScheduler {
+    docker_client: Arc<dyn DockerClient>,
+    /// Hour of day (UTC) to run cleanup (default: 2 AM)
+    cleanup_hour: u32,
+    /// Maximum number of days build cache can be unused before deletion (default: 7)
+    max_cache_age_days: i64,
+}
+
+impl DockerOnlyCleanupScheduler {
+    pub fn new(docker_client: Arc<dyn DockerClient>) -> Self {
+        Self {
+            docker_client,
+            cleanup_hour: 2, // 2 AM UTC
+            max_cache_age_days: 7,
+        }
+    }
+
+    pub fn with_cleanup_hour(mut self, hour: u32) -> Self {
+        self.cleanup_hour = hour % 24;
+        self
+    }
+
+    pub fn with_max_cache_age_days(mut self, days: i64) -> Self {
+        self.max_cache_age_days = days;
+        self
+    }
+
+    /// Start the cleanup scheduler (blocking, should be spawned in a tokio task).
+    pub async fn start_cleanup_scheduler(&self) {
+        info!(
+            "Docker cleanup scheduler started (agent node, cleanup hour: {}:00 UTC)",
+            self.cleanup_hour
+        );
+
+        loop {
+            let seconds_until_cleanup = seconds_until_next_cleanup(self.cleanup_hour);
+            let hours = seconds_until_cleanup / 3600;
+            let minutes = (seconds_until_cleanup % 3600) / 60;
+
+            debug!(
+                "Next Docker cleanup scheduled in {} hours {} minutes",
+                hours, minutes
+            );
+
+            sleep(Duration::from_secs(seconds_until_cleanup)).await;
+
+            info!("🧹 Starting nightly Docker cleanup (agent node)");
+            perform_docker_prune(&self.docker_client, self.max_cache_age_days).await;
+            info!("Nightly Docker cleanup completed (agent node)");
+
+            // Sleep for 1 minute to avoid running cleanup multiple times in the same minute
+            sleep(Duration::from_secs(60)).await;
+        }
+    }
+}
+
 /// Docker cleanup service that runs nightly
 pub struct DockerCleanupService {
     docker_client: Arc<dyn DockerClient>,
@@ -158,25 +290,7 @@ impl DockerCleanupService {
 
     /// Calculate seconds until the next scheduled cleanup
     fn seconds_until_next_cleanup(&self) -> u64 {
-        let now = chrono::Utc::now();
-
-        // Calculate target time (today at cleanup_hour)
-        let target_time = now
-            .with_hour(self.cleanup_hour)
-            .and_then(|t| t.with_minute(0))
-            .and_then(|t| t.with_second(0))
-            .expect("Failed to calculate target cleanup time");
-
-        let next_cleanup = if target_time > now {
-            // Cleanup time hasn't passed today
-            target_time
-        } else {
-            // Cleanup time already passed today, schedule for tomorrow
-            target_time + chrono::Duration::days(1)
-        };
-
-        let duration = next_cleanup - now;
-        duration.num_seconds().max(0) as u64
+        seconds_until_next_cleanup(self.cleanup_hour)
     }
 
     /// Start the cleanup scheduler (blocking, should be spawned in tokio task)
@@ -210,47 +324,7 @@ impl DockerCleanupService {
     async fn perform_cleanup(&self) {
         info!("🧹 Starting nightly Docker cleanup");
 
-        // Cleanup unused images
-        match self.docker_client.prune_images(true).await {
-            Ok(stats) => {
-                if stats.images_deleted > 0 {
-                    info!(
-                        "✅ Removed {} unused Docker images, freed {} MB",
-                        stats.images_deleted, stats.space_reclaimed_mb
-                    );
-                } else {
-                    info!("✅ No unused Docker images to remove");
-                }
-            }
-            Err(e) => {
-                error!("❌ Failed to prune Docker images: {}", e);
-            }
-        }
-
-        // Cleanup old build cache
-        match self
-            .docker_client
-            .prune_builder_cache(self.max_cache_age_days)
-            .await
-        {
-            Ok(output) => {
-                // Parse output for statistics
-                if output.contains("freed") || output.contains("removed") {
-                    info!("✅ Docker build cache cleanup completed: {}", output.trim());
-                } else if output.is_empty() {
-                    info!("✅ No old Docker build cache to remove");
-                } else {
-                    debug!("Docker build cache cleanup output: {}", output);
-                }
-            }
-            Err(e) => {
-                // Builder prune might not be available in all Docker versions
-                warn!(
-                    "⚠️ Failed to prune Docker builder cache (may not be available): {}",
-                    e
-                );
-            }
-        }
+        perform_docker_prune(&self.docker_client, self.max_cache_age_days).await;
 
         // Cleanup old persisted static asset chunks
         if let Some(ref static_dir) = self.static_dir {
@@ -530,5 +604,58 @@ mod tests {
                 .with_max_cache_age_days(14);
 
         assert_eq!(service.max_cache_age_days, 14);
+    }
+
+    #[test]
+    fn test_docker_only_scheduler_defaults() {
+        let scheduler = DockerOnlyCleanupScheduler::new(Arc::new(DefaultDockerClient));
+
+        assert_eq!(scheduler.cleanup_hour, 2);
+        assert_eq!(scheduler.max_cache_age_days, 7);
+    }
+
+    #[test]
+    fn test_docker_only_scheduler_custom_cleanup_hour() {
+        let scheduler =
+            DockerOnlyCleanupScheduler::new(Arc::new(DefaultDockerClient)).with_cleanup_hour(3);
+
+        assert_eq!(scheduler.cleanup_hour, 3);
+    }
+
+    #[test]
+    fn test_docker_only_scheduler_custom_cache_age() {
+        let scheduler = DockerOnlyCleanupScheduler::new(Arc::new(DefaultDockerClient))
+            .with_max_cache_age_days(14);
+
+        assert_eq!(scheduler.max_cache_age_days, 14);
+    }
+
+    #[tokio::test]
+    async fn test_perform_docker_prune_reports_success() {
+        let client: Arc<dyn DockerClient> = Arc::new(MockDockerClient {
+            prune_images_result: Ok(PruneStats {
+                images_deleted: 2,
+                space_reclaimed_mb: 128,
+            }),
+            prune_cache_result: Ok("removed 1 build cache entries, freed 64 MB".to_string()),
+        });
+
+        // Exercises the shared free function directly — success is "did
+        // not panic and produced no error path" since prune_images/
+        // prune_builder_cache results are only logged, not returned.
+        perform_docker_prune(&client, 7).await;
+    }
+
+    #[tokio::test]
+    async fn test_perform_docker_prune_handles_errors_gracefully() {
+        let client: Arc<dyn DockerClient> = Arc::new(MockDockerClient {
+            prune_images_result: Err("daemon unreachable".to_string()),
+            prune_cache_result: Err("builder prune not supported".to_string()),
+        });
+
+        // Both prune calls fail; the shared helper must not panic — errors
+        // are logged and cleanup continues (e.g. images prune failing must
+        // not skip the build-cache prune).
+        perform_docker_prune(&client, 7).await;
     }
 }
