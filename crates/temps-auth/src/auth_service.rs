@@ -400,13 +400,20 @@ impl AuthService {
                 // Algorithm::SHA1, 6 digits, skew 1, step 30 — these are the
                 // parameters that were used when the secret was enrolled (see
                 // `generate_mfa_setup_candidate`). They must not silently change.
+                // `build()` (not `build_noncompliant()`) so a malformed stored
+                // secret still fails loudly instead of constructing a Totp that
+                // silently never validates.
                 let totp = Builder::new()
                     .with_algorithm(Algorithm::SHA1)
                     .with_digits(6)
                     .with_skew(1)
                     .with_step_duration(30)
                     .with_secret(decoded)
-                    .build_noncompliant();
+                    .build()
+                    .map_err(|error| MfaChallengeError::VerifierConfiguration {
+                        user_id: user.id,
+                        reason: format!("TOTP verifier cannot be initialized: {error}"),
+                    })?;
 
                 // check_current now returns Option<u64>: Some(step) = valid,
                 // None = invalid. There is no longer a fallible clock path.

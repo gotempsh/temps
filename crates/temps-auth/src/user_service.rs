@@ -175,15 +175,17 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
         .collect::<Result<Vec<_>, _>>()?;
 
     // Validate that the generated secret can produce a well-formed TOTP.
-    // In totp-rs 6.0.0 Secret is a struct (From<Vec<u8>>), Builder replaces
-    // TOTP::new, and build_noncompliant never fails for these fixed, valid params.
-    let _ = Builder::new()
+    // In totp-rs 6.0.0 Secret is a struct (From<Vec<u8>>) and Builder replaces
+    // TOTP::new. Use `build()` (not `build_noncompliant()`) so this validation
+    // actually enforces RFC digit/secret-length checks instead of always passing.
+    Builder::new()
         .with_algorithm(Algorithm::SHA1)
         .with_digits(6)
         .with_skew(1)
         .with_step_duration(30)
         .with_secret(secret.clone())
-        .build_noncompliant();
+        .build()
+        .map_err(|error| UserServiceError::Mfa(format!("Failed to create TOTP: {}", error)))?;
 
     let otp_auth_url = format!(
         "otpauth://totp/Temps:{}?secret={}&issuer=Temps&algorithm=SHA1&digits=6&period=30",
@@ -926,7 +928,8 @@ impl UserService {
             .with_skew(1)
             .with_step_duration(30)
             .with_secret(decoded)
-            .build_noncompliant();
+            .build()
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
         if totp.check_current(code).is_some() {
             // Enable MFA
@@ -1031,7 +1034,8 @@ impl UserService {
             .with_skew(1)
             .with_step_duration(30)
             .with_secret(decoded)
-            .build_noncompliant();
+            .build()
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
         Ok(totp.check_current(code).is_some())
     }
