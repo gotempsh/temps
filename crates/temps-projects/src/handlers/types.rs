@@ -608,21 +608,22 @@ pub struct UpdateDeploymentConfigRequest {
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
     /// Project-level default timeout for regular (non-streaming) HTTP
-    /// requests, in seconds (1-86400). Environments may override this; always
-    /// clamped to the operator's global hard ceiling regardless of what's set
-    /// here. Absent leaves the current value unchanged.
+    /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
+    /// override this; always clamped to the operator's global hard ceiling
+    /// regardless of what's set here. Absent leaves the current value
+    /// unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_seconds: Option<i32>,
     /// Project-level default idle timeout for Server-Sent Events streams, in
-    /// seconds (1-86400). Environments may override this; always clamped to
-    /// the operator's global hard ceiling. Absent leaves the current value
-    /// unchanged.
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sse_idle_timeout_seconds: Option<i32>,
     /// Project-level default idle timeout for WebSocket connections, in
-    /// seconds (1-86400). Environments may override this; always clamped to
-    /// the operator's global hard ceiling. Absent leaves the current value
-    /// unchanged.
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<i32>,
 }

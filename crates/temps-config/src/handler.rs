@@ -1497,8 +1497,8 @@ fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem>
 }
 
 /// Reject a request-timeout ceiling outside the supported range, or a
-/// default timeout of zero (which would mean "every request times out
-/// instantly").
+/// nonzero default timeout outside `1..=max`. `0` is accepted as the
+/// explicit "no timeout" state — see the loop below.
 ///
 /// The proxy already clamps a stored out-of-range ceiling on read
 /// (`RequestTimeoutSettings::ceiling`) — but storing one anyway would mean
