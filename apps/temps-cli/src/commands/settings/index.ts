@@ -97,10 +97,10 @@ export function buildAutomationSettingsUpdate(
   ) {
     const current = currentSettings?.request_timeouts
     const fields: Array<[string, string | undefined, number]> = [
-      ['--max-request-timeout', options.maxRequestTimeout, current?.max_request_timeout_seconds ?? 3600],
-      ['--default-http-timeout', options.defaultHttpTimeout, current?.default_http_timeout_seconds ?? 60],
-      ['--default-sse-idle-timeout', options.defaultSseIdleTimeout, current?.default_sse_idle_timeout_seconds ?? 3600],
-      ['--default-websocket-idle-timeout', options.defaultWebsocketIdleTimeout, current?.default_websocket_idle_timeout_seconds ?? 3600],
+      ['--max-request-timeout', options.maxRequestTimeout, current?.max_request_timeout_seconds ?? 600],
+      ['--default-http-timeout', options.defaultHttpTimeout, current?.default_http_timeout_seconds ?? 0],
+      ['--default-sse-idle-timeout', options.defaultSseIdleTimeout, current?.default_sse_idle_timeout_seconds ?? 0],
+      ['--default-websocket-idle-timeout', options.defaultWebsocketIdleTimeout, current?.default_websocket_idle_timeout_seconds ?? 0],
     ]
     const parsed: number[] = []
     for (const [flag, raw, fallback] of fields) {
@@ -428,24 +428,25 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
       }
 
       case 'request_timeouts': {
-        info('The hard ceiling always wins, even over a project/environment override.')
+        info('0 means no timeout. Timeouts are opt-in — existing apps are unaffected until you set a nonzero default here.')
+        info('The hard ceiling only applies once a timeout is actually configured; it never creates one on its own.')
         newline()
 
         const maxRequestTimeout = await promptNumber(
           'Hard ceiling for all request/idle timeouts (seconds)',
-          { default: currentSettings?.request_timeouts?.max_request_timeout_seconds ?? 3600, min: 1 }
+          { default: currentSettings?.request_timeouts?.max_request_timeout_seconds ?? 600, min: 5 }
         )
         const defaultHttpTimeout = await promptNumber(
-          'Default timeout for regular HTTP requests (seconds)',
-          { default: currentSettings?.request_timeouts?.default_http_timeout_seconds ?? 60, min: 1 }
+          'Default timeout for regular HTTP requests (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_http_timeout_seconds ?? 0, min: 0 }
         )
         const defaultSseIdleTimeout = await promptNumber(
-          'Default idle timeout for SSE streams (seconds)',
-          { default: currentSettings?.request_timeouts?.default_sse_idle_timeout_seconds ?? 3600, min: 1 }
+          'Default idle timeout for SSE streams (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_sse_idle_timeout_seconds ?? 0, min: 0 }
         )
         const defaultWebsocketIdleTimeout = await promptNumber(
-          'Default idle timeout for WebSocket connections (seconds)',
-          { default: currentSettings?.request_timeouts?.default_websocket_idle_timeout_seconds ?? 3600, min: 1 }
+          'Default idle timeout for WebSocket connections (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_websocket_idle_timeout_seconds ?? 0, min: 0 }
         )
 
         updates.request_timeouts = {

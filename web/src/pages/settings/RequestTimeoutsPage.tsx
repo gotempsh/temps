@@ -23,17 +23,20 @@ interface RequestTimeoutsFormData {
 }
 
 const DEFAULTS: RequestTimeoutSettings = {
-  max_request_timeout_seconds: 3600,
-  default_http_timeout_seconds: 60,
-  default_sse_idle_timeout_seconds: 3600,
-  default_websocket_idle_timeout_seconds: 3600,
+  max_request_timeout_seconds: 600,
+  default_http_timeout_seconds: 0,
+  default_sse_idle_timeout_seconds: 0,
+  default_websocket_idle_timeout_seconds: 0,
 }
 
 /**
  * Upstream request/connection timeouts the proxy applies to customer app
- * traffic. These are the global hard ceiling and defaults; a project or
- * environment may set a shorter value under Deployment Config, but can never
- * exceed the ceiling set here.
+ * traffic. Timeouts are opt-in: by default no timeout is applied to any
+ * traffic class (0 = no timeout), so an existing app with a slow endpoint or
+ * long-lived connection keeps working unchanged. A project or environment
+ * may set its own override under Deployment Config; the hard ceiling below
+ * only takes effect once a timeout is actually configured (here or per
+ * project/environment) — it never creates one on its own.
  */
 export function RequestTimeoutsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -103,12 +106,16 @@ export function RequestTimeoutsPage() {
             Request Timeouts
           </CardTitle>
           <CardDescription>
-            How long the proxy waits on upstream app traffic before closing the
-            connection. Server-Sent Events and WebSocket connections get their
-            own idle timeout since they&apos;re long-lived by design — a plain
-            HTTP request uses the regular timeout instead. Projects and
-            environments can set a shorter value under Deployment Config, but
-            never longer than the ceiling below.
+            How long the proxy waits on upstream app traffic before closing
+            the connection. Timeouts are opt-in — 0 means no timeout, and
+            that&apos;s the default for every traffic class, so existing apps
+            are unaffected until you configure one. Server-Sent Events and
+            WebSocket connections get their own idle timeout since
+            they&apos;re long-lived by design — a plain HTTP request uses the
+            regular timeout instead. Projects and environments can set their
+            own override under Deployment Config; the ceiling below only
+            applies once a timeout is actually configured, and never longer
+            than that.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -130,7 +137,8 @@ export function RequestTimeoutsPage() {
             />
             <p className="text-xs text-muted-foreground">
               No project/environment override, and no default below, can exceed
-              this. Min 5, max 86400 (24h). Default 3600 (1h).
+              this — but only applies once a timeout is actually configured.
+              Min 5, max 86400 (24h). Default 600 (10m).
             </p>
             {errors.request_timeouts?.max_request_timeout_seconds && (
               <p className="text-xs text-destructive">
@@ -147,19 +155,19 @@ export function RequestTimeoutsPage() {
               <Input
                 id="default_http_timeout_seconds"
                 type="number"
-                min={1}
+                min={0}
                 {...register('request_timeouts.default_http_timeout_seconds', {
                   valueAsNumber: true,
                   required: true,
-                  min: 1,
+                  min: 0,
                 })}
               />
               <p className="text-xs text-muted-foreground">
-                Non-streaming requests. Default 60.
+                Non-streaming requests. 0 = no timeout (default).
               </p>
               {errors.request_timeouts?.default_http_timeout_seconds && (
                 <p className="text-xs text-destructive">
-                  Must be at least 1 second
+                  Must be 0 (no timeout) or greater
                 </p>
               )}
             </div>
@@ -171,18 +179,18 @@ export function RequestTimeoutsPage() {
               <Input
                 id="default_sse_idle_timeout_seconds"
                 type="number"
-                min={1}
+                min={0}
                 {...register(
                   'request_timeouts.default_sse_idle_timeout_seconds',
-                  { valueAsNumber: true, required: true, min: 1 }
+                  { valueAsNumber: true, required: true, min: 0 }
                 )}
               />
               <p className="text-xs text-muted-foreground">
-                Server-Sent Events streams. Default 3600.
+                Server-Sent Events streams. 0 = no timeout (default).
               </p>
               {errors.request_timeouts?.default_sse_idle_timeout_seconds && (
                 <p className="text-xs text-destructive">
-                  Must be at least 1 second
+                  Must be 0 (no timeout) or greater
                 </p>
               )}
             </div>
@@ -194,19 +202,19 @@ export function RequestTimeoutsPage() {
               <Input
                 id="default_websocket_idle_timeout_seconds"
                 type="number"
-                min={1}
+                min={0}
                 {...register(
                   'request_timeouts.default_websocket_idle_timeout_seconds',
-                  { valueAsNumber: true, required: true, min: 1 }
+                  { valueAsNumber: true, required: true, min: 0 }
                 )}
               />
               <p className="text-xs text-muted-foreground">
-                WebSocket connections. Default 3600.
+                WebSocket connections. 0 = no timeout (default).
               </p>
               {errors.request_timeouts
                 ?.default_websocket_idle_timeout_seconds && (
                 <p className="text-xs text-destructive">
-                  Must be at least 1 second
+                  Must be 0 (no timeout) or greater
                 </p>
               )}
             </div>

@@ -2559,10 +2559,10 @@
           },
           "request_timeouts": {
             "default": {
-              "default_http_timeout_seconds": 60,
-              "default_sse_idle_timeout_seconds": 3600,
-              "default_websocket_idle_timeout_seconds": 3600,
-              "max_request_timeout_seconds": 3600
+              "default_http_timeout_seconds": 0,
+              "default_sse_idle_timeout_seconds": 0,
+              "default_websocket_idle_timeout_seconds": 0,
+              "max_request_timeout_seconds": 600
             },
             "oneOf": [
               {
@@ -9743,7 +9743,7 @@
             "type": "integer"
           },
           "requestTimeoutSeconds": {
-            "description": "Override for the proxy's upstream timeout on regular (non-streaming)\nHTTP requests to this project/environment, in seconds.\n`None` = inherit the global `request_timeouts.default_http_timeout_seconds`.\nAlways clamped to the global hard ceiling\n(`request_timeouts.max_request_timeout_seconds`) at resolution time,\nregardless of what's set here.",
+            "description": "Override for the proxy's upstream timeout on regular (non-streaming)\nHTTP requests to this project/environment, in seconds.\n`None` = inherit the global `request_timeouts.default_http_timeout_seconds`\n(which itself defaults to \"no timeout\"). `Some(0)` explicitly forces\n\"no timeout\" for this project/environment, overriding a nonzero\nglobal default. `Some(n)` for `n > 0` sets an explicit timeout,\nalways clamped to the global hard ceiling\n(`request_timeouts.max_request_timeout_seconds`) at resolution time.",
             "format": "int32",
             "type": [
               "integer",
@@ -9766,7 +9766,7 @@
             "type": "boolean"
           },
           "sseIdleTimeoutSeconds": {
-            "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. Always clamped to\nthe global hard ceiling at resolution time.",
+            "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
             "format": "int32",
             "type": [
               "integer",
@@ -9793,7 +9793,7 @@
             "type": "integer"
           },
           "websocketIdleTimeoutSeconds": {
-            "description": "Override for the proxy's idle timeout on WebSocket connections to this\nproject/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_websocket_idle_timeout_seconds`. Always\nclamped to the global hard ceiling at resolution time.",
+            "description": "Override for the proxy's idle timeout on WebSocket connections to this\nproject/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
             "format": "int32",
             "type": [
               "integer",
@@ -31108,36 +31108,36 @@
         "type": "object"
       },
       "RequestTimeoutSettings": {
-        "description": "Upstream request/connection timeouts for customer app traffic.\n\nThe proxy previously hardcoded these (60s for regular HTTP, 3600s for\nWebSocket upgrades) with no SSE-specific handling at all — an idle SSE\nstream got RST'd at the 60s HTTP default, since only the `Upgrade:\nwebsocket` header extended the timeout. This settings struct makes all\nthree configurable while keeping the same defaults, so upgrading\ninstalls see no behavior change until an operator opts in — except the\nSSE default, which is the actual fix for the RST-on-idle bug.\n\n`max_request_timeout_seconds` is a hard ceiling: whatever a project or\nenvironment configures (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`) is always\nclamped to it, so lowering the ceiling here takes effect immediately\nwithout needing every environment row re-saved.",
+        "description": "Upstream request/connection timeouts for customer app traffic.\n\nBy default, no timeout is applied to customer app traffic at all — an\nexisting app that happens to have a slow endpoint, a long-polling\nrequest, or an unusually long response must keep working exactly as it\ndid before this setting existed. Timeouts here are opt-in: an operator\ncan set a global default, and/or a project/environment can set its own\noverride (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until\none of those is explicitly configured, the proxy holds the connection\nopen indefinitely (bounded only by TCP/OS-level limits).\n\n`default_*_timeout_seconds` of `0` means \"no timeout\" — this is the\nout-of-the-box value for all three. `max_request_timeout_seconds` is a\nhard ceiling that only comes into play once a timeout is actually\nconfigured (globally or per project/environment): whatever value is\nresolved is always clamped to it, so lowering the ceiling here takes\neffect immediately without needing every environment row re-saved. It\nnever *creates* a timeout for traffic that has none.",
         "properties": {
           "default_http_timeout_seconds": {
-            "default": 60,
-            "description": "Default timeout for regular (non-streaming) HTTP requests, in\nseconds. Used when a project/environment hasn't set\n`request_timeout_seconds`.",
-            "example": 60,
+            "default": 0,
+            "description": "Default timeout for regular (non-streaming) HTTP requests, in\nseconds. Used when a project/environment hasn't set\n`request_timeout_seconds`. `0` (the default) means no timeout.",
+            "example": 0,
             "format": "int32",
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "default_sse_idle_timeout_seconds": {
-            "default": 3600,
-            "description": "Default idle timeout for Server-Sent Events streams, in seconds. Used\nwhen a project/environment hasn't set `sse_idle_timeout_seconds`.",
-            "example": 3600,
+            "default": 0,
+            "description": "Default idle timeout for Server-Sent Events streams, in seconds. Used\nwhen a project/environment hasn't set `sse_idle_timeout_seconds`. `0`\n(the default) means no timeout.",
+            "example": 0,
             "format": "int32",
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "default_websocket_idle_timeout_seconds": {
-            "default": 3600,
-            "description": "Default idle timeout for WebSocket connections, in seconds. Used when\na project/environment hasn't set `websocket_idle_timeout_seconds`.",
-            "example": 3600,
+            "default": 0,
+            "description": "Default idle timeout for WebSocket connections, in seconds. Used when\na project/environment hasn't set `websocket_idle_timeout_seconds`.\n`0` (the default) means no timeout.",
+            "example": 0,
             "format": "int32",
-            "minimum": 1,
+            "minimum": 0,
             "type": "integer"
           },
           "max_request_timeout_seconds": {
-            "default": 3600,
-            "description": "Hard ceiling, in seconds. No project/environment override — and no\nresolved default — can exceed this value.",
-            "example": 3600,
+            "default": 600,
+            "description": "Hard ceiling, in seconds, applied once a timeout is configured (via a\nglobal default above or a project/environment override). Has no\neffect on traffic with no timeout configured at all.",
+            "example": 600,
             "format": "int32",
             "maximum": 86400,
             "minimum": 5,

@@ -329,7 +329,9 @@ export function EnvironmentConfigurationCard({
           ? parseInt(formData.wake_timeout_seconds)
           : null,
         // Empty string clears the override (inherit the project/global
-        // default); a value overrides it. Always clamped server-side to the
+        // default, which itself defaults to "no timeout"). "0" is a valid,
+        // distinct override meaning "explicitly no timeout for this
+        // environment." Any nonzero value is clamped server-side to the
         // operator's global hard ceiling regardless of what's set here.
         request_timeout_seconds: formData.request_timeout_seconds
           ? parseInt(formData.request_timeout_seconds)
@@ -690,16 +692,18 @@ export function EnvironmentConfigurationCard({
               </div>
               <p className="text-xs text-muted-foreground mb-4">
                 Override the global request timeout defaults for this
-                environment. Leave blank to inherit the project/global default.
-                Always clamped server-side to the operator&apos;s global hard
-                ceiling.
+                environment. Leave blank to inherit the project/global
+                default (no timeout, unless an operator configured one).
+                Enter 0 to explicitly force no timeout for this environment.
+                Nonzero values are always clamped server-side to the
+                operator&apos;s global hard ceiling.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <Label>Regular HTTP (seconds)</Label>
                   <Input
                     type="number"
-                    min="1"
+                    min="0"
                     max="86400"
                     value={formData.request_timeout_seconds}
                     onChange={(e) =>
@@ -715,7 +719,7 @@ export function EnvironmentConfigurationCard({
                   <Label>SSE Idle (seconds)</Label>
                   <Input
                     type="number"
-                    min="1"
+                    min="0"
                     max="86400"
                     value={formData.sse_idle_timeout_seconds}
                     onChange={(e) =>
@@ -731,7 +735,7 @@ export function EnvironmentConfigurationCard({
                   <Label>WebSocket Idle (seconds)</Label>
                   <Input
                     type="number"
-                    min="1"
+                    min="0"
                     max="86400"
                     value={formData.websocket_idle_timeout_seconds}
                     onChange={(e) =>

@@ -1517,6 +1517,9 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
             ))
             .build());
     }
+    // `0` is the valid, default "no timeout" state for each traffic class —
+    // opt-in only, so an existing app with no timeout configured keeps
+    // working unchanged. A nonzero value must still be a sane duration.
     for (name, value) in [
         (
             "default_http_timeout_seconds",
@@ -1531,10 +1534,13 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
             timeouts.default_websocket_idle_timeout_seconds,
         ),
     ] {
-        if value == 0 {
+        if value != 0 && !(1..=max).contains(&value) {
             return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .title("Validation Error")
-                .detail(format!("request_timeouts.{name} must be greater than 0"))
+                .detail(format!(
+                    "request_timeouts.{name} must be 0 (no timeout) or between 1 and {max} \
+                     seconds (got {value})"
+                ))
                 .build());
         }
     }
@@ -2260,14 +2266,17 @@ mod tests {
     }
 
     #[test]
-    fn request_timeouts_zero_default_is_rejected() {
+    fn request_timeouts_zero_default_is_accepted_as_no_timeout() {
+        // 0 is the platform default and an explicit, valid "no timeout"
+        // state for each traffic class — not a validation error. Timeouts
+        // must be opt-in, so a zero default must never be rejected.
         let sse_zero = RequestTimeoutSettings {
             default_sse_idle_timeout_seconds: 0,
             ..RequestTimeoutSettings::default()
         };
         assert!(
-            validate_request_timeouts(&sse_zero).is_err(),
-            "zero SSE default should be rejected"
+            validate_request_timeouts(&sse_zero).is_ok(),
+            "zero SSE default (no timeout) should be accepted"
         );
 
         let http_zero = RequestTimeoutSettings {
@@ -2275,8 +2284,8 @@ mod tests {
             ..RequestTimeoutSettings::default()
         };
         assert!(
-            validate_request_timeouts(&http_zero).is_err(),
-            "zero HTTP default should be rejected"
+            validate_request_timeouts(&http_zero).is_ok(),
+            "zero HTTP default (no timeout) should be accepted"
         );
 
         let websocket_zero = RequestTimeoutSettings {
@@ -2284,8 +2293,38 @@ mod tests {
             ..RequestTimeoutSettings::default()
         };
         assert!(
-            validate_request_timeouts(&websocket_zero).is_err(),
-            "zero WebSocket default should be rejected"
+            validate_request_timeouts(&websocket_zero).is_ok(),
+            "zero WebSocket default (no timeout) should be accepted"
+        );
+    }
+
+    #[test]
+    fn request_timeouts_nonzero_default_outside_range_is_rejected() {
+        let http_too_high = RequestTimeoutSettings {
+            default_http_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&http_too_high).is_err(),
+            "HTTP default above the max ceiling should be rejected"
+        );
+
+        let sse_too_high = RequestTimeoutSettings {
+            default_sse_idle_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&sse_too_high).is_err(),
+            "SSE default above the max ceiling should be rejected"
+        );
+
+        let websocket_too_high = RequestTimeoutSettings {
+            default_websocket_idle_timeout_seconds: 90_000,
+            ..RequestTimeoutSettings::default()
+        };
+        assert!(
+            validate_request_timeouts(&websocket_too_high).is_err(),
+            "WebSocket default above the max ceiling should be rejected"
         );
     }
 

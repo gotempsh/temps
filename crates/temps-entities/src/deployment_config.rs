@@ -377,24 +377,28 @@ pub struct DeploymentConfig {
 
     /// Override for the proxy's upstream timeout on regular (non-streaming)
     /// HTTP requests to this project/environment, in seconds.
-    /// `None` = inherit the global `request_timeouts.default_http_timeout_seconds`.
-    /// Always clamped to the global hard ceiling
-    /// (`request_timeouts.max_request_timeout_seconds`) at resolution time,
-    /// regardless of what's set here.
+    /// `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+    /// (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+    /// "no timeout" for this project/environment, overriding a nonzero
+    /// global default. `Some(n)` for `n > 0` sets an explicit timeout,
+    /// always clamped to the global hard ceiling
+    /// (`request_timeouts.max_request_timeout_seconds`) at resolution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_seconds: Option<i32>,
 
     /// Override for the proxy's idle timeout on Server-Sent Events streams to
     /// this project/environment, in seconds. `None` = inherit the global
-    /// `request_timeouts.default_sse_idle_timeout_seconds`. Always clamped to
+    /// `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
     /// the global hard ceiling at resolution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_idle_timeout_seconds: Option<i32>,
 
     /// Override for the proxy's idle timeout on WebSocket connections to this
     /// project/environment, in seconds. `None` = inherit the global
-    /// `request_timeouts.default_websocket_idle_timeout_seconds`. Always
-    /// clamped to the global hard ceiling at resolution time.
+    /// `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+    /// the global hard ceiling at resolution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<i32>,
 }
@@ -644,7 +648,9 @@ impl DeploymentConfig {
         // Sanity bounds only — the operator's hard ceiling
         // (`AppSettings.request_timeouts.max_request_timeout_seconds`) is
         // enforced separately at resolution time, since this type has no
-        // access to global settings.
+        // access to global settings. `0` is a valid explicit "no timeout"
+        // override (same uncapped-sentinel convention as `cpu_limit`/
+        // `memory_limit` above), so the floor is 0, not 1.
         for (name, value) in [
             ("Request timeout", self.request_timeout_seconds),
             ("SSE idle timeout", self.sse_idle_timeout_seconds),
@@ -654,9 +660,9 @@ impl DeploymentConfig {
             ),
         ] {
             if let Some(seconds) = value {
-                if !(1..=86400).contains(&seconds) {
+                if !(0..=86400).contains(&seconds) {
                     return Err(format!(
-                        "{name} {seconds} is not in valid range (1-86400 seconds)"
+                        "{name} {seconds} is not in valid range (0-86400 seconds, 0 = no timeout)"
                     ));
                 }
             }
@@ -964,11 +970,18 @@ mod tests {
 
     #[test]
     fn request_timeout_validation_rejects_out_of_range() {
-        let too_low = DeploymentConfig {
+        // 0 is a valid explicit "no timeout" override, not a validation error.
+        let no_timeout_override = DeploymentConfig {
             request_timeout_seconds: Some(0),
             ..Default::default()
         };
-        assert!(too_low.validate().is_err());
+        assert!(no_timeout_override.validate().is_ok());
+
+        let negative = DeploymentConfig {
+            request_timeout_seconds: Some(-1),
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
 
         let too_high = DeploymentConfig {
             sse_idle_timeout_seconds: Some(90_000),

@@ -1288,6 +1288,7 @@ interface TimeoutsOptions {
 
 function formatTimeout(seconds: number | null | undefined): string {
   if (seconds == null) return colors.muted('inherit (project/global default)')
+  if (seconds === 0) return colors.muted('no timeout (explicit override)')
   return `${seconds}s`
 }
 
@@ -1337,24 +1338,24 @@ async function timeoutsCmd(environment: string, options: TimeoutsOptions): Promi
     } else {
       if (options.request) {
         const seconds = parseInt(options.request, 10)
-        if (isNaN(seconds) || seconds <= 0) {
-          errorOutput('--request must be a positive number of seconds')
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--request must be 0 (no timeout) or a positive number of seconds')
           return
         }
         updateBody.request_timeout_seconds = seconds
       }
       if (options.sseIdle) {
         const seconds = parseInt(options.sseIdle, 10)
-        if (isNaN(seconds) || seconds <= 0) {
-          errorOutput('--sse-idle must be a positive number of seconds')
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--sse-idle must be 0 (no timeout) or a positive number of seconds')
           return
         }
         updateBody.sse_idle_timeout_seconds = seconds
       }
       if (options.websocketIdle) {
         const seconds = parseInt(options.websocketIdle, 10)
-        if (isNaN(seconds) || seconds <= 0) {
-          errorOutput('--websocket-idle must be a positive number of seconds')
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--websocket-idle must be 0 (no timeout) or a positive number of seconds')
           return
         }
         updateBody.websocket_idle_timeout_seconds = seconds
@@ -1408,9 +1409,11 @@ async function timeoutsCmd(environment: string, options: TimeoutsOptions): Promi
     keyValue('WebSocket idle timeout', formatTimeout(config?.websocketIdleTimeoutSeconds))
     newline()
     info('An unset value inherits the project default, then the operator\'s global default —')
+    info('which is "no timeout" unless an operator has configured one. Nonzero values are')
     info('always clamped to the global hard ceiling regardless of what\'s configured here.')
     newline()
     info(`Set it with: ${colors.muted('temps env timeouts ' + environment + ' --request 30 --sse-idle 900')}`)
+    info(`Force no timeout: ${colors.muted('temps env timeouts ' + environment + ' --request 0')}`)
     info(`Clear overrides: ${colors.muted('temps env timeouts ' + environment + ' --inherit')}`)
   }
 }

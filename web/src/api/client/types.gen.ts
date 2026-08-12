@@ -4749,10 +4749,12 @@ export type DeploymentConfig = {
     /**
      * Override for the proxy's upstream timeout on regular (non-streaming)
      * HTTP requests to this project/environment, in seconds.
-     * `None` = inherit the global `request_timeouts.default_http_timeout_seconds`.
-     * Always clamped to the global hard ceiling
-     * (`request_timeouts.max_request_timeout_seconds`) at resolution time,
-     * regardless of what's set here.
+     * `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+     * (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+     * "no timeout" for this project/environment, overriding a nonzero
+     * global default. `Some(n)` for `n > 0` sets an explicit timeout,
+     * always clamped to the global hard ceiling
+     * (`request_timeouts.max_request_timeout_seconds`) at resolution time.
      */
     requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
@@ -4763,7 +4765,8 @@ export type DeploymentConfig = {
     /**
      * Override for the proxy's idle timeout on Server-Sent Events streams to
      * this project/environment, in seconds. `None` = inherit the global
-     * `request_timeouts.default_sse_idle_timeout_seconds`. Always clamped to
+     * `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+     * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
      * the global hard ceiling at resolution time.
      */
     sseIdleTimeoutSeconds?: number | null;
@@ -4795,8 +4798,9 @@ export type DeploymentConfig = {
     /**
      * Override for the proxy's idle timeout on WebSocket connections to this
      * project/environment, in seconds. `None` = inherit the global
-     * `request_timeouts.default_websocket_idle_timeout_seconds`. Always
-     * clamped to the global hard ceiling at resolution time.
+     * `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+     * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+     * the global hard ceiling at resolution time.
      */
     websocketIdleTimeoutSeconds?: number | null;
 };
@@ -14081,40 +14085,47 @@ export type RequestRow = {
 /**
  * Upstream request/connection timeouts for customer app traffic.
  *
- * The proxy previously hardcoded these (60s for regular HTTP, 3600s for
- * WebSocket upgrades) with no SSE-specific handling at all — an idle SSE
- * stream got RST'd at the 60s HTTP default, since only the `Upgrade:
- * websocket` header extended the timeout. This settings struct makes all
- * three configurable while keeping the same defaults, so upgrading
- * installs see no behavior change until an operator opts in — except the
- * SSE default, which is the actual fix for the RST-on-idle bug.
+ * By default, no timeout is applied to customer app traffic at all — an
+ * existing app that happens to have a slow endpoint, a long-polling
+ * request, or an unusually long response must keep working exactly as it
+ * did before this setting existed. Timeouts here are opt-in: an operator
+ * can set a global default, and/or a project/environment can set its own
+ * override (`DeploymentConfig::request_timeout_seconds` /
+ * `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until
+ * one of those is explicitly configured, the proxy holds the connection
+ * open indefinitely (bounded only by TCP/OS-level limits).
  *
- * `max_request_timeout_seconds` is a hard ceiling: whatever a project or
- * environment configures (`DeploymentConfig::request_timeout_seconds` /
- * `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`) is always
- * clamped to it, so lowering the ceiling here takes effect immediately
- * without needing every environment row re-saved.
+ * `default_*_timeout_seconds` of `0` means "no timeout" — this is the
+ * out-of-the-box value for all three. `max_request_timeout_seconds` is a
+ * hard ceiling that only comes into play once a timeout is actually
+ * configured (globally or per project/environment): whatever value is
+ * resolved is always clamped to it, so lowering the ceiling here takes
+ * effect immediately without needing every environment row re-saved. It
+ * never *creates* a timeout for traffic that has none.
  */
 export type RequestTimeoutSettings = {
     /**
      * Default timeout for regular (non-streaming) HTTP requests, in
      * seconds. Used when a project/environment hasn't set
-     * `request_timeout_seconds`.
+     * `request_timeout_seconds`. `0` (the default) means no timeout.
      */
     default_http_timeout_seconds?: number;
     /**
      * Default idle timeout for Server-Sent Events streams, in seconds. Used
-     * when a project/environment hasn't set `sse_idle_timeout_seconds`.
+     * when a project/environment hasn't set `sse_idle_timeout_seconds`. `0`
+     * (the default) means no timeout.
      */
     default_sse_idle_timeout_seconds?: number;
     /**
      * Default idle timeout for WebSocket connections, in seconds. Used when
      * a project/environment hasn't set `websocket_idle_timeout_seconds`.
+     * `0` (the default) means no timeout.
      */
     default_websocket_idle_timeout_seconds?: number;
     /**
-     * Hard ceiling, in seconds. No project/environment override — and no
-     * resolved default — can exceed this value.
+     * Hard ceiling, in seconds, applied once a timeout is configured (via a
+     * global default above or a project/environment override). Has no
+     * effect on traffic with no timeout configured at all.
      */
     max_request_timeout_seconds?: number;
 };
