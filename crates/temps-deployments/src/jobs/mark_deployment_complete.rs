@@ -831,6 +831,65 @@ impl MarkDeploymentCompleteJob {
                 .await?;
         }
 
+        // ── Pre-completion staleness check ────────────────────────────────
+        //
+        // A concurrent rollback may have called stop_environment_containers
+        // while we were waiting inside Phase 2 / Phase 2.5. That function
+        // killed our containers AND atomically flipped our state to "stopped"
+        // (CAS: only from "running") to signal supersession. If we let
+        // Phase 3 write "completed" now, it would clobber that "stopped"
+        // marker even though we were intentionally superseded. Detect that
+        // here: re-read our state and abort cleanly when already "stopped".
+        //
+        // We do NOT call reject_unusable_deployment in this branch because
+        // the rollback's own MarkDeploymentCompleteJob will set
+        // env.current_deployment_id to the new rollback deployment once it
+        // acquires this environment's lock (which we hold, and will release
+        // momentarily when mark_complete_inner returns).
+        let deployment_state_before_completion =
+            deployments::Entity::find_by_id(self.deployment_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to re-check deployment {} state before completion: {}",
+                        self.deployment_id, e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Deployment {} disappeared before completion",
+                        self.deployment_id
+                    ))
+                })?;
+
+        if deployment_state_before_completion.state == "stopped" {
+            // A concurrent rollback superseded this deployment while we were
+            // propagating routes. The rollback already killed our containers
+            // and marked us "stopped". Abort here — writing "completed" now
+            // would wrongly clobber that marker. The rollback's own
+            // MarkDeploymentCompleteJob will fix up env.current_deployment_id
+            // once it acquires this lock.
+            info!(
+                deployment_id = self.deployment_id,
+                environment_id,
+                "Deployment was superseded by a concurrent rollback during route \
+                 propagation — aborting completion cleanly (state: stopped)"
+            );
+            self.log(
+                "Deployment superseded by a concurrent rollback — aborting \
+                 completion; state already set to 'stopped'"
+                    .to_string(),
+            )
+            .await
+            .ok();
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Deployment {} was superseded by a concurrent rollback \
+                 (state: stopped) — completion aborted",
+                self.deployment_id
+            )));
+        }
+
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
         active_deployment.state = Set("completed".to_string());

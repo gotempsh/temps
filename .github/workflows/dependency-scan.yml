@@ -58,6 +58,16 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: dependency-scan-cargo-audit
+          # Save from `main` only -- writes are scoped to the producing ref,
+          # so without this every open PR held its own ~340MB copy under this
+          # key (9 simultaneous copies measured = ~2.9GB, more than a quarter
+          # of the repo's 10GB cache pool). That's what was evicting
+          # `temps-musl-fast-*` -- the much larger, much more valuable shared
+          # musl build cache in rust-tests.yml -- turning its restore-keys
+          # fallback into a full ~80min cold compile on every workflow run.
+          # See the matching `save-if` note on the `test-build`/
+          # `nextest-archive` caches in rust-tests.yml for the same lesson.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Runs `cargo audit` against Cargo.lock and fails the job if any
       # RUSTSEC advisory matches a resolved dependency (all advisories, not

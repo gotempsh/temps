@@ -166,6 +166,42 @@ async fn test_store_and_get_trace() {
 }
 
 #[tokio::test]
+async fn test_has_traces() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let project_with_spans = 1;
+    let project_without_spans = 2;
+
+    assert!(
+        !storage.has_traces(project_with_spans).await.unwrap(),
+        "no spans stored yet"
+    );
+
+    let root = sample_span(
+        project_with_spans,
+        "aabbccdd11223344aabbccdd11223344",
+        "0102030405060708",
+        None,
+        "GET /api/users",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    storage.store_spans(vec![root]).await.unwrap();
+
+    assert!(
+        storage.has_traces(project_with_spans).await.unwrap(),
+        "a span was just stored for this project"
+    );
+    assert!(
+        !storage.has_traces(project_without_spans).await.unwrap(),
+        "a different project must not see another project's spans"
+    );
+}
+
+#[tokio::test]
 async fn test_query_spans_filters() {
     let Some((_db, storage)) = setup_storage().await else {
         return;

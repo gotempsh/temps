@@ -6223,7 +6223,7 @@ mod tests {
             .match_header("authorization", "Bearer owned-github-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body("{}")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
             .create_async()
             .await;
 
@@ -6382,7 +6382,7 @@ mod tests {
             .match_header("authorization", "Bearer test-access-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body("{}")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
             .create_async()
             .await;
         let file_content = server

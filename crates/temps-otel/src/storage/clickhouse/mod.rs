@@ -1967,6 +1967,36 @@ impl OtelStorage for ClickHouseOtelStorage {
         Ok(row.cnt)
     }
 
+    /// Whether `project_id` has ever received at least one span.
+    ///
+    /// Deliberately NOT `count_traces(query) > 0` or a `LIMIT 1` read through
+    /// `query_trace_summaries`: both aggregate by `trace_id`, which forces a
+    /// per-project GROUP BY over every matching row when no time bound is
+    /// given — the exact shape that drove sustained ClickHouse CPU when the
+    /// project-setup checklist polled trace-summaries with `limit=1` and no
+    /// window (it only needed a yes/no answer). This issues no GROUP BY, no
+    /// `argMax`, and no ORDER BY: `project_id` is the first column of spans'
+    /// `ORDER BY (project_id, trace_id, span_id)` (0001_spans.sql), so
+    /// `LIMIT 1` resolves against the sparse index — a seek to the first
+    /// granule for this project, not a scan.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        #[derive(::clickhouse::Row, Deserialize, Debug)]
+        struct ChExistsRow {
+            #[allow(dead_code)]
+            one: u8,
+        }
+
+        let rows = self
+            .ch
+            .query("SELECT 1 AS one FROM spans WHERE project_id = ? LIMIT 1")
+            .bind(project_id)
+            .fetch_all::<ChExistsRow>()
+            .await
+            .map_err(|e| ch_query_err("has_traces", e))?;
+
+        Ok(!rows.is_empty())
+    }
+
     /// Fetch all spans of a single trace, ordered by start_time ASC.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
         // Simple point-lookup — the ORDER BY (project_id, trace_id, span_id)

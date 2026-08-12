@@ -2,10 +2,10 @@ import type { ProjectResponse } from '@/api/client'
 import {
   hasAnalyticsEventsOptions,
   hasErrorGroupsOptions,
+  hasTracesOptions,
   listCustomDomainsForProjectOptions,
   listMonitorsOptions,
   listProjectServicesOptions,
-  queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -129,12 +129,8 @@ export function useProjectSetup(project: ProjectResponse) {
     ...listProjectServicesOptions({ path: { project_id: project.id } }),
   })
   const telemetryQuery = useQuery({
-    ...queryTraceSummariesOptions({
-      query: {
-        project_id: project.id,
-        limit: 1,
-        include_total: false,
-      },
+    ...hasTracesOptions({
+      path: { project_id: project.id },
     }),
   })
 
@@ -144,7 +140,7 @@ export function useProjectSetup(project: ProjectResponse) {
     customDomainCount: domainsQuery.data?.domains?.length ?? 0,
     monitorCount: monitorsQuery.data?.length ?? 0,
     serviceCount: servicesQuery.data?.length ?? 0,
-    hasTelemetryTraces: (telemetryQuery.data?.data?.length ?? 0) > 0,
+    hasTelemetryTraces: !!telemetryQuery.data?.has_traces,
   })
   const completedCount = steps.filter((step) => step.done).length
   const totalCount = steps.length

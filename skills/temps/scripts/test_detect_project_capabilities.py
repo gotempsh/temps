@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 from detect_project_capabilities import detect
 
@@ -90,6 +93,28 @@ class CapabilityDetectorTests(unittest.TestCase):
             result = detect(root)
 
             self.assertEqual(result["capabilities"]["error_tracking"]["status"], "missing")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO files are not supported")
+    def test_named_pipe_is_ignored_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.mkfifo(root / "package.json")
+            outcome: dict[str, object] = {}
+
+            def run_detection() -> None:
+                outcome["result"] = detect(root)
+
+            detector = threading.Thread(target=run_detection, daemon=True)
+            detector.start()
+            detector.join(timeout=1)
+
+            self.assertFalse(detector.is_alive(), "capability detection blocked on a FIFO")
+            result = cast(dict[str, Any], outcome["result"])
+            self.assertIsInstance(result, dict)
+            self.assertEqual(
+                result["capabilities"]["error_tracking"]["status"],
+                "missing",
+            )
 
 
 if __name__ == "__main__":

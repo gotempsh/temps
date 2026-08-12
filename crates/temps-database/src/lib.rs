@@ -23,6 +23,40 @@ mod tests {
     use temps_migrations::Migrator;
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
+    /// Retry a container connection attempt with exponential backoff.
+    ///
+    /// TimescaleDB containers on a loaded CI runner can take much longer than
+    /// a few seconds to finish initdb and start accepting connections; a
+    /// connection attempted too early observes "Connection reset by peer"
+    /// rather than a connection-refused, and a fixed 5-attempt/2s budget
+    /// (~13s total) was repeatedly too short under CI resource contention.
+    /// Retry for up to 60s with backoff instead of a fixed attempt count.
+    async fn retry_db_connect<T, E, F, Fut>(mut connect_fn: F) -> anyhow::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let mut delay = tokio::time::Duration::from_millis(250);
+        let max_delay = tokio::time::Duration::from_secs(3);
+        loop {
+            match connect_fn().await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(anyhow::anyhow!(
+                            "Failed to connect to database after retrying for 60s: {}",
+                            e
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, max_delay);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_establish_connection() -> anyhow::Result<()> {
         // Start TimescaleDB container
@@ -47,26 +81,8 @@ mod tests {
         let port = postgres_container.get_host_port_ipv4(5432).await?;
         let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-        // Wait a bit for the database to be ready, then connect with retries
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        let mut retries = 5;
-        let db = loop {
-            match Database::connect(&database_url).await {
-                Ok(db) => break db,
-                Err(e) if retries > 0 => {
-                    retries -= 1;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    if retries == 0 {
-                        return Err(anyhow::anyhow!(
-                            "Failed to connect to database after retries: {}",
-                            e
-                        ));
-                    }
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to connect to database: {}", e)),
-            }
-        };
+        // Connect with retries; the container may still be finishing initdb.
+        let db = retry_db_connect(|| Database::connect(&database_url)).await?;
 
         // Test basic connectivity
         let result = sea_orm::Statement::from_string(
@@ -104,27 +120,8 @@ mod tests {
         let port = postgres_container.get_host_port_ipv4(5432).await?;
         let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-        // Wait a bit for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        // Retry connection setup
-        let mut retries = 5;
-        let connection = loop {
-            match establish_connection(&database_url).await {
-                Ok(conn) => break conn,
-                Err(e) if retries > 0 => {
-                    retries -= 1;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    if retries == 0 {
-                        return Err(anyhow::anyhow!(
-                            "Failed to establish connection after retries: {}",
-                            e
-                        ));
-                    }
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to establish connection: {}", e)),
-            }
-        };
+        // Connect with retries; the container may still be finishing initdb.
+        let connection = retry_db_connect(|| establish_connection(&database_url)).await?;
 
         // Heavy audit index creation is deliberately outside the migration
         // transaction. Prove the post-migration path is idempotent and creates
@@ -330,22 +327,7 @@ mod tests {
         let port = container.get_host_port_ipv4(5432).await?;
         let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        let mut retries = 5;
-        let db = loop {
-            match connect_without_migrations(&database_url).await {
-                Ok(db) => break db,
-                Err(e) if retries > 0 => {
-                    retries -= 1;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    if retries == 0 {
-                        return Err(anyhow::anyhow!("connect failed after retries: {e}"));
-                    }
-                }
-                Err(e) => return Err(anyhow::anyhow!("connect failed: {e}")),
-            }
-        };
+        let db = retry_db_connect(|| connect_without_migrations(&database_url)).await?;
 
         Ok(Some((container, db)))
     }
