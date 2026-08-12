@@ -50,7 +50,7 @@ url = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
 # Keep this aligned with Octocrab's public GitHub App key type.
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 uuid = { workspace = true }
 http-body-util = { workspace = true }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
