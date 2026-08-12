@@ -307,7 +307,10 @@ impl MarkDeploymentCompleteJob {
                 }
                 Ok(Err(error)) => {
                     consecutive_successes = 0;
-                    last_observation = format!("request failed: {error}");
+                    last_observation = format!(
+                        "connection failed before any HTTP response was received ({}) — the app is likely not listening on the expected host/port yet",
+                        Self::describe_reqwest_error(&error)
+                    );
                 }
                 Err(_) => {
                     return Err(format!(
@@ -331,6 +334,25 @@ impl MarkDeploymentCompleteJob {
 
     fn is_usable_public_status(status: reqwest::StatusCode) -> bool {
         status.is_success() || status.is_redirection()
+    }
+
+    /// `reqwest::Error`'s `Display` only says "error sending request for url
+    /// (...)" — the actual reason (connection refused, DNS failure, TLS
+    /// error, timeout) lives in the source chain. Walk it so operators see
+    /// why the connection failed instead of a message that repeats the URL.
+    fn describe_reqwest_error(error: &reqwest::Error) -> String {
+        let mut causes = Vec::new();
+        let mut source: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(error);
+        while let Some(cause) = source {
+            causes.push(cause.to_string());
+            source = std::error::Error::source(cause);
+        }
+        if causes.is_empty() {
+            error.to_string()
+        } else {
+            causes.join(" -> ")
+        }
     }
 
     /// Restore the last known-good route and persist a contextual failure in a
