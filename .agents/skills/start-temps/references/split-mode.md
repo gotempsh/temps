@@ -19,14 +19,11 @@ must know where the sibling console lives.
 ## 1. Allocate the slot, then kill only this slot's processes
 
 Run **step 0** from the main procedure, then the ownership-checked kill from
-**step 1** (it already covers all three ports). Additionally clear prior
-split processes started from *this* checkout only:
-
-```bash
-source "$HOME/.temps-dev/slot-<N>.env"
-pkill -f "$TEMPS_ROOT/target/.*temps proxy" 2>/dev/null
-pkill -f "$TEMPS_ROOT/target/.*temps serve --role" 2>/dev/null
-```
+**step 1** (it covers all three listeners). Do not use `pkill -f`: command-line
+matching treats checkout paths as regular expressions and can kill another
+worktree's process. If an orphaned process has no listener, identify its PID
+manually and apply the same canonical cwd-under-`$TEMPS_ROOT` check from step 1
+before stopping it.
 
 ## 2. Build once, then launch both from the same binary
 
@@ -63,7 +60,7 @@ cd "$TEMPS_ROOT/crates/temps-cli" && \
     --disable-https-redirect \
     --database-url="$TEMPS_DATABASE_URL" \
     --address=127.0.0.1:$TEMPS_PARKED_PORT \
-    --console-address=0.0.0.0:$TEMPS_CONSOLE_PORT \
+    --console-address=127.0.0.1:$TEMPS_CONSOLE_PORT \
     --log-level=debug \
     > "$TEMPS_CONSOLE_LOG" 2>&1 & disown
 echo "console launched, pid $!"
@@ -89,8 +86,8 @@ cd "$TEMPS_ROOT/crates/temps-cli" && \
     proxy \
     --disable-https-redirect \
     --database-url="$TEMPS_DATABASE_URL" \
-    --address=0.0.0.0:$TEMPS_HTTP_PORT \
-    --tls-address=0.0.0.0:$TEMPS_TLS_PORT \
+    --address=127.0.0.1:$TEMPS_HTTP_PORT \
+    --tls-address=127.0.0.1:$TEMPS_TLS_PORT \
     --console-address=127.0.0.1:$TEMPS_CONSOLE_PORT \
     --log-level=debug \
     > "$TEMPS_PROXY_LOG" 2>&1 & disown

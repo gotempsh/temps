@@ -62,6 +62,9 @@ derives every port from it:
 
 Rules:
 
+- All listeners bind to `127.0.0.1` by default. LAN exposure is not part of
+  this workflow; configure TLS and strong non-development credentials before
+  opting into a non-loopback bind.
 - The **first checkout** you run step 0 in claims slot 0, so the familiar
   `http://localhost:3000` / `:8080` belong to whichever worktree you started
   first (usually your primary clone).
@@ -103,10 +106,13 @@ Rules:
 Run this **from inside the checkout you are working in** (the worktree, not
 necessarily your primary clone). It is idempotent — rerunning it returns the
 same slot. Run it verbatim; it prints the port map and writes
-`~/.temps-dev/slot-<N>.env`, which every later step sources.
+`~/.temps-dev/slot-<N>.env`, which every later step sources. The file is
+created with mode `0600`, and every value is shell-escaped before writing so
+checkout paths and overrides cannot become commands when the file is sourced.
 
 ```bash
 set -u
+umask 077
 mkdir -p "$HOME/.temps-dev"
 
 # Which checkout is this working in?
@@ -118,10 +124,11 @@ DB_CONTAINER="${TEMPS_DEV_DB_CONTAINER:-temps-db}"
 DB_URL_BASE="${TEMPS_DEV_DB_URL_BASE:-postgres://temps:temps@localhost:5432}"
 
 SLOT=""
+TEMPS_ROOT_ID=$(printf '%s' "$TEMPS_ROOT" | shasum -a 256 | awk '{print $1}')
 # 1. Reuse an existing claim for this checkout.
 for f in "$HOME"/.temps-dev/slot-*.env; do
   [ -e "$f" ] || continue
-  if grep -qxF "TEMPS_ROOT=\"$TEMPS_ROOT\"" "$f"; then
+  if grep -qxF "TEMPS_ROOT_ID=$TEMPS_ROOT_ID" "$f"; then
     SLOT=${f##*/slot-}; SLOT=${SLOT%.env}; break
   fi
 done
@@ -151,31 +158,32 @@ else
 fi
 DATA_DIR="$TEMPS_ROOT/crates/temps-cli/temps_data"   # gitignored in every checkout
 
-cat > "$HOME/.temps-dev/slot-$SLOT.env" <<EOF
-# temps dev slot $SLOT — written by the start-temps skill. Delete to release.
-TEMPS_SLOT=$SLOT
-TEMPS_ROOT="$TEMPS_ROOT"
-TEMPS_HTTP_PORT=$((8080+SLOT*10))
-TEMPS_CONSOLE_PORT=$((8081+SLOT*10))
-TEMPS_TLS_PORT=$((8443+SLOT*10))
-TEMPS_PARKED_PORT=$((8085+SLOT*10))
-TEMPS_WEB_PORT=$((3000+SLOT))
-TEMPS_DB_NAME=$DB_NAME
-TEMPS_DB_CONTAINER="$DB_CONTAINER"
-TEMPS_DATABASE_URL=$DB_URL_BASE/$DB_NAME
-TEMPS_DATA_DIR="$DATA_DIR"
-TEMPS_ADMIN_EMAIL=dev@temps.sh
-TEMPS_ADMIN_PASSWORD_FILE=$HOME/.temps-dev/slot-$SLOT.admin-password
-TEMPS_SERVE_LOG=/tmp/temps-serve-s$SLOT.log
-TEMPS_CONSOLE_LOG=/tmp/temps-console-s$SLOT.log
-TEMPS_PROXY_LOG=/tmp/temps-proxy-s$SLOT.log
-TEMPS_WEB_LOG=/tmp/temps-web-s$SLOT.log
-EOF
-
-cat "$HOME/.temps-dev/slot-$SLOT.env"
+SLOT_FILE="$HOME/.temps-dev/slot-$SLOT.env"
+{
+  echo "# temps dev slot $SLOT — written by the start-temps skill. Delete to release."
+  printf 'TEMPS_SLOT=%q\n' "$SLOT"
+  printf 'TEMPS_ROOT_ID=%q\n' "$TEMPS_ROOT_ID"
+  printf 'TEMPS_ROOT=%q\n' "$TEMPS_ROOT"
+  printf 'TEMPS_HTTP_PORT=%q\n' "$((8080+SLOT*10))"
+  printf 'TEMPS_CONSOLE_PORT=%q\n' "$((8081+SLOT*10))"
+  printf 'TEMPS_TLS_PORT=%q\n' "$((8443+SLOT*10))"
+  printf 'TEMPS_PARKED_PORT=%q\n' "$((8085+SLOT*10))"
+  printf 'TEMPS_WEB_PORT=%q\n' "$((3000+SLOT))"
+  printf 'TEMPS_DB_NAME=%q\n' "$DB_NAME"
+  printf 'TEMPS_DB_CONTAINER=%q\n' "$DB_CONTAINER"
+  printf 'TEMPS_DATABASE_URL=%q\n' "$DB_URL_BASE/$DB_NAME"
+  printf 'TEMPS_DATA_DIR=%q\n' "$DATA_DIR"
+  printf 'TEMPS_ADMIN_EMAIL=%q\n' 'dev@temps.sh'
+  printf 'TEMPS_ADMIN_PASSWORD_FILE=%q\n' "$HOME/.temps-dev/slot-$SLOT.admin-password"
+  printf 'TEMPS_SERVE_LOG=%q\n' "/tmp/temps-serve-s$SLOT.log"
+  printf 'TEMPS_CONSOLE_LOG=%q\n' "/tmp/temps-console-s$SLOT.log"
+  printf 'TEMPS_PROXY_LOG=%q\n' "/tmp/temps-proxy-s$SLOT.log"
+  printf 'TEMPS_WEB_LOG=%q\n' "/tmp/temps-web-s$SLOT.log"
+} > "$SLOT_FILE"
+chmod 600 "$SLOT_FILE"
 echo
 echo "slot $SLOT -> api http://localhost:$((8080+SLOT*10))  web http://localhost:$((3000+SLOT))  db $DB_NAME"
-echo "env file: $HOME/.temps-dev/slot-$SLOT.env"
+echo "env file: $SLOT_FILE (mode 0600; contains the database URL — do not print it)"
 ```
 
 **Substitute the printed slot number for `<N>` in every block below**, and
@@ -207,13 +215,15 @@ fi
 
 mkdir -p "$TEMPS_DATA_DIR"
 if [ ! -f "$TEMPS_ADMIN_PASSWORD_FILE" ]; then
-  printf 'TempsDev!%s\n' "$TEMPS_SLOT" > "$TEMPS_ADMIN_PASSWORD_FILE"
+  { openssl rand -base64 24 | tr -d '\n'; printf '!Aa1\n'; } > "$TEMPS_ADMIN_PASSWORD_FILE"
   chmod 600 "$TEMPS_ADMIN_PASSWORD_FILE"
 fi
-echo "login: $TEMPS_ADMIN_EMAIL / $(cat "$TEMPS_ADMIN_PASSWORD_FILE")"
+echo "login: $TEMPS_ADMIN_EMAIL / ***"
+echo "password file: $TEMPS_ADMIN_PASSWORD_FILE (mode 0600; do not print its contents)"
 ```
 
-Report those credentials to the user — a fresh slot DB has no other account.
+Report the email and password-file path, but never the password — a fresh slot
+DB has no other account.
 (Password rules: ≥8 chars with upper, lower, digit and a special character —
 `validate_password_complexity` rejects anything weaker and `serve` will fail
 to start.)
@@ -254,15 +264,6 @@ for spec in "$TEMPS_HTTP_PORT backend" "$TEMPS_CONSOLE_PORT console" "$TEMPS_WEB
 done
 ```
 
-If a debugger session (lldb / codelldb / debugserver) is attached to *this*
-checkout's binary:
-
-```bash
-source "$HOME/.temps-dev/slot-<N>.env"
-pkill -f "debugserver.*$TEMPS_ROOT" 2>/dev/null
-pkill -f "codelldb.*$TEMPS_ROOT" 2>/dev/null
-```
-
 > Never use a bare `pkill -f temps` / `pkill -f cargo` — it takes down every
 > other checkout's server too.
 
@@ -289,9 +290,9 @@ cd "$TEMPS_ROOT/crates/temps-cli" && \
     serve \
     --disable-https-redirect \
     --database-url="$TEMPS_DATABASE_URL" \
-    --address=0.0.0.0:$TEMPS_HTTP_PORT \
-    --tls-address=0.0.0.0:$TEMPS_TLS_PORT \
-    --console-address=0.0.0.0:$TEMPS_CONSOLE_PORT \
+    --address=127.0.0.1:$TEMPS_HTTP_PORT \
+    --tls-address=127.0.0.1:$TEMPS_TLS_PORT \
+    --console-address=127.0.0.1:$TEMPS_CONSOLE_PORT \
     --log-level=debug \
     > "$TEMPS_SERVE_LOG" 2>&1 & disown
 echo "serve launched (slot $TEMPS_SLOT) -> $TEMPS_SERVE_LOG"
@@ -375,7 +376,8 @@ that exists nowhere else:
 
 ```
 slot <N>: web http://localhost:<3000+N>   api http://localhost:<8080+N*10>
-          db temps_s<N>   login dev@temps.sh / TempsDev!<N>
+          db temps_s<N>   login dev@temps.sh / ***
+          password file ~/.temps-dev/slot-<N>.admin-password
 ```
 
 ### 6. After-restart housekeeping (optional)
@@ -398,10 +400,29 @@ dir, not the database.
 
 ```bash
 source "$HOME/.temps-dev/slot-<N>.env"
+EXPECTED_ROOT=$(git -C "$TEMPS_ROOT" rev-parse --show-toplevel 2>/dev/null) || {
+  echo "REFUSING cleanup: TEMPS_ROOT is not a Git checkout"; exit 1;
+}
+EXPECTED_DATA_DIR="$EXPECTED_ROOT/crates/temps-cli/temps_data"
+[ "$TEMPS_ROOT" = "$EXPECTED_ROOT" ] && [ -f "$TEMPS_ROOT/Cargo.toml" ] && \
+  [ -d "$TEMPS_ROOT/crates/temps-cli" ] || {
+  echo "REFUSING cleanup: invalid Temps workspace root"; exit 1;
+}
+[ "$TEMPS_DATA_DIR" = "$EXPECTED_DATA_DIR" ] || {
+  echo "REFUSING cleanup: data dir is outside the expected checkout path"; exit 1;
+}
+case "$TEMPS_SLOT" in
+  0) EXPECTED_DB_NAME=temps ;;
+  [1-9]|[1-2][0-9]) EXPECTED_DB_NAME="temps_s$TEMPS_SLOT" ;;
+  *) echo "REFUSING cleanup: slot must be an integer in 0..29"; exit 1 ;;
+esac
+[ "$TEMPS_DB_NAME" = "$EXPECTED_DB_NAME" ] || {
+  echo "REFUSING cleanup: database does not match the validated slot"; exit 1;
+}
 if [ "$TEMPS_SLOT" != 0 ]; then
   docker exec -i "$TEMPS_DB_CONTAINER" psql -U temps -c "DROP DATABASE IF EXISTS \"$TEMPS_DB_NAME\" WITH (FORCE)"
 fi
-rm -rf "$TEMPS_DATA_DIR"
+rm -rf -- "$TEMPS_DATA_DIR"
 rm -f "$TEMPS_ADMIN_PASSWORD_FILE" "$HOME/.temps-dev/slot-$TEMPS_SLOT.env"
 echo "slot $TEMPS_SLOT released"
 ```
