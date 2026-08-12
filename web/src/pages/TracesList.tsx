@@ -7,6 +7,7 @@ import {
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
+  hasTracesOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -776,33 +777,29 @@ export default function TracesList({ project }: TracesListProps) {
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
   // "Has this project EVER received a trace?" — a window/filter-independent
-  // probe (project_id only, limit 1). The main query above is scoped to the
-  // selected time range and filters, so its `total` goes to 0 whenever the
-  // window happens to be empty. Gating the setup onboarding on that would show
-  // "set up OpenTelemetry" to a project with millions of historical traces just
+  // probe. The main query above is scoped to the selected time range and
+  // filters, so its `total` goes to 0 whenever the window happens to be
+  // empty. Gating the setup onboarding on that would show "set up
+  // OpenTelemetry" to a project with millions of historical traces just
   // because nothing landed in the last 24h. This probe answers the real
   // question the onboarding screen is for.
   //
-  // `include_total: false` matters here. The probe only needs to know whether
-  // ANY trace exists, but `total` is a second aggregation over the project's
-  // whole retention — with no time filter to narrow it, that is the single most
-  // expensive query on this page (measured at ~10s on an 860M-span project).
-  // Asking for one row and checking whether we got it answers the same question
-  // without computing a count nobody reads.
+  // Uses the dedicated has-traces existence endpoint rather than
+  // trace-summaries with limit=1: without a time bound, trace-summaries
+  // GROUPs BY trace_id over the project's entire retention window — this was
+  // the single most expensive query on this page (measured at ~10s on an
+  // 860M-span project) before has-traces made it an O(1) index lookup.
   const {
-    data: anyTraceData,
+    data: hasTracesData,
     isLoading: isProbeLoading,
     refetch: refetchProbe,
   } = useQuery({
-    ...queryTraceSummariesOptions({
-      query: { project_id: project.id, limit: 1, include_total: false },
+    ...hasTracesOptions({
+      path: { project_id: project.id },
     }),
     enabled: !!project.id,
   })
-  // Deliberately NOT `total`: with include_total=false the server omits it, and
-  // `total ?? 0` would read "not computed" as "no traces" and show the setup
-  // onboarding to a project that has millions of them.
-  const hasEverReceivedTraces = (anyTraceData?.data?.length ?? 0) > 0
+  const hasEverReceivedTraces = !!hasTracesData?.has_traces
 
   const hasActiveFilters =
     !!search ||
