@@ -9,6 +9,105 @@ use thiserror::Error;
 
 use temps_agents::error::AgentError;
 
+/// Typed errors for the snapshot sub-API (ADR-037).
+///
+/// HTTP mappings:
+/// - `NotFound` → 404
+/// - `NotReady` | `CrossBackendRestore` | `QuotaExceeded` | `InvalidState` → 422
+/// - `NotSupported` → 501
+/// - `ScrubFailed` | `DigestMismatch` | `ArtifactMissing` | `SandboxNotFound` → 500
+/// - `Database` | `Io` | `Provider` → 500
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum SandboxSnapshotError {
+    /// The requested snapshot does not exist (or the caller does not own it).
+    #[error("Snapshot {snapshot_id} not found")]
+    NotFound { snapshot_id: String },
+
+    /// The snapshot exists but is not yet `ready` (e.g. still `creating`).
+    #[error("Snapshot {snapshot_id} is not ready (status: {status})")]
+    NotReady { snapshot_id: String, status: String },
+
+    /// Attempt to restore a Docker snapshot onto a Firecracker backend (or v.v.).
+    #[error("Cannot restore a '{snapshot_backend}' snapshot on a '{target_backend}' backend")]
+    CrossBackendRestore {
+        snapshot_backend: String,
+        target_backend: String,
+    },
+
+    /// The backend does not support snapshots (e.g. Firecracker v1, Local).
+    #[error("Snapshot is not supported by backend '{backend}'")]
+    NotSupported { backend: String },
+
+    /// A snapshot for this user is already in progress (`creating` status).
+    ///
+    /// Only one snapshot per user may be in flight at a time to prevent the
+    /// TOCTOU race in the quota check (creating rows have size_bytes = 0 until
+    /// they finalize, so multiple concurrent creates could bypass the byte cap).
+    /// The caller should wait for the in-flight snapshot to reach `ready` or
+    /// `failed` before retrying.
+    #[error(
+        "A snapshot for user {user_id} is already in progress; \
+         wait for it to reach 'ready' or 'failed' before creating another"
+    )]
+    SnapshotInProgress { user_id: i32 },
+
+    /// The user's total snapshot storage would exceed their quota.
+    #[error(
+        "Snapshot quota exceeded for user {user_id}: used {used_bytes} bytes, \
+         quota {quota_bytes} bytes"
+    )]
+    QuotaExceeded {
+        user_id: i32,
+        used_bytes: u64,
+        quota_bytes: u64,
+    },
+
+    /// The credential-scrubbing step failed or the verification rejected the
+    /// committed image because a sensitive key survived.
+    #[error("Snapshot scrub failed for sandbox {sandbox_id}: {reason}")]
+    ScrubFailed { sandbox_id: String, reason: String },
+
+    /// The artifact's content digest doesn't match what was expected.
+    #[error("Digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch { expected: String, actual: String },
+
+    /// The artifact file is missing from disk (stale or never written).
+    #[error("Snapshot artifact missing at path: {path}")]
+    ArtifactMissing { path: String },
+
+    /// The source sandbox doesn't exist or was already destroyed.
+    #[error("Sandbox {sandbox_id} not found")]
+    SandboxNotFound { sandbox_id: String },
+
+    /// The sandbox is not running — snapshots require a live container.
+    ///
+    /// v1 only supports snapshotting running sandboxes. Resume the sandbox
+    /// first (PUT /v1/sandboxes/{id}/resume), then retry the snapshot.
+    #[error(
+        "Sandbox {sandbox_id} is not running; snapshots require a running sandbox \
+         — resume it first"
+    )]
+    SandboxNotRunning { sandbox_id: String },
+
+    /// The sandbox is in a state that doesn't allow snapshotting.
+    #[error("Sandbox {sandbox_id} is in state '{state}' — cannot {operation}")]
+    InvalidState {
+        sandbox_id: String,
+        state: String,
+        operation: String,
+    },
+
+    #[error("Database error: {0}")]
+    Database(#[from] sea_orm::DbErr),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Provider error: {0}")]
+    Provider(#[from] AgentError),
+}
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum SandboxError {

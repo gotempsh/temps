@@ -193,30 +193,36 @@ mod tests {
         // The compatibility migration is deliberately reversible as a no-op:
         // the concurrently managed index must survive both down and re-up.
         //
-        // Roll back exactly far enough to include this migration, computed
-        // from its position in the migrator's list rather than a hardcoded
-        // `Some(1)` -- migrations appended after it push it further from the
-        // end, and a hardcoded step count silently starts rolling back the
-        // wrong migration instead.
-        let target_migration_name = "m20260806_000001_index_permission_denied_retention";
+        // Compute how many migrations exist AFTER
+        // `m20260806_000001_index_permission_denied_retention` so we roll back
+        // exactly (count + 1) migrations to land just before it. Hardcoding
+        // `Some(1)` broke whenever a new migration was appended after this one
+        // — that new migration would be the one rolled back instead of the
+        // index-retention migration we're actually testing.
+        let target = "m20260806_000001_index_permission_denied_retention";
         let all_migrations = Migrator::migrations();
-        let target_index = all_migrations
+        let target_pos = all_migrations
             .iter()
-            .position(|migration| migration.name() == target_migration_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("{target_migration_name} not found in Migrator::migrations()")
-            })?;
-        let steps_to_target = (all_migrations.len() - target_index) as u32;
-        Migrator::down(connection.as_ref(), Some(steps_to_target)).await?;
+            .position(|m| m.name() == target)
+            .ok_or_else(|| anyhow::anyhow!("{} not found in migration list", target))?;
+        let after_count = all_migrations.len() - target_pos - 1;
+        let steps = (after_count + 1) as u32;
+
+        Migrator::down(connection.as_ref(), Some(steps)).await?;
         let pending_after_down = get_pending_migration_names(connection.as_ref()).await?;
-        assert!(
-            pending_after_down
-                .iter()
-                .any(|name| name == target_migration_name),
-            "expected {target_migration_name} to be pending after rolling back \
-             {steps_to_target} migration(s), got {pending_after_down:?}"
+        // Pending migrations are returned in ascending (chronological) order —
+        // the target is the oldest pending migration, so it is first().
+        // Rolling back more than 1 step means later migrations appear after it.
+        assert_eq!(
+            pending_after_down.first().map(String::as_str),
+            Some(target),
+            "expected first pending migration to be '{}' after rolling back {} steps (after_count={}), got: {:?}",
+            target,
+            steps,
+            after_count,
+            pending_after_down,
         );
-        Migrator::up(connection.as_ref(), Some(steps_to_target)).await?;
+        Migrator::up(connection.as_ref(), Some(steps)).await?;
         let index_after_round_trip = connection
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,

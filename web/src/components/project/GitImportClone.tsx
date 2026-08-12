@@ -884,7 +884,15 @@ export function GitImportClone({
                   showSelection={false}
                   itemsPerPage={15}
                   showHeader={true}
-                  compactMode={false}
+                  compactMode
+                  providerType={(() => {
+                    const selectedConn = connections?.connections?.find(
+                      (c) => c.id.toString() === selectedConnection
+                    )
+                    return selectedConn
+                      ? providerTypeForConnectionId(selectedConn.provider_id)
+                      : undefined
+                  })()}
                 />
               )}
             </CardContent>

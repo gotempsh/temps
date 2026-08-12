@@ -3,26 +3,39 @@
 //! No business logic lives here.
 
 pub mod sandboxes;
+pub mod snapshots;
 pub mod terminal;
 pub mod version_header;
 
 use std::sync::Arc;
 
-use axum::{middleware, Router};
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
 use utoipa::OpenApi;
 
 use crate::services::sandbox_service::SandboxService;
+use crate::services::snapshot_service::SnapshotService;
 
 /// Shared state for sandbox HTTP handlers. Intentionally minimal — the
 /// service already owns db/registry/jobs/config, so handlers need only
 /// the service itself plus the project access checker.
 pub struct SandboxAppState {
     pub sandbox_service: Arc<SandboxService>,
+    /// Snapshot service (ADR-037). `None` when the sandbox plugin is loaded
+    /// without a Docker provider (e.g. Firecracker-only builds).
+    pub snapshot_service: Option<Arc<SnapshotService>>,
     /// Team-membership gate for `project_id`-scoped creates (ADR-028).
     /// `None` when no checker is registered (OSS builds without the
     /// teams plugin), in which case `project_access_guard!` is a no-op
     /// and ownership/scope checks alone apply.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Audit logger for write operations. `None` when no audit plugin is
+    /// registered (e.g. some test builds). Audit failures must not fail
+    /// the primary request — log the error and continue.
+    pub audit_service: Option<Arc<dyn temps_core::AuditLogger>>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -71,6 +84,12 @@ pub struct SandboxAppState {
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
         terminal::terminal,
+        // Snapshot API (ADR-037)
+        snapshots::create_snapshot,
+        snapshots::list_snapshots,
+        snapshots::get_snapshot,
+        snapshots::delete_snapshot,
+        snapshots::storage_summary,
     ),
     components(schemas(
         sandboxes::CreateSandboxBody,
@@ -107,17 +126,44 @@ pub struct SandboxAppState {
         temps_agents::sandbox::RootfsCacheEntry,
         temps_agents::sandbox::RootfsVmEntry,
         temps_agents::sandbox::RootfsGcReport,
+        // Snapshot schemas (ADR-037)
+        snapshots::CreateSnapshotBody,
+        snapshots::SnapshotResponse,
+        snapshots::ListSnapshotsResponse,
+        crate::services::snapshot_service::StorageSummary,
     )),
     tags(
-        (name = "Sandboxes", description = "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.")
+        (name = "Sandboxes", description = "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers."),
+        (name = "Snapshots", description = "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots."),
     )
 )]
 pub struct SandboxApiDoc;
 
-/// Configure all `/v1/sandboxes/*` routes. Every response is stamped with
-/// the `X-Sandbox-API-Version` diagnostic header (see ADR-009).
+/// Configure all `/v1/sandboxes/*` and `/v1/sandbox-snapshots/*` routes.
+/// Every response is stamped with the `X-Sandbox-API-Version` diagnostic
+/// header (see ADR-009).
 pub fn configure_routes() -> Router<Arc<SandboxAppState>> {
-    sandboxes::routes().layer(middleware::from_fn(version_header::inject_version_header))
+    // Snapshot collection routes — static `/storage-summary` registered
+    // before the `{snap_id}` capture so Axum doesn't swallow it.
+    let snapshot_routes = Router::new()
+        .route(
+            "/v1/sandbox-snapshots/storage-summary",
+            get(snapshots::storage_summary),
+        )
+        .route("/v1/sandbox-snapshots", get(snapshots::list_snapshots))
+        .route(
+            "/v1/sandbox-snapshots/{snap_id}",
+            get(snapshots::get_snapshot).delete(snapshots::delete_snapshot),
+        )
+        // Per-sandbox snapshot creation is nested under the sandbox routes.
+        .route(
+            "/v1/sandboxes/{id}/snapshots",
+            post(snapshots::create_snapshot),
+        );
+
+    sandboxes::routes()
+        .merge(snapshot_routes)
+        .layer(middleware::from_fn(version_header::inject_version_header))
 }
 
 #[cfg(test)]
@@ -166,6 +212,11 @@ mod tests {
             "/v1/sandboxes/{id}/terminal",
             "/v1/sandboxes/rootfs",
             "/v1/sandboxes/rootfs/gc",
+            // Snapshot API (ADR-037)
+            "/v1/sandboxes/{id}/snapshots",
+            "/v1/sandbox-snapshots",
+            "/v1/sandbox-snapshots/storage-summary",
+            "/v1/sandbox-snapshots/{snap_id}",
         ] {
             assert!(
                 paths.contains_key(expected),

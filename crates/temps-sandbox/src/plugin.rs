@@ -28,6 +28,7 @@ use crate::services::expiration_sweeper::SandboxExpirationSweeper;
 use crate::services::job_tracker::JobTracker;
 use crate::services::registry::StandaloneSandboxRegistry;
 use crate::services::sandbox_service::SandboxService;
+use crate::services::snapshot_service::SnapshotService;
 
 pub struct SandboxPlugin;
 
@@ -92,7 +93,7 @@ impl TempsPlugin for SandboxPlugin {
             let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
             let git_provider_manager = context.require_service::<GitProviderManager>();
 
-            let registry = Arc::new(StandaloneSandboxRegistry::new(provider));
+            let registry = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
             context.register_service(registry.clone());
 
             let jobs = Arc::new(JobTracker::new());
@@ -108,15 +109,25 @@ impl TempsPlugin for SandboxPlugin {
                 );
             }
 
-            let service = Arc::new(SandboxService::new(
-                db,
-                registry,
-                jobs,
-                platform_config,
-                cookie_crypto,
-                git_provider_manager,
-                root,
-            ));
+            // SnapshotService (ADR-037): wired with the same provider and
+            // registry the sandbox service uses. Created first so it can be
+            // injected into SandboxService for the destroy→nullify path.
+            let snapshot_service =
+                Arc::new(SnapshotService::new(db.clone(), registry.clone(), provider));
+            context.register_service(snapshot_service.clone());
+
+            let service = Arc::new(
+                SandboxService::new(
+                    db.clone(),
+                    registry.clone(),
+                    jobs,
+                    platform_config,
+                    cookie_crypto,
+                    git_provider_manager,
+                    root,
+                )
+                .with_snapshot_service(snapshot_service),
+            );
             context.register_service(service);
 
             debug!("Sandbox plugin services registered");
@@ -257,9 +268,21 @@ impl TempsPlugin for SandboxPlugin {
         // other crate that takes this dependency optionally.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
+        // SnapshotService is optional at the router level: absent when the
+        // sandbox provider doesn't support snapshots (Firecracker-only builds).
+        // Handlers check `Option<Arc<SnapshotService>>` and return 501 when None.
+        let snapshot_service = context.get_service::<SnapshotService>();
+
+        // Audit service is optional — absent in OSS builds without the audit
+        // plugin. Handlers log a warning on audit failure but never fail the
+        // primary request because of it.
+        let audit_service = context.get_service::<dyn temps_core::AuditLogger>();
+
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,
+            snapshot_service,
             project_access_checker,
+            audit_service,
         });
         let router = configure_routes().with_state(app_state);
         Some(PluginRoutes::new(router))

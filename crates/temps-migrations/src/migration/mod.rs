@@ -177,6 +177,7 @@ mod m20260804_000001_add_must_change_password_to_users;
 pub mod m20260805_000001_index_normalized_managed_domains;
 mod m20260806_000001_index_permission_denied_retention;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
+pub mod m20260810_000001_create_sandbox_snapshots;
 mod m20260811_000001_create_renewal_attempts;
 
 pub struct Migrator;
@@ -370,6 +371,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
             Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
             Box::new(m20260806_000001_index_permission_denied_retention::Migration),
+            Box::new(m20260810_000001_create_sandbox_snapshots::Migration),
             Box::new(m20260811_000001_create_renewal_attempts::Migration),
         ]
     }
