@@ -49,10 +49,22 @@ const DEPLOYMENT_TEMP_ROOT: &str = "/tmp/temps-deployments";
 /// builds a `TempDirGuard` around the wrong path (a bad join, a variable
 /// mix-up, a copy-pasted call elsewhere in the codebase) can't turn into a
 /// silent `rm -rf` of something that isn't a scratch temp directory.
-/// `std::env::temp_dir()` is included alongside the hardcoded production
-/// root because tests intentionally create guards under the OS temp dir
-/// (which is `/tmp` on Linux CI but `$TMPDIR`, e.g. `/var/folders/...`, on
-/// macOS) rather than writing into the real `/tmp/temps-deployments`.
+///
+/// Production only allows `DEPLOYMENT_TEMP_ROOT` itself -- `std::env::temp_dir()`
+/// (`/tmp` on Linux) is NOT included there, since `/tmp/temps-deployments` is
+/// already a subdirectory of it: adding it would make the check accept any
+/// path under `/tmp`, silently defeating the whole point of scoping removal
+/// to the deployments tree. The broader OS-temp-dir root is added only under
+/// `#[cfg(test)]`, because tests intentionally build guards under
+/// `std::env::temp_dir()` (which is `/tmp` on Linux CI but `$TMPDIR`, e.g.
+/// `/var/folders/...`, on macOS) rather than writing into the real
+/// `/tmp/temps-deployments`.
+#[cfg(not(test))]
+fn safe_temp_roots() -> Vec<PathBuf> {
+    vec![PathBuf::from(DEPLOYMENT_TEMP_ROOT)]
+}
+
+#[cfg(test)]
 fn safe_temp_roots() -> Vec<PathBuf> {
     vec![PathBuf::from(DEPLOYMENT_TEMP_ROOT), std::env::temp_dir()]
 }
@@ -760,10 +772,21 @@ impl WorkflowTask for DownloadRepoJob {
         if keep_deployment_temp_files() {
             return Ok(());
         }
-        // Clean up temporary directory if it exists
+        // Clean up temporary directory if it exists. Same safety check as
+        // `TempDirGuard::drop()`: `work_dir` is only ever set to a path this
+        // job created under `DEPLOYMENT_TEMP_ROOT`, but this stays defensive
+        // rather than trusting that invariant holds forever.
         if let Some(ref work_dir) = context.work_dir {
             if work_dir.exists() {
-                std::fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
+                if is_within_safe_temp_root(work_dir) {
+                    std::fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
+                } else {
+                    tracing::error!(
+                        path = %work_dir.display(),
+                        "Refusing to clean up deployment work dir: path is outside the \
+                         expected temp roots."
+                    );
+                }
             }
         }
         Ok(())
