@@ -234,28 +234,28 @@ pub struct BinlogManifest {
 pub struct MariaDbInputConfig {
     /// MariaDB host address.
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// MariaDB host port (auto-assigned if not provided).
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// Initial application database.
     #[serde(default = "default_database")]
-    #[schemars(example = "example_database", default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
     pub database: String,
 
     /// Initial application user.
     #[serde(default = "default_username")]
-    #[schemars(example = "example_username", default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
     pub username: String,
 
     /// Application user password (auto-generated if not provided or too short).
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(
         with = "Option<String>",
-        example = "example_password",
+        example = example_password(),
         description = "Application user password (minimum 8 characters, auto-generated if not provided)"
     )]
     pub password: Option<String>,
@@ -264,14 +264,14 @@ pub struct MariaDbInputConfig {
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(
         with = "Option<String>",
-        example = "example_root_password",
+        example = example_root_password(),
         description = "Root password (minimum 8 characters, auto-generated if not provided)"
     )]
     pub root_password: Option<String>,
 
     /// Full Docker image reference.
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Managed service size/tuning profile.

@@ -35,32 +35,32 @@ use super::{
 )]
 pub struct S3InputConfig {
     /// S3/MinIO port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// S3 access key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_access_key")]
+    #[schemars(with = "Option<String>", example = example_access_key())]
     pub access_key: Option<String>,
 
     /// S3 secret key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_secret_key")]
+    #[schemars(with = "Option<String>", example = example_secret_key())]
     pub secret_key: Option<String>,
 
     /// S3 host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// S3 region
     #[serde(default = "default_region")]
-    #[schemars(example = "example_region", default = "default_region")]
+    #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
     /// Docker image to use for MinIO (e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)
     #[serde(default = "default_image")]
-    #[schemars(example = "example_image", default = "default_image")]
+    #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
 
     /// Real Docker container name when this service was imported from an

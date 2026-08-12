@@ -42,31 +42,31 @@ use super::{
 pub struct MongodbInputConfig {
     /// MongoDB host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// MongoDB port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// MongoDB database name
     #[serde(default = "default_database")]
-    #[schemars(example = "example_database", default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
     pub database: String,
 
     /// MongoDB username
     #[serde(default = "default_username")]
-    #[schemars(example = "example_username", default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
     pub username: String,
 
     /// MongoDB password (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_password")]
-    #[schemars(with = "Option<String>", example = "example_password")]
+    #[schemars(with = "Option<String>", example = example_password())]
     pub password: Option<String>,
 
     /// Docker image to use for MongoDB (e.g., gotempsh/mongodb-walg:8.0, gotempsh/mongodb-walg:7.0)
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Optional replica set name. When set, mongod is started with `--replSet <name>`,
@@ -75,7 +75,7 @@ pub struct MongodbInputConfig {
     /// This is a single-node replica set — for multi-node HA use the cluster topology.
     /// Cannot be changed after creation: switching modes on an existing data volume corrupts state.
     #[serde(default, deserialize_with = "deserialize_optional_replica_set")]
-    #[schemars(with = "Option<String>", example = "example_replica_set")]
+    #[schemars(with = "Option<String>", example = example_replica_set())]
     pub replica_set: Option<String>,
 
     /// Real Docker container name when this service was imported from an
