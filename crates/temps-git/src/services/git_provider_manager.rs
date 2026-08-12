@@ -24,38 +24,7 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use reqwest::Url;
 
-/// Create a GitHub App JWT signed with RS256.
-///
-/// Replicates the semantics of `octocrab::auth::create_jwt` without crossing
-/// the jsonwebtoken v10/v11 type boundary imposed by octocrab's public API:
-///   - `iss` = numeric app ID
-///   - `iat` = now − 60 s  (absorb clock skew)
-///   - `exp` = now + 540 s (9 min; GitHub hard-cap is 10 min)
-fn create_github_app_jwt(
-    app_id: u64,
-    key: &jsonwebtoken::EncodingKey,
-) -> Result<String, jsonwebtoken::errors::Error> {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        iss: u64,
-        iat: u64,
-        exp: u64,
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_secs();
-
-    let claims = Claims {
-        iss: app_id,
-        iat: now.saturating_sub(60),
-        exp: now + (9 * 60),
-    };
-
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    jsonwebtoken::encode(&header, &claims, key)
-}
+use super::github::create_github_app_jwt;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectPresetDomain {

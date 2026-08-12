@@ -23,7 +23,7 @@ use url::Url;
 ///   - `iss` = numeric app ID
 ///   - `iat` = now − 60 s  (absorb clock skew)
 ///   - `exp` = now + 540 s (9 min; GitHub hard-cap is 10 min)
-fn create_github_app_jwt(
+pub(crate) fn create_github_app_jwt(
     app_id: u64,
     key: &jsonwebtoken::EncodingKey,
 ) -> Result<String, jsonwebtoken::errors::Error> {
