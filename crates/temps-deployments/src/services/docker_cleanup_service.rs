@@ -17,6 +17,12 @@ pub trait DockerClient: Send + Sync {
 
     /// Remove unused Docker build cache
     async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String>;
+
+    /// Remove a single named image. Must NOT force-remove: Docker refuses
+    /// removal while any container still references the image, which is
+    /// the safety net against deleting an image a retention-policy query
+    /// incorrectly judged unneeded.
+    async fn remove_image(&self, image_name: &str) -> Result<(), String>;
 }
 
 /// Statistics from Docker prune operations
@@ -24,6 +30,13 @@ pub trait DockerClient: Send + Sync {
 pub struct PruneStats {
     pub images_deleted: u64,
     pub space_reclaimed_mb: u64,
+}
+
+/// Row shape for the deployment-image retention query in
+/// `DockerCleanupService::cleanup_stale_deployment_images`.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct DeploymentImageCandidate {
+    image_name: String,
 }
 
 /// Default Docker client implementation using the Docker daemon
@@ -97,6 +110,22 @@ impl DockerClient for DefaultDockerClient {
                 }
             }
             Err(e) => Err(format!("Failed to prune build cache: {}", e)),
+        }
+    }
+
+    async fn remove_image(&self, image_name: &str) -> Result<(), String> {
+        use bollard::query_parameters::RemoveImageOptionsBuilder;
+        use bollard::Docker;
+
+        let docker = Docker::connect_with_unix_defaults()
+            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
+
+        // No `force`: see the safety note on the trait method.
+        let options = RemoveImageOptionsBuilder::default().build();
+
+        match docker.remove_image(image_name, Some(options), None).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Failed to remove image '{}': {}", image_name, e)),
         }
     }
 }
@@ -248,6 +277,13 @@ pub struct DockerCleanupService {
     max_chunk_age_hours: u64,
     /// Maximum age of static asset cache entries in days (default: 7)
     max_asset_cache_age_days: i64,
+    /// Number of most-recent deployment images to always keep per
+    /// project+environment, regardless of age (default: 5)
+    keep_recent_deployment_images: u64,
+    /// Minimum age in days before a deployment's image becomes eligible for
+    /// removal, even if it falls outside `keep_recent_deployment_images`
+    /// (default: 7)
+    max_deployment_image_age_days: i64,
 }
 
 impl DockerCleanupService {
@@ -265,6 +301,8 @@ impl DockerCleanupService {
             static_dir: None,
             max_chunk_age_hours: 24,
             max_asset_cache_age_days: 7,
+            keep_recent_deployment_images: 5,
+            max_deployment_image_age_days: 7,
         }
     }
 
@@ -285,6 +323,16 @@ impl DockerCleanupService {
 
     pub fn with_max_asset_cache_age_days(mut self, days: i64) -> Self {
         self.max_asset_cache_age_days = days;
+        self
+    }
+
+    pub fn with_keep_recent_deployment_images(mut self, count: u64) -> Self {
+        self.keep_recent_deployment_images = count;
+        self
+    }
+
+    pub fn with_max_deployment_image_age_days(mut self, days: i64) -> Self {
+        self.max_deployment_image_age_days = days;
         self
     }
 
@@ -326,6 +374,10 @@ impl DockerCleanupService {
 
         perform_docker_prune(&self.docker_client, self.max_cache_age_days).await;
 
+        // Cleanup old deployment images that generic image pruning can
+        // never reach (see cleanup_stale_deployment_images)
+        self.cleanup_stale_deployment_images().await;
+
         // Cleanup old persisted static asset chunks
         if let Some(ref static_dir) = self.static_dir {
             let chunks_base = static_dir.join("chunks");
@@ -348,6 +400,94 @@ impl DockerCleanupService {
         self.cleanup_stale_asset_cache().await;
 
         info!("Nightly cleanup completed");
+    }
+
+    /// Remove Docker images for deployments that are no longer needed for
+    /// rollback. Every deployment builds a uniquely-tagged image
+    /// (`temps-{project}:{deployment_id}`), so unlike ordinary build output
+    /// these never become "dangling" and `perform_docker_prune` above can
+    /// never reclaim them — left unchecked they accumulate forever.
+    ///
+    /// Keeps, per project+environment: the environment's currently-live
+    /// deployment, the `keep_recent_deployment_images` most recent
+    /// deployments, and anything younger than
+    /// `max_deployment_image_age_days`. Everything else is removed.
+    /// Removal is best-effort and never forced (see `DockerClient::
+    /// remove_image`), so Docker itself refuses if a container still
+    /// references the image — the safety net against this query being
+    /// wrong.
+    async fn cleanup_stale_deployment_images(&self) {
+        use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
+
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::days(self.max_deployment_image_age_days);
+
+        let candidates =
+            match DeploymentImageCandidate::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"
+SELECT image_name FROM (
+    SELECT
+        id,
+        image_name,
+        created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY project_id, environment_id
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM deployments
+    WHERE image_name IS NOT NULL
+) ranked
+WHERE rn > $1
+  AND created_at < $2
+  AND id NOT IN (
+      SELECT current_deployment_id FROM environments
+      WHERE current_deployment_id IS NOT NULL
+  )
+"#,
+                [
+                    (self.keep_recent_deployment_images as i64).into(),
+                    cutoff.into(),
+                ],
+            ))
+            .all(self.db.as_ref())
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!("Failed to query stale deployment images: {}", e);
+                    return;
+                }
+            };
+
+        if candidates.is_empty() {
+            debug!("No stale deployment images to remove");
+            return;
+        }
+
+        let mut removed = 0u64;
+        for candidate in &candidates {
+            match self.docker_client.remove_image(&candidate.image_name).await {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    // Expected and harmless: the image was already removed,
+                    // was never local (multi-node builds run on a different
+                    // node's daemon), or is still referenced by a running
+                    // container — Docker's own refusal covers that last case.
+                    debug!(
+                        "Skipped removing deployment image '{}': {}",
+                        candidate.image_name, e
+                    );
+                }
+            }
+        }
+
+        if removed > 0 {
+            info!(
+                "🧹 Removed {} stale deployment image(s) (older than {} days, beyond the last {})",
+                removed, self.max_deployment_image_age_days, self.keep_recent_deployment_images
+            );
+        }
     }
 
     /// Delete static_asset_cache rows older than `max_asset_cache_age_days`
@@ -565,6 +705,10 @@ mod tests {
         async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
             self.prune_cache_result.clone()
         }
+
+        async fn remove_image(&self, _image_name: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
@@ -657,5 +801,100 @@ mod tests {
         // are logged and cleanup continues (e.g. images prune failing must
         // not skip the build-cache prune).
         perform_docker_prune(&client, 7).await;
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingDockerClient {
+        removed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DockerClient for RecordingDockerClient {
+        async fn prune_images(&self, _force: bool) -> Result<PruneStats, String> {
+            Ok(PruneStats {
+                images_deleted: 0,
+                space_reclaimed_mb: 0,
+            })
+        }
+
+        async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn remove_image(&self, image_name: &str) -> Result<(), String> {
+            self.removed.lock().unwrap().push(image_name.to_string());
+            Ok(())
+        }
+    }
+
+    fn image_candidate_row(image_name: &str) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "image_name".to_string(),
+            sea_orm::Value::String(Some(Box::new(image_name.to_string()))),
+        )])
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_deployment_images_removes_candidates() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([[
+                    image_candidate_row("temps-blog:12"),
+                    image_candidate_row("temps-blog:13"),
+                ]])
+                .into_connection(),
+        );
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let docker_client: Arc<dyn DockerClient> = Arc::new(RecordingDockerClient {
+            removed: removed.clone(),
+        });
+
+        let service = DockerCleanupService::new(docker_client, db, mock_file_store());
+        service.cleanup_stale_deployment_images().await;
+
+        let removed = removed.lock().unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"temps-blog:12".to_string()));
+        assert!(removed.contains(&"temps-blog:13".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_deployment_images_noop_when_none_stale() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .into_connection(),
+        );
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let docker_client: Arc<dyn DockerClient> = Arc::new(RecordingDockerClient {
+            removed: removed.clone(),
+        });
+
+        let service = DockerCleanupService::new(docker_client, db, mock_file_store());
+        service.cleanup_stale_deployment_images().await;
+
+        assert!(removed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_default_deployment_image_retention() {
+        let service =
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store());
+
+        assert_eq!(service.keep_recent_deployment_images, 5);
+        assert_eq!(service.max_deployment_image_age_days, 7);
+    }
+
+    #[test]
+    fn test_custom_deployment_image_retention() {
+        let service =
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
+                .with_keep_recent_deployment_images(10)
+                .with_max_deployment_image_age_days(30);
+
+        assert_eq!(service.keep_recent_deployment_images, 10);
+        assert_eq!(service.max_deployment_image_age_days, 30);
     }
 }
