@@ -476,6 +476,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.websocket_idle_timeout_seconds),
+                max_concurrent_connections: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.max_concurrent_connections),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()

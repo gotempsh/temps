@@ -12,6 +12,7 @@ pub mod ai_agent_detector;
 pub mod branded_404;
 pub mod cloudflare_ips;
 pub mod config;
+mod connection_limiter;
 pub mod crawler_detector;
 pub mod handler;
 pub mod metrics;

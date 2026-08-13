@@ -507,6 +507,12 @@ pub struct ProxyContext {
     /// connection lifetime, not a latency, so `logging` keeps it out of the
     /// duration histograms — see [`crate::metrics::ProxyMetrics::record`].
     pub streaming_session: bool,
+    /// Reserved in-flight slot for this request's project/environment, held
+    /// for the whole request lifetime and released when dropped in
+    /// `logging()`. `None` when no cap applies (unlimited, or no
+    /// project/environment resolved for this request — e.g. console/preview
+    /// traffic).
+    pub connection_permit: Option<crate::connection_limiter::ConnectionPermit>,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -548,6 +554,9 @@ pub struct LoadBalancer {
     /// `service/static_asset_lookup.rs` and WS4 in IMPLEMENTATION_PLAN.md.
     static_asset_lookup: Arc<crate::service::static_asset_lookup::StaticAssetLookup>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    /// Per-project/environment concurrent-connection cap enforcement. See
+    /// issue #646 and `crate::connection_limiter`.
+    connection_limiter: Arc<crate::connection_limiter::ConnectionLimiter>,
     /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
     /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
     /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
@@ -606,6 +615,7 @@ impl LoadBalancer {
             route_table: None,
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
+            connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
@@ -3001,6 +3011,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_response_time_ms: None,
             preview_route: None,
             streaming_session: false,
+            connection_permit: None,
         }
     }
 
@@ -3877,6 +3888,65 @@ impl ProxyHttp for LoadBalancer {
             // Record activity for on-demand idle tracking
             if let Some(ref on_demand) = self.on_demand_manager {
                 on_demand.record_activity(project_ctx.environment.id);
+            }
+
+            // Per-project/environment concurrent-connection cap (issue #646): a slow
+            // or malicious upstream must not be able to exhaust the proxy's own
+            // connection budget now that request timeouts are opt-in (PR #642). Keyed
+            // on environment id (the actual upstream-instance granularity); global
+            // default and the project/environment DeploymentConfig override are
+            // resolved the same way as the timeout settings above.
+            let connection_limits = self
+                .config_service
+                .get_settings()
+                .await
+                .map(|settings| settings.connection_limits)
+                .unwrap_or_default();
+            let project_config = project_ctx
+                .project
+                .deployment_config
+                .clone()
+                .unwrap_or_default();
+            let effective_config = project_ctx
+                .environment
+                .get_effective_deployment_config(&project_config);
+            let connection_limit = effective_config
+                .max_concurrent_connections
+                .map(|v| v.max(0) as u32)
+                .unwrap_or(connection_limits.default_max_concurrent_connections);
+
+            match self
+                .connection_limiter
+                .try_acquire(project_ctx.environment.id, connection_limit)
+            {
+                Some(permit) => ctx.connection_permit = Some(permit),
+                None => {
+                    warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        limit = connection_limit,
+                        "Environment at concurrent-connection capacity; rejecting request"
+                    );
+                    let mut response =
+                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                    response.insert_header("Retry-After", "1")?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "application/json")?;
+                    // Generic body/message: this must not be distinguishable from the
+                    // proxy's other 503 responses (e.g. no upstream route found), or
+                    // an unauthenticated caller could use it as an oracle to confirm
+                    // that a given hostname routes to a real project/environment.
+                    let body_bytes = Bytes::from_static(
+                        br#"{"status":"service_unavailable","message":"Service temporarily unavailable, please retry"}"#,
+                    );
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session.write_response_body(Some(body_bytes), true).await?;
+                    ctx.routing_status = "connection_limit_exceeded".to_string();
+                    return Ok(true);
+                }
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
@@ -5251,6 +5321,9 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        // ctx.connection_permit (if any) releases its slot when ctx is dropped
+        // after this hook returns — no explicit release needed here.
+
         // No response written (client abort / connect failure with no reply)
         // has no status; 0 falls into the 5xx class, which is the honest read.
         let status_code = session
@@ -5586,6 +5659,7 @@ mod markdown_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             streaming_session: false,
+            connection_permit: None,
         }
     }
 
@@ -6118,6 +6192,7 @@ mod markdown_pipeline_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             streaming_session: false,
+            connection_permit: None,
         }
     }
 

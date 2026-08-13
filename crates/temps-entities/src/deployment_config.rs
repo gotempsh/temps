@@ -401,6 +401,18 @@ pub struct DeploymentConfig {
     /// the global hard ceiling at resolution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's cap on concurrent in-flight requests to this
+    /// project/environment's upstream, independent of the timeout overrides
+    /// above. `None` = inherit the global
+    /// `connection_limits.default_max_concurrent_connections`. `Some(0)`
+    /// explicitly forces "unlimited" for this project/environment, overriding
+    /// a nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —
+    /// there is no global ceiling clamp here (unlike the timeout settings):
+    /// an operator who has explicitly set a per-project value has made a
+    /// deliberate choice and the platform should respect it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_connections: Option<i32>,
 }
 
 /// Deployment configuration snapshot for deployments
@@ -495,6 +507,7 @@ impl Default for DeploymentConfig {
             request_timeout_seconds: None,
             sse_idle_timeout_seconds: None,
             websocket_idle_timeout_seconds: None,
+            max_concurrent_connections: None,
         }
     }
 }
@@ -593,6 +606,9 @@ impl DeploymentConfig {
             websocket_idle_timeout_seconds: other
                 .websocket_idle_timeout_seconds
                 .or(self.websocket_idle_timeout_seconds),
+            max_concurrent_connections: other
+                .max_concurrent_connections
+                .or(self.max_concurrent_connections),
         }
     }
 
@@ -665,6 +681,15 @@ impl DeploymentConfig {
                         "{name} {seconds} is not in valid range (0-86400 seconds, 0 = no timeout)"
                     ));
                 }
+            }
+        }
+
+        if let Some(max_conn) = self.max_concurrent_connections {
+            if max_conn < 0 {
+                return Err(format!(
+                    "max_concurrent_connections cannot be negative, got {}",
+                    max_conn
+                ));
             }
         }
 

@@ -75,6 +75,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub request_timeouts: RequestTimeoutSettings,
 
+    /// Per-upstream concurrent-connection cap applied by the proxy to
+    /// customer app traffic. `0` (the default) is unlimited. See issue #646.
+    #[serde(default)]
+    pub connection_limits: ConnectionLimitSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -336,6 +341,24 @@ impl Default for RequestTimeoutSettings {
             default_websocket_idle_timeout_seconds: 0,
         }
     }
+}
+
+/// Per-upstream concurrent-connection limiting. Protects the proxy's own
+/// connection/file-descriptor budget from a single slow or malicious
+/// customer upstream — independent of the request/idle timeouts in
+/// `RequestTimeoutSettings`, which bound how long a connection may stay
+/// open, not how many may exist at once. See issue #646.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, ToSchema, Deserialize)]
+#[serde(default)]
+pub struct ConnectionLimitSettings {
+    /// Default max concurrent in-flight requests to a single
+    /// project/environment's upstream, used when the project/environment
+    /// hasn't set its own `max_concurrent_connections` override. `0` (the
+    /// default) means unlimited — matches the "opt-in, never breaks an
+    /// existing app on upgrade" philosophy already established for
+    /// `RequestTimeoutSettings`.
+    #[schema(minimum = 0, example = 200)]
+    pub default_max_concurrent_connections: u32,
 }
 
 /// Control-plane build resource limits.
@@ -1011,6 +1034,7 @@ impl Default for AppSettings {
             insecure_tls: false,
             ai_chat_limits: AiChatLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
+            connection_limits: ConnectionLimitSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
@@ -1650,6 +1674,48 @@ mod tests {
 
         let parsed = AppSettings::from_json(settings.to_json());
         assert_eq!(parsed.request_timeouts, settings.request_timeouts);
+    }
+
+    #[test]
+    fn connection_limits_default_is_unlimited_opt_in_only() {
+        // Out of the box, no cap is applied — an existing app with many
+        // concurrent requests must keep working without any operator action.
+        // The limit is opt-in: an operator sets a nonzero global default
+        // and/or a project/environment sets its own override.
+        let s = ConnectionLimitSettings::default();
+        assert_eq!(s.default_max_concurrent_connections, 0);
+    }
+
+    #[test]
+    fn connection_limits_round_trip_through_json() {
+        let mut settings = AppSettings::default();
+        settings
+            .connection_limits
+            .default_max_concurrent_connections = 200;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(
+            parsed.connection_limits.default_max_concurrent_connections,
+            200
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_without_connection_limits_deserializes() {
+        // An old `settings.data` row written before this feature shipped has
+        // no `connection_limits` key. `#[serde(default)]` must fill it in
+        // with the unlimited default so pre-existing deployments aren't
+        // suddenly capped on upgrade.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(parsed.connection_limits, ConnectionLimitSettings::default());
+        assert_eq!(
+            parsed.connection_limits.default_max_concurrent_connections,
+            0
+        );
     }
 
     /// Regression: a settings save must not delete the `admin_gate`
