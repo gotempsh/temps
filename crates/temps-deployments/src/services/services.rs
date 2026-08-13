@@ -128,6 +128,15 @@ fn confined_archive_path(
     Ok(data_dir.join(relative))
 }
 
+/// A public git repository + branch, returned only for projects whose repo
+/// is actually public -- see [`DeploymentService::get_public_repo_reference`].
+#[derive(Clone, Debug)]
+pub struct RepoReference {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -3614,6 +3623,53 @@ impl DeploymentService {
             })?;
 
         Ok(jobs)
+    }
+
+    /// The project's git host reference (owner/repo + branch) for a
+    /// deployment, but ONLY when the repo is public -- returns `None` for a
+    /// private repo or a project with no git connection at all (e.g. a
+    /// manual/CLI upload). Callers that surface this externally (e.g. in a
+    /// GitHub issue template on a public repo) must never see a private
+    /// repo's URL, so the `is_public_repo` check happens here rather than
+    /// being left to each caller to remember.
+    pub async fn get_public_repo_reference(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+    ) -> Result<Option<RepoReference>, DeploymentError> {
+        use temps_entities::projects;
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "deployment {} for project {} not found",
+                    deployment_id, project_id
+                ))
+            })?;
+
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+
+        if !project.is_public_repo {
+            return Ok(None);
+        }
+
+        Ok(Some(RepoReference {
+            owner: project.repo_owner,
+            repo: project.repo_name,
+            branch: deployment.branch_ref.unwrap_or(project.main_branch),
+        }))
     }
 
     /// Cancel all running deployments with a given reason
@@ -7248,6 +7304,44 @@ mod tests {
             !preview.redacted_log.contains("super-secret-value"),
             "known secret value must be redacted from the trace"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_public_repo_reference_none_for_private_none_for_public(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        // setup_test_data's project doesn't set is_public_repo, so it defaults
+        // to private -- must never leak repo_owner/repo_name into a public
+        // GitHub issue template.
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let private_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?;
+        assert!(
+            private_result.is_none(),
+            "a private (or unlinked) repo must never be surfaced"
+        );
+
+        let mut project_update: projects::ActiveModel = project.clone().into();
+        project_update.is_public_repo = Set(true);
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.clone().into();
+        deployment_update.branch_ref = Set(Some("feat/some-branch".to_string()));
+        deployment_update.update(db.as_ref()).await?;
+
+        let public_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?
+            .expect("public repo must return a reference");
+        assert_eq!(public_result.owner, "test-owner");
+        assert_eq!(public_result.repo, "test-repo");
+        assert_eq!(public_result.branch, "feat/some-branch");
 
         Ok(())
     }

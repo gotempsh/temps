@@ -1,6 +1,7 @@
 import { getPool } from "./db/pool.js";
 import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";
+import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
@@ -18,6 +19,7 @@ async function main() {
 
   const events = createEventsRoutes(pool);
   const stats = createStatsRoutes(pool);
+  const failureReports = createFailureReportsRoutes(pool);
 
   const server = Bun.serve({
     port: PORT,
@@ -37,6 +39,9 @@ async function main() {
       }
       if (method === "POST" && path === "/v1/events/batch") {
         return events.postBatch(req);
+      }
+      if (method === "POST" && path === "/v1/deploy-failure-reports") {
+        return failureReports.postReport(req);
       }
 
       // Stats endpoints (add auth in production via INGEST_API_KEY or network policy)

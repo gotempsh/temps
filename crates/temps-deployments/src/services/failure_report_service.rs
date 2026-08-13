@@ -48,6 +48,21 @@ const SENSITIVE_JOB_CONFIG_FIELDS: &[&str] = &[
     "environment_vars",
 ];
 
+/// Deployment job errors are often nested chains ("Job execution failed:
+/// Failed to build image: Build failed: Build failed: Docker stream error:
+/// ..."), which makes an unbounded GitHub issue title unreadable in a PR
+/// list or notification. Cap it, breaking at a char boundary since these
+/// messages can contain multi-byte output from arbitrary build tools.
+const MAX_TITLE_ERROR_CHARS: usize = 80;
+
+fn truncate_for_title(message: &str) -> String {
+    let trimmed = message.trim();
+    match trimmed.char_indices().nth(MAX_TITLE_ERROR_CHARS) {
+        Some((byte_idx, _)) => format!("{}…", &trimmed[..byte_idx]),
+        None => trimmed.to_string(),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FailureReportError {
     #[error("Job '{job_id}' not found in deployment {deployment_id}")]
@@ -247,20 +262,37 @@ impl FailureReportService {
 
         let redacted_log = self.build_redacted_log(&jobs).await?;
 
+        // Only ever included when the project's repo is public -- a private
+        // repo's URL/branch must never be pasted into an issue on the
+        // public gotempsh/temps tracker.
+        let repo_reference = self
+            .deployment_service
+            .get_public_repo_reference(project_id, deployment_id)
+            .await?;
+
         let github_issue_title = format!(
             "Deploy failure: {}{}",
             failed_job.name,
             error_message
                 .as_deref()
-                .map(|m| format!(" — {m}"))
+                .map(|m| format!(" — {}", truncate_for_title(m)))
                 .unwrap_or_default()
         );
+        let repo_line = repo_reference
+            .map(|r| {
+                format!(
+                    "**Repository:** https://github.com/{}/{} @ {}\n",
+                    r.owner, r.repo, r.branch
+                )
+            })
+            .unwrap_or_default();
         let github_issue_body = format!(
-            "**Temps version:** {}\n**Failed stage:** {} ({})\n\n\
+            "**Temps version:** {}\n**Failed stage:** {} ({})\n{}\n\
              Paste your (redacted) deployment log below:\n\n```\n[paste here]\n```\n",
             env!("CARGO_PKG_VERSION"),
             failed_job.name,
             failed_job_type,
+            repo_line,
         );
 
         Ok(FailureReportPreview {
@@ -333,5 +365,28 @@ mod tests {
         std::env::set_var("TEMPS_TELEMETRY", "0");
         assert!(!FailureReportService::reporting_enabled_from_env());
         std::env::remove_var("TEMPS_TELEMETRY");
+    }
+
+    #[test]
+    fn truncate_for_title_passes_short_messages_through() {
+        assert_eq!(
+            truncate_for_title("build failed: exit code 1"),
+            "build failed: exit code 1"
+        );
+    }
+
+    #[test]
+    fn truncate_for_title_caps_long_nested_error_chains() {
+        let message = "Job execution failed: Failed to build image: Build failed: Build failed: \
+             Docker stream error: process \"/bin/sh -c pnpm install --frozen-lockfile\" did not \
+             complete successfully: exit code: 127";
+        let truncated = truncate_for_title(message);
+        assert!(truncated.chars().count() <= MAX_TITLE_ERROR_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_title_trims_whitespace() {
+        assert_eq!(truncate_for_title("  padded  "), "padded");
     }
 }
