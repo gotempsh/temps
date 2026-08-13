@@ -17,6 +17,5 @@ pub use store::clickhouse_migrations;
 pub use store::timescale::{validate_metric_name, TimescaleMetricsStore};
 pub use store::{
     duration_to_step, is_monotonic_counter, range_to_step, LabelledMetric, LatestByLabelQuery,
-    LatestQuery,
-    MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind,
+    LatestQuery, MetricKind, MetricPoint, MetricsStore, RangeQuery, SourceKind,
 };
