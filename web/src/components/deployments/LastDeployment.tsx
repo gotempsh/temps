@@ -2,11 +2,13 @@ import { DeploymentResponse } from '@/api/client'
 import { getSettingsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useQuery } from '@tanstack/react-query'
 import { Camera, ExternalLink, GitBranch, Settings } from 'lucide-react'
 import { Link } from 'react-router'
+import { normalizeUrl } from '@/lib/deployment-url'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
 interface LastDeploymentProps {
@@ -83,32 +85,10 @@ export function LastDeployment({
               Deployment Information
             </h3>
             <div className="flex flex-col items-start gap-2 mb-4">
-              {deployment.environment.domains.map((domain) => {
-                const url = domain.startsWith('http')
-                  ? domain
-                  : `https://${domain}`
-                return (
-                  <div
-                    key={domain}
-                    className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
-                    onClick={() => window.open(url, '_blank')}
-                  >
-                    <span className="text-sm text-muted-foreground truncate">
-                      {domain}
-                    </span>
-                    <ExternalLink className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                  </div>
-                )
-              })}
-              <div
-                className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
-                onClick={() => window.open(deployment.url, '_blank')}
-              >
-                <span className="text-sm text-muted-foreground truncate">
-                  {deployment.url}
-                </span>
-                <ExternalLink className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              </div>
+              {deployment.environment.domains.map((domain) => (
+                <DeploymentUrlRow key={domain} value={domain} />
+              ))}
+              <DeploymentUrlRow value={deployment.url} />
             </div>
 
             <h4 className="text-sm font-semibold mb-2">Status</h4>
@@ -137,5 +117,36 @@ export function LastDeployment({
         </div>
       </CardContent>
     </Card>
+  )
+}
+
+function DeploymentUrlRow({ value }: { value: string }) {
+  const href = normalizeUrl(value)
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      {href ? (
+        <>
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex min-w-0 items-center gap-1 hover:opacity-80 transition-opacity"
+          >
+            <span className="truncate text-sm text-muted-foreground">
+              {value}
+            </span>
+            <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          </a>
+          <CopyButton
+            value={href}
+            minimal
+            label="Copy URL"
+            className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
+          />
+        </>
+      ) : (
+        <span className="truncate text-sm text-muted-foreground">{value}</span>
+      )}
+    </div>
   )
 }
