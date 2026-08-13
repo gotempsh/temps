@@ -35,6 +35,7 @@ syntax may have changed.
 - [`containers`](containers.md)
 - [`tokens`](tokens.md)
 - [`errors`](errors.md)
+- [`metrics`](metrics.md)
 - [`traces`](traces.md)
 - [`otel-forward`](otel-forward.md)
 - [`kv`](kv.md)

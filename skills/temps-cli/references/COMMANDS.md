@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.31`
+> Generated from: `@temps-sdk/cli@0.1.32`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.31 [command]
+bunx @temps-sdk/cli@0.1.32 [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.31 [command]
+npx @temps-sdk/cli@0.1.32 [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.31 login
+bunx @temps-sdk/cli@0.1.32 login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.31 configure
+bunx @temps-sdk/cli@0.1.32 configure
 ```
 
 ## Global Options
@@ -72,6 +72,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`containers`](#containers) - Manage project containers in environments
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
+- [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`kv`](#kv) - KV store commands (coming soon)
@@ -3230,6 +3231,80 @@ Delete all source files for a release
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--release <version>` | Release version | - | Yes |
+
+## `metrics` (alias: `metric`)
+
+Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
+
+**Subcommands:**
+
+- `names` - List distinct metric names ingested for a project — start here if you don't know what to query
+- `query` - Query a metric with time bucketing and aggregation
+- `label-keys` - List the label keys observed on a metric — powers filter/group-by discovery
+- `label-values` - List the distinct values seen for a label key on a metric
+
+### `metrics names`
+
+List distinct metric names ingested for a project — start here if you don't know what to query
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `metrics query`
+
+Query a metric with time bucketing and aggregation
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--metric-name <name>` | Metric to query (see "temps metrics names") | - | No |
+| `--service-name <name>` | Filter by service name | - | No |
+| `--environment <name>` | Filter by deployment environment name | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 24h, 7d) | `24h` | No |
+| `--start-time <iso>` | Explicit window start (RFC 3339) — overrides --period | - | No |
+| `--end-time <iso>` | Explicit window end (RFC 3339) — overrides --period | - | No |
+| `--bucket-interval <interval>` | Bucket size, e.g. "5 minutes", "1 hour" | - | No |
+| `--aggregation <mode>` | Per-bucket aggregation: avg (default), sum, min, max, count, rate, p50/p95/p99, quantile:0.95 | - | No |
+| `--metric-type <type>` | Filter by metric type: gauge, sum, histogram, exponential_histogram, summary | - | No |
+| `--label-filters <pairs>` | Comma-separated key=value data-point label filters, e.g. http.method=GET,http.status_code=200 | - | No |
+| `--group-by <keys>` | Comma-separated label keys to group series by, e.g. http.method,http.route | - | No |
+| `--limit <n>` | Max buckets to return (default: 500, server cap: 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `metrics label-keys`
+
+List the label keys observed on a metric — powers filter/group-by discovery
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--metric-name <name>` | Metric to inspect | - | Yes |
+| `--start-time <iso>` | Window start (RFC 3339); defaults to 24h before end | - | No |
+| `--end-time <iso>` | Window end (RFC 3339); defaults to now | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `metrics label-values`
+
+List the distinct values seen for a label key on a metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--metric-name <name>` | Metric to inspect | - | Yes |
+| `--label-key <key>` | Label key whose values to list | - | Yes |
+| `--start-time <iso>` | Window start (RFC 3339); defaults to 24h before end | - | No |
+| `--end-time <iso>` | Window end (RFC 3339); defaults to now | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `traces` (alias: `trace`)
 
@@ -6509,48 +6584,48 @@ Upgrade your plan
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.31 login
+bunx @temps-sdk/cli@0.1.32 login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.31 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@0.1.32 --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.31 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.32 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.31 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.32 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.31 runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.32 runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.31 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.32 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.31 environments list --project my-app
+bunx @temps-sdk/cli@0.1.32 environments list --project my-app
 
 # Set environment variables on the intended server
-bunx @temps-sdk/cli@0.1.31 --target-context production environments vars set --project my-app --key DATABASE_URL
+bunx @temps-sdk/cli@0.1.32 --target-context production environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.31 environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.32 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Add a custom domain on the intended server
-bunx @temps-sdk/cli@0.1.31 --target-context production domains add --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.32 --target-context production domains add --project my-app --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.31 domains list --project my-app
+bunx @temps-sdk/cli@0.1.32 domains list --project my-app
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.31 --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.32 --target-context production domains remove --project my-app --domain app.example.com
 ```
 
 ## Environment Variables
@@ -6570,7 +6645,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.31 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.32 configure show` to view current configuration.
 
 ## Support
 
