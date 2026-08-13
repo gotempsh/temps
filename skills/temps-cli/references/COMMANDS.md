@@ -556,6 +556,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
 
@@ -656,6 +657,40 @@ Show deployment build logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | No |
 | `-d, --deployment <id>` | Specific deployment ID | - | No |
+
+### `deployments failure-report`
+
+Preview or send a redacted deploy-failure trace
+
+**Subcommands:**
+
+- `preview` - Preview the redacted, editable failure-report text for a failed job
+- `send` - Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+#### `deployments failure-report preview`
+
+Preview the redacted, editable failure-report text for a failed job
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+
+#### `deployments failure-report send`
+
+Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+| `--text-file <path>` | Read the (already-reviewed) report text from a file | - | No |
 
 ## `domains` (alias: `domain`)
 

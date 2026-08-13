@@ -61,6 +61,9 @@ pub struct AppState {
     /// enabled. Serves container CPU/memory history (written by the
     /// container health monitor under `source_kind = container`).
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Builds and sends deploy-failure reports (redacted trace, user-edited,
+    /// sent on request) -- see [`crate::services::failure_report_service`].
+    pub failure_report_service: Arc<crate::services::FailureReportService>,
 }
 
 use crate::services::types::Deployment;
@@ -625,6 +628,39 @@ pub struct DeploymentJobResponse {
     pub outputs: Option<serde_json::Value>,
     pub dependencies: Option<serde_json::Value>,
     pub execution_order: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct FailureReportPreviewResponse {
+    /// Redacted, editable draft of the failure trace. Shown in a textarea the
+    /// user can edit before sending — nothing is sent without their review.
+    pub redacted_log: String,
+    pub error_message: Option<String>,
+    /// Whether "send to Temps" should be offered. False when the operator
+    /// opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+    pub reporting_enabled: bool,
+    pub failed_job_type: String,
+    pub github_issue_title: String,
+    pub github_issue_body: String,
+}
+
+impl From<crate::services::FailureReportPreview> for FailureReportPreviewResponse {
+    fn from(preview: crate::services::FailureReportPreview) -> Self {
+        Self {
+            redacted_log: preview.redacted_log,
+            error_message: preview.error_message,
+            reporting_enabled: preview.reporting_enabled,
+            failed_job_type: preview.failed_job_type,
+            github_issue_title: preview.github_issue_title,
+            github_issue_body: preview.github_issue_body,
+        }
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SendFailureReportRequest {
+    /// The report text as reviewed (and possibly edited) by the user.
+    pub report_text: String,
 }
 
 impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {

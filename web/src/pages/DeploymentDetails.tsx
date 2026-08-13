@@ -3,10 +3,13 @@ import {
   cancelDeploymentMutation,
   deployFromImageMutation,
   getDeploymentOptions,
+  getFailureReportPreviewOptions,
+  getDeploymentJobsOptions,
   getSettingsOptions,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
+  sendFailureReportMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
@@ -17,17 +20,35 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
+import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
 import { normalizeUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
@@ -47,6 +68,7 @@ import {
   Play,
   RotateCcw,
   RotateCw,
+  Send,
   X,
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
@@ -54,12 +76,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 type BadgeVariant =
-  | 'default'
-  | 'secondary'
-  | 'destructive'
-  | 'success'
-  | 'warning'
-  | 'outline'
+  'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
 
 function statusBadgeVariant(status: string): BadgeVariant {
   switch (status) {
@@ -419,6 +436,157 @@ function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
         </p>
       </div>
     </div>
+  )
+}
+
+// "Help us fix this" — offered only for a genuinely failed deployment (not a
+// user-initiated cancel). Finds the failed job, then offers to send a
+// redacted, user-editable copy of its trace to the Temps team, or to copy it
+// for a pre-filled GitHub issue instead.
+function DeployFailureReport({
+  project,
+  deployment,
+}: {
+  project: ProjectResponse
+  deployment: DeploymentResponse
+}) {
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+  // `null` until the user types — the textarea then falls back to the fetched
+  // preview, so we never need an effect to "seed" state from the query.
+  const [editedText, setEditedText] = useState<string | null>(null)
+
+  const isFailed = deployment.status === 'failed'
+
+  const { data: jobsData } = useQuery({
+    ...getDeploymentJobsOptions({
+      path: { project_id: project.id, deployment_id: deployment.id },
+    }),
+    enabled: isFailed,
+  })
+  const failedJob = jobsData?.jobs.find((job) => job.status === 'failure')
+
+  const previewQuery = useQuery({
+    ...getFailureReportPreviewOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: deployment.id,
+        job_id: failedJob?.job_id ?? '',
+      },
+    }),
+    enabled: isFailed && !!failedJob,
+  })
+  const reportText = editedText ?? previewQuery.data?.redacted_log ?? ''
+
+  const sendReport = useMutation({
+    ...sendFailureReportMutation(),
+    meta: {
+      errorTitle: 'Failed to send failure report',
+    },
+    onSuccess: () => {
+      toast.success('Failure report sent — thank you for helping us fix this')
+      setIsDialogOpen(false)
+      setEditedText(null)
+    },
+  })
+
+  if (!isFailed || !failedJob) return null
+
+  const handleOpenGithubIssue = async () => {
+    const body = previewQuery.data?.github_issue_body ?? ''
+    const title = previewQuery.data?.github_issue_title ?? 'Deploy failure'
+    if (previewQuery.data?.redacted_log) {
+      await writeToClipboard(previewQuery.data.redacted_log)
+      toast.info('Redacted log copied — paste it into the issue body')
+    }
+    const url = `https://github.com/gotempsh/temps/issues/new?title=${encodeURIComponent(
+      title
+    )}&body=${encodeURIComponent(body)}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">
+            Help us fix this in the next release
+          </p>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Send a redacted copy of the failure trace to the Temps team, or open
+            a GitHub issue.
+          </p>
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <DialogTrigger asChild>
+                      <Button
+                        size="sm"
+                        disabled={
+                          previewQuery.data?.reporting_enabled === false
+                        }
+                      >
+                        <Send className="mr-2 h-4 w-4" />
+                        Send failure report
+                      </Button>
+                    </DialogTrigger>
+                  </span>
+                </TooltipTrigger>
+                {previewQuery.data?.reporting_enabled === false && (
+                  <TooltipContent>
+                    Outbound reporting is disabled on this instance
+                    (TEMPS_TELEMETRY).
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            </TooltipProvider>
+            <DialogContent className="max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Send failure report</DialogTitle>
+                <DialogDescription>
+                  This is a redacted copy of the build trace for the failed
+                  stage. Review and edit it before sending — nothing is sent
+                  until you press Send.
+                </DialogDescription>
+              </DialogHeader>
+              {previewQuery.isLoading ? (
+                <Skeleton className="h-64 w-full" />
+              ) : (
+                <Textarea
+                  value={reportText}
+                  onChange={(e) => setEditedText(e.target.value)}
+                  className="h-64 font-mono text-xs"
+                />
+              )}
+              <DialogFooter>
+                <Button
+                  onClick={() =>
+                    sendReport.mutate({
+                      path: {
+                        project_id: project.id,
+                        deployment_id: deployment.id,
+                        job_id: failedJob.job_id,
+                      },
+                      body: { report_text: reportText },
+                    })
+                  }
+                  disabled={sendReport.isPending || !reportText}
+                >
+                  {sendReport.isPending ? 'Sending...' : 'Send'}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Button variant="outline" size="sm" onClick={handleOpenGithubIssue}>
+            <GithubIcon className="mr-2 h-4 w-4" />
+            Open a GitHub issue instead
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1030,13 +1198,13 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
   const hasBuildConfig = Boolean(
     md &&
-      (md.builder ||
-        md.deploymentSourceType ||
-        md.externalImageRef ||
-        md.healthCheckPath ||
-        md.dockerfilePath ||
-        md.staticBundlePath ||
-        md.imageUploadedLocally)
+    (md.builder ||
+      md.deploymentSourceType ||
+      md.externalImageRef ||
+      md.healthCheckPath ||
+      md.dockerfilePath ||
+      md.staticBundlePath ||
+      md.imageUploadedLocally)
   )
 
   // The resource facts worth surfacing, as compact chips: CPU + memory
@@ -1103,6 +1271,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
         <CancelledReason deployment={deployment} />
+        <DeployFailureReport project={project} deployment={deployment} />
 
         {resourceBadges.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">

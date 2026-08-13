@@ -54,6 +54,17 @@ pub struct DeploymentPromotedAudit {
     pub target_environment_id: i32,
 }
 
+/// A user sent a redacted failure-trace report to the Temps team, or opened
+/// a pre-filled GitHub issue, for a failed deployment. Never carries the
+/// report content itself -- just that a report was made, and for what.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentFailureReportedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub deployment_id: i32,
+    pub job_id: String,
+}
+
 // ── Container action audits ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +229,10 @@ impl_audit_operation!(DeploymentResumedAudit, "DEPLOYMENT_RESUMED");
 impl_audit_operation!(DeploymentCancelledAudit, "DEPLOYMENT_CANCELLED");
 impl_audit_operation!(DeploymentTeardownAudit, "DEPLOYMENT_TEARDOWN");
 impl_audit_operation!(DeploymentPromotedAudit, "DEPLOYMENT_PROMOTED");
+impl_audit_operation!(
+    DeploymentFailureReportedAudit,
+    "DEPLOYMENT_FAILURE_REPORTED"
+);
 impl_audit_operation!(EnvironmentTeardownAudit, "ENVIRONMENT_TEARDOWN");
 impl_audit_operation!(ContainerActionAudit, "CONTAINER_ACTION");
 impl_audit_operation!(

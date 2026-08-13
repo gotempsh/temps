@@ -9,6 +9,7 @@ import { rollback } from './rollback.js'
 import { status } from './status.js'
 import { drop } from './drop.js'
 import { cancelDeploymentAction, pauseDeploymentAction, resumeDeploymentAction, teardownDeploymentAction } from './actions.js'
+import { failureReportPreviewAction, failureReportSendAction } from './failure-report.js'
 
 export function registerDeployCommands(program: Command): void {
   program
@@ -176,4 +177,28 @@ export function registerDeployCommands(program: Command): void {
     .option('-n, --lines <number>', 'Number of lines to show', '100')
     .option('-d, --deployment <id>', 'Specific deployment ID')
     .action(logs)
+
+  const failureReport = deployments
+    .command('failure-report')
+    .description('Preview or send a redacted deploy-failure trace')
+
+  failureReport
+    .command('preview')
+    .description('Preview the redacted, editable failure-report text for a failed job')
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-d, --deployment-id <id>', 'Deployment ID')
+    .requiredOption('-j, --job-id <id>', 'Failed job ID (see "deployments logs")')
+    .action(failureReportPreviewAction)
+
+  failureReport
+    .command('send')
+    .description(
+      'Send a failure report to the Temps team. Reads report text from --text-file, ' +
+        'or stdin if piped, or defaults to the redacted preview.',
+    )
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-d, --deployment-id <id>', 'Deployment ID')
+    .requiredOption('-j, --job-id <id>', 'Failed job ID (see "deployments logs")')
+    .option('--text-file <path>', 'Read the (already-reviewed) report text from a file')
+    .action(failureReportSendAction)
 }

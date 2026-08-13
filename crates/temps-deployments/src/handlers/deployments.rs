@@ -27,6 +27,7 @@ use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetad
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
+use crate::handlers::failure_report::*;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
     ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerInfoResponse,
@@ -34,7 +35,8 @@ use crate::handlers::types::{
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
+    EnvVarResponse, FailureReportPreviewResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
+    SendFailureReportRequest,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -117,6 +119,8 @@ fn public_compose_service_url(
         get_deployment_jobs,
         get_deployment_job_logs,
         tail_deployment_job_logs,
+        get_failure_report_preview,
+        send_failure_report,
         list_deployment_container_logs,
         get_deployment_container_log_content,
         rollback_to_deployment,
@@ -163,7 +167,9 @@ fn public_compose_service_url(
         PromoteDeploymentRequest,
         DeploymentContainerLogResponse,
         DeploymentContainerLogsListResponse,
-        DeploymentContainerLogContentResponse
+        DeploymentContainerLogContentResponse,
+        FailureReportPreviewResponse,
+        SendFailureReportRequest
     )),
     info(
         title = "Deployments API",
@@ -195,6 +201,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs",
             get(get_deployment_job_logs),
+        )
+        .route(
+            "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report",
+            get(get_failure_report_preview).post(send_failure_report),
         )
         // Historical (captured) container logs for previous deployments. These
         // survive teardown so users can read the logs of a container that no
@@ -3900,6 +3910,17 @@ mod tests {
             Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker")),
         ));
 
+        let failure_report_service = Arc::new(
+            crate::services::FailureReportService::new(
+                deployment_service.clone(),
+                log_service.clone(),
+                Arc::new(
+                    temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+                ),
+            )
+            .expect("Failed to build test FailureReportService"),
+        );
+
         Arc::new(AppState {
             deployment_service,
             log_service,
@@ -3939,6 +3960,7 @@ mod tests {
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
+            failure_report_service,
         })
     }
 

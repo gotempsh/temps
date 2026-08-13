@@ -16058,6 +16058,41 @@
         ],
         "type": "object"
       },
+      "FailureReportPreviewResponse": {
+        "properties": {
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_job_type": {
+            "type": "string"
+          },
+          "github_issue_body": {
+            "type": "string"
+          },
+          "github_issue_title": {
+            "type": "string"
+          },
+          "redacted_log": {
+            "description": "Redacted, editable draft of the failure trace. Shown in a textarea the\nuser can edit before sending — nothing is sent without their review.",
+            "type": "string"
+          },
+          "reporting_enabled": {
+            "description": "Whether \"send to Temps\" should be offered. False when the operator\nopted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "redacted_log",
+          "reporting_enabled",
+          "failed_job_type",
+          "github_issue_title",
+          "github_issue_body"
+        ],
+        "type": "object"
+      },
       "FieldResponse": {
         "properties": {
           "field_type": {
@@ -33940,6 +33975,18 @@
         ],
         "type": "object"
       },
+      "SendFailureReportRequest": {
+        "properties": {
+          "report_text": {
+            "description": "The report text as reviewed (and possibly edited) by the user.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "report_text"
+        ],
+        "type": "object"
+      },
       "SendMessageRequest": {
         "properties": {
           "ai_model": {
@@ -40589,7 +40636,7 @@
             ]
           },
           "requestTimeoutSeconds": {
-            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (1-86400). Environments may override this; always\nclamped to the operator's global hard ceiling regardless of what's set\nhere. Absent leaves the current value unchanged.",
+            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (0 = no timeout, or 1-86400). Environments may\noverride this; always clamped to the operator's global hard ceiling\nregardless of what's set here. Absent leaves the current value\nunchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40613,7 +40660,7 @@
             ]
           },
           "sseIdleTimeoutSeconds": {
-            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (0 = no timeout, or 1-86400). Environments may override this;\nalways clamped to the operator's global hard ceiling. Absent leaves\nthe current value unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40621,7 +40668,7 @@
             ]
           },
           "websocketIdleTimeoutSeconds": {
-            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (0 = no timeout, or 1-86400). Environments may override this;\nalways clamped to the operator's global hard ceiling. Absent leaves\nthe current value unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40898,7 +40945,7 @@
             ]
           },
           "request_timeout_seconds": {
-            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
+            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
             "format": "int32",
             "type": [
               "integer",
@@ -40924,7 +40971,7 @@
             ]
           },
           "sse_idle_timeout_seconds": {
-            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
@@ -40954,7 +41001,7 @@
             ]
           },
           "websocket_idle_timeout_seconds": {
-            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
+            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
@@ -76263,6 +76310,136 @@
           }
         },
         "summary": "Get jobs for a specific deployment",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report": {
+      "get": {
+        "operationId": "get_failure_report_preview",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Failed job ID",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailureReportPreviewResponse"
+                }
+              }
+            },
+            "description": "Redacted failure-report preview"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ],
+        "summary": "Preview a redacted, editable copy of a failed job's trace.",
+        "tags": [
+          "Deployments"
+        ]
+      },
+      "post": {
+        "operationId": "send_failure_report",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Failed job ID",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendFailureReportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Report sent"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Failed to reach the central reporting endpoint"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ],
+        "summary": "Send a user-reviewed failure report to the Temps team.",
         "tags": [
           "Deployments"
         ]

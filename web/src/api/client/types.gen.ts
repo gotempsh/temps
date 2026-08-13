@@ -7477,6 +7477,23 @@ export type ExternalServiceSummary = {
     service_type: string;
 };
 
+export type FailureReportPreviewResponse = {
+    error_message?: string | null;
+    failed_job_type: string;
+    github_issue_body: string;
+    github_issue_title: string;
+    /**
+     * Redacted, editable draft of the failure trace. Shown in a textarea the
+     * user can edit before sending — nothing is sent without their review.
+     */
+    redacted_log: string;
+    /**
+     * Whether "send to Temps" should be offered. False when the operator
+     * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+     */
+    reporting_enabled: boolean;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -15491,6 +15508,13 @@ export type SendEmailResponseBody = {
     status: string;
 };
 
+export type SendFailureReportRequest = {
+    /**
+     * The report text as reviewed (and possibly edited) by the user.
+     */
+    report_text: string;
+};
+
 export type SendMessageRequest = {
     /**
      * Optional next-turn model. The provider harness remains pinned, but its
@@ -18449,25 +18473,26 @@ export type UpdateDeploymentConfigRequest = {
     replicas?: number | null;
     /**
      * Project-level default timeout for regular (non-streaming) HTTP
-     * requests, in seconds (1-86400). Environments may override this; always
-     * clamped to the operator's global hard ceiling regardless of what's set
-     * here. Absent leaves the current value unchanged.
+     * requests, in seconds (0 = no timeout, or 1-86400). Environments may
+     * override this; always clamped to the operator's global hard ceiling
+     * regardless of what's set here. Absent leaves the current value
+     * unchanged.
      */
     requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
     /**
      * Project-level default idle timeout for Server-Sent Events streams, in
-     * seconds (1-86400). Environments may override this; always clamped to
-     * the operator's global hard ceiling. Absent leaves the current value
-     * unchanged.
+     * seconds (0 = no timeout, or 1-86400). Environments may override this;
+     * always clamped to the operator's global hard ceiling. Absent leaves
+     * the current value unchanged.
      */
     sseIdleTimeoutSeconds?: number | null;
     /**
      * Project-level default idle timeout for WebSocket connections, in
-     * seconds (1-86400). Environments may override this; always clamped to
-     * the operator's global hard ceiling. Absent leaves the current value
-     * unchanged.
+     * seconds (0 = no timeout, or 1-86400). Environments may override this;
+     * always clamped to the operator's global hard ceiling. Absent leaves
+     * the current value unchanged.
      */
     websocketIdleTimeoutSeconds?: number | null;
 };
@@ -18619,7 +18644,7 @@ export type UpdateEnvironmentSettingsRequest = {
     replicas?: number | null;
     /**
      * Override the proxy's timeout for regular (non-streaming) HTTP requests
-     * to this environment, in seconds (1-86400). Always clamped to the
+     * to this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
      * operator's global hard ceiling regardless of what's set here.
      * Absent leaves the current value unchanged. Send JSON `null` to clear
      * the override (inherit the project/global default).
@@ -18632,7 +18657,7 @@ export type UpdateEnvironmentSettingsRequest = {
     session_recording_enabled?: boolean | null;
     /**
      * Override the proxy's idle timeout for Server-Sent Events streams to
-     * this environment, in seconds (1-86400). Always clamped to the
+     * this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
      * operator's global hard ceiling. Absent leaves the current value
      * unchanged. Send JSON `null` to clear the override.
      */
@@ -18653,7 +18678,7 @@ export type UpdateEnvironmentSettingsRequest = {
     wake_timeout_seconds?: number | null;
     /**
      * Override the proxy's idle timeout for WebSocket connections to this
-     * environment, in seconds (1-86400). Always clamped to the operator's
+     * environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's
      * global hard ceiling. Absent leaves the current value unchanged. Send
      * JSON `null` to clear the override.
      */
@@ -40251,6 +40276,90 @@ export type GetDeploymentJobsResponses = {
 };
 
 export type GetDeploymentJobsResponse = GetDeploymentJobsResponses[keyof GetDeploymentJobsResponses];
+
+export type GetFailureReportPreviewData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type GetFailureReportPreviewErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFailureReportPreviewResponses = {
+    /**
+     * Redacted failure-report preview
+     */
+    200: FailureReportPreviewResponse;
+};
+
+export type GetFailureReportPreviewResponse = GetFailureReportPreviewResponses[keyof GetFailureReportPreviewResponses];
+
+export type SendFailureReportData = {
+    body: SendFailureReportRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type SendFailureReportErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Failed to reach the central reporting endpoint
+     */
+    502: unknown;
+};
+
+export type SendFailureReportResponses = {
+    /**
+     * Report sent
+     */
+    204: void;
+};
+
+export type SendFailureReportResponse = SendFailureReportResponses[keyof SendFailureReportResponses];
 
 export type GetDeploymentJobLogsData = {
     body?: never;
