@@ -456,7 +456,8 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Parse `--name value` / `--name=value` / bare `--flag` tokens into a flat JSON
-/// object. Values are coerced to int/bool when they look like one, else string.
+/// object. Values are coerced to JSON scalars and structured values when they
+/// look like one, else string.
 fn parse_flags(tokens: &[String]) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     let mut i = 0;
@@ -468,10 +469,10 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
             ));
         };
         if let Some((k, v)) = rest.split_once('=') {
-            map.insert(k.to_string(), coerce(v));
+            map.insert(k.to_string(), coerce(k, v)?);
             i += 1;
         } else if i + 1 < tokens.len() && !tokens[i + 1].starts_with("--") {
-            map.insert(rest.to_string(), coerce(&tokens[i + 1]));
+            map.insert(rest.to_string(), coerce(rest, &tokens[i + 1])?);
             i += 2;
         } else {
             // A flag with no value → boolean true (e.g. `--only_errors`).
@@ -482,9 +483,9 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
-fn coerce(s: &str) -> Value {
+fn coerce(flag: &str, s: &str) -> Result<Value, String> {
     if let Ok(n) = s.parse::<i64>() {
-        return Value::from(n);
+        return Ok(Value::from(n));
     }
     // Floats too, or every fractional value becomes a string and the API
     // rejects it with `invalid type: string "0.5", expected f64`. Thresholds
@@ -494,13 +495,13 @@ fn coerce(s: &str) -> Value {
     if let Ok(n) = s.parse::<f64>() {
         if n.is_finite() {
             if let Some(v) = serde_json::Number::from_f64(n) {
-                return Value::Number(v);
+                return Ok(Value::Number(v));
             }
         }
     }
     match s {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
         _ => {
             // Object/array-shaped flag values (e.g. `--parameters {"database":"app"}`)
             // are real JSON, not opaque strings — a body param typed as a map/array
@@ -511,12 +512,17 @@ fn coerce(s: &str) -> Value {
             let trimmed = s.trim();
             if (trimmed.starts_with('{') && trimmed.ends_with('}'))
                 || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+                || (trimmed.starts_with('"') && trimmed.ends_with('"'))
             {
-                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                    return v;
-                }
+                return serde_json::from_str::<Value>(trimmed).map_err(|error| {
+                    format!(
+                        "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
+                         valid JSON with double-quoted keys and string values, for example \
+                         `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
+                    )
+                });
             }
-            Value::String(s.to_string())
+            Ok(Value::String(s.to_string()))
         }
     }
 }
@@ -618,10 +624,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_flags_keeps_malformed_brace_string_as_string() {
-        // Not valid JSON — must fall back to a plain string rather than error.
-        let v = parse_flags(&["--name".into(), "{not json}".into()]).unwrap();
-        assert_eq!(v["name"], Value::from("{not json}"));
+    fn parse_flags_rejects_malformed_structured_values() {
+        let error = parse_flags(&[
+            "--parameters".into(),
+            "{database:postgres,username:postgres}".into(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
+        assert!(error.contains("double-quoted keys"), "{error}");
+        assert!(error.contains(r#"{"database":"postgres""#), "{error}");
+    }
+
+    #[test]
+    fn escaped_json_quotes_are_not_silently_stripped_into_a_string() {
+        let tokens = tokenize(
+            r#"create_service --name postgres-test --service_type postgres --parameters {\"database\":\"postgres\",\"username\":\"postgres\"}"#,
+        );
+        let error = parse_flags(&tokens[1..]).unwrap_err();
+
+        assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
+    }
+
+    #[test]
+    fn parse_flags_decodes_a_json_quoted_string() {
+        let parsed = parse_flags(&["--service_type".into(), r#""postgres""#.into()]).unwrap();
+
+        assert_eq!(parsed["service_type"], Value::String("postgres".into()));
     }
 
     #[test]

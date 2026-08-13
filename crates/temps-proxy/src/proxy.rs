@@ -2431,17 +2431,250 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+/// Console/control-plane traffic always gets a fixed timeout, regardless of
+/// what customer app traffic is configured to use — a `None` (no timeout)
+/// resolved for customer traffic must never leak into the console path.
 fn upstream_io_timeout(
     peer_addr: &str,
     console_addr: &str,
     is_websocket: bool,
-    default_timeout: std::time::Duration,
-) -> std::time::Duration {
+    default_timeout: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
     let is_console = !console_addr.is_empty() && peer_addr == console_addr;
     if is_console && !is_websocket {
-        std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)
+        Some(std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS))
     } else {
         default_timeout
+    }
+}
+
+/// Which of the three configurable timeout classes a request falls under.
+/// SSE and WebSocket are long-lived by design and get their own idle-timeout
+/// class distinct from regular HTTP — see `resolve_customer_io_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutTrafficKind {
+    Http,
+    Sse,
+    WebSocket,
+}
+
+/// Resolve the upstream I/O timeout for customer app traffic: pick the
+/// override for this traffic kind from the merged project/environment
+/// `DeploymentConfig` (falling back to the matching global default), then
+/// clamp to the global hard ceiling — unless the resolved value is `0`
+/// ("no timeout"), in which case `None` is returned and the ceiling never
+/// applies. Timeouts are opt-in: an app with no override and a zero global
+/// default (the platform default) gets an unbounded connection, exactly as
+/// it did before this setting existed. `0` can also be set explicitly as a
+/// project/environment override, to force "no timeout" even when the
+/// operator has configured a nonzero global default.
+///
+/// Pure function so the classify+clamp logic is unit-testable without a full
+/// Pingora session — mirrors `upstream_io_timeout` above, which stays
+/// separate and untouched: it governs the fixed console/control-plane
+/// timeout, not customer app traffic.
+fn resolve_customer_io_timeout(
+    kind: TimeoutTrafficKind,
+    effective_config: &temps_entities::deployment_config::DeploymentConfig,
+    request_timeouts: &temps_core::RequestTimeoutSettings,
+) -> Option<std::time::Duration> {
+    let (override_seconds, default_seconds) = match kind {
+        TimeoutTrafficKind::Http => (
+            effective_config.request_timeout_seconds,
+            request_timeouts.default_http_timeout_seconds,
+        ),
+        TimeoutTrafficKind::Sse => (
+            effective_config.sse_idle_timeout_seconds,
+            request_timeouts.default_sse_idle_timeout_seconds,
+        ),
+        TimeoutTrafficKind::WebSocket => (
+            effective_config.websocket_idle_timeout_seconds,
+            request_timeouts.default_websocket_idle_timeout_seconds,
+        ),
+    };
+    let resolved = override_seconds
+        .and_then(|secs| u32::try_from(secs).ok())
+        .unwrap_or(default_seconds);
+    if resolved == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        request_timeouts.clamp_to_ceiling(resolved) as u64,
+    ))
+}
+
+#[cfg(test)]
+mod resolve_customer_io_timeout_tests {
+    use super::*;
+    use temps_core::RequestTimeoutSettings;
+    use temps_entities::deployment_config::DeploymentConfig;
+
+    #[test]
+    fn no_timeout_by_default_when_nothing_is_configured() {
+        // The platform default: an app with no project/environment override
+        // and no operator-configured global default gets an unbounded
+        // connection for every traffic kind, exactly as it did before this
+        // setting existed.
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings::default();
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            None
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_a_nonzero_global_default_per_kind_when_unconfigured() {
+        // Once an operator opts the platform into default timeouts, SSE must
+        // get its own idle-timeout class rather than silently falling
+        // through to the HTTP default (the RST-on-idle bug this feature
+        // fixes).
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 3600,
+            default_http_timeout_seconds: 60,
+            default_sse_idle_timeout_seconds: 3600,
+            default_websocket_idle_timeout_seconds: 1800,
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(1800))
+        );
+    }
+
+    #[test]
+    fn project_or_environment_override_wins_when_below_ceiling() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(10),
+            sse_idle_timeout_seconds: Some(120),
+            websocket_idle_timeout_seconds: Some(90),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings::default();
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn explicit_zero_override_forces_no_timeout_even_with_a_nonzero_global_default() {
+        // An operator can opt the whole platform into a default timeout, and
+        // a specific project can still opt back out with an explicit 0.
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            default_http_timeout_seconds: 60,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn global_hard_ceiling_always_wins_even_over_an_explicit_override() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(9000),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(120)),
+            "an operator-lowered ceiling must win even over a project's explicit override"
+        );
+    }
+
+    /// Same guarantee as above, but for the SSE and WebSocket arms — each
+    /// traffic kind reads a different `DeploymentConfig` field, so the ceiling
+    /// clamp needs to be proven for all three, not just HTTP.
+    #[test]
+    fn global_hard_ceiling_wins_over_an_explicit_override_for_sse_and_websocket() {
+        let config = DeploymentConfig {
+            sse_idle_timeout_seconds: Some(9000),
+            websocket_idle_timeout_seconds: Some(9000),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn global_hard_ceiling_also_clamps_a_nonzero_unconfigured_default() {
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 30,
+            default_websocket_idle_timeout_seconds: 9000,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn ceiling_has_no_effect_when_nothing_resolves_to_a_timeout() {
+        // The ceiling only constrains a timeout that's actually configured —
+        // it must never *create* one for traffic that has none.
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 30,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
     }
 }
 
@@ -2458,8 +2691,18 @@ mod upstream_io_timeout_tests {
     #[test]
     fn console_traffic_gets_the_extended_timeout() {
         let console = "10.0.0.5:8081";
-        let timeout = upstream_io_timeout(console, console, false, Duration::from_secs(60));
-        assert_eq!(timeout, Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS));
+        let timeout = upstream_io_timeout(console, console, false, Some(Duration::from_secs(60)));
+        assert_eq!(timeout, Some(Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)));
+    }
+
+    /// Console traffic must always get a concrete timeout even when customer
+    /// traffic elsewhere is resolving to "no timeout" — a `None` default
+    /// must never leak the unbounded state onto the control plane.
+    #[test]
+    fn console_traffic_gets_the_extended_timeout_even_when_default_is_none() {
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, false, None);
+        assert_eq!(timeout, Some(Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)));
     }
 
     /// The console timeout must actually cover the real worst case of the
@@ -2498,9 +2741,17 @@ mod upstream_io_timeout_tests {
             "10.0.0.9:9000",
             "10.0.0.5:8081",
             false,
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
         );
-        assert_eq!(timeout, Duration::from_secs(60));
+        assert_eq!(timeout, Some(Duration::from_secs(60)));
+    }
+
+    /// The whole point of the opt-in default: customer traffic resolving to
+    /// "no timeout" (`None`) must pass straight through unchanged.
+    #[test]
+    fn customer_app_traffic_with_no_timeout_configured_stays_unbounded() {
+        let timeout = upstream_io_timeout("10.0.0.9:9000", "10.0.0.5:8081", false, None);
+        assert_eq!(timeout, None);
     }
 
     #[test]
@@ -2511,8 +2762,8 @@ mod upstream_io_timeout_tests {
         // a value distinct from CONSOLE_IO_TIMEOUT_SECS so the assertion
         // can't pass by coincidence.
         let console = "10.0.0.5:8081";
-        let timeout = upstream_io_timeout(console, console, true, Duration::from_secs(7200));
-        assert_eq!(timeout, Duration::from_secs(7200));
+        let timeout = upstream_io_timeout(console, console, true, Some(Duration::from_secs(7200)));
+        assert_eq!(timeout, Some(Duration::from_secs(7200)));
     }
 
     #[test]
@@ -2520,8 +2771,9 @@ mod upstream_io_timeout_tests {
         // The trait's default console_address() is "" for resolvers that
         // don't override it (test mocks) — must never accidentally match a
         // peer address and grant an unintended extended timeout.
-        let timeout = upstream_io_timeout("10.0.0.9:9000", "", false, Duration::from_secs(60));
-        assert_eq!(timeout, Duration::from_secs(60));
+        let timeout =
+            upstream_io_timeout("10.0.0.9:9000", "", false, Some(Duration::from_secs(60)));
+        assert_eq!(timeout, Some(Duration::from_secs(60)));
     }
 }
 
@@ -4690,15 +4942,14 @@ impl ProxyHttp for LoadBalancer {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
-        let io_timeout = if is_websocket {
-            std::time::Duration::from_secs(3600)
-        } else {
-            std::time::Duration::from_secs(60)
-        };
 
         // Workspace preview gateway: skip the route table and forward straight
         // to the local gateway. The host header is preserved so the gateway
         // can decode `ws-<sid>-<port>` and pick the right sandbox container.
+        // This peer is an internal shared gateway, not customer app traffic,
+        // so it keeps the fixed WS/HTTP split rather than the configurable
+        // per-project/environment timeouts resolved below for the customer
+        // traffic path.
         //
         // Every preview target shares this same physical peer address, so
         // `group_key` MUST be set per-target — otherwise Pingora's
@@ -4707,12 +4958,17 @@ impl ProxyHttp for LoadBalancer {
         // serve a different sandbox's request (see `preview_peer_group_key`
         // doc comment for the full mechanism).
         if let Some(host) = &ctx.preview_route {
+            let preview_io_timeout = if is_websocket {
+                std::time::Duration::from_secs(3600)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
             let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
             peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-            peer.options.read_timeout = Some(io_timeout);
-            peer.options.write_timeout = Some(io_timeout);
-            peer.options.idle_timeout = Some(io_timeout);
+            peer.options.read_timeout = Some(preview_io_timeout);
+            peer.options.write_timeout = Some(preview_io_timeout);
+            peer.options.idle_timeout = Some(preview_io_timeout);
             ctx.upstream_host = Some(PREVIEW_GATEWAY_PEER.to_string());
             return Ok(peer);
         }
@@ -4734,33 +4990,71 @@ impl ProxyHttp for LoadBalancer {
 
         let mut peer = selection.peer;
 
-        // The 60s hot-path default (set above) is tuned for customer-app
-        // traffic — a slow customer endpoint shouldn't hang a proxy worker
-        // forever. It's the wrong bound for the console/control-plane API,
-        // which the browser reaches through this same proxy: long-running
-        // admin operations (e.g. POST /api/imports/execute, which
-        // synchronously builds, deploys, and health-checks the imported
-        // app) routinely take well over 60s for a real app. Without this,
-        // the request is RST'd out from under a handler that goes on to
-        // finish successfully server-side — the import completes, but the
-        // browser sees a 503 and the user has no way to know it worked.
+        // Resolve the effective per-request/idle timeout for customer app
+        // traffic: project config as the base layer, environment config
+        // overriding it (Environment > Project > Global — the same
+        // inheritance chain used elsewhere, e.g. for security config), then
+        // always clamped to the operator's global hard ceiling. SSE and
+        // WebSocket get their own idle-timeout class since they're
+        // long-lived by design; `ctx.is_sse`/`ctx.is_websocket` were already
+        // detected from request headers in `early_request_filter`.
+        let request_timeouts = self
+            .config_service
+            .get_settings()
+            .await
+            .map(|settings| settings.request_timeouts)
+            .unwrap_or_default();
+        let project_config = ctx
+            .project
+            .as_ref()
+            .and_then(|p| p.deployment_config.clone())
+            .unwrap_or_default();
+        let effective_config = ctx
+            .environment
+            .as_ref()
+            .map(|env| env.get_effective_deployment_config(&project_config))
+            .unwrap_or(project_config);
+        let traffic_kind = if ctx.is_websocket {
+            TimeoutTrafficKind::WebSocket
+        } else if ctx.is_sse {
+            TimeoutTrafficKind::Sse
+        } else {
+            TimeoutTrafficKind::Http
+        };
+        let customer_io_timeout =
+            resolve_customer_io_timeout(traffic_kind, &effective_config, &request_timeouts);
+
+        // The customer-traffic timeout above is tuned per project/environment
+        // — a slow customer endpoint shouldn't hang a proxy worker forever.
+        // It's the wrong bound for the console/control-plane API, which the
+        // browser reaches through this same proxy: long-running admin
+        // operations (e.g. POST /api/imports/execute, which synchronously
+        // builds, deploys, and health-checks the imported app) routinely
+        // take well over 60s for a real app. Without this, the request is
+        // RST'd out from under a handler that goes on to finish successfully
+        // server-side — the import completes, but the browser sees a 503
+        // and the user has no way to know it worked.
         let io_timeout = upstream_io_timeout(
             &peer.address().to_string(),
             self.upstream_resolver.console_address(),
             is_websocket,
-            io_timeout,
+            customer_io_timeout,
         );
 
-        // Configure upstream connection options. `io_timeout` is bumped to
-        // 1h for websocket upgrades (see top of this method) so idle terminals
-        // and SSE streams don't get RST every 60s, and to 10 minutes for
-        // console/control-plane traffic (see above).
+        // Configure upstream connection options. `io_timeout` is the
+        // project/environment-configured (or global-default) value for this
+        // traffic's class — HTTP/SSE/WebSocket — resolved above, bumped to
+        // `CONSOLE_IO_TIMEOUT_SECS` for console/control-plane traffic (see
+        // above). `None` means no timeout is configured for this traffic at
+        // all (the platform default) and flows straight through to Pingora,
+        // which leaves the connection unbounded — never converted to "the
+        // ceiling" or any other fallback duration.
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-        peer.options.read_timeout = Some(io_timeout);
-        peer.options.write_timeout = Some(io_timeout);
+        peer.options.read_timeout = io_timeout;
+        peer.options.write_timeout = io_timeout;
         // Close idle pooled connections after the same window to avoid stale
         // keep-alive reuse.
-        peer.options.idle_timeout = Some(io_timeout);
+        peer.options.idle_timeout = io_timeout;
 
         // Populate context with upstream information
         let addr = peer.address();

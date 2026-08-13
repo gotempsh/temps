@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 /// How long `deploy()` waits for every Compose service to report `running`
@@ -25,6 +26,13 @@ const COMPOSE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// Interval between `docker compose ps` polls while waiting for readiness.
 const COMPOSE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a single TCP connect attempt against a published port may take
+/// before `port_reachable` gives up and reports the port not yet listening.
+/// Short by design: this runs once per poll interval, not once total, so a
+/// slow/unreachable port degrades to "still pending" rather than stalling
+/// the whole readiness loop.
+const PORT_PROBE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Docker label Compose attaches to every network/volume/container it
 /// manages, set to the `-p <project_name>` value.
@@ -3075,7 +3083,40 @@ impl ComposeExecutor {
                 .compose_ps(project_dir, project_name, compose_file)
                 .await?;
             match Self::classify_readiness(&entries) {
-                ComposeReadiness::Ready => return Ok(()),
+                ComposeReadiness::Ready => {
+                    // `docker compose ps` reports a container "running" the
+                    // instant its process starts — for a service with no
+                    // `healthcheck:` block, that can be well before the app
+                    // inside has actually bound its published port. Trusting
+                    // that state as done meant `deploy_compose` returned
+                    // success while the app was still starting, and the
+                    // public-readiness gate in MarkDeploymentCompleteJob
+                    // (which runs immediately after) would race it and
+                    // revert a perfectly good deployment. Close that gap
+                    // here instead: for services without a healthcheck,
+                    // require their published TCP ports to actually accept
+                    // a connection before calling the stack ready.
+                    let unreachable = Self::unreachable_published_ports(&entries).await;
+                    if unreachable.is_empty() {
+                        return Ok(());
+                    }
+                    if start.elapsed() >= timeout {
+                        let container_logs = self
+                            .describe_unhealthy_containers(
+                                project_dir,
+                                project_name,
+                                compose_file,
+                                environment_vars,
+                            )
+                            .await;
+                        return Err(ComposeError::ServicesNotReady {
+                            project: project_name.to_string(),
+                            timeout_secs: timeout.as_secs(),
+                            reason: format!("{}{}", unreachable.join(", "), container_logs),
+                        });
+                    }
+                    tokio::time::sleep(COMPOSE_READY_POLL_INTERVAL).await;
+                }
                 ComposeReadiness::Failed(reasons) => {
                     let container_logs = self
                         .describe_unhealthy_containers(
@@ -3148,6 +3189,67 @@ impl ComposeExecutor {
         } else {
             ComposeReadiness::Ready
         }
+    }
+
+    /// For every `running` service that declares no Compose `healthcheck`,
+    /// verify at least one of its published TCP ports actually accepts a
+    /// connection. `docker compose ps` state alone can't tell "container
+    /// process started" from "app is listening" — a Node/Python/etc. app
+    /// commonly takes a few seconds after process start to bind its port,
+    /// and without this check that gap was invisible to the deploy job.
+    /// Services with no published ports (workers, internal-only sidecars)
+    /// have nothing to probe and are left as-is.
+    async fn unreachable_published_ports(entries: &[ComposePsEntry]) -> Vec<String> {
+        let mut reasons = Vec::new();
+        for entry in entries {
+            if !entry.health.is_empty() {
+                // Has a healthcheck — `classify_readiness` already required
+                // it to be "healthy" before we got here.
+                continue;
+            }
+            let tcp_ports: Vec<u16> = entry
+                .publishers
+                .iter()
+                .filter(|publisher| {
+                    publisher.published_port > 0
+                        && (publisher.protocol.is_empty() || publisher.protocol == "tcp")
+                })
+                .map(|publisher| publisher.published_port)
+                .collect();
+            if tcp_ports.is_empty() {
+                continue;
+            }
+            let mut any_reachable = false;
+            for port in &tcp_ports {
+                if Self::port_reachable(*port).await {
+                    any_reachable = true;
+                    break;
+                }
+            }
+            if !any_reachable {
+                reasons.push(format!(
+                    "service '{}' published port(s) {} not yet accepting connections",
+                    entry.service,
+                    tcp_ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        reasons
+    }
+
+    /// Best-effort TCP connect probe against a published host port.
+    async fn port_reachable(published_port: u16) -> bool {
+        tokio::time::timeout(
+            PORT_PROBE_CONNECT_TIMEOUT,
+            TcpStream::connect(("127.0.0.1", published_port)),
+        )
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
     }
 
     async fn discover_containers(
@@ -4014,6 +4116,63 @@ mod tests {
             ComposeExecutor::classify_readiness(&entries),
             ComposeReadiness::Ready
         );
+    }
+
+    fn entry_with_publisher(service: &str, published_port: u16) -> ComposePsEntry {
+        let mut e = entry(service, "running", "");
+        e.publishers.push(ComposePsPublisher {
+            published_port,
+            target_port: published_port,
+            protocol: "tcp".to_string(),
+        });
+        e
+    }
+
+    #[tokio::test]
+    async fn unreachable_published_ports_no_healthcheck_and_no_listener_is_unreachable() {
+        // Nothing is bound to this port, so the connect attempt must fail —
+        // reproducing a service whose process started but whose app hasn't
+        // opened its port yet.
+        let entries = [entry_with_publisher("web", 18291)];
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("web"));
+        assert!(reasons[0].contains("18291"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_published_ports_no_healthcheck_and_listening_is_reachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let entries = [entry_with_publisher("web", port)];
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        assert!(reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreachable_published_ports_with_healthcheck_is_skipped() {
+        // classify_readiness already required "healthy" for this service to
+        // reach the caller, so the port probe must not second-guess it even
+        // though nothing is listening on the (fake) published port here.
+        let mut e = entry("web", "running", "healthy");
+        e.publishers.push(ComposePsPublisher {
+            published_port: 18292,
+            target_port: 18292,
+            protocol: "tcp".to_string(),
+        });
+        let reasons = ComposeExecutor::unreachable_published_ports(&[e]).await;
+        assert!(reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreachable_published_ports_with_no_published_ports_is_skipped() {
+        // A worker/internal-only service has nothing to probe.
+        let entries = [entry("worker", "running", "")];
+        let reasons = ComposeExecutor::unreachable_published_ports(&entries).await;
+        assert!(reasons.is_empty());
     }
 
     #[test]

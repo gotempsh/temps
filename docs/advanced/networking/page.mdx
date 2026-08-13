@@ -64,3 +64,51 @@ are ever removed; user-created records are left intact.
 
 If the provider token cannot access the zone, Temps flags it on the managed
 domain (and in the preview) and skips the sync rather than failing silently.
+
+## Request Timeouts
+
+By default, the proxy applies **no timeout** to upstream app traffic —
+regular HTTP requests, Server-Sent Events streams, and WebSocket connections
+all stay open indefinitely (bounded only by TCP/OS-level limits). This is
+deliberate: request timeouts are **opt-in**, so upgrading Temps, or deploying
+an app with a slow endpoint or a long-lived connection, never breaks
+something that worked before.
+
+### Global defaults and the hard ceiling
+
+Open **Settings → Request Timeouts** to configure platform-wide defaults:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| Hard ceiling | 600s (10m) | The maximum any resolved timeout can be, once one is actually configured. Has no effect on traffic with no timeout at all. |
+| Regular HTTP | 0 (no timeout) | Applies to non-streaming requests when a project/environment hasn't set its own override. |
+| SSE idle | 0 (no timeout) | Applies to Server-Sent Events streams. Idle time only — an active stream is never cut off. |
+| WebSocket idle | 0 (no timeout) | Applies to WebSocket connections. Idle time only. |
+
+Setting any of the three defaults to a nonzero value opts the whole platform
+into that timeout for every app that hasn't set its own override. The hard
+ceiling always wins over whatever is resolved — globally or per
+project/environment — but it never *creates* a timeout for traffic that
+doesn't have one.
+
+### Per-project and per-environment overrides
+
+Under a project's **Environments → Environment settings**, the **Request
+Timeouts** section lets you override any of the three values for that
+specific environment:
+
+- Leave a field blank to inherit the project default, then the global
+  default (which is "no timeout" out of the box).
+- Enter `0` to explicitly force "no timeout" for that environment — useful
+  to opt one long-request app out even after an operator has configured a
+  nonzero global default.
+- Enter any other value to set an explicit timeout, always clamped to the
+  operator's global hard ceiling.
+
+The same three fields are available via the CLI:
+
+```bash
+bunx @temps-sdk/cli env timeouts <environment> --request 30 --sse-idle 900
+bunx @temps-sdk/cli env timeouts <environment> --request 0   # force no timeout
+bunx @temps-sdk/cli env timeouts <environment> --inherit      # clear all overrides
+```

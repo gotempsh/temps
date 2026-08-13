@@ -595,6 +595,36 @@ impl InternalApiCaller {
         self.index.catalog()
     }
 
+    /// Deterministic catalogue of read operations visible to `auth`.
+    ///
+    /// Unlike the model-facing root help, this includes every operation so a
+    /// resumable provider session can be invalidated when an operation is
+    /// added, removed, or changes its method/path/description contract.
+    pub fn cli_read_catalog(&self, auth: &AuthContext) -> String {
+        let mut ops: Vec<&ApiOperation> = self
+            .index
+            .operations()
+            .iter()
+            .filter(|op| self.permitted(op, auth))
+            .collect();
+        ops.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+
+        let mut out = String::with_capacity(ops.len() * 96);
+        for op in ops {
+            out.push_str(&op.operation_id);
+            out.push('\t');
+            out.push_str(&op.method);
+            out.push('\t');
+            out.push_str(&op.path);
+            out.push('\t');
+            if let Some(description) = op.summary.as_deref().or(op.description.as_deref()) {
+                out.push_str(description.trim());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// The `operation_id`s actually resolved into this caller's index — i.e. the
     /// allowlist entries that matched a real operation in the OpenAPI document.
     /// Useful for startup diagnostics: an allowlist entry that is NOT in this list

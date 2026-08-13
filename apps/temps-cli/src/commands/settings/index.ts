@@ -7,7 +7,7 @@ import {
 } from '../../api/sdk.gen.js'
 import type { AppSettings } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
+import { promptText, promptConfirm, promptSelect, promptNumber } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
 interface UpdateOptions {
@@ -20,6 +20,10 @@ interface UpdateOptions {
   rateLimitingEnabled?: string
   rateLimitingRpm?: string
   screenshotsEnabled?: string
+  maxRequestTimeout?: string
+  defaultHttpTimeout?: string
+  defaultSseIdleTimeout?: string
+  defaultWebsocketIdleTimeout?: string
   yes?: boolean
 }
 
@@ -39,6 +43,12 @@ interface SetPreviewDomainOptions {
 interface CurrentSettingsSnapshot {
   letsencrypt?: { email?: string | null; environment?: string } | null
   rate_limiting?: { max_requests_per_minute?: number } | null
+  request_timeouts?: {
+    max_request_timeout_seconds?: number
+    default_http_timeout_seconds?: number
+    default_sse_idle_timeout_seconds?: number
+    default_websocket_idle_timeout_seconds?: number
+  } | null
 }
 
 /**
@@ -77,6 +87,38 @@ export function buildAutomationSettingsUpdate(
     const enabled = options.screenshotsEnabled === 'true'
     updates.screenshots = {
       enabled,
+    }
+  }
+  if (
+    options.maxRequestTimeout ||
+    options.defaultHttpTimeout ||
+    options.defaultSseIdleTimeout ||
+    options.defaultWebsocketIdleTimeout
+  ) {
+    const current = currentSettings?.request_timeouts
+    const fields: Array<[string, string | undefined, number]> = [
+      ['--max-request-timeout', options.maxRequestTimeout, current?.max_request_timeout_seconds ?? 600],
+      ['--default-http-timeout', options.defaultHttpTimeout, current?.default_http_timeout_seconds ?? 0],
+      ['--default-sse-idle-timeout', options.defaultSseIdleTimeout, current?.default_sse_idle_timeout_seconds ?? 0],
+      ['--default-websocket-idle-timeout', options.defaultWebsocketIdleTimeout, current?.default_websocket_idle_timeout_seconds ?? 0],
+    ]
+    const parsed: number[] = []
+    for (const [flag, raw, fallback] of fields) {
+      if (raw === undefined) {
+        parsed.push(fallback)
+        continue
+      }
+      const value = parseInt(raw, 10)
+      if (Number.isNaN(value)) {
+        return { error: `${flag} must be a number, got "${raw}"` }
+      }
+      parsed.push(value)
+    }
+    updates.request_timeouts = {
+      max_request_timeout_seconds: parsed[0],
+      default_http_timeout_seconds: parsed[1],
+      default_sse_idle_timeout_seconds: parsed[2],
+      default_websocket_idle_timeout_seconds: parsed[3],
     }
   }
 
@@ -125,6 +167,10 @@ export function registerSettingsCommands(program: Command): void {
     .option('--rate-limiting-enabled <enabled>', 'Enable rate limiting (true/false)')
     .option('--rate-limiting-rpm <rpm>', 'Requests per minute')
     .option('--screenshots-enabled <enabled>', 'Enable screenshots (true/false)')
+    .option('--max-request-timeout <seconds>', 'Hard ceiling for all upstream request/idle timeouts, in seconds')
+    .option('--default-http-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
+    .option('--default-sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
+    .option('--default-websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(updateSettingsAction)
 
@@ -257,6 +303,10 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
     options.letsencryptMode ||
     options.rateLimitingEnabled ||
     options.screenshotsEnabled ||
+    options.maxRequestTimeout ||
+    options.defaultHttpTimeout ||
+    options.defaultSseIdleTimeout ||
+    options.defaultWebsocketIdleTimeout ||
     (options.setting && options.value)
   )
 
@@ -278,6 +328,7 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
         { name: 'Rate Limiting', value: 'rate_limiting' },
         { name: 'Security Headers', value: 'security_headers' },
         { name: 'Screenshots', value: 'screenshots' },
+        { name: 'Request Timeouts', value: 'request_timeouts' },
       ],
     })
 
@@ -375,13 +426,53 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
         }
         break
       }
+
+      case 'request_timeouts': {
+        info('0 means no timeout. Timeouts are opt-in — existing apps are unaffected until you set a nonzero default here.')
+        info('The hard ceiling only applies once a timeout is actually configured; it never creates one on its own.')
+        newline()
+
+        const maxRequestTimeout = await promptNumber(
+          'Hard ceiling for all request/idle timeouts (seconds)',
+          { default: currentSettings?.request_timeouts?.max_request_timeout_seconds ?? 600, min: 5 }
+        )
+        const defaultHttpTimeout = await promptNumber(
+          'Default timeout for regular HTTP requests (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_http_timeout_seconds ?? 0, min: 0 }
+        )
+        const defaultSseIdleTimeout = await promptNumber(
+          'Default idle timeout for SSE streams (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_sse_idle_timeout_seconds ?? 0, min: 0 }
+        )
+        const defaultWebsocketIdleTimeout = await promptNumber(
+          'Default idle timeout for WebSocket connections (seconds, 0 = no timeout)',
+          { default: currentSettings?.request_timeouts?.default_websocket_idle_timeout_seconds ?? 0, min: 0 }
+        )
+
+        updates.request_timeouts = {
+          max_request_timeout_seconds: maxRequestTimeout,
+          default_http_timeout_seconds: defaultHttpTimeout,
+          default_sse_idle_timeout_seconds: defaultSseIdleTimeout,
+          default_websocket_idle_timeout_seconds: defaultWebsocketIdleTimeout,
+        }
+        break
+      }
     }
   }
 
   await withSpinner('Updating settings...', async () => {
+    // The server's PUT /settings deserializes the whole body straight into
+    // `AppSettings`, whose fields are `#[serde(default)]` — so any field
+    // omitted from this request is indistinguishable from "explicitly reset
+    // to default" and gets wiped server-side (masked/sensitive fields like
+    // credentials are the only ones the server restores automatically).
+    // Sending only `updates` would silently reset every untouched setting
+    // (rate limiting, security headers, request timeouts, monitoring, etc.)
+    // back to its Rust default. Merge onto the settings already fetched
+    // above so a change to one setting can never clobber another.
     const { error } = await updateSettings({
       client,
-      body: updates as AppSettings,
+      body: { ...currentSettings, ...updates } as AppSettings,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -396,11 +487,16 @@ async function setExternalUrl(options: SetExternalUrlOptions): Promise<void> {
   await setupClient()
 
   await withSpinner('Updating external URL...', async () => {
+    // See the comment in updateSettingsAction: PUT /settings replaces every
+    // field not present in the body with its default, so this must send the
+    // full current settings with only external_url changed.
+    const { data: currentSettings, error: getError } = await getSettings({ client })
+    if (getError) {
+      throw new Error(getErrorMessage(getError))
+    }
     const { error } = await updateSettings({
       client,
-      body: {
-        external_url: options.url,
-      } as AppSettings,
+      body: { ...currentSettings, external_url: options.url } as AppSettings,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -415,11 +511,16 @@ async function setPreviewDomain(options: SetPreviewDomainOptions): Promise<void>
   await setupClient()
 
   await withSpinner('Updating preview domain...', async () => {
+    // See the comment in updateSettingsAction: PUT /settings replaces every
+    // field not present in the body with its default, so this must send the
+    // full current settings with only preview_domain changed.
+    const { data: currentSettings, error: getError } = await getSettings({ client })
+    if (getError) {
+      throw new Error(getErrorMessage(getError))
+    }
     const { error } = await updateSettings({
       client,
-      body: {
-        preview_domain: options.domain,
-      } as AppSettings,
+      body: { ...currentSettings, preview_domain: options.domain } as AppSettings,
     })
     if (error) {
       throw new Error(getErrorMessage(error))

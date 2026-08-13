@@ -1,10 +1,18 @@
 import {
   createConversation,
   findConversation,
+  getAiProviderStatus,
   getConversation,
   getProject,
+  listPendingActions,
+  refreshAiProviderStatus,
+  type PendingActionResponse,
   updateProjectSettings,
 } from '@/api/client'
+import {
+  PermissionCard,
+  type PermissionRequest,
+} from '@/components/ai/PermissionCard'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -17,16 +25,29 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   Check,
+  Bot,
+  Brain,
   ChevronDown,
   ChevronRight,
+  Info,
+  Lock,
   Loader2,
   Paperclip,
+  RefreshCw,
   Send,
   ShieldCheck,
+  Shield,
   Sparkles,
   Square,
   Wrench,
@@ -38,12 +59,37 @@ import {
 } from '@/components/markdown/untrusted'
 import { CopyButton } from '@/components/ui/copy-button'
 import { cn } from '@/lib/utils'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react'
 import { toast } from 'sonner'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { useAiAssistant } from './AiAssistantContext'
+import {
+  chatProviderLabel,
+  reconcileChatRuntimeAfterRefresh,
+  resolveChatRuntimeSelection,
+  type ChatProviderOption,
+  type ChatRuntimeSelection,
+} from './chat-runtime-options'
+import {
+  chatComposerSubmitAction,
+  isChatComposerDisabled,
+  resolveChatComposerLayout,
+} from './chat-page-state'
+import {
+  assistantParts,
+  unrepresentedPendingActions,
+  type ChatMessage,
+  type ChatPart,
+  type ToolCall,
+} from './chat-message-parts'
 // highlight.js token theme for fenced code blocks. github-dark reads well on the
 // dark code surface used in both light and dark app themes.
 import 'highlight.js/styles/github-dark.css'
@@ -85,38 +131,6 @@ function remarkSoftBreaks() {
 }
 
 /** A tool invocation surfaced over the stream / persisted on the message. */
-interface ToolCall {
-  id: string
-  name: string
-  arguments: string
-  /** undefined while running (live), a string once done; null only from the API. */
-  result?: string | null
-}
-
-/**
- * One ordered segment of an assistant turn — a chunk of prose or a tool
- * invocation — so tools render inline where they occurred instead of all
- * hoisted above the text. Built in arrival order from the live event stream, and
- * replayed from `metadata.parts` on reload (so live and reload look identical).
- */
-type ChatPart =
-  | { type: 'text'; text: string }
-  | { type: 'tool'; tool: ToolCall }
-
-/**
- * Local chat message shape. Mirrors the SDK's MessageResponse. Assistant turns
- * carry ordered `parts` (text/tool segments); `tools` is kept for backward
- * compatibility with turns persisted before parts were tracked.
- */
-interface ChatMessage {
-  role: string
-  content: string
-  created_at?: string
-  tools?: ToolCall[]
-  parts?: ChatPart[]
-}
-
-
 /**
  * Per-message copy affordance.
  *
@@ -137,16 +151,214 @@ function MessageCopyButton({ text }: { text: string }) {
   )
 }
 
-/** Render segments for an assistant message, falling back for legacy turns that
- *  predate ordered `parts` (tools first, then the prose). */
-function assistantParts(m: ChatMessage): ChatPart[] {
-  if (m.parts && m.parts.length > 0) return m.parts
-  const parts: ChatPart[] = []
-  for (const tool of m.tools ?? []) parts.push({ type: 'tool', tool })
-  if (m.content) parts.push({ type: 'text', text: m.content })
-  return parts
+/**
+ * Maps a `getConversation` response into the panel's `ChatMessage[]` state,
+ * including a still-unresolved permission request (ADR-038 Phase 2) as a live,
+ * answerable card rather than the inert "asked" text alone — used both on
+ * initial load and by `pollForReply`'s fallback refetch.
+ */
+function mapConversationDetail(detail: {
+  messages?: Array<{
+    role: string
+    content: string
+    created_at?: string
+    tools?: ChatMessage['tools'] | null
+    parts?: ChatPart[] | null
+  }> | null
+  pending_permission?: PermissionRequest | null
+}): ChatMessage[] {
+  const mapped: ChatMessage[] = (detail.messages ?? []).map((m) => {
+    const rawParts = m.parts
+    return {
+      role: m.role,
+      content: m.content,
+      created_at: m.created_at,
+      tools: m.tools ?? undefined,
+      parts: rawParts && rawParts.length > 0 ? rawParts : undefined,
+    }
+  })
+  const pendingPermission = detail.pending_permission
+  if (pendingPermission) {
+    const last = mapped[mapped.length - 1]
+    const permissionPart: ChatPart = {
+      type: 'permission',
+      permission: pendingPermission,
+    }
+    if (last?.role === 'assistant') {
+      last.parts = [...(last.parts ?? []), permissionPart]
+    } else {
+      mapped.push({
+        role: 'assistant',
+        content: '',
+        created_at: new Date().toISOString(),
+        parts: [permissionPart],
+      })
+    }
+  }
+  return mapped
 }
 
+/**
+ * Pop the trailing optimistic assistant turn if it never received anything.
+ * Checking `content` alone isn't enough: a pending permission card lives in
+ * `parts`, not `content` — dropping the turn on a dead connection would
+ * silently discard a still-answerable question with no way to resolve it
+ * (ADR-038 Phase 2).
+ */
+type SetMessages = React.Dispatch<React.SetStateAction<ChatMessage[]>>
+type SetError = React.Dispatch<React.SetStateAction<string | null>>
+
+function dropEmptyAssistantTurn(setMessages: SetMessages) {
+  setMessages((m) => {
+    const last = m[m.length - 1]
+    return last?.role === 'assistant' &&
+      last.content === '' &&
+      !(last.parts && last.parts.length > 0)
+      ? m.slice(0, -1)
+      : m
+  })
+}
+
+/**
+ * Apply one wire event (SSE frame or WebSocket frame — both carry the same
+ * `(eventName, data)` shape, tee'd from the same point server-side) to the
+ * trailing assistant turn. Shared by the sending tab's own fetch-reader loop
+ * and the cross-tab `useConversationStream` WS listener, so token/tool/
+ * permission rendering can never drift between "I sent this" and "I'm
+ * watching this."
+ */
+function applyWireEvent(
+  eventName: string,
+  data: string,
+  setMessages: SetMessages,
+  setError: SetError
+) {
+  if (eventName === 'error') {
+    if (data) setError(data)
+    dropEmptyAssistantTurn(setMessages)
+    return
+  }
+  if (eventName === 'tool_call') {
+    try {
+      const t = JSON.parse(data) as {
+        id: string
+        name: string
+        arguments: string
+      }
+      setMessages((m) => {
+        const copy = [...m]
+        const last = copy[copy.length - 1]
+        if (last?.role === 'assistant') {
+          const tool: ToolCall = {
+            id: t.id,
+            name: t.name,
+            arguments: t.arguments,
+            result: undefined,
+          }
+          copy[copy.length - 1] = {
+            ...last,
+            tools: [...(last.tools ?? []), tool],
+            parts: [...(last.parts ?? []), { type: 'tool', tool }],
+          }
+        }
+        return copy
+      })
+    } catch {
+      /* ignore malformed tool_call frame */
+    }
+    return
+  }
+  if (eventName === 'tool_result') {
+    try {
+      const t = JSON.parse(data) as {
+        id: string
+        name: string
+        content: string
+      }
+      setMessages((m) => {
+        const copy = [...m]
+        const last = copy[copy.length - 1]
+        if (last?.role === 'assistant') {
+          copy[copy.length - 1] = {
+            ...last,
+            tools: (last.tools ?? []).map((tool) =>
+              tool.id === t.id ? { ...tool, result: t.content } : tool
+            ),
+            parts: (last.parts ?? []).map((part) =>
+              part.type === 'tool' && part.tool.id === t.id
+                ? { type: 'tool', tool: { ...part.tool, result: t.content } }
+                : part
+            ),
+          }
+        }
+        return copy
+      })
+    } catch {
+      /* ignore malformed tool_result frame */
+    }
+    return
+  }
+  // ADR-038 Phase 2: interactive bridge permission request
+  if (eventName === 'permission_requested') {
+    try {
+      const p = JSON.parse(data) as {
+        id: string
+        kind: string
+        tool_name: string
+        input: unknown
+      }
+      const perm: PermissionRequest = {
+        id: p.id,
+        kind: p.kind as PermissionRequest['kind'],
+        tool_name: p.tool_name,
+        input: p.input,
+      }
+      setMessages((m) => {
+        const copy = [...m]
+        const last = copy[copy.length - 1]
+        if (last?.role === 'assistant') {
+          copy[copy.length - 1] = {
+            ...last,
+            parts: [
+              ...(last.parts ?? []),
+              { type: 'permission', permission: perm },
+            ],
+          }
+        }
+        return copy
+      })
+    } catch {
+      /* ignore malformed permission_requested frame */
+    }
+    return
+  }
+  // Plain token text (unnamed SSE frame).
+  if (data) {
+    setMessages((m) => {
+      const copy = [...m]
+      const last = copy[copy.length - 1]
+      // Append to the trailing text part, or open a new one (so prose that
+      // follows a tool call becomes its own segment).
+      const prevParts = last?.parts ?? []
+      const lastPart = prevParts[prevParts.length - 1]
+      const parts: ChatPart[] =
+        lastPart?.type === 'text'
+          ? [
+              ...prevParts.slice(0, -1),
+              { type: 'text', text: lastPart.text + data },
+            ]
+          : [...prevParts, { type: 'text', text: data }]
+      copy[copy.length - 1] = {
+        ...last,
+        role: 'assistant',
+        content: (last?.content ?? '') + data,
+        parts,
+        created_at: last?.created_at ?? new Date().toISOString(),
+      }
+      return copy
+    })
+  }
+}
 
 /**
  * The plain text a "copy" on this message should yield.
@@ -211,7 +423,9 @@ function ToolBlock({ value }: { value: string }) {
       )}
     >
       <ReactMarkdown
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        rehypePlugins={[
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+        ]}
         components={markdownComponents}
       >
         {`\`\`\`json\n${json}\n\`\`\``}
@@ -318,7 +532,10 @@ function buildFixMessage(
 }
 
 const ACTION_STATUS: Record<string, { label: string; cls: string }> = {
-  proposed: { label: 'Awaiting your confirmation', cls: 'text-amber-600 dark:text-amber-400' },
+  proposed: {
+    label: 'Awaiting your confirmation',
+    cls: 'text-amber-600 dark:text-amber-400',
+  },
   executing: { label: 'Running…', cls: 'text-muted-foreground' },
   executed: { label: 'Executed', cls: 'text-green-600 dark:text-green-400' },
   failed: { label: 'Failed', cls: 'text-destructive' },
@@ -431,7 +648,9 @@ function PendingActionCard({
           {proposal.summary && (
             <div className="text-muted-foreground">{proposal.summary}</div>
           )}
-          <div className={cn('text-[11px] font-medium', st.cls)}>{st.label}</div>
+          <div className={cn('text-[11px] font-medium', st.cls)}>
+            {st.label}
+          </div>
         </div>
       </div>
       {params && params !== '{}' && (
@@ -502,7 +721,12 @@ function PendingActionCard({
               className="mt-1 h-7 gap-1 px-2 text-xs"
               onClick={() =>
                 onFix(
-                  buildFixMessage(proposal.operation, proposal.method, params, error)
+                  buildFixMessage(
+                    proposal.operation,
+                    proposal.method,
+                    params,
+                    error
+                  )
                 )
               }
             >
@@ -636,7 +860,8 @@ function PlanActionCard({
   let actionableIdx = -1
   for (let i = 0; i < plan.steps.length; i++) {
     if (statuses[i] === 'proposed') {
-      if (statuses.slice(0, i).every((st) => st === 'executed')) actionableIdx = i
+      if (statuses.slice(0, i).every((st) => st === 'executed'))
+        actionableIdx = i
       break
     }
   }
@@ -660,7 +885,10 @@ function PlanActionCard({
             typeof d?.status === 'string'
               ? d.status
               : (prev[actionId]?.status ?? 'proposed'),
-          result: d?.result != null ? JSON.stringify(d.result) : prev[actionId]?.result,
+          result:
+            d?.result != null
+              ? JSON.stringify(d.result)
+              : prev[actionId]?.result,
           error: !r.ok
             ? ((d as { detail?: string } | null)?.detail ??
               `Could not ${kind} this step.`)
@@ -807,7 +1035,12 @@ function PlanActionCard({
                     className="h-7 gap-1 px-2 text-xs"
                     onClick={() =>
                       onFix(
-                        buildFixMessage(s.operation, s.method, stt.params ?? null, stt.error ?? null)
+                        buildFixMessage(
+                          s.operation,
+                          s.method,
+                          stt.params ?? null,
+                          stt.error ?? null
+                        )
                       )
                     }
                   >
@@ -835,20 +1068,14 @@ function WriteProposalCard({
   onFix?: (text: string) => void
 }) {
   const plan = parsePlanProposal(tool.result)
-  if (plan) return <PlanActionCard projectId={projectId} plan={plan} onFix={onFix} />
+  if (plan)
+    return <PlanActionCard projectId={projectId} plan={plan} onFix={onFix} />
   return <PendingActionCard projectId={projectId} tool={tool} onFix={onFix} />
 }
 
-/**
- * A slim, in-chat affordance to turn on AI *write actions* for this project —
- * shown only while they're off. Enabling is a deliberate, security-sensitive
- * step (it lets the AI PROPOSE mutations), so it goes through a confirmation
- * dialog rather than a bare toggle; every proposed action is still individually
- * confirm-gated at execution time. This removes the trip to Settings without
- * cheapening the opt-in.
- */
+/** A visible, reversible project-level control for Temps write proposals. */
 function WriteActionsEnabler({ projectId }: { projectId: number }) {
-  // null = still loading / unknown; true = on (render nothing); false = off.
+  // null = still loading / unknown.
   const [enabled, setEnabled] = useState<boolean | null>(null)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -869,56 +1096,100 @@ function WriteActionsEnabler({ projectId }: { projectId: number }) {
     }
   }, [projectId])
 
-  const enable = async () => {
+  const update = async (nextEnabled: boolean) => {
     setBusy(true)
     try {
       const { error } = await updateProjectSettings({
         path: { project_id: projectId },
-        // Enable the read-only chat too, so a project never ends up with write
-        // actions on but the chat itself off (the chat is where you propose and
-        // confirm those writes).
-        body: { ai_write_actions_enabled: true, ai_debug_chat_enabled: true },
+        // Enabling writes also enables chat, because chat is where proposals
+        // are reviewed. Disabling writes must not unexpectedly disable chat.
+        body: {
+          ai_write_actions_enabled: nextEnabled,
+          ...(nextEnabled ? { ai_debug_chat_enabled: true } : {}),
+        },
       })
       if (error) throw error
-      setEnabled(true)
+      setEnabled(nextEnabled)
       setConfirmOpen(false)
-      toast.success('AI write actions enabled for this project')
+      toast.success(
+        nextEnabled
+          ? 'AI write proposals enabled for this project'
+          : 'AI write proposals disabled for this project'
+      )
     } catch {
       toast.error(
-        "Couldn't enable write actions — you may need project admin permission."
+        `Couldn't ${nextEnabled ? 'enable' : 'disable'} write proposals — you may need project admin permission.`
       )
     } finally {
       setBusy(false)
     }
   }
 
-  // Hidden while loading, unknown, or already enabled.
-  if (enabled !== false) return null
+  if (enabled === null) {
+    return (
+      <Skeleton
+        className="h-8 w-48 rounded-md"
+        aria-label="Loading AI write status"
+      />
+    )
+  }
 
   return (
     <>
       <button
         type="button"
         onClick={() => setConfirmOpen(true)}
-        className="flex w-full items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-left text-xs text-amber-700 transition-colors hover:bg-amber-500/10 dark:text-amber-400"
+        className={cn(
+          'flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
+          enabled
+            ? 'border-green-500/30 bg-green-500/5 text-green-700 hover:bg-green-500/10 dark:text-green-400'
+            : 'border-amber-500/30 bg-amber-500/5 text-amber-700 hover:bg-amber-500/10 dark:text-amber-400'
+        )}
       >
-        <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+        {enabled ? (
+          <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+        ) : (
+          <Shield className="h-3.5 w-3.5 shrink-0" />
+        )}
         <span className="min-w-0 flex-1">
-          Read-only. <span className="font-medium">Enable write actions</span> to
-          let the AI propose changes.
+          {enabled ? (
+            <>
+              <span className="font-medium">Write proposals enabled.</span>{' '}
+              Every action still requires confirmation.
+            </>
+          ) : (
+            <>
+              Read-only.{' '}
+              <span className="font-medium">Enable write proposals</span> to let
+              the AI suggest changes.
+            </>
+          )}
         </span>
       </button>
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Enable AI write actions?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {enabled
+                ? 'Disable AI write proposals?'
+                : 'Enable AI write proposals?'}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This lets the assistant <strong>propose</strong> changes to this
-              project — redeploys, restarts, environment variables, domains.
-              Nothing runs automatically: every proposed action waits for you to
-              review and <strong>Confirm</strong> it here in the chat, and runs
-              with your own permissions. You can turn this off anytime in
-              Settings → Security.
+              {enabled ? (
+                <>
+                  The assistant will return to read-only access and cannot stage
+                  new changes. Existing proposals remain available for you to
+                  confirm or reject.
+                </>
+              ) : (
+                <>
+                  This lets the assistant <strong>propose</strong> changes to
+                  this project — redeploys, restarts, environment variables,
+                  domains. Nothing runs automatically: every proposal waits for
+                  you to review and <strong>Confirm</strong> it here in chat,
+                  and runs with your own permissions.
+                </>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -926,17 +1197,81 @@ function WriteActionsEnabler({ projectId }: { projectId: number }) {
             <AlertDialogAction
               onClick={(e) => {
                 e.preventDefault()
-                void enable()
+                void update(!enabled)
               }}
               disabled={busy}
             >
               {busy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
-              Enable write actions
+              {enabled ? 'Disable write proposals' : 'Enable write proposals'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </>
+  )
+}
+
+/**
+ * ADR-038 Phase 1/2: a persistent notice about the interactive-tools state.
+ *
+ * - `null` / missing / unknown: render nothing (unconfirmed guess is worse)
+ * - `supports_interactive_tools === false` AND `interactive_bridge_status`
+ *   is `null` / absent: original Phase 1 notice — conversational mode, no
+ *   bridge opted in.
+ * - `interactive_bridge_status === 'unavailable'`: amber notice — bridge
+ *   opted in but CLI not authenticated right now (falling back).
+ * - `interactive_bridge_status === 'healthy'`: bridge is live, hide the
+ *   notice entirely — `PermissionCard`s will render in-line as they arrive.
+ */
+function InteractiveToolsNotice({ provider }: { provider: string }) {
+  // null = still loading / unknown.
+  const [supported, setSupported] = useState<boolean | null>(null)
+  // `interactive_bridge_status` from the extended provider status response.
+  // Not in the generated types yet, so we read it defensively.
+  const [bridgeStatus, setBridgeStatus] = useState<string | null | undefined>(
+    undefined
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    getAiProviderStatus()
+      .then(({ data }) => {
+        if (!cancelled && data) {
+          setSupported(data.supports_interactive_tools)
+          // Read defensively: field is present on the backend but the
+          // generated client type hasn't been updated yet.
+          const extended = data as typeof data & {
+            interactive_bridge_status?: string | null
+          }
+          setBridgeStatus(extended.interactive_bridge_status ?? null)
+        }
+      })
+      .catch(() => {
+        /* leave unknown — just don't show the notice */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Still loading.
+  if (supported === null && bridgeStatus === undefined) return null
+
+  // Gateway conversations use native provider APIs and do not depend on the
+  // instance-level host CLI preference reported by this endpoint.
+  if (provider === 'gateway' || provider.startsWith('gateway_key:')) return null
+
+  if (bridgeStatus === 'healthy') return null
+
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+      <Info className="h-3.5 w-3.5 shrink-0 translate-y-px" />
+      <span className="min-w-0 flex-1">
+        {bridgeStatus === 'unavailable'
+          ? 'This host CLI is selected but is not authenticated right now. Restore its host login, then reload this chat.'
+          : 'This CLI uses its provider-native permission mode. Inline Temps approval cards are available only when that CLI exposes an interactive permission bridge.'}
+      </span>
+    </div>
   )
 }
 
@@ -962,6 +1297,22 @@ interface DebugChatPanelProps {
   emptyHint?: string
   /** Notifies the parent of the active conversation's public id (for reset). */
   onConversationChange?: (publicId: string | null) => void
+}
+
+function providerDisplayName(provider: string): string {
+  if (provider.startsWith('gateway_key:')) return 'AI Gateway'
+  switch (provider) {
+    case 'gateway':
+      return 'AI Gateway'
+    case 'claude_cli':
+      return 'Claude Code'
+    case 'codex_cli':
+      return 'Codex'
+    case 'opencode':
+      return 'OpenCode'
+    default:
+      return provider
+  }
 }
 
 const proseClasses =
@@ -1000,7 +1351,9 @@ function MarkdownText({ text }: { text: string }) {
         remarkPlugins={[remarkGfm, remarkSoftBreaks]}
         // `detect` so unlabeled ``` fences (common in LLM output) still get
         // highlighted; `ignoreMissing` avoids throwing on an unknown language hint.
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        rehypePlugins={[
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+        ]}
         components={markdownComponents}
       >
         {text}
@@ -1010,21 +1363,25 @@ function MarkdownText({ text }: { text: string }) {
 }
 
 /**
- * The body of an assistant turn: its ordered text/tool segments, so a tool card
- * shows exactly where the model invoked it rather than hoisted above the prose.
- * Shows the typing indicator only while a trailing turn is streaming with nothing
- * rendered yet (no tools, no text) — never an empty turn left by a failed send.
+ * The body of an assistant turn: its ordered text/tool/permission segments, so
+ * cards render inline where they occurred instead of all hoisted above the
+ * prose. Shows the typing indicator only while a trailing turn is streaming
+ * with nothing rendered yet.
  */
 function AssistantBody({
   message,
   streaming,
   projectId,
+  conversationPublicId,
   onFix,
+  onPermissionResolved,
 }: {
   message: ChatMessage
   streaming: boolean
   projectId: number
+  conversationPublicId: string | null
   onFix?: (text: string) => void
+  onPermissionResolved?: () => void
 }) {
   const parts = assistantParts(message)
   if (parts.length === 0) {
@@ -1046,12 +1403,154 @@ function AssistantBody({
           ) : (
             <ToolCard key={part.tool.id} tool={part.tool} />
           )
+        ) : part.type === 'permission' ? (
+          // ADR-038 Phase 2: interactive bridge permission request
+          <PermissionCard
+            key={`perm-${part.permission.id}`}
+            projectId={projectId}
+            conversationPublicId={conversationPublicId ?? ''}
+            permission={part.permission}
+            onResolved={onPermissionResolved}
+          />
         ) : (
           <MarkdownText key={`text-${idx}`} text={part.text} />
         )
       )}
     </>
   )
+}
+
+/** Backoff schedule for WS reconnects — bounded, no thundering herd. */
+const WS_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 15000]
+
+/**
+ * Keeps a `GET .../conversations/{publicId}/stream` WebSocket open for the
+ * panel's full lifetime (not just during an active send, unlike the fetch
+ * reader in `send()`), so a second tab/device watching the same conversation
+ * sees tokens, tool activity, and permission requests live instead of only on
+ * reload.
+ *
+ * `suppressRef` is a counter, not a boolean: the tab that is itself sending a
+ * message or resolving a permission must ignore its own broadcast echo (it
+ * already has that data from its own request), but those two actions can
+ * overlap so a simple flag would race. Once `suppressRef.current` returns to
+ * 0 this tab is back to being a normal observer.
+ */
+function useConversationStream(
+  projectId: number,
+  publicId: string | null,
+  suppressRef: { current: number },
+  setMessages: SetMessages,
+  setError: SetError,
+  setWsTurnActive: React.Dispatch<React.SetStateAction<boolean>>
+) {
+  useEffect(() => {
+    if (!publicId) return
+    let cancelled = false
+    let ws: WebSocket | null = null
+    let attempt = 0
+    // True once this effect instance has completed at least one connection —
+    // distinguishes the initial connect (history was already loaded by the
+    // panel's own init fetch, no need to resync) from a later reconnect
+    // (missed whatever happened while disconnected, including possibly a
+    // `turn_complete` — resync and clear any stuck "thinking" state rather
+    // than trust stale local state).
+    let hasConnectedBefore = false
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+    const resync = () => {
+      getConversation({ path: { project_id: projectId, public_id: publicId } })
+        .then(({ data }) => {
+          if (!cancelled && data) setMessages(mapConversationDetail(data))
+        })
+        .catch(() => {
+          /* best-effort resync — the next event or a manual reload recovers */
+        })
+    }
+
+    const connect = () => {
+      if (cancelled) return
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const socket = new WebSocket(
+        `${wsProtocol}//${window.location.host}/api/projects/${projectId}/ai/conversations/${publicId}/stream`
+      )
+      ws = socket
+      socket.onopen = () => {
+        attempt = 0
+        if (hasConnectedBefore) {
+          setWsTurnActive(false)
+          resync()
+        }
+        hasConnectedBefore = true
+      }
+      socket.onmessage = (ev) => {
+        if (suppressRef.current > 0) return
+        let frame: { event?: string; data?: string }
+        try {
+          frame = JSON.parse(ev.data as string) as {
+            event?: string
+            data?: string
+          }
+        } catch {
+          return
+        }
+        const eventName = frame.event ?? ''
+        const data = frame.data ?? ''
+        if (eventName === 'resync_required') {
+          setWsTurnActive(false)
+          resync()
+          return
+        }
+        if (eventName === 'turn_complete') {
+          setWsTurnActive(false)
+          return
+        }
+        if (eventName === 'error') {
+          setWsTurnActive(false)
+          applyWireEvent(eventName, data, setMessages, setError)
+          return
+        }
+        if (eventName === 'user_message') {
+          setWsTurnActive(true)
+          try {
+            const u = JSON.parse(data) as {
+              content: string
+              created_at?: string
+            }
+            const now = u.created_at ?? new Date().toISOString()
+            setMessages((m) => [
+              ...m,
+              { role: 'user', content: u.content, created_at: now },
+              { role: 'assistant', content: '', created_at: now },
+            ])
+          } catch {
+            /* ignore malformed user_message frame */
+          }
+          return
+        }
+        applyWireEvent(eventName, data, setMessages, setError)
+      }
+      socket.onclose = () => {
+        if (cancelled) return
+        const delay =
+          WS_RECONNECT_DELAYS_MS[
+            Math.min(attempt, WS_RECONNECT_DELAYS_MS.length - 1)
+          ]
+        attempt += 1
+        reconnectTimer = setTimeout(connect, delay)
+      }
+      socket.onerror = () => {
+        socket.close()
+      }
+    }
+
+    connect()
+    return () => {
+      cancelled = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      ws?.close()
+    }
+  }, [projectId, publicId, suppressRef, setMessages, setError, setWsTurnActive])
 }
 
 /**
@@ -1082,7 +1581,33 @@ export function DebugChatPanel({
   const { pageContext } = useAiAssistant()
   const [includeContext, setIncludeContext] = useState(true)
   const [publicId, setPublicId] = useState<string | null>(null)
+  const providerPinnedRef = useRef(false)
+  const [providerOptions, setProviderOptions] = useState<ChatProviderOption[]>(
+    []
+  )
+  const [providerStatusState, setProviderStatusState] = useState<
+    'loading' | 'success' | 'error'
+  >('loading')
+  const [providerRefreshing, setProviderRefreshing] = useState(false)
+  const [runtimeSelection, setRuntimeSelection] =
+    useState<ChatRuntimeSelection>({
+      providerId: 'gateway',
+      modelId: null,
+      thinkingOptionId: null,
+      permissionModeId: null,
+    })
+  const selectedProvider = runtimeSelection.providerId
+  const selectedProviderOption = providerOptions.find(
+    (provider) => provider.id === selectedProvider
+  )
+  const selectedModelOption = selectedProviderOption?.models.find(
+    (model) => model.id === runtimeSelection.modelId
+  )
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [pendingActionSnapshot, setPendingActionSnapshot] = useState<{
+    conversationId: string
+    actions: PendingActionResponse[]
+  } | null>(null)
   const [input, setInput] = useState(() => {
     try {
       return localStorage.getItem(draftKey) ?? ''
@@ -1102,10 +1627,166 @@ export function DebugChatPanel({
   // unmounts). Dropping the SSE connection also tells the server to stop
   // generating, so a stopped turn doesn't keep costing tokens.
   const abortRef = useRef<AbortController | null>(null)
+  const queuedInterruptRef = useRef<string | null>(null)
+  const sendAfterInterruptRef = useRef<(text: string) => void>(() => {})
+  // Counts this tab's own in-flight writes to the conversation (an active
+  // send, or a permission being resolved+polled) — see useConversationStream.
+  const wsSuppressRef = useRef(0)
+  // Whether a turn is in flight on ANOTHER tab, per the live wire — an
+  // observer tab has no local `streaming` state to drive the "thinking"
+  // indicator with, since it never called send() itself.
+  const [wsTurnActive, setWsTurnActive] = useState(false)
+
+  // New conversations may choose any provider that is ready on this host.
+  // Once the first message creates the row, `publicId` locks only the provider
+  // harness. Model, reasoning, and permission mode remain turn-level controls.
+  const loadProviderStatus = useCallback(async (forceRefresh = false) => {
+    if (forceRefresh) setProviderRefreshing(true)
+    else setProviderStatusState('loading')
+    try {
+      const statusResult = forceRefresh
+        ? await refreshAiProviderStatus({ throwOnError: true })
+        : await getAiProviderStatus({ throwOnError: true })
+      const status = statusResult.data
+      const options = (status?.available_providers ?? []).map((provider) => {
+        const extended = provider as typeof provider & ChatProviderOption
+        return {
+          id: provider.id,
+          name: provider.name,
+          auth_source: provider.auth_source,
+          models: extended.models ?? [],
+          default_model_id: extended.default_model_id,
+          model_discovery_status: extended.model_discovery_status,
+          model_discovery_error: extended.model_discovery_error,
+          permission_modes: extended.permission_modes ?? [],
+          default_permission_mode_id: extended.default_permission_mode_id,
+        }
+      })
+      setProviderOptions((current) =>
+        providerPinnedRef.current
+          ? [
+              ...options,
+              ...current.filter(
+                (saved) => !options.some((option) => option.id === saved.id)
+              ),
+            ]
+          : options
+      )
+
+      if (providerPinnedRef.current) {
+        setRuntimeSelection((current) =>
+          reconcileChatRuntimeAfterRefresh(options, current)
+        )
+      }
+
+      const active =
+        status?.active_provider_type === 'agent_cli'
+          ? status.agent_cli_provider_id
+          : 'gateway'
+      if (
+        !providerPinnedRef.current &&
+        active &&
+        options.some((option) => option.id === active)
+      ) {
+        setRuntimeSelection(resolveChatRuntimeSelection(options, active))
+      } else if (!providerPinnedRef.current && options[0]) {
+        setRuntimeSelection(resolveChatRuntimeSelection(options, options[0].id))
+      }
+      setProviderStatusState('success')
+    } catch {
+      if (forceRefresh) {
+        toast.error('Couldn’t refresh provider authentication and models')
+      } else {
+        setProviderStatusState('error')
+      }
+    } finally {
+      setProviderRefreshing(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    // Defer the async refresh out of the effect's synchronous phase. The
+    // initial state already renders the loading skeleton, so no paint is lost.
+    const timer = window.setTimeout(() => void loadProviderStatus(), 0)
+    return () => window.clearTimeout(timer)
+  }, [loadProviderStatus])
+
+  useConversationStream(
+    projectId,
+    publicId,
+    wsSuppressRef,
+    setMessages,
+    setError,
+    setWsTurnActive
+  )
+
+  // Pending actions are durable rows. Linking their proposal receipt back to
+  // an assistant message is deliberately best-effort, so load the rows too:
+  // otherwise a transient persistence failure can leave a real proposal with
+  // no Confirm/Reject UI after a reload.
+  useEffect(() => {
+    if (!publicId) return
+    if (streaming) return
+    let cancelled = false
+    listPendingActions({
+      path: { project_id: projectId, public_id: publicId },
+    })
+      .then(({ data }) => {
+        if (!cancelled) {
+          setPendingActionSnapshot({
+            conversationId: publicId,
+            actions: data ?? [],
+          })
+        }
+      })
+      .catch(() => {
+        // The transcript remains usable; an ordinary API error banner would
+        // obscure the composer. The next completed turn retries this query.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [messages.length, projectId, publicId, streaming])
+
+  const recoveredPendingActions =
+    publicId && pendingActionSnapshot?.conversationId === publicId
+      ? unrepresentedPendingActions(messages, pendingActionSnapshot.actions)
+      : []
 
   const stop = useCallback(() => {
     abortRef.current?.abort()
   }, [])
+
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  const composerDisabled = isChatComposerDisabled(
+    Boolean(publicId),
+    starting,
+    lazyCreate
+  )
+
+  // `autoFocus` handles a composer that mounts enabled. Existing chats first
+  // mount disabled while their conversation id loads, so focus again whenever
+  // the composer becomes usable. This also returns keyboard focus after a turn
+  // finishes, matching normal chat-composer behaviour.
+  useEffect(() => {
+    if (composerDisabled) return
+    const frame = window.requestAnimationFrame(() => {
+      composerRef.current?.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [composerDisabled, projectId, contextType, ctxId])
+
+  // Keep short prompts compact, grow with wrapped/new lines, then hand longer
+  // drafts to an internal scrollbar so the composer cannot consume the chat.
+  useLayoutEffect(() => {
+    const textarea = composerRef.current
+    if (!textarea) return
+
+    textarea.style.height = '0px'
+    const layout = resolveChatComposerLayout(textarea.scrollHeight)
+    textarea.style.height = `${layout.height}px`
+    textarea.style.overflowY = layout.overflowY
+  }, [input])
 
   // Abort any in-flight stream if the panel unmounts mid-generation.
   useEffect(() => () => abortRef.current?.abort(), [])
@@ -1129,6 +1810,10 @@ export function DebugChatPanel({
       setInput('')
       setError(null)
       setStreaming(true)
+      // This tab already gets its own tokens via this request's SSE body — the
+      // WS listener must ignore its own broadcast echo of the same turn, or
+      // every token would render twice.
+      wsSuppressRef.current += 1
       // Optimistically append the user's turn + an empty assistant turn that the
       // stream fills in. The empty assistant turn renders a typing indicator
       // while streaming; on any failure below we drop it again so it can't linger
@@ -1139,31 +1824,30 @@ export function DebugChatPanel({
         { role: 'user', content, created_at: now },
         { role: 'assistant', content: '', created_at: now },
       ])
-      // Pop the trailing optimistic assistant turn if it never received content
-      // (used on every failure path so a failed send leaves only the error line).
-      const dropEmptyAssistantTurn = () =>
-        setMessages((m) => {
-          const last = m[m.length - 1]
-          return last?.role === 'assistant' && last.content === ''
-            ? m.slice(0, -1)
-            : m
-        })
       try {
         // Lazy-create the conversation on the first message (new project chat).
         if (!id) {
           const { data: conv, error: problem } = await createConversation({
             path: { project_id: projectId },
-            body: { context_type: contextType, context_id: ctxId },
+            body: {
+              context_type: contextType,
+              context_id: ctxId,
+              ai_provider: selectedProvider,
+              ai_model: runtimeSelection.modelId,
+              ai_thinking_level: runtimeSelection.thinkingOptionId,
+              ai_permission_mode: runtimeSelection.permissionModeId,
+            },
           })
           if (!conv) {
             setError(
               (problem as { detail?: string } | undefined)?.detail ||
                 'Could not start the chat. Make sure an AI provider is configured.'
             )
-            dropEmptyAssistantTurn()
+            dropEmptyAssistantTurn(setMessages)
             return
           }
           id = conv.public_id
+          providerPinnedRef.current = true
           setPublicId(conv.public_id)
         }
         const controller = new AbortController()
@@ -1178,6 +1862,9 @@ export function DebugChatPanel({
           },
           body: JSON.stringify({
             content,
+            ai_model: runtimeSelection.modelId,
+            ai_thinking_level: runtimeSelection.thinkingOptionId,
+            ai_permission_mode: runtimeSelection.permissionModeId,
             // Ephemeral framing about the page the user is on — not stored or
             // shown; the backend attaches it to this turn only. Honours the
             // user's include toggle.
@@ -1188,7 +1875,7 @@ export function DebugChatPanel({
         if (!res.ok || !res.body) {
           const problem = await res.json().catch(() => ({}))
           setError(problem.detail || 'The AI request failed.')
-          dropEmptyAssistantTurn()
+          dropEmptyAssistantTurn(setMessages)
           return
         }
         const reader = res.body.getReader()
@@ -1212,110 +1899,30 @@ export function DebugChatPanel({
               }
             }
             const chunk = dataParts.join('\n')
-            if (eventName === 'error') {
-              if (chunk) setError(chunk)
-              dropEmptyAssistantTurn()
-              continue
-            }
-            if (eventName === 'tool_call') {
-              try {
-                const t = JSON.parse(chunk) as {
-                  id: string
-                  name: string
-                  arguments: string
-                }
-                setMessages((m) => {
-                  const copy = [...m]
-                  const last = copy[copy.length - 1]
-                  if (last?.role === 'assistant') {
-                    const tool: ToolCall = {
-                      id: t.id,
-                      name: t.name,
-                      arguments: t.arguments,
-                      result: undefined,
-                    }
-                    copy[copy.length - 1] = {
-                      ...last,
-                      tools: [...(last.tools ?? []), tool],
-                      parts: [...(last.parts ?? []), { type: 'tool', tool }],
-                    }
-                  }
-                  return copy
-                })
-              } catch {
-                /* ignore malformed tool_call frame */
-              }
-              continue
-            }
-            if (eventName === 'tool_result') {
-              try {
-                const t = JSON.parse(chunk) as {
-                  id: string
-                  name: string
-                  content: string
-                }
-                setMessages((m) => {
-                  const copy = [...m]
-                  const last = copy[copy.length - 1]
-                  if (last?.role === 'assistant') {
-                    copy[copy.length - 1] = {
-                      ...last,
-                      tools: (last.tools ?? []).map((tool) =>
-                        tool.id === t.id ? { ...tool, result: t.content } : tool
-                      ),
-                      parts: (last.parts ?? []).map((part) =>
-                        part.type === 'tool' && part.tool.id === t.id
-                          ? { type: 'tool', tool: { ...part.tool, result: t.content } }
-                          : part
-                      ),
-                    }
-                  }
-                  return copy
-                })
-              } catch {
-                /* ignore malformed tool_result frame */
-              }
-              continue
-            }
-            if (chunk) {
-              setMessages((m) => {
-                const copy = [...m]
-                const last = copy[copy.length - 1]
-                // Append to the trailing text part, or open a new one (so prose
-                // that follows a tool call becomes its own segment).
-                const prevParts = last?.parts ?? []
-                const lastPart = prevParts[prevParts.length - 1]
-                const parts: ChatPart[] =
-                  lastPart?.type === 'text'
-                    ? [
-                        ...prevParts.slice(0, -1),
-                        { type: 'text', text: lastPart.text + chunk },
-                      ]
-                    : [...prevParts, { type: 'text', text: chunk }]
-                copy[copy.length - 1] = {
-                  ...last,
-                  role: 'assistant',
-                  content: (last?.content ?? '') + chunk,
-                  parts,
-                  created_at: last?.created_at ?? new Date().toISOString(),
-                }
-                return copy
-              })
-            }
+            applyWireEvent(eventName, chunk, setMessages, setError)
           }
         }
       } catch (e) {
         // A user-initiated Stop (AbortController) is not an error — just keep
         // whatever streamed so far and drop the turn only if nothing arrived.
         if (e instanceof DOMException && e.name === 'AbortError') {
-          dropEmptyAssistantTurn()
+          dropEmptyAssistantTurn(setMessages)
         } else {
           setError('Connection error while talking to the AI.')
-          dropEmptyAssistantTurn()
+          dropEmptyAssistantTurn(setMessages)
         }
       } finally {
         abortRef.current = null
         setStreaming(false)
+        wsSuppressRef.current = Math.max(0, wsSuppressRef.current - 1)
+        const queuedInterrupt = queuedInterruptRef.current
+        queuedInterruptRef.current = null
+        if (queuedInterrupt) {
+          window.setTimeout(
+            () => sendAfterInterruptRef.current(queuedInterrupt),
+            0
+          )
+        }
       }
     },
     [
@@ -1327,8 +1934,25 @@ export function DebugChatPanel({
       ctxId,
       pageContext,
       includeContext,
+      selectedProvider,
+      runtimeSelection.modelId,
+      runtimeSelection.thinkingOptionId,
+      runtimeSelection.permissionModeId,
     ]
   )
+
+  sendAfterInterruptRef.current = (text) => void send(text)
+  const submitComposer = useCallback(() => {
+    const action = chatComposerSubmitAction(input, streaming)
+    if (action === 'none') return
+    if (action === 'interrupt-and-send') {
+      queuedInterruptRef.current = input.trim()
+      setInput('')
+      stop()
+      return
+    }
+    void send(input)
+  }, [input, streaming, send, stop])
 
   const start = useCallback(async () => {
     setStarting(true)
@@ -1336,7 +1960,14 @@ export function DebugChatPanel({
     try {
       const { data: conv, error: problem } = await createConversation({
         path: { project_id: projectId },
-        body: { context_type: contextType, context_id: ctxId },
+        body: {
+          context_type: contextType,
+          context_id: ctxId,
+          ai_provider: selectedProvider,
+          ai_model: runtimeSelection.modelId,
+          ai_thinking_level: runtimeSelection.thinkingOptionId,
+          ai_permission_mode: runtimeSelection.permissionModeId,
+        },
       })
       if (!conv) {
         setError(
@@ -1345,7 +1976,20 @@ export function DebugChatPanel({
         )
         return
       }
+      const extended = conv as typeof conv & {
+        ai_model?: string | null
+        ai_thinking_level?: string | null
+        ai_permission_mode?: string | null
+      }
+      setRuntimeSelection(
+        resolveChatRuntimeSelection(providerOptions, conv.ai_provider, {
+          modelId: extended.ai_model,
+          thinkingOptionId: extended.ai_thinking_level,
+          permissionModeId: extended.ai_permission_mode,
+        })
+      )
       setPublicId(conv.public_id)
+      providerPinnedRef.current = true
       setMessages([])
       void send(startPrompt, conv.public_id)
     } catch {
@@ -1353,7 +1997,18 @@ export function DebugChatPanel({
     } finally {
       setStarting(false)
     }
-  }, [projectId, contextType, ctxId, startPrompt, send])
+  }, [
+    projectId,
+    contextType,
+    ctxId,
+    startPrompt,
+    send,
+    selectedProvider,
+    runtimeSelection.modelId,
+    runtimeSelection.thinkingOptionId,
+    runtimeSelection.permissionModeId,
+    providerOptions,
+  ])
 
   // Keep the latest send/start in refs so the one-shot init effect below can
   // call them without listing them as dependencies (which would make it re-run
@@ -1383,26 +2038,68 @@ export function DebugChatPanel({
           if (autoStart) void startRef.current()
           return
         }
+        providerPinnedRef.current = true
+        const extended = conv as typeof conv & {
+          ai_model?: string | null
+          ai_thinking_level?: string | null
+          ai_permission_mode?: string | null
+        }
+        setProviderOptions((options) => {
+          const next = options.some((option) => option.id === conv.ai_provider)
+            ? options
+            : [
+                ...options,
+                {
+                  id: conv.ai_provider,
+                  name: providerDisplayName(conv.ai_provider),
+                  auth_source: conv.ai_provider.startsWith('gateway')
+                    ? 'configured_key'
+                    : 'host_environment',
+                  models: extended.ai_model
+                    ? [
+                        {
+                          id: extended.ai_model,
+                          name: extended.ai_model,
+                          thinking_options: extended.ai_thinking_level
+                            ? [
+                                {
+                                  id: extended.ai_thinking_level,
+                                  name: extended.ai_thinking_level,
+                                },
+                              ]
+                            : [],
+                          default_thinking_option_id:
+                            extended.ai_thinking_level,
+                        },
+                      ]
+                    : [],
+                  default_model_id: extended.ai_model,
+                  permission_modes: extended.ai_permission_mode
+                    ? [
+                        {
+                          id: extended.ai_permission_mode,
+                          name: extended.ai_permission_mode,
+                        },
+                      ]
+                    : [],
+                  default_permission_mode_id: extended.ai_permission_mode,
+                },
+              ]
+          setRuntimeSelection(
+            resolveChatRuntimeSelection(next, conv.ai_provider, {
+              modelId: extended.ai_model,
+              thinkingOptionId: extended.ai_thinking_level,
+              permissionModeId: extended.ai_permission_mode,
+            })
+          )
+          return next
+        })
         setPublicId(conv.public_id)
         const { data: detail } = await getConversation({
           path: { project_id: projectId, public_id: conv.public_id },
         }).catch(() => ({ data: null }))
         if (!ignore && detail) {
-          setMessages(
-            (detail.messages ?? []).map((m) => {
-              // `parts` is newer than the current generated SDK type; read it
-              // defensively until the client is regenerated.
-              const rawParts = (m as { parts?: ChatPart[] }).parts
-              return {
-                role: m.role,
-                content: m.content,
-                created_at: m.created_at,
-                tools: m.tools ?? undefined,
-                parts:
-                  rawParts && rawParts.length > 0 ? rawParts : undefined,
-              }
-            })
-          )
+          setMessages(mapConversationDetail(detail))
         }
       } catch {
         /* best-effort: leave the panel in its empty state */
@@ -1420,6 +2117,58 @@ export function DebugChatPanel({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages])
 
+  // Fallback for when the SSE connection that was open when a question was
+  // asked has died by the time the user answers it (backgrounded tab, network
+  // blip, server restart). `resolvePermission` still delivers the answer to
+  // the model and the reply still gets persisted — this just polls history
+  // for it so it appears without a manual reload. Stops as soon as the server
+  // has more messages than we've rendered, or after a bounded number of tries.
+  const pollForReply = useCallback(() => {
+    if (!publicId) return
+    let cancelled = false
+    let attempt = 0
+    // The permission-resolve request also triggers a `user_message` broadcast
+    // (the synthetic "you answered" turn) — suppress the WS echo of that on
+    // this tab for the duration of the poll, since this refetch already
+    // covers it.
+    wsSuppressRef.current += 1
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      wsSuppressRef.current = Math.max(0, wsSuppressRef.current - 1)
+    }
+    const poll = async () => {
+      if (cancelled || attempt >= 6) {
+        release()
+        return
+      }
+      attempt += 1
+      const { data: detail } = await getConversation({
+        path: { project_id: projectId, public_id: publicId },
+      }).catch(() => ({ data: null }))
+      if (cancelled || !detail) {
+        release()
+        return
+      }
+      const serverMessageCount = detail.messages?.length ?? 0
+      const hasPendingPermission = Boolean(detail.pending_permission)
+      let caughtUp = false
+      setMessages((m) => {
+        if (serverMessageCount <= m.length && !hasPendingPermission) return m
+        caughtUp = true
+        return mapConversationDetail(detail)
+      })
+      if (!caughtUp) setTimeout(poll, 2000)
+      else release()
+    }
+    void poll()
+    return () => {
+      cancelled = true
+      release()
+    }
+  }, [projectId, publicId])
+
   // Report the active conversation id upward (lets the dock reset it).
   useEffect(() => {
     onConversationChange?.(publicId)
@@ -1427,6 +2176,9 @@ export function DebugChatPanel({
 
   const visible = messages.filter((m) => m.role !== 'system')
   const busy = streaming || starting
+  // A turn in flight either from this tab's own send() or observed live from
+  // another tab over the WS — both need the "thinking" indicator to show.
+  const liveTurn = streaming || wsTurnActive
   // Show a standalone "thinking" row only before the optimistic assistant turn
   // exists (i.e. while the conversation is being created).
   const showBootRow = visible.length === 0 && busy
@@ -1469,7 +2221,10 @@ export function DebugChatPanel({
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <Sparkles className="h-6 w-6 text-muted-foreground" />
-              <Button onClick={() => void start()} disabled={starting}>
+              <Button
+                onClick={() => void start()}
+                disabled={starting || providerOptions.length === 0}
+              >
                 {starting ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
@@ -1489,8 +2244,22 @@ export function DebugChatPanel({
           </div>
         )}
 
-        {visible.map((m, i) =>
-          m.role === 'user' ? (
+        {visible.map((m, i) => {
+          const isTrailing = i === visible.length - 1
+          // A completed assistant turn with nothing extracted (e.g. the CLI's
+          // only action was a tool call CLI-chat can't bridge — ADR-038)
+          // renders as truly nothing, not an empty styled bubble: the padded,
+          // rounded `bg-muted` wrapper below has no way to look "empty" once
+          // it exists, so skip the whole message instead of leaving a blank
+          // gray bar in the transcript that reads as an answer with no text.
+          if (
+            m.role === 'assistant' &&
+            assistantParts(m).length === 0 &&
+            !(liveTurn && isTrailing)
+          ) {
+            return null
+          }
+          return m.role === 'user' ? (
             <div key={i} className="group flex flex-col items-end gap-0.5">
               <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
                 {m.content}
@@ -1511,9 +2280,11 @@ export function DebugChatPanel({
                 <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
                   <AssistantBody
                     message={m}
-                    streaming={streaming && i === visible.length - 1}
+                    streaming={liveTurn && isTrailing}
                     projectId={projectId}
+                    conversationPublicId={publicId}
                     onFix={(text) => void send(text)}
+                    onPermissionResolved={pollForReply}
                   />
                 </div>
                 {assistantParts(m).length > 0 && (
@@ -1530,7 +2301,30 @@ export function DebugChatPanel({
               </div>
             </div>
           )
-        )}
+        })}
+
+        {recoveredPendingActions.map((action) => (
+          <div key={action.public_id} className="flex items-start">
+            <div className="min-w-0 flex-1 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
+              <PendingActionCard
+                projectId={projectId}
+                tool={{
+                  id: `pending-${action.public_id}`,
+                  name: 'temps_write',
+                  arguments: '',
+                  result: JSON.stringify({
+                    status: 'proposed',
+                    action_id: action.public_id,
+                    operation: action.operation_id,
+                    method: action.method,
+                    summary: action.summary,
+                  }),
+                }}
+                onFix={(text) => void send(text)}
+              />
+            </div>
+          </div>
+        ))}
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
@@ -1562,44 +2356,297 @@ export function DebugChatPanel({
         </button>
       )}
 
+      <InteractiveToolsNotice provider={selectedProvider} />
       <WriteActionsEnabler projectId={projectId} />
 
-      <div className="flex items-end gap-2 border-t pt-3">
+      {providerStatusState === 'loading' && providerOptions.length === 0 && (
+        <div
+          className="flex items-center gap-2 text-xs text-muted-foreground"
+          role="status"
+        >
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Loading AI providers and models…
+        </div>
+      )}
+      {providerStatusState === 'error' && (
+        <div
+          className="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          role="alert"
+        >
+          <span>Couldn’t load AI providers or model capabilities.</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7"
+            onClick={() => void loadProviderStatus(true)}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
+      {providerStatusState === 'success' &&
+        selectedProviderOption?.model_discovery_status === 'unavailable' && (
+          <div
+            className="flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            role="status"
+          >
+            <span>
+              {selectedProviderOption.model_discovery_error ??
+                'Model discovery is unavailable; the provider default remains usable.'}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7"
+              onClick={() => void loadProviderStatus(true)}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+
+      <div className="shrink-0 overflow-hidden rounded-lg border border-input bg-background transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20">
         <Textarea
+          ref={composerRef}
+          autoFocus
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder={placeholder}
           rows={2}
-          disabled={streaming || (!publicId && !starting && !lazyCreate)}
-          className="resize-none"
+          disabled={composerDisabled}
+          className="min-h-[72px] resize-none overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
-              void send(input)
+              submitComposer()
             }
           }}
         />
-        {streaming ? (
-          <Button
-            type="button"
-            onClick={stop}
-            size="icon"
-            variant="secondary"
-            title="Stop generating"
-            aria-label="Stop generating"
-          >
-            <Square className="h-3.5 w-3.5 fill-current" />
-          </Button>
-        ) : (
-          <Button
-            onClick={() => void send(input)}
-            disabled={!input.trim() || (!publicId && !lazyCreate)}
-            size="icon"
-            aria-label="Send message"
-          >
-            <Send className="h-4 w-4" />
-          </Button>
-        )}
+        <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-0.5">
+            {providerStatusState === 'loading' ? (
+              <div
+                className="flex h-8 items-center gap-2 px-2"
+                role="status"
+                aria-label="Loading AI runtime options"
+              >
+                <Skeleton className="h-4 w-44 rounded-sm" />
+                <Skeleton className="h-4 w-32 rounded-sm" />
+                <Skeleton className="h-4 w-20 rounded-sm" />
+                <Skeleton className="h-4 w-36 rounded-sm" />
+              </div>
+            ) : (
+              <>
+                <Select
+                  value={selectedProvider}
+                  onValueChange={(providerId) =>
+                    setRuntimeSelection(
+                      resolveChatRuntimeSelection(providerOptions, providerId)
+                    )
+                  }
+                  disabled={
+                    Boolean(publicId) ||
+                    streaming ||
+                    starting ||
+                    providerOptions.length === 0
+                  }
+                >
+                  <SelectTrigger
+                    className="h-8 w-auto max-w-64 border-0 bg-transparent px-2 text-xs shadow-none"
+                    title={
+                      publicId
+                        ? 'Provider is fixed when a conversation is created'
+                        : 'Choose the provider for this new chat'
+                    }
+                  >
+                    {publicId ? (
+                      <Lock className="mr-1 h-3 w-3 shrink-0" />
+                    ) : (
+                      <Bot className="mr-1 h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <SelectValue
+                      placeholder={
+                        providerOptions.length === 0
+                          ? 'No provider configured'
+                          : 'Select provider'
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {providerOptions.map((provider) => (
+                      <SelectItem key={provider.id} value={provider.id}>
+                        {chatProviderLabel(provider)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {providerStatusState === 'success' &&
+                  providerOptions.length === 0 && (
+                    <Button
+                      asChild
+                      variant="link"
+                      size="sm"
+                      className="h-8 px-1 text-xs"
+                    >
+                      <a href="/ai-gateway">Configure an AI provider</a>
+                    </Button>
+                  )}
+
+                {selectedProviderOption &&
+                  selectedProviderOption.models.length > 0 && (
+                    <Select
+                      value={runtimeSelection.modelId ?? undefined}
+                      onValueChange={(modelId) =>
+                        setRuntimeSelection(
+                          resolveChatRuntimeSelection(
+                            providerOptions,
+                            selectedProvider,
+                            {
+                              modelId,
+                              permissionModeId:
+                                runtimeSelection.permissionModeId,
+                            }
+                          )
+                        )
+                      }
+                      disabled={streaming || starting}
+                    >
+                      <SelectTrigger
+                        className="h-8 w-auto max-w-56 border-0 bg-transparent px-2 text-xs shadow-none"
+                        title="Choose the model for the next turn"
+                      >
+                        <Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />
+                        <SelectValue placeholder="Model" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {selectedProviderOption.models.map((model) => (
+                          <SelectItem key={model.id} value={model.id}>
+                            {model.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+
+                {selectedModelOption &&
+                  selectedModelOption.thinking_options.length > 0 && (
+                    <Select
+                      value={runtimeSelection.thinkingOptionId ?? undefined}
+                      onValueChange={(thinkingOptionId) =>
+                        setRuntimeSelection((selection) => ({
+                          ...selection,
+                          thinkingOptionId,
+                        }))
+                      }
+                      disabled={streaming || starting}
+                    >
+                      <SelectTrigger
+                        className="h-8 w-auto max-w-40 border-0 bg-transparent px-2 text-xs shadow-none"
+                        title={
+                          publicId
+                            ? 'Choose the reasoning level for the next turn'
+                            : 'Choose how much reasoning the model should use'
+                        }
+                      >
+                        <SelectValue placeholder="Thinking" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {selectedModelOption.thinking_options.map((option) => (
+                          <SelectItem key={option.id} value={option.id}>
+                            <span className="flex items-center gap-2">
+                              <Brain
+                                className="h-4 w-4 shrink-0"
+                                aria-hidden="true"
+                              />
+                              <span>{option.name}</span>
+                            </span>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+
+                {selectedProviderOption &&
+                  selectedProviderOption.permission_modes.length > 0 && (
+                    <Select
+                      value={runtimeSelection.permissionModeId ?? undefined}
+                      onValueChange={(permissionModeId) =>
+                        setRuntimeSelection((selection) => ({
+                          ...selection,
+                          permissionModeId,
+                        }))
+                      }
+                      disabled={streaming || starting}
+                    >
+                      <SelectTrigger
+                        className="h-8 w-auto max-w-48 border-0 bg-transparent px-2 text-xs shadow-none"
+                        title="Choose the permission mode for the next turn"
+                      >
+                        <Shield className="mr-1 h-3.5 w-3.5 shrink-0" />
+                        <SelectValue placeholder="Permissions" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {selectedProviderOption.permission_modes.map((mode) => (
+                          <SelectItem key={mode.id} value={mode.id}>
+                            {mode.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  disabled={providerRefreshing || streaming || starting}
+                  onClick={() => void loadProviderStatus(true)}
+                  aria-label="Refresh provider authentication and models"
+                  title="Refresh provider authentication and models"
+                >
+                  <RefreshCw
+                    className={cn(
+                      'h-3.5 w-3.5',
+                      providerRefreshing && 'animate-spin'
+                    )}
+                  />
+                </Button>
+              </>
+            )}
+          </div>
+          {streaming && !input.trim() ? (
+            <Button
+              type="button"
+              onClick={stop}
+              size="icon"
+              variant="secondary"
+              title="Stop generating"
+              aria-label="Stop generating"
+            >
+              <Square className="h-3.5 w-3.5 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              onClick={submitComposer}
+              disabled={
+                !input.trim() ||
+                (!publicId && !lazyCreate) ||
+                (!publicId && providerOptions.length === 0)
+              }
+              size="icon"
+              aria-label={
+                streaming ? 'Interrupt and send message' : 'Send message'
+              }
+              title={streaming ? 'Interrupt and send message' : undefined}
+            >
+              <Send className="h-4 w-4" />
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   )

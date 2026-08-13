@@ -94,3 +94,24 @@ pub struct AiActionRejectedAudit {
 
 impl_audit_operation!(AiActionConfirmedAudit, "ai.pending_action.confirmed");
 impl_audit_operation!(AiActionRejectedAudit, "ai.pending_action.rejected");
+
+// --- Interactive permission-bridge audit events ----------------------------
+
+/// Audit entry for resolving an interactive permission request (ADR-038 Phase 2).
+///
+/// Only the permission kind and id are recorded — never the raw tool input or
+/// answer content, which may carry sensitive data (credentials, PII, code).
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionResolvedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub conversation_id: String,
+    /// The CLI's `request_id` (same value used as the registry key and in the
+    /// resolve endpoint URL as `{permission_id}`).
+    pub permission_id: String,
+    /// Decision kind: `"allow_tool"`, `"deny_tool"`, `"answer_question"`,
+    /// `"approve_plan"`, or `"reject_plan"`.
+    pub decision_kind: String,
+}
+
+impl_audit_operation!(PermissionResolvedAudit, "ai.permission.resolved");

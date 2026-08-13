@@ -434,6 +434,9 @@ Update deployment configuration (resources, replicas)
 | `--memory-limit <limit>` | Memory limit in MB | - | No |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
+| `--request-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
+| `--sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
+| `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 
@@ -846,6 +849,7 @@ Manage environments and environment variables
 - `delete` (`rm`) - Delete an environment
 - `vars` - Manage environment variables
 - `resources` - View or set CPU/memory resources for an environment
+- `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
 - `crons` - Manage cron jobs
@@ -985,6 +989,21 @@ View or set CPU/memory resources for an environment
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
 | `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
 | `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments timeouts`
+
+View or set upstream request/idle timeouts for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--request <seconds>` | Timeout for regular (non-streaming) HTTP requests, in seconds | - | No |
+| `--sse-idle <seconds>` | Idle timeout for Server-Sent Events streams, in seconds | - | No |
+| `--websocket-idle <seconds>` | Idle timeout for WebSocket connections, in seconds | - | No |
+| `--inherit` | Clear all three overrides (inherit the project/global defaults) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments force-https`
@@ -2193,6 +2212,10 @@ Update platform settings
 | `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | No |
 | `--rate-limiting-rpm <rpm>` | Requests per minute | - | No |
 | `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | No |
+| `--max-request-timeout <seconds>` | Hard ceiling for all upstream request/idle timeouts, in seconds | - | No |
+| `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
+| `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
+| `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
@@ -5691,6 +5714,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
 - `fs` - Filesystem operations inside a sandbox
+- `snapshots` - Manage sandbox snapshots (ADR-037)
+- `snapshot` - Take a snapshot of a sandbox
 
 ### `sandbox create`
 
@@ -5720,6 +5745,7 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -5899,6 +5925,73 @@ Create a directory inside the sandbox (mkdir -p)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--path <path>` | Absolute path inside the sandbox | - | Yes |
+
+### `sandbox snapshots`
+
+Manage sandbox snapshots (ADR-037)
+
+**Subcommands:**
+
+- `list` (`ls`) - List your snapshots
+- `show` - Show details for a snapshot
+- `delete` (`rm`) - Delete a snapshot permanently
+- `storage` - Show snapshot storage usage and quota
+
+#### `sandbox snapshots list` (alias: `ls`)
+
+List your snapshots
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <id>` | Filter by project ID | - | No |
+| `--status <status>` | Filter by status: creating \| ready \| failed \| deleted | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox snapshots show`
+
+Show details for a snapshot
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox snapshots delete` (alias: `rm`)
+
+Delete a snapshot permanently
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation prompt | - | No |
+
+#### `sandbox snapshots storage`
+
+Show snapshot storage usage and quota
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+### `sandbox snapshot`
+
+Take a snapshot of a sandbox
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--label <label>` | Human-readable label for the snapshot | - | No |
+| `--wait` | Wait until the snapshot reaches ready or failed status | - | No |
+| `--json` | Output as JSON | - | No |
 
 ## `workflow` (alias: `wf`)
 

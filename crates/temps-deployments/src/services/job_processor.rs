@@ -663,13 +663,37 @@ impl JobProcessorService {
                 "Workflow execution failed for deployment {}: {}",
                 deployment_id, error_message
             );
-            if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
-                db,
-                deployment_id,
-                PipelineStatus::Failed,
-                Some(error_message),
-            )
-            .await
+
+            // Re-read the current deployment state before writing "failed".
+            // execute_deployment_workflow already skips its own "failed" write
+            // when the deployment is "stopped" (superseded by a concurrent
+            // rollback), but this is a second write on the same error path
+            // that must honour the same invariant. Without this guard,
+            // "stopped" set by stop_environment_containers would be silently
+            // overwritten here, making the deployment unavailable for
+            // promote/rollback even though it was successfully superseded.
+            let already_stopped = deployments::Entity::find_by_id(deployment_id)
+                .one(db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .map(|d| d.state == "stopped")
+                .unwrap_or(false);
+
+            if already_stopped {
+                info!(
+                    "Deployment {} already marked 'stopped' by a concurrent \
+                     rollback — not overwriting with 'failed'",
+                    deployment_id
+                );
+            } else if let Err(update_err) =
+                JobProcessorService::update_deployment_status_with_message(
+                    db,
+                    deployment_id,
+                    PipelineStatus::Failed,
+                    Some(error_message),
+                )
+                .await
             {
                 error!("Failed to update deployment status: {}", update_err);
             }

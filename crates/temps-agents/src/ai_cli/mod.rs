@@ -4,7 +4,8 @@ pub mod codex;
 pub mod opencode;
 
 pub use catalog::{
-    find_provider, AuthFlavor, CredentialFormat, ProviderCatalogEntry, PROVIDER_CATALOG,
+    find_provider, AuthFlavor, CredentialFormat, HostAccessRequirement, ProviderCatalogEntry,
+    ProviderOption, PROVIDER_CATALOG,
 };
 
 use async_trait::async_trait;
@@ -14,11 +15,77 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use temps_ai::streaming::{PermissionDecision, PermissionRequest};
+use tokio::process::Command;
+use tokio::sync::oneshot;
+
 use crate::error::AgentError;
+
+/// Remove the Temps server environment before launching an AI harness.
+///
+/// Harnesses may expose native shell tools to the model, so inheriting the
+/// server process environment would also expose database URLs, signing keys,
+/// and credentials for unrelated integrations. Keep only the small set needed
+/// to locate the executable and the authenticated user's CLI config. Provider
+/// credentials and the ephemeral MCP token are added explicitly by adapters.
+pub(crate) fn sanitize_command_environment(command: &mut Command) {
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ];
+    let preserved = ALLOWED
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    command.envs(preserved);
+}
+
+pub(crate) fn copy_environment_variable(command: &mut Command, name: &str) {
+    if let Some(value) = std::env::var_os(name) {
+        command.env(name, value);
+    }
+}
 
 /// Callback invoked for each line of AI CLI output (for real-time streaming)
 pub type OnEventCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Bridge for the `--permission-prompt-tool stdio` interactive control protocol
+/// (ADR-038 Phase 2, milestone 3+).  Wired by `ConversationService` so that
+/// `run_interactive` can register pending permissions in the in-process registry
+/// and await human decisions without knowing about the service layer.
+///
+/// `on_permission_request` is called once per `control_request` frame.  It MUST:
+/// 1. Insert a `oneshot::Sender<PermissionDecision>` keyed by `req.id` into the
+///    shared pending-permission registry (so the resolve endpoint can claim it).
+/// 2. Emit an appropriate SSE event (e.g. `ChatStreamEvent::PermissionRequested`)
+///    so the UI can render the approval card.
+/// 3. Return the matching `oneshot::Receiver` so `run_interactive` can `await`
+///    the decision and write the `control_response` back to the CLI's stdin.
+pub struct PermissionBridge {
+    pub on_permission_request:
+        Arc<dyn Fn(PermissionRequest) -> oneshot::Receiver<PermissionDecision> + Send + Sync>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub url: String,
+    /// Ephemeral bearer value valid only for this CLI turn.
+    pub authorization_token: String,
+}
 
 pub struct AiRunConfig {
     pub work_dir: PathBuf,
@@ -29,8 +96,25 @@ pub struct AiRunConfig {
     /// Optional preferred model name (e.g. "sonnet", "gpt-5-codex").
     /// `None` lets the CLI pick its default.
     pub model: Option<String>,
+    /// Provider-specific reasoning effort/variant selected by the caller.
+    pub thinking_level: Option<String>,
+    /// Provider-specific sandbox/approval/agent mode selected by the caller.
+    pub permission_mode: Option<String>,
     /// Optional callback for streaming each line of output in real-time
     pub on_event: Option<OnEventCallback>,
+    /// Optional bridge for the interactive control protocol.  When `Some`,
+    /// `run_interactive` will register pending permissions here and await
+    /// decisions from the resolve endpoint instead of ignoring control_request
+    /// lines (milestone 2 fallback).  `None` preserves milestone 2 behaviour.
+    pub permission_bridge: Option<Arc<PermissionBridge>>,
+    /// Resume a previous Claude CLI session by passing `--resume <session_id>`.
+    /// Used by the interactive path to continue a conversation across HTTP turns
+    /// (ADR-038 Phase 2, milestone 4, `cli_session_id` continuity).
+    /// Only meaningful for `run_interactive`; ignored by `run` and
+    /// `continue_conversation`.
+    pub resume_session_id: Option<String>,
+    /// Ephemeral loopback MCP bridge exposing only this request's scoped tools.
+    pub mcp_server: Option<McpServerConfig>,
 }
 
 pub struct AiRunResult {
@@ -63,15 +147,111 @@ pub struct AiCliStatus {
     pub setup_hint: Option<String>,
 }
 
+/// Model and reasoning capabilities reported by the installed provider CLI.
+/// Both provider-status UI and chat validation consume this shape so a model
+/// advertised by a harness cannot be rejected by a separate static catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCliModelCapability {
+    pub id: String,
+    pub name: String,
+    pub reasoning_options: Vec<String>,
+    pub default_reasoning_option: Option<String>,
+}
+
+pub async fn discover_model_capabilities(provider: &str) -> Vec<AiCliModelCapability> {
+    match create_provider(provider) {
+        Some(provider) => provider.discover_model_capabilities().await,
+        None => Vec::new(),
+    }
+}
+
 #[async_trait]
 pub trait AiCliProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn check_installed(&self) -> bool;
     async fn get_status(&self) -> AiCliStatus;
+    async fn discover_model_capabilities(&self) -> Vec<AiCliModelCapability> {
+        Vec::new()
+    }
+    fn extract_assistant_text(&self, _line: &str) -> Option<String> {
+        None
+    }
+    fn extract_partial_text(&self, _line: &str) -> Option<String> {
+        None
+    }
+    fn dropped_tool_use_name(&self, _line: &str) -> Option<String> {
+        None
+    }
+
+    async fn capabilities(&self) -> Option<temps_ai::ProviderCapabilities> {
+        let registration = find_provider(self.name())?;
+        let models = self
+            .discover_model_capabilities()
+            .await
+            .into_iter()
+            .map(|model| temps_ai::ModelCapability {
+                id: model.id,
+                name: model.name,
+                thinking_modes: model
+                    .reasoning_options
+                    .into_iter()
+                    .map(|id| temps_ai::SelectOption {
+                        name: display_option_name(&id),
+                        id,
+                        description: Some("Supported by this model".to_string()),
+                    })
+                    .collect(),
+                default_thinking_mode_id: model.default_reasoning_option,
+            })
+            .collect::<Vec<_>>();
+        Some(temps_ai::ProviderCapabilities {
+            id: registration.id.to_string(),
+            name: registration.name.to_string(),
+            auth_source: temps_ai::ProviderAuthSource::HostEnvironment,
+            default_model_id: models.first().map(|model| model.id.clone()),
+            models,
+            permission_modes: registration
+                .permission_modes
+                .iter()
+                .map(|mode| temps_ai::SelectOption {
+                    id: mode.id.to_string(),
+                    name: mode.name.to_string(),
+                    description: Some(mode.description.to_string()),
+                })
+                .collect(),
+            default_permission_mode_id: Some(registration.default_permission_mode_id.to_string()),
+            realtime: temps_ai::RealtimeCapabilities {
+                text_streaming: registration.text_streaming,
+                reasoning_streaming: registration.reasoning_streaming,
+                tool_events: true,
+                user_interactions: registration.user_interactions,
+                cancellation: true,
+            },
+        })
+    }
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
+    /// Execute one normalized chat turn. Most adapters use their regular run
+    /// protocol; adapters with a bidirectional interaction protocol override
+    /// this without requiring a special path in ConversationService.
+    async fn run_turn(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
+        self.run(config).await
+    }
     /// Continue an existing conversation in the same work directory.
     /// Uses `--continue` to resume the most recent session.
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError>;
+}
+
+fn display_option_name(id: &str) -> String {
+    match id {
+        "xhigh" => "Extra high".to_string(),
+        value => {
+            let mut characters = value.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// Parse raw CLI output into the common parsed shape for any provider.
@@ -101,6 +281,45 @@ pub fn parse_output(provider: &str, output: &str) -> claude::ParsedClaudeOutput 
         }
         _ => claude::parse_claude_output(output),
     }
+}
+
+/// Extract the human-readable assistant text carried by one line of a
+/// provider's structured CLI output, or `None` when the line is a
+/// system/hook/tool-call/usage-only event with nothing to show a user.
+///
+/// Every provider here is invoked with a JSON-lines output flag
+/// (`--output-format stream-json`, `--json`, `--format json`) so its stdout
+/// is NDJSON, not plain prose — a caller that forwards raw lines as if they
+/// were chat tokens ends up displaying the wire protocol (hook events, rate
+/// limit frames, tool-call deltas) instead of the answer. Each provider's
+/// schema differs, so dispatch on `provider` (an `AiCliProvider::name()`
+/// value) the same way [`parse_output`] does.
+pub fn extract_assistant_text(provider: &str, line: &str) -> Option<String> {
+    create_provider(provider)?.extract_assistant_text(line)
+}
+
+/// Extract one incremental text delta from a line, for providers whose CLI
+/// exposes real token-by-token streaming — currently only `claude_cli` (via
+/// `--include-partial-messages`; see [`claude::extract_partial_text`]).
+/// Codex's and OpenCode's `--json`/`--format json` output has no equivalent
+/// delta event today, so they always return `None` here — callers must fall
+/// back to [`extract_assistant_text`] for those providers, which still
+/// delivers the full reply, just not incrementally.
+pub fn extract_partial_text(provider: &str, line: &str) -> Option<String> {
+    create_provider(provider)?.extract_partial_text(line)
+}
+
+/// Name the tool/action a dropped event invoked, when `line` is a tool call
+/// or other non-text event that CLI-chat cannot bridge back to the user
+/// (ADR-038) — e.g. `AskUserQuestion`, `ExitPlanMode`, `command_execution`.
+/// Returns `None` when `line` isn't one of these (including whenever
+/// [`extract_assistant_text`] already returned text for it).
+///
+/// Callers use this only to `warn!`-log the tool name for operator
+/// diagnostics — never log the returned name's surrounding `input`/`part`
+/// data, which may carry user content or command output.
+pub fn dropped_tool_use_name(provider: &str, line: &str) -> Option<String> {
+    create_provider(provider)?.dropped_tool_use_name(line)
 }
 
 /// Turn a failed CLI's raw stream output into a short, actionable message.
@@ -144,6 +363,18 @@ pub fn summarize_cli_failure(provider: &str, output: &str) -> String {
                 if !msg.trim().is_empty() {
                     return scrub_and_bound(msg);
                 }
+            }
+        }
+        // OpenCode can exit successfully while reporting a provider/auth
+        // failure as a JSON event. Surface its human message instead of
+        // treating the run as an empty successful reply.
+        if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+            let message = v
+                .pointer("/error/data/message")
+                .or_else(|| v.pointer("/error/message"))
+                .and_then(|message| message.as_str());
+            if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+                return scrub_and_bound(message);
             }
         }
     }
@@ -205,24 +436,35 @@ pub fn scrub_and_bound(s: &str) -> String {
 
 /// Create an AI CLI provider by name
 pub fn create_provider(name: &str) -> Option<Box<dyn AiCliProvider>> {
-    match name {
-        "claude_cli" => Some(Box::new(claude::ClaudeCliProvider)),
-        "codex_cli" => Some(Box::new(codex::CodexCliProvider)),
-        "opencode" => Some(Box::new(opencode::OpenCodeCliProvider)),
-        _ => None,
-    }
+    find_provider(name).map(|registration| (registration.factory)())
 }
-
-/// All supported provider names.
-pub const PROVIDER_NAMES: &[(&str, &str)] = &[
-    ("claude_cli", "Claude Code"),
-    ("opencode", "OpenCode"),
-    ("codex_cli", "Codex"),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitized_harness_environment_drops_server_secrets() {
+        let mut command = Command::new("provider");
+        command.env("DATABASE_URL", "postgres://secret");
+        command.env("TEMPS_ENCRYPTION_KEY", "secret");
+        sanitize_command_environment(&mut command);
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(environment.get("DATABASE_URL"), None);
+        assert_eq!(environment.get("TEMPS_ENCRYPTION_KEY"), None);
+        if std::env::var_os("PATH").is_some() {
+            assert!(environment.contains_key("PATH"));
+        }
+    }
 
     #[test]
     fn test_summarize_cli_failure_rate_limit_rejected() {
@@ -240,6 +482,15 @@ mod tests {
         assert_eq!(
             summarize_cli_failure("claude_cli", output),
             "Invalid API key"
+        );
+    }
+
+    #[test]
+    fn test_summarize_opencode_zero_exit_error_frame() {
+        let output = r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}"#;
+        assert_eq!(
+            summarize_cli_failure("opencode", output),
+            "Token refresh failed: 401"
         );
     }
 

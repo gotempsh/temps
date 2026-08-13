@@ -446,6 +446,25 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Max seconds to wait for containers to start on wake (5-120). Default: 30.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_timeout_seconds: Option<i32>,
+    /// Override the proxy's timeout for regular (non-streaming) HTTP requests
+    /// to this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+    /// operator's global hard ceiling regardless of what's set here.
+    /// Absent leaves the current value unchanged. Send JSON `null` to clear
+    /// the override (inherit the project/global default).
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub request_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's idle timeout for Server-Sent Events streams to
+    /// this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
+    /// operator's global hard ceiling. Absent leaves the current value
+    /// unchanged. Send JSON `null` to clear the override.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub sse_idle_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's idle timeout for WebSocket connections to this
+    /// environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's
+    /// global hard ceiling. Absent leaves the current value unchanged. Send
+    /// JSON `null` to clear the override.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub websocket_idle_timeout_seconds: Option<Option<i32>>,
     /// Set a password to protect this environment. The proxy will show an HTML
     /// password form before allowing access. The password is bcrypt-hashed
     /// server-side and never stored in plaintext.

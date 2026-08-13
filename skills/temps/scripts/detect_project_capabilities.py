@@ -135,7 +135,14 @@ def candidate_files(root: Path):
 
 
 def read_candidate(path: Path) -> str | None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Opening a FIFO read-only blocks until a writer connects. Open candidates
+    # non-blocking first, then use fstat on the descriptor as the authoritative
+    # file-type check before reading any bytes.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError:

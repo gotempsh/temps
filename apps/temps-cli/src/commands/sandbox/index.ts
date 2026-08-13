@@ -320,6 +320,10 @@ export function registerSandboxCommands(program: Command): void {
       '--preview-password-length <n>',
       'Length of the generated preview password (8..=256, default 24)',
     )
+    .option(
+      '--from-snapshot <snap-id>',
+      'Create sandbox from a snapshot (mutually exclusive with --image)',
+    )
     .option('--json', 'Output as JSON')
     .action(createAction)
 
@@ -464,6 +468,47 @@ export function registerSandboxCommands(program: Command): void {
     .description('Create a directory inside the sandbox (mkdir -p)')
     .requiredOption('--path <path>', 'Absolute path inside the sandbox')
     .action(fsMkdirAction)
+
+  // ── Snapshot subgroup (ADR-037) ──
+  const snaps = sandbox.command('snapshots').description('Manage sandbox snapshots (ADR-037)')
+
+  sandbox
+    .command('snapshot <id>')
+    .description('Take a snapshot of a sandbox')
+    .option('--label <label>', 'Human-readable label for the snapshot')
+    .option('--wait', 'Wait until the snapshot reaches ready or failed status')
+    .option('--json', 'Output as JSON')
+    .action(snapshotCreateAction)
+
+  snaps
+    .command('list')
+    .alias('ls')
+    .description('List your snapshots')
+    .option('--project <id>', 'Filter by project ID')
+    .option('--status <status>', 'Filter by status: creating | ready | failed | deleted')
+    .option('--page <n>', 'Page number (1-indexed)')
+    .option('--page-size <n>', 'Items per page (default 20, max 100)')
+    .option('--json', 'Output as JSON')
+    .action(snapshotListAction)
+
+  snaps
+    .command('show <snapId>')
+    .description('Show details for a snapshot')
+    .option('--json', 'Output as JSON')
+    .action(snapshotShowAction)
+
+  snaps
+    .command('delete <snapId>')
+    .alias('rm')
+    .description('Delete a snapshot permanently')
+    .option('-f, --force', 'Skip confirmation prompt')
+    .action(snapshotDeleteAction)
+
+  snaps
+    .command('storage')
+    .description('Show snapshot storage usage and quota')
+    .option('--json', 'Output as JSON')
+    .action(snapshotStorageAction)
 }
 
 // ── Actions ─────────────────────────────────────────────────────────────────
@@ -489,6 +534,7 @@ interface CreateOptions {
   repo?: string
   branch?: string
   newBranch?: string
+  fromSnapshot?: string
   json?: boolean
 }
 
@@ -566,7 +612,12 @@ async function createAction(options: CreateOptions): Promise<void> {
   const api = await auth()
   const env = parseEnvPairs(options.env)
 
+  if (options.fromSnapshot && options.image) {
+    throw new Error("--from-snapshot and --image are mutually exclusive")
+  }
+
   const body: Record<string, unknown> = {}
+  if (options.fromSnapshot) body.from_snapshot = options.fromSnapshot
   if (options.image) body.image = options.image
   if (options.name) body.name = options.name
   if (options.timeout !== undefined) body.timeout_secs = Number(options.timeout)
@@ -1233,4 +1284,255 @@ async function fsMkdirAction(id: string, options: { path: string }): Promise<voi
     }),
   )
   success(`Directory ${colors.primary(options.path)} created`)
+}
+
+// ── Snapshot API helpers ─────────────────────────────────────────────────────
+
+/**
+ * Build URL for the flat `/v1/sandbox-snapshots/...` collection routes.
+ * These live at a different root than `/v1/sandboxes/...`.
+ */
+function snapshotUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/v1/sandbox-snapshots${path}`
+}
+
+interface SnapshotResponse {
+  id: string
+  status: string
+  backend: string
+  label: string | null
+  content_digest: string
+  size_bytes: number
+  image_ref: string | null
+  // source_sandbox_id intentionally omitted: the backend omits the raw
+  // internal DB integer to avoid leaking the source sandbox's sequential ID.
+  project_id: number | null
+  created_at: string
+  updated_at: string
+}
+
+interface ListSnapshotsResponse {
+  snapshots: SnapshotResponse[]
+  total: number
+  page: number
+  page_size: number
+}
+
+interface StorageSummaryResponse {
+  total_bytes: number
+  snapshot_count: number
+  quota_bytes: number
+  // null when the platform disk-space check is not yet implemented (deferred).
+  // Treat null as "unknown", not "zero bytes available".
+  available_disk_bytes: number | null
+}
+
+async function snapshotApiRequest<T>(
+  api: SandboxApi,
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(init.headers)
+  headers.set('Authorization', `Bearer ${api.apiKey}`)
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const response = await fetch(snapshotUrl(api.baseUrl, path), { ...init, headers })
+
+  if (!response.ok) {
+    throw await readApiError(response)
+  }
+
+  if (response.status === 204) {
+    return undefined as T
+  }
+
+  return (await response.json()) as T
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`
+}
+
+function snapshotStatusColor(status: string): string {
+  if (status === 'ready') return colors.success(status)
+  if (status === 'failed' || status === 'deleted') return colors.error(status)
+  if (status === 'creating') return colors.warning(status)
+  return status
+}
+
+// ── Snapshot actions ─────────────────────────────────────────────────────────
+
+async function snapshotCreateAction(
+  sandboxId: string,
+  options: { label?: string; wait?: boolean; json?: boolean },
+): Promise<void> {
+  const api = await auth()
+  const body: Record<string, unknown> = {}
+  if (options.label) body.label = options.label
+
+  const snap = await withSpinner('Creating snapshot…', () =>
+    apiRequest<SnapshotResponse>(
+      api,
+      `/${encodeURIComponent(sandboxId)}/snapshots`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  )
+
+  // Poll until ready/failed if --wait
+  let finalSnap = snap
+  if (options.wait && snap.status === 'creating') {
+    finalSnap = await withSpinner('Waiting for snapshot to be ready…', async () => {
+      let current = snap
+      let attempts = 0
+      const maxAttempts = 120 // 120 × 5s = 10 min
+      while (current.status === 'creating' && attempts < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 5000))
+        current = await snapshotApiRequest<SnapshotResponse>(api, `/${encodeURIComponent(current.id)}`)
+        attempts++
+      }
+      return current
+    })
+  }
+
+  if (options.json) {
+    json(finalSnap)
+    return
+  }
+
+  if (finalSnap.status === 'creating') {
+    info(`Snapshot ${colors.primary(finalSnap.id)} is still being created.`)
+    info(`Poll with: temps sandbox snapshots show ${finalSnap.id}`)
+    info(`Create sandbox from it with: temps sandbox create --from-snapshot ${finalSnap.id}`)
+  } else if (finalSnap.status === 'ready') {
+    success(`Snapshot ${colors.primary(finalSnap.id)} is ready`)
+  } else {
+    warning(`Snapshot ${colors.primary(finalSnap.id)} is in status: ${finalSnap.status}`)
+  }
+  keyValue('ID', finalSnap.id)
+  keyValue('Status', snapshotStatusColor(finalSnap.status))
+  keyValue('Size', formatBytes(finalSnap.size_bytes))
+  if (finalSnap.label) keyValue('Label', finalSnap.label)
+  keyValue('Backend', finalSnap.backend)
+  keyValue('Created', finalSnap.created_at)
+}
+
+async function snapshotListAction(options: {
+  project?: string
+  status?: string
+  page?: string
+  pageSize?: string
+  json?: boolean
+}): Promise<void> {
+  const api = await auth()
+
+  const params = new URLSearchParams()
+  if (options.project) params.set('project_id', options.project)
+  if (options.status) params.set('status', options.status)
+  if (options.page) params.set('page', options.page)
+  if (options.pageSize) params.set('page_size', options.pageSize)
+  const qs = params.toString() ? `?${params.toString()}` : ''
+
+  const res = await withSpinner('Fetching snapshots…', () =>
+    snapshotApiRequest<ListSnapshotsResponse>(api, `${qs}`),
+  )
+
+  if (options.json) {
+    json(res)
+    return
+  }
+
+  if (res.snapshots.length === 0) {
+    info('No snapshots found.')
+    return
+  }
+
+  const columns: TableColumn<SnapshotResponse>[] = [
+    { header: 'ID', accessor: (s) => colors.primary(s.id) },
+    { header: 'Status', accessor: (s) => snapshotStatusColor(s.status) },
+    { header: 'Backend', key: 'backend' },
+    { header: 'Label', accessor: (s) => s.label ?? '-' },
+    { header: 'Size', accessor: (s) => formatBytes(s.size_bytes) },
+    { header: 'Created', key: 'created_at' },
+  ]
+
+  newline()
+  printTable(res.snapshots, columns)
+  newline()
+  info(`Page ${res.page} of ${Math.ceil(res.total / res.page_size)} — ${res.total} total`)
+}
+
+async function snapshotShowAction(snapId: string, options: { json?: boolean }): Promise<void> {
+  const api = await auth()
+  const snap = await withSpinner('Fetching snapshot…', () =>
+    snapshotApiRequest<SnapshotResponse>(api, `/${encodeURIComponent(snapId)}`),
+  )
+
+  if (options.json) {
+    json(snap)
+    return
+  }
+
+  newline()
+  keyValue('ID', snap.id)
+  keyValue('Status', snapshotStatusColor(snap.status))
+  keyValue('Backend', snap.backend)
+  if (snap.label) keyValue('Label', snap.label)
+  keyValue('Size', formatBytes(snap.size_bytes))
+  keyValue('Digest', snap.content_digest)
+  if (snap.image_ref) keyValue('Image ref', snap.image_ref)
+  keyValue('Created', snap.created_at)
+  keyValue('Updated', snap.updated_at)
+  newline()
+  if (snap.status === 'ready') {
+    info(`Restore with: temps sandbox create --from-snapshot ${snap.id}`)
+  }
+}
+
+async function snapshotDeleteAction(snapId: string, options: { force?: boolean }): Promise<void> {
+  if (!options.force) {
+    const confirmed = await promptConfirm({
+      message: `Delete snapshot ${snapId}? This cannot be undone.`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Aborted.')
+      return
+    }
+  }
+
+  const api = await auth()
+  await withSpinner('Deleting snapshot…', () =>
+    snapshotApiRequest<void>(api, `/${encodeURIComponent(snapId)}`, { method: 'DELETE' }),
+  )
+  success(`Snapshot ${colors.primary(snapId)} deleted`)
+}
+
+async function snapshotStorageAction(options: { json?: boolean }): Promise<void> {
+  const api = await auth()
+  const summary = await withSpinner('Fetching storage summary…', () =>
+    snapshotApiRequest<StorageSummaryResponse>(api, '/storage-summary'),
+  )
+
+  if (options.json) {
+    json(summary)
+    return
+  }
+
+  newline()
+  keyValue('Snapshots', String(summary.snapshot_count))
+  keyValue('Used', `${formatBytes(summary.total_bytes)} / ${formatBytes(summary.quota_bytes)}`)
+  keyValue(
+    'Available on disk',
+    summary.available_disk_bytes !== null ? formatBytes(summary.available_disk_bytes) : 'unknown',
+  )
+  const pct = summary.quota_bytes > 0
+    ? ((summary.total_bytes / summary.quota_bytes) * 100).toFixed(1)
+    : '0.0'
+  keyValue('Quota used', `${pct}%`)
+  newline()
 }

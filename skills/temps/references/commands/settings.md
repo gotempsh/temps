@@ -42,6 +42,10 @@ Update platform settings
 | `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | No |
 | `--rate-limiting-rpm <rpm>` | Requests per minute | - | No |
 | `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | No |
+| `--max-request-timeout <seconds>` | Hard ceiling for all upstream request/idle timeouts, in seconds | - | No |
+| `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
+| `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
+| `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`

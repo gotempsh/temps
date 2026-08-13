@@ -197,6 +197,34 @@ pub struct SandboxCreateConfig {
     pub owner_user_id: Option<i32>,
 }
 
+/// Artifact produced by a successful [`SandboxProvider::take_snapshot`] call.
+///
+/// Contains everything the service layer needs to persist the snapshot row and
+/// to re-hydrate the snapshot on restore. It is a plain data struct, not a
+/// trait object — no provider-specific types leak across the boundary.
+///
+/// ADR-037 §2 describes the full design.
+#[derive(Debug, Clone)]
+pub struct SnapshotArtifact {
+    /// Content-addressed path on the host: `$TEMPS_DATA_DIR/snapshots/<digest>.tar`.
+    /// Written atomically (write to temp path, rename on close) by the provider.
+    pub content_path: std::path::PathBuf,
+    /// SHA-256 hex of the tarball. The canonical store key — two snapshots
+    /// with identical content share one file on disk (dedup on digest).
+    pub content_digest: String,
+    /// Approximate size of the tarball in bytes.
+    pub size_bytes: u64,
+    /// Which backend produced this artifact. Cross-backend restore is rejected
+    /// with 422 at the service layer (a Docker tar cannot boot as a Firecracker
+    /// rootfs, and vice versa).
+    pub backend: SandboxBackend,
+    /// For Docker: the daemon image tag `temps-snapshot/<public_id>:latest`
+    /// that was committed before exporting. Stored so the restore path can
+    /// confirm (or re-import) the image in the daemon without parsing the
+    /// tarball name.
+    pub image_ref: Option<String>,
+}
+
 /// A cached rootfs image (Firecracker backend). Digest-keyed build artifact
 /// shared by all VMs created from the same image.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -572,6 +600,86 @@ pub trait SandboxProvider: Send + Sync {
                 self.name()
             ),
         })
+    }
+
+    /// Capture the current state of `handle` as a reusable [`SnapshotArtifact`].
+    ///
+    /// The sandbox should be stopped before calling this (the service layer is
+    /// responsible for quiescing). For Docker, this executes the three-step
+    /// credential-scrubbing protocol from ADR-037 §4 before committing:
+    ///
+    /// 1. Shred `/etc/temps/credential-daemon.env` inside the container.
+    /// 2. Strip injected env vars from the committed image config.
+    /// 3. Reject the snapshot if any known-sensitive key pattern survives.
+    ///
+    /// `label` is a human-readable annotation stored on the DB row; it is
+    /// **not** used as part of the content-addressed file name.
+    ///
+    /// **Default: returns `AgentError::SandboxExecFailed` ("not supported").**
+    /// Backends other than Docker leave this default until their snapshot
+    /// support lands in a separate ADR.
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        label: Option<String>,
+    ) -> Result<SnapshotArtifact, AgentError> {
+        let _ = label;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "take_snapshot is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Create and start a new sandbox seeded from a previously-taken
+    /// [`SnapshotArtifact`] instead of a base image.
+    ///
+    /// For Docker: ensures the snapshot image tag is present in the daemon
+    /// (loading from the tarball if absent), then passes `artifact.image_ref`
+    /// as the `image` in the container create config. The resulting handle
+    /// is indistinguishable from one created from any other image.
+    ///
+    /// The caller is responsible for verifying that `artifact.backend` matches
+    /// the target provider's backend before calling — the service layer does
+    /// this check and returns 422 on mismatch.
+    ///
+    /// **Default: returns `AgentError::SandboxExecFailed` ("not supported").**
+    async fn create_from_snapshot(
+        &self,
+        artifact: &SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let _ = artifact;
+        let _ = config;
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: String::new(),
+            reason: format!(
+                "create_from_snapshot is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Remove a snapshot image from the backend's image store.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted. Failure is logged but does not fail the delete — the
+    /// tarball (the source of truth) is already removed; an orphaned image
+    /// tag is cleaned up on the next GC or by the operator.
+    ///
+    /// **Default: a no-op with a debug log.** Backends other than Docker (e.g.
+    /// Local, Firecracker) have no image store concept and leave this default.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(
+            image_ref = %image_ref,
+            provider = %self.name(),
+            "delete_image: provider does not support image deletion (no-op)"
+        );
+        Ok(())
     }
 
     /// Provider name for logging and error messages.

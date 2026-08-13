@@ -383,6 +383,14 @@ impl OtelService {
         self.storage.count_traces(query).await
     }
 
+    /// Whether `project_id` has ever received at least one span — the
+    /// existence check backing onboarding/setup UI. Cheaper than
+    /// `count_traces`/`query_trace_summaries` for that purpose: see
+    /// [`crate::storage::OtelStorage::has_traces`].
+    pub async fn has_traces(&self, project_id: i32) -> Result<bool, OtelError> {
+        self.storage.has_traces(project_id).await
+    }
+
     pub async fn get_trace(
         &self,
         project_id: i32,

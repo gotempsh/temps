@@ -17,6 +17,13 @@ pub fn generate() -> String {
     format!("{}{}", PUBLIC_ID_PREFIX, hex::encode(bytes))
 }
 
+/// Generate a new opaque public ID with a custom prefix (e.g. `snap_`).
+pub fn generate_with_prefix(prefix: &str) -> String {
+    let mut bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    format!("{}_{}", prefix, hex::encode(bytes))
+}
+
 /// Returns true iff `s` has the expected `sbx_` prefix and hex suffix.
 /// Used at the HTTP boundary to reject malformed path parameters before
 /// they hit the DB.

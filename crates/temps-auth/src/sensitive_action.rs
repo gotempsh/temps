@@ -405,13 +405,18 @@ mod tests {
             "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
         )
         .expect("test MFA secret is valid base32");
-        let secret_bytes = totp_rs::Secret::Raw(secret)
-            .to_bytes()
-            .expect("test MFA secret converts to bytes");
-        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret_bytes)
-            .expect("test TOTP initializes")
+        // In totp-rs 6.0.0: Secret::Raw is gone (Secret is now a struct, not an
+        // enum). Raw bytes become Secret via From<Vec<u8>>. TOTP::new is gone;
+        // use Builder. generate_current() returns Token (Display), not Result.
+        totp_rs::Builder::new()
+            .with_algorithm(totp_rs::Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(secret)
+            .build_noncompliant()
             .generate_current()
-            .expect("test clock generates a TOTP")
+            .to_string()
     }
 
     #[tokio::test]

@@ -75,6 +75,7 @@ members = [
     "crates/temps-embeddings",
     "crates/temps-plugin-sdk",
     "crates/temps-wireguard",
+    "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
     "crates/temps-agents",
     "crates/temps-agents-mcp-proxy",
@@ -193,7 +194,7 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 # ============================================================================
 utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
-schemars = { version = "0.8", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
 
 # ============================================================================
 # Cryptography & Security
@@ -201,7 +202,7 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 argon2 = "0.5"
 aes-gcm = "0.11.0"
 hkdf = "0.13"
-totp-rs = "5.7.0"
+totp-rs = "6.0.0"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 sha2 = "0.11.0"
 base64 = "0.23"

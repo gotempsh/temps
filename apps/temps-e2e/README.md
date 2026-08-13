@@ -53,6 +53,50 @@ temps api-key \
   --name=e2e --role=admin --user-email=you@example.com --output-format=json
 ```
 
+## AI chat evals (Claude/Codex subscriptions)
+
+The Promptfoo suite exercises the real Temps chat HTTP/SSE boundary and runs
+the same read-only prompts through both `claude_cli` and `codex_cli`. It does
+not invoke either CLI directly and never reads, copies, or prints
+`~/.claude/*` or `~/.codex/auth.json`. Claude/Codex subscription authentication
+remains owned by the running Temps process, exactly as it is in the product.
+
+Prerequisites:
+
+- Start Temps with Claude Code and/or Codex already authenticated on that host.
+- Enable AI chat for a disposable project.
+- Mint a human-user API key with access to that project and the host-provider
+  permissions required by the selected harnesses. Codex host execution requires
+  a system administrator; the API still applies that user's project access.
+
+Run the local-only, non-destructive suite:
+
+```bash
+cd apps/temps-e2e
+export TEMPS_URL=http://localhost:3021
+export TEMPS_API_KEY=tk_...              # never put this in a tracked file
+export TEMPS_AI_EVAL_PROJECT_ID=1
+bun run ai:eval
+```
+
+The default cases only read accessible projects, managed-service inventory,
+and project environments. They do not enable write actions, approve proposals,
+or create infrastructure. Each provider/case gets an isolated temporary chat,
+which is archived after the result is collected. Set
+`TEMPS_AI_EVAL_KEEP_CONVERSATIONS=1` only when debugging a failed run.
+
+Optional model overrides are
+`TEMPS_AI_EVAL_CLAUDE_MODEL` / `TEMPS_AI_EVAL_CODEX_MODEL`; optional thinking
+overrides are `TEMPS_AI_EVAL_CLAUDE_THINKING` /
+`TEMPS_AI_EVAL_CODEX_THINKING`. When omitted, Temps uses the harness's current
+defaults. Promptfoo caching and telemetry are disabled by the package script,
+and its local result database is stored under the gitignored `.promptfoo/`
+directory. Do not use Promptfoo sharing/upload commands for these results.
+
+To intentionally evaluate a remote instance, it must use HTTPS and you must
+set `TEMPS_AI_EVAL_ALLOW_REMOTE=1`. This explicit gate prevents accidentally
+sending a Temps API key to an arbitrary URL.
+
 ## Commands
 
 ```bash

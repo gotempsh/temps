@@ -15,7 +15,7 @@ use temps_core::UtcDateTime;
 use temps_entities::types::RoleType;
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Algorithm, Builder};
 use tracing::{debug, error, info, warn};
 
 const MAX_USER_EMAIL_BYTES: usize = 254;
@@ -174,16 +174,18 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Raw(secret).to_bytes().map_err(|error| {
-            UserServiceError::Mfa(format!("Failed to create TOTP secret: {}", error))
-        })?,
-    )
-    .map_err(|error| UserServiceError::Mfa(format!("Failed to create TOTP: {}", error)))?;
+    // Validate that the generated secret can produce a well-formed TOTP.
+    // In totp-rs 6.0.0 Secret is a struct (From<Vec<u8>>) and Builder replaces
+    // TOTP::new. Use `build()` (not `build_noncompliant()`) so this validation
+    // actually enforces RFC digit/secret-length checks instead of always passing.
+    Builder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(secret.clone())
+        .build()
+        .map_err(|error| UserServiceError::Mfa(format!("Failed to create TOTP: {}", error)))?;
 
     let otp_auth_url = format!(
         "otpauth://totp/Temps:{}?secret={}&issuer=Temps&algorithm=SHA1&digits=6&period=30",
@@ -914,26 +916,22 @@ impl UserService {
             .clone()
             .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
-        // Verify TOTP code
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            Secret::Raw(
-                base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret).ok_or_else(
-                    || UserServiceError::Mfa("Invalid MFA secret encoding".to_string()),
-                )?,
-            )
-            .to_bytes()
-            .map_err(|e| UserServiceError::Mfa(format!("Invalid MFA secret: {}", e)))?,
-        )
-        .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
+        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
+        // Builder replaces TOTP::new, and check_current returns Option<u64> not
+        // Result<bool, _>. The enrolled params (SHA1 / 6 digits / skew 1 / 30s) must
+        // match what generate_mfa_setup_candidate used.
+        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
+            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
+        let totp = Builder::new()
+            .with_algorithm(Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(decoded)
+            .build()
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
-        if totp
-            .check_current(code)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify code: {}", e)))?
-        {
+        if totp.check_current(code).is_some() {
             // Enable MFA
             let mut user_update: temps_entities::users::ActiveModel = user.into();
             user_update.mfa_enabled = Set(true);
@@ -1025,24 +1023,21 @@ impl UserService {
             }
         }
 
-        // Verify TOTP code
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            Secret::Raw(
-                base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret).ok_or_else(
-                    || UserServiceError::Mfa("Invalid MFA secret encoding".to_string()),
-                )?,
-            )
-            .to_bytes()
-            .map_err(|e| UserServiceError::Mfa(format!("Invalid MFA secret: {}", e)))?,
-        )
-        .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
+        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
+        // Builder replaces TOTP::new, and check_current returns Option<u64> not
+        // Result<bool, _>. The enrolled params must match generate_mfa_setup_candidate.
+        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
+            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
+        let totp = Builder::new()
+            .with_algorithm(Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(decoded)
+            .build()
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
-        totp.check_current(code)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))
+        Ok(totp.check_current(code).is_some())
     }
 
     async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {

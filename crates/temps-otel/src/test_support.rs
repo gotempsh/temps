@@ -698,6 +698,11 @@ impl OtelStorage for MockOtelStorage {
         Ok(count as u64)
     }
 
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let spans = self.spans.lock().unwrap();
+        Ok(spans.iter().any(|span| span.project_id == project_id))
+    }
+
     async fn apply_retention(&self, _project_id: i32) -> StorageResult<u64> {
         Ok(0)
     }

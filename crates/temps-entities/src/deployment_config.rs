@@ -374,6 +374,33 @@ pub struct DeploymentConfig {
     /// Requests return 503 if exceeded. Default: 30.
     #[serde(default = "default_wake_timeout")]
     pub wake_timeout_seconds: i32,
+
+    /// Override for the proxy's upstream timeout on regular (non-streaming)
+    /// HTTP requests to this project/environment, in seconds.
+    /// `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+    /// (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+    /// "no timeout" for this project/environment, overriding a nonzero
+    /// global default. `Some(n)` for `n > 0` sets an explicit timeout,
+    /// always clamped to the global hard ceiling
+    /// (`request_timeouts.max_request_timeout_seconds`) at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's idle timeout on Server-Sent Events streams to
+    /// this project/environment, in seconds. `None` = inherit the global
+    /// `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+    /// the global hard ceiling at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_idle_timeout_seconds: Option<i32>,
+
+    /// Override for the proxy's idle timeout on WebSocket connections to this
+    /// project/environment, in seconds. `None` = inherit the global
+    /// `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+    /// explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+    /// the global hard ceiling at resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<i32>,
 }
 
 /// Deployment configuration snapshot for deployments
@@ -465,6 +492,9 @@ impl Default for DeploymentConfig {
             on_demand: false,
             idle_timeout_seconds: 300,
             wake_timeout_seconds: 30,
+            request_timeout_seconds: None,
+            sse_idle_timeout_seconds: None,
+            websocket_idle_timeout_seconds: None,
         }
     }
 }
@@ -554,6 +584,15 @@ impl DeploymentConfig {
             } else {
                 self.wake_timeout_seconds
             },
+            request_timeout_seconds: other
+                .request_timeout_seconds
+                .or(self.request_timeout_seconds),
+            sse_idle_timeout_seconds: other
+                .sse_idle_timeout_seconds
+                .or(self.sse_idle_timeout_seconds),
+            websocket_idle_timeout_seconds: other
+                .websocket_idle_timeout_seconds
+                .or(self.websocket_idle_timeout_seconds),
         }
     }
 
@@ -603,6 +642,29 @@ impl DeploymentConfig {
                     "Wake timeout {} is not in valid range (5-120 seconds)",
                     self.wake_timeout_seconds
                 ));
+            }
+        }
+
+        // Sanity bounds only — the operator's hard ceiling
+        // (`AppSettings.request_timeouts.max_request_timeout_seconds`) is
+        // enforced separately at resolution time, since this type has no
+        // access to global settings. `0` is a valid explicit "no timeout"
+        // override (same uncapped-sentinel convention as `cpu_limit`/
+        // `memory_limit` above), so the floor is 0, not 1.
+        for (name, value) in [
+            ("Request timeout", self.request_timeout_seconds),
+            ("SSE idle timeout", self.sse_idle_timeout_seconds),
+            (
+                "WebSocket idle timeout",
+                self.websocket_idle_timeout_seconds,
+            ),
+        ] {
+            if let Some(seconds) = value {
+                if !(0..=86400).contains(&seconds) {
+                    return Err(format!(
+                        "{name} {seconds} is not in valid range (0-86400 seconds, 0 = no timeout)"
+                    ));
+                }
             }
         }
 
@@ -849,6 +911,89 @@ mod tests {
         };
         let json2 = serde_json::to_value(&config_no_nodes).unwrap();
         assert!(!json2.as_object().unwrap().contains_key("target_nodes"));
+    }
+
+    #[test]
+    fn request_timeout_fields_default_to_inherit() {
+        let config = DeploymentConfig::default();
+        assert_eq!(config.request_timeout_seconds, None);
+        assert_eq!(config.sse_idle_timeout_seconds, None);
+        assert_eq!(config.websocket_idle_timeout_seconds, None);
+    }
+
+    #[test]
+    fn merge_env_request_timeout_overrides_project() {
+        // Three-state semantics (like memory_limit, not the idle_timeout_seconds
+        // sentinel pattern): env None must inherit project's value, env Some
+        // must win outright.
+        let project = DeploymentConfig {
+            request_timeout_seconds: Some(30),
+            sse_idle_timeout_seconds: Some(1800),
+            websocket_idle_timeout_seconds: Some(1800),
+            ..Default::default()
+        };
+
+        let env_override = DeploymentConfig {
+            request_timeout_seconds: Some(10),
+            ..Default::default()
+        };
+        let merged = project.merge(&env_override);
+        assert_eq!(merged.request_timeout_seconds, Some(10));
+        // Env left these unset -> inherit project's values.
+        assert_eq!(merged.sse_idle_timeout_seconds, Some(1800));
+        assert_eq!(merged.websocket_idle_timeout_seconds, Some(1800));
+
+        let env_no_override = DeploymentConfig::default();
+        let merged2 = project.merge(&env_no_override);
+        assert_eq!(merged2.request_timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn request_timeout_fields_round_trip_and_omit_when_none() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(45),
+            sse_idle_timeout_seconds: Some(900),
+            websocket_idle_timeout_seconds: Some(1200),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        let deserialized: DeploymentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized, config);
+
+        let default_config = DeploymentConfig::default();
+        let json2 = serde_json::to_value(&default_config).unwrap();
+        let obj = json2.as_object().unwrap();
+        assert!(!obj.contains_key("requestTimeoutSeconds"));
+        assert!(!obj.contains_key("sseIdleTimeoutSeconds"));
+        assert!(!obj.contains_key("websocketIdleTimeoutSeconds"));
+    }
+
+    #[test]
+    fn request_timeout_validation_rejects_out_of_range() {
+        // 0 is a valid explicit "no timeout" override, not a validation error.
+        let no_timeout_override = DeploymentConfig {
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        assert!(no_timeout_override.validate().is_ok());
+
+        let negative = DeploymentConfig {
+            request_timeout_seconds: Some(-1),
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
+
+        let too_high = DeploymentConfig {
+            sse_idle_timeout_seconds: Some(90_000),
+            ..Default::default()
+        };
+        assert!(too_high.validate().is_err());
+
+        let ok = DeploymentConfig {
+            websocket_idle_timeout_seconds: Some(3600),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

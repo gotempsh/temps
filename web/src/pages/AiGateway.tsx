@@ -1,5 +1,5 @@
 import { Fragment, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -39,7 +40,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { CopyButton } from '@/components/ui/copy-button'
-import { CodeBlock } from '@/components/ui/code-block'
 import { CodeTabs, type CodeExample } from '@/components/ui/code-tabs'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
@@ -48,7 +48,15 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from '@/components/ui/chart'
-import { Bar, BarChart, Line, LineChart, XAxis, YAxis, CartesianGrid } from 'recharts'
+import {
+  Bar,
+  BarChart,
+  Line,
+  LineChart,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+} from 'recharts'
 import {
   Sheet,
   SheetContent,
@@ -97,6 +105,7 @@ import {
   Cpu,
   Hash,
   Info,
+  RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -105,8 +114,18 @@ import {
   deleteProviderKey,
   updateProviderKey,
   testProviderKeyById,
+  saveAiProviderCredential,
   type ProviderKeyResponse,
+  type ProviderCatalogDto,
 } from '@/api/client'
+import {
+  getAiProviderStatusOptions,
+  getAiProviderStatusQueryKey,
+  updateAiProviderPreferenceMutation,
+  listAiProvidersOptions,
+  listAiProvidersQueryKey,
+  refreshAiProviderStatusMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { useProjects } from '@/contexts/ProjectsContext'
 import {
@@ -116,6 +135,7 @@ import {
   aiProviderModels,
   getAiProvider,
 } from '@/lib/ai-providers'
+import { hostAuthLabel } from '@/lib/ai-cli-auth'
 // ============================================================================
 // Usage Analytics types & fetchers
 // ============================================================================
@@ -195,7 +215,10 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json()
 }
 
-function buildUsageUrl(path: string, params: Record<string, string | undefined>) {
+function buildUsageUrl(
+  path: string,
+  params: Record<string, string | undefined>
+) {
   const searchParams = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined) searchParams.set(key, value)
@@ -218,7 +241,10 @@ function formatCost(dollars: number): string {
   return `$${dollars.toFixed(6)}`
 }
 
-function findPricing(model: string, pricingMap: Map<string, ModelPricing>): ModelPricing | undefined {
+function findPricing(
+  model: string,
+  pricingMap: Map<string, ModelPricing>
+): ModelPricing | undefined {
   // Exact match first
   const exact = pricingMap.get(model)
   if (exact) return exact
@@ -293,13 +319,26 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
-function LogCostCell({ log, pricingMap }: { log: UsageLogEntry; pricingMap: Map<string, ModelPricing> }) {
-  const cost = computeCost(log.model, log.input_tokens, log.output_tokens, pricingMap)
+function LogCostCell({
+  log,
+  pricingMap,
+}: {
+  log: UsageLogEntry
+  pricingMap: Map<string, ModelPricing>
+}) {
+  const cost = computeCost(
+    log.model,
+    log.input_tokens,
+    log.output_tokens,
+    pricingMap
+  )
   return <>{cost > 0 ? formatCost(cost) : '—'}</>
 }
 
-function UsageAnalytics() {
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(TIME_RANGES[0])
+export function UsageAnalytics() {
+  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
+    TIME_RANGES[0]
+  )
 
   const timeParams = useMemo(() => {
     const to = new Date().toISOString()
@@ -317,7 +356,13 @@ function UsageAnalytics() {
   })
 
   const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
-    queryKey: ['aiUsage', 'timeseries', timeParams.from, timeParams.to, timeParams.bucket],
+    queryKey: [
+      'aiUsage',
+      'timeseries',
+      timeParams.from,
+      timeParams.to,
+      timeParams.bucket,
+    ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
         buildUsageUrl('timeseries', {
@@ -332,7 +377,10 @@ function UsageAnalytics() {
     queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
-        buildUsageUrl('by-provider', { from: timeParams.from, to: timeParams.to })
+        buildUsageUrl('by-provider', {
+          from: timeParams.from,
+          to: timeParams.to,
+        })
       ),
   })
 
@@ -340,7 +388,11 @@ function UsageAnalytics() {
     queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
-        buildUsageUrl('top-models', { from: timeParams.from, to: timeParams.to, limit: '10' })
+        buildUsageUrl('top-models', {
+          from: timeParams.from,
+          to: timeParams.to,
+          limit: '10',
+        })
       ),
   })
 
@@ -350,9 +402,13 @@ function UsageAnalytics() {
   const [recentPageSize, setRecentPageSize] = useState(20)
   const [recentProvider, setRecentProvider] = useState('all')
   const [recentStatus, setRecentStatus] = useState('all')
-  const [recentCostOp, setRecentCostOp] = useState<'gte' | 'gt' | 'lte' | 'lt'>('gte')
+  const [recentCostOp, setRecentCostOp] = useState<'gte' | 'gt' | 'lte' | 'lt'>(
+    'gte'
+  )
   const [recentCostInput, setRecentCostInput] = useState('')
-  const [recentTokensOp, setRecentTokensOp] = useState<'gte' | 'gt' | 'lte' | 'lt'>('gte')
+  const [recentTokensOp, setRecentTokensOp] = useState<
+    'gte' | 'gt' | 'lte' | 'lt'
+  >('gte')
   const [recentTokensInput, setRecentTokensInput] = useState('')
   // The filter row is collapsed by default and only revealed on demand.
   const [recentFiltersOpen, setRecentFiltersOpen] = useState(false)
@@ -393,18 +449,25 @@ function UsageAnalytics() {
 
   const recentActiveFilterCount = Object.keys(recentFilterParams).length
 
-  const { data: recentLogsPage, isPlaceholderData: recentIsPlaceholder } = useQuery({
-    queryKey: ['aiUsage', 'recent', recentPage, recentPageSize, recentFilterParams],
-    queryFn: () =>
-      fetchJson<UsageLogPage>(
-        buildUsageUrl('recent', {
-          limit: String(recentPageSize),
-          offset: String(recentPage * recentPageSize),
-          ...recentFilterParams,
-        })
-      ),
-    placeholderData: (prev) => prev,
-  })
+  const { data: recentLogsPage, isPlaceholderData: recentIsPlaceholder } =
+    useQuery({
+      queryKey: [
+        'aiUsage',
+        'recent',
+        recentPage,
+        recentPageSize,
+        recentFilterParams,
+      ],
+      queryFn: () =>
+        fetchJson<UsageLogPage>(
+          buildUsageUrl('recent', {
+            limit: String(recentPageSize),
+            offset: String(recentPage * recentPageSize),
+            ...recentFilterParams,
+          })
+        ),
+      placeholderData: (prev) => prev,
+    })
 
   const recentLogs = recentLogsPage?.entries
   const recentTotal = recentLogsPage?.total ?? 0
@@ -437,7 +500,8 @@ function UsageAnalytics() {
   const totalEstimatedCost = useMemo(() => {
     if (!topModels || pricingMap.size === 0) return 0
     return topModels.reduce(
-      (sum, m) => sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
+      (sum, m) =>
+        sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
       0
     )
   }, [topModels, pricingMap])
@@ -446,9 +510,16 @@ function UsageAnalytics() {
     () =>
       (timeseries ?? []).map((b) => ({
         ...b,
-        label: timeParams.bucket === 'hour'
-          ? new Date(b.bucket).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          : new Date(b.bucket).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+        label:
+          timeParams.bucket === 'hour'
+            ? new Date(b.bucket).toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+              })
+            : new Date(b.bucket).toLocaleDateString([], {
+                month: 'short',
+                day: 'numeric',
+              }),
       })),
     [timeseries, timeParams.bucket]
   )
@@ -578,13 +649,25 @@ function UsageAnalytics() {
               description="Make some requests through the AI Gateway to see analytics here."
             />
           ) : (
-            <ChartContainer config={requestsChartConfig} className="h-[200px] w-full">
+            <ChartContainer
+              config={requestsChartConfig}
+              className="h-[200px] w-full"
+            >
               <BarChart data={chartTimeseries} accessibilityLayer>
                 <CartesianGrid vertical={false} />
-                <XAxis dataKey="label" tickLine={false} axisLine={false} fontSize={12} />
+                <XAxis
+                  dataKey="label"
+                  tickLine={false}
+                  axisLine={false}
+                  fontSize={12}
+                />
                 <YAxis tickLine={false} axisLine={false} fontSize={12} />
                 <ChartTooltip content={<ChartTooltipContent />} />
-                <Bar dataKey="request_count" fill="var(--color-request_count)" radius={[4, 4, 0, 0]} />
+                <Bar
+                  dataKey="request_count"
+                  fill="var(--color-request_count)"
+                  radius={[4, 4, 0, 0]}
+                />
               </BarChart>
             </ChartContainer>
           )}
@@ -605,14 +688,39 @@ function UsageAnalytics() {
                 No data
               </div>
             ) : (
-              <ChartContainer config={tokensChartConfig} className="h-[200px] w-full">
+              <ChartContainer
+                config={tokensChartConfig}
+                className="h-[200px] w-full"
+              >
                 <LineChart data={chartTimeseries} accessibilityLayer>
                   <CartesianGrid vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} fontSize={12} />
-                  <YAxis tickLine={false} axisLine={false} fontSize={12} tickFormatter={formatTokenCount} />
+                  <XAxis
+                    dataKey="label"
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                    tickFormatter={formatTokenCount}
+                  />
                   <ChartTooltip content={<ChartTooltipContent />} />
-                  <Line type="monotone" dataKey="input_tokens" stroke="var(--color-input_tokens)" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="output_tokens" stroke="var(--color-output_tokens)" strokeWidth={2} dot={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="input_tokens"
+                    stroke="var(--color-input_tokens)"
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="output_tokens"
+                    stroke="var(--color-output_tokens)"
+                    strokeWidth={2}
+                    dot={false}
+                  />
                 </LineChart>
               </ChartContainer>
             )}
@@ -631,13 +739,32 @@ function UsageAnalytics() {
                 No data
               </div>
             ) : (
-              <ChartContainer config={latencyChartConfig} className="h-[200px] w-full">
+              <ChartContainer
+                config={latencyChartConfig}
+                className="h-[200px] w-full"
+              >
                 <LineChart data={chartTimeseries} accessibilityLayer>
                   <CartesianGrid vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} fontSize={12} />
-                  <YAxis tickLine={false} axisLine={false} fontSize={12} unit="ms" />
+                  <XAxis
+                    dataKey="label"
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                    unit="ms"
+                  />
                   <ChartTooltip content={<ChartTooltipContent />} />
-                  <Line type="monotone" dataKey="avg_latency_ms" stroke="var(--color-avg_latency_ms)" strokeWidth={2} dot={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="avg_latency_ms"
+                    stroke="var(--color-avg_latency_ms)"
+                    strokeWidth={2}
+                    dot={false}
+                  />
                 </LineChart>
               </ChartContainer>
             )}
@@ -657,17 +784,39 @@ function UsageAnalytics() {
                 No data
               </div>
             ) : (
-              <ChartContainer config={providerChartConfig} className="h-[200px] w-full">
+              <ChartContainer
+                config={providerChartConfig}
+                className="h-[200px] w-full"
+              >
                 <BarChart
-                  data={byProvider.map((p) => ({ ...p, name: providerName(p.provider) }))}
+                  data={byProvider.map((p) => ({
+                    ...p,
+                    name: providerName(p.provider),
+                  }))}
                   layout="vertical"
                   accessibilityLayer
                 >
                   <CartesianGrid horizontal={false} />
-                  <XAxis type="number" tickLine={false} axisLine={false} fontSize={12} />
-                  <YAxis dataKey="name" type="category" tickLine={false} axisLine={false} fontSize={12} width={80} />
+                  <XAxis
+                    type="number"
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    dataKey="name"
+                    type="category"
+                    tickLine={false}
+                    axisLine={false}
+                    fontSize={12}
+                    width={80}
+                  />
                   <ChartTooltip content={<ChartTooltipContent />} />
-                  <Bar dataKey="request_count" fill="var(--color-request_count)" radius={[0, 4, 4, 0]} />
+                  <Bar
+                    dataKey="request_count"
+                    fill="var(--color-request_count)"
+                    radius={[0, 4, 4, 0]}
+                  />
                 </BarChart>
               </ChartContainer>
             )}
@@ -686,12 +835,23 @@ function UsageAnalytics() {
             ) : (
               <div className="space-y-3">
                 {topModels.map((m) => {
-                  const cost = computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap)
+                  const cost = computeCost(
+                    m.model,
+                    m.input_tokens,
+                    m.output_tokens,
+                    pricingMap
+                  )
                   return (
-                    <div key={m.model} className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between text-sm">
+                    <div
+                      key={m.model}
+                      className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between text-sm"
+                    >
                       <div className="flex items-center gap-2 min-w-0">
                         <span className="font-mono truncate">{m.model}</span>
-                        <Badge variant="outline" className="text-[10px] shrink-0">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] shrink-0"
+                        >
                           {providerName(m.provider)}
                         </Badge>
                       </div>
@@ -699,7 +859,9 @@ function UsageAnalytics() {
                         <span>{formatTokenCount(m.request_count)} req</span>
                         <span>{formatTokenCount(m.total_tokens)} tok</span>
                         {cost > 0 && (
-                          <span className="text-orange-500 font-medium">{formatCost(cost)}</span>
+                          <span className="text-orange-500 font-medium">
+                            {formatCost(cost)}
+                          </span>
                         )}
                       </div>
                     </div>
@@ -770,7 +932,9 @@ function UsageAnalytics() {
               <div className="flex items-center gap-2">
                 <Select
                   value={recentCostOp}
-                  onValueChange={(v) => setRecentCostOp(v as typeof recentCostOp)}
+                  onValueChange={(v) =>
+                    setRecentCostOp(v as typeof recentCostOp)
+                  }
                 >
                   <SelectTrigger className="w-[92px]">
                     <SelectValue />
@@ -803,7 +967,9 @@ function UsageAnalytics() {
               <div className="flex items-center gap-2">
                 <Select
                   value={recentTokensOp}
-                  onValueChange={(v) => setRecentTokensOp(v as typeof recentTokensOp)}
+                  onValueChange={(v) =>
+                    setRecentTokensOp(v as typeof recentTokensOp)
+                  }
                 >
                   <SelectTrigger className="w-[104px]">
                     <SelectValue />
@@ -850,7 +1016,9 @@ function UsageAnalytics() {
         <CardContent>
           {!recentLogs || recentLogs.length === 0 ? (
             <div className="py-8 text-center text-sm text-muted-foreground">
-              {recentHasFilters ? 'No requests match these filters' : 'No recent requests'}
+              {recentHasFilters
+                ? 'No requests match these filters'
+                : 'No recent requests'}
             </div>
           ) : (
             <div
@@ -864,8 +1032,12 @@ function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
-                    <TableHead className="hidden md:table-cell">Tokens</TableHead>
-                    <TableHead className="hidden md:table-cell">Latency</TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Tokens
+                    </TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Latency
+                    </TableHead>
                     <TableHead className="hidden md:table-cell">Cost</TableHead>
                     <TableHead>Status</TableHead>
                   </TableRow>
@@ -884,7 +1056,9 @@ function UsageAnalytics() {
                       <TableCell className="font-medium">
                         {providerName(log.provider)}
                       </TableCell>
-                      <TableCell className="font-mono text-xs">{log.model}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {log.model}
+                      </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}
                       </TableCell>
@@ -897,7 +1071,9 @@ function UsageAnalytics() {
                       <TableCell>
                         <div className="flex items-center gap-1.5">
                           <Badge
-                            variant={log.status < 400 ? 'default' : 'destructive'}
+                            variant={
+                              log.status < 400 ? 'default' : 'destructive'
+                            }
                             className={
                               log.status < 400
                                 ? 'bg-green-500/15 text-green-500 hover:bg-green-500/25'
@@ -930,8 +1106,8 @@ function UsageAnalytics() {
                 <p className="text-xs text-muted-foreground">
                   <span className="hidden sm:inline">
                     Showing {recentPage * recentPageSize + 1}–
-                    {Math.min((recentPage + 1) * recentPageSize, recentTotal)} of{' '}
-                    {recentTotal.toLocaleString()}
+                    {Math.min((recentPage + 1) * recentPageSize, recentTotal)}{' '}
+                    of {recentTotal.toLocaleString()}
                   </span>
                   <span className="sm:hidden">
                     {recentPage + 1} / {recentTotalPages}
@@ -1109,7 +1285,10 @@ interface GenAiTraceDetailResponse {
   event_count: number
 }
 
-function buildOtelUrl(path: string, params: Record<string, string | number | undefined>) {
+function buildOtelUrl(
+  path: string,
+  params: Record<string, string | number | undefined>
+) {
   const searchParams = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined) searchParams.set(key, String(value))
@@ -1144,10 +1323,20 @@ function buildSpanTree(spans: GenAiSpanDetail[]): SpanTreeNode[] {
 
 function spanIcon(span: GenAiSpanDetail) {
   if (span.gen_ai_operation === 'execute_tool' || span.tool_name) return Wrench
-  if (span.agent_name || span.gen_ai_operation === 'invoke_agent' || span.gen_ai_operation === 'create_agent') return Bot
+  if (
+    span.agent_name ||
+    span.gen_ai_operation === 'invoke_agent' ||
+    span.gen_ai_operation === 'create_agent'
+  )
+    return Bot
   if (span.gen_ai_operation === 'embeddings') return Database
   if (span.gen_ai_operation === 'retrieval') return Globe
-  if (span.gen_ai_operation === 'chat' || span.gen_ai_operation === 'generate_content' || span.gen_ai_operation === 'text_completion') return MessageSquare
+  if (
+    span.gen_ai_operation === 'chat' ||
+    span.gen_ai_operation === 'generate_content' ||
+    span.gen_ai_operation === 'text_completion'
+  )
+    return MessageSquare
   if (span.gen_ai_system) return Cpu
   if (span.kind === 'CLIENT') return Globe
   if (span.kind === 'SERVER') return Activity
@@ -1184,7 +1373,8 @@ function SpanTreeRow({
   const span = node.span
   const hasChildren = node.children.length > 0
   const Icon = spanIcon(span)
-  const durationPct = maxDuration > 0 ? (span.duration_ms / maxDuration) * 100 : 0
+  const durationPct =
+    maxDuration > 0 ? (span.duration_ms / maxDuration) * 100 : 0
   const isGenAi = !!span.gen_ai_system || !!span.gen_ai_operation
   const isError = span.status_code === 'ERROR'
 
@@ -1201,32 +1391,47 @@ function SpanTreeRow({
         {hasChildren ? (
           <button
             className="h-4 w-4 shrink-0 text-muted-foreground hover:text-foreground"
-            onClick={(e) => { e.stopPropagation(); setOpen(!open) }}
+            onClick={(e) => {
+              e.stopPropagation()
+              setOpen(!open)
+            }}
           >
-            <ChevronRight className={`h-3.5 w-3.5 transition-transform ${open ? 'rotate-90' : ''}`} />
+            <ChevronRight
+              className={`h-3.5 w-3.5 transition-transform ${open ? 'rotate-90' : ''}`}
+            />
           </button>
         ) : (
           <span className="w-4 shrink-0" />
         )}
 
         {/* Icon */}
-        <Icon className={`h-3.5 w-3.5 shrink-0 ${isGenAi ? 'text-primary' : 'text-muted-foreground'}`} />
+        <Icon
+          className={`h-3.5 w-3.5 shrink-0 ${isGenAi ? 'text-primary' : 'text-muted-foreground'}`}
+        />
 
         {/* Name */}
-        <span className={`font-mono text-xs truncate max-w-[120px] sm:max-w-[260px] ${isGenAi ? 'text-foreground' : 'text-muted-foreground'}`}>
+        <span
+          className={`font-mono text-xs truncate max-w-[120px] sm:max-w-[260px] ${isGenAi ? 'text-foreground' : 'text-muted-foreground'}`}
+        >
           {spanLabel(span)}
         </span>
 
         {/* Operation badge */}
         {span.gen_ai_operation && (
-          <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 shrink-0 hidden sm:inline-flex">
+          <Badge
+            variant="outline"
+            className="text-[9px] px-1 py-0 h-4 shrink-0 hidden sm:inline-flex"
+          >
             {span.gen_ai_operation}
           </Badge>
         )}
 
         {/* Model badge */}
         {span.gen_ai_model && (
-          <Badge variant="secondary" className="text-[9px] px-1 py-0 h-4 shrink-0 hidden lg:inline-flex">
+          <Badge
+            variant="secondary"
+            className="text-[9px] px-1 py-0 h-4 shrink-0 hidden lg:inline-flex"
+          >
             {span.gen_ai_model}
           </Badge>
         )}
@@ -1242,27 +1447,38 @@ function SpanTreeRow({
         {/* Tokens */}
         {(span.input_tokens != null || span.output_tokens != null) && (
           <span className="text-[10px] text-muted-foreground tabular-nums hidden sm:inline">
-            {span.input_tokens != null ? formatTokenCount(span.input_tokens) : '—'}
+            {span.input_tokens != null
+              ? formatTokenCount(span.input_tokens)
+              : '—'}
             {' / '}
-            {span.output_tokens != null ? formatTokenCount(span.output_tokens) : '—'}
+            {span.output_tokens != null
+              ? formatTokenCount(span.output_tokens)
+              : '—'}
           </span>
         )}
 
         {/* Cache indicator */}
-        {span.cache_read_input_tokens != null && span.cache_read_input_tokens > 0 && (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 text-blue-500 border-blue-500/30 shrink-0">
-                  cached
-                </Badge>
-              </TooltipTrigger>
-              <TooltipContent>
-                <p>{formatTokenCount(span.cache_read_input_tokens)} tokens from cache</p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )}
+        {span.cache_read_input_tokens != null &&
+          span.cache_read_input_tokens > 0 && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge
+                    variant="outline"
+                    className="text-[9px] px-1 py-0 h-4 text-blue-500 border-blue-500/30 shrink-0"
+                  >
+                    cached
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>
+                    {formatTokenCount(span.cache_read_input_tokens)} tokens from
+                    cache
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
 
         {/* Duration bar */}
         <div className="w-16 shrink-0 hidden md:flex items-center gap-1">
@@ -1273,38 +1489,60 @@ function SpanTreeRow({
             />
           </div>
           <span className="text-[10px] text-muted-foreground tabular-nums w-10 text-right">
-            {span.duration_ms >= 1000 ? `${(span.duration_ms / 1000).toFixed(1)}s` : `${span.duration_ms.toFixed(0)}ms`}
+            {span.duration_ms >= 1000
+              ? `${(span.duration_ms / 1000).toFixed(1)}s`
+              : `${span.duration_ms.toFixed(0)}ms`}
           </span>
         </div>
       </div>
 
       {/* Children */}
-      {open && hasChildren && node.children.map((child) => (
-        <SpanTreeRow
-          key={child.span.span_id}
-          node={child}
-          depth={depth + 1}
-          maxDuration={maxDuration}
-          onSelect={onSelect}
-        />
-      ))}
+      {open &&
+        hasChildren &&
+        node.children.map((child) => (
+          <SpanTreeRow
+            key={child.span.span_id}
+            node={child}
+            depth={depth + 1}
+            maxDuration={maxDuration}
+            onSelect={onSelect}
+          />
+        ))}
     </>
   )
 }
 
 // ── SpanDetailSheet ─────────────────────────────────────────────────
 
-function DetailRow({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
+function DetailRow({
+  label,
+  value,
+  mono,
+}: {
+  label: string
+  value: React.ReactNode
+  mono?: boolean
+}) {
   if (value == null || value === '' || value === '—') return null
   return (
     <div className="flex justify-between items-start gap-4 py-1.5">
       <span className="text-xs text-muted-foreground shrink-0">{label}</span>
-      <span className={`text-xs text-right break-all ${mono ? 'font-mono' : ''}`}>{value}</span>
+      <span
+        className={`text-xs text-right break-all ${mono ? 'font-mono' : ''}`}
+      >
+        {value}
+      </span>
     </div>
   )
 }
 
-function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+function DetailSection({
+  title,
+  children,
+}: {
+  title: string
+  children: React.ReactNode
+}) {
   const hasContent = (() => {
     const arr = Array.isArray(children) ? children : [children]
     return arr.some((c) => c != null && c !== false)
@@ -1312,7 +1550,9 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
   if (!hasContent) return null
   return (
     <div>
-      <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">{title}</h4>
+      <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
+        {title}
+      </h4>
       <div className="divide-y divide-border">{children}</div>
     </div>
   )
@@ -1330,7 +1570,10 @@ interface ContentBlock {
 interface ChatMessage {
   role: string
   content?: string | ContentBlock[] | null
-  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
+  tool_calls?: Array<{
+    id?: string
+    function?: { name?: string; arguments?: string }
+  }>
   tool_call_id?: string
 }
 
@@ -1344,10 +1587,13 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
   const textContent = typeof msg.content === 'string' ? msg.content : null
 
   // Extract thinking blocks and text blocks separately
-  const thinkingBlocks = contentBlocks?.filter(b => b.type === 'thinking') ?? []
-  const textBlocks = contentBlocks?.filter(b => b.type === 'text') ?? []
-  const toolUseBlocks = contentBlocks?.filter(b => b.type === 'tool_use') ?? []
-  const toolResultBlocks = contentBlocks?.filter(b => b.type === 'tool_result') ?? []
+  const thinkingBlocks =
+    contentBlocks?.filter((b) => b.type === 'thinking') ?? []
+  const textBlocks = contentBlocks?.filter((b) => b.type === 'text') ?? []
+  const toolUseBlocks =
+    contentBlocks?.filter((b) => b.type === 'tool_use') ?? []
+  const toolResultBlocks =
+    contentBlocks?.filter((b) => b.type === 'tool_result') ?? []
 
   return (
     <div className="space-y-1.5">
@@ -1356,7 +1602,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
         <div key={`thinking-${i}`} className="flex justify-start">
           <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-violet-500/10 border border-violet-500/20">
             <div className="flex items-center gap-1.5 mb-1">
-              <span className="text-[10px] font-semibold uppercase text-violet-500">thinking</span>
+              <span className="text-[10px] font-semibold uppercase text-violet-500">
+                thinking
+              </span>
             </div>
             <div className="whitespace-pre-wrap break-words text-muted-foreground italic">
               {block.thinking || block.text}
@@ -1379,11 +1627,17 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
           }`}
         >
           <div className="flex items-center gap-1.5 mb-1">
-            <span className={`text-[10px] font-semibold uppercase ${
-              isUser ? 'text-primary-foreground/70' : 'text-muted-foreground'
-            }`}>
+            <span
+              className={`text-[10px] font-semibold uppercase ${
+                isUser ? 'text-primary-foreground/70' : 'text-muted-foreground'
+              }`}
+            >
               {msg.role}
-              {isTool && msg.tool_call_id && <span className="font-mono font-normal ml-1">({msg.tool_call_id})</span>}
+              {isTool && msg.tool_call_id && (
+                <span className="font-mono font-normal ml-1">
+                  ({msg.tool_call_id})
+                </span>
+              )}
             </span>
           </div>
           {/* String content */}
@@ -1398,18 +1652,28 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
           ))}
           {/* Tool result blocks (Anthropic format) */}
           {toolResultBlocks.map((block, i) => (
-            <div key={`result-${i}`} className="whitespace-pre-wrap break-words">
-              {typeof block.text === 'string' ? block.text : JSON.stringify(block.input ?? block.text, null, 2)}
+            <div
+              key={`result-${i}`}
+              className="whitespace-pre-wrap break-words"
+            >
+              {typeof block.text === 'string'
+                ? block.text
+                : JSON.stringify(block.input ?? block.text, null, 2)}
             </div>
           ))}
           {/* Tool calls from OpenAI format */}
           {msg.tool_calls && msg.tool_calls.length > 0 && (
             <div className="space-y-1 mt-1">
               {msg.tool_calls.map((tc, j) => (
-                <div key={j} className="bg-background/50 rounded p-1.5 font-mono text-[10px]">
+                <div
+                  key={j}
+                  className="bg-background/50 rounded p-1.5 font-mono text-[10px]"
+                >
                   <span className="text-amber-500">{tc.function?.name}</span>
                   {tc.function?.arguments && (
-                    <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">{tc.function.arguments}</pre>
+                    <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
+                      {tc.function.arguments}
+                    </pre>
                   )}
                 </div>
               ))}
@@ -1417,12 +1681,19 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
           )}
           {/* Tool use blocks from Anthropic format */}
           {toolUseBlocks.map((block, j) => (
-            <div key={`tool-use-${j}`} className="bg-background/50 rounded p-1.5 font-mono text-[10px] mt-1">
+            <div
+              key={`tool-use-${j}`}
+              className="bg-background/50 rounded p-1.5 font-mono text-[10px] mt-1"
+            >
               <span className="text-amber-500">{block.name}</span>
-              {block.id && <span className="text-muted-foreground ml-1">({block.id})</span>}
+              {block.id && (
+                <span className="text-muted-foreground ml-1">({block.id})</span>
+              )}
               {block.input && (
                 <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
-                  {typeof block.input === 'string' ? block.input : JSON.stringify(block.input, null, 2)}
+                  {typeof block.input === 'string'
+                    ? block.input
+                    : JSON.stringify(block.input, null, 2)}
                 </pre>
               )}
             </div>
@@ -1441,7 +1712,12 @@ interface ToolSpanInfo {
   duration_ms: number
 }
 
-function FullConversationView({ systemInstructions, inputMessages, outputMessages, toolSpans }: {
+function FullConversationView({
+  systemInstructions,
+  inputMessages,
+  outputMessages,
+  toolSpans,
+}: {
   systemInstructions?: string | null
   inputMessages?: string | null
   outputMessages?: string | null
@@ -1481,7 +1757,11 @@ function FullConversationView({ systemInstructions, inputMessages, outputMessage
       allMessages.push({
         role: 'tool_execution',
         content: [
-          { type: 'tool_exec', text: ts.tool_call_result || undefined, name: ts.tool_name || undefined },
+          {
+            type: 'tool_exec',
+            text: ts.tool_call_result || undefined,
+            name: ts.tool_name || undefined,
+          },
         ] as ContentBlock[],
         tool_call_id: ts.tool_call_id || undefined,
       })
@@ -1505,15 +1785,25 @@ function FullConversationView({ systemInstructions, inputMessages, outputMessage
                     tool execution
                   </span>
                   {block?.name && (
-                    <span className="font-mono text-[10px] text-emerald-500">{block.name}</span>
+                    <span className="font-mono text-[10px] text-emerald-500">
+                      {block.name}
+                    </span>
                   )}
                   {msg.tool_call_id && (
-                    <span className="font-mono text-[10px] text-muted-foreground">({msg.tool_call_id})</span>
+                    <span className="font-mono text-[10px] text-muted-foreground">
+                      ({msg.tool_call_id})
+                    </span>
                   )}
                 </div>
                 {block?.text && (
                   <pre className="whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground mt-1">
-                    {(() => { try { return JSON.stringify(JSON.parse(block.text), null, 2) } catch { return block.text } })()}
+                    {(() => {
+                      try {
+                        return JSON.stringify(JSON.parse(block.text), null, 2)
+                      } catch {
+                        return block.text
+                      }
+                    })()}
                   </pre>
                 )}
               </div>
@@ -1530,11 +1820,17 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
   const [open, setOpen] = useState(false)
   if (!value) return null
   let formatted: string
-  try { formatted = JSON.stringify(JSON.parse(value), null, 2) } catch { formatted = value }
+  try {
+    formatted = JSON.stringify(JSON.parse(value), null, 2)
+  } catch {
+    formatted = value
+  }
   return (
     <Collapsible open={open} onOpenChange={setOpen} className="py-1.5">
       <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-        <ChevronRight className={`h-3 w-3 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <ChevronRight
+          className={`h-3 w-3 transition-transform ${open ? 'rotate-90' : ''}`}
+        />
         {label}
       </CollapsibleTrigger>
       <CollapsibleContent>
@@ -1562,16 +1858,20 @@ function SpanDetailSheet({
   const isError = span.status_code === 'ERROR'
 
   const totalTokens = (span.input_tokens ?? 0) + (span.output_tokens ?? 0)
-  const cacheTokens = (span.cache_read_input_tokens ?? 0) + (span.cache_creation_input_tokens ?? 0)
+  const cacheTokens =
+    (span.cache_read_input_tokens ?? 0) +
+    (span.cache_creation_input_tokens ?? 0)
 
   // Find sibling tool execution spans (children of the same parent, or children of this span)
   const siblingToolSpans: ToolSpanInfo[] = (allSpans ?? [])
-    .filter(s =>
-      s.span_id !== span.span_id &&
-      (s.gen_ai_operation === 'execute_tool' || s.tool_name) &&
-      (s.parent_span_id === span.parent_span_id || s.parent_span_id === span.span_id)
+    .filter(
+      (s) =>
+        s.span_id !== span.span_id &&
+        (s.gen_ai_operation === 'execute_tool' || s.tool_name) &&
+        (s.parent_span_id === span.parent_span_id ||
+          s.parent_span_id === span.span_id)
     )
-    .map(s => ({
+    .map((s) => ({
       tool_name: s.tool_name,
       tool_call_id: s.tool_call_id,
       tool_call_arguments: s.tool_call_arguments,
@@ -1585,14 +1885,20 @@ function SpanDetailSheet({
         <SheetHeader className="pb-4">
           <div className="flex items-center gap-2">
             <Icon className="h-4 w-4 text-primary" />
-            <SheetTitle className="text-sm font-mono">{spanLabel(span)}</SheetTitle>
+            <SheetTitle className="text-sm font-mono">
+              {spanLabel(span)}
+            </SheetTitle>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             {span.gen_ai_operation && (
-              <Badge variant="outline" className="text-[10px]">{span.gen_ai_operation}</Badge>
+              <Badge variant="outline" className="text-[10px]">
+                {span.gen_ai_operation}
+              </Badge>
             )}
             {span.gen_ai_system && (
-              <Badge variant="secondary" className="text-[10px]">{span.gen_ai_system}</Badge>
+              <Badge variant="secondary" className="text-[10px]">
+                {span.gen_ai_system}
+              </Badge>
             )}
             <Badge
               variant={isError ? 'destructive' : 'default'}
@@ -1601,7 +1907,9 @@ function SpanDetailSheet({
               {span.status_code}
             </Badge>
             {isError && span.error_type && (
-              <Badge variant="destructive" className="text-[10px]">{span.error_type}</Badge>
+              <Badge variant="destructive" className="text-[10px]">
+                {span.error_type}
+              </Badge>
             )}
           </div>
         </SheetHeader>
@@ -1611,38 +1919,67 @@ function SpanDetailSheet({
           {totalTokens > 0 && (
             <div className="grid grid-cols-2 gap-2">
               <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Input</div>
-                <div className="text-lg font-bold tabular-nums">{formatTokenCount(span.input_tokens ?? 0)}</div>
-                {span.cache_read_input_tokens != null && span.cache_read_input_tokens > 0 && (
-                  <div className="text-[10px] text-blue-500">{formatTokenCount(span.cache_read_input_tokens)} cached</div>
-                )}
-                {span.cache_creation_input_tokens != null && span.cache_creation_input_tokens > 0 && (
-                  <div className="text-[10px] text-amber-500">{formatTokenCount(span.cache_creation_input_tokens)} cache write</div>
-                )}
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Input
+                </div>
+                <div className="text-lg font-bold tabular-nums">
+                  {formatTokenCount(span.input_tokens ?? 0)}
+                </div>
+                {span.cache_read_input_tokens != null &&
+                  span.cache_read_input_tokens > 0 && (
+                    <div className="text-[10px] text-blue-500">
+                      {formatTokenCount(span.cache_read_input_tokens)} cached
+                    </div>
+                  )}
+                {span.cache_creation_input_tokens != null &&
+                  span.cache_creation_input_tokens > 0 && (
+                    <div className="text-[10px] text-amber-500">
+                      {formatTokenCount(span.cache_creation_input_tokens)} cache
+                      write
+                    </div>
+                  )}
               </Card>
               <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Output</div>
-                <div className="text-lg font-bold tabular-nums">{formatTokenCount(span.output_tokens ?? 0)}</div>
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Output
+                </div>
+                <div className="text-lg font-bold tabular-nums">
+                  {formatTokenCount(span.output_tokens ?? 0)}
+                </div>
                 {span.output_type && (
-                  <div className="text-[10px] text-muted-foreground">{span.output_type}</div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {span.output_type}
+                  </div>
                 )}
               </Card>
             </div>
           )}
 
           {/* Cache ratio bar */}
-          {cacheTokens > 0 && span.input_tokens != null && span.input_tokens > 0 && (
-            <div>
-              <div className="flex justify-between text-[10px] text-muted-foreground mb-1">
-                <span>Cache hit ratio</span>
-                <span>{Math.round(((span.cache_read_input_tokens ?? 0) / span.input_tokens) * 100)}%</span>
+          {cacheTokens > 0 &&
+            span.input_tokens != null &&
+            span.input_tokens > 0 && (
+              <div>
+                <div className="flex justify-between text-[10px] text-muted-foreground mb-1">
+                  <span>Cache hit ratio</span>
+                  <span>
+                    {Math.round(
+                      ((span.cache_read_input_tokens ?? 0) /
+                        span.input_tokens) *
+                        100
+                    )}
+                    %
+                  </span>
+                </div>
+                <Progress
+                  value={
+                    ((span.cache_read_input_tokens ?? 0) / span.input_tokens) *
+                    100
+                  }
+                  className="h-1.5"
+                />
               </div>
-              <Progress
-                value={((span.cache_read_input_tokens ?? 0) / span.input_tokens) * 100}
-                className="h-1.5"
-              />
-            </div>
-          )}
+            )}
 
           <Separator />
 
@@ -1651,30 +1988,65 @@ function SpanDetailSheet({
             <DetailRow label="Span ID" value={span.span_id} mono />
             <DetailRow label="Parent Span" value={span.parent_span_id} mono />
             <DetailRow label="Kind" value={span.kind} />
-            <DetailRow label="Duration" value={`${span.duration_ms.toFixed(1)}ms`} />
-            <DetailRow label="Start" value={new Date(span.start_time).toLocaleString()} />
+            <DetailRow
+              label="Duration"
+              value={`${span.duration_ms.toFixed(1)}ms`}
+            />
+            <DetailRow
+              label="Start"
+              value={new Date(span.start_time).toLocaleString()}
+            />
           </DetailSection>
 
           {/* Model */}
           <DetailSection title="Model">
             <DetailRow label="Requested Model" value={span.gen_ai_model} mono />
-            <DetailRow label="Response Model" value={span.gen_ai_response_model} mono />
+            <DetailRow
+              label="Response Model"
+              value={span.gen_ai_response_model}
+              mono
+            />
             <DetailRow label="Response ID" value={span.response_id} mono />
-            <DetailRow label="Finish Reasons" value={span.response_finish_reasons?.join(', ')} />
-            <DetailRow label="Conversation ID" value={span.conversation_id} mono />
+            <DetailRow
+              label="Finish Reasons"
+              value={span.response_finish_reasons?.join(', ')}
+            />
+            <DetailRow
+              label="Conversation ID"
+              value={span.conversation_id}
+              mono
+            />
           </DetailSection>
 
           {/* Request Parameters */}
           <DetailSection title="Request Parameters">
-            <DetailRow label="Temperature" value={span.request_temperature?.toString()} />
-            <DetailRow label="Max Tokens" value={span.request_max_tokens?.toString()} />
+            <DetailRow
+              label="Temperature"
+              value={span.request_temperature?.toString()}
+            />
+            <DetailRow
+              label="Max Tokens"
+              value={span.request_max_tokens?.toString()}
+            />
             <DetailRow label="Top P" value={span.request_top_p?.toString()} />
             <DetailRow label="Top K" value={span.request_top_k?.toString()} />
-            <DetailRow label="Frequency Penalty" value={span.request_frequency_penalty?.toString()} />
-            <DetailRow label="Presence Penalty" value={span.request_presence_penalty?.toString()} />
-            <DetailRow label="Stop Sequences" value={span.request_stop_sequences?.join(', ')} />
+            <DetailRow
+              label="Frequency Penalty"
+              value={span.request_frequency_penalty?.toString()}
+            />
+            <DetailRow
+              label="Presence Penalty"
+              value={span.request_presence_penalty?.toString()}
+            />
+            <DetailRow
+              label="Stop Sequences"
+              value={span.request_stop_sequences?.join(', ')}
+            />
             <DetailRow label="Seed" value={span.request_seed?.toString()} />
-            <DetailRow label="Choice Count" value={span.request_choice_count?.toString()} />
+            <DetailRow
+              label="Choice Count"
+              value={span.request_choice_count?.toString()}
+            />
           </DetailSection>
 
           {/* Agent */}
@@ -1700,8 +2072,14 @@ function SpanDetailSheet({
           {/* Embeddings */}
           {span.embeddings_dimension_count != null && (
             <DetailSection title="Embeddings">
-              <DetailRow label="Dimensions" value={span.embeddings_dimension_count.toString()} />
-              <DetailRow label="Encoding Formats" value={span.request_encoding_formats?.join(', ')} />
+              <DetailRow
+                label="Dimensions"
+                value={span.embeddings_dimension_count.toString()}
+              />
+              <DetailRow
+                label="Encoding Formats"
+                value={span.request_encoding_formats?.join(', ')}
+              />
             </DetailSection>
           )}
 
@@ -1721,24 +2099,52 @@ function SpanDetailSheet({
           )}
 
           {/* Provider-Specific */}
-          {(span.openai_api_type || span.openai_system_fingerprint || span.aws_bedrock_guardrail_id || span.azure_resource_provider_namespace) && (
+          {(span.openai_api_type ||
+            span.openai_system_fingerprint ||
+            span.aws_bedrock_guardrail_id ||
+            span.azure_resource_provider_namespace) && (
             <DetailSection title="Provider Specific">
               <DetailRow label="OpenAI API Type" value={span.openai_api_type} />
-              <DetailRow label="Request Service Tier" value={span.openai_request_service_tier} />
-              <DetailRow label="Response Service Tier" value={span.openai_response_service_tier} />
-              <DetailRow label="System Fingerprint" value={span.openai_system_fingerprint} mono />
-              <DetailRow label="Bedrock Guardrail" value={span.aws_bedrock_guardrail_id} mono />
-              <DetailRow label="Bedrock Knowledge Base" value={span.aws_bedrock_knowledge_base_id} mono />
-              <DetailRow label="Azure Namespace" value={span.azure_resource_provider_namespace} />
+              <DetailRow
+                label="Request Service Tier"
+                value={span.openai_request_service_tier}
+              />
+              <DetailRow
+                label="Response Service Tier"
+                value={span.openai_response_service_tier}
+              />
+              <DetailRow
+                label="System Fingerprint"
+                value={span.openai_system_fingerprint}
+                mono
+              />
+              <DetailRow
+                label="Bedrock Guardrail"
+                value={span.aws_bedrock_guardrail_id}
+                mono
+              />
+              <DetailRow
+                label="Bedrock Knowledge Base"
+                value={span.aws_bedrock_knowledge_base_id}
+                mono
+              />
+              <DetailRow
+                label="Azure Namespace"
+                value={span.azure_resource_provider_namespace}
+              />
             </DetailSection>
           )}
 
           {/* Conversation / Messages */}
-          {(span.system_instructions || span.input_messages || span.output_messages) && (
+          {(span.system_instructions ||
+            span.input_messages ||
+            span.output_messages) && (
             <>
               <Separator />
               <div>
-                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Conversation</h4>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                  Conversation
+                </h4>
                 <FullConversationView
                   systemInstructions={span.system_instructions}
                   inputMessages={span.input_messages}
@@ -1750,11 +2156,15 @@ function SpanDetailSheet({
           )}
 
           {/* Tool Content */}
-          {(span.tool_call_arguments || span.tool_call_result || span.tool_definitions) && (
+          {(span.tool_call_arguments ||
+            span.tool_call_result ||
+            span.tool_definitions) && (
             <>
               <Separator />
               <div>
-                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Tool Content</h4>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
+                  Tool Content
+                </h4>
                 <JsonBlock label="Arguments" value={span.tool_call_arguments} />
                 <JsonBlock label="Result" value={span.tool_call_result} />
                 <JsonBlock label="Definitions" value={span.tool_definitions} />
@@ -1767,7 +2177,9 @@ function SpanDetailSheet({
             <>
               <Separator />
               <div>
-                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Retrieval</h4>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
+                  Retrieval
+                </h4>
                 {span.retrieval_query_text && (
                   <DetailRow label="Query" value={span.retrieval_query_text} />
                 )}
@@ -1864,10 +2276,13 @@ function computeInvocations(spans: GenAiSpanDetail[]): InvocationSet {
   // Among token-only calls, keep the topmost of any parent/child pair.
   const deduped = chosen.filter((s) => {
     if (contentIds.has(s.span_id)) return true
-    return !chosen.some((o) => o.span_id !== s.span_id && isAncestor(o.span_id, s))
+    return !chosen.some(
+      (o) => o.span_id !== s.span_id && isAncestor(o.span_id, s)
+    )
   })
   deduped.sort(
-    (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
+    (a, b) =>
+      new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
   )
 
   // Attach each tool-execution span to the call it belongs to (its parent, or a
@@ -1896,7 +2311,11 @@ function computeInvocations(spans: GenAiSpanDetail[]): InvocationSet {
     if (list.length) toolByInvocation.set(inv.span_id, list)
   }
 
-  return { invocations: deduped, toolByInvocation, hasAnyContent: contentSpans.length > 0 }
+  return {
+    invocations: deduped,
+    toolByInvocation,
+    hasAnyContent: contentSpans.length > 0,
+  }
 }
 
 function fmtSpanDuration(ms: number): string {
@@ -1925,7 +2344,9 @@ function InvocationCard({
   const cacheRead = span.cache_read_input_tokens ?? 0
 
   return (
-    <Card className={`overflow-hidden ${isError ? 'border-destructive/40' : ''}`}>
+    <Card
+      className={`overflow-hidden ${isError ? 'border-destructive/40' : ''}`}
+    >
       <Collapsible open={open} onOpenChange={setOpen}>
         <div className="flex items-start gap-2 p-3">
           <CollapsibleTrigger asChild>
@@ -1935,7 +2356,9 @@ function InvocationCard({
               />
               <span
                 className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${
-                  isError ? 'bg-destructive/10 text-destructive' : 'bg-primary/10 text-primary'
+                  isError
+                    ? 'bg-destructive/10 text-destructive'
+                    : 'bg-primary/10 text-primary'
                 }`}
               >
                 <Icon className="h-3.5 w-3.5" />
@@ -1959,12 +2382,18 @@ function InvocationCard({
                     </Badge>
                   )}
                   {model && (
-                    <Badge variant="secondary" className="h-4 px-1 font-mono text-[9px]">
+                    <Badge
+                      variant="secondary"
+                      className="h-4 px-1 font-mono text-[9px]"
+                    >
                       {model}
                     </Badge>
                   )}
                   {isError && (
-                    <Badge variant="destructive" className="h-4 px-1 text-[9px]">
+                    <Badge
+                      variant="destructive"
+                      className="h-4 px-1 text-[9px]"
+                    >
                       {span.error_type || 'error'}
                     </Badge>
                   )}
@@ -1974,19 +2403,31 @@ function InvocationCard({
                     <Clock className="h-3 w-3" />
                     {fmtSpanDuration(span.duration_ms)}
                   </span>
-                  {(span.input_tokens != null || span.output_tokens != null) && (
+                  {(span.input_tokens != null ||
+                    span.output_tokens != null) && (
                     <span>
-                      {span.input_tokens != null ? formatTokenCount(span.input_tokens) : '—'} in
+                      {span.input_tokens != null
+                        ? formatTokenCount(span.input_tokens)
+                        : '—'}{' '}
+                      in
                       {' / '}
-                      {span.output_tokens != null ? formatTokenCount(span.output_tokens) : '—'} out
+                      {span.output_tokens != null
+                        ? formatTokenCount(span.output_tokens)
+                        : '—'}{' '}
+                      out
                     </span>
                   )}
                   {cacheRead > 0 && (
-                    <span className="text-blue-500">{formatTokenCount(cacheRead)} cached</span>
+                    <span className="text-blue-500">
+                      {formatTokenCount(cacheRead)} cached
+                    </span>
                   )}
-                  {span.response_finish_reasons && span.response_finish_reasons.length > 0 && (
-                    <span>finish: {span.response_finish_reasons.join(', ')}</span>
-                  )}
+                  {span.response_finish_reasons &&
+                    span.response_finish_reasons.length > 0 && (
+                      <span>
+                        finish: {span.response_finish_reasons.join(', ')}
+                      </span>
+                    )}
                 </div>
               </div>
             </button>
@@ -2012,10 +2453,17 @@ function InvocationCard({
               />
             ) : (
               <p className="text-xs text-muted-foreground">
-                No message content was captured for this call. Enable it by exporting{' '}
-                <code className="font-mono text-[11px]">gen_ai.input.messages</code> /{' '}
-                <code className="font-mono text-[11px]">gen_ai.output.messages</code> (opt-in in the
-                OpenTelemetry GenAI semantic conventions), or open{' '}
+                No message content was captured for this call. Enable it by
+                exporting{' '}
+                <code className="font-mono text-[11px]">
+                  gen_ai.input.messages
+                </code>{' '}
+                /{' '}
+                <code className="font-mono text-[11px]">
+                  gen_ai.output.messages
+                </code>{' '}
+                (opt-in in the OpenTelemetry GenAI semantic conventions), or
+                open{' '}
                 <button
                   type="button"
                   className="underline underline-offset-2 hover:text-foreground"
@@ -2061,11 +2509,13 @@ function TraceConversationView({
     <div className="space-y-3">
       {!hasAnyContent && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-muted-foreground">
-          Message content isn&apos;t captured for these calls. You can see each call&apos;s model,
-          tokens, and timing below — to read the actual prompts and responses, export{' '}
-          <code className="font-mono text-[11px]">gen_ai.input.messages</code> and{' '}
-          <code className="font-mono text-[11px]">gen_ai.output.messages</code> (opt-in content
-          capture).
+          Message content isn&apos;t captured for these calls. You can see each
+          call&apos;s model, tokens, and timing below — to read the actual
+          prompts and responses, export{' '}
+          <code className="font-mono text-[11px]">gen_ai.input.messages</code>{' '}
+          and{' '}
+          <code className="font-mono text-[11px]">gen_ai.output.messages</code>{' '}
+          (opt-in content capture).
         </div>
       )}
       {invocations.map((span, i) => (
@@ -2105,7 +2555,10 @@ function TraceDetailView({
   )
 
   const maxDuration = useMemo(
-    () => (traceDetail ? Math.max(...traceDetail.spans.map((s) => s.duration_ms), 1) : 1),
+    () =>
+      traceDetail
+        ? Math.max(...traceDetail.spans.map((s) => s.duration_ms), 1)
+        : 1,
     [traceDetail]
   )
 
@@ -2113,21 +2566,46 @@ function TraceDetailView({
   const stats = useMemo(() => {
     if (!traceDetail) return null
     const spans = traceDetail.spans
-    const genAiSpans = spans.filter((s) => s.gen_ai_system || s.gen_ai_operation)
+    const genAiSpans = spans.filter(
+      (s) => s.gen_ai_system || s.gen_ai_operation
+    )
     const totalInput = spans.reduce((s, sp) => s + (sp.input_tokens ?? 0), 0)
     const totalOutput = spans.reduce((s, sp) => s + (sp.output_tokens ?? 0), 0)
-    const totalCacheRead = spans.reduce((s, sp) => s + (sp.cache_read_input_tokens ?? 0), 0)
-    const totalCacheCreate = spans.reduce((s, sp) => s + (sp.cache_creation_input_tokens ?? 0), 0)
+    const totalCacheRead = spans.reduce(
+      (s, sp) => s + (sp.cache_read_input_tokens ?? 0),
+      0
+    )
+    const totalCacheCreate = spans.reduce(
+      (s, sp) => s + (sp.cache_creation_input_tokens ?? 0),
+      0
+    )
     const errors = spans.filter((s) => s.status_code === 'ERROR')
-    const tools = spans.filter((s) => s.gen_ai_operation === 'execute_tool' || s.tool_name)
-    const agents = spans.filter((s) => s.agent_name || s.gen_ai_operation === 'invoke_agent')
+    const tools = spans.filter(
+      (s) => s.gen_ai_operation === 'execute_tool' || s.tool_name
+    )
+    const agents = spans.filter(
+      (s) => s.agent_name || s.gen_ai_operation === 'invoke_agent'
+    )
     const rootDuration = tree[0]?.span.duration_ms ?? 0
-    return { genAiSpans, totalInput, totalOutput, totalCacheRead, totalCacheCreate, errors, tools, agents, rootDuration }
+    return {
+      genAiSpans,
+      totalInput,
+      totalOutput,
+      totalCacheRead,
+      totalCacheCreate,
+      errors,
+      tools,
+      agents,
+      rootDuration,
+    }
   }, [traceDetail, tree])
 
   // Count of AI invocations for the Conversation tab label.
   const invocationCount = useMemo(
-    () => (traceDetail ? computeInvocations(traceDetail.spans).invocations.length : 0),
+    () =>
+      traceDetail
+        ? computeInvocations(traceDetail.spans).invocations.length
+        : 0,
     [traceDetail]
   )
 
@@ -2143,7 +2621,9 @@ function TraceDetailView({
           <ArrowLeft className="h-4 w-4 mr-1" />
           Back to traces
         </Button>
-        <span className="text-sm text-muted-foreground font-mono truncate">{traceId}</span>
+        <span className="text-sm text-muted-foreground font-mono truncate">
+          {traceId}
+        </span>
       </div>
 
       {detailLoading ? (
@@ -2164,38 +2644,66 @@ function TraceDetailView({
           {stats && (
             <div className="grid gap-3 grid-cols-2 md:grid-cols-4 lg:grid-cols-6">
               <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Total Spans</div>
-                <div className="text-xl font-bold">{traceDetail.span_count}</div>
-                <div className="text-[10px] text-muted-foreground">{stats.genAiSpans.length} GenAI</div>
-              </Card>
-              <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Duration</div>
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Total Spans
+                </div>
                 <div className="text-xl font-bold">
-                  {stats.rootDuration >= 1000 ? `${(stats.rootDuration / 1000).toFixed(1)}s` : `${stats.rootDuration.toFixed(0)}ms`}
+                  {traceDetail.span_count}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  {stats.genAiSpans.length} GenAI
                 </div>
               </Card>
               <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Input Tokens</div>
-                <div className="text-xl font-bold tabular-nums">{formatTokenCount(stats.totalInput)}</div>
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Duration
+                </div>
+                <div className="text-xl font-bold">
+                  {stats.rootDuration >= 1000
+                    ? `${(stats.rootDuration / 1000).toFixed(1)}s`
+                    : `${stats.rootDuration.toFixed(0)}ms`}
+                </div>
+              </Card>
+              <Card className="p-3">
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Input Tokens
+                </div>
+                <div className="text-xl font-bold tabular-nums">
+                  {formatTokenCount(stats.totalInput)}
+                </div>
                 {stats.totalCacheRead > 0 && (
-                  <div className="text-[10px] text-blue-500">{formatTokenCount(stats.totalCacheRead)} cached</div>
+                  <div className="text-[10px] text-blue-500">
+                    {formatTokenCount(stats.totalCacheRead)} cached
+                  </div>
                 )}
               </Card>
               <Card className="p-3">
-                <div className="text-[10px] text-muted-foreground uppercase">Output Tokens</div>
-                <div className="text-xl font-bold tabular-nums">{formatTokenCount(stats.totalOutput)}</div>
+                <div className="text-[10px] text-muted-foreground uppercase">
+                  Output Tokens
+                </div>
+                <div className="text-xl font-bold tabular-nums">
+                  {formatTokenCount(stats.totalOutput)}
+                </div>
               </Card>
               {stats.tools.length > 0 && (
                 <Card className="p-3">
-                  <div className="text-[10px] text-muted-foreground uppercase">Tool Calls</div>
+                  <div className="text-[10px] text-muted-foreground uppercase">
+                    Tool Calls
+                  </div>
                   <div className="text-xl font-bold">{stats.tools.length}</div>
                 </Card>
               )}
               {stats.errors.length > 0 && (
                 <Card className="p-3 border-destructive/50">
-                  <div className="text-[10px] text-destructive uppercase">Errors</div>
-                  <div className="text-xl font-bold text-destructive">{stats.errors.length}</div>
-                  <div className="text-[10px] text-destructive/70">{stats.errors[0].error_type ?? 'Unknown'}</div>
+                  <div className="text-[10px] text-destructive uppercase">
+                    Errors
+                  </div>
+                  <div className="text-xl font-bold text-destructive">
+                    {stats.errors.length}
+                  </div>
+                  <div className="text-[10px] text-destructive/70">
+                    {stats.errors[0].error_type ?? 'Unknown'}
+                  </div>
                 </Card>
               )}
             </div>
@@ -2208,19 +2716,26 @@ function TraceDetailView({
                 <MessageSquare className="h-3.5 w-3.5" />
                 Conversation
                 {invocationCount > 0 && (
-                  <span className="text-xs text-muted-foreground">{invocationCount}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {invocationCount}
+                  </span>
                 )}
               </TabsTrigger>
               <TabsTrigger value="tree" className="gap-1.5">
                 <ListTree className="h-3.5 w-3.5" />
                 Span tree
-                <span className="text-xs text-muted-foreground">{traceDetail.span_count}</span>
+                <span className="text-xs text-muted-foreground">
+                  {traceDetail.span_count}
+                </span>
               </TabsTrigger>
             </TabsList>
 
             {/* Default: the AI invocations, each with its conversation inline. */}
             <TabsContent value="conversation" className="mt-4">
-              <TraceConversationView spans={traceDetail.spans} onOpenSpan={handleSelect} />
+              <TraceConversationView
+                spans={traceDetail.spans}
+                onOpenSpan={handleSelect}
+              />
             </TabsContent>
 
             {/* Raw span tree — click any span for full details. */}
@@ -2249,27 +2764,41 @@ function TraceDetailView({
           {events.length > 0 && (
             <Card>
               <CardHeader className="pb-2">
-                <CardTitle className="text-base">Events ({events.length})</CardTitle>
+                <CardTitle className="text-base">
+                  Events ({events.length})
+                </CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="space-y-2">
                   {events.map((event, i) => (
-                    <div key={`${event.span_id}-${i}`} className="flex items-start gap-3 py-2 border-b border-border last:border-0">
+                    <div
+                      key={`${event.span_id}-${i}`}
+                      className="flex items-start gap-3 py-2 border-b border-border last:border-0"
+                    >
                       <Info className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-mono text-xs">{event.event_name}</span>
+                          <span className="font-mono text-xs">
+                            {event.event_name}
+                          </span>
                           <span className="text-[10px] text-muted-foreground">
                             {new Date(event.timestamp).toLocaleTimeString()}
                           </span>
                         </div>
                         {Object.keys(event.attributes).length > 0 && (
                           <div className="mt-1 flex flex-wrap gap-1">
-                            {Object.entries(event.attributes).slice(0, 6).map(([k, v]) => (
-                              <Badge key={k} variant="outline" className="text-[9px] px-1 py-0 h-4 font-mono">
-                                {k.replace('gen_ai.', '')}: {v.length > 30 ? v.slice(0, 30) + '...' : v}
-                              </Badge>
-                            ))}
+                            {Object.entries(event.attributes)
+                              .slice(0, 6)
+                              .map(([k, v]) => (
+                                <Badge
+                                  key={k}
+                                  variant="outline"
+                                  className="text-[9px] px-1 py-0 h-4 font-mono"
+                                >
+                                  {k.replace('gen_ai.', '')}:{' '}
+                                  {v.length > 30 ? v.slice(0, 30) + '...' : v}
+                                </Badge>
+                              ))}
                           </div>
                         )}
                       </div>
@@ -2282,19 +2811,26 @@ function TraceDetailView({
         </>
       )}
 
-      <SpanDetailSheet span={selectedSpan} open={sheetOpen} onOpenChange={setSheetOpen} allSpans={traceDetail?.spans} />
+      <SpanDetailSheet
+        span={selectedSpan}
+        open={sheetOpen}
+        onOpenChange={setSheetOpen}
+        allSpans={traceDetail?.spans}
+      />
     </div>
   )
 }
 
 // ── AgentActivity ───────────────────────────────────────────────────
 
-function AgentActivity() {
+export function AgentActivity() {
   const { projects } = useProjects()
-  const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>(
-    projects[0]?.id
+  const [selectedProjectId, setSelectedProjectId] = useState<
+    number | undefined
+  >(projects[0]?.id)
+  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
+    TIME_RANGES[0]
   )
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(TIME_RANGES[0])
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
 
@@ -2307,7 +2843,13 @@ function AgentActivity() {
   }, [timeRange])
 
   const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: ['genaiTraces', projectId, timeParams.from, timeParams.to, systemFilter],
+    queryKey: [
+      'genaiTraces',
+      projectId,
+      timeParams.from,
+      timeParams.to,
+      systemFilter,
+    ],
     queryFn: () =>
       fetchJson<GenAiTraceSummariesResponse>(
         buildOtelUrl('genai/traces', {
@@ -2390,7 +2932,9 @@ function AgentActivity() {
             {TIME_RANGES.map((range) => (
               <Button
                 key={range.label}
-                variant={timeRange.label === range.label ? 'default' : 'outline'}
+                variant={
+                  timeRange.label === range.label ? 'default' : 'outline'
+                }
                 size="sm"
                 onClick={() => setTimeRange(range)}
               >
@@ -2431,11 +2975,21 @@ function AgentActivity() {
                     <TableHead>Service</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
-                    <TableHead className="hidden md:table-cell">Spans</TableHead>
-                    <TableHead className="hidden md:table-cell">Duration</TableHead>
-                    <TableHead className="hidden lg:table-cell">Input</TableHead>
-                    <TableHead className="hidden lg:table-cell">Output</TableHead>
-                    <TableHead className="hidden xl:table-cell">Cache</TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Spans
+                    </TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Duration
+                    </TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Input
+                    </TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Output
+                    </TableHead>
+                    <TableHead className="hidden xl:table-cell">
+                      Cache
+                    </TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead className="w-8"></TableHead>
                   </TableRow>
@@ -2451,7 +3005,9 @@ function AgentActivity() {
                       >
                         <TableCell>
                           <div>
-                            <span className="font-mono text-xs block">{trace.root_span_name}</span>
+                            <span className="font-mono text-xs block">
+                              {trace.root_span_name}
+                            </span>
                             <div className="flex items-center gap-1">
                               <span className="text-[10px] text-muted-foreground">
                                 {new Date(trace.start_time).toLocaleString([], {
@@ -2462,7 +3018,10 @@ function AgentActivity() {
                                 })}
                               </span>
                               {trace.gen_ai_operation && (
-                                <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5">
+                                <Badge
+                                  variant="outline"
+                                  className="text-[9px] px-1 py-0 h-3.5"
+                                >
                                   {trace.gen_ai_operation}
                                 </Badge>
                               )}
@@ -2477,7 +3036,9 @@ function AgentActivity() {
                             <Badge variant="outline" className="text-[10px]">
                               {trace.gen_ai_system}
                             </Badge>
-                          ) : '—'}
+                          ) : (
+                            '—'
+                          )}
                         </TableCell>
                         <TableCell className="font-mono text-xs">
                           {trace.gen_ai_model ?? '—'}
@@ -2491,25 +3052,45 @@ function AgentActivity() {
                             : `${trace.duration_ms.toFixed(0)}ms`}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell text-muted-foreground tabular-nums">
-                          {trace.total_input_tokens != null ? formatTokenCount(trace.total_input_tokens) : '—'}
+                          {trace.total_input_tokens != null
+                            ? formatTokenCount(trace.total_input_tokens)
+                            : '—'}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell text-muted-foreground tabular-nums">
-                          {trace.total_output_tokens != null ? formatTokenCount(trace.total_output_tokens) : '—'}
+                          {trace.total_output_tokens != null
+                            ? formatTokenCount(trace.total_output_tokens)
+                            : '—'}
                         </TableCell>
                         <TableCell className="hidden xl:table-cell">
                           {cachePct != null ? (
                             <TooltipProvider>
                               <Tooltip>
                                 <TooltipTrigger>
-                                  <Badge variant="outline" className="text-[10px] text-blue-500 border-blue-500/30">
+                                  <Badge
+                                    variant="outline"
+                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                  >
                                     {cachePct}% hit
                                   </Badge>
                                 </TooltipTrigger>
                                 <TooltipContent>
-                                  <p>{formatTokenCount(trace.total_cache_read_input_tokens ?? 0)} tokens served from cache</p>
-                                  {trace.total_cache_creation_input_tokens != null && trace.total_cache_creation_input_tokens > 0 && (
-                                    <p>{formatTokenCount(trace.total_cache_creation_input_tokens)} tokens written to cache</p>
-                                  )}
+                                  <p>
+                                    {formatTokenCount(
+                                      trace.total_cache_read_input_tokens ?? 0
+                                    )}{' '}
+                                    tokens served from cache
+                                  </p>
+                                  {trace.total_cache_creation_input_tokens !=
+                                    null &&
+                                    trace.total_cache_creation_input_tokens >
+                                      0 && (
+                                      <p>
+                                        {formatTokenCount(
+                                          trace.total_cache_creation_input_tokens
+                                        )}{' '}
+                                        tokens written to cache
+                                      </p>
+                                    )}
                                 </TooltipContent>
                               </Tooltip>
                             </TooltipProvider>
@@ -2519,7 +3100,9 @@ function AgentActivity() {
                         </TableCell>
                         <TableCell>
                           {trace.error_count > 0 ? (
-                            <Badge variant="destructive">{trace.error_count} err</Badge>
+                            <Badge variant="destructive">
+                              {trace.error_count} err
+                            </Badge>
                           ) : (
                             <Badge
                               variant="default"
@@ -2554,7 +3137,9 @@ function AgentActivity() {
 // ── ProjectAgentActivity (exported for project detail page) ─────────
 
 export function ProjectAgentActivity({ projectId }: { projectId: number }) {
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(TIME_RANGES[0])
+  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
+    TIME_RANGES[0]
+  )
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -2574,7 +3159,13 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
   }, [timeRange])
 
   const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: ['genaiTraces', projectId, timeParams.from, timeParams.to, systemFilter],
+    queryKey: [
+      'genaiTraces',
+      projectId,
+      timeParams.from,
+      timeParams.to,
+      systemFilter,
+    ],
     queryFn: () =>
       fetchJson<GenAiTraceSummariesResponse>(
         buildOtelUrl('genai/traces', {
@@ -2638,7 +3229,9 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
             {TIME_RANGES.map((range) => (
               <Button
                 key={range.label}
-                variant={timeRange.label === range.label ? 'default' : 'outline'}
+                variant={
+                  timeRange.label === range.label ? 'default' : 'outline'
+                }
                 size="sm"
                 onClick={() => setTimeRange(range)}
               >
@@ -2672,11 +3265,21 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                     <TableHead>Service</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
-                    <TableHead className="hidden md:table-cell">Spans</TableHead>
-                    <TableHead className="hidden md:table-cell">Duration</TableHead>
-                    <TableHead className="hidden lg:table-cell">Input</TableHead>
-                    <TableHead className="hidden lg:table-cell">Output</TableHead>
-                    <TableHead className="hidden xl:table-cell">Cache</TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Spans
+                    </TableHead>
+                    <TableHead className="hidden md:table-cell">
+                      Duration
+                    </TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Input
+                    </TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Output
+                    </TableHead>
+                    <TableHead className="hidden xl:table-cell">
+                      Cache
+                    </TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead className="w-8"></TableHead>
                   </TableRow>
@@ -2692,7 +3295,9 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                       >
                         <TableCell>
                           <div>
-                            <span className="font-mono text-xs block">{trace.root_span_name}</span>
+                            <span className="font-mono text-xs block">
+                              {trace.root_span_name}
+                            </span>
                             <div className="flex items-center gap-1">
                               <span className="text-[10px] text-muted-foreground">
                                 {new Date(trace.start_time).toLocaleString([], {
@@ -2703,7 +3308,10 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                                 })}
                               </span>
                               {trace.gen_ai_operation && (
-                                <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5">
+                                <Badge
+                                  variant="outline"
+                                  className="text-[9px] px-1 py-0 h-3.5"
+                                >
                                   {trace.gen_ai_operation}
                                 </Badge>
                               )}
@@ -2718,7 +3326,9 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                             <Badge variant="outline" className="text-[10px]">
                               {trace.gen_ai_system}
                             </Badge>
-                          ) : '—'}
+                          ) : (
+                            '—'
+                          )}
                         </TableCell>
                         <TableCell className="font-mono text-xs">
                           {trace.gen_ai_model ?? '—'}
@@ -2732,25 +3342,45 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                             : `${trace.duration_ms.toFixed(0)}ms`}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell text-muted-foreground tabular-nums">
-                          {trace.total_input_tokens != null ? formatTokenCount(trace.total_input_tokens) : '—'}
+                          {trace.total_input_tokens != null
+                            ? formatTokenCount(trace.total_input_tokens)
+                            : '—'}
                         </TableCell>
                         <TableCell className="hidden lg:table-cell text-muted-foreground tabular-nums">
-                          {trace.total_output_tokens != null ? formatTokenCount(trace.total_output_tokens) : '—'}
+                          {trace.total_output_tokens != null
+                            ? formatTokenCount(trace.total_output_tokens)
+                            : '—'}
                         </TableCell>
                         <TableCell className="hidden xl:table-cell">
                           {cachePct != null ? (
                             <TooltipProvider>
                               <Tooltip>
                                 <TooltipTrigger>
-                                  <Badge variant="outline" className="text-[10px] text-blue-500 border-blue-500/30">
+                                  <Badge
+                                    variant="outline"
+                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                  >
                                     {cachePct}% hit
                                   </Badge>
                                 </TooltipTrigger>
                                 <TooltipContent>
-                                  <p>{formatTokenCount(trace.total_cache_read_input_tokens ?? 0)} tokens served from cache</p>
-                                  {trace.total_cache_creation_input_tokens != null && trace.total_cache_creation_input_tokens > 0 && (
-                                    <p>{formatTokenCount(trace.total_cache_creation_input_tokens)} tokens written to cache</p>
-                                  )}
+                                  <p>
+                                    {formatTokenCount(
+                                      trace.total_cache_read_input_tokens ?? 0
+                                    )}{' '}
+                                    tokens served from cache
+                                  </p>
+                                  {trace.total_cache_creation_input_tokens !=
+                                    null &&
+                                    trace.total_cache_creation_input_tokens >
+                                      0 && (
+                                      <p>
+                                        {formatTokenCount(
+                                          trace.total_cache_creation_input_tokens
+                                        )}{' '}
+                                        tokens written to cache
+                                      </p>
+                                    )}
                                 </TooltipContent>
                               </Tooltip>
                             </TooltipProvider>
@@ -2760,7 +3390,9 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                         </TableCell>
                         <TableCell>
                           {trace.error_count > 0 ? (
-                            <Badge variant="destructive">{trace.error_count} err</Badge>
+                            <Badge variant="destructive">
+                              {trace.error_count} err
+                            </Badge>
                           ) : (
                             <Badge
                               variant="default"
@@ -2811,8 +3443,8 @@ function DeleteConfirmDialog({
         <DialogHeader>
           <DialogTitle>Delete Provider Key</DialogTitle>
           <DialogDescription>
-            Are you sure you want to delete &quot;{providerKey?.display_name}&quot;?
-            This will stop routing requests through this provider key.
+            Are you sure you want to delete &quot;{providerKey?.display_name}
+            &quot;? This will stop routing requests through this provider key.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -2833,26 +3465,162 @@ function DeleteConfirmDialog({
   )
 }
 
-const VALID_TABS = ['keys', 'usage', 'activity', 'settings'] as const
-type TabValue = (typeof VALID_TABS)[number]
+// ============================================================================
+// Agent CLI credential dialog body (ADR-037) — the CLI-provider counterpart
+// to the BYOK "Add Provider Key" form above. Same dialog shell, different
+// fields: an auth-flavor picker (a CLI can accept a subscription OAuth
+// token, a plain API key, or a config file, depending on provider) plus one
+// credential blob, instead of display-name/key/base-url.
+// ============================================================================
+
+interface CliCredentialDialogBodyProps {
+  cli: ProviderCatalogDto
+  authType: string
+  onAuthTypeChange: (id: string) => void
+  credential: string
+  onCredentialChange: (value: string) => void
+  onSave: () => void
+  saving: boolean
+}
+
+function CliCredentialDialogBody({
+  cli,
+  authType,
+  onAuthTypeChange,
+  credential,
+  onCredentialChange,
+  onSave,
+  saving,
+}: CliCredentialDialogBodyProps) {
+  const selectedFlavor =
+    cli.auth_flavors.find((f) => f.id === authType) ?? cli.auth_flavors[0]
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Configure {cli.name}</DialogTitle>
+        <DialogDescription>
+          Your credential is encrypted at rest and injected into each agent
+          session on this host — not used for gateway BYOK routing.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="grid gap-4 py-4">
+        <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+          <AiProviderIcon provider={cli.id} size={36} />
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <div className="text-sm font-medium">{cli.name}</div>
+            <div className="text-xs text-muted-foreground truncate">
+              Install:{' '}
+              <code className="bg-muted px-1 rounded">
+                {cli.install_command}
+              </code>
+            </div>
+            <div className="text-xs text-muted-foreground truncate">
+              Auth:{' '}
+              <code className="bg-muted px-1 rounded">{cli.auth_command}</code>
+            </div>
+          </div>
+        </div>
+
+        {cli.auth_flavors.length > 1 && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {cli.auth_flavors.map((flavor) => (
+              <button
+                key={flavor.id}
+                type="button"
+                onClick={() => onAuthTypeChange(flavor.id)}
+                className={`rounded-md border p-2.5 text-left transition-colors ${
+                  selectedFlavor?.id === flavor.id
+                    ? 'border-primary bg-primary/10'
+                    : 'border-border hover:border-primary/50'
+                }`}
+              >
+                <p className="text-xs font-medium">{flavor.label}</p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {flavor.description}
+                </p>
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="grid gap-2">
+          <Label htmlFor="cliCredential">
+            {selectedFlavor?.label ?? 'Credential'}
+            {selectedFlavor?.env_var && (
+              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                → injected as {selectedFlavor.env_var}
+              </span>
+            )}
+          </Label>
+          {selectedFlavor?.description && (
+            <p className="text-xs text-muted-foreground">
+              {selectedFlavor.description}
+            </p>
+          )}
+          {selectedFlavor?.format === 'config_file' ? (
+            <Textarea
+              id="cliCredential"
+              placeholder={
+                cli.credential_saved
+                  ? '••••••••••••• (saved — paste a new file body to replace)'
+                  : 'Paste the full file contents here...'
+              }
+              value={credential}
+              onChange={(e) => onCredentialChange(e.target.value)}
+              className="min-h-[140px] font-mono text-xs"
+            />
+          ) : (
+            <Input
+              id="cliCredential"
+              type="password"
+              placeholder={
+                cli.credential_saved
+                  ? '••••••••••••• (saved — paste a new value to replace)'
+                  : selectedFlavor?.format === 'oauth_token'
+                    ? 'Paste OAuth token...'
+                    : 'Paste API key...'
+              }
+              value={credential}
+              onChange={(e) => onCredentialChange(e.target.value)}
+            />
+          )}
+        </div>
+      </div>
+      <DialogFooter>
+        <Button
+          onClick={onSave}
+          disabled={saving || !credential.trim()}
+          className="w-full sm:w-auto"
+        >
+          {saving ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Saving…
+            </>
+          ) : (
+            'Save credential'
+          )}
+        </Button>
+      </DialogFooter>
+    </>
+  )
+}
 
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
-  const [searchParams, setSearchParams] = useSearchParams()
 
-  const tabParam = searchParams.get('tab') as TabValue | null
-  const activeTab = tabParam && VALID_TABS.includes(tabParam) ? tabParam : 'keys'
-  const setActiveTab = (tab: string) => {
-    setSearchParams({ tab }, { replace: true })
-  }
-
-  usePageTitle(activeTab === 'activity' ? 'AI Traces' : 'AI Gateway')
+  usePageTitle('AI Gateway')
 
   const [dialogOpen, setDialogOpen] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
-  const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(null)
-  const [snippetLang, setSnippetLang] = useState<'bash' | 'python' | 'typescript'>('bash')
+  const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
+    null
+  )
+  const [snippetLang, setSnippetLang] = useState<
+    'bash' | 'python' | 'typescript'
+  >('bash')
   const [snippetProvider, setSnippetProvider] = useState<string>('')
 
   // Form state
@@ -2860,6 +3628,11 @@ export function AiGatewayPage() {
   const [newDisplayName, setNewDisplayName] = useState('')
   const [newApiKey, setNewApiKey] = useState('')
   const [newBaseUrl, setNewBaseUrl] = useState('')
+
+  // Agent CLI credential form state — same dialog shell as BYOK, different
+  // fields (auth flavor + one credential blob instead of key/name/base-url).
+  const [newCliAuthType, setNewCliAuthType] = useState('')
+  const [newCliCredential, setNewCliCredential] = useState('')
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
@@ -2876,10 +3649,124 @@ export function AiGatewayPage() {
 
   const keys = keysData ?? []
 
+  // Agent CLI catalog (Claude Code, Codex, OpenCode) — rendered alongside
+  // the BYOK providers below so switching to a subscription-backed CLI is
+  // one list, not a separate settings surface (ADR-037 Phase 2).
+  const { data: cliCatalog, isLoading: cliCatalogLoading } = useQuery(
+    listAiProvidersOptions()
+  )
+  const cliProviders = cliCatalog?.providers ?? []
+  // Static shell so the three subscription CLI rows render immediately
+  // instead of popping in 2-3s late — that delay comes from the backend
+  // spawning a subprocess per CLI to check host auth status. Only the
+  // Status/Actions cells (which depend on that check) show a skeleton;
+  // provider name/description are known ahead of time.
+  const CLI_PROVIDER_SHELL: Array<{ id: string; name: string }> = [
+    { id: 'claude_cli', name: 'Claude Code' },
+    { id: 'codex_cli', name: 'Codex (OpenAI)' },
+    { id: 'opencode_cli', name: 'OpenCode' },
+  ]
+  const { data: providerPreference } = useQuery(getAiProviderStatusOptions())
+
+  const activeCliProviderId =
+    providerPreference?.active_provider_type === 'agent_cli'
+      ? providerPreference.agent_cli_provider_id
+      : null
+
+  const preferenceMutation = useMutation({
+    ...updateAiProviderPreferenceMutation(),
+    meta: { errorTitle: 'Failed to update AI provider preference' },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
+    },
+  })
+
+  const refreshProviderStatusMutation = useMutation({
+    ...refreshAiProviderStatusMutation(),
+    meta: { errorTitle: 'Failed to refresh AI provider status' },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
+      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
+      toast.success('Provider authentication and models refreshed')
+    },
+  })
+
+  const activateCliProvider = (providerId: string, providerName: string) => {
+    preferenceMutation.mutate(
+      {
+        body: { provider_type: 'agent_cli', agent_cli_provider_id: providerId },
+      },
+      {
+        onSuccess: () => {
+          toast.success(`Routing AI workloads through ${providerName}`)
+        },
+      }
+    )
+  }
+
+  const switchToGateway = () => {
+    preferenceMutation.mutate(
+      { body: { provider_type: 'gateway', agent_cli_provider_id: null } },
+      {
+        onSuccess: () => {
+          toast.success('Routing AI workloads through the gateway (BYOK)')
+        },
+      }
+    )
+  }
+
+  // Save (or replace) a CLI's credential — same encrypted storage the
+  // /agent-sandbox/providers detail page uses, just surfaced inline here so
+  // "Configure" behaves like the BYOK dialog instead of navigating away.
+  const saveCliCredentialMutation = useMutation({
+    mutationFn: (vars: {
+      providerId: string
+      authType: string
+      credential: string
+    }) =>
+      saveAiProviderCredential({
+        path: { provider_id: vars.providerId },
+        body: { auth_type: vars.authType, credential: vars.credential },
+      }),
+    meta: { errorTitle: 'Failed to save credential' },
+    onSuccess: (_data, vars) => {
+      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
+      setDialogOpen(false)
+      resetForm()
+      toast.success(
+        `${cliProviders.find((p) => p.id === vars.providerId)?.name ?? vars.providerId} credential saved`
+      )
+    },
+  })
+
+  const handleSaveCliCredential = () => {
+    if (!newProvider) return
+    if (!newCliCredential.trim()) {
+      toast.error('Please paste a credential')
+      return
+    }
+    saveCliCredentialMutation.mutate({
+      providerId: newProvider,
+      authType: newCliAuthType,
+      credential: newCliCredential.trim(),
+    })
+  }
+
+  const openCliDialog = (cli: ProviderCatalogDto) => {
+    setNewProvider(cli.id)
+    setNewCliAuthType(cli.current_auth_type ?? cli.auth_flavors[0]?.id ?? '')
+    setNewCliCredential('')
+    setDialogOpen(true)
+  }
+
   // Create mutation
   const createMutation = useMutation({
-    mutationFn: (data: { provider: string; display_name: string; api_key: string; base_url?: string }) =>
-      createProviderKey({ body: data }),
+    mutationFn: (data: {
+      provider: string
+      display_name: string
+      api_key: string
+      base_url?: string
+    }) => createProviderKey({ body: data }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -2926,7 +3813,9 @@ export function AiGatewayPage() {
     },
     onSuccess: (data) => {
       if (data.success) {
-        toast.success(`${providerName(data.provider)} key is valid (${data.latency_ms}ms)`)
+        toast.success(
+          `${providerName(data.provider)} key is valid (${data.latency_ms}ms)`
+        )
       } else {
         toast.error(`${providerName(data.provider)} key test failed`, {
           description: data.error ?? undefined,
@@ -2949,6 +3838,8 @@ export function AiGatewayPage() {
     setNewDisplayName('')
     setNewApiKey('')
     setNewBaseUrl('')
+    setNewCliAuthType('')
+    setNewCliCredential('')
   }
 
   const handleCreate = () => {
@@ -2986,13 +3877,15 @@ export function AiGatewayPage() {
   const firstConfiguredProvider = SUPPORTED_PROVIDERS.find((p) =>
     keys.some((k) => k.provider === p.id && k.is_active)
   )
+
+  // Which dialog body to render — set when a CLI row's "Configure"/"Update
+  // credential" action opened the shared dialog (see openCliDialog above).
+  const dialogCliProvider = cliProviders.find((p) => p.id === newProvider)
   const effectiveSnippetProvider =
-    snippetProvider ||
-    firstConfiguredProvider?.id ||
-    SUPPORTED_PROVIDERS[0].id
+    snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
   const snippetModel =
-    SUPPORTED_PROVIDERS.find((p) => p.id === effectiveSnippetProvider)?.defaultModel ??
-    SUPPORTED_PROVIDERS[0].defaultModel
+    SUPPORTED_PROVIDERS.find((p) => p.id === effectiveSnippetProvider)
+      ?.defaultModel ?? SUPPORTED_PROVIDERS[0].defaultModel
 
   const codeSnippets = {
     bash: `curl ${gatewayEndpoint}/chat/completions \\
@@ -3030,8 +3923,18 @@ console.log(response.choices[0].message.content);`,
 
   const snippetExamples: CodeExample[] = [
     { id: 'bash', label: 'cURL', language: 'bash', code: codeSnippets.bash },
-    { id: 'python', label: 'Python', language: 'python', code: codeSnippets.python },
-    { id: 'typescript', label: 'Node.js', language: 'typescript', code: codeSnippets.typescript },
+    {
+      id: 'python',
+      label: 'Python',
+      language: 'python',
+      code: codeSnippets.python,
+    },
+    {
+      id: 'typescript',
+      label: 'Node.js',
+      language: 'typescript',
+      code: codeSnippets.typescript,
+    },
   ]
 
   return (
@@ -3039,16 +3942,15 @@ console.log(response.choices[0].message.content);`,
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">
-            {activeTab === 'activity' ? 'AI Traces' : 'AI Gateway'}
-          </h1>
+          <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway</h1>
           <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
-            {activeTab === 'activity'
-              ? 'OpenTelemetry traces from your AI workloads (gen_ai.* spans)'
-              : 'Unified API for multiple AI providers with a single endpoint'}
+            Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
-        <Button onClick={() => setDialogOpen(true)} className="w-full sm:w-auto">
+        <Button
+          onClick={() => setDialogOpen(true)}
+          className="w-full sm:w-auto"
+        >
           <Plus className="mr-2 h-4 w-4" />
           Add Provider Key
         </Button>
@@ -3077,8 +3979,8 @@ console.log(response.choices[0].message.content);`,
                 <CopyButton value={gatewayEndpoint} className="shrink-0" />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" onClick={() => setActiveTab('settings')}>
-                  View code examples
+                <Button size="sm" asChild>
+                  <Link to="/ai-gateway/setup">View code examples</Link>
                 </Button>
                 {!firstConfiguredProvider && (
                   <Button
@@ -3130,109 +4032,336 @@ console.log(response.choices[0].message.content);`,
         </div>
       </Card>
 
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-        <div className="overflow-x-auto -mx-1 px-1">
-          <TabsList className="w-full sm:w-auto">
-            <TabsTrigger value="keys">Provider Keys</TabsTrigger>
-            <TabsTrigger value="usage">Usage</TabsTrigger>
-            <TabsTrigger value="activity">Activity</TabsTrigger>
-            <TabsTrigger value="settings">Settings</TabsTrigger>
-          </TabsList>
+      {/* Provider Keys — compact table: one row per supported provider.
+          Click the chevron to expand and see individual keys with per-key
+          test/toggle/delete actions. Keeps the screen dense so you can see
+          all providers at once. */}
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">AI providers</h2>
+            <p className="text-sm text-muted-foreground">
+              Gateway keys and subscription CLIs available on this host.
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => refreshProviderStatusMutation.mutate({})}
+            disabled={refreshProviderStatusMutation.isPending}
+          >
+            <RefreshCw
+              className={`mr-2 h-4 w-4 ${
+                refreshProviderStatusMutation.isPending ? 'animate-spin' : ''
+              }`}
+            />
+            Refresh auth &amp; models
+          </Button>
         </div>
+        {isLoading ? (
+          <div className="space-y-2">
+            {[1, 2, 3, 4].map((i) => (
+              <Skeleton key={i} className="h-14 w-full" />
+            ))}
+          </div>
+        ) : (
+          <div className="overflow-hidden rounded-lg border">
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="w-[44px]" />
+                  <TableHead>Provider</TableHead>
+                  <TableHead className="hidden lg:table-cell">Models</TableHead>
+                  <TableHead className="hidden sm:table-cell w-[140px]">
+                    Status
+                  </TableHead>
+                  <TableHead className="w-[180px] text-right">
+                    Actions
+                  </TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {SUPPORTED_PROVIDERS.map((provider) => {
+                  const providerKeys = keys.filter(
+                    (k) => k.provider === provider.id
+                  )
+                  const activeKey = providerKeys.find((k) => k.is_active)
+                  const hasAnyKey = providerKeys.length > 0
+                  const configured = !!activeKey
+                  const expanded = expandedProvider === provider.id && hasAnyKey
 
-        {/* Provider Keys Tab — compact table: one row per supported
-            provider. Click the chevron to expand and see individual keys
-            with per-key test/toggle/delete actions. Keeps the screen dense
-            so you can see all providers at once. */}
-        <TabsContent value="keys" className="space-y-4">
-          {isLoading ? (
-            <div className="space-y-2">
-              {[1, 2, 3, 4].map((i) => (
-                <Skeleton key={i} className="h-14 w-full" />
-              ))}
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-lg border">
-              <Table>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead className="w-[44px]" />
-                    <TableHead>Provider</TableHead>
-                    <TableHead className="hidden lg:table-cell">Models</TableHead>
-                    <TableHead className="hidden sm:table-cell w-[140px]">Status</TableHead>
-                    <TableHead className="w-[180px] text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {SUPPORTED_PROVIDERS.map((provider) => {
-                    const providerKeys = keys.filter((k) => k.provider === provider.id)
-                    const activeKey = providerKeys.find((k) => k.is_active)
-                    const hasAnyKey = providerKeys.length > 0
-                    const configured = !!activeKey
-                    const expanded = expandedProvider === provider.id && hasAnyKey
-
-                    return (
-                      <Fragment key={provider.id}>
-                        <TableRow
-                          className={
-                            hasAnyKey
-                              ? 'cursor-pointer'
-                              : 'hover:bg-transparent'
-                          }
-                          onClick={
-                            hasAnyKey
-                              ? () =>
-                                  setExpandedProvider(
-                                    expanded ? null : provider.id
-                                  )
-                              : undefined
-                          }
+                  return (
+                    <Fragment key={provider.id}>
+                      <TableRow
+                        className={
+                          hasAnyKey ? 'cursor-pointer' : 'hover:bg-transparent'
+                        }
+                        onClick={
+                          hasAnyKey
+                            ? () =>
+                                setExpandedProvider(
+                                  expanded ? null : provider.id
+                                )
+                            : undefined
+                        }
+                      >
+                        <TableCell className="py-2 pr-0">
+                          {hasAnyKey ? (
+                            <ChevronRight
+                              className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? 'rotate-90' : ''}`}
+                            />
+                          ) : null}
+                        </TableCell>
+                        <TableCell className="py-2">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <AiProviderIcon provider={provider.id} size={32} />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-medium truncate">
+                                  {provider.name}
+                                </span>
+                                {hasAnyKey && (
+                                  <Badge
+                                    variant="secondary"
+                                    className="h-5 px-1.5 text-[10px]"
+                                  >
+                                    {providerKeys.length}{' '}
+                                    {providerKeys.length === 1 ? 'key' : 'keys'}
+                                  </Badge>
+                                )}
+                              </div>
+                              <p className="text-xs text-muted-foreground truncate">
+                                {provider.tagline}
+                              </p>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
+                          <span className="line-clamp-1">
+                            {provider.models}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden sm:table-cell py-2">
+                          {configured ? (
+                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
+                              Active
+                            </Badge>
+                          ) : hasAnyKey ? (
+                            <Badge
+                              variant="secondary"
+                              className="justify-center whitespace-nowrap"
+                            >
+                              Disabled
+                            </Badge>
+                          ) : (
+                            <Badge
+                              variant="outline"
+                              className="justify-center whitespace-nowrap text-muted-foreground"
+                            >
+                              Not configured
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell
+                          className="py-2 text-right"
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          <TableCell className="py-2 pr-0">
-                            {hasAnyKey ? (
-                              <ChevronRight
-                                className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? 'rotate-90' : ''}`}
-                              />
-                            ) : null}
-                          </TableCell>
+                          <Button
+                            variant={hasAnyKey ? 'outline' : 'default'}
+                            size="sm"
+                            onClick={() => {
+                              setNewProvider(provider.id)
+                              setNewDisplayName(
+                                hasAnyKey
+                                  ? `${provider.name} (key ${providerKeys.length + 1})`
+                                  : provider.name
+                              )
+                              setDialogOpen(true)
+                            }}
+                          >
+                            <Plus className="mr-1.5 h-3.5 w-3.5" />
+                            {hasAnyKey ? 'Add key' : 'Configure'}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+
+                      {expanded &&
+                        providerKeys.map((key) => (
+                          <TableRow
+                            key={key.id}
+                            className="bg-muted/30 hover:bg-muted/40"
+                          >
+                            <TableCell />
+                            <TableCell colSpan={3} className="py-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className="text-sm font-medium truncate">
+                                  {key.display_name}
+                                </span>
+                                {!key.is_active && (
+                                  <Badge
+                                    variant="secondary"
+                                    className="h-5 px-1.5 text-[10px]"
+                                  >
+                                    Disabled
+                                  </Badge>
+                                )}
+                                <code className="text-xs text-muted-foreground truncate">
+                                  {key.api_key_masked}
+                                </code>
+                              </div>
+                            </TableCell>
+                            <TableCell className="py-2 text-right">
+                              <div className="flex items-center justify-end gap-0.5">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  onClick={() => testKeyMutation.mutate(key.id)}
+                                  disabled={testingKeyId === key.id}
+                                  title="Test key"
+                                >
+                                  {testingKeyId === key.id ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Play className="h-4 w-4" />
+                                  )}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  onClick={() => handleToggle(key)}
+                                  disabled={toggleMutation.isPending}
+                                  title={
+                                    key.is_active ? 'Disable key' : 'Enable key'
+                                  }
+                                >
+                                  {key.is_active ? (
+                                    <Power className="h-4 w-4" />
+                                  ) : (
+                                    <PowerOff className="h-4 w-4 text-muted-foreground" />
+                                  )}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  onClick={() => handleDelete(key)}
+                                  title="Delete key"
+                                >
+                                  <Trash2 className="h-4 w-4 text-destructive" />
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                    </Fragment>
+                  )
+                })}
+
+                {/* Subscription-backed agent CLIs (ADR-037 Phase 2) — same
+                      row shape as BYOK providers above, but only one CLI can
+                      be the active routing target at a time (unlike BYOK
+                      keys, which are additive). "Active" means this CLI is
+                      what AI Gateway requests currently route through.
+
+                      Host auth status is checked via a per-CLI subprocess
+                      spawn server-side, which takes a couple seconds — the
+                      rows below render immediately from a static shell so
+                      only the Status/Actions cells (the part that's
+                      actually waiting on that check) show a skeleton. */}
+                {cliCatalogLoading
+                  ? CLI_PROVIDER_SHELL.map((shell) => (
+                      <TableRow key={shell.id} className="hover:bg-transparent">
+                        <TableCell className="py-2 pr-0" />
+                        <TableCell className="py-2">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <AiProviderIcon provider={shell.id} size={32} />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-medium truncate">
+                                  {shell.name}
+                                </span>
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 px-1.5 text-[10px] text-muted-foreground"
+                                >
+                                  Subscription
+                                </Badge>
+                              </div>
+                              <Skeleton className="h-3 w-48 mt-1" />
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell py-2">
+                          <Skeleton className="h-3 w-32" />
+                        </TableCell>
+                        <TableCell className="hidden sm:table-cell py-2">
+                          <Skeleton className="h-5 w-24" />
+                        </TableCell>
+                        <TableCell className="py-2 text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <Skeleton className="h-8 w-32" />
+                            <Skeleton className="h-8 w-8" />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  : cliProviders.map((cli) => {
+                      const isActive = activeCliProviderId === cli.id
+                      return (
+                        <TableRow key={cli.id} className="hover:bg-transparent">
+                          <TableCell className="py-2 pr-0" />
                           <TableCell className="py-2">
                             <div className="flex items-center gap-3 min-w-0">
-                              <AiProviderIcon provider={provider.id} size={32} />
+                              <AiProviderIcon provider={cli.id} size={32} />
                               <div className="min-w-0">
                                 <div className="flex items-center gap-2">
                                   <span className="text-sm font-medium truncate">
-                                    {provider.name}
+                                    {cli.name}
                                   </span>
-                                  {hasAnyKey && (
+                                  <Badge
+                                    variant="outline"
+                                    className="h-5 px-1.5 text-[10px] text-muted-foreground"
+                                  >
+                                    Subscription
+                                  </Badge>
+                                  {cli.host_authenticated && (
                                     <Badge
                                       variant="secondary"
                                       className="h-5 px-1.5 text-[10px]"
                                     >
-                                      {providerKeys.length}{' '}
-                                      {providerKeys.length === 1 ? 'key' : 'keys'}
+                                      Host environment
                                     </Badge>
                                   )}
                                 </div>
                                 <p className="text-xs text-muted-foreground truncate">
-                                  {provider.tagline}
+                                  {cli.host_authenticated
+                                    ? `${hostAuthLabel(cli.host_auth_method)} — available for host-routed AI tasks; sandbox workflows require a separate credential`
+                                    : (cli.host_auth_hint ??
+                                      'Not authenticated on this host yet')}
                                 </p>
                               </div>
                             </div>
                           </TableCell>
                           <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
-                            <span className="line-clamp-1">{provider.models}</span>
+                            <span className="line-clamp-1">
+                              {cli.models.length > 0
+                                ? cli.models.join(', ')
+                                : 'Model selection lives in the CLI’s own config'}
+                            </span>
                           </TableCell>
                           <TableCell className="hidden sm:table-cell py-2">
-                            {configured ? (
+                            {isActive ? (
                               <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
                                 Active
                               </Badge>
-                            ) : hasAnyKey ? (
+                            ) : cli.host_authenticated ? (
                               <Badge
                                 variant="secondary"
                                 className="justify-center whitespace-nowrap"
                               >
-                                Disabled
+                                Configured
                               </Badge>
                             ) : (
                               <Badge
@@ -3243,310 +4372,188 @@ console.log(response.choices[0].message.content);`,
                               </Badge>
                             )}
                           </TableCell>
-                          <TableCell
-                            className="py-2 text-right"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <Button
-                              variant={hasAnyKey ? 'outline' : 'default'}
-                              size="sm"
-                              onClick={() => {
-                                setNewProvider(provider.id)
-                                setNewDisplayName(
-                                  hasAnyKey
-                                    ? `${provider.name} (key ${providerKeys.length + 1})`
-                                    : provider.name
-                                )
-                                setDialogOpen(true)
-                              }}
-                            >
-                              <Plus className="mr-1.5 h-3.5 w-3.5" />
-                              {hasAnyKey ? 'Add key' : 'Configure'}
-                            </Button>
+                          <TableCell className="py-2 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              {isActive ? (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={switchToGateway}
+                                  disabled={preferenceMutation.isPending}
+                                >
+                                  Switch to Gateway
+                                </Button>
+                              ) : cli.host_authenticated ? (
+                                <Button
+                                  variant="default"
+                                  size="sm"
+                                  onClick={() =>
+                                    activateCliProvider(cli.id, cli.name)
+                                  }
+                                  disabled={preferenceMutation.isPending}
+                                >
+                                  Use this provider
+                                </Button>
+                              ) : (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled
+                                  title={
+                                    cli.host_auth_hint ??
+                                    'Not authenticated on this host yet'
+                                  }
+                                >
+                                  Not authenticated
+                                </Button>
+                              )}
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8"
+                                title={
+                                  cli.credential_saved
+                                    ? 'Update sandbox credential (used by the AI Workflows autofixer, not chat)'
+                                    : 'Configure sandbox credential (used by the AI Workflows autofixer, not chat)'
+                                }
+                                onClick={() => openCliDialog(cli)}
+                              >
+                                <Wrench className="h-4 w-4" />
+                              </Button>
+                            </div>
                           </TableCell>
                         </TableRow>
-
-                        {expanded &&
-                          providerKeys.map((key) => (
-                            <TableRow
-                              key={key.id}
-                              className="bg-muted/30 hover:bg-muted/40"
-                            >
-                              <TableCell />
-                              <TableCell colSpan={3} className="py-2">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="text-sm font-medium truncate">
-                                    {key.display_name}
-                                  </span>
-                                  {!key.is_active && (
-                                    <Badge
-                                      variant="secondary"
-                                      className="h-5 px-1.5 text-[10px]"
-                                    >
-                                      Disabled
-                                    </Badge>
-                                  )}
-                                  <code className="text-xs text-muted-foreground truncate">
-                                    {key.api_key_masked}
-                                  </code>
-                                </div>
-                              </TableCell>
-                              <TableCell className="py-2 text-right">
-                                <div className="flex items-center justify-end gap-0.5">
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-8 w-8"
-                                    onClick={() =>
-                                      testKeyMutation.mutate(key.id)
-                                    }
-                                    disabled={testingKeyId === key.id}
-                                    title="Test key"
-                                  >
-                                    {testingKeyId === key.id ? (
-                                      <Loader2 className="h-4 w-4 animate-spin" />
-                                    ) : (
-                                      <Play className="h-4 w-4" />
-                                    )}
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-8 w-8"
-                                    onClick={() => handleToggle(key)}
-                                    disabled={toggleMutation.isPending}
-                                    title={
-                                      key.is_active
-                                        ? 'Disable key'
-                                        : 'Enable key'
-                                    }
-                                  >
-                                    {key.is_active ? (
-                                      <Power className="h-4 w-4" />
-                                    ) : (
-                                      <PowerOff className="h-4 w-4 text-muted-foreground" />
-                                    )}
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-8 w-8"
-                                    onClick={() => handleDelete(key)}
-                                    title="Delete key"
-                                  >
-                                    <Trash2 className="h-4 w-4 text-destructive" />
-                                  </Button>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          ))}
-                      </Fragment>
-                    )
-                  })}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </TabsContent>
-
-        {/* Usage Tab */}
-        <TabsContent value="usage" className="space-y-4">
-          <UsageAnalytics />
-        </TabsContent>
-
-        {/* Activity Tab */}
-        <TabsContent value="activity" className="space-y-4">
-          <AgentActivity />
-        </TabsContent>
-
-        {/* Settings Tab */}
-        <TabsContent value="settings" className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Gateway Endpoint</CardTitle>
-              <CardDescription>
-                Use this endpoint with any OpenAI-compatible SDK. Just swap the
-                base URL and use your Temps API key.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex items-center gap-2">
-                <code className="flex-1 rounded-md bg-muted px-3 py-2 text-sm font-mono">
-                  {gatewayEndpoint}
-                </code>
-                <CopyButton value={gatewayEndpoint} className="shrink-0" />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                The gateway is OpenAI-compatible — use any model from any
-                configured provider with the same endpoint.
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Quick Start</CardTitle>
-              <CardDescription>
-                Copy a code snippet to start making requests.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <CodeTabs
-                value={snippetLang}
-                onValueChange={(id) =>
-                  setSnippetLang(id as 'bash' | 'python' | 'typescript')
-                }
-                examples={snippetExamples}
-                rightSlot={
-                  <Select
-                    value={effectiveSnippetProvider}
-                    onValueChange={setSnippetProvider}
-                  >
-                    <SelectTrigger className="h-8 w-full sm:w-[200px]">
-                      <SelectValue placeholder="Provider" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SUPPORTED_PROVIDERS.map((p) => (
-                        <SelectItem key={p.id} value={p.id}>
-                          <div className="flex items-center gap-2">
-                            <AiProviderIcon provider={p.id} size={20} />
-                            <span>{p.name}</span>
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                }
-              />
-            </CardContent>
-          </Card>
-
-          {/* "Supported Providers" grid is intentionally gone — the
-              catalog on the Provider Keys tab covers the same ground
-              (brand icon, models, configured/not-configured status, and
-              a direct "Configure" button). Duplicating it here just
-              meant two places to keep in sync. */}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Bring Your Own Key (BYOK)</CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground space-y-3">
-              <p>
-                You can also pass provider keys per-request using HTTP headers,
-                bypassing the stored keys above. This is useful for testing or
-                when you want to use a different key for specific requests.
-              </p>
-              <CodeBlock
-                code={`X-Provider-Api-Key: sk-your-key-here\nX-Provider-Base-Url: https://custom-endpoint.example.com/v1`}
-                language="text"
-                title="BYOK Headers"
-              />
-              <p className="text-xs">
-                When BYOK headers are present, stored keys are not used for that
-                request. The response will include a{' '}
-                <code className="bg-muted px-1 py-0.5 rounded text-foreground">
-                  x-temps-credential-type: byok
-                </code>{' '}
-                header.
-              </p>
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
+                      )
+                    })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </div>
 
       {/* Add Provider Key Dialog — provider is locked (set by whichever
           card opened the dialog). No Select inside the dialog; the
-          provider identity is shown as a header. */}
-      <Dialog open={dialogOpen} onOpenChange={(open) => { setDialogOpen(open); if (!open) resetForm() }}>
+          provider identity is shown as a header. Branches between the BYOK
+          key form and the agent-CLI credential form so "Configure" behaves
+          the same way regardless of which row opened it (ADR-037). */}
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open)
+          if (!open) resetForm()
+        }}
+      >
         <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {newProvider ? `Configure ${providerName(newProvider)}` : 'Add Provider Key'}
-            </DialogTitle>
-            <DialogDescription>
-              Your key is encrypted at rest and used only to route requests
-              through the gateway.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4 py-4">
-            {newProvider && (
-              <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-                <AiProviderIcon provider={newProvider} size={36} />
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">
-                    {providerName(newProvider)}
+          {dialogCliProvider ? (
+            <CliCredentialDialogBody
+              cli={dialogCliProvider}
+              authType={newCliAuthType}
+              onAuthTypeChange={setNewCliAuthType}
+              credential={newCliCredential}
+              onCredentialChange={setNewCliCredential}
+              onSave={handleSaveCliCredential}
+              saving={saveCliCredentialMutation.isPending}
+            />
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>
+                  {newProvider
+                    ? `Configure ${providerName(newProvider)}`
+                    : 'Add Provider Key'}
+                </DialogTitle>
+                <DialogDescription>
+                  Your key is encrypted at rest and used only to route requests
+                  through the gateway.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="grid gap-4 py-4">
+                {newProvider && (
+                  <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+                    <AiProviderIcon provider={newProvider} size={36} />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium">
+                        {providerName(newProvider)}
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {providerModels(newProvider)}
+                      </div>
+                    </div>
+                    {getAiProvider(newProvider)?.keyDocsUrl && (
+                      <a
+                        href={getAiProvider(newProvider)!.keyDocsUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
+                      >
+                        Get key →
+                      </a>
+                    )}
                   </div>
-                  <div className="text-xs text-muted-foreground truncate">
-                    {providerModels(newProvider)}
-                  </div>
-                </div>
-                {getAiProvider(newProvider)?.keyDocsUrl && (
-                  <a
-                    href={getAiProvider(newProvider)!.keyDocsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
-                  >
-                    Get key →
-                  </a>
                 )}
+                <div className="grid gap-2">
+                  <Label htmlFor="displayName">Display Name</Label>
+                  <Input
+                    id="displayName"
+                    placeholder="Production API Key"
+                    value={newDisplayName}
+                    onChange={(e) => setNewDisplayName(e.target.value)}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="apiKey">API Key</Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    placeholder="sk-..."
+                    value={newApiKey}
+                    onChange={(e) => setNewApiKey(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Your key is encrypted at rest and never exposed in the
+                    dashboard.
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="baseUrl">
+                    Custom Base URL{' '}
+                    <span className="text-muted-foreground font-normal">
+                      (optional)
+                    </span>
+                  </Label>
+                  <Input
+                    id="baseUrl"
+                    placeholder="https://api.openai.com/v1"
+                    value={newBaseUrl}
+                    onChange={(e) => setNewBaseUrl(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Override the default API endpoint for this provider.
+                  </p>
+                </div>
               </div>
-            )}
-            <div className="grid gap-2">
-              <Label htmlFor="displayName">Display Name</Label>
-              <Input
-                id="displayName"
-                placeholder="Production API Key"
-                value={newDisplayName}
-                onChange={(e) => setNewDisplayName(e.target.value)}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="apiKey">API Key</Label>
-              <Input
-                id="apiKey"
-                type="password"
-                placeholder="sk-..."
-                value={newApiKey}
-                onChange={(e) => setNewApiKey(e.target.value)}
-              />
               <p className="text-xs text-muted-foreground">
-                Your key is encrypted at rest and never exposed in the dashboard.
+                We'll verify the key works before saving — this usually takes
+                1–2 seconds.
               </p>
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="baseUrl">
-                Custom Base URL{' '}
-                <span className="text-muted-foreground font-normal">(optional)</span>
-              </Label>
-              <Input
-                id="baseUrl"
-                placeholder="https://api.openai.com/v1"
-                value={newBaseUrl}
-                onChange={(e) => setNewBaseUrl(e.target.value)}
-              />
-              <p className="text-xs text-muted-foreground">
-                Override the default API endpoint for this provider.
-              </p>
-            </div>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            We'll verify the key works before saving — this usually takes 1–2
-            seconds.
-          </p>
-          <DialogFooter>
-            <Button onClick={handleCreate} disabled={createMutation.isPending} className="w-full sm:w-auto">
-              {createMutation.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Verifying &amp; saving…
-                </>
-              ) : (
-                'Add key'
-              )}
-            </Button>
-          </DialogFooter>
+              <DialogFooter>
+                <Button
+                  onClick={handleCreate}
+                  disabled={createMutation.isPending}
+                  className="w-full sm:w-auto"
+                >
+                  {createMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Verifying &amp; saving…
+                    </>
+                  ) : (
+                    'Add key'
+                  )}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
         </DialogContent>
       </Dialog>
 

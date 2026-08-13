@@ -16,6 +16,7 @@ export const sections = [
   { title: "estimate-temps-savings", id: "estimate-temps-savings" },
   { title: "deploy-to-temps", id: "deploy-to-temps" },
   { title: "temps-cli", id: "temps-cli" },
+  { title: "temps-best-practices", id: "temps-best-practices" },
   { title: "temps-platform-setup", id: "temps-platform-setup" },
   { title: "temps-mcp-setup", id: "temps-mcp-setup" },
   { title: "add-react-analytics", id: "add-react-analytics" },
@@ -32,7 +33,7 @@ Give your AI coding agent deep knowledge about Temps. Skills are structured guid
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Temps ships with **9 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
+Temps ships with **10 skills** that work with AI coding tools like Claude Code, Cursor, Windsurf, Cline, and any agent that supports the skills protocol. Each skill is a curated set of instructions, code examples, and reference material that the AI loads when it recognizes a relevant task.
 
 For example, if you tell your AI agent "deploy my app to Temps", and the `deploy-to-temps` skill is installed, the agent already knows the exact CLI commands, framework detection logic, Dockerfile patterns, and troubleshooting steps -- without you having to explain anything.
 
@@ -73,6 +74,7 @@ Select skills to install (space to toggle)
   ◻ add-session-recording
   ◻ deploy-to-temps
   ◻ estimate-temps-savings
+  ◻ temps-best-practices
   ◻ temps-cli
   ◻ temps-mcp-setup
   ◻ temps-platform-setup
@@ -104,6 +106,7 @@ Replace `deploy-to-temps` with any skill name from the list below.
 | [`estimate-temps-savings`](#estimate-temps-savings) | Audit your SaaS stack and calculate what Temps would save you | "how much would I save", "audit my stack" |
 | [`deploy-to-temps`](#deploy-to-temps)             | Deploy applications with auto-detection and CI/CD             | "deploy to temps", "temps deployment" |
 | [`temps-cli`](#temps-cli)                         | Complete reference for all 54+ CLI commands                   | "temps cli", "temps command"          |
+| [`temps-best-practices`](#temps-best-practices)   | Runtime contract and observability best practices             | "temps best practices", "prepare this app for temps" |
 | [`temps-platform-setup`](#temps-platform-setup)   | Install and configure Temps on a server                       | "install temps", "setup temps"        |
 | [`temps-mcp-setup`](#temps-mcp-setup)             | Configure the MCP server for AI agents                        | "temps mcp", "add temps to claude"    |
 | [`add-react-analytics`](#add-react-analytics)     | Add analytics, events, and Web Vitals to React apps           | "add analytics", "track events"       |
@@ -205,6 +208,38 @@ npx skills add gotempsh/temps --skill temps-cli
   <Property name="CI/CD Automation">
     Non-interactive mode (`-y` flag), JSON output for scripting, environment
     variable auth, common automation patterns.
+  </Property>
+</Properties>
+
+---
+
+## temps-best-practices {{ anchor: true, id: 'temps-best-practices' }}
+
+Best practices for application code that runs on Temps -- the runtime contract and production observability. Complements `temps-cli`, which covers platform operations instead.
+
+```bash
+npx skills add gotempsh/temps --skill temps-best-practices
+```
+
+<Properties>
+  <Property name="Runtime Contract">
+    `.temps.yaml` health checks, `PORT`/`HOST` binding, `SIGTERM` handling
+    within the 10-second shutdown window, readiness semantics, and
+    migrations.
+  </Property>
+  <Property name="Five Observability Pillars">
+    Error tracking, traces, metrics, logs, and analytics -- which pillar a
+    given signal belongs in, and the concrete endpoint/auth/gotcha details
+    for each.
+  </Property>
+  <Property name="Credential Boundaries">
+    Which auto-injected env vars are client-safe and which are server-only,
+    so a deployment token or OTLP header never ends up in a browser bundle.
+  </Property>
+  <Property name="Definition of Done">
+    A verification checklist -- runtime, health noise, error tracking,
+    traces, metrics, logs, replay, and client-bundle hygiene -- before
+    calling an app production-ready.
   </Property>
 </Properties>
 

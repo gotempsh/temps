@@ -742,3 +742,37 @@ async fn trace_summaries_resolves_divergent_duplicates_by_version() {
         "argMax must not tie-break arbitrarily between divergent copies"
     );
 }
+
+#[tokio::test]
+async fn has_traces_is_true_for_a_project_with_spans_and_false_otherwise() {
+    let Some(h) = harness().await else {
+        println!("ClickHouse not available, skipping");
+        return;
+    };
+    h.storage
+        .store_spans(fixture())
+        .await
+        .expect("seed fixture");
+
+    assert!(
+        h.storage
+            .has_traces(PROJECT)
+            .await
+            .expect("has_traces(PROJECT)"),
+        "PROJECT has spans in the fixture"
+    );
+    assert!(
+        h.storage
+            .has_traces(OTHER_PROJECT)
+            .await
+            .expect("has_traces(OTHER_PROJECT)"),
+        "OTHER_PROJECT has the decoy trace in the fixture"
+    );
+    assert!(
+        !h.storage
+            .has_traces(-1)
+            .await
+            .expect("has_traces(unused project)"),
+        "a project no span has ever named must report false"
+    );
+}

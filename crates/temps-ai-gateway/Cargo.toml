@@ -10,7 +10,10 @@ homepage.workspace = true
 [dependencies]
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-ai = { path = "../temps-ai" }
+temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
+temps-agents = { path = "../temps-agents" }
 temps-entities = { path = "../temps-entities" }
 
 serde = { workspace = true }

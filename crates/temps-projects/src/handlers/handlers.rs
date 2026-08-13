@@ -1448,6 +1448,21 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
+    if config.request_timeout_seconds.is_some() {
+        updated_fields.insert("request_timeout_seconds".to_string(), "updated".to_string());
+    }
+    if config.sse_idle_timeout_seconds.is_some() {
+        updated_fields.insert(
+            "sse_idle_timeout_seconds".to_string(),
+            "updated".to_string(),
+        );
+    }
+    if config.websocket_idle_timeout_seconds.is_some() {
+        updated_fields.insert(
+            "websocket_idle_timeout_seconds".to_string(),
+            "updated".to_string(),
+        );
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,

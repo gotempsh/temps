@@ -1491,6 +1491,30 @@ impl OtelStorage for TimescaleDbStorage {
         }
         self.count_traces_from_table(query).await
     }
+
+    /// Whether `project_id` has ever received at least one span. See the
+    /// ClickHouse implementation's doc comment for why this stays a plain
+    /// existence probe rather than `count_traces(..) > 0`: the caller (the
+    /// project-setup checklist) only needs yes/no, and `otel_trace_summaries`
+    /// is indexed on `project_id`, so `EXISTS (... LIMIT 1)` is an index
+    /// lookup regardless of how many traces the project has accumulated.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT EXISTS(SELECT 1 FROM otel_trace_summaries WHERE project_id = $1 LIMIT 1) AS has_traces",
+                vec![project_id.into()],
+            ))
+            .await?;
+
+        if let Some(row) = result {
+            Ok(row.try_get("", "has_traces").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
         // Two-phase lookup. Phase 1: fetch the trace's time window from
         // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans

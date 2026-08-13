@@ -68,6 +68,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub ai_chat_limits: AiChatLimitsSettings,
 
+    /// Upstream request/connection timeouts applied by the proxy to customer
+    /// app traffic. Provides a global hard ceiling plus global defaults for
+    /// regular HTTP, SSE, and WebSocket traffic; projects and environments
+    /// may set a shorter value but never exceed the ceiling here.
+    #[serde(default)]
+    pub request_timeouts: RequestTimeoutSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -240,6 +247,94 @@ impl AiChatLimitsSettings {
             self.turn_timeout_secs
                 .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
         )
+    }
+}
+
+/// Upstream request/connection timeouts for customer app traffic.
+///
+/// By default, no timeout is applied to customer app traffic at all — an
+/// existing app that happens to have a slow endpoint, a long-polling
+/// request, or an unusually long response must keep working exactly as it
+/// did before this setting existed. Timeouts here are opt-in: an operator
+/// can set a global default, and/or a project/environment can set its own
+/// override (`DeploymentConfig::request_timeout_seconds` /
+/// `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until
+/// one of those is explicitly configured, the proxy holds the connection
+/// open indefinitely (bounded only by TCP/OS-level limits).
+///
+/// `default_*_timeout_seconds` of `0` means "no timeout" — this is the
+/// out-of-the-box value for all three. `max_request_timeout_seconds` is a
+/// hard ceiling that only comes into play once a timeout is actually
+/// configured (globally or per project/environment): whatever value is
+/// resolved is always clamped to it, so lowering the ceiling here takes
+/// effect immediately without needing every environment row re-saved. It
+/// never *creates* a timeout for traffic that has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct RequestTimeoutSettings {
+    /// Hard ceiling, in seconds, applied once a timeout is configured (via a
+    /// global default above or a project/environment override). Has no
+    /// effect on traffic with no timeout configured at all.
+    #[schema(minimum = 5, maximum = 86400, example = 600)]
+    pub max_request_timeout_seconds: u32,
+
+    /// Default timeout for regular (non-streaming) HTTP requests, in
+    /// seconds. Used when a project/environment hasn't set
+    /// `request_timeout_seconds`. `0` (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_http_timeout_seconds: u32,
+
+    /// Default idle timeout for Server-Sent Events streams, in seconds. Used
+    /// when a project/environment hasn't set `sse_idle_timeout_seconds`. `0`
+    /// (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_sse_idle_timeout_seconds: u32,
+
+    /// Default idle timeout for WebSocket connections, in seconds. Used when
+    /// a project/environment hasn't set `websocket_idle_timeout_seconds`.
+    /// `0` (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_websocket_idle_timeout_seconds: u32,
+}
+
+impl RequestTimeoutSettings {
+    /// Lower bound for `max_request_timeout_seconds`: below this, ordinary
+    /// requests to a slow-starting app would routinely fail.
+    pub const MIN_CEILING_SECS: u32 = 5;
+    /// Upper bound for `max_request_timeout_seconds`: a day-long single
+    /// upstream connection is already far past anything a proxy should hold
+    /// open.
+    pub const MAX_CEILING_SECS: u32 = 86400;
+
+    /// The configured ceiling, clamped to the supported range. Clamped
+    /// rather than trusted for the same reason as `AiChatLimitsSettings`:
+    /// the settings row is JSON any admin can write, and an unclamped 0
+    /// would mean "every request times out instantly" for any traffic that
+    /// does have a timeout configured.
+    pub fn ceiling(&self) -> u32 {
+        self.max_request_timeout_seconds
+            .clamp(Self::MIN_CEILING_SECS, Self::MAX_CEILING_SECS)
+    }
+
+    /// Clamp a resolved, *already-nonzero* per-request timeout (merged from
+    /// project/environment overrides or one of the defaults above) down to
+    /// the hard ceiling. The ceiling always wins. Callers must treat `0`
+    /// (no timeout) as a distinct case and never pass it here — clamping
+    /// would turn "no timeout" into "the ceiling," which is exactly the
+    /// unwanted default-on behavior this type exists to avoid.
+    pub fn clamp_to_ceiling(&self, seconds: u32) -> u32 {
+        seconds.min(self.ceiling())
+    }
+}
+
+impl Default for RequestTimeoutSettings {
+    fn default() -> Self {
+        Self {
+            max_request_timeout_seconds: 600,
+            default_http_timeout_seconds: 0,
+            default_sse_idle_timeout_seconds: 0,
+            default_websocket_idle_timeout_seconds: 0,
+        }
     }
 }
 
@@ -915,6 +1010,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             ai_chat_limits: AiChatLimitsSettings::default(),
+            request_timeouts: RequestTimeoutSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
@@ -1487,6 +1583,73 @@ mod tests {
         let parsed = AppSettings::from_json(settings.to_json());
         assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
         assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
+    }
+
+    #[test]
+    fn request_timeouts_default_is_no_timeout_opt_in_only() {
+        // No traffic-class default applies a timeout out of the box — an
+        // existing app with a slow endpoint or long-lived connection must
+        // keep working exactly as it did before this setting existed.
+        // Timeouts are opt-in: an operator sets a nonzero global default
+        // and/or a project/environment sets its own override. The ceiling
+        // stays at a sane value because it only ever constrains a timeout
+        // that's actually configured — it can't create one on its own.
+        let s = RequestTimeoutSettings::default();
+        assert_eq!(s.max_request_timeout_seconds, 600);
+        assert_eq!(s.default_http_timeout_seconds, 0);
+        assert_eq!(s.default_sse_idle_timeout_seconds, 0);
+        assert_eq!(s.default_websocket_idle_timeout_seconds, 0);
+    }
+
+    #[test]
+    fn request_timeouts_ceiling_clamps_out_of_range_values() {
+        let mut s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MIN_CEILING_SECS);
+
+        s.max_request_timeout_seconds = u32::MAX;
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MAX_CEILING_SECS);
+    }
+
+    #[test]
+    fn request_timeouts_clamp_to_ceiling_never_exceeds_ceiling() {
+        let s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.clamp_to_ceiling(30), 30, "below ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(120), 120, "at ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(9000), 120, "above ceiling: clamped");
+    }
+
+    #[test]
+    fn legacy_settings_json_without_request_timeouts_deserializes() {
+        // An old `settings.data` row written before this feature shipped has
+        // no `request_timeouts` key. `#[serde(default)]` must fill it in
+        // with the no-timeout defaults so pre-migration rows keep loading
+        // with identical (i.e. unbounded) proxy behavior.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(parsed.request_timeouts, RequestTimeoutSettings::default());
+    }
+
+    #[test]
+    fn request_timeouts_round_trip_through_json() {
+        let mut settings = AppSettings::default();
+        settings.request_timeouts.max_request_timeout_seconds = 120;
+        settings.request_timeouts.default_http_timeout_seconds = 30;
+        settings.request_timeouts.default_sse_idle_timeout_seconds = 90;
+        settings
+            .request_timeouts
+            .default_websocket_idle_timeout_seconds = 90;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.request_timeouts, settings.request_timeouts);
     }
 
     /// Regression: a settings save must not delete the `admin_gate`

@@ -22,9 +22,12 @@ pub const TOOL_USAGE_GUIDANCE: &str = "\
 ## Grounding
 Answer from tool results, not assumptions. If a claim can be checked with a tool, check it first. Cite concrete values you actually retrieved (ids, counts, timestamps, statuses), and say plainly when the data does not show something. Never invent facts, ids, or numbers.
 
-## Querying the platform API (the `temps` CLI)
-You have read-only access to the platform's REST API through a single `temps`
-tool — a command line you drive like any CLI:
+## Querying the platform API (the `temps` tool)
+You have read-only access to the platform's REST API through a single MCP tool
+named `temps`. Its `command` argument emulates a CLI grammar, but it is NOT a
+local executable: invoke the registered `temps` tool directly. Never use a
+shell, terminal, Bash, or a locally installed `temps` binary for these calls.
+Drive the tool's command grammar as follows:
 - `temps --help` → the list of sections (also shown below in this prompt).
 - `temps <section> --help` → the operations in a section.
 - `temps <section> <operation> --help` → an operation's description and flags.
@@ -81,6 +84,14 @@ pub trait ConversationContextProvider: Send + Sync {
     /// keywords. `auth` is the calling user's context, so the appendix can be
     /// scoped to what they're permitted to discover. Default: nothing.
     fn system_appendix(&self, _auth: &AuthContext) -> Option<String> {
+        None
+    }
+
+    /// Stable provider-specific catalog material that affects what a resumed
+    /// interactive CLI session believes it can do. This must exclude live
+    /// entity/page context; it is hashed solely to invalidate stale sessions
+    /// when their effective capability contract changes.
+    fn cli_session_contract(&self, _auth: &AuthContext) -> Option<String> {
         None
     }
 

@@ -32,6 +32,7 @@ use crate::services::job_tracker::JobTracker;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::snapshot_service::SnapshotService;
 
 /// Optional initial content to seed into the sandbox after create.
 /// Mirrors `@vercel/sandbox`'s `source: { type, url, revision?, username?,
@@ -168,6 +169,11 @@ pub struct CreateSandboxRequest {
     /// Project to derive the repo from when `source` is absent, and to
     /// attribute the sandbox to. `None` → unattached sandbox.
     pub project_id: Option<i32>,
+    /// Pre-resolved snapshot artifact (ADR-037). When `Some`, the sandbox
+    /// is created via `provider.create_from_snapshot` instead of
+    /// `provider.create`. Mutually exclusive with `image`; validated in the
+    /// handler before this field is populated.
+    pub from_snapshot_artifact: Option<temps_agents::sandbox::SnapshotArtifact>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -441,6 +447,10 @@ pub struct SandboxService {
     /// allocated. Each sandbox gets `{data_dir}/{public_id}/` bind-mounted
     /// to `/workspace` inside the container.
     data_root: PathBuf,
+    /// Snapshot service for nullifying `source_sandbox_id` references when
+    /// a sandbox is destroyed (ADR-037). `None` when snapshots are not
+    /// enabled for this deployment (e.g. Firecracker-only).
+    snapshot_service: Option<Arc<SnapshotService>>,
 }
 
 impl SandboxService {
@@ -461,7 +471,15 @@ impl SandboxService {
             cookie_crypto,
             git_provider_manager,
             data_root,
+            snapshot_service: None,
         }
+    }
+
+    /// Set the snapshot service after construction (two-phase init).
+    /// Called by the plugin once both services are registered (ADR-037).
+    pub fn with_snapshot_service(mut self, svc: Arc<SnapshotService>) -> Self {
+        self.snapshot_service = Some(svc);
+        self
     }
 
     pub fn registry(&self) -> &StandaloneSandboxRegistry {
@@ -994,7 +1012,16 @@ impl SandboxService {
             backend,
         };
 
-        let handle = match self.registry.create(config).await {
+        // Choose create path: snapshot restore vs normal create.
+        let create_result = if let Some(ref artifact) = req.from_snapshot_artifact {
+            // ADR-037: restore from snapshot. The provider ensures the image
+            // is loaded into the daemon before creating the container.
+            self.registry.create_from_snapshot(artifact, config).await
+        } else {
+            self.registry.create(config).await
+        };
+
+        let handle = match create_result {
             Ok(h) => h,
             Err(e) => {
                 // Tear the container down before touching the work dir.
@@ -1408,6 +1435,22 @@ TEMPS_ASKPASS_EOF\n\
         self.remove_work_dir(public_id_value).await;
         self.record_event(row.id, "destroyed", None).await;
         self.mark_destroyed(row.id).await?;
+
+        // Nullify source_sandbox_id on any snapshot that references this
+        // sandbox (ADR-037). Best-effort: a failure here is not fatal to
+        // the destroy — the snapshot rows still exist and are usable, they
+        // just carry a stale integer reference to a now-gone sandbox.
+        if let Some(ref snap_svc) = self.snapshot_service {
+            if let Err(e) = snap_svc.nullify_source_sandbox(row.id).await {
+                tracing::warn!(
+                    sandbox_id = %public_id_value,
+                    internal_id = row.id,
+                    "destroy: failed to nullify source_sandbox_id on snapshots: {}",
+                    e
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -3490,6 +3533,237 @@ mod storage_cleanup_tests {
             "a failed seed must not strand a work dir holding a cloned \
              repository; found {:?}",
             leftovers
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── Major 5: from_snapshot routing ───────────────────────────────────────
+
+    /// When `CreateSandboxRequest.from_snapshot_artifact` is `Some`, the
+    /// service routes to `registry.create_from_snapshot` instead of
+    /// `registry.create`. FakeProvider doesn't override `create_from_snapshot`
+    /// so it returns the trait-default "not supported" error — the test
+    /// confirms the routing by observing that error rather than a normal
+    /// create-failure reason.
+    #[tokio::test]
+    async fn create_sandbox_from_snapshot_routes_to_create_from_snapshot() {
+        let data_root = unique_data_root("from-snapshot-route");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // insert of the new row (RETURNING)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // mark_destroyed update (RETURNING) — cleanup after create fails
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let artifact = temps_agents::sandbox::SnapshotArtifact {
+            content_path: std::path::PathBuf::from("/tmp/test.tar"),
+            content_digest: "sha256fake".to_string(),
+            size_bytes: 1024,
+            backend: temps_agents::sandbox::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/test:v1".to_string()),
+        };
+
+        let req = CreateSandboxRequest {
+            from_snapshot_artifact: Some(artifact),
+            ..Default::default()
+        };
+
+        let err = service
+            .create_sandbox(1, req)
+            .await
+            .expect_err("FakeProvider::create_from_snapshot returns NotSupported, must fail");
+
+        // The error message proves we went through the from-snapshot path, not
+        // the normal create path.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") || msg.contains("from_snapshot"),
+            "error must reference the snapshot create path, got: {:?}",
+            err
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── Major 5: non-Docker provider trait defaults ───────────────────────────
+
+    /// Providers that don't override `take_snapshot` return a typed "not
+    /// supported" error rather than silently succeeding. Regression guard for
+    /// any future provider that inherits the trait without implementing it.
+    #[tokio::test]
+    async fn non_docker_provider_take_snapshot_default_returns_not_supported() {
+        let handle = handle_for("test");
+        let result = FakeProvider::new().take_snapshot(&handle, None).await;
+        assert!(
+            result.is_err(),
+            "default take_snapshot must return an error, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not supported"),
+            "error must say 'not supported', got: {}",
+            msg
+        );
+    }
+
+    /// Providers that don't override `create_from_snapshot` return a typed
+    /// "not supported" error. Ensures the from-snapshot routing fails loudly
+    /// on backends that don't implement it, rather than silently no-oping.
+    #[tokio::test]
+    async fn non_docker_provider_create_from_snapshot_default_returns_not_supported() {
+        let artifact = temps_agents::sandbox::SnapshotArtifact {
+            content_path: std::path::PathBuf::from("/tmp/test.tar"),
+            content_digest: "sha256fake".to_string(),
+            size_bytes: 0,
+            backend: temps_agents::sandbox::SandboxBackend::Docker,
+            image_ref: None,
+        };
+        let config = SandboxCreateConfig {
+            run_id: 0,
+            container_name_override: None,
+            host_work_dir: std::path::PathBuf::from("/tmp"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(3600),
+            backend: None,
+            owner_user_id: None,
+        };
+        let result = FakeProvider::new()
+            .create_from_snapshot(&artifact, config)
+            .await;
+        assert!(
+            result.is_err(),
+            "default create_from_snapshot must return an error, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not supported"),
+            "error must say 'not supported', got: {}",
+            msg
+        );
+    }
+
+    /// Providers that don't override `delete_image` should no-op successfully.
+    /// The default is intentionally a no-op for backends (Local, Firecracker)
+    /// that have no image store concept.
+    #[tokio::test]
+    async fn non_docker_provider_delete_image_default_is_noop() {
+        let result = FakeProvider::new()
+            .delete_image("temps-snapshot/test:v1")
+            .await;
+        assert!(
+            result.is_ok(),
+            "default delete_image must succeed (no-op), got: {:?}",
+            result
+        );
+    }
+
+    // ── Major 5: nullify_source_sandbox failure isolation ─────────────────────
+
+    /// `destroy_sandbox` calls `nullify_source_sandbox` best-effort. When the
+    /// snapshot DB fails (e.g. transient network error), the destroy must still
+    /// complete and return `Ok(())`. A DB error in nullify must never strand the
+    /// user with an un-destroyable sandbox.
+    ///
+    /// We attach a SnapshotService backed by a MockDatabase that errors on the
+    /// `update_many` query, then verify destroy_sandbox still returns Ok.
+    #[tokio::test]
+    async fn destroy_sandbox_nullify_failure_does_not_fail_destroy() {
+        use crate::services::snapshot_service::SnapshotService;
+        use temps_agents::sandbox::local::LocalSandboxProvider;
+
+        let data_root = unique_data_root("nullify-fail");
+        let dir = seed_work_dir(&data_root, PUBLIC_ID);
+
+        // SandboxService DB: three queries for destroy path
+        let sandbox_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![sandbox_events::Model {
+                id: 1,
+                sandbox_id: 7,
+                event_type: "destroyed".into(),
+                detail: None,
+                created_at: Utc::now(),
+            }]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        // SnapshotService DB: update_many for nullify fails with a DB error
+        let snap_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "simulated nullify transient failure".to_string(),
+                )])
+                .into_connection(),
+        );
+
+        let snap_provider = Arc::new(LocalSandboxProvider::new()) as Arc<dyn SandboxProvider>;
+        let snap_registry = Arc::new(StandaloneSandboxRegistry::new(snap_provider.clone()));
+        let snapshot_service =
+            Arc::new(SnapshotService::new(snap_db, snap_registry, snap_provider));
+
+        // Build the full SandboxService with the snapshot_service injected,
+        // then wrap in Arc (note: with_snapshot_service must be called before Arc::new).
+        let db = Arc::new(sandbox_db);
+        let registry = Arc::new(StandaloneSandboxRegistry::new(
+            Arc::new(FakeProvider::new()) as Arc<dyn SandboxProvider>,
+        ));
+        let config = Arc::new(temps_config::ConfigService::new(
+            Arc::new(test_server_config(data_root.clone())),
+            db.clone(),
+        ));
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+        let git = Arc::new(GitProviderManager::new(
+            db.clone(),
+            encryption,
+            Arc::new(PanicOnSendJobQueue) as Arc<dyn temps_core::JobQueue>,
+            config.clone(),
+        ));
+        let cookie_crypto = Arc::new(
+            temps_core::CookieCrypto::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test cookie key"),
+        );
+        let service = Arc::new(
+            SandboxService::new(
+                db,
+                registry,
+                Arc::new(JobTracker::new()),
+                config,
+                cookie_crypto,
+                git,
+                data_root.clone(),
+            )
+            .with_snapshot_service(snapshot_service),
+        );
+
+        // destroy_sandbox must succeed even though nullify_source_sandbox failed.
+        let result = service.destroy_sandbox(PUBLIC_ID, 1).await;
+        assert!(
+            result.is_ok(),
+            "destroy_sandbox must succeed even when nullify_source_sandbox fails, got: {:?}",
+            result
+        );
+
+        // Work dir still cleaned up
+        assert!(
+            !dir.exists(),
+            "work dir must be removed even when nullify failed"
         );
         let _ = std::fs::remove_dir_all(&data_root);
     }

@@ -1382,6 +1382,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_container_info",
         "get_container_detail",
         "list_containers",
+        // ── Projects: current-user-filtered metadata ──
+        // The handler enforces ProjectsRead and derives hidden project ids
+        // from the AuthContext forwarded by the current private chat turn.
+        "get_projects",
         // ── Deployments: status / jobs / history ──
         "get_deployment",
         "get_last_deployment",
@@ -1425,7 +1429,13 @@ fn ai_read_allowlist() -> Vec<String> {
         //    Without these it proposes duplicates of rules that exist.
         "list_alerts",
         "get_alert",
-        // ── Service status / health / types (NOT params/env) ──
+        // ── Service inventory / status / health / types (NOT params/env) ──
+        // `list_services` is filtered by the current user's
+        // ExternalServicesRead permission, and deployment tokens are rejected
+        // by the handler. Without it, the AI can see only services already
+        // linked to the current project and cannot discover a newly created
+        // database in order to link or inspect it.
+        "list_services",
         "get_service_health_status",
         "list_service_health_statuses",
         "get_service_stats",
@@ -3442,6 +3452,7 @@ mod ai_tool_allowlist_tests {
     use super::*;
     use temps_ai_api_tools::ReadOnlyApiIndex;
     use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
+    use temps_providers::handlers::ExternalServiceApiDoc;
     use utoipa::OpenApi;
 
     /// A throwaway admin auth context for the prepare-path tests (no request is
@@ -3658,6 +3669,44 @@ mod ai_tool_allowlist_tests {
                 "duplicate allowlist entry: {entry}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_projects_resolves_and_is_discoverable_in_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = temps_projects::handlers::ApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        assert!(caller
+            .indexed_operation_ids()
+            .contains(&"get_projects".to_string()));
+
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![],
+        };
+        let catalog = caller.run_cli("projects --help", &scope).await;
+        assert!(catalog.contains("get_projects"), "catalog: {catalog}");
+    }
+
+    #[tokio::test]
+    async fn list_services_resolves_and_is_discoverable_in_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = ExternalServiceApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        assert!(caller
+            .indexed_operation_ids()
+            .contains(&"list_services".to_string()));
+
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![],
+        };
+        let catalog = caller.run_cli("external-services --help", &scope).await;
+        assert!(catalog.contains("list_services"), "catalog: {catalog}");
     }
 
     /// PR #265 added `DeploymentMetricsGetRange`/`DeploymentMetricsGetLatest`/

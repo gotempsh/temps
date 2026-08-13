@@ -464,6 +464,18 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.wake_timeout_seconds)
                     .unwrap_or(30),
+                request_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.request_timeout_seconds),
+                sse_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.sse_idle_timeout_seconds),
+                websocket_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.websocket_idle_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -595,6 +607,25 @@ pub struct UpdateDeploymentConfigRequest {
     /// are emulated on the control plane and substantially slower, so they are
     /// opted into rather than triggered by cluster topology.
     pub cross_architecture_builds: Option<bool>,
+    /// Project-level default timeout for regular (non-streaming) HTTP
+    /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
+    /// override this; always clamped to the operator's global hard ceiling
+    /// regardless of what's set here. Absent leaves the current value
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for Server-Sent Events streams, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse_idle_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for WebSocket connections, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]

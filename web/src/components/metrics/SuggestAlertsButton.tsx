@@ -169,15 +169,15 @@ export function SuggestAlertsButton({
                 <AlertDialogDescription>
                   Suggesting alerts needs a model to reason over your metrics,
                   and this instance has no AI provider configured yet. Add one
-                  in Settings → AI Providers (you bring your own key — Temps
-                  stores it encrypted and calls the provider directly). Come
-                  back here afterwards and this button will open the chat.
+                  on the AI Gateway page (you bring your own key — Temps stores
+                  it encrypted and calls the provider directly). Come back here
+                  afterwards and this button will open the chat.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Close</AlertDialogCancel>
                 <AlertDialogAction asChild>
-                  <Link to="/settings/ai-providers">Go to AI Providers</Link>
+                  <Link to="/ai-gateway">Go to AI Gateway</Link>
                 </AlertDialogAction>
               </AlertDialogFooter>
             </>

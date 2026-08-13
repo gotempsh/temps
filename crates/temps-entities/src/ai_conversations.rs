@@ -28,6 +28,25 @@ pub struct Model {
     pub metadata: Option<serde_json::Value>,
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
+    /// Provider selected when the conversation was created: `gateway` or an
+    /// agent CLI catalog id. Immutable for the conversation lifetime.
+    pub ai_provider: String,
+    /// Model selected with the provider when the conversation was created.
+    pub ai_model: String,
+    /// Provider-specific reasoning effort/variant, immutable for this chat.
+    pub ai_thinking_level: Option<String>,
+    /// Provider-specific permission/agent mode, immutable for this chat.
+    pub ai_permission_mode: String,
+    /// Claude CLI session UUID from the `system/init` or `result` event
+    /// (`--input-format stream-json` interactive mode, ADR-038 Phase 2).
+    /// Used to resume the session via `claude --resume <session_id>`.
+    /// `None` for conversations that have never used the interactive CLI path,
+    /// or for conversations backed by other providers (Codex, OpenCode, BYOK).
+    pub cli_session_id: Option<String>,
+    /// Stable fingerprint of the effective tool/catalog and provider contract
+    /// used to create `cli_session_id`. A session is resumable only when this
+    /// matches the contract assembled for the current turn.
+    pub cli_session_fingerprint: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

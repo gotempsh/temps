@@ -56,6 +56,20 @@ impl StandaloneSandboxRegistry {
         Ok(handle)
     }
 
+    /// Create a sandbox from a snapshot artifact (ADR-037). Registers the
+    /// handle identically to `create` — the difference is only at the
+    /// provider level (image is loaded from the tarball if not present).
+    pub async fn create_from_snapshot(
+        &self,
+        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let id = config.run_id;
+        let handle = self.provider.create_from_snapshot(artifact, config).await?;
+        self.handles.write().await.insert(id, handle.clone());
+        Ok(handle)
+    }
+
     /// Strip the `sbx_` prefix from a public ID to get the container
     /// label the provider indexes by. Docker-side container names are
     /// `temps-sandbox-<hex>` where `<hex>` is the label returned here.

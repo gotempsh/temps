@@ -15,6 +15,7 @@ Manage environments and environment variables
 - `delete` (`rm`) - Delete an environment
 - `vars` - Manage environment variables
 - `resources` - View or set CPU/memory resources for an environment
+- `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
 - `crons` - Manage cron jobs
@@ -154,6 +155,21 @@ View or set CPU/memory resources for an environment
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
 | `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
 | `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments timeouts`
+
+View or set upstream request/idle timeouts for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--request <seconds>` | Timeout for regular (non-streaming) HTTP requests, in seconds | - | No |
+| `--sse-idle <seconds>` | Idle timeout for Server-Sent Events streams, in seconds | - | No |
+| `--websocket-idle <seconds>` | Idle timeout for WebSocket connections, in seconds | - | No |
+| `--inherit` | Clear all three overrides (inherit the project/global defaults) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments force-https`

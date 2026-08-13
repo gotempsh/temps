@@ -226,6 +226,7 @@ export async function updatePlatformSettings(
     attack_mode: updated.attack_mode,
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
+    request_timeouts: updated.request_timeouts,
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,

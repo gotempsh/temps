@@ -13,7 +13,6 @@ use serde::Serialize;
 use std::sync::Arc;
 use temps_core::notifications::DynNotificationService;
 use thiserror::Error;
-use totp_rs::Secret;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 const DEFAULT_EXTERNAL_URL: &str = "http://localhost:8000";
@@ -390,7 +389,7 @@ impl AuthService {
     ) -> Result<bool, MfaChallengeError> {
         match &user.mfa_secret {
             Some(secret) => {
-                use totp_rs::{Algorithm, TOTP};
+                use totp_rs::{Algorithm, Builder};
 
                 let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
                     .ok_or(MfaChallengeError::VerifierConfiguration {
@@ -398,25 +397,27 @@ impl AuthService {
                     reason: "stored secret is not valid base32".to_string(),
                 })?;
 
-                let secret_bytes = Secret::Raw(decoded).to_bytes().map_err(|error| {
-                    MfaChallengeError::VerifierConfiguration {
-                        user_id: user.id,
-                        reason: format!("stored secret cannot be converted to bytes: {error}"),
-                    }
-                })?;
-
-                let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes).map_err(|error| {
-                    MfaChallengeError::VerifierConfiguration {
+                // Algorithm::SHA1, 6 digits, skew 1, step 30 — these are the
+                // parameters that were used when the secret was enrolled (see
+                // `generate_mfa_setup_candidate`). They must not silently change.
+                // `build()` (not `build_noncompliant()`) so a malformed stored
+                // secret still fails loudly instead of constructing a Totp that
+                // silently never validates.
+                let totp = Builder::new()
+                    .with_algorithm(Algorithm::SHA1)
+                    .with_digits(6)
+                    .with_skew(1)
+                    .with_step_duration(30)
+                    .with_secret(decoded)
+                    .build()
+                    .map_err(|error| MfaChallengeError::VerifierConfiguration {
                         user_id: user.id,
                         reason: format!("TOTP verifier cannot be initialized: {error}"),
-                    }
-                })?;
+                    })?;
 
-                totp.check_current(code)
-                    .map_err(|error| MfaChallengeError::VerificationClock {
-                        user_id: user.id,
-                        reason: error.to_string(),
-                    })
+                // check_current now returns Option<u64>: Some(step) = valid,
+                // None = invalid. There is no longer a fallible clock path.
+                Ok(totp.check_current(code).is_some())
             }
             None => Err(MfaChallengeError::VerifierConfiguration {
                 user_id: user.id,
@@ -2189,10 +2190,17 @@ mod tests {
     fn current_totp_code(secret: &str) -> String {
         let secret_bytes = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
             .expect("test secret should be valid base32");
-        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret_bytes)
-            .expect("test TOTP should initialize")
+        // In totp-rs 6.0.0 the constructor is Builder-based and generate_current()
+        // returns Token (implements Display), not Result<String, _>.
+        totp_rs::Builder::new()
+            .with_algorithm(totp_rs::Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(secret_bytes)
+            .build_noncompliant()
             .generate_current()
-            .expect("test clock should generate a TOTP")
+            .to_string()
     }
 
     #[tokio::test]
