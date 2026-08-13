@@ -6,6 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import {
   Table,
   TableBody,
@@ -1317,6 +1318,8 @@ export function NodesPage() {
           )}
         </CardContent>
       </Card>
+
+      <ClusterDnsCard />
     </div>
   )
 }

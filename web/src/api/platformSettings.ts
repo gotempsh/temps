@@ -234,6 +234,9 @@ export async function updatePlatformSettings(
     // `#[serde(default)]`, so omitting this field would silently re-enable
     // console updates whenever any other settings page is saved.
     self_update: updated.self_update,
+    // Same reasoning: omitting this would silently reset cluster DNS back to
+    // disabled on every unrelated settings save.
+    cluster_dns: updated.cluster_dns,
   }
   const result = await updateSettings({ body })
   if (result.error) {
