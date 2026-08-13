@@ -144,12 +144,26 @@ impl DockerClient for DefaultDockerClient {
 fn seconds_until_next_cleanup(cleanup_hour: u32) -> u64 {
     let now = chrono::Utc::now();
 
-    // Calculate target time (today at cleanup_hour)
-    let target_time = now
+    // Calculate target time (today at cleanup_hour). `with_hour` etc. only
+    // return None for an out-of-range component; every caller already
+    // constrains `cleanup_hour` to 0..24 via `% 24`, but this runs on every
+    // scheduler tick for the life of the process (console and every worker
+    // agent), so a future caller skipping that guard must not crash the
+    // spawned task -- retry in 24h instead of panicking.
+    let target_time = match now
         .with_hour(cleanup_hour)
         .and_then(|t| t.with_minute(0))
         .and_then(|t| t.with_second(0))
-        .expect("Failed to calculate target cleanup time");
+    {
+        Some(t) => t,
+        None => {
+            error!(
+                cleanup_hour,
+                "Invalid cleanup hour; docker cleanup scheduler will retry in 24h"
+            );
+            return 24 * 3600;
+        }
+    };
 
     let next_cleanup = if target_time > now {
         // Cleanup time hasn't passed today
@@ -738,6 +752,14 @@ mod tests {
         // Should be positive and less than 24 hours
         assert!(seconds > 0);
         assert!(seconds <= 24 * 3600);
+    }
+
+    #[test]
+    fn test_seconds_until_next_cleanup_invalid_hour_retries_instead_of_panicking() {
+        // 25 is out of chrono's 0..24 range for `with_hour`; every real
+        // caller guards with `% 24`, but this must degrade to a 24h retry
+        // rather than panic if that guard is ever skipped.
+        assert_eq!(seconds_until_next_cleanup(25), 24 * 3600);
     }
 
     #[test]
