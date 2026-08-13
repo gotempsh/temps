@@ -489,6 +489,9 @@ struct ChTimeBucketRow {
     bucket_ms: i64,
     request_count: u64,
     avg_response_time_ms: f64,
+    p50_response_time_ms: f64,
+    p95_response_time_ms: f64,
+    p99_response_time_ms: f64,
     error_count: u64,
     total_request_bytes: i64,
     total_response_bytes: i64,
@@ -1255,6 +1258,9 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 count() AS request_count, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms, \
+                ifNull(quantile(0.50)(response_time_ms), 0) AS p50_response_time_ms, \
+                ifNull(quantile(0.95)(response_time_ms), 0) AS p95_response_time_ms, \
+                ifNull(quantile(0.99)(response_time_ms), 0) AS p99_response_time_ms, \
                 countIf(status_code >= 400) AS error_count, \
                 sum(ifNull(request_size_bytes, 0)) AS total_request_bytes, \
                 sum(ifNull(response_size_bytes, 0)) AS total_response_bytes \
@@ -1295,6 +1301,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                     0.0
                 } else {
                     r.avg_response_time_ms
+                },
+                p50_response_time_ms: if r.p50_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p50_response_time_ms
+                },
+                p95_response_time_ms: if r.p95_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p95_response_time_ms
+                },
+                p99_response_time_ms: if r.p99_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p99_response_time_ms
                 },
                 error_count: r.error_count as i64,
                 total_request_bytes: r.total_request_bytes,

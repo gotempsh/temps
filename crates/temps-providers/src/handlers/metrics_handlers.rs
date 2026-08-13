@@ -37,17 +37,19 @@ use axum::{
     routing::{get, patch, put},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
+    UtcDateTime,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
 use temps_metrics::{
-    is_monotonic_counter, range_to_step, LatestByLabelQuery, LatestQuery, RangeQuery, SourceKind,
+    duration_to_step, is_monotonic_counter, range_to_step, LatestByLabelQuery, LatestQuery,
+    RangeQuery, SourceKind,
 };
 use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -110,15 +112,61 @@ pub struct MetricsRangeQuery {
     /// Metric name, e.g. `"pg.connections_active"`.
     pub metric: String,
     /// Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+    /// Ignored when `start_time` and `end_time` are both set.
     #[serde(default = "default_range")]
     pub range: String,
     /// Optional histogram percentile (0–100).  When provided, the endpoint
     /// fetches histogram buckets and computes the requested quantile.
     pub percentile: Option<f64>,
+    /// Explicit window start (ISO 8601). Must be paired with `end_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T00:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub start_time: Option<UtcDateTime>,
+    /// Explicit window end (ISO 8601). Must be paired with `start_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T12:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub end_time: Option<UtcDateTime>,
 }
 
 fn default_range() -> String {
     "1h".to_string()
+}
+
+/// Resolve `(from, to, step)` from either an explicit `[start_time, end_time]`
+/// pair or a preset `range`. Explicit bounds win when both are present.
+fn resolve_range_window(
+    params: &MetricsRangeQuery,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, Duration), Problem> {
+    match (params.start_time, params.end_time) {
+        (Some(start), Some(end)) => {
+            if start >= end {
+                return Err(bad_request()
+                    .detail("start_time must be before end_time")
+                    .build());
+            }
+            let span = end - start;
+            let max = Duration::days(temps_core::time_window::MAX_WINDOW_DAYS);
+            if span > max {
+                return Err(bad_request()
+                    .detail(format!(
+                        "Requested time range spans {} days, which exceeds the {}-day maximum for this endpoint. Older data is still available — request it {} days at a time by moving start_time/end_time back.",
+                        span.num_days().max(1),
+                        temps_core::time_window::MAX_WINDOW_DAYS,
+                        temps_core::time_window::MAX_WINDOW_DAYS
+                    ))
+                    .build());
+            }
+            Ok((start, end, duration_to_step(span)))
+        }
+        (None, None) => {
+            let (window, step) = range_to_step(&params.range);
+            let now = Utc::now();
+            Ok((now - window, now, step))
+        }
+        _ => Err(bad_request()
+            .detail("start_time and end_time must both be provided")
+            .build()),
+    }
 }
 
 /// A single `(timestamp, value)` data point in a metric series.
@@ -271,9 +319,7 @@ async fn get_service_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Database,
@@ -281,7 +327,7 @@ async fn get_service_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 
@@ -1008,9 +1054,7 @@ async fn get_deployment_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Deployment,
@@ -1018,7 +1062,7 @@ async fn get_deployment_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 
@@ -1179,9 +1223,7 @@ async fn get_node_metrics_range(
             .build()
     })?;
 
-    let (window, step) = range_to_step(&params.range);
-    let now = Utc::now();
-    let from = now - window;
+    let (from, to, step) = resolve_range_window(&params)?;
 
     let query = RangeQuery {
         source_kind: SourceKind::Node,
@@ -1189,7 +1231,7 @@ async fn get_node_metrics_range(
         monotonic: is_monotonic_counter(&params.metric),
         name: params.metric.clone(),
         from,
-        to: now,
+        to,
         step,
     };
 

@@ -24,17 +24,32 @@ pub fn is_monotonic_counter(metric_name: &str) -> bool {
         || metric_name.ends_with(".count")
 }
 
+/// Bucket step for a metric range query, matching the node-metrics UI
+/// presets: 1m for ≤1h, 5m for ≤6h, 15m for ≤24h, 1h otherwise.
+pub fn duration_to_step(window: Duration) -> Duration {
+    if window <= Duration::hours(1) {
+        Duration::minutes(1)
+    } else if window <= Duration::hours(6) {
+        Duration::minutes(5)
+    } else if window <= Duration::hours(24) {
+        Duration::minutes(15)
+    } else {
+        Duration::hours(1)
+    }
+}
+
 /// Convert a UI `range` string (`1h`, `6h`, `24h`, `7d`) to
 /// `(window_duration, bucket_step)` for a [`RangeQuery`]. Unknown ranges
 /// fall back to the 1-hour window.
 pub fn range_to_step(range: &str) -> (Duration, Duration) {
-    match range {
-        "1h" => (Duration::hours(1), Duration::minutes(1)),
-        "6h" => (Duration::hours(6), Duration::minutes(5)),
-        "24h" => (Duration::hours(24), Duration::minutes(15)),
-        "7d" => (Duration::days(7), Duration::hours(1)),
-        _ => (Duration::hours(1), Duration::minutes(1)),
-    }
+    let window = match range {
+        "1h" => Duration::hours(1),
+        "6h" => Duration::hours(6),
+        "24h" => Duration::hours(24),
+        "7d" => Duration::days(7),
+        _ => Duration::hours(1),
+    };
+    (window, duration_to_step(window))
 }
 
 /// The kind of metric value being stored.
@@ -250,6 +265,24 @@ mod tests {
         let (window, step) = range_to_step("30d");
         assert_eq!(window, Duration::hours(1));
         assert_eq!(step, Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_duration_to_step_matches_preset_windows() {
+        assert_eq!(duration_to_step(Duration::hours(1)), Duration::minutes(1));
+        assert_eq!(duration_to_step(Duration::hours(6)), Duration::minutes(5));
+        assert_eq!(duration_to_step(Duration::hours(24)), Duration::minutes(15));
+        assert_eq!(duration_to_step(Duration::days(7)), Duration::hours(1));
+    }
+
+    #[test]
+    fn test_duration_to_step_custom_windows() {
+        assert_eq!(
+            duration_to_step(Duration::minutes(90)),
+            Duration::minutes(5)
+        );
+        assert_eq!(duration_to_step(Duration::hours(12)), Duration::minutes(15));
+        assert_eq!(duration_to_step(Duration::hours(48)), Duration::hours(1));
     }
 
     #[test]

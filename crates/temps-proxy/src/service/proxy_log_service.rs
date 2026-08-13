@@ -1,6 +1,7 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::proxy_logs;
@@ -909,9 +910,23 @@ impl ProxyLogService {
             && Self::is_minute_multiple_interval(&bucket_interval)
             && self.stats_cagg_exists().await
         {
-            return self
-                .get_time_bucket_stats_from_cagg(start_time, end_time, bucket_interval, filters)
-                .await;
+            let mut stats = self
+                .get_time_bucket_stats_from_cagg(
+                    start_time,
+                    end_time,
+                    bucket_interval.clone(),
+                    filters.clone(),
+                )
+                .await?;
+            self.attach_response_time_percentiles(
+                &mut stats,
+                start_time,
+                end_time,
+                &bucket_interval,
+                filters.as_ref(),
+            )
+            .await?;
+            return Ok(stats);
         }
 
         // Build the base WHERE clause for filters
@@ -969,13 +984,22 @@ impl ProxyLogService {
         }
 
         // Add bucket_interval as parameterized value
-        values.push(bucket_interval.into());
+        values.push(bucket_interval.clone().into());
 
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
 
         let results = self.db.query_all(stmt).await?;
 
-        Ok(Self::rows_to_time_bucket_stats(&results, start_time))
+        let mut stats = Self::rows_to_time_bucket_stats(&results, start_time);
+        self.attach_response_time_percentiles(
+            &mut stats,
+            start_time,
+            end_time,
+            &bucket_interval,
+            filters.as_ref(),
+        )
+        .await?;
+        Ok(stats)
     }
 
     /// [`Self::get_time_bucket_stats`] served from the `proxy_logs_stats_1m`
@@ -1072,12 +1096,102 @@ impl ProxyLogService {
                     bucket: bucket.to_rfc3339(),
                     request_count,
                     avg_response_time_ms,
+                    p50_response_time_ms: 0.0,
+                    p95_response_time_ms: 0.0,
+                    p99_response_time_ms: 0.0,
                     error_count,
                     total_request_bytes,
                     total_response_bytes,
                 }
             })
             .collect()
+    }
+
+    /// Overlay p50/p95/p99 from the raw `proxy_logs` table onto already-bucketed
+    /// count/avg/byte stats.
+    ///
+    /// Counts come from the continuous aggregate when it can answer (sums roll
+    /// up losslessly). Percentiles cannot be reconstructed from those sums, so
+    /// this is a second, project-scoped scan of `response_time_ms` — the same
+    /// index the dashboard already uses, and only the timing column.
+    async fn attach_response_time_percentiles(
+        &self,
+        stats: &mut [TimeBucketStats],
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+        filters: Option<&StatsFilters>,
+    ) -> Result<(), ProxyLogServiceError> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+
+        let mut where_clauses = vec!["timestamp >= $1".to_string(), "timestamp < $2".to_string()];
+        let mut param_index = 3;
+        if let Some(f) = filters {
+            Self::build_filter_sql(f, &mut param_index, &mut where_clauses);
+        }
+        let where_clause = format!("WHERE {}", where_clauses.join(" AND "));
+        let bucket_param_index = param_index;
+
+        let sql = format!(
+            r#"
+            SELECT
+                bucket::timestamptz as bucket,
+                COALESCE(p50, 0)::float8 as p50_response_time_ms,
+                COALESCE(p95, 0)::float8 as p95_response_time_ms,
+                COALESCE(p99, 0)::float8 as p99_response_time_ms
+            FROM (
+                SELECT
+                    time_bucket(${}::interval, timestamp) AS bucket,
+                    percentile_cont(0.50) WITHIN GROUP (ORDER BY response_time_ms) as p50,
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY response_time_ms) as p95,
+                    percentile_cont(0.99) WITHIN GROUP (ORDER BY response_time_ms) as p99
+                FROM proxy_logs
+                {}
+                GROUP BY bucket
+            ) sub
+            "#,
+            bucket_param_index, where_clause
+        );
+
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        if let Some(f) = filters {
+            Self::add_filter_values(&mut values, f);
+        }
+        values.push(bucket_interval.to_string().into());
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let rows = self.db.query_all(stmt).await?;
+
+        let mut by_epoch: HashMap<i64, (f64, f64, f64)> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let bucket: DateTime<Utc> = row.try_get("", "bucket").unwrap_or(start_time);
+            let p50: f64 = row.try_get("", "p50_response_time_ms").unwrap_or(0.0);
+            let p95: f64 = row.try_get("", "p95_response_time_ms").unwrap_or(0.0);
+            let p99: f64 = row.try_get("", "p99_response_time_ms").unwrap_or(0.0);
+            by_epoch.insert(bucket.timestamp(), (p50, p95, p99));
+        }
+
+        for bucket in stats.iter_mut() {
+            let Some(ts) = DateTime::parse_from_rfc3339(&bucket.bucket)
+                .ok()
+                .map(|d| d.timestamp())
+            else {
+                continue;
+            };
+            if let Some((p50, p95, p99)) = by_epoch.get(&ts) {
+                bucket.p50_response_time_ms = *p50;
+                bucket.p95_response_time_ms = *p95;
+                bucket.p99_response_time_ms = *p99;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get health summaries for multiple projects in a single query
@@ -2170,6 +2284,12 @@ pub struct TimeBucketStats {
     pub request_count: i64,
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
+    /// p50 response time in milliseconds (0 when the bucket has no timings)
+    pub p50_response_time_ms: f64,
+    /// p95 response time in milliseconds (0 when the bucket has no timings)
+    pub p95_response_time_ms: f64,
+    /// p99 response time in milliseconds (0 when the bucket has no timings)
+    pub p99_response_time_ms: f64,
     /// Number of errors (status >= 400)
     pub error_count: i64,
     /// Total request bytes
@@ -2869,6 +2989,15 @@ mod tests {
             .expect("populated raw bucket");
         assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
+
+        // Percentiles are computed from raw response_time_ms on both paths
+        // ([20, 30, 50, 100] → p50=40, p95=92.5, p99=98.5 via percentile_cont).
+        assert!((cagg_busy.p50_response_time_ms - 40.0).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - 92.5).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - 98.5).abs() < 1e-9);
+        assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);
     }
 
     fn sample_proxy_log_model(request_id: &str) -> proxy_logs::Model {
