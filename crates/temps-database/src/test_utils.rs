@@ -56,8 +56,27 @@ use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{
+    core::{wait::LogWaitStrategy, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+};
 use tokio::sync::{Mutex, OnceCell};
+
+/// The postgres/timescaledb entrypoint starts a temporary server to run
+/// initdb + init scripts, shuts it down, then starts the real server --
+/// "database system is ready to accept connections" is logged once for
+/// each. Waiting for only the first occurrence (or worse, a flat sleep)
+/// races that restart: under CI load the gap between the two servers can
+/// exceed a fixed delay, and a connection attempt during the restart
+/// window gets ECONNRESET/ECONNREFUSED instead of a slow-but-working
+/// connection. Waiting for the second occurrence is the only readiness
+/// signal that's actually correct.
+fn postgres_ready_wait_for() -> WaitFor {
+    WaitFor::log(
+        LogWaitStrategy::stderr("database system is ready to accept connections").with_times(2),
+    )
+}
 
 /// Returns true only for errors that indicate the container runtime itself
 /// cannot be reached. Test callers may skip on these infrastructure errors,
@@ -139,11 +158,18 @@ impl SharedContainer {
 
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -153,9 +179,6 @@ impl SharedContainer {
             "postgresql://{}:{}@localhost:{}/{}",
             username, password, port, db_name
         );
-
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         Ok(Self {
             container: postgres_container,
@@ -530,11 +553,18 @@ impl TestDatabase {
     ) -> anyhow::Result<Self> {
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -545,10 +575,10 @@ impl TestDatabase {
             username, password, port, db_name
         );
 
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        // Connect with retries
+        // Connect with retries -- the wait strategy above already blocks
+        // until postgres logs readiness, but keep a short retry budget as
+        // a safety net for the brief window between the log line and the
+        // TCP listener actually accepting.
         let db = Self::connect_with_retry(&database_url, 10).await?;
 
         let test_db = TestDatabase {
