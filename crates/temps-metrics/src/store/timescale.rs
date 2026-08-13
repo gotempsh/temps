@@ -402,8 +402,11 @@ impl MetricsStore for TimescaleMetricsStore {
         let raw_label_filter = raw_label_filter.as_str();
 
         let sql = if range_duration <= seven_days {
-            // Raw table — use time_bucket with the requested step.
-            let step_secs = filter.step.num_seconds().max(1);
+            // Raw table — use time_bucket with the requested step, coarsened
+            // so a 7-day window cannot emit 1-minute buckets.
+            let step_secs = super::clamp_step(range_duration, filter.step)
+                .num_seconds()
+                .max(1);
             let sk = escape_sql_string(filter.source_kind.as_str());
             let sid = filter.source_id;
             let nm = escape_sql_string(&filter.name);

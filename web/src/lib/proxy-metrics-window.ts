@@ -34,6 +34,9 @@ export type ResolvedProxyWindow = {
   showDate: boolean
 }
 
+/** Matches `temps_core::time_window::MAX_SERIES_POINTS`. */
+export const PROXY_MAX_CHART_POINTS = 1_000
+
 /** Bucket width matching the node-metrics endpoint's per-range resolution. */
 export function pickProxyBucketInterval(durationSeconds: number): string {
   if (durationSeconds <= 3_600) return '1 minute'

@@ -622,6 +622,65 @@ impl ProxyLogService {
         Self::resolve_window(Some(start_time), Some(end_time), project_scoped).map(|_| ())
     }
 
+    /// Reject a `bucket_interval` that would emit more than
+    /// [`temps_core::time_window::MAX_SERIES_POINTS`] buckets over `[start, end)`.
+    ///
+    /// Window-width caps alone are not enough: `1 minute` over 7 days is a
+    /// legal interval string and a legal window, but ~10k `time_bucket_gapfill`
+    /// buckets. The UI already coarsens with window size; this is the API
+    /// backstop for a crafted query.
+    fn enforce_bucket_count(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+    ) -> Result<(), ProxyLogServiceError> {
+        if !Self::is_valid_interval(bucket_interval) {
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            )));
+        }
+        let step_secs = Self::interval_to_seconds(bucket_interval).ok_or_else(|| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            ))
+        })?;
+        let span_secs = (end_time - start_time).num_seconds().max(1);
+        let buckets = temps_core::time_window::bucket_count(span_secs, step_secs);
+        let max = temps_core::time_window::MAX_SERIES_POINTS;
+        if buckets > max {
+            let min_step_secs = temps_core::time_window::min_step_secs(span_secs);
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "bucket_interval '{bucket_interval}' would produce {buckets} buckets over this window, which exceeds the {max}-point maximum. Use an interval of at least {min_step_secs} seconds."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Convert a validated `"N unit"` interval into seconds for the bucket-count
+    /// cap. Sub-second units collapse to 1-second buckets (same floor as the
+    /// ClickHouse path). Months/years are approximated; charts never request them.
+    pub(crate) fn interval_to_seconds(interval: &str) -> Option<i64> {
+        let parts: Vec<&str> = interval.split_whitespace().collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let n: i64 = parts[0].parse().ok()?;
+        let unit_secs: i64 = match parts[1] {
+            "microsecond" | "microseconds" | "millisecond" | "milliseconds" | "second"
+            | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 3_600,
+            "day" | "days" => 86_400,
+            "week" | "weeks" => 604_800,
+            "month" | "months" => 2_592_000,
+            "year" | "years" => 31_536_000,
+            _ => return None,
+        };
+        Some(n.saturating_mul(unit_secs).max(1))
+    }
+
     pub async fn list_with_filters(
         &self,
         start_date: Option<UtcDateTime>,
@@ -887,19 +946,14 @@ impl ProxyLogService {
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
         let project_scoped = filters.as_ref().is_some_and(|f| f.project_id.is_some());
         Self::enforce_window_span(start_time, end_time, project_scoped)?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
 
         if let Some(storage) = &self.storage {
             return storage
                 .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
                 .await;
         }
-        // Validate bucket interval
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
-        }
+        // Interval already checked by enforce_bucket_count.
 
         // Serve from the 1-minute continuous aggregate when it can answer
         // this query: every set filter is a grouping column of the aggregate
@@ -1954,6 +2008,7 @@ impl ProxyLogService {
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
         Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
 
         if let Some(storage) = &self.storage {
             return storage
@@ -1966,12 +2021,6 @@ impl ProxyLogService {
                     group_by,
                 )
                 .await;
-        }
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
         }
 
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
@@ -2544,6 +2593,60 @@ mod tests {
         // Invalid: special characters
         assert!(!ProxyLogService::is_valid_interval("1; DROP TABLE"));
         assert!(!ProxyLogService::is_valid_interval("1' OR '1'='1"));
+    }
+
+    fn fixture_range(start: &str, end: &str) -> (UtcDateTime, UtcDateTime) {
+        let start = chrono::DateTime::parse_from_rfc3339(start)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(end)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        (start, end)
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_1m_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 minute")
+            .expect_err("1m over 7d exceeds MAX_SERIES_POINTS");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!(
+                "{}-point maximum",
+                temps_core::time_window::MAX_SERIES_POINTS
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("1 minute"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("7d at 1h is 168 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_30d_scoped() {
+        // Project-scoped windows may be 30d; the UI uses 1h buckets (720 points).
+        let (start, end) = fixture_range("2026-07-14T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("30d at 1h is 720 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_malformed_interval() {
+        let (start, end) = fixture_range("2026-08-13T00:00:00Z", "2026-08-13T01:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 fortnight")
+            .expect_err("unknown unit");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter, got {err:?}");
+        };
+        assert!(msg.contains("Invalid bucket interval"), "{msg}");
     }
 
     #[test]

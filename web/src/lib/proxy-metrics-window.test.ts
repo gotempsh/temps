@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   pickProxyBucketInterval,
+  PROXY_MAX_CHART_POINTS,
   proxyWindowTooWide,
   resolveProxyWindow,
 } from './proxy-metrics-window'
@@ -13,6 +14,21 @@ describe('pickProxyBucketInterval', () => {
     expect(pickProxyBucketInterval(21_600)).toBe('5 minutes')
     expect(pickProxyBucketInterval(86_400)).toBe('15 minutes')
     expect(pickProxyBucketInterval(604_800)).toBe('1 hour')
+  })
+
+  test('stays under PROXY_MAX_CHART_POINTS through 30d', () => {
+    const stepSeconds: Record<string, number> = {
+      '1 minute': 60,
+      '5 minutes': 300,
+      '15 minutes': 900,
+      '1 hour': 3_600,
+    }
+    for (const secs of [3_600, 21_600, 86_400, 604_800, 30 * 86_400]) {
+      const interval = pickProxyBucketInterval(secs)
+      const step = stepSeconds[interval]
+      expect(step).toBeDefined()
+      expect(Math.ceil(secs / step)).toBeLessThanOrEqual(PROXY_MAX_CHART_POINTS)
+    }
   })
 })
 

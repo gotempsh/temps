@@ -367,7 +367,8 @@ impl MetricsStore for ClickhouseMetricsStore {
     /// the CH backend has only the raw table and does query-time bucketing.
     /// The trait explicitly permits this. We still coerce very wide ranges to
     /// coarser buckets to cap the result point count:
-    /// - range ≤ 7 days  → honor `filter.step`
+    /// - always at least [`super::clamp_step`] (no 1-minute buckets over 7 days)
+    /// - range ≤ 7 days  → honor the (clamped) `filter.step`
     /// - range ≤ 90 days → at least 1-hour buckets
     /// - range > 90 days → at least 1-day buckets
     ///
@@ -392,8 +393,14 @@ impl MetricsStore for ClickhouseMetricsStore {
         let seven_days = chrono::Duration::days(7);
         let ninety_days = chrono::Duration::days(90);
 
-        // Coerce the bucket width for wide ranges to bound the point count.
-        let requested = filter.step.num_seconds().max(1);
+        // Coerce the bucket width to bound the point count:
+        // - always at least clamp_step (no 1m-over-7d)
+        // - range ≤ 7 days  → honor the (clamped) requested step
+        // - range ≤ 90 days → at least 1-hour buckets
+        // - range > 90 days → at least 1-day buckets
+        let requested = super::clamp_step(range_duration, filter.step)
+            .num_seconds()
+            .max(1);
         let step_secs = if range_duration <= seven_days {
             requested
         } else if range_duration <= ninety_days {

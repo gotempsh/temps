@@ -134,6 +134,9 @@ fn default_range() -> String {
 
 /// Resolve `(from, to, step)` from either an explicit `[start_time, end_time]`
 /// pair or a preset `range`. Explicit bounds win when both are present.
+///
+/// `step` is always server-derived via `duration_to_step` — callers cannot
+/// request 1-minute buckets over a 7-day window.
 fn resolve_range_window(
     params: &MetricsRangeQuery,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>, Duration), Problem> {
@@ -1639,6 +1642,38 @@ mod tests {
     fn test_histogram_quantile_all_zero_counts_returns_nan() {
         let result = histogram_quantile(0.5, &[1.0, 2.0], &[0, 0]);
         assert!(result.is_nan());
+    }
+
+    fn range_query(start: DateTime<Utc>, end: DateTime<Utc>) -> MetricsRangeQuery {
+        MetricsRangeQuery {
+            metric: "node.cpu_percent".into(),
+            range: "1h".into(),
+            percentile: None,
+            start_time: Some(start),
+            end_time: Some(end),
+        }
+    }
+
+    #[test]
+    fn custom_seven_day_window_uses_hourly_step() {
+        let start = DateTime::parse_from_rfc3339("2026-08-06T00:00:00Z")
+            .expect("valid fixture")
+            .with_timezone(&Utc);
+        let end = start + Duration::days(7);
+        let (_, _, step) = resolve_range_window(&range_query(start, end)).expect("within cap");
+        assert_eq!(step, Duration::hours(1));
+        let points = (end - start).num_seconds() / step.num_seconds().max(1);
+        assert!(points <= temps_core::time_window::MAX_SERIES_POINTS);
+    }
+
+    #[test]
+    fn custom_one_hour_window_uses_minute_step() {
+        let start = DateTime::parse_from_rfc3339("2026-08-13T11:00:00Z")
+            .expect("valid fixture")
+            .with_timezone(&Utc);
+        let end = start + Duration::hours(1);
+        let (_, _, step) = resolve_range_window(&range_query(start, end)).expect("within cap");
+        assert_eq!(step, Duration::minutes(1));
     }
 
     #[test]

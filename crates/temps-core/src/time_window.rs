@@ -72,6 +72,31 @@ pub const MAX_WINDOW_DAYS: i64 = 7;
 /// for an existing menu option.
 pub const MAX_WINDOW_DAYS_SCOPED: i64 = 30;
 
+/// Hard cap on buckets/points a time-series chart query may return.
+///
+/// Window-width caps ([`MAX_WINDOW_DAYS`] / [`MAX_WINDOW_DAYS_SCOPED`]) bound
+/// how much raw data a scan considers. This bounds how many GROUP BY buckets
+/// (and gapfill placeholders) that scan is allowed to emit — `1 minute` over
+/// 7 days is 10_080 points, which is a large result and a large `time_bucket`
+/// / `toStartOfInterval` grouping on a small box.
+///
+/// Presets stay well under this: 7d at 1h = 168, 30d scoped at 1h = 720.
+/// Callers that pick their own step/interval must be rejected or coarsened
+/// when `span / step` would exceed this.
+pub const MAX_SERIES_POINTS: i64 = 1_000;
+
+/// Ceiling of `span_secs / step_secs` for positive durations.
+pub fn bucket_count(span_secs: i64, step_secs: i64) -> i64 {
+    let span = span_secs.max(1);
+    let step = step_secs.max(1);
+    span.saturating_add(step - 1) / step
+}
+
+/// Smallest step (seconds) that keeps [`bucket_count`] ≤ [`MAX_SERIES_POINTS`].
+pub fn min_step_secs(span_secs: i64) -> i64 {
+    bucket_count(span_secs, MAX_SERIES_POINTS)
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TimeWindowError {
     /// The requested span exceeds [`MAX_WINDOW_DAYS`].
@@ -355,5 +380,21 @@ mod tests {
         let err = resolve(Some(start), Some(end), Duration::hours(1))
             .expect_err("an explicit end one second over the cap has no tolerance to absorb it");
         assert!(matches!(err, TimeWindowError::TooWide { .. }));
+    }
+
+    #[test]
+    fn bucket_count_ceil_divides() {
+        assert_eq!(bucket_count(7 * 86_400, 60), 10_080);
+        assert_eq!(bucket_count(7 * 86_400, 3_600), 168);
+        assert_eq!(bucket_count(30 * 86_400, 3_600), 720);
+        assert_eq!(bucket_count(1, 60), 1);
+    }
+
+    #[test]
+    fn min_step_secs_keeps_7d_under_the_point_cap() {
+        let span = 7 * 86_400;
+        let step = min_step_secs(span);
+        assert!(bucket_count(span, step) <= MAX_SERIES_POINTS);
+        assert!(step > 60, "1-minute buckets over 7d must be coarsened");
     }
 }
