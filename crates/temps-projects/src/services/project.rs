@@ -2917,6 +2917,15 @@ impl ProjectService {
         if let Some(cross_architecture_builds) = config.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
+        if let Some(request_timeout_seconds) = config.request_timeout_seconds {
+            deployment_config.request_timeout_seconds = Some(request_timeout_seconds);
+        }
+        if let Some(sse_idle_timeout_seconds) = config.sse_idle_timeout_seconds {
+            deployment_config.sse_idle_timeout_seconds = Some(sse_idle_timeout_seconds);
+        }
+        if let Some(websocket_idle_timeout_seconds) = config.websocket_idle_timeout_seconds {
+            deployment_config.websocket_idle_timeout_seconds = Some(websocket_idle_timeout_seconds);
+        }
 
         // Validate the deployment config
         deployment_config

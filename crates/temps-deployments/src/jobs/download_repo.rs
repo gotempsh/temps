@@ -37,6 +37,51 @@ fn keep_deployment_temp_files() -> bool {
     keep
 }
 
+/// The only directory tree `create_temp_dir()` ever hands to a
+/// `TempDirGuard`. Kept as a named constant so the guard's own safety check
+/// (below) and the path construction can't silently drift apart.
+const DEPLOYMENT_TEMP_ROOT: &str = "/tmp/temps-deployments";
+
+/// Returns the directory roots a `TempDirGuard` is allowed to
+/// `remove_dir_all()`. Anything outside these is refused, regardless of how
+/// the guard was constructed -- this is deliberately checked in `Drop`
+/// itself rather than trusted at each call site, so a future caller that
+/// builds a `TempDirGuard` around the wrong path (a bad join, a variable
+/// mix-up, a copy-pasted call elsewhere in the codebase) can't turn into a
+/// silent `rm -rf` of something that isn't a scratch temp directory.
+///
+/// Production only allows `DEPLOYMENT_TEMP_ROOT` itself -- `std::env::temp_dir()`
+/// (`/tmp` on Linux) is NOT included there, since `/tmp/temps-deployments` is
+/// already a subdirectory of it: adding it would make the check accept any
+/// path under `/tmp`, silently defeating the whole point of scoping removal
+/// to the deployments tree. The broader OS-temp-dir root is added only under
+/// `#[cfg(test)]`, because tests intentionally build guards under
+/// `std::env::temp_dir()` (which is `/tmp` on Linux CI but `$TMPDIR`, e.g.
+/// `/var/folders/...`, on macOS) rather than writing into the real
+/// `/tmp/temps-deployments`.
+#[cfg(not(test))]
+fn safe_temp_roots() -> Vec<PathBuf> {
+    vec![PathBuf::from(DEPLOYMENT_TEMP_ROOT)]
+}
+
+#[cfg(test)]
+fn safe_temp_roots() -> Vec<PathBuf> {
+    vec![PathBuf::from(DEPLOYMENT_TEMP_ROOT), std::env::temp_dir()]
+}
+
+/// True if `path` resolves inside one of `safe_temp_roots()`. Canonicalizes
+/// both sides when possible so a symlinked tmp dir (e.g. macOS's
+/// `/tmp` -> `/private/tmp`) doesn't produce a false negative; falls back to
+/// a plain prefix comparison if canonicalization fails (path already
+/// removed, or a root that doesn't exist on this platform).
+fn is_within_safe_temp_root(path: &std::path::Path) -> bool {
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    safe_temp_roots().iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        candidate.starts_with(&root)
+    })
+}
+
 /// Removes a deployment's temp directory on drop unless `disarm()` was
 /// called first. Guarantees the directory created in `create_temp_dir()` is
 /// cleaned up on every error path inside `download_repository()` -- without
@@ -70,6 +115,15 @@ impl TempDirGuard {
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
         if !self.armed || self.keep {
+            return;
+        }
+        if !is_within_safe_temp_root(&self.path) {
+            tracing::error!(
+                path = %self.path.display(),
+                "Refusing to remove deployment temp directory: path is outside the \
+                 expected temp roots. This should never happen -- treat it as a bug in \
+                 whatever constructed this TempDirGuard, not as a directory to delete."
+            );
             return;
         }
         match std::fs::remove_dir_all(&self.path) {
@@ -287,7 +341,7 @@ impl DownloadRepoJob {
             .map_err(|e| WorkflowError::Other(format!("Failed to get unix timestamp: {}", e)))?
             .as_secs();
 
-        let temp_dir = std::path::PathBuf::from("/tmp/temps-deployments").join(format!(
+        let temp_dir = std::path::PathBuf::from(DEPLOYMENT_TEMP_ROOT).join(format!(
             "deployment-{}-{}",
             context.deployment_id, unix_epoch
         ));
@@ -718,10 +772,21 @@ impl WorkflowTask for DownloadRepoJob {
         if keep_deployment_temp_files() {
             return Ok(());
         }
-        // Clean up temporary directory if it exists
+        // Clean up temporary directory if it exists. Same safety check as
+        // `TempDirGuard::drop()`: `work_dir` is only ever set to a path this
+        // job created under `DEPLOYMENT_TEMP_ROOT`, but this stays defensive
+        // rather than trusting that invariant holds forever.
         if let Some(ref work_dir) = context.work_dir {
             if work_dir.exists() {
-                std::fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
+                if is_within_safe_temp_root(work_dir) {
+                    std::fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
+                } else {
+                    tracing::error!(
+                        path = %work_dir.display(),
+                        "Refusing to clean up deployment work dir: path is outside the \
+                         expected temp roots."
+                    );
+                }
             }
         }
         Ok(())
@@ -1162,6 +1227,28 @@ mod tests {
     }
 
     #[test]
+    fn test_temp_dir_guard_refuses_to_remove_path_outside_safe_temp_roots() {
+        // A directory that is neither under `/tmp/temps-deployments` nor
+        // under `std::env::temp_dir()` -- e.g. a call site that built the
+        // guard around the wrong path. This must never be deleted, no
+        // matter how the guard was constructed.
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("temps-guard-unsafe-test-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let _guard = TempDirGuard::new(dir.clone(), false);
+        }
+
+        assert!(
+            dir.exists(),
+            "TempDirGuard must refuse to remove a directory outside the safe temp roots"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_temp_dir_guard_disarm_keeps_directory() {
         let dir = std::env::temp_dir().join("temps-guard-test-disarm");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1203,13 +1290,41 @@ mod tests {
     /// the success path, so `cleanup()`/`cleanup_terminal_resources` had
     /// nothing to remove and `/tmp/temps-deployments/deployment-*` leaked
     /// forever on every failed download.
+    // Serialized against `test_download_repository_keeps_temp_dir_on_early_failure_when_debug_flag_set`:
+    // both tests read/write the process-wide `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES`
+    // env var, and cargo's default parallel test execution can interleave them
+    // -- this test's `create_temp_dir()` call can observe the other test's `set_var("1")`
+    // mid-flight, making its guard think cleanup should be skipped and leaking
+    // a directory that then fails the assertion below.
     #[tokio::test]
+    #[serial_test::serial(deployment_temp_dir_env_var)]
     async fn test_download_repository_cleans_up_temp_dir_on_early_failure() {
         let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
 
         // A distinctive deployment ID keeps this test's glob isolated from
         // any other directories that might exist under /tmp/temps-deployments.
         let deployment_id = 918_273_645;
+
+        // Pre-test cleanup: remove any dirs left by a previous run of this
+        // test that was killed before its `TempDirGuard::drop` could run
+        // (e.g. `cargo test` interrupted mid-suite) — a stale dir would
+        // otherwise fail the assertion below spuriously. This test DOES
+        // create a temp dir itself (`create_temp_dir()` runs before the
+        // `validate_git_url` check that fails it); the `#[serial]` attribute
+        // above is what actually prevents cross-test contamination via the
+        // shared `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` env var.
+        if let Ok(entries) = std::fs::read_dir("/tmp/temps-deployments") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("deployment-{deployment_id}-"))
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+
         let job = DownloadRepoJob::new_public(
             "test".to_string(),
             "owner".to_string(),
@@ -1246,7 +1361,12 @@ mod tests {
         );
     }
 
+    // See the matching `#[serial]` note on
+    // `test_download_repository_cleans_up_temp_dir_on_early_failure` above --
+    // both tests mutate the process-wide `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES`
+    // env var and must not run concurrently with each other.
     #[tokio::test]
+    #[serial_test::serial(deployment_temp_dir_env_var)]
     async fn test_download_repository_keeps_temp_dir_on_early_failure_when_debug_flag_set() {
         let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
 

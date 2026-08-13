@@ -56,36 +56,36 @@ pub const DEFAULT_RUSTFS_PASSWORD: &str = "rustfsadmin";
 )]
 pub struct RustfsInputConfig {
     /// RustFS API port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// RustFS console port (auto-assigned if not provided)
-    #[schemars(example = "example_console_port")]
+    #[schemars(example = example_console_port())]
     pub console_port: Option<String>,
 
     /// Access key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_access_key")]
+    #[schemars(with = "Option<String>", example = example_access_key())]
     pub access_key: Option<String>,
 
     /// Secret key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_secret_key")]
+    #[schemars(with = "Option<String>", example = example_secret_key())]
     pub secret_key: Option<String>,
 
     /// Host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// S3 region
     #[serde(default = "default_region")]
-    #[schemars(example = "example_region", default = "default_region")]
+    #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
     /// Docker image to use for RustFS
     #[serde(default = "default_image")]
-    #[schemars(example = "example_image", default = "default_image")]
+    #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
 
     /// Metrics ingest key (`si_` prefix). Populated automatically when metrics

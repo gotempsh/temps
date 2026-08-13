@@ -423,8 +423,16 @@ impl ProxyCommand {
         }
 
         // Start route table listener
+        // Keep `listener` itself alive on the stack — only pass a clone into
+        // start_listening(). RouteTableListener's Drop aborts its background
+        // recv task, so consuming the only Arc reference here would abort the
+        // task the instant this block_on call returns: the "Started listening"
+        // log would fire, but the loop would never actually process a single
+        // NOTIFY. Mirrors the pattern already used for `project_listener` below
+        // and for `route_table_listener` in `serve/mod.rs`.
         info!("Starting route table listener...");
-        rt.block_on(async { listener.start_listening().await })?;
+        let listener_clone = listener.clone();
+        rt.block_on(async move { listener_clone.start_listening().await })?;
 
         // Start project change listener
         // Keep the listener alive on the stack so its Drop doesn't abort the background task

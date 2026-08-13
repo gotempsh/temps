@@ -248,6 +248,11 @@ pub struct QuotaResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct HasTracesResponse {
+    pub has_traces: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PipelineStatsResponse {
     pub stats: PipelineStats,
 }
@@ -1167,6 +1172,44 @@ pub async fn get_quota(
 
     let quota = state.otel_service.get_storage_quota(project_id).await?;
     Ok(Json(QuotaResponse { quota }))
+}
+
+/// Whether a project has ever received at least one trace span.
+///
+/// A pure existence check for onboarding/setup UI (e.g. "has this project
+/// set up OpenTelemetry yet?"). Deliberately not `/otel/trace-summaries`
+/// with `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,
+/// `argMax`) and, without a time bound, that aggregation runs over every
+/// span the project has ever ingested. This endpoint answers the same
+/// yes/no question in O(1) — see `OtelStorage::has_traces`.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/has-traces/{project_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    responses(
+        (status = 200, description = "Trace existence check", body = HasTracesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn has_traces(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let has_traces = state.otel_service.has_traces(project_id).await?;
+    Ok(Json(HasTracesResponse { has_traces }))
 }
 
 /// Get OTel pipeline statistics (admin/system view).

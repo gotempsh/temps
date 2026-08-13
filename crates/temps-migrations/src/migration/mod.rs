@@ -177,6 +177,13 @@ mod m20260804_000001_add_must_change_password_to_users;
 pub mod m20260805_000001_index_normalized_managed_domains;
 mod m20260806_000001_index_permission_denied_retention;
 pub mod m20260806_000001_sandbox_workspace_lifecycle;
+mod m20260809_000001_ai_gateway_config_provider_type;
+mod m20260810_000001_add_cli_session_id_to_ai_conversations;
+pub mod m20260810_000001_create_sandbox_snapshots;
+mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
+mod m20260810_000003_pin_ai_provider_to_conversations;
+mod m20260810_000004_add_ai_conversation_runtime_options;
+mod m20260811_000001_add_cli_session_fingerprint;
 mod m20260811_000001_create_renewal_attempts;
 
 pub struct Migrator;
@@ -370,7 +377,69 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
             Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
             Box::new(m20260806_000001_index_permission_denied_retention::Migration),
+            Box::new(m20260809_000001_ai_gateway_config_provider_type::Migration),
+            // Main shipped the sandbox migration first. Keep it ahead of this
+            // branch's independently authored migration with the same date and
+            // sequence stamp; DeriveMigrationName uses the full module name, so
+            // the two records remain distinct in seaql_migrations.
+            Box::new(m20260810_000001_create_sandbox_snapshots::Migration),
+            Box::new(
+                m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
+            ),
+            Box::new(
+                m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config::Migration,
+            ),
+            Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
+            Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
+            // Main shipped the renewal-attempts migration first. Preserve
+            // that upgrade history before this branch's independently named
+            // migration with the same date and sequence stamp.
             Box::new(m20260811_000001_create_renewal_attempts::Migration),
+            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn migration_names_are_unique_and_same_stamp_upgrade_history_stays_main_first() {
+        let names = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+        let unique = names.iter().collect::<HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "every registry entry must have a unique persisted migration name"
+        );
+
+        for (shipped, added) in [
+            (
+                "m20260810_000001_create_sandbox_snapshots",
+                "m20260810_000001_add_cli_session_id_to_ai_conversations",
+            ),
+            (
+                "m20260811_000001_create_renewal_attempts",
+                "m20260811_000001_add_cli_session_fingerprint",
+            ),
+        ] {
+            let shipped_position = names
+                .iter()
+                .position(|name| name == shipped)
+                .unwrap_or_else(|| panic!("shipped migration '{shipped}' is missing"));
+            let added_position = names
+                .iter()
+                .position(|name| name == added)
+                .unwrap_or_else(|| panic!("added migration '{added}' is missing"));
+            assert!(
+                shipped_position < added_position,
+                "shipped migration '{shipped}' must precede '{added}'"
+            );
+        }
     }
 }

@@ -166,6 +166,7 @@ pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
 pub mod sandbox_events;
+pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory

@@ -2240,7 +2240,12 @@ impl AgentExecutor {
                 max_turns: config.max_turns,
                 timeout: Duration::from_secs(config.timeout_seconds as u64),
                 model: config.ai_model.clone(),
+                thinking_level: None,
+                permission_mode: None,
                 on_event: Some(on_event),
+                permission_bridge: None,
+                resume_session_id: None,
+                mcp_server: None,
             };
             override_provider.run(ai_config).await?
         } else {
@@ -2392,7 +2397,12 @@ impl AgentExecutor {
                     max_turns: config.max_turns,
                     timeout: Duration::from_secs(config.timeout_seconds as u64),
                     model: config.ai_model.clone(),
+                    thinking_level: None,
+                    permission_mode: None,
                     on_event: Some(on_event),
+                    permission_bridge: None,
+                    resume_session_id: None,
+                    mcp_server: None,
                 };
                 override_provider.continue_conversation(ai_config).await?
             } else {

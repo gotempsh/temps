@@ -45,6 +45,7 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/insights
 ///   GET /otel/health
 ///   GET /otel/quota
+///   GET /otel/has-traces/{project_id}
 ///   GET /otel/pipeline-stats
 pub fn configure_routes() -> Router<OtelAppState> {
     // OTLP ingest endpoints are split into their own sub-router so
@@ -104,6 +105,10 @@ pub fn configure_routes() -> Router<OtelAppState> {
         )
         .route("/otel/health/{project_id}", get(query_handler::get_health))
         .route("/otel/quota/{project_id}", get(query_handler::get_quota))
+        .route(
+            "/otel/has-traces/{project_id}",
+            get(query_handler::has_traces),
+        )
         .route(
             "/otel/pipeline-stats",
             get(query_handler::get_pipeline_stats),

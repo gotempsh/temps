@@ -692,6 +692,19 @@ impl EnvironmentService {
         if let Some(wake_timeout_seconds) = settings.wake_timeout_seconds {
             deployment_config.wake_timeout_seconds = wake_timeout_seconds;
         }
+        // Double-Option semantics, like cpu_request/cpu_limit above: outer
+        // `Some` applies the change (inner `None` clears the override so the
+        // environment inherits the project/global value again, inner
+        // `Some(n)` sets it); outer `None` leaves the current value unchanged.
+        if let Some(request_timeout_seconds) = settings.request_timeout_seconds {
+            deployment_config.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(sse_idle_timeout_seconds) = settings.sse_idle_timeout_seconds {
+            deployment_config.sse_idle_timeout_seconds = sse_idle_timeout_seconds;
+        }
+        if let Some(websocket_idle_timeout_seconds) = settings.websocket_idle_timeout_seconds {
+            deployment_config.websocket_idle_timeout_seconds = websocket_idle_timeout_seconds;
+        }
 
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
@@ -1338,6 +1351,9 @@ mod tests {
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
+                    request_timeout_seconds: None,
+                    sse_idle_timeout_seconds: None,
+                    websocket_idle_timeout_seconds: None,
                     password: None,
                 },
             )
@@ -1347,6 +1363,120 @@ mod tests {
             result.is_ok(),
             "Should allow keeping the same branch: {:?}",
             result.err()
+        );
+    }
+
+    /// Double-Option clearing (`Some(None)`) must actually remove the override
+    /// from the persisted `deployment_config`, not just leave it unchanged —
+    /// this project has shipped a bug before where a double-Option "clear"
+    /// silently no-opped instead of nulling the column.
+    #[tokio::test]
+    async fn test_update_settings_clears_request_timeout_override() {
+        let current_env = environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                request_timeout_seconds: Some(120),
+                ..Default::default()
+            }),
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        };
+        let updated_env = environments::Model {
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                request_timeout_seconds: None,
+                ..Default::default()
+            }),
+            ..current_env.clone()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![current_env]])
+            .append_query_results(vec![vec![updated_env]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let svc = EnvironmentService::new(db.clone(), config_service);
+
+        let result = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    branch: None,
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    replicas: None,
+                    exposed_port: None,
+                    automatic_deploy: None,
+                    performance_metrics_enabled: None,
+                    session_recording_enabled: None,
+                    security: None,
+                    target_nodes: None,
+                    target_labels: None,
+                    anti_affinity: None,
+                    cross_architecture_builds: None,
+                    protected: None,
+                    attack_mode: None,
+                    force_https: None,
+                    on_demand: None,
+                    idle_timeout_seconds: None,
+                    wake_timeout_seconds: None,
+                    // Outer Some, inner None: explicitly clear the override
+                    // so the environment reverts to inheriting the
+                    // project/global request timeout.
+                    request_timeout_seconds: Some(None),
+                    sse_idle_timeout_seconds: None,
+                    websocket_idle_timeout_seconds: None,
+                    password: None,
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "clearing an override should succeed: {:?}",
+            result.err()
+        );
+
+        // Inspect the actual UPDATE statement rather than trusting the mock's
+        // canned response — it must not still carry the cleared field.
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            !log.contains("requestTimeoutSeconds"),
+            "cleared field must be omitted from the persisted deployment_config JSON, got: {log}"
         );
     }
 

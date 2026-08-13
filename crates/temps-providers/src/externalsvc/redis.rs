@@ -36,25 +36,25 @@ const REDIS_BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub struct RedisInputConfig {
     /// Redis host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// Redis port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// Redis password (auto-generated if not provided, empty, or less than 8 characters)
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(
         with = "Option<String>",
-        example = "example_password",
+        example = example_password(),
         description = "Redis password (minimum 8 characters, auto-generated if not provided)"
     )]
     pub password: Option<String>,
 
     /// Full Docker image reference (e.g., "gotempsh/redis-walg:8-bookworm")
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Real Docker container name when this service was imported from an

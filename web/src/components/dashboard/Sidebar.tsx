@@ -68,6 +68,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
+  Terminal,
   Users,
   UsersRound,
   Wand2,
@@ -135,18 +136,7 @@ const navWorkflow: PlatformNavItem[] = [
     ],
   },
   { title: 'Email', url: '/email', icon: Mail },
-  {
-    title: 'AI',
-    url: '/ai-gateway',
-    icon: Sparkles,
-    subItems: [
-      { title: 'AI Chat', url: '/chat', icon: MessageSquare },
-      { title: 'AI Gateway', url: '/ai-gateway', icon: Sparkles },
-      { title: 'AI Workflows', url: '/agent-sandbox', icon: Bot },
-      { title: 'Skills', url: '/skills', icon: Wand2 },
-      { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
-    ],
-  },
+  { title: 'AI', url: '/ai-gateway', icon: Sparkles },
   {
     title: 'Source',
     url: '/git-providers',
@@ -181,7 +171,6 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Platform', url: '/settings', icon: Settings2 },
       { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
-      { title: 'AI Providers', url: '/settings/ai-providers', icon: Sparkles },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
     ],
   },
@@ -204,6 +193,11 @@ const settingsGroups: SettingsGroupDef[] = [
         icon: Boxes,
       },
       { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
+      {
+        title: 'Request Timeouts',
+        url: '/settings/request-timeouts',
+        icon: Clock,
+      },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
     ],
@@ -225,6 +219,29 @@ const settingsGroups: SettingsGroupDef[] = [
       },
     ],
   },
+]
+
+// AI drill-down — swapped in for /ai-gateway, /chat, /agent-sandbox,
+// /skills, /mcp-servers, /ai-workflows, mirroring the Settings sidebar
+// swap so AI's several pages read as one coherent area instead of a
+// scattered set of sidebar entries.
+const AI_MODE_PREFIXES = [
+  '/ai-gateway',
+  '/chat',
+  '/agent-sandbox',
+  '/skills',
+  '/mcp-servers',
+  '/ai-workflows',
+]
+const aiNavItems: { title: string; url: string; icon: LucideIcon }[] = [
+  { title: 'Providers', url: '/ai-gateway', icon: Sparkles },
+  { title: 'Usage', url: '/ai-gateway/usage', icon: BarChart3 },
+  { title: 'Activity', url: '/ai-gateway/activity', icon: Activity },
+  { title: 'Setup', url: '/ai-gateway/setup', icon: Terminal },
+  { title: 'Chats', url: '/chat', icon: MessageSquare },
+  { title: 'Workflows', url: '/ai-workflows', icon: Bot },
+  { title: 'Skills', url: '/skills', icon: Wand2 },
+  { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({
@@ -350,6 +367,7 @@ export default function AppSidebar() {
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   const settingsMode = location.pathname.startsWith('/settings')
+  const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
   const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =
     projectMatch &&
@@ -358,14 +376,18 @@ export default function AppSidebar() {
       : null
 
   // Override: user pressed Back from a route-driven swap; show DefaultNav
-  // only for that exact pathname. Navigating anywhere else clears the override
-  // by derivation, without a setState-in-effect render cycle.
-  const [forceDefaultPath, setForceDefaultPath] = useState<string | null>(null)
-  const forceDefault = forceDefaultPath === location.pathname
+  // only for that exact navigation. Keyed on `location.key` rather than
+  // pathname — a Link back to the very same URL (e.g. clicking "AI" again
+  // right after backing out of it) still produces a new history entry with
+  // a new key, so the override correctly drops and the swap re-triggers.
+  // Comparing by pathname alone left the sidebar stuck on DefaultNav until
+  // the user navigated somewhere else first.
+  const [forceDefaultKey, setForceDefaultKey] = useState<string | null>(null)
+  const forceDefault = forceDefaultKey === location.key
 
   const compact = isMinimal && !isMobile
 
-  const showDefault = forceDefault || (!settingsMode && !projectSlug)
+  const showDefault = forceDefault || (!settingsMode && !aiMode && !projectSlug)
 
   return (
     <Sidebar>
@@ -413,14 +435,16 @@ export default function AppSidebar() {
           <DefaultNav
             pluginItems={pluginItems}
             pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
-            onReturnToProject={() => setForceDefaultPath(null)}
+            onReturnToProject={() => setForceDefaultKey(null)}
           />
         ) : settingsMode ? (
-          <SettingsNav onBack={() => setForceDefaultPath(location.pathname)} />
+          <SettingsNav onBack={() => setForceDefaultKey(location.key)} />
+        ) : aiMode ? (
+          <AiNav onBack={() => setForceDefaultKey(location.key)} />
         ) : projectSlug ? (
           <ProjectNav
             slug={projectSlug}
-            onBack={() => setForceDefaultPath(location.pathname)}
+            onBack={() => setForceDefaultKey(location.key)}
           />
         ) : null}
       </SidebarContent>
@@ -894,6 +918,20 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
           />
         )
       })}
+    </>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
+// Chats, Workflows, Skills, MCP Servers). Back button returns to root.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function AiNav({ onBack }: { onBack: () => void }) {
+  return (
+    <>
+      <SwapHeader title="AI" onBack={onBack} backLabel="Back to menu" />
+      <NavSection label="AI" items={aiNavItems} />
     </>
   )
 }

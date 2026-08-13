@@ -13,6 +13,7 @@ pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+mod sensitive;
 pub mod service;
 
 pub use pending_actions::{PendingActionError, PendingActionService};
@@ -22,7 +23,7 @@ pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::project::ProjectChatProvider;
-pub use service::{ChatStreamEvent, ConversationService};
+pub use service::{ChatStreamEvent, ConversationService, PendingPermissionEntry};
 
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]
@@ -47,4 +48,14 @@ pub enum ChatError {
     Db(#[from] sea_orm::DbErr),
     #[error("AI provider error: {0}")]
     Ai(String),
+    /// Submitted `PermissionDecision` variant is incompatible with the kind the
+    /// CLI requested.  E.g. sending `allow_tool` for a `question` permission.
+    #[error(
+        "permission decision type mismatch: expected a decision for kind \
+         '{expected_kind}', received '{received}'"
+    )]
+    PermissionKindMismatch {
+        expected_kind: String,
+        received: String,
+    },
 }

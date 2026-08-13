@@ -33,6 +33,7 @@ fn extract_byok(headers: &HeaderMap) -> ByokOverride {
             .get("x-provider-base-url")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string()),
+        system_key_id: None,
     }
 }
 

@@ -1,0 +1,82 @@
+{
+  "skill_name": "temps",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Deploy this existing Next.js app to my production Temps context. Keep the current package manager and don't add unrelated dependencies.",
+      "expected_output": "Inspects the app and target context, runs the capability detector, offers missing observability once without blocking deployment, uses pinned @temps-sdk/cli with --target-context, and verifies deployment health.",
+      "files": [],
+      "expectations": [
+        "Uses bunx or npx with @temps-sdk/cli@0.1.31 rather than a global temps command",
+        "Names an explicit target context for state-changing commands",
+        "Checks analytics, error tracking, and tracing before the final deploy step",
+        "Treats observability as an opt-in offer rather than a deployment requirement",
+        "Includes a read-only deployment verification"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Add Temps analytics and error tracking to this Vite React app, but do not enable session replay. I want proof both integrations send data.",
+      "expected_output": "Routes to the JavaScript how-to, preserves the package manager, proposes dependency/source changes, keeps credentials out of source, avoids replay, and verifies a synthetic analytics event and handled error end to end.",
+      "files": [],
+      "expectations": [
+        "Loads only the React/JavaScript, analytics, error-tracking, and hygiene guidance",
+        "Does not enable session replay",
+        "Keeps the DSN environment-driven and avoids exposing server OTLP credentials",
+        "Verifies a synthetic analytics event and handled exception in Temps",
+        "Does not treat dependency installation as proof of delivery"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Show me the latest errors for project 42 in staging. Do not change anything.",
+      "expected_output": "Routes directly to the errors command reference, uses an explicit staging context and a pinned CLI invocation, performs only read operations, and does not load deployment or observability setup guides.",
+      "files": [],
+      "expectations": [
+        "Uses only the relevant errors command-group reference",
+        "Uses @temps-sdk/cli@0.1.31 with the staging target context",
+        "Performs no state-changing operation",
+        "Does not offer instrumentation during a read-only error query"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Restore backup 0192 into the production Postgres database now. It is urgent.",
+      "expected_output": "Inspects immutable artifact and restore capabilities, explains source, recovery point, destination, overwrite and downtime, then obtains explicit confirmation immediately before any restore command.",
+      "files": [],
+      "expectations": [
+        "Routes to backup-recovery and the focused backups/services command references",
+        "Does not treat urgency as authorization for a destructive restore",
+        "Names the explicit production target context and destination",
+        "Prefers a new isolated service when the user has not required in-place recovery",
+        "Requires engine-level structural verification before traffic changes"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Create a Redis service for project api in staging and wire its connection string into the app.",
+      "expected_output": "Inspects service types and existing resources, confirms staging context and service parameters, creates and links the service without exposing credentials, and verifies service health and linkage.",
+      "files": [],
+      "expectations": [
+        "Routes to managed-services plus services command reference",
+        "Uses an explicit staging target context",
+        "Explains the write before execution",
+        "Never prints or persists the generated connection string",
+        "Verifies service health and project/environment linkage"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Add a GitHub Actions workflow that deploys this app to Temps production on pushes to main.",
+      "expected_output": "Creates a pinned, explicit-context CI workflow with secret-store credentials, preflight identity, bounded deployment verification, and no developer-local state.",
+      "files": [],
+      "expectations": [
+        "Routes to ci-automation and deploy-application",
+        "Pins @temps-sdk/cli@0.1.31 and verifies the reviewed package integrity",
+        "Uses CI secrets rather than repository plaintext or local ~/.temps files",
+        "Uses an explicit production target context and preflight whoami",
+        "Waits for deployment health and fails on a bounded timeout"
+      ]
+    }
+  ]
+}

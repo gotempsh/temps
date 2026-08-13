@@ -1,0 +1,4 @@
+interface:
+  display_name: "Temps CLI"
+  short_description: "Operate Temps safely from the command line"
+  default_prompt: "Use $temps-cli to perform this Temps CLI task safely against the intended context."

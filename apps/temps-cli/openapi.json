@@ -1423,6 +1423,51 @@
         },
         "type": "object"
       },
+      "AiCliStatusDto": {
+        "description": "Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.\n`AiCliStatus` itself does not derive `ToSchema`, so this local projection is\nused for OpenAPI generation only — the fields are identical.",
+        "properties": {
+          "auth_method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authenticated": {
+            "type": "boolean"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "setup_hint": {
+            "description": "Instructions for the operator when not installed or not authenticated.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subscription_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider",
+          "installed",
+          "authenticated"
+        ],
+        "type": "object"
+      },
       "AiConfigSettings": {
         "description": "Global AI configuration settings. Controls the default config repo\ncontaining `.claude/` directory (skills, MCP servers, plugins) that\ngets overlaid into every agent sandbox.",
         "properties": {
@@ -1457,6 +1502,34 @@
         "required": [
           "service_id",
           "enabled"
+        ],
+        "type": "object"
+      },
+      "AiModelOptionDto": {
+        "properties": {
+          "default_thinking_option_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "thinking_options": {
+            "items": {
+              "$ref": "#/components/schemas/AiSelectOptionDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "thinking_options"
         ],
         "type": "object"
       },
@@ -1510,6 +1583,102 @@
           "path",
           "request_count",
           "agent_count"
+        ],
+        "type": "object"
+      },
+      "AiProviderStatusResponse": {
+        "description": "Current AI provider routing preference and availability for this instance.\n\nThe `configured` field drives the UI onboarding state: when `false` the UI\nmust show _exactly what is missing_ (`reason`) and _where to fix it_\n(`setup_path`), not hide the feature.",
+        "properties": {
+          "active_provider_type": {
+            "description": "Active preference: `\"gateway\"` (BYOK) or `\"agent_cli\"` (subscription).",
+            "type": "string"
+          },
+          "agent_cli_provider_id": {
+            "description": "Catalog id of the active agent CLI provider, or `null` when\n`active_provider_type` is `\"gateway\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_cli_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AiCliStatusDto",
+                "description": "Live status of the selected agent CLI, or `null` when\n`active_provider_type` is `\"gateway\"`."
+              }
+            ]
+          },
+          "available_providers": {
+            "description": "Providers a chat user may choose for a new conversation. Authentication\nsource is descriptive metadata only and never contains credentials.",
+            "items": {
+              "$ref": "#/components/schemas/AvailableAiProviderDto"
+            },
+            "type": "array"
+          },
+          "configured": {
+            "description": "Whether the active provider is ready to serve requests.",
+            "type": "boolean"
+          },
+          "gateway_available": {
+            "description": "Whether at least one active BYOK provider key exists.",
+            "type": "boolean"
+          },
+          "interactive_bridge_status": {
+            "description": "Health of normalized mid-turn user interactions, or `null` when the\nactive adapter does not advertise them. Kept for API compatibility.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Human-readable explanation of why `configured` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path the operator should visit to fix the missing configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supports_interactive_tools": {
+            "description": "Whether the active adapter's normalized realtime contract exposes tool\nevents. Kept under the legacy field name for API compatibility.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active_provider_type",
+          "configured",
+          "gateway_available",
+          "available_providers",
+          "supports_interactive_tools"
+        ],
+        "type": "object"
+      },
+      "AiSelectOptionDto": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
         ],
         "type": "object"
       },
@@ -2388,6 +2557,20 @@
               }
             ]
           },
+          "request_timeouts": {
+            "default": {
+              "default_http_timeout_seconds": 0,
+              "default_sse_idle_timeout_seconds": 0,
+              "default_websocket_idle_timeout_seconds": 0,
+              "max_request_timeout_seconds": 600
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestTimeoutSettings",
+                "description": "Upstream request/connection timeouts applied by the proxy to customer\napp traffic. Provides a global hard ceiling plus global defaults for\nregular HTTP, SSE, and WebSocket traffic; projects and environments\nmay set a shorter value but never exceed the ceiling here."
+              }
+            ]
+          },
           "require_mfa_for_admins": {
             "default": false,
             "description": "When `true`, any user holding the `Admin` role must have MFA enrolled\n(`users.mfa_enabled = true`) to complete a **password** login. Users\nwithout MFA enrolled are rejected with a typed error instructing them\nto enroll before retrying. This only gates the password-login path\n(`AuthService::login`) -- SSO/OIDC logins are handled by a separate\ncode path (`OidcService::resolve_user` + `oidc_handler`) and are\nintentionally unaffected, since federating identity to a\nproperly-hardened IdP is itself an acceptable alternative to local\nTOTP MFA. Modeled as a settings row (not an env var) per CLAUDE.md so\nan operator can flip it at runtime via the Settings API without\nrestarting the binary.",
@@ -2547,6 +2730,10 @@
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
           },
+          "request_timeouts": {
+            "$ref": "#/components/schemas/RequestTimeoutSettings",
+            "description": "Upstream request/connection timeouts (hard ceiling + defaults) applied\nby the proxy to customer app traffic. No sensitive content."
+          },
           "require_mfa_for_admins": {
             "description": "When enabled, Admin-role accounts without MFA enrolled are rejected\nat password login (bherila/temps#32). SSO/OIDC logins are unaffected.",
             "type": "boolean"
@@ -2592,6 +2779,7 @@
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
+          "request_timeouts",
           "self_update"
         ],
         "type": "object"
@@ -3136,6 +3324,63 @@
         "required": [
           "run",
           "logs"
+        ],
+        "type": "object"
+      },
+      "AvailableAiProviderDto": {
+        "properties": {
+          "auth_source": {
+            "description": "`configured_key` for the gateway or `host_environment` for an ambient\nCLI login discovered in the Temps process environment.",
+            "type": "string"
+          },
+          "default_model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_permission_mode_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "model_discovery_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_discovery_status": {
+            "description": "`ready` when the model list was loaded, `unavailable` when the provider\ncan still run with its own default but live discovery failed.",
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/AiModelOptionDto"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "permission_modes": {
+            "items": {
+              "$ref": "#/components/schemas/AiSelectOptionDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "auth_source",
+          "models",
+          "model_discovery_status",
+          "permission_modes"
         ],
         "type": "object"
       },
@@ -6280,6 +6525,17 @@
                   "$ref": "#/components/schemas/MessageResponse"
                 },
                 "type": "array"
+              },
+              "pending_permission": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PermissionRequest",
+                    "description": "A still-unresolved interactive permission request (ADR-038 Phase 2), if\none is pending on this conversation right now. The client renders this\nas a live, answerable `PermissionCard` — without it, a question that\narrived while the tab was away shows only as inert history text with no\nway to answer it."
+                  }
+                ]
               }
             },
             "required": [
@@ -6291,6 +6547,21 @@
       },
       "ConversationResponse": {
         "properties": {
+          "ai_model": {
+            "type": "string"
+          },
+          "ai_permission_mode": {
+            "type": "string"
+          },
+          "ai_provider": {
+            "type": "string"
+          },
+          "ai_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "context_id": {
             "type": "string"
           },
@@ -6322,7 +6593,10 @@
           "context_id",
           "status",
           "created_at",
-          "last_activity_at"
+          "last_activity_at",
+          "ai_provider",
+          "ai_model",
+          "ai_permission_mode"
         ],
         "type": "object"
       },
@@ -6794,6 +7068,31 @@
       },
       "CreateConversationRequest": {
         "properties": {
+          "ai_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_permission_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "description": "Provider pinned to this conversation. Omitted requests use the current\ninstance preference.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "context_id": {
             "description": "The entity id (ints stringified).",
             "type": "string"
@@ -8291,6 +8590,13 @@
             },
             "type": "object"
           },
+          "from_snapshot": {
+            "description": "Create the sandbox from a snapshot (ADR-037).\n\nMutually exclusive with `image`: if both are set the request fails\nwith 400. When set, the sandbox is created with the snapshotted\nfilesystem rather than a base image, giving users a reproducible\nstarting point.\n\nThe snapshot must be in `ready` status and belong to the calling user.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "image": {
             "description": "Docker image override. `null` uses the platform default.",
             "type": [
@@ -8444,6 +8750,19 @@
           "name",
           "config"
         ],
+        "type": "object"
+      },
+      "CreateSnapshotBody": {
+        "description": "Request body for `POST /v1/sandboxes/{id}/snapshots`.",
+        "properties": {
+          "label": {
+            "description": "Optional human-readable label for the snapshot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateTeamMemberRequest": {
@@ -9423,6 +9742,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "requestTimeoutSeconds": {
+            "description": "Override for the proxy's upstream timeout on regular (non-streaming)\nHTTP requests to this project/environment, in seconds.\n`None` = inherit the global `request_timeouts.default_http_timeout_seconds`\n(which itself defaults to \"no timeout\"). `Some(0)` explicitly forces\n\"no timeout\" for this project/environment, overriding a nonzero\nglobal default. `Some(n)` for `n > 0` sets an explicit timeout,\nalways clamped to the global hard ceiling\n(`request_timeouts.max_request_timeout_seconds`) at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -9437,6 +9764,14 @@
           "sessionRecordingEnabled": {
             "description": "Enable session recording for analytics",
             "type": "boolean"
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "targetLabels": {
             "description": "Label selector for node-based scheduling. Replicas are only deployed to\nnodes whose labels match the selector.\n\nMatching rules:\n- **Same key, array value** → OR: node must match any value\n- **Different keys** → AND: node must satisfy all keys\n\nExample: `{\"region\": [\"us\", \"asia\"], \"gpu\": \"true\"}`\n→ (region=us OR region=asia) AND gpu=true\n\nApplied after `target_nodes` filtering (they stack)."
@@ -9456,6 +9791,14 @@
             "description": "Max seconds to wait for containers to start when waking from on-demand sleep.\nRequests return 503 if exceeded. Default: 30.",
             "format": "int32",
             "type": "integer"
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Override for the proxy's idle timeout on WebSocket connections to this\nproject/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -17702,6 +18045,21 @@
       "GlobalConversationResponse": {
         "description": "A conversation in the unified cross-project switcher: carries the project it\nbelongs to (name/slug) so the UI can show where the chat was started and\nlink back to the source.",
         "properties": {
+          "ai_model": {
+            "type": "string"
+          },
+          "ai_permission_mode": {
+            "type": "string"
+          },
+          "ai_provider": {
+            "type": "string"
+          },
+          "ai_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "context_id": {
             "type": "string"
           },
@@ -17750,7 +18108,10 @@
           "context_id",
           "status",
           "created_at",
-          "last_activity_at"
+          "last_activity_at",
+          "ai_provider",
+          "ai_model",
+          "ai_permission_mode"
         ],
         "type": "object"
       },
@@ -18164,6 +18525,17 @@
         },
         "required": [
           "has_metrics"
+        ],
+        "type": "object"
+      },
+      "HasTracesResponse": {
+        "properties": {
+          "has_traces": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "has_traces"
         ],
         "type": "object"
       },
@@ -20647,6 +21019,39 @@
         "required": [
           "items",
           "total"
+        ],
+        "type": "object"
+      },
+      "ListSnapshotsResponse": {
+        "description": "Paginated list of snapshots.",
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/SnapshotResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "snapshots",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -26170,6 +26575,100 @@
         },
         "type": "object"
       },
+      "PermissionDecision": {
+        "description": "The user's decision for a pending permission request.  Serialized as a tagged\nJSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`\ncarry an optional human-readable reason that is forwarded to the CLI's\n`control_response` (never stored).",
+        "oneOf": [
+          {
+            "description": "Allow the tool to run as requested (milestone 3).",
+            "properties": {
+              "type": {
+                "enum": [
+                  "allow_tool"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Deny the tool, with an optional explanation for the model (milestone 3).",
+            "properties": {
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "deny_tool"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Answer an `AskUserQuestion` prompt (milestone 4).  `answers` is a JSON\nobject mapping the literal question text to the chosen option label or\nfree-text answer, per the confirmed wire protocol.",
+            "properties": {
+              "answers": {},
+              "type": {
+                "enum": [
+                  "answer_question"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "answers",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Approve an `ExitPlanMode` plan (milestone 5).",
+            "properties": {
+              "type": {
+                "enum": [
+                  "approve_plan"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Reject an `ExitPlanMode` plan with optional feedback (milestone 5).",
+            "properties": {
+              "feedback": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "reject_plan"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PermissionInfo": {
         "description": "Information about a single permission",
         "properties": {
@@ -26190,6 +26689,69 @@
           "name",
           "description",
           "category"
+        ],
+        "type": "object"
+      },
+      "PermissionKind": {
+        "description": "Kind of permission the Claude CLI is requesting via `--permission-prompt-tool stdio`\n(ADR-038 Phase 2). Used to drive the correct UI card (`ToolApproval` → allow/deny\nbuttons; `Question` → answer form; `PlanApproval` → approve/reject-with-feedback).",
+        "enum": [
+          "tool_approval",
+          "question",
+          "plan_approval"
+        ],
+        "type": "string"
+      },
+      "PermissionRequest": {
+        "description": "A permission request emitted by `run_interactive` when the Claude CLI blocks\non a `control_request` frame.  Passed to the UI via an SSE event so the user\ncan respond before the subprocess continues.",
+        "properties": {
+          "id": {
+            "description": "The CLI's own `request_id` (UUID); used as the key in the pending-permission\nregistry and as `{permission_id}` in the resolve endpoint.",
+            "type": "string"
+          },
+          "input": {
+            "description": "Raw `request.input` from the CLI — passed through to the UI verbatim so\neach milestone's card can render the relevant fields without requiring the\nservice layer to know about tool-specific schemas."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PermissionKind",
+            "description": "What kind of interaction is required."
+          },
+          "tool_name": {
+            "description": "The tool name from `request.tool_name` (e.g. `\"Bash\"`, `\"AskUserQuestion\"`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "tool_name",
+          "input"
+        ],
+        "type": "object"
+      },
+      "PermissionRequestedEvent": {
+        "description": "Payload for the `permission_requested` SSE event (ADR-038 Phase 2).\nThe active provider turn is paused waiting for the user to approve or deny\na tool/question/plan. Resolve via\n`POST .../permissions/{id}/resolve`.",
+        "properties": {
+          "id": {
+            "description": "The CLI's `request_id` — also the `{permission_id}` in the resolve URL.",
+            "type": "string"
+          },
+          "input": {
+            "description": "Raw `input` from the CLI request. Passed through verbatim so each\nmilestone's card can render tool-specific fields without the service\nlayer needing to know about their schemas."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PermissionKind",
+            "description": "What kind of interaction is required: `\"tool_approval\"`, `\"question\"`,\nor `\"plan_approval\"`."
+          },
+          "tool_name": {
+            "description": "Tool name from the CLI request (e.g. `\"Bash\"`, `\"AskUserQuestion\"`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "tool_name",
+          "input"
         ],
         "type": "object"
       },
@@ -28123,6 +28685,24 @@
               "null"
             ]
           },
+          "host_auth_hint": {
+            "description": "Explains why `host_authenticated` is false (not installed vs.\ninstalled-but-not-authenticated), or `None` when it's true.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_auth_method": {
+            "description": "Authentication mechanism reported by the CLI running in the Temps\nprocess environment (for example `chatgpt_subscription` or\n`host_auth_store`). Never contains credential material.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_authenticated": {
+            "description": "True when the CLI is installed AND authenticated on **this host** —\nthe machine running the Temps server process. This is a completely\ndifferent signal from `credential_saved`: that field is about a\ncredential seeded into a *sandboxed autofixer container*, while this\none is what actually gates whether the AI Gateway can route requests\nto this provider (ADR-037's `AgentCliAiService` uses only the host's\nambient CLI session — ordering `claude setup-token`/`codex login` on\nthis machine — and never reads the sandbox credential at all). A\nprovider can show `credential_saved: true` and `host_authenticated:\nfalse` at the same time; only the latter means chat/gateway routing\nwill actually work.",
+            "type": "boolean"
+          },
           "id": {
             "type": "string"
           },
@@ -28176,7 +28756,8 @@
           "auth_flavors",
           "models",
           "credential_saved",
-          "supports_max_turns"
+          "supports_max_turns",
+          "host_authenticated"
         ],
         "type": "object"
       },
@@ -30526,6 +31107,45 @@
         ],
         "type": "object"
       },
+      "RequestTimeoutSettings": {
+        "description": "Upstream request/connection timeouts for customer app traffic.\n\nBy default, no timeout is applied to customer app traffic at all — an\nexisting app that happens to have a slow endpoint, a long-polling\nrequest, or an unusually long response must keep working exactly as it\ndid before this setting existed. Timeouts here are opt-in: an operator\ncan set a global default, and/or a project/environment can set its own\noverride (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until\none of those is explicitly configured, the proxy holds the connection\nopen indefinitely (bounded only by TCP/OS-level limits).\n\n`default_*_timeout_seconds` of `0` means \"no timeout\" — this is the\nout-of-the-box value for all three. `max_request_timeout_seconds` is a\nhard ceiling that only comes into play once a timeout is actually\nconfigured (globally or per project/environment): whatever value is\nresolved is always clamped to it, so lowering the ceiling here takes\neffect immediately without needing every environment row re-saved. It\nnever *creates* a timeout for traffic that has none.",
+        "properties": {
+          "default_http_timeout_seconds": {
+            "default": 0,
+            "description": "Default timeout for regular (non-streaming) HTTP requests, in\nseconds. Used when a project/environment hasn't set\n`request_timeout_seconds`. `0` (the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default_sse_idle_timeout_seconds": {
+            "default": 0,
+            "description": "Default idle timeout for Server-Sent Events streams, in seconds. Used\nwhen a project/environment hasn't set `sse_idle_timeout_seconds`. `0`\n(the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default_websocket_idle_timeout_seconds": {
+            "default": 0,
+            "description": "Default idle timeout for WebSocket connections, in seconds. Used when\na project/environment hasn't set `websocket_idle_timeout_seconds`.\n`0` (the default) means no timeout.",
+            "example": 0,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_request_timeout_seconds": {
+            "default": 600,
+            "description": "Hard ceiling, in seconds, applied once a timeout is configured (via a\nglobal default above or a project/environment override). Has no\neffect on traffic with no timeout configured at all.",
+            "example": 600,
+            "format": "int32",
+            "maximum": 86400,
+            "minimum": 5,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "RequiredPasswordChangeRequest": {
         "properties": {
           "new_password": {
@@ -30624,6 +31244,18 @@
         },
         "required": [
           "disk_size_mb"
+        ],
+        "type": "object"
+      },
+      "ResolvePermissionRequest": {
+        "description": "Body for the `POST .../permissions/{permission_id}/resolve` endpoint.",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/PermissionDecision"
+          }
+        },
+        "required": [
+          "decision"
         ],
         "type": "object"
       },
@@ -33038,6 +33670,24 @@
             "description": "Version the attempt started from.",
             "type": "string"
           },
+          "migrations_applied": {
+            "description": "Number of database migrations that were successfully applied during\nthis attempt. Set at completion (success or migration failure). `None`\nif migrations were never reached (pre-swap failure).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total number of database migrations that were planned. Set at the same\ntime as `migrations_applied`. `None` if migrations were never reached.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "previous_binary_path": {
             "description": "Where the replaced binary was kept, so a bad release can be reverted by\nhand (`mv <path> <binary>`). Set once the swap completes.",
             "type": [
@@ -33096,6 +33746,7 @@
           "downloading",
           "verifying",
           "installing",
+          "migrating",
           "restarting",
           "pending_restart",
           "failed"
@@ -33291,6 +33942,27 @@
       },
       "SendMessageRequest": {
         "properties": {
+          "ai_model": {
+            "description": "Optional next-turn model. The provider harness remains pinned, but its\nadvertised models may be changed between turns.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_permission_mode": {
+            "description": "Optional next-turn permission mode for the pinned provider harness.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_thinking_level": {
+            "description": "Optional next-turn thinking level.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content": {
             "type": "string"
           },
@@ -35955,6 +36627,62 @@
         ],
         "type": "object"
       },
+      "SnapshotResponse": {
+        "description": "Single snapshot as returned by the API.",
+        "properties": {
+          "backend": {
+            "type": "string"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "backend",
+          "content_digest",
+          "size_bytes",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "SourceArchiveUpload": {
         "properties": {
           "file": {
@@ -37582,6 +38310,44 @@
           "total_bytes",
           "limit_bytes",
           "usage_pct"
+        ],
+        "type": "object"
+      },
+      "StorageSummary": {
+        "description": "Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.",
+        "properties": {
+          "available_disk_bytes": {
+            "description": "Available bytes on the snapshots filesystem, or `null` when the\nplatform check is not yet implemented (deferred — see `available_disk_space()`).\nAPI consumers MUST treat `null` as \"unknown\" rather than \"zero bytes\navailable\". A `Some(0)` would incorrectly block snapshot creation.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "quota_bytes": {
+            "description": "Per-user quota in bytes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshot_count": {
+            "description": "Number of `ready` snapshots.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_bytes": {
+            "description": "Total bytes used by all `ready` snapshots for this user.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_bytes",
+          "snapshot_count",
+          "quota_bytes"
         ],
         "type": "object"
       },
@@ -39570,6 +40336,13 @@
             "description": "True when `channel` was set explicitly in settings rather than inferred.",
             "type": "boolean"
           },
+          "current_migration_name": {
+            "description": "Name of the migration currently running. `Some` while `phase` is\n`migrating` and a migration step is in flight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "current_version": {
             "description": "Version tag of the running binary. Always present — the version page\nneeds it whether or not an update exists.",
             "type": "string"
@@ -39588,6 +40361,24 @@
           "manual_command": {
             "description": "The equivalent command to run by hand. Always present.",
             "type": "string"
+          },
+          "migrations_applied": {
+            "description": "Number of migrations applied so far. `Some` while `phase` is `migrating`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_total": {
+            "description": "Total migrations to be applied. `Some` once the migrate child has\nreported its first `started` event.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "phase": {
             "$ref": "#/components/schemas/SelfUpdatePhase",
@@ -39797,6 +40588,14 @@
               "null"
             ]
           },
+          "requestTimeoutSeconds": {
+            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (1-86400). Environments may override this; always\nclamped to the operator's global hard ceiling regardless of what's set\nhere. Absent leaves the current value unchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -39810,6 +40609,22 @@
           "sessionRecordingEnabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sseIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocketIdleTimeoutSeconds": {
+            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -40082,6 +40897,14 @@
               "null"
             ]
           },
+          "request_timeout_seconds": {
+            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "security": {
             "oneOf": [
               {
@@ -40097,6 +40920,14 @@
             "description": "Enable/disable session recording",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "sse_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -40116,6 +40947,14 @@
           },
           "wake_timeout_seconds": {
             "description": "Max seconds to wait for containers to start on wake (5-120). Default: 30.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "websocket_idle_timeout_seconds": {
+            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
@@ -40919,6 +41758,33 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateProviderPreferenceRequest": {
+        "description": "Request body for `PUT /api/ai/provider-preference`.",
+        "properties": {
+          "agent_cli_provider_id": {
+            "description": "Required when `provider_type` is `\"agent_cli\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "interactive_bridge_enabled": {
+            "description": "Deprecated compatibility field. Adapter realtime behavior is derived\nfrom its capability contract and cannot be toggled independently.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "provider_type": {
+            "description": "`\"gateway\"` or `\"agent_cli\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_type"
+        ],
         "type": "object"
       },
       "UpdateProviderRequest": {
@@ -45039,7 +45905,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List every active conversation across all projects, most-recently-active\nfirst, annotated with project name/slug. Powers the unified \"all chats\"\nswitcher in the AI assistant dock.",
+        "summary": "List the current user's active conversations across all projects,\nmost-recently-active first, annotated with project name/slug.",
         "tags": [
           "AI Chat"
         ]
@@ -45087,6 +45953,191 @@
         ],
         "tags": [
           "AI Gateway Pricing"
+        ]
+      }
+    },
+    "/ai/provider-preference": {
+      "put": {
+        "operationId": "update_ai_provider_preference",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProviderPreferenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderStatusResponse"
+                }
+              }
+            },
+            "description": "Updated provider preference and availability"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Provider Status"
+        ]
+      }
+    },
+    "/ai/provider-status": {
+      "get": {
+        "operationId": "get_ai_provider_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderStatusResponse"
+                }
+              }
+            },
+            "description": "Current provider preference and availability"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Provider Status"
+        ]
+      }
+    },
+    "/ai/provider-status/refresh": {
+      "post": {
+        "operationId": "refresh_ai_provider_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderStatusResponse"
+                }
+              }
+            },
+            "description": "Fresh provider authentication and model capability snapshot"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Provider refresh failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Provider Status"
         ]
       }
     },
@@ -67449,6 +68500,75 @@
         ]
       }
     },
+    "/otel/has-traces/{project_id}": {
+      "get": {
+        "description": "A pure existence check for onboarding/setup UI (e.g. \"has this project\nset up OpenTelemetry yet?\"). Deliberately not `/otel/trace-summaries`\nwith `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,\n`argMax`) and, without a time bound, that aggregation runs over every\nspan the project has ever ingested. This endpoint answers the same\nyes/no question in O(1) — see `OtelStorage::has_traces`.",
+        "operationId": "has_traces",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HasTracesResponse"
+                }
+              }
+            },
+            "description": "Trace existence check"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether a project has ever received at least one trace span.",
+        "tags": [
+          "OTel"
+        ]
+      }
+    },
     "/otel/health/{project_id}": {
       "get": {
         "operationId": "get_health",
@@ -72585,7 +73705,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Find the existing chat for a context (returns `null` if none yet). Requires\nthe per-project `ai_debug_chat_enabled` toggle to be on; returns 403 when the\nfeature is disabled so revoking it consistently hides existing chat content.",
+        "summary": "Find the current user's existing chat for a context (returns `null` if none\nyet). Conversations are private even between members of the same project.\nRequires the per-project `ai_debug_chat_enabled` toggle to be on.",
         "tags": [
           "AI Chat"
         ]
@@ -72639,7 +73759,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Get-or-create the chat for a context (seeds it on first open).",
+        "summary": "Get-or-create the current user's private chat for a context.",
         "tags": [
           "AI Chat"
         ]
@@ -72685,7 +73805,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List all active conversations for a project, most-recently-active first.\nPowers the conversation switcher in the AI assistant sidebar.",
+        "summary": "List the current user's active conversations for a project,\nmost-recently-active first.",
         "tags": [
           "AI Chat"
         ]
@@ -72970,6 +74090,81 @@
           }
         ],
         "summary": "List all pending actions for a conversation (most-recently-proposed first).",
+        "tags": [
+          "AI Chat"
+        ]
+      }
+    },
+    "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve": {
+      "post": {
+        "operationId": "resolve_permission",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The CLI's request_id from the SSE event",
+            "in": "path",
+            "name": "permission_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolvePermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Decision accepted; subprocess will continue"
+          },
+          "400": {
+            "description": "Invalid decision payload"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Unknown permission_id (may have timed out or been auto-denied)"
+          },
+          "409": {
+            "description": "Permission already resolved (concurrent resolve race)"
+          },
+          "410": {
+            "description": "Turn already ended (subprocess exited before decision arrived)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "AI Chat"
         ]
@@ -91244,6 +92439,187 @@
         ]
       }
     },
+    "/v1/sandbox-snapshots": {
+      "get": {
+        "operationId": "list_snapshots",
+        "parameters": [
+          {
+            "description": "Filter by project",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by status",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSnapshotsResponse"
+                }
+              }
+            },
+            "description": "List of snapshots"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/storage-summary": {
+      "get": {
+        "operationId": "storage_summary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageSummary"
+                }
+              }
+            },
+            "description": "Storage usage summary"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/storage-summary`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
+    "/v1/sandbox-snapshots/{snap_id}": {
+      "delete": {
+        "operationId": "delete_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Snapshot deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`DELETE /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      },
+      "get": {
+        "operationId": "get_snapshot",
+        "parameters": [
+          {
+            "description": "Snapshot public ID",
+            "in": "path",
+            "name": "snap_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot detail"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`GET /v1/sandbox-snapshots/{snap_id}`",
+        "tags": [
+          "Snapshots"
+        ]
+      }
+    },
     "/v1/sandboxes": {
       "get": {
         "operationId": "list_sandboxes",
@@ -92560,6 +93936,75 @@
         ],
         "tags": [
           "Sandboxes"
+        ]
+      }
+    },
+    "/v1/sandboxes/{id}/snapshots": {
+      "post": {
+        "description": "Initiates a snapshot of the sandbox. The response is **202 Accepted**\nwith the snapshot row in `creating` status. The caller should poll\n`GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or\n`failed`.\n\nThe sandbox is stopped for the duration of the snapshot and restarted\nautomatically when it completes (unless it was already stopped).",
+        "operationId": "create_snapshot",
+        "parameters": [
+          {
+            "description": "Sandbox public ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            },
+            "description": "Snapshot initiated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "422": {
+            "description": "Quota exceeded or invalid state"
+          },
+          "500": {
+            "description": "Internal error"
+          },
+          "501": {
+            "description": "Snapshots not supported by backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "`POST /v1/sandboxes/{id}/snapshots`",
+        "tags": [
+          "Snapshots"
         ]
       }
     },
@@ -94142,6 +95587,10 @@
       "name": "Sandboxes"
     },
     {
+      "description": "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots.",
+      "name": "Snapshots"
+    },
+    {
       "description": "Log search, context, live tail, and retention management",
       "name": "Logs"
     },
@@ -94208,6 +95657,10 @@
     {
       "description": "Model pricing endpoints",
       "name": "AI Gateway Pricing"
+    },
+    {
+      "description": "Provider preference and availability endpoints",
+      "name": "AI Provider Status"
     },
     {
       "description": "API key management endpoints",

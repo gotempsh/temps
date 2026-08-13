@@ -45,7 +45,7 @@ impl From<AgentError> for Problem {
                     .with_title("AI CLI Not Installed")
                     .with_detail(error.to_string())
             }
-            AgentError::AiCliFailed { .. } => {
+            AgentError::AiCliFailed { .. } | AgentError::AiCliReportedError { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("AI CLI Failed")
                     .with_detail(error.to_string())

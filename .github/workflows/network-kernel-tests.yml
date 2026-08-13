@@ -32,6 +32,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: temps-network-unit
+          # Save from `main` only -- this workflow triggers on pull_request,
+          # so without this guard every open PR touching temps-network holds
+          # its own copy under this key, competing with the shared
+          # temps-musl-fast-* cache for the repo's 10GB cache pool (see the
+          # dependency-scan-cargo-audit incident this mirrors).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run unit tests
         run: cargo test -p temps-network --lib
 

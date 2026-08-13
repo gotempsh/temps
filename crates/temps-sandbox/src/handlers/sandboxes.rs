@@ -439,6 +439,17 @@ pub struct CreateSandboxBody {
     #[serde(default)]
     pub project_id: Option<i32>,
 
+    /// Create the sandbox from a snapshot (ADR-037).
+    ///
+    /// Mutually exclusive with `image`: if both are set the request fails
+    /// with 400. When set, the sandbox is created with the snapshotted
+    /// filesystem rather than a base image, giving users a reproducible
+    /// starting point.
+    ///
+    /// The snapshot must be in `ready` status and belong to the calling user.
+    #[serde(default)]
+    pub from_snapshot: Option<String>,
+
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
     // don't act on them because temps has no equivalent concept today.
@@ -468,6 +479,9 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             backend: b.backend,
             lifecycle: b.lifecycle,
             project_id: b.project_id,
+            // Snapshot artifact is resolved and injected by the handler;
+            // the `From` impl starts with None and the handler sets it.
+            from_snapshot_artifact: None,
         }
     }
 }
@@ -917,10 +931,44 @@ pub async fn create_sandbox(
     if let Some(src) = body.source.as_ref() {
         src.validate_async().await?;
     }
-    let row = state
-        .sandbox_service
-        .create_sandbox(auth.user_id(), body.into())
-        .await?;
+
+    // `from_snapshot` and `image` are mutually exclusive: snapshotting
+    // overrides the base image, so passing both is ambiguous.
+    if body.from_snapshot.is_some() && body.image.is_some() {
+        return Err(
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Conflicting Fields")
+                .detail("'from_snapshot' and 'image' are mutually exclusive — omit one")
+                .build(),
+        );
+    }
+
+    // If `from_snapshot` is set, resolve the artifact and inject it into
+    // the request so the service can call `provider.create_from_snapshot`.
+    let user_id = auth.user_id();
+    let from_snapshot_id = body.from_snapshot.clone();
+    let mut req: crate::services::sandbox_service::CreateSandboxRequest = body.into();
+
+    if let Some(snap_id) = from_snapshot_id {
+        let backend = req.backend.as_deref().unwrap_or("docker");
+        let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
+            use crate::error::SandboxSnapshotError;
+            use temps_core::problemdetails::Problem;
+            Problem::from(SandboxSnapshotError::NotSupported {
+                backend: backend.to_string(),
+            })
+        })?;
+        let artifact = snapshot_svc
+            .resolve_for_restore(user_id, &snap_id, backend)
+            .await
+            .map_err(|e| {
+                use temps_core::problemdetails::Problem;
+                Problem::from(e)
+            })?;
+        req.from_snapshot_artifact = Some(artifact);
+    }
+
+    let row = state.sandbox_service.create_sandbox(user_id, req).await?;
     let resp = build_response(&state, row).await;
     Ok((StatusCode::CREATED, Json(resp)))
 }

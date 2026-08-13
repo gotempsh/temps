@@ -88,6 +88,25 @@ pub struct ProviderCatalogDto {
     /// for Codex/OpenCode, which run to completion — the UI labels their
     /// max-turns inputs accordingly.
     pub supports_max_turns: bool,
+    /// True when the CLI is installed AND authenticated on **this host** —
+    /// the machine running the Temps server process. This is a completely
+    /// different signal from `credential_saved`: that field is about a
+    /// credential seeded into a *sandboxed autofixer container*, while this
+    /// one is what actually gates whether the AI Gateway can route requests
+    /// to this provider (ADR-037's `AgentCliAiService` uses only the host's
+    /// ambient CLI session — ordering `claude setup-token`/`codex login` on
+    /// this machine — and never reads the sandbox credential at all). A
+    /// provider can show `credential_saved: true` and `host_authenticated:
+    /// false` at the same time; only the latter means chat/gateway routing
+    /// will actually work.
+    pub host_authenticated: bool,
+    /// Authentication mechanism reported by the CLI running in the Temps
+    /// process environment (for example `chatgpt_subscription` or
+    /// `host_auth_store`). Never contains credential material.
+    pub host_auth_method: Option<String>,
+    /// Explains why `host_authenticated` is false (not installed vs.
+    /// installed-but-not-authenticated), or `None` when it's true.
+    pub host_auth_hint: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -205,54 +224,73 @@ pub async fn list_ai_providers(
 
     let sandbox = load_agent_sandbox(&app_state).await?;
 
-    let providers = PROVIDER_CATALOG
-        .iter()
-        .map(|entry| {
-            let provider_cfg = sandbox.provider_config(entry.id);
-            let credential_saved = provider_cfg.credentials_encrypted.is_some();
-            let current_auth_type = if credential_saved {
-                Some(provider_cfg.auth_type)
-            } else {
-                None
+    let mut providers = Vec::with_capacity(PROVIDER_CATALOG.len());
+    for entry in PROVIDER_CATALOG.iter() {
+        let provider_cfg = sandbox.provider_config(entry.id);
+        let credential_saved = provider_cfg.credentials_encrypted.is_some();
+        let current_auth_type = if credential_saved {
+            Some(provider_cfg.auth_type)
+        } else {
+            None
+        };
+
+        let (host_authenticated, host_auth_method, host_auth_hint) =
+            match crate::ai_cli::create_provider(entry.id) {
+                Some(provider) => {
+                    let status = provider.get_status().await;
+                    let authenticated = status.installed && status.authenticated;
+                    (
+                        authenticated,
+                        status.auth_method,
+                        if authenticated {
+                            None
+                        } else {
+                            status.setup_hint
+                        },
+                    )
+                }
+                None => (false, None, None),
             };
 
-            ProviderCatalogDto {
-                id: entry.id.to_string(),
-                name: entry.name.to_string(),
-                install_command: entry.install_command.to_string(),
-                auth_command: entry.auth_command.to_string(),
-                auth_flavors: entry
-                    .auth_flavors
-                    .iter()
-                    .map(|f| AuthFlavorDto {
-                        id: f.id.to_string(),
-                        label: f.label.to_string(),
-                        description: f.description.to_string(),
-                        format: match f.format {
-                            CredentialFormat::ApiKey => "api_key".to_string(),
-                            CredentialFormat::OauthToken => "oauth_token".to_string(),
-                            CredentialFormat::ConfigFile => "config_file".to_string(),
-                        },
-                        env_var: if matches!(f.format, CredentialFormat::ApiKey) {
-                            Some(f.env_var.to_string())
-                        } else {
-                            None
-                        },
-                    })
-                    .collect(),
-                models: entry.models.iter().map(|m| m.to_string()).collect(),
-                credential_saved,
-                current_auth_type,
-                default_model: provider_cfg.default_model.clone(),
-                max_turns_analysis: provider_cfg.max_turns_analysis,
-                max_turns_fix: provider_cfg.max_turns_fix,
-                max_turns_feedback: provider_cfg.max_turns_feedback,
-                // Only Claude Code has a --max-turns flag today; Codex and
-                // OpenCode run to completion regardless of these settings.
-                supports_max_turns: entry.id == "claude_cli",
-            }
-        })
-        .collect();
+        providers.push(ProviderCatalogDto {
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
+            install_command: entry.install_command.to_string(),
+            auth_command: entry.auth_command.to_string(),
+            auth_flavors: entry
+                .auth_flavors
+                .iter()
+                .map(|f| AuthFlavorDto {
+                    id: f.id.to_string(),
+                    label: f.label.to_string(),
+                    description: f.description.to_string(),
+                    format: match f.format {
+                        CredentialFormat::ApiKey => "api_key".to_string(),
+                        CredentialFormat::OauthToken => "oauth_token".to_string(),
+                        CredentialFormat::ConfigFile => "config_file".to_string(),
+                    },
+                    env_var: if matches!(f.format, CredentialFormat::ApiKey) {
+                        Some(f.env_var.to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+            models: entry.models.iter().map(|m| m.to_string()).collect(),
+            credential_saved,
+            current_auth_type,
+            default_model: provider_cfg.default_model.clone(),
+            max_turns_analysis: provider_cfg.max_turns_analysis,
+            max_turns_fix: provider_cfg.max_turns_fix,
+            max_turns_feedback: provider_cfg.max_turns_feedback,
+            // Only Claude Code has a --max-turns flag today; Codex and
+            // OpenCode run to completion regardless of these settings.
+            supports_max_turns: entry.id == "claude_cli",
+            host_authenticated,
+            host_auth_method,
+            host_auth_hint,
+        });
+    }
 
     Ok(Json(ProviderCatalogResponse {
         default_provider: sandbox.default_provider,

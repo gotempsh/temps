@@ -31,6 +31,7 @@ interface Candidate {
   confidence: string
   reason: string
   isStatic: boolean
+  composePath?: string | null
 }
 
 interface Inspection {
@@ -147,6 +148,10 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
         source_type: candidate.isStatic ? 'static_files' : 'uploaded_source',
         automatic_deploy: false,
         storage_service_ids: [],
+        preset_config:
+          candidate.preset === 'docker-compose' && candidate.composePath
+            ? { composePath: candidate.composePath }
+            : undefined,
       },
     })
     if (created.error || !created.data) throw new Error(JSON.stringify(created.error || 'Project creation returned no data'))

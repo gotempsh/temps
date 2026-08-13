@@ -14,7 +14,11 @@ import {
   useConsoleExtensions,
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
-import { QueryCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  QueryCache,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
@@ -258,11 +262,6 @@ const RequiredPasswordChange = lazy(() =>
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
-const AiProvidersPage = lazy(() =>
-  import('./pages/settings/AiProvidersPage').then((m) => ({
-    default: m.AiProvidersPage,
-  }))
-)
 const DockerRegistryPage = lazy(() =>
   import('./pages/settings/DockerRegistryPage').then((m) => ({
     default: m.DockerRegistryPage,
@@ -281,6 +280,11 @@ const SecurityPage = lazy(() =>
 const RateLimitingPage = lazy(() =>
   import('./pages/settings/RateLimitingPage').then((m) => ({
     default: m.RateLimitingPage,
+  }))
+)
+const RequestTimeoutsPage = lazy(() =>
+  import('./pages/settings/RequestTimeoutsPage').then((m) => ({
+    default: m.RequestTimeoutsPage,
   }))
 )
 const DiskMonitoringPage = lazy(() =>
@@ -333,10 +337,30 @@ const AiGateway = lazy(() =>
     default: m.AiGatewayPage,
   }))
 )
+const AiGatewayUsagePage = lazy(() =>
+  import('./pages/AiGatewayUsagePage').then((m) => ({
+    default: m.AiGatewayUsagePage,
+  }))
+)
+const AiGatewayActivityPage = lazy(() =>
+  import('./pages/AiGatewayActivityPage').then((m) => ({
+    default: m.AiGatewayActivityPage,
+  }))
+)
+const AiGatewaySetupPage = lazy(() =>
+  import('./pages/AiGatewaySetupPage').then((m) => ({
+    default: m.AiGatewaySetupPage,
+  }))
+)
 
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
+  }))
+)
+const AiWorkflowsOverview = lazy(() =>
+  import('./pages/AiWorkflowsOverview').then((m) => ({
+    default: m.AiWorkflowsOverview,
   }))
 )
 const AgentSandboxLayout = lazy(() =>
@@ -564,10 +588,6 @@ const FullAppRoutes = () => {
                     settings sidebar swap. */}
                     <Route path="/settings" element={<SettingsLayout />}>
                       <Route index element={<Settings />} />
-                      <Route
-                        path="ai-providers"
-                        element={<AiProvidersPage />}
-                      />
                       <Route path="notifications" element={<Notifications />} />
                       <Route path="users" element={<Users />} />
                       <Route path="users/new" element={<CreateUser />} />
@@ -610,6 +630,10 @@ const FullAppRoutes = () => {
                       <Route
                         path="build-limits"
                         element={<BuildLimitsPage />}
+                      />
+                      <Route
+                        path="request-timeouts"
+                        element={<RequestTimeoutsPage />}
                       />
                       <Route
                         path="metrics-monitoring"
@@ -671,7 +695,23 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/email/:id" element={<EmailDetail />} />
                     <Route path="/ai-gateway" element={<AiGateway />} />
+                    <Route
+                      path="/ai-gateway/usage"
+                      element={<AiGatewayUsagePage />}
+                    />
+                    <Route
+                      path="/ai-gateway/activity"
+                      element={<AiGatewayActivityPage />}
+                    />
+                    <Route
+                      path="/ai-gateway/setup"
+                      element={<AiGatewaySetupPage />}
+                    />
                     <Route path="/chat" element={<AiChat />} />
+                    <Route
+                      path="/ai-workflows"
+                      element={<AiWorkflowsOverview />}
+                    />
                     <Route
                       path="/agent-sandbox"
                       element={<AgentSandboxLayout />}
@@ -772,6 +812,10 @@ const FullAppRoutes = () => {
                     />
                     <Route
                       path="/settings/ai-gateway/*"
+                      element={<Navigate to="/ai-gateway" replace />}
+                    />
+                    <Route
+                      path="/settings/ai-providers"
                       element={<Navigate to="/ai-gateway" replace />}
                     />
                     <Route
@@ -921,7 +965,8 @@ const queryClient = new QueryClient({
       // to decide whether to show the login screen -- match it the same way.
       const problem = error as { title?: string } | null
       const isUnauthorized =
-        problem?.title === 'Authentication Required' || problem?.title === 'Unauthorized'
+        problem?.title === 'Authentication Required' ||
+        problem?.title === 'Unauthorized'
       if (!isUnauthorized) return
 
       // The current-user query already surfaces its own auth error straight

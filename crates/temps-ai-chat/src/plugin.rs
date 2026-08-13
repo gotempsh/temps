@@ -52,6 +52,7 @@ impl TempsPlugin for AiChatPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
+            let encryption = context.require_service::<temps_core::EncryptionService>();
             let ai = context.require_service::<dyn temps_ai::AiService>();
             let log_service = context.require_service::<temps_logs::LogService>();
             // Audit logger for chat write operations (registered by AuditPlugin,
@@ -85,8 +86,11 @@ impl TempsPlugin for AiChatPlugin {
 
             // Pending-action service (propose-then-confirm write actions).
             // Audit is emitted by the handler layer (with full RequestMetadata).
-            let pending_actions =
-                Arc::new(PendingActionService::new(db.clone(), write_handle.clone()));
+            let pending_actions = Arc::new(PendingActionService::new(
+                db.clone(),
+                write_handle.clone(),
+                encryption,
+            ));
             context.register_service(pending_actions.clone());
 
             // Built-in providers (one per context_type). Future context types add
@@ -113,9 +117,10 @@ impl TempsPlugin for AiChatPlugin {
             let config_service = context.get_service::<temps_config::ConfigService>();
             let mut service = ConversationService::new(db.clone(), ai, providers)
                 .with_write_support(write_handle, pending_actions.clone());
-            if let Some(cfg) = config_service {
-                service = service.with_config(cfg);
+            if let Some(cfg) = &config_service {
+                service = service.with_config(cfg.clone());
             }
+
             let service = Arc::new(service);
             context.register_service(service.clone());
 

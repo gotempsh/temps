@@ -76,6 +76,7 @@ tokio-test = "0.4"
 mockall = "0.15"
 tower = { workspace = true }
 env_logger = "0.11"
+serial_test = "4.0"
 
 [features]
 default = []

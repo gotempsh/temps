@@ -27,6 +27,9 @@ pub enum CredentialType {
 pub struct ByokOverride {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Exact administrator-configured key selected by a pinned conversation.
+    /// Missing or inactive IDs fail closed; they never fall back to another key.
+    pub system_key_id: Option<i32>,
 }
 
 /// The core gateway service that routes requests to the appropriate provider,
@@ -48,6 +51,14 @@ impl GatewayService {
             provider_key_service,
             providers,
         }
+    }
+
+    /// Models advertised by the adapter for one configured provider key.
+    pub fn available_models_for_provider(&self, provider_id: &str) -> Vec<ModelInfo> {
+        self.providers
+            .get(provider_id)
+            .map(|provider| provider.available_models())
+            .unwrap_or_default()
     }
 
     /// Route a model name to the provider and resolve the API key.
@@ -99,13 +110,30 @@ impl GatewayService {
         }
 
         // System key: look up from database
-        let key_record = self
-            .provider_key_service
-            .get_active_by_provider(provider_id)
-            .await?
-            .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
-                provider: provider_id.to_string(),
-            })?;
+        let key_record = if let Some(key_id) = byok.system_key_id {
+            let key = self.provider_key_service.get_by_id(key_id).await?;
+            if !key.is_active {
+                return Err(AiGatewayError::Validation {
+                    message: format!("AI provider key {key_id} is inactive"),
+                });
+            }
+            if key.provider != provider_id {
+                return Err(AiGatewayError::Validation {
+                    message: format!(
+                        "AI provider key {key_id} is configured for '{}' and cannot serve model '{model}'",
+                        key.provider
+                    ),
+                });
+            }
+            key
+        } else {
+            self.provider_key_service
+                .get_active_by_provider(provider_id)
+                .await?
+                .ok_or_else(|| AiGatewayError::ProviderNotConfigured {
+                    provider: provider_id.to_string(),
+                })?
+        };
 
         let decrypted_key = self
             .provider_key_service

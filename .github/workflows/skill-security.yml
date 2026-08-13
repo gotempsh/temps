@@ -7,6 +7,9 @@ on:
     branches: [main]
     paths:
       - "skills/**"
+      - "apps/temps-cli/package.json"
+      - "apps/temps-cli/src/commands/docs.ts"
+      - "apps/temps-cli/src/commands/docs.test.ts"
       - ".github/workflows/skill-security.yml"
       - ".github/skill-scanner-requirements.in"
       - ".github/skill-scanner-requirements.txt"
@@ -57,6 +60,12 @@ jobs:
               ".github/skill-scanner-requirements.in",
               ".github/skill-scanner-requirements.txt",
               ".github/workflows/skill-security.yml",
+          }
+          temps_dependency_files = {
+              "apps/temps-cli/package.json",
+              "apps/temps-cli/src/commands/docs.ts",
+              "apps/temps-cli/src/commands/docs.test.ts",
+              "skills/temps-cli/references/COMMANDS.md",
           }
           name_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -129,6 +138,16 @@ jobs:
                   if validated is not None:
                       selected.add(validated)
 
+              # The /temps command references are generated from the CLI
+              # catalog. Changes to that catalog or its generator must scan
+              # and validate both the source skill and routed skill even when
+              # only one skill directory appears in the diff.
+              if temps_dependency_files.intersection(changed):
+                  for dependent_skill in ("temps", "temps-cli"):
+                      validated = validate_skill(skills_root / dependent_skill)
+                      if validated is not None:
+                          selected.add(validated)
+
               if not control_files.intersection(changed):
                   scan_mode = "changed"
                   skill_paths = sorted(selected)
@@ -182,6 +201,23 @@ jobs:
           --require-hashes
           --only-binary=:all:
           --requirement .github/skill-scanner-requirements.txt
+
+      - name: Validate Temps router and generated references
+        if: matrix.skill-path == 'skills/temps'
+        run: |
+          set -euo pipefail
+          python3 skills/temps/scripts/validate_skill.py
+          python3 -m unittest discover \
+            -s skills/temps/scripts \
+            -p 'test_*.py' \
+            -v
+
+          generated_dir="$(mktemp -d)"
+          trap 'rm -rf "$generated_dir"' EXIT
+          python3 skills/temps/scripts/generate_command_references.py \
+            --source skills/temps-cli/references/COMMANDS.md \
+            --destination "$generated_dir"
+          diff -ru skills/temps/references/commands "$generated_dir"
 
       - name: Scan skill
         env:

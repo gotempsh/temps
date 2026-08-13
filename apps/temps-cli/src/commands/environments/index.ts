@@ -141,6 +141,18 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(resourcesCmd)
 
+  // Request timeouts subcommand
+  environments
+    .command('timeouts <environment>')
+    .description('View or set upstream request/idle timeouts for an environment')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--request <seconds>', 'Timeout for regular (non-streaming) HTTP requests, in seconds')
+    .option('--sse-idle <seconds>', 'Idle timeout for Server-Sent Events streams, in seconds')
+    .option('--websocket-idle <seconds>', 'Idle timeout for WebSocket connections, in seconds')
+    .option('--inherit', 'Clear all three overrides (inherit the project/global defaults)')
+    .option('--json', 'Output in JSON format')
+    .action(timeoutsCmd)
+
   // Force HTTPS subcommand
   environments
     .command('force-https <environment>')
@@ -1261,6 +1273,149 @@ function displayResources(env: EnvironmentResponse | null | undefined): void {
   info(`${colors.bold('Requests')} = guaranteed minimum resources`)
   newline()
   info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
+}
+
+// ============ Request Timeouts Command ============
+
+interface TimeoutsOptions {
+  project?: string
+  request?: string
+  sseIdle?: string
+  websocketIdle?: string
+  inherit?: boolean
+  json?: boolean
+}
+
+function formatTimeout(seconds: number | null | undefined): string {
+  if (seconds == null) return colors.muted('inherit (project/global default)')
+  if (seconds === 0) return colors.muted('no timeout (explicit override)')
+  return `${seconds}s`
+}
+
+async function timeoutsCmd(environment: string, options: TimeoutsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const resolved = await requireProjectSlug(options.project)
+  const projectId = await getProjectId(resolved.slug)
+
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  const hasSetOptions = options.request || options.sseIdle || options.websocketIdle
+  if (hasSetOptions && options.inherit) {
+    errorOutput('Pass either --inherit or one of --request/--sse-idle/--websocket-idle, not both')
+    return
+  }
+
+  if (hasSetOptions || options.inherit) {
+    const updateBody: {
+      request_timeout_seconds?: number | null
+      sse_idle_timeout_seconds?: number | null
+      websocket_idle_timeout_seconds?: number | null
+    } = {}
+
+    if (options.inherit) {
+      updateBody.request_timeout_seconds = null
+      updateBody.sse_idle_timeout_seconds = null
+      updateBody.websocket_idle_timeout_seconds = null
+    } else {
+      if (options.request) {
+        const seconds = parseInt(options.request, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--request must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.request_timeout_seconds = seconds
+      }
+      if (options.sseIdle) {
+        const seconds = parseInt(options.sseIdle, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--sse-idle must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.sse_idle_timeout_seconds = seconds
+      }
+      if (options.websocketIdle) {
+        const seconds = parseInt(options.websocketIdle, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--websocket-idle must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.websocket_idle_timeout_seconds = seconds
+      }
+    }
+
+    const updatedEnv = await withSpinner('Updating timeouts...', async () => {
+      const { data, error } = await updateEnvironmentSettings({
+        client,
+        path: { project_id: projectId, env_id: targetEnv.id },
+        body: updateBody,
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      return data
+    })
+
+    const config = updatedEnv?.deployment_config
+    if (options.json) {
+      json({
+        environment: updatedEnv?.slug,
+        request_timeout_seconds: config?.requestTimeoutSeconds ?? null,
+        sse_idle_timeout_seconds: config?.sseIdleTimeoutSeconds ?? null,
+        websocket_idle_timeout_seconds: config?.websocketIdleTimeoutSeconds ?? null,
+      })
+      return
+    }
+
+    newline()
+    success(`Timeouts updated for ${resolved.slug}/${environment}`)
+    newline()
+    keyValue('HTTP request timeout', formatTimeout(config?.requestTimeoutSeconds))
+    keyValue('SSE idle timeout', formatTimeout(config?.sseIdleTimeoutSeconds))
+    keyValue('WebSocket idle timeout', formatTimeout(config?.websocketIdleTimeoutSeconds))
+  } else {
+    const config = targetEnv.deployment_config
+    if (options.json) {
+      json({
+        environment: targetEnv.slug,
+        request_timeout_seconds: config?.requestTimeoutSeconds ?? null,
+        sse_idle_timeout_seconds: config?.sseIdleTimeoutSeconds ?? null,
+        websocket_idle_timeout_seconds: config?.websocketIdleTimeoutSeconds ?? null,
+      })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} Request timeouts for ${resolved.slug}/${environment}`)
+    newline()
+    keyValue('HTTP request timeout', formatTimeout(config?.requestTimeoutSeconds))
+    keyValue('SSE idle timeout', formatTimeout(config?.sseIdleTimeoutSeconds))
+    keyValue('WebSocket idle timeout', formatTimeout(config?.websocketIdleTimeoutSeconds))
+    newline()
+    info('An unset value inherits the project default, then the operator\'s global default —')
+    info('which is "no timeout" unless an operator has configured one. Nonzero values are')
+    info('always clamped to the global hard ceiling regardless of what\'s configured here.')
+    newline()
+    info(`Set it with: ${colors.muted('temps env timeouts ' + environment + ' --request 30 --sse-idle 900')}`)
+    info(`Force no timeout: ${colors.muted('temps env timeouts ' + environment + ' --request 0')}`)
+    info(`Clear overrides: ${colors.muted('temps env timeouts ' + environment + ' --inherit')}`)
+  }
 }
 
 // ============ Force HTTPS Command ============

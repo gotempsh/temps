@@ -695,6 +695,24 @@ export type AiChatLimitsSettings = {
 };
 
 /**
+ * Mirrors `temps_agents::ai_cli::AiCliStatus` with utoipa `ToSchema` added.
+ * `AiCliStatus` itself does not derive `ToSchema`, so this local projection is
+ * used for OpenAPI generation only — the fields are identical.
+ */
+export type AiCliStatusDto = {
+    auth_method?: string | null;
+    authenticated: boolean;
+    installed: boolean;
+    provider: string;
+    /**
+     * Instructions for the operator when not installed or not authenticated.
+     */
+    setup_hint?: string | null;
+    subscription_type?: string | null;
+    version?: string | null;
+};
+
+/**
  * Global AI configuration settings. Controls the default config repo
  * containing `.claude/` directory (skills, MCP servers, plugins) that
  * gets overlaid into every agent sandbox.
@@ -722,6 +740,13 @@ export type AiDataAccessResponse = {
     service_id: number;
 };
 
+export type AiModelOptionDto = {
+    default_thinking_option_id?: string | null;
+    id: string;
+    name: string;
+    thinking_options: Array<AiSelectOptionDto>;
+};
+
 /**
  * Response wrapping the AI page breakdown rows.
  */
@@ -744,6 +769,63 @@ export type AiPageBreakdownRow = {
     last_seen?: string | null;
     path: string;
     request_count: number;
+};
+
+/**
+ * Current AI provider routing preference and availability for this instance.
+ *
+ * The `configured` field drives the UI onboarding state: when `false` the UI
+ * must show _exactly what is missing_ (`reason`) and _where to fix it_
+ * (`setup_path`), not hide the feature.
+ */
+export type AiProviderStatusResponse = {
+    /**
+     * Active preference: `"gateway"` (BYOK) or `"agent_cli"` (subscription).
+     */
+    active_provider_type: string;
+    /**
+     * Catalog id of the active agent CLI provider, or `null` when
+     * `active_provider_type` is `"gateway"`.
+     */
+    agent_cli_provider_id?: string | null;
+    agent_cli_status?: null | AiCliStatusDto;
+    /**
+     * Providers a chat user may choose for a new conversation. Authentication
+     * source is descriptive metadata only and never contains credentials.
+     */
+    available_providers: Array<AvailableAiProviderDto>;
+    /**
+     * Whether the active provider is ready to serve requests.
+     */
+    configured: boolean;
+    /**
+     * Whether at least one active BYOK provider key exists.
+     */
+    gateway_available: boolean;
+    /**
+     * Health of normalized mid-turn user interactions, or `null` when the
+     * active adapter does not advertise them. Kept for API compatibility.
+     */
+    interactive_bridge_status?: string | null;
+    /**
+     * Human-readable explanation of why `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * Console path the operator should visit to fix the missing configuration.
+     */
+    setup_path?: string | null;
+    /**
+     * Whether the active adapter's normalized realtime contract exposes tool
+     * events. Kept under the legacy field name for API compatibility.
+     */
+    supports_interactive_tools: boolean;
+};
+
+export type AiSelectOptionDto = {
+    description?: string | null;
+    id: string;
+    name: string;
 };
 
 /**
@@ -1090,6 +1172,13 @@ export type AppSettings = {
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     /**
+     * Upstream request/connection timeouts applied by the proxy to customer
+     * app traffic. Provides a global hard ceiling plus global defaults for
+     * regular HTTP, SSE, and WebSocket traffic; projects and environments
+     * may set a shorter value but never exceed the ceiling here.
+     */
+    request_timeouts?: RequestTimeoutSettings;
+    /**
      * When `true`, any user holding the `Admin` role must have MFA enrolled
      * (`users.mfa_enabled = true`) to complete a **password** login. Users
      * without MFA enrolled are rejected with a typed error instructing them
@@ -1191,6 +1280,11 @@ export type AppSettingsResponse = {
      */
     proxy_port: number;
     rate_limiting: RateLimitSettings;
+    /**
+     * Upstream request/connection timeouts (hard ceiling + defaults) applied
+     * by the proxy to customer app traffic. No sensitive content.
+     */
+    request_timeouts: RequestTimeoutSettings;
     /**
      * When enabled, Admin-role accounts without MFA enrolled are rejected
      * at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
@@ -1448,6 +1542,26 @@ export type AutofixerRunResponse = {
 export type AutofixerRunWithLogsResponse = {
     logs: Array<AgentRunLogResponse>;
     run: AutofixerRunResponse;
+};
+
+export type AvailableAiProviderDto = {
+    /**
+     * `configured_key` for the gateway or `host_environment` for an ambient
+     * CLI login discovered in the Temps process environment.
+     */
+    auth_source: string;
+    default_model_id?: string | null;
+    default_permission_mode_id?: string | null;
+    id: string;
+    model_discovery_error?: string | null;
+    /**
+     * `ready` when the model list was loaded, `unavailable` when the provider
+     * can still run with its own default but live discovery failed.
+     */
+    model_discovery_status: string;
+    models: Array<AiModelOptionDto>;
+    name: string;
+    permission_modes: Array<AiSelectOptionDto>;
 };
 
 /**
@@ -3056,9 +3170,14 @@ export type ConversationDetailResponse = ConversationResponse & {
      * Turns oldest-first. The `system` seed message is omitted (internal).
      */
     messages: Array<MessageResponse>;
+    pending_permission?: null | PermissionRequest;
 };
 
 export type ConversationResponse = {
+    ai_model: string;
+    ai_permission_mode: string;
+    ai_provider: string;
+    ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
     created_at: string;
@@ -3277,6 +3396,14 @@ export type CreateCloudflareProviderRequest = {
 };
 
 export type CreateConversationRequest = {
+    ai_model?: string | null;
+    ai_permission_mode?: string | null;
+    /**
+     * Provider pinned to this conversation. Omitted requests use the current
+     * instance preference.
+     */
+    ai_provider?: string | null;
+    ai_thinking_level?: string | null;
     /**
      * The entity id (ints stringified).
      */
@@ -3983,6 +4110,17 @@ export type CreateSandboxBody = {
         [key: string]: string;
     };
     /**
+     * Create the sandbox from a snapshot (ADR-037).
+     *
+     * Mutually exclusive with `image`: if both are set the request fails
+     * with 400. When set, the sandbox is created with the snapshotted
+     * filesystem rather than a base image, giving users a reproducible
+     * starting point.
+     *
+     * The snapshot must be in `ready` status and belong to the calling user.
+     */
+    from_snapshot?: string | null;
+    /**
      * Docker image override. `null` uses the platform default.
      */
     image?: string | null;
@@ -4051,6 +4189,16 @@ export type CreateSlackProviderRequest = {
     config: SlackConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+/**
+ * Request body for `POST /v1/sandboxes/{id}/snapshots`.
+ */
+export type CreateSnapshotBody = {
+    /**
+     * Optional human-readable label for the snapshot.
+     */
+    label?: string | null;
 };
 
 export type CreateTeamMemberRequest = {
@@ -4598,11 +4746,30 @@ export type DeploymentConfig = {
      * Defaults to 1 replica
      */
     replicas?: number;
+    /**
+     * Override for the proxy's upstream timeout on regular (non-streaming)
+     * HTTP requests to this project/environment, in seconds.
+     * `None` = inherit the global `request_timeouts.default_http_timeout_seconds`
+     * (which itself defaults to "no timeout"). `Some(0)` explicitly forces
+     * "no timeout" for this project/environment, overriding a nonzero
+     * global default. `Some(n)` for `n > 0` sets an explicit timeout,
+     * always clamped to the global hard ceiling
+     * (`request_timeouts.max_request_timeout_seconds`) at resolution time.
+     */
+    requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     /**
      * Enable session recording for analytics
      */
     sessionRecordingEnabled?: boolean;
+    /**
+     * Override for the proxy's idle timeout on Server-Sent Events streams to
+     * this project/environment, in seconds. `None` = inherit the global
+     * `request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`
+     * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+     * the global hard ceiling at resolution time.
+     */
+    sseIdleTimeoutSeconds?: number | null;
     /**
      * Label selector for node-based scheduling. Replicas are only deployed to
      * nodes whose labels match the selector.
@@ -4628,6 +4795,14 @@ export type DeploymentConfig = {
      * Requests return 503 if exceeded. Default: 30.
      */
     wakeTimeoutSeconds?: number;
+    /**
+     * Override for the proxy's idle timeout on WebSocket connections to this
+     * project/environment, in seconds. `None` = inherit the global
+     * `request_timeouts.default_websocket_idle_timeout_seconds`. `Some(0)`
+     * explicitly forces "no timeout". `Some(n)` for `n > 0` is clamped to
+     * the global hard ceiling at resolution time.
+     */
+    websocketIdleTimeoutSeconds?: number | null;
 };
 
 /**
@@ -8192,6 +8367,10 @@ export type GitSourcePlan = {
  * link back to the source.
  */
 export type GlobalConversationResponse = {
+    ai_model: string;
+    ai_permission_mode: string;
+    ai_provider: string;
+    ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
     created_at: string;
@@ -8315,6 +8494,10 @@ export type HasMetricsQuery = {
 
 export type HasMetricsResponse = {
     has_metrics: boolean;
+};
+
+export type HasTracesResponse = {
+    has_traces: boolean;
 };
 
 /**
@@ -9449,6 +9632,16 @@ export type ListSecretsResponse = {
  */
 export type ListSkillsResponse = {
     items: Array<SkillDefinitionResponse>;
+    total: number;
+};
+
+/**
+ * Paginated list of snapshots.
+ */
+export type ListSnapshotsResponse = {
+    page: number;
+    page_size: number;
+    snapshots: Array<SnapshotResponse>;
     total: number;
 };
 
@@ -11766,6 +11959,27 @@ export type PerformanceMetricsResponse = {
 };
 
 /**
+ * The user's decision for a pending permission request.  Serialized as a tagged
+ * JSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`
+ * carry an optional human-readable reason that is forwarded to the CLI's
+ * `control_response` (never stored).
+ */
+export type PermissionDecision = {
+    type: 'allow_tool';
+} | {
+    reason?: string | null;
+    type: 'deny_tool';
+} | {
+    answers: unknown;
+    type: 'answer_question';
+} | {
+    type: 'approve_plan';
+} | {
+    feedback?: string | null;
+    type: 'reject_plan';
+};
+
+/**
  * Information about a single permission
  */
 export type PermissionInfo = {
@@ -11781,6 +11995,68 @@ export type PermissionInfo = {
      * The permission identifier (e.g., "projects:read")
      */
     name: string;
+};
+
+/**
+ * Kind of permission the Claude CLI is requesting via `--permission-prompt-tool stdio`
+ * (ADR-038 Phase 2). Used to drive the correct UI card (`ToolApproval` → allow/deny
+ * buttons; `Question` → answer form; `PlanApproval` → approve/reject-with-feedback).
+ */
+export type PermissionKind = 'tool_approval' | 'question' | 'plan_approval';
+
+/**
+ * A permission request emitted by `run_interactive` when the Claude CLI blocks
+ * on a `control_request` frame.  Passed to the UI via an SSE event so the user
+ * can respond before the subprocess continues.
+ */
+export type PermissionRequest = {
+    /**
+     * The CLI's own `request_id` (UUID); used as the key in the pending-permission
+     * registry and as `{permission_id}` in the resolve endpoint.
+     */
+    id: string;
+    /**
+     * Raw `request.input` from the CLI — passed through to the UI verbatim so
+     * each milestone's card can render the relevant fields without requiring the
+     * service layer to know about tool-specific schemas.
+     */
+    input: unknown;
+    /**
+     * What kind of interaction is required.
+     */
+    kind: PermissionKind;
+    /**
+     * The tool name from `request.tool_name` (e.g. `"Bash"`, `"AskUserQuestion"`).
+     */
+    tool_name: string;
+};
+
+/**
+ * Payload for the `permission_requested` SSE event (ADR-038 Phase 2).
+ * The active provider turn is paused waiting for the user to approve or deny
+ * a tool/question/plan. Resolve via
+ * `POST .../permissions/{id}/resolve`.
+ */
+export type PermissionRequestedEvent = {
+    /**
+     * The CLI's `request_id` — also the `{permission_id}` in the resolve URL.
+     */
+    id: string;
+    /**
+     * Raw `input` from the CLI request. Passed through verbatim so each
+     * milestone's card can render tool-specific fields without the service
+     * layer needing to know about their schemas.
+     */
+    input: unknown;
+    /**
+     * What kind of interaction is required: `"tool_approval"`, `"question"`,
+     * or `"plan_approval"`.
+     */
+    kind: PermissionKind;
+    /**
+     * Tool name from the CLI request (e.g. `"Bash"`, `"AskUserQuestion"`).
+     */
+    tool_name: string;
 };
 
 export type PgUpgradeLogResponse = {
@@ -12790,6 +13066,31 @@ export type ProviderCatalogDto = {
      * that as "Use provider default".
      */
     default_model?: string | null;
+    /**
+     * Explains why `host_authenticated` is false (not installed vs.
+     * installed-but-not-authenticated), or `None` when it's true.
+     */
+    host_auth_hint?: string | null;
+    /**
+     * Authentication mechanism reported by the CLI running in the Temps
+     * process environment (for example `chatgpt_subscription` or
+     * `host_auth_store`). Never contains credential material.
+     */
+    host_auth_method?: string | null;
+    /**
+     * True when the CLI is installed AND authenticated on **this host** —
+     * the machine running the Temps server process. This is a completely
+     * different signal from `credential_saved`: that field is about a
+     * credential seeded into a *sandboxed autofixer container*, while this
+     * one is what actually gates whether the AI Gateway can route requests
+     * to this provider (ADR-037's `AgentCliAiService` uses only the host's
+     * ambient CLI session — ordering `claude setup-token`/`codex login` on
+     * this machine — and never reads the sandbox credential at all). A
+     * provider can show `credential_saved: true` and `host_authenticated:
+     * false` at the same time; only the latter means chat/gateway routing
+     * will actually work.
+     */
+    host_authenticated: boolean;
     id: string;
     install_command: string;
     /**
@@ -13781,6 +14082,54 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+/**
+ * Upstream request/connection timeouts for customer app traffic.
+ *
+ * By default, no timeout is applied to customer app traffic at all — an
+ * existing app that happens to have a slow endpoint, a long-polling
+ * request, or an unusually long response must keep working exactly as it
+ * did before this setting existed. Timeouts here are opt-in: an operator
+ * can set a global default, and/or a project/environment can set its own
+ * override (`DeploymentConfig::request_timeout_seconds` /
+ * `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until
+ * one of those is explicitly configured, the proxy holds the connection
+ * open indefinitely (bounded only by TCP/OS-level limits).
+ *
+ * `default_*_timeout_seconds` of `0` means "no timeout" — this is the
+ * out-of-the-box value for all three. `max_request_timeout_seconds` is a
+ * hard ceiling that only comes into play once a timeout is actually
+ * configured (globally or per project/environment): whatever value is
+ * resolved is always clamped to it, so lowering the ceiling here takes
+ * effect immediately without needing every environment row re-saved. It
+ * never *creates* a timeout for traffic that has none.
+ */
+export type RequestTimeoutSettings = {
+    /**
+     * Default timeout for regular (non-streaming) HTTP requests, in
+     * seconds. Used when a project/environment hasn't set
+     * `request_timeout_seconds`. `0` (the default) means no timeout.
+     */
+    default_http_timeout_seconds?: number;
+    /**
+     * Default idle timeout for Server-Sent Events streams, in seconds. Used
+     * when a project/environment hasn't set `sse_idle_timeout_seconds`. `0`
+     * (the default) means no timeout.
+     */
+    default_sse_idle_timeout_seconds?: number;
+    /**
+     * Default idle timeout for WebSocket connections, in seconds. Used when
+     * a project/environment hasn't set `websocket_idle_timeout_seconds`.
+     * `0` (the default) means no timeout.
+     */
+    default_websocket_idle_timeout_seconds?: number;
+    /**
+     * Hard ceiling, in seconds, applied once a timeout is configured (via a
+     * global default above or a project/environment override). Has no
+     * effect on traffic with no timeout configured at all.
+     */
+    max_request_timeout_seconds?: number;
+};
+
 export type RequiredPasswordChangeRequest = {
     new_password: string;
 };
@@ -13826,6 +14175,13 @@ export type ResizeSandboxBody = {
      * New root disk size in MB. Grow-only; must exceed the current size.
      */
     disk_size_mb: number;
+};
+
+/**
+ * Body for the `POST .../permissions/{permission_id}/resolve` endpoint.
+ */
+export type ResolvePermissionRequest = {
+    decision: PermissionDecision;
 };
 
 /**
@@ -14980,12 +15336,13 @@ export type SelfUpdateAttempt = {
     from_version: string;
     /**
      * Number of database migrations that were successfully applied during
-     * this attempt. `None` if migrations were never reached (pre-swap failure).
+     * this attempt. Set at completion (success or migration failure). `None`
+     * if migrations were never reached (pre-swap failure).
      */
     migrations_applied?: number | null;
     /**
-     * Total number of database migrations that were planned. `None` if
-     * migrations were never reached (pre-swap failure).
+     * Total number of database migrations that were planned. Set at the same
+     * time as `migrations_applied`. `None` if migrations were never reached.
      */
     migrations_total?: number | null;
     /**
@@ -15126,6 +15483,19 @@ export type SendEmailResponseBody = {
 };
 
 export type SendMessageRequest = {
+    /**
+     * Optional next-turn model. The provider harness remains pinned, but its
+     * advertised models may be changed between turns.
+     */
+    ai_model?: string | null;
+    /**
+     * Optional next-turn permission mode for the pinned provider harness.
+     */
+    ai_permission_mode?: string | null;
+    /**
+     * Optional next-turn thinking level.
+     */
+    ai_thinking_level?: string | null;
     content: string;
     /**
      * Optional, client-supplied description of the page/entity the user is
@@ -16232,6 +16602,22 @@ export type SmtpResult = {
     is_disabled: boolean;
 };
 
+/**
+ * Single snapshot as returned by the API.
+ */
+export type SnapshotResponse = {
+    backend: string;
+    content_digest: string;
+    created_at: string;
+    id: string;
+    image_ref?: string | null;
+    label?: string | null;
+    project_id?: number | null;
+    size_bytes: number;
+    status: string;
+    updated_at: string;
+};
+
 export type SourceArchiveUpload = {
     file: Blob | File;
 };
@@ -16923,6 +17309,31 @@ export type StorageQuota = {
     total_bytes: number;
     traces_bytes: number;
     usage_pct: number;
+};
+
+/**
+ * Storage summary returned by `GET /v1/sandbox-snapshots/storage-summary`.
+ */
+export type StorageSummary = {
+    /**
+     * Available bytes on the snapshots filesystem, or `null` when the
+     * platform check is not yet implemented (deferred — see `available_disk_space()`).
+     * API consumers MUST treat `null` as "unknown" rather than "zero bytes
+     * available". A `Some(0)` would incorrectly block snapshot creation.
+     */
+    available_disk_bytes?: number | null;
+    /**
+     * Per-user quota in bytes.
+     */
+    quota_bytes: number;
+    /**
+     * Number of `ready` snapshots.
+     */
+    snapshot_count: number;
+    /**
+     * Total bytes used by all `ready` snapshots for this user.
+     */
+    total_bytes: number;
 };
 
 export type StripeConfig = {
@@ -17925,6 +18336,11 @@ export type UpdateCapabilityResponse = {
      */
     channel_is_pinned: boolean;
     /**
+     * Name of the migration currently running. `Some` while `phase` is
+     * `migrating` and a migration step is in flight.
+     */
+    current_migration_name?: string | null;
+    /**
      * Version tag of the running binary. Always present — the version page
      * needs it whether or not an update exists.
      */
@@ -17935,17 +18351,12 @@ export type UpdateCapabilityResponse = {
      */
     manual_command: string;
     /**
-     * Name of the migration currently running. Set while `phase` is `migrating`
-     * and a migration step is in flight.
-     */
-    current_migration_name?: string | null;
-    /**
-     * Number of migrations applied so far. Set while `phase` is `migrating`.
+     * Number of migrations applied so far. `Some` while `phase` is `migrating`.
      */
     migrations_applied?: number | null;
     /**
-     * Total migrations to be applied. Set once the migrate child has reported
-     * its first `started` event.
+     * Total migrations to be applied. `Some` once the migrate child has
+     * reported its first `started` event.
      */
     migrations_total?: number | null;
     /**
@@ -18015,8 +18426,29 @@ export type UpdateDeploymentConfigRequest = {
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
     replicas?: number | null;
+    /**
+     * Project-level default timeout for regular (non-streaming) HTTP
+     * requests, in seconds (1-86400). Environments may override this; always
+     * clamped to the operator's global hard ceiling regardless of what's set
+     * here. Absent leaves the current value unchanged.
+     */
+    requestTimeoutSeconds?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
+    /**
+     * Project-level default idle timeout for Server-Sent Events streams, in
+     * seconds (1-86400). Environments may override this; always clamped to
+     * the operator's global hard ceiling. Absent leaves the current value
+     * unchanged.
+     */
+    sseIdleTimeoutSeconds?: number | null;
+    /**
+     * Project-level default idle timeout for WebSocket connections, in
+     * seconds (1-86400). Environments may override this; always clamped to
+     * the operator's global hard ceiling. Absent leaves the current value
+     * unchanged.
+     */
+    websocketIdleTimeoutSeconds?: number | null;
 };
 
 export type UpdateDeploymentTokenRequest = {
@@ -18164,11 +18596,26 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     protected?: boolean | null;
     replicas?: number | null;
+    /**
+     * Override the proxy's timeout for regular (non-streaming) HTTP requests
+     * to this environment, in seconds (1-86400). Always clamped to the
+     * operator's global hard ceiling regardless of what's set here.
+     * Absent leaves the current value unchanged. Send JSON `null` to clear
+     * the override (inherit the project/global default).
+     */
+    request_timeout_seconds?: number | null;
     security?: null | SecurityConfig;
     /**
      * Enable/disable session recording
      */
     session_recording_enabled?: boolean | null;
+    /**
+     * Override the proxy's idle timeout for Server-Sent Events streams to
+     * this environment, in seconds (1-86400). Always clamped to the
+     * operator's global hard ceiling. Absent leaves the current value
+     * unchanged. Send JSON `null` to clear the override.
+     */
+    sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
      * Same key with array value -> OR, different keys -> AND.
@@ -18183,6 +18630,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Max seconds to wait for containers to start on wake (5-120). Default: 30.
      */
     wake_timeout_seconds?: number | null;
+    /**
+     * Override the proxy's idle timeout for WebSocket connections to this
+     * environment, in seconds (1-86400). Always clamped to the operator's
+     * global hard ceiling. Absent leaves the current value unchanged. Send
+     * JSON `null` to clear the override.
+     */
+    websocket_idle_timeout_seconds?: number | null;
 };
 
 /**
@@ -18540,6 +18994,25 @@ export type UpdateProviderKeyRequest = {
     default_model?: string | null;
     display_name?: string | null;
     is_active?: boolean | null;
+};
+
+/**
+ * Request body for `PUT /api/ai/provider-preference`.
+ */
+export type UpdateProviderPreferenceRequest = {
+    /**
+     * Required when `provider_type` is `"agent_cli"`.
+     */
+    agent_cli_provider_id?: string | null;
+    /**
+     * Deprecated compatibility field. Adapter realtime behavior is derived
+     * from its capability contract and cannot be toggled independently.
+     */
+    interactive_bridge_enabled?: boolean | null;
+    /**
+     * `"gateway"` or `"agent_cli"`.
+     */
+    provider_type: string;
 };
 
 export type UpdateProviderRequest = {
@@ -20473,6 +20946,109 @@ export type GetPricingResponses = {
 };
 
 export type GetPricingResponse = GetPricingResponses[keyof GetPricingResponses];
+
+export type UpdateAiProviderPreferenceData = {
+    body: UpdateProviderPreferenceRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-preference';
+};
+
+export type UpdateAiProviderPreferenceErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateAiProviderPreferenceError = UpdateAiProviderPreferenceErrors[keyof UpdateAiProviderPreferenceErrors];
+
+export type UpdateAiProviderPreferenceResponses = {
+    /**
+     * Updated provider preference and availability
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type UpdateAiProviderPreferenceResponse = UpdateAiProviderPreferenceResponses[keyof UpdateAiProviderPreferenceResponses];
+
+export type GetAiProviderStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-status';
+};
+
+export type GetAiProviderStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetAiProviderStatusError = GetAiProviderStatusErrors[keyof GetAiProviderStatusErrors];
+
+export type GetAiProviderStatusResponses = {
+    /**
+     * Current provider preference and availability
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type GetAiProviderStatusResponse = GetAiProviderStatusResponses[keyof GetAiProviderStatusResponses];
+
+export type RefreshAiProviderStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/provider-status/refresh';
+};
+
+export type RefreshAiProviderStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Provider refresh failed
+     */
+    500: ProblemDetails;
+};
+
+export type RefreshAiProviderStatusError = RefreshAiProviderStatusErrors[keyof RefreshAiProviderStatusErrors];
+
+export type RefreshAiProviderStatusResponses = {
+    /**
+     * Fresh provider authentication and model capability snapshot
+     */
+    200: AiProviderStatusResponse;
+};
+
+export type RefreshAiProviderStatusResponse = RefreshAiProviderStatusResponses[keyof RefreshAiProviderStatusResponses];
 
 export type ListProviderKeysData = {
     body?: never;
@@ -34980,6 +35556,44 @@ export type GetUnifiedTraceResponses = {
 
 export type GetUnifiedTraceResponse = GetUnifiedTraceResponses[keyof GetUnifiedTraceResponses];
 
+export type HasTracesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/has-traces/{project_id}';
+};
+
+export type HasTracesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type HasTracesError = HasTracesErrors[keyof HasTracesErrors];
+
+export type HasTracesResponses = {
+    /**
+     * Trace existence check
+     */
+    200: HasTracesResponse;
+};
+
+export type HasTracesResponse2 = HasTracesResponses[keyof HasTracesResponses];
+
 export type GetHealthData = {
     body?: never;
     path: {
@@ -38110,6 +38724,59 @@ export type ListPendingActionsResponses = {
 };
 
 export type ListPendingActionsResponse = ListPendingActionsResponses[keyof ListPendingActionsResponses];
+
+export type ResolvePermissionData = {
+    body: ResolvePermissionRequest;
+    path: {
+        project_id: number;
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * The CLI's request_id from the SSE event
+         */
+        permission_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve';
+};
+
+export type ResolvePermissionErrors = {
+    /**
+     * Invalid decision payload
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Unknown permission_id (may have timed out or been auto-denied)
+     */
+    404: unknown;
+    /**
+     * Permission already resolved (concurrent resolve race)
+     */
+    409: unknown;
+    /**
+     * Turn already ended (subprocess exited before decision arrived)
+     */
+    410: unknown;
+};
+
+export type ResolvePermissionResponses = {
+    /**
+     * Decision accepted; subprocess will continue
+     */
+    204: void;
+};
+
+export type ResolvePermissionResponse = ResolvePermissionResponses[keyof ResolvePermissionResponses];
 
 export type GetPendingActionData = {
     body?: never;
@@ -49712,6 +50379,137 @@ export type RemoveRoleResponses = {
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
 
+export type ListSnapshotsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project
+         */
+        project_id?: number;
+        /**
+         * Filter by status
+         */
+        status?: string;
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Page size (max 100)
+         */
+        page_size?: number;
+    };
+    url: '/v1/sandbox-snapshots';
+};
+
+export type ListSnapshotsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type ListSnapshotsResponses = {
+    /**
+     * List of snapshots
+     */
+    200: ListSnapshotsResponse;
+};
+
+export type ListSnapshotsResponse2 = ListSnapshotsResponses[keyof ListSnapshotsResponses];
+
+export type StorageSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandbox-snapshots/storage-summary';
+};
+
+export type StorageSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type StorageSummaryResponses = {
+    /**
+     * Storage usage summary
+     */
+    200: StorageSummary;
+};
+
+export type StorageSummaryResponse = StorageSummaryResponses[keyof StorageSummaryResponses];
+
+export type DeleteSnapshotData = {
+    body?: never;
+    path: {
+        /**
+         * Snapshot public ID
+         */
+        snap_id: string;
+    };
+    query?: never;
+    url: '/v1/sandbox-snapshots/{snap_id}';
+};
+
+export type DeleteSnapshotErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DeleteSnapshotResponses = {
+    /**
+     * Snapshot deleted
+     */
+    204: void;
+};
+
+export type DeleteSnapshotResponse = DeleteSnapshotResponses[keyof DeleteSnapshotResponses];
+
+export type GetSnapshotData = {
+    body?: never;
+    path: {
+        /**
+         * Snapshot public ID
+         */
+        snap_id: string;
+    };
+    query?: never;
+    url: '/v1/sandbox-snapshots/{snap_id}';
+};
+
+export type GetSnapshotErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type GetSnapshotResponses = {
+    /**
+     * Snapshot detail
+     */
+    200: SnapshotResponse;
+};
+
+export type GetSnapshotResponse = GetSnapshotResponses[keyof GetSnapshotResponses];
+
 export type ListSandboxesData = {
     body?: never;
     path?: never;
@@ -50525,6 +51323,58 @@ export type ResumeSandboxResponses = {
 };
 
 export type ResumeSandboxResponse = ResumeSandboxResponses[keyof ResumeSandboxResponses];
+
+export type CreateSnapshotData = {
+    body: CreateSnapshotBody;
+    path: {
+        /**
+         * Sandbox public ID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/snapshots';
+};
+
+export type CreateSnapshotErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Quota exceeded or invalid state
+     */
+    422: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+    /**
+     * Snapshots not supported by backend
+     */
+    501: unknown;
+};
+
+export type CreateSnapshotResponses = {
+    /**
+     * Snapshot initiated
+     */
+    202: SnapshotResponse;
+};
+
+export type CreateSnapshotResponse = CreateSnapshotResponses[keyof CreateSnapshotResponses];
 
 export type SourceSandboxData = {
     body: SourceBody;

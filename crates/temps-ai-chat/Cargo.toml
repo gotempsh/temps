@@ -13,12 +13,15 @@ categories = ["development-tools"]
 [dependencies]
 temps-ai = { path = "../temps-ai" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
+temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
+temps-agents = { path = "../temps-agents" }
 temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
 temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
+tempfile = { workspace = true }
 
 axum = { workspace = true }
 utoipa = { workspace = true }
@@ -35,7 +38,10 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 anyhow = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 # `test-util` gives the paused clock used to exercise the turn deadline without

@@ -1437,6 +1437,17 @@ fn is_loopback_zone(zone: &str) -> bool {
         || z.ends_with(".localhost")
         || z.starts_with("127.0.0.1")
         || z.contains("127-0-0-1")
+        // `localho.st` is a real public DNS name that resolves to 127.0.0.1 --
+        // used throughout this codebase as the local/loopback dev domain
+        // (see doctor.rs's "default - configure a real domain for
+        // production" warning and the proxy's SameSite-safe cookie tests)
+        // specifically so browsers treat it as a normal internet host. It is
+        // still loopback for ACME purposes: Let's Encrypt's HTTP-01/on-demand
+        // validators cannot reach a box whose public DNS answer is its own
+        // loopback address, so issuance can never succeed and on-demand TLS
+        // must stay off here exactly as it does for `localhost`/`127.0.0.1`.
+        || z == "localho.st"
+        || z.ends_with(".localho.st")
 }
 
 impl SetupCommand {
@@ -3084,6 +3095,10 @@ mod tests {
         assert!(is_loopback_zone("127-0-0-1.sslip.io"));
         assert!(!is_loopback_zone("1.2.3.4.sslip.io"));
         assert!(!is_loopback_zone("example.com"));
+        assert!(is_loopback_zone("localho.st"));
+        assert!(is_loopback_zone("*.localho.st"));
+        assert!(is_loopback_zone("app.localho.st"));
+        assert!(!is_loopback_zone("localho.st.example.com"));
     }
 
     #[test]
@@ -3098,6 +3113,7 @@ mod tests {
         assert!(!should_enable("localhost")); // local mode
         assert!(!should_enable("")); // no domain
         assert!(!should_enable("   ")); // whitespace-only
+        assert!(!should_enable("localho.st")); // local/dev-cluster loopback domain
     }
 
     #[test]

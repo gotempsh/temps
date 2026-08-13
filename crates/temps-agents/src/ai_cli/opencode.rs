@@ -2,10 +2,126 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::{AiCliProvider, AiCliStatus, AiRunConfig, AiRunResult};
+use super::{
+    copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
+    AiRunConfig, AiRunResult,
+};
 use crate::error::AgentError;
 
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct OpenCodeCliProvider;
+
+fn cancellation_safe_command() -> Command {
+    let mut command = Command::new("opencode");
+    sanitize_command_environment(&mut command);
+    for name in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "XAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ] {
+        copy_environment_variable(&mut command, name);
+    }
+    command.kill_on_drop(true);
+    command
+}
+
+fn apply_chat_mcp(cmd: &mut Command, config: &AiRunConfig) {
+    if let Some(server) = &config.mcp_server {
+        cmd.env(
+            "OPENCODE_CONFIG_CONTENT",
+            serde_json::json!({
+                "mcp": { "temps-chat": {
+                    "type": "remote",
+                    "url": server.url,
+                    "headers": { "Authorization": format!("Bearer {}", server.authorization_token) }
+                }},
+                // Chat runs may invoke only the ephemeral, authenticated MCP
+                // bridge. Deny OpenCode's host bash/filesystem/web tools even
+                // when the selected host agent normally enables them.
+                "permission": {
+                    "*": "deny",
+                    "temps_chat_*": "allow"
+                }
+            })
+            .to_string(),
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeModelInfo {
+    pub id: String,
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
+fn parse_model_listing(output: &str) -> Vec<OpenCodeModelInfo> {
+    let mut models = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = output[cursor..].find('{') {
+        let json_start = cursor + relative_start;
+        let header = output[cursor..json_start].trim();
+        let Some(id) = header
+            .lines()
+            .last()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            break;
+        };
+        let mut values = serde_json::Deserializer::from_str(&output[json_start..])
+            .into_iter::<serde_json::Value>();
+        let Some(Ok(value)) = values.next() else {
+            break;
+        };
+        let consumed = values.byte_offset();
+        if consumed == 0 {
+            break;
+        }
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        let variants = value
+            .get("variants")
+            .and_then(serde_json::Value::as_object)
+            .map(|variants| variants.keys().cloned().collect())
+            .unwrap_or_default();
+        models.push(OpenCodeModelInfo {
+            id: id.to_string(),
+            name,
+            variants,
+        });
+        cursor = json_start + consumed;
+    }
+    models
+}
+
+/// Ask OpenCode for models available to its configured providers. `--verbose`
+/// supplies display names and the exact per-model variant set accepted by
+/// `opencode run --variant`.
+pub async fn discover_models() -> Vec<OpenCodeModelInfo> {
+    let mut command = cancellation_safe_command();
+    command
+        .args(["models", "--verbose"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(MODEL_DISCOVERY_TIMEOUT, command.output())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|output| output.status.success())
+        .map(|output| parse_model_listing(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
 
 #[async_trait]
 impl AiCliProvider for OpenCodeCliProvider {
@@ -14,26 +130,34 @@ impl AiCliProvider for OpenCodeCliProvider {
     }
 
     async fn check_installed(&self) -> bool {
-        Command::new("opencode")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+        tokio::time::timeout(
+            STATUS_TIMEOUT,
+            cancellation_safe_command()
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|status| status.success())
+        .unwrap_or(false)
     }
 
     async fn get_status(&self) -> AiCliStatus {
-        let version_output = Command::new("opencode")
-            .arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+        let version_output = tokio::time::timeout(
+            STATUS_TIMEOUT,
+            cancellation_safe_command()
+                .arg("--version")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await;
 
         let (installed, version) = match version_output {
-            Ok(output) if output.status.success() => {
+            Ok(Ok(output)) if output.status.success() => {
                 let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 (true, if ver.is_empty() { None } else { Some(ver) })
             }
@@ -53,22 +177,31 @@ impl AiCliProvider for OpenCodeCliProvider {
             }
         };
 
-        // OpenCode uses API keys configured via `opencode auth`
-        // Check if any provider is configured by running `opencode models`
-        let auth_output = Command::new("opencode")
-            .args(["auth", "status"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+        // Ask OpenCode to inspect its own auth store rather than reading
+        // auth.json. This respects the runtime user's HOME/XDG paths and keeps
+        // credential contents outside Temps. Current OpenCode exposes `auth
+        // list`; older code used the nonexistent `auth status` subcommand and
+        // therefore reported every host login as unavailable.
+        let auth_output = tokio::time::timeout(
+            STATUS_TIMEOUT,
+            cancellation_safe_command()
+                .args(["auth", "list"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await;
 
         let (authenticated, setup_hint) = match auth_output {
-            Ok(output) if output.status.success() => {
+            Ok(Ok(output)) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.contains("No credentials") || stdout.trim().is_empty() {
+                if !opencode_has_credentials(&stdout) {
                     (
                         false,
-                        Some("Run 'opencode auth add' to configure an AI provider API key.".into()),
+                        Some(
+                            "Run 'opencode auth login' as the user running Temps to configure a provider."
+                                .into(),
+                        ),
                     )
                 } else {
                     (true, None)
@@ -76,7 +209,10 @@ impl AiCliProvider for OpenCodeCliProvider {
             }
             _ => (
                 false,
-                Some("Run 'opencode auth add' to configure an AI provider API key.".into()),
+                Some(
+                    "Run 'opencode auth login' as the user running Temps to configure a provider."
+                        .into(),
+                ),
             ),
         };
 
@@ -85,18 +221,55 @@ impl AiCliProvider for OpenCodeCliProvider {
             installed,
             version,
             authenticated,
-            auth_method: None,
+            auth_method: authenticated.then(|| "host_auth_store".to_string()),
             email: None,
             subscription_type: None,
             setup_hint,
         }
     }
 
+    async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
+        discover_models()
+            .await
+            .into_iter()
+            .map(|model| {
+                let default_reasoning_option = model
+                    .variants
+                    .iter()
+                    .find(|variant| variant.as_str() == "medium")
+                    .or_else(|| model.variants.first())
+                    .cloned();
+                super::AiCliModelCapability {
+                    id: model.id,
+                    name: model.name,
+                    reasoning_options: model.variants,
+                    default_reasoning_option,
+                }
+            })
+            .collect()
+    }
+
+    fn extract_assistant_text(&self, line: &str) -> Option<String> {
+        extract_assistant_text(line)
+    }
+
+    fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
+        dropped_tool_use_name(line)
+    }
+
     async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let mut cmd = Command::new("opencode");
+        let mut cmd = cancellation_safe_command();
         cmd.arg("run");
+        if let Some(agent) = config.permission_mode.as_deref() {
+            cmd.arg("--agent").arg(agent);
+        }
+        if let Some(variant) = config.thinking_level.as_deref() {
+            if variant != "default" {
+                cmd.arg("--variant").arg(variant);
+            }
+        }
         // Flags must come *before* the positional message, since everything
         // after the first positional is treated as part of the prompt.
         if let Some(m) = config.model.as_deref() {
@@ -104,6 +277,7 @@ impl AiCliProvider for OpenCodeCliProvider {
                 cmd.arg("--model").arg(m);
             }
         }
+        apply_chat_mcp(&mut cmd, &config);
         cmd.arg("--format")
             .arg("json")
             .arg(&config.prompt)
@@ -187,6 +361,13 @@ impl AiCliProvider for OpenCodeCliProvider {
                 provider: self.name().to_string(),
                 exit_code,
                 stderr: crate::ai_cli::summarize_cli_failure(self.name(), &error_output),
+            });
+        }
+
+        if output_reports_error(&stdout) {
+            return Err(AgentError::AiCliReportedError {
+                provider: self.name().to_string(),
+                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
             });
         }
 
@@ -208,13 +389,22 @@ impl AiCliProvider for OpenCodeCliProvider {
     async fn continue_conversation(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let mut cmd = Command::new("opencode");
+        let mut cmd = cancellation_safe_command();
         cmd.arg("run").arg("--continue");
+        if let Some(agent) = config.permission_mode.as_deref() {
+            cmd.arg("--agent").arg(agent);
+        }
+        if let Some(variant) = config.thinking_level.as_deref() {
+            if variant != "default" {
+                cmd.arg("--variant").arg(variant);
+            }
+        }
         if let Some(m) = config.model.as_deref() {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);
             }
         }
+        apply_chat_mcp(&mut cmd, &config);
         cmd.arg("--format")
             .arg("json")
             .arg(&config.prompt)
@@ -301,6 +491,13 @@ impl AiCliProvider for OpenCodeCliProvider {
             });
         }
 
+        if output_reports_error(&stdout) {
+            return Err(AgentError::AiCliReportedError {
+                provider: self.name().to_string(),
+                message: crate::ai_cli::summarize_cli_failure(self.name(), &stdout),
+            });
+        }
+
         let (tokens_input, tokens_output, model) = parse_opencode_output(&stdout);
 
         Ok(AiRunResult {
@@ -314,6 +511,23 @@ impl AiCliProvider for OpenCodeCliProvider {
             is_max_turns_error: false,
         })
     }
+}
+
+fn opencode_has_credentials(status_output: &str) -> bool {
+    let normalized = status_output.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !normalized.contains("no credentials")
+        && !normalized.contains("0 credentials")
+}
+
+fn output_reports_error(output: &str) -> bool {
+    output.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("error")
+    })
 }
 
 /// Parse OpenCode `--format json` output for accumulated token usage and
@@ -407,9 +621,80 @@ fn env_var_for_model(model: Option<&str>) -> &'static str {
     }
 }
 
+/// Extract assistant text from one line of OpenCode's `--format json`
+/// output. Only `type":"text"` events (with `part.type":"text"`) carry
+/// user-facing text — `step_start`/`step_finish`/tool events return `None`.
+pub fn extract_assistant_text(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if value.get("type").and_then(|v| v.as_str()) != Some("text") {
+        return None;
+    }
+    let text = value.get("part")?.get("text").and_then(|v| v.as_str())?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Name the tool of a `type":"tool"` event, when `line` reports a tool
+/// invocation OpenCode's CLI cannot bridge back to the user in CLI-chat
+/// mode. Returns `None` for text/step events and any other event shape (see
+/// [`extract_assistant_text`]).
+///
+/// Used only for diagnostic logging (ADR-038) — never logs tool arguments or
+/// output, which may carry user data.
+pub fn dropped_tool_use_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if value.get("type").and_then(|v| v.as_str()) != Some("tool") {
+        return None;
+    }
+    value
+        .get("part")
+        .and_then(|p| p.get("tool"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| Some("tool".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_models_and_exact_variants_from_verbose_listing() {
+        let output = r#"openai/gpt-5.4
+{
+  "name": "GPT-5.4",
+  "variants": {
+    "none": { "reasoningEffort": "none" },
+    "low": { "reasoningEffort": "low" },
+    "medium": { "reasoningEffort": "medium" },
+    "high": { "reasoningEffort": "high" }
+  }
+}
+ollama/qwen3.5:9b
+{
+  "name": "qwen3.5:9b",
+  "variants": {}
+}"#;
+
+        let models = parse_model_listing(output);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "openai/gpt-5.4");
+        assert_eq!(models[0].name, "GPT-5.4");
+        assert_eq!(models[0].variants, ["none", "low", "medium", "high"]);
+        assert_eq!(models[1].id, "ollama/qwen3.5:9b");
+        assert!(models[1].variants.is_empty());
+    }
 
     #[test]
     fn test_opencode_provider_name() {
@@ -418,11 +703,67 @@ mod tests {
     }
 
     #[test]
+    fn opencode_registers_v2_remote_chat_mcp_config() {
+        let config = AiRunConfig {
+            work_dir: std::env::temp_dir(),
+            prompt: "hello".to_string(),
+            api_key: String::new(),
+            max_turns: 1,
+            timeout: std::time::Duration::from_secs(30),
+            model: None,
+            thinking_level: None,
+            permission_mode: Some("build".to_string()),
+            on_event: None,
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: Some(crate::ai_cli::McpServerConfig {
+                url: "http://127.0.0.1:32123/mcp/turn".to_string(),
+                authorization_token: "ephemeral-test-token".to_string(),
+            }),
+        };
+        let mut command = cancellation_safe_command();
+        apply_chat_mcp(&mut command, &config);
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == "OPENCODE_CONFIG_CONTENT")
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            })
+            .expect("OpenCode config env");
+        let json: serde_json::Value = serde_json::from_str(&value).expect("parse config JSON");
+        assert_eq!(json["mcp"]["temps-chat"]["type"], "remote");
+        assert!(json["mcp"]["temps-chat"].get("codemode").is_none());
+        assert!(json["mcp"]["temps-chat"].get("enabled").is_none());
+        assert_eq!(json["permission"]["*"], "deny");
+        assert_eq!(json["permission"]["temps_chat_*"], "allow");
+    }
+
+    #[test]
+    fn test_opencode_auth_list_detects_credentials_without_reading_secrets() {
+        let output = "Credentials ~/.local/share/opencode/auth.json\nOpenAI oauth\n2 credentials";
+        assert!(opencode_has_credentials(output));
+        assert!(!opencode_has_credentials("No credentials"));
+        assert!(!opencode_has_credentials("0 credentials"));
+        assert!(!opencode_has_credentials("  "));
+    }
+
+    #[test]
     fn test_parse_opencode_output_empty() {
         let (input, output, model) = parse_opencode_output("");
         assert!(input.is_none());
         assert!(output.is_none());
         assert!(model.is_none());
+    }
+
+    #[test]
+    fn detects_error_event_even_when_opencode_exits_zero() {
+        let output = r#"{"type":"error","timestamp":1,"error":{"data":{"message":"Token refresh failed: 401"}}}"#;
+        assert!(output_reports_error(output));
+        assert!(!output_reports_error(
+            r#"{"type":"text","part":{"type":"text","text":"4"}}"#
+        ));
     }
 
     #[test]
@@ -463,5 +804,43 @@ mod tests {
         assert_eq!(env_var_for_model(None), "ANTHROPIC_API_KEY");
         // No slash → also falls back.
         assert_eq!(env_var_for_model(Some("bare-model")), "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn test_extract_assistant_text_from_text_event() {
+        let line = r#"{"type":"text","part":{"type":"text","text":"hello"}}"#;
+        assert_eq!(extract_assistant_text(line).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_extract_assistant_text_ignores_step_events() {
+        let step_start =
+            r#"{"type":"step_start","part":{"type":"step-start","providerID":"anthropic"}}"#;
+        let step_finish =
+            r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":1}}}"#;
+        assert_eq!(extract_assistant_text(step_start), None);
+        assert_eq!(extract_assistant_text(step_finish), None);
+    }
+
+    #[test]
+    fn test_dropped_tool_use_name_from_tool_event() {
+        let line = r#"{"type":"tool","part":{"tool":"bash","input":{"command":"rm -rf /secret"}}}"#;
+        let name = dropped_tool_use_name(line);
+        assert_eq!(name.as_deref(), Some("bash"));
+        assert!(!name.unwrap().contains("rm -rf"));
+    }
+
+    #[test]
+    fn test_dropped_tool_use_name_falls_back_when_tool_name_missing() {
+        let line = r#"{"type":"tool","part":{}}"#;
+        assert_eq!(dropped_tool_use_name(line).as_deref(), Some("tool"));
+    }
+
+    #[test]
+    fn test_dropped_tool_use_name_none_for_text_and_step_events() {
+        let text = r#"{"type":"text","part":{"type":"text","text":"hi"}}"#;
+        let step_start = r#"{"type":"step_start","part":{"type":"step-start"}}"#;
+        assert_eq!(dropped_tool_use_name(text), None);
+        assert_eq!(dropped_tool_use_name(step_start), None);
     }
 }

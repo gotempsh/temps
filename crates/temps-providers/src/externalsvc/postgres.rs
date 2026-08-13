@@ -151,26 +151,26 @@ pub(crate) fn validate_pg_username(name: &str) -> std::result::Result<(), String
 pub struct PostgresInputConfig {
     /// PostgreSQL host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// PostgreSQL port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// PostgreSQL database name
     #[serde(default = "default_database")]
-    #[schemars(example = "example_database", default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
     pub database: String,
 
     /// PostgreSQL username
     #[serde(default = "default_username")]
-    #[schemars(example = "example_username", default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
     pub username: String,
 
     /// PostgreSQL password (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_password")]
-    #[schemars(with = "Option<String>", example = "example_password")]
+    #[schemars(with = "Option<String>", example = example_password())]
     pub password: Option<String>,
 
     /// Maximum number of connections
@@ -179,19 +179,19 @@ pub struct PostgresInputConfig {
         deserialize_with = "deserialize_max_connections"
     )]
     #[schemars(
-        example = "example_max_connections",
+        example = example_max_connections(),
         default = "default_max_connections"
     )]
     pub max_connections: u32,
 
     /// SSL mode (disable, allow, prefer, require)
     #[serde(default = "default_ssl_mode")]
-    #[schemars(example = "example_ssl_mode", default = "default_ssl_mode_string")]
+    #[schemars(example = example_ssl_mode(), default = "default_ssl_mode_string")]
     pub ssl_mode: Option<String>,
 
     /// Docker image to use (defaults to gotempsh/postgres-walg:18-bookworm, supports timescale/timescaledb-ha:pg18)
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: Option<String>,
 
     /// Real Docker container name when this service was imported from an
