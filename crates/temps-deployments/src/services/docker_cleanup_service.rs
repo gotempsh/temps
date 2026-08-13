@@ -306,6 +306,11 @@ pub struct DockerCleanupService {
     /// removal, even if it falls outside `keep_recent_deployment_images`
     /// (default: 7)
     max_deployment_image_age_days: i64,
+    /// Maximum number of stale deployment images to remove in a single
+    /// nightly run (default: 500). Bounds memory and Docker API calls on
+    /// installs with very large deployment histories; any remainder is
+    /// picked up on the following night's run.
+    max_deployment_images_per_run: u64,
 }
 
 impl DockerCleanupService {
@@ -325,6 +330,7 @@ impl DockerCleanupService {
             max_asset_cache_age_days: 7,
             keep_recent_deployment_images: 5,
             max_deployment_image_age_days: 7,
+            max_deployment_images_per_run: 500,
         }
     }
 
@@ -355,6 +361,11 @@ impl DockerCleanupService {
 
     pub fn with_max_deployment_image_age_days(mut self, days: i64) -> Self {
         self.max_deployment_image_age_days = days;
+        self
+    }
+
+    pub fn with_max_deployment_images_per_run(mut self, count: u64) -> Self {
+        self.max_deployment_images_per_run = count;
         self
     }
 
@@ -433,11 +444,14 @@ impl DockerCleanupService {
     /// Keeps, per project+environment: the environment's currently-live
     /// deployment, the `keep_recent_deployment_images` most recent
     /// deployments, and anything younger than
-    /// `max_deployment_image_age_days`. Everything else is removed.
-    /// Removal is best-effort and never forced (see `DockerClient::
-    /// remove_image`), so Docker itself refuses if a container still
-    /// references the image — the safety net against this query being
-    /// wrong.
+    /// `max_deployment_image_age_days`. Everything else is removed, oldest
+    /// first, capped at `max_deployment_images_per_run` per call so a very
+    /// large deployment history can't load an unbounded result set or
+    /// serialize an unbounded run of Docker API calls in one pass — any
+    /// remainder is picked up on the next nightly run. Removal is
+    /// best-effort and never forced (see `DockerClient::remove_image`), so
+    /// Docker itself refuses if a container still references the image —
+    /// the safety net against this query being wrong.
     async fn cleanup_stale_deployment_images(&self) {
         use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 
@@ -466,10 +480,13 @@ WHERE rn > $1
       SELECT current_deployment_id FROM environments
       WHERE current_deployment_id IS NOT NULL
   )
+ORDER BY created_at ASC
+LIMIT $3
 "#,
                 [
                     (self.keep_recent_deployment_images as i64).into(),
                     cutoff.into(),
+                    (self.max_deployment_images_per_run as i64).into(),
                 ],
             ))
             .all(self.db.as_ref())
@@ -915,6 +932,7 @@ mod tests {
 
         assert_eq!(service.keep_recent_deployment_images, 5);
         assert_eq!(service.max_deployment_image_age_days, 7);
+        assert_eq!(service.max_deployment_images_per_run, 500);
     }
 
     #[test]
@@ -922,9 +940,11 @@ mod tests {
         let service =
             DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
                 .with_keep_recent_deployment_images(10)
-                .with_max_deployment_image_age_days(30);
+                .with_max_deployment_image_age_days(30)
+                .with_max_deployment_images_per_run(50);
 
         assert_eq!(service.keep_recent_deployment_images, 10);
         assert_eq!(service.max_deployment_image_age_days, 30);
+        assert_eq!(service.max_deployment_images_per_run, 50);
     }
 }
