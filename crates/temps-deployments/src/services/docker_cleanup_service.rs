@@ -92,6 +92,14 @@ impl DockerClient for DefaultDockerClient {
         filters.insert("until".to_string(), vec![duration]);
 
         let options = PruneBuildOptionsBuilder::default()
+            // Without `all`, the Build/prune API only removes cache marked
+            // "dangling" (not shared by any remaining build lineage) --
+            // the same distinction as `docker image prune` vs `-a`. Most
+            // build cache (e.g. per-build COPY/RUN layers with unique
+            // content) is never dangling, so leaving this unset meant the
+            // nightly cleanup reclaimed almost none of it regardless of
+            // the `until` age filter, letting the cache grow unbounded.
+            .all(true)
             .filters(&filters)
             .build();
 
