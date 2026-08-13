@@ -30,6 +30,7 @@ import { registerContainersCommands } from './commands/containers/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
+import { registerMetricsCommands } from './commands/metrics/index.js'
 import { registerTracesCommands } from './commands/traces/index.js'
 import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
@@ -174,6 +175,7 @@ export function createProgram(): Command {
   registerContainersCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
+  registerMetricsCommands(program)
   registerTracesCommands(program)
   registerOtelForwardCommands(program)
   registerKvCommands(program)
