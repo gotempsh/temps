@@ -54,23 +54,23 @@ describe('generateDocs', () => {
     expect(skill.split('\n').length).toBeLessThanOrEqual(500)
     expect(skill).toContain('[references/COMMANDS.md](references/COMMANDS.md)')
     expect(skill).toContain('[references/WORKFLOWS.md](references/WORKFLOWS.md)')
-    expect(skill).toContain('bunx @temps-sdk/cli@0.1.32')
+    expect(skill).toContain('bunx @temps-sdk/cli@0.1.33')
     expect(skill).not.toContain('npm install --global')
     expect(commandReference).toContain('## Command index')
-    expect(commandReference).toContain('bunx @temps-sdk/cli@0.1.32 [command]')
+    expect(commandReference).toContain('bunx @temps-sdk/cli@0.1.33 [command]')
     expect(commandReference).toContain('[`backups`](#backups)')
     expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.32 --target-context production projects create --name my-app',
+      'bunx @temps-sdk/cli@0.1.33 --target-context production projects create --name my-app',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.32 --target-context production environments vars set --project my-app --key DATABASE_URL',
+      'bunx @temps-sdk/cli@0.1.33 --target-context production environments vars set --project my-app --key DATABASE_URL',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.32 --target-context production domains add --project my-app --domain app.example.com',
+      'bunx @temps-sdk/cli@0.1.33 --target-context production domains add --project my-app --domain app.example.com',
     )
     expect(commandReference).toContain(
-      'bunx @temps-sdk/cli@0.1.32 --target-context production domains remove --project my-app --domain app.example.com',
+      'bunx @temps-sdk/cli@0.1.33 --target-context production domains remove --project my-app --domain app.example.com',
     )
     expect(commandReference).toContain('| `-n, --limit <number>` | Limit results | `10` | No |')
   })
@@ -108,7 +108,7 @@ describe('generateDocs', () => {
     expect(skill.split('\n').length).toBeLessThanOrEqual(500)
     expect(skill).toContain('[references/commands/INDEX.md](references/commands/INDEX.md)')
     expect(skill).toContain('[howtos/observability-onboarding.md](howtos/observability-onboarding.md)')
-    expect(skill).toContain('bunx @temps-sdk/cli@0.1.32')
+    expect(skill).toContain('bunx @temps-sdk/cli@0.1.33')
     expect(skill).not.toContain('npm install --global')
   })
 })

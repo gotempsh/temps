@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
-PINNED_CLI = "@temps-sdk/cli@0.1.32"
+PINNED_CLI = "@temps-sdk/cli@0.1.33"
 
 
 def main() -> int:
