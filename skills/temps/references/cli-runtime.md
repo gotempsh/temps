@@ -9,7 +9,7 @@ has a global `temps` command and never use an unpinned package runner.
 ```bash
 command -v bunx || command -v npx
 
-expected_temps_cli_integrity='sha512-nz1MrIyi2hxcTmY4isY9MN44lclmgQdtifiAXaCNc+A5ZS9MqoDkwZL/NpEMNeld0PoAubCyyim+NvLou1eqHg=='
+expected_temps_cli_integrity='sha512-+m/SP1DZX5w0v/HnP3KpOBoQWMzOvPNlly638xNAbbRBgUk1XwMc/3NK9xh4SSbIlU4zbTycuGUemH2YXMj1SA=='
 actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.32 dist.integrity)"
 test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
   echo 'Refusing to run: @temps-sdk/cli@0.1.32 integrity mismatch' >&2
