@@ -7,9 +7,9 @@ pub enum OtelError {
     AuthFailed { reason: String },
 
     #[error(
-        "Authentication failed for project '{project_slug}': Missing token in Authorization or X-Temps-Api-Key header"
+        "Authentication failed for claimed project '{claimed_project_slug}': Missing token in Authorization or X-Temps-Api-Key header"
     )]
-    MissingAuthToken { project_slug: String },
+    MissingAuthToken { claimed_project_slug: String },
 
     #[error("Invalid API key format")]
     InvalidApiKey,
@@ -90,11 +90,11 @@ mod tests {
     #[test]
     fn test_display_missing_auth_token_includes_project_slug() {
         let err = OtelError::MissingAuthToken {
-            project_slug: "example-project".into(),
+            claimed_project_slug: "example-project".into(),
         };
         assert_eq!(
             err.to_string(),
-            "Authentication failed for project 'example-project': Missing token in Authorization or X-Temps-Api-Key header"
+            "Authentication failed for claimed project 'example-project': Missing token in Authorization or X-Temps-Api-Key header"
         );
     }
 
