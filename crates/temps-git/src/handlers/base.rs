@@ -1311,7 +1311,7 @@ pub async fn get_repository_preset_by_name(
     // Calculate preset for this repository
     let preset_result = state
         .git_provider_manager
-        .calculate_repository_preset_live(repository.id, auth.user_id(), query.branch)
+        .calculate_repository_preset_live(repository.id, query.branch)
         .await?;
 
     Ok((
@@ -2495,7 +2495,7 @@ pub async fn get_repository_preset_live(
     // Use only the service layer - no direct database access
     let preset_result = state
         .git_provider_manager
-        .calculate_repository_preset_live(repository_id, auth.user_id(), query.branch)
+        .calculate_repository_preset_live(repository_id, query.branch)
         .await?;
 
     Ok((
@@ -2552,7 +2552,7 @@ pub async fn get_repository_env_example_live(
 
     let result = state
         .git_provider_manager
-        .calculate_repository_env_example_live(repository_id, auth.user_id(), query.branch)
+        .calculate_repository_env_example_live(repository_id, query.branch)
         .await?;
 
     Ok((
@@ -2663,12 +2663,7 @@ pub async fn get_repository_compose_services_live(
 
     let result = state
         .git_provider_manager
-        .calculate_repository_compose_services_live(
-            repository_id,
-            auth.user_id(),
-            query.branch,
-            query.path,
-        )
+        .calculate_repository_compose_services_live(repository_id, query.branch, query.path)
         .await?;
 
     Ok((
@@ -2720,7 +2715,6 @@ pub async fn get_repository_compose_preview(
         .git_provider_manager
         .calculate_repository_compose_preview_live(
             repository_id,
-            auth.user_id(),
             request.branch,
             request.path,
             request.compose_override,

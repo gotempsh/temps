@@ -1702,31 +1702,27 @@ impl GitProviderManager {
     /// requesting user. Returning `RepositoryNotFound` for both missing and
     /// foreign repositories avoids turning numeric repository IDs into a
     /// cross-tenant existence oracle.
+    /// Look up a repository for the "live" fetch endpoints (preset,
+    /// env-example, compose services/preview).
+    ///
+    /// Repositories are reached through their connection, which is shared
+    /// across all authenticated users (single-tenant: "the team is the app"
+    /// for now, see #656), so this is intentionally not scoped to a caller's
+    /// user_id -- any user with GitRepositoriesRead may fetch live data for
+    /// any repository behind any connection.
     async fn get_repository_for_user(
         &self,
         repository_id: i32,
-        user_id: i32,
     ) -> Result<repositories::Model, GitProviderManagerError> {
-        let result = repositories::Entity::find_by_id(repository_id)
-            .find_also_related(git_provider_connections::Entity)
+        repositories::Entity::find_by_id(repository_id)
             .one(self.db.as_ref())
-            .await?;
-
-        let Some((repository, Some(connection))) = result else {
-            return Err(GitProviderManagerError::RepositoryNotFound(format!(
-                "Repository {} not found",
-                repository_id
-            )));
-        };
-
-        if connection.user_id != Some(user_id) {
-            return Err(GitProviderManagerError::RepositoryNotFound(format!(
-                "Repository {} not found",
-                repository_id
-            )));
-        }
-
-        Ok(repository)
+            .await?
+            .ok_or_else(|| {
+                GitProviderManagerError::RepositoryNotFound(format!(
+                    "Repository {} not found",
+                    repository_id
+                ))
+            })
     }
     pub async fn get_repository_by_owner_and_name_in_connection(
         &self,
@@ -2518,22 +2514,14 @@ impl GitProviderManager {
                 ))
             })?;
 
-        let user_id = self
-            .get_connection(connection_id)
-            .await?
-            .user_id
-            .ok_or_else(|| {
-                GitProviderManagerError::InvalidConfiguration(format!(
-                    "Connection {} has no owning user",
-                    connection_id
-                ))
-            })?;
+        // Verify the connection exists (connections are shared across all
+        // authenticated users -- see `get_repository_for_user` -- so no
+        // owning-user check is needed here beyond confirming it's real).
+        let _ = self.get_connection(connection_id).await?;
 
         // Calculate preset (this will automatically cache it in the database)
         let _ = self
-            .calculate_repository_preset_live(
-                repo_id, user_id, None, // Use default branch
-            )
+            .calculate_repository_preset_live(repo_id, None) // Use default branch
             .await?;
 
         Ok(())
@@ -3428,10 +3416,9 @@ impl GitProviderManager {
     pub async fn calculate_repository_preset_live(
         &self,
         repository_id: i32,
-        user_id: i32,
         branch: Option<String>,
     ) -> Result<RepositoryPresetDomain, GitProviderManagerError> {
-        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+        let repository = self.get_repository_for_user(repository_id).await?;
 
         // Repository always has a git provider connection (required field)
         let connection_id = repository.git_provider_connection_id;
@@ -3539,10 +3526,9 @@ impl GitProviderManager {
     pub async fn calculate_repository_env_example_live(
         &self,
         repository_id: i32,
-        user_id: i32,
         branch: Option<String>,
     ) -> Result<RepositoryEnvExampleDomain, GitProviderManagerError> {
-        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+        let repository = self.get_repository_for_user(repository_id).await?;
 
         let connection_id = repository.git_provider_connection_id;
         let provider_service = {
@@ -3628,11 +3614,10 @@ impl GitProviderManager {
     pub async fn calculate_repository_compose_services_live(
         &self,
         repository_id: i32,
-        user_id: i32,
         branch: Option<String>,
         path: String,
     ) -> Result<RepositoryComposeServicesDomain, GitProviderManagerError> {
-        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+        let repository = self.get_repository_for_user(repository_id).await?;
 
         let connection_id = repository.git_provider_connection_id;
         let provider_service = {
@@ -3690,13 +3675,12 @@ impl GitProviderManager {
     pub async fn calculate_repository_compose_preview_live(
         &self,
         repository_id: i32,
-        user_id: i32,
         branch: Option<String>,
         path: String,
         compose_override: Option<String>,
         excluded_services: Vec<String>,
     ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
-        let repository = self.get_repository_for_user(repository_id, user_id).await?;
+        let repository = self.get_repository_for_user(repository_id).await?;
 
         let connection_id = repository.git_provider_connection_id;
         let provider_service = {
@@ -6300,14 +6284,14 @@ mod tests {
         assert_eq!(manager.get_valid_github_token_for_user(5).await, None);
     }
 
-    fn mock_manager_with_repository_owner(owner_user_id: Option<i32>) -> GitProviderManager {
+    fn mock_manager_with_repository(connection_owner_user_id: Option<i32>) -> GitProviderManager {
         use sea_orm::{DatabaseBackend, MockDatabase};
 
-        let connection = connection_fixture(11, owner_user_id);
+        let connection = connection_fixture(11, connection_owner_user_id);
         let repository = repository_fixture(connection.id);
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([[(repository, Some(connection))]])
+                .append_query_results([[repository]])
                 .into_connection(),
         );
         GitProviderManager::new(
@@ -6323,46 +6307,33 @@ mod tests {
         )
     }
 
+    // Connections (and the repositories behind them) are shared across all
+    // authenticated users (single-tenant: "the team is the app" for now, see
+    // #656) -- any user should resolve a repository regardless of which
+    // teammate's connection it's attached to, or whether that connection has
+    // an owner recorded at all.
     #[tokio::test]
-    async fn connected_repository_lookup_allows_its_owner() {
-        let manager = mock_manager_with_repository_owner(Some(5));
+    async fn connected_repository_lookup_is_shared_across_users() {
+        let manager = mock_manager_with_repository(Some(5));
 
         let repository = manager
-            .get_repository_for_user(42, 5)
+            .get_repository_for_user(42)
             .await
-            .expect("the owning user should resolve the repository");
+            .expect("any authenticated user should resolve a shared repository");
 
         assert_eq!(repository.id, 42);
     }
 
     #[tokio::test]
-    async fn connected_repository_lookup_hides_repository_from_other_users() {
-        let manager = mock_manager_with_repository_owner(Some(5));
+    async fn connected_repository_lookup_allows_ownerless_connections() {
+        let manager = mock_manager_with_repository(None);
 
-        let error = manager
-            .get_repository_for_user(42, 6)
+        let repository = manager
+            .get_repository_for_user(42)
             .await
-            .expect_err("a different user must not resolve the repository");
+            .expect("an ownerless connection's repository should still resolve");
 
-        assert!(matches!(
-            error,
-            GitProviderManagerError::RepositoryNotFound(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn connected_repository_lookup_rejects_ownerless_connections() {
-        let manager = mock_manager_with_repository_owner(None);
-
-        let error = manager
-            .get_repository_for_user(42, 5)
-            .await
-            .expect_err("an ownerless connection must not expose repository contents");
-
-        assert!(matches!(
-            error,
-            GitProviderManagerError::RepositoryNotFound(_)
-        ));
+        assert_eq!(repository.id, 42);
     }
 
     async fn mock_manager_with_compose_file(
@@ -6428,7 +6399,7 @@ mod tests {
         let repository = repository_fixture(connection.id);
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([[(repository, Some(connection.clone()))]])
+                .append_query_results([[repository]])
                 .append_query_results([[connection.clone()]])
                 .append_query_results([[connection]])
                 .into_connection(),
@@ -6477,7 +6448,6 @@ services:
         let result = manager
             .calculate_repository_compose_preview_live(
                 42,
-                5,
                 Some("feature/compose".to_string()),
                 "deploy/compose.preview.yml".to_string(),
                 Some(
@@ -6516,7 +6486,6 @@ services:
         let error = manager
             .calculate_repository_compose_preview_live(
                 42,
-                5,
                 Some("release-candidate".to_string()),
                 "ops/custom.compose.yaml".to_string(),
                 None,
