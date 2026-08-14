@@ -23,7 +23,7 @@ import { parsePeriod } from './period.js'
 const DEVICES = ['desktop', 'mobile'] as const
 const MAX_BACKEND_ID = 2_147_483_647
 const RFC3339_DATE_TIME =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/
 const GROUP_BY_DIMENSIONS = [
   'path',
   'country',
@@ -121,9 +121,37 @@ function parseGroupBy(value: string | undefined): GroupByDimension | undefined {
 }
 
 function parseDate(value: string, label: string): string {
-  if (!RFC3339_DATE_TIME.test(value)) {
+  const match = RFC3339_DATE_TIME.exec(value)
+  if (!match) {
     throw new Error(`${label} must be a valid RFC 3339 date`)
   }
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] =
+    match
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  const second = Number(secondText)
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText)
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText)
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  const validComponents =
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= (daysInMonth[month - 1] ?? 0) &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    offsetHour <= 23 &&
+    offsetMinute <= 59
+  if (!validComponents) {
+    throw new Error(`${label} must be a valid RFC 3339 date`)
+  }
+
   const timestamp = Date.parse(value)
   if (Number.isNaN(timestamp)) {
     throw new Error(`${label} must be a valid RFC 3339 date`)
@@ -177,9 +205,11 @@ export function resolvePerformanceWindow(options: PerformanceOptions): ResolvedW
     throw new Error('--start-date and --end-date must be provided together')
   }
 
-  if (options.startDate && options.endDate) {
-    const startDate = parseDate(options.startDate, 'Start date')
-    const endDate = parseDate(options.endDate, 'End date')
+  if (hasStart && hasEnd) {
+    const startValue = options.startDate ?? ''
+    const endValue = options.endDate ?? ''
+    const startDate = parseDate(startValue, 'Start date')
+    const endDate = parseDate(endValue, 'End date')
     if (Date.parse(startDate) >= Date.parse(endDate)) {
       throw new Error('Start date must be earlier than end date')
     }

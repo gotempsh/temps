@@ -89,6 +89,27 @@ describe('Performance Insights date windows', () => {
         })
       ).toThrow(/valid RFC 3339/)
     }
+    for (const invalidRfc3339 of [
+      '2026-02-29T00:00:00Z',
+      '2026-02-30T00:00:00Z',
+      '2026-08-01T24:00:00Z',
+      '2026-08-01T00:60:00Z',
+      '2026-08-01T00:00:60Z',
+      '2026-08-01T00:00:00+24:00',
+    ]) {
+      expect(() =>
+        resolvePerformanceWindow({
+          startDate: invalidRfc3339,
+          endDate: '2026-08-08T00:00:00Z',
+        })
+      ).toThrow(/valid RFC 3339/)
+    }
+    expect(() => resolvePerformanceWindow({ startDate: '', endDate: '' })).toThrow(
+      /valid RFC 3339/
+    )
+    expect(() =>
+      resolvePerformanceWindow({ startDate: '', endDate: '2026-08-08T00:00:00Z' })
+    ).toThrow(/valid RFC 3339/)
   })
 })
 
