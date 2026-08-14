@@ -22413,6 +22413,13 @@
       "MetricsRangeQuery": {
         "description": "Query params for range metric queries.",
         "properties": {
+          "end_time": {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metric": {
             "description": "Metric name, e.g. `\"pg.connections_active\"`.",
             "type": "string"
@@ -22426,8 +22433,15 @@
             ]
           },
           "range": {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "type": "string"
+          },
+          "start_time": {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -39099,6 +39113,21 @@
             "format": "int64",
             "type": "integer"
           },
+          "p50_response_time_ms": {
+            "description": "p50 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
+          "p95_response_time_ms": {
+            "description": "p95 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
+          "p99_response_time_ms": {
+            "description": "p99 response time in milliseconds (0 when the bucket has no timings)",
+            "format": "double",
+            "type": "number"
+          },
           "request_count": {
             "description": "Total number of requests in this bucket",
             "format": "int64",
@@ -39119,6 +39148,9 @@
           "bucket",
           "request_count",
           "avg_response_time_ms",
+          "p50_response_time_ms",
+          "p95_response_time_ms",
+          "p99_response_time_ms",
           "error_count",
           "total_request_bytes",
           "total_response_bytes"
@@ -54148,7 +54180,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -54165,6 +54197,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -58564,7 +58622,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -58581,6 +58639,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -66370,7 +66454,7 @@
             }
           },
           {
-            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.",
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -66387,6 +66471,32 @@
               "format": "double",
               "type": [
                 "number",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -88156,7 +88266,7 @@
             }
           },
           {
-            "description": "Bucket interval (e.g., \"1 hour\", \"1 day\", \"5 minutes\")",
+            "description": "Bucket interval (e.g., \"1 hour\", \"1 day\", \"5 minutes\").\nMust keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).",
             "in": "query",
             "name": "bucket_interval",
             "required": false,

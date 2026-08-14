@@ -10138,6 +10138,10 @@ export type MetricsQuery = {
  */
 export type MetricsRangeQuery = {
     /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
      * Metric name, e.g. `"pg.connections_active"`.
      */
     metric: string;
@@ -10155,10 +10159,6 @@ export type MetricsRangeQuery = {
      * Explicit window start (ISO 8601). Must be paired with `end_time`.
      */
     start_time?: string | null;
-    /**
-     * Explicit window end (ISO 8601). Must be paired with `start_time`.
-     */
-    end_time?: string | null;
 };
 
 /**
@@ -47543,7 +47543,8 @@ export type GetTimeBucketStatsData = {
          */
         end_time: string;
         /**
-         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+         * Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
          */
         bucket_interval?: string;
         /**

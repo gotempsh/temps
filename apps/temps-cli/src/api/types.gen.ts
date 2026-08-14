@@ -10138,6 +10138,10 @@ export type MetricsQuery = {
  */
 export type MetricsRangeQuery = {
     /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
      * Metric name, e.g. `"pg.connections_active"`.
      */
     metric: string;
@@ -10148,8 +10152,13 @@ export type MetricsRangeQuery = {
     percentile?: number | null;
     /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
      */
     range?: string;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
 };
 
 /**
@@ -17745,6 +17754,18 @@ export type TimeBucketStats = {
      * Number of errors (status >= 400)
      */
     error_count: number;
+    /**
+     * p50 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p50_response_time_ms: number;
+    /**
+     * p95 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p95_response_time_ms: number;
+    /**
+     * p99 response time in milliseconds (0 when the bucket has no timings)
+     */
+    p99_response_time_ms: number;
     /**
      * Total number of requests in this bucket
      */
@@ -25807,6 +25828,7 @@ export type DeploymentMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -25814,6 +25836,14 @@ export type DeploymentMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/deployments/{id}/metrics';
 };
@@ -28951,6 +28981,7 @@ export type ExternalServiceMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -28958,6 +28989,14 @@ export type ExternalServiceMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/external-services/{id}/metrics';
 };
@@ -34362,6 +34401,7 @@ export type NodeMetricsGetRangeData = {
         metric: string;
         /**
          * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
         /**
@@ -34369,6 +34409,14 @@ export type NodeMetricsGetRangeData = {
          * fetches histogram buckets and computes the requested quantile.
          */
         percentile?: number | null;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
     };
     url: '/nodes/{id}/metrics';
 };
@@ -47518,7 +47566,8 @@ export type GetTimeBucketStatsData = {
          */
         end_time: string;
         /**
-         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+         * Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
          */
         bucket_interval?: string;
         /**
