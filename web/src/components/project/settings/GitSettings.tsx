@@ -6,6 +6,7 @@ import {
 } from '@/api/client'
 import {
   detectPublicPresetsOptions,
+  getPublicBranchesOptions,
   getPublicRepositoryOptions,
   getRepositoryByIdOptions,
   getRepositoryPresetLiveOptions,
@@ -104,6 +105,7 @@ import {
   type ProjectSettingsView,
 } from '@/lib/project-settings-view'
 import {
+  parseRepositoryCoordinates,
   parsePublicRepositoryUrl,
   publicRepositoryProvider,
 } from '@/lib/public-repository'
@@ -186,8 +188,8 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
 
   const {
     data: branchesData,
-    isLoading: isLoadingBranches,
-    refetch: refetchBranches,
+    isLoading: isLoadingConnectedBranches,
+    refetch: refetchConnectedBranches,
   } = useQuery({
     queryKey: [
       'repository-branches',
@@ -220,11 +222,31 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
       !!project?.repo_name &&
       !!project?.git_provider_connection_id,
   })
+  const publicBranchesQuery = useQuery({
+    ...getPublicBranchesOptions({
+      path: {
+        provider: publicProvider,
+        owner: project?.repo_owner || '',
+        repo: project?.repo_name || '',
+      },
+    }),
+    enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
+    retry: false,
+  })
   const branches: Array<{
     name: string
     commit_sha: string
     protected: boolean
-  }> = (branchesData?.branches as any) || []
+  }> =
+    ((isPublicRepo
+      ? publicBranchesQuery.data?.branches
+      : branchesData?.branches) as any) || []
+  const isLoadingBranches = isPublicRepo
+    ? publicBranchesQuery.isLoading
+    : isLoadingConnectedBranches
+  const refetchBranches = isPublicRepo
+    ? publicBranchesQuery.refetch
+    : refetchConnectedBranches
 
   // Repository metadata (description, language, pushed_at, default_branch, clone urls)
   const { data: repositoryData } = useQuery({
@@ -278,6 +300,20 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
     }),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
+  const publicRepositoryQuery = useQuery({
+    ...getPublicRepositoryOptions({
+      path: {
+        provider: publicProvider,
+        owner: project?.repo_owner || '',
+        repo: project?.repo_name || '',
+      },
+    }),
+    enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
+  })
+  const repositoryDescription =
+    repositoryData?.description ?? publicRepositoryQuery.data?.description
+  const effectiveDefaultBranch =
+    repositoryData?.default_branch ?? publicRepositoryQuery.data?.default_branch
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
@@ -682,9 +718,9 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
                         : 'Connected'}
                   </Badge>
                 </div>
-                {repositoryData?.description && (
+                {repositoryDescription && (
                   <p className="text-sm text-muted-foreground line-clamp-2">
-                    {repositoryData.description}
+                    {repositoryDescription}
                   </p>
                 )}
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -693,12 +729,12 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
                       Pushed <TimeAgo date={repositoryData.pushed_at} />
                     </span>
                   )}
-                  {repositoryData?.default_branch && (
+                  {effectiveDefaultBranch && (
                     <span className="flex items-center gap-1">
                       <GitBranchIcon className="size-3" />
                       default{' '}
                       <span className="font-mono text-foreground">
-                        {repositoryData.default_branch}
+                        {effectiveDefaultBranch}
                       </span>
                     </span>
                   )}
@@ -788,8 +824,7 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
                       <span className="font-mono text-sm truncate">
                         {project.main_branch}
                       </span>
-                      {repositoryData?.default_branch ===
-                        project.main_branch && (
+                      {effectiveDefaultBranch === project.main_branch && (
                         <Badge variant="outline" className="text-xs">
                           default
                         </Badge>
@@ -861,8 +896,7 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
                                       protected
                                     </Badge>
                                   )}
-                                  {b.name ===
-                                    repositoryData?.default_branch && (
+                                  {b.name === effectiveDefaultBranch && (
                                     <Check className="size-3 text-green-500" />
                                   )}
                                   {b.commit_sha && (
@@ -2503,6 +2537,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 
   const [selectedRepoState, setSelectedRepoState] =
     useState<RepositoryResponse | null>(null)
+  const [connectionRepositoryMode, setConnectionRepositoryMode] = useState<
+    'synced' | 'manual'
+  >('synced')
+  const [manualRepositoryReference, setManualRepositoryReference] =
+    useState('')
+  const manualRepository = useMemo(
+    () => parseRepositoryCoordinates(manualRepositoryReference),
+    [manualRepositoryReference]
+  )
   const selectedRepositoryQuery = useQuery({
     ...getRepositoryByIdOptions({
       path: { repository_id: selectedRepositoryId || 0 },
@@ -2652,9 +2695,11 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const repoToConnect =
     mode === 'public'
       ? parsedPublic
-      : selectedRepo
-        ? { owner: selectedRepo.owner, name: selectedRepo.name }
-        : null
+      : connectionRepositoryMode === 'manual'
+        ? manualRepository
+        : selectedRepo
+          ? { owner: selectedRepo.owner, name: selectedRepo.name }
+          : null
 
   const handleConnect = async () => {
     if (!repoToConnect) return
@@ -2692,6 +2737,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       body.git_provider_connection_id = null
     } else {
       body.git_provider_connection_id = selectedConnectionId
+      body.is_public_repo = false
     }
     try {
       await updateGit.mutateAsync({
@@ -2764,6 +2810,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 const connectionId = Number(value)
                 if (connectionId !== selectedConnectionId) {
                   setSelectedRepoState(null)
+                  setBranch('')
                   navigate(repositoryConnectionPath(project.slug, connectionId))
                 }
               }}
@@ -2795,33 +2842,108 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
           </div>
 
           {selectedConnectionId && (
-            <div className="border-t pt-3">
-              <RepositorySelector
-                connectionId={selectedConnectionId}
-                onSelect={(repo) => {
-                  setSelectedRepoState(repo)
-                  setBranch(repo?.default_branch || '')
-                  navigate(
-                    repo
-                      ? repositorySelectionPath(
-                          project.slug,
-                          selectedConnectionId,
-                          repo.id
-                        )
-                      : repositoryConnectionPath(
-                          project.slug,
-                          selectedConnectionId
-                        )
-                  )
-                }}
-                selectedRepository={selectedRepo}
-                title=""
-                description=""
-                showAsCard={false}
-                compactMode
-                itemsPerPage={24}
-                providerType={selectedProviderType}
-              />
+            <div className="space-y-3 border-t pt-3">
+              <div className="inline-flex rounded-lg border p-0.5">
+                <Button
+                  type="button"
+                  variant={
+                    connectionRepositoryMode === 'synced'
+                      ? 'secondary'
+                      : 'ghost'
+                  }
+                  size="sm"
+                  onClick={() => {
+                    setConnectionRepositoryMode('synced')
+                    setBranch('')
+                  }}
+                >
+                  Browse synced
+                </Button>
+                <Button
+                  type="button"
+                  variant={
+                    connectionRepositoryMode === 'manual'
+                      ? 'secondary'
+                      : 'ghost'
+                  }
+                  size="sm"
+                  onClick={() => {
+                    setConnectionRepositoryMode('manual')
+                    setSelectedRepoState(null)
+                    setBranch('')
+                    navigate(
+                      repositoryConnectionPath(project.slug, selectedConnectionId)
+                    )
+                  }}
+                >
+                  Enter manually
+                </Button>
+              </div>
+
+              {connectionRepositoryMode === 'synced' ? (
+                <RepositorySelector
+                  connectionId={selectedConnectionId}
+                  onSelect={(repo) => {
+                    setSelectedRepoState(repo)
+                    setBranch(repo?.default_branch || '')
+                    navigate(
+                      repo
+                        ? repositorySelectionPath(
+                            project.slug,
+                            selectedConnectionId,
+                            repo.id
+                          )
+                        : repositoryConnectionPath(
+                            project.slug,
+                            selectedConnectionId
+                          )
+                    )
+                  }}
+                  selectedRepository={selectedRepo}
+                  title=""
+                  description=""
+                  showAsCard={false}
+                  compactMode
+                  itemsPerPage={24}
+                  providerType={selectedProviderType}
+                />
+              ) : (
+                <Card>
+                  <CardContent className="space-y-2 p-4">
+                    <Label htmlFor="connected-repository-reference">
+                      Repository
+                    </Label>
+                    <Input
+                      id="connected-repository-reference"
+                      value={manualRepositoryReference}
+                      onChange={(event) => {
+                        const nextReference = event.target.value
+                        const nextRepository =
+                          parseRepositoryCoordinates(nextReference)
+                        if (
+                          nextRepository?.owner !== manualRepository?.owner ||
+                          nextRepository?.name !== manualRepository?.name
+                        ) {
+                          setBranch('')
+                        }
+                        setManualRepositoryReference(nextReference)
+                      }}
+                      placeholder="owner/repository"
+                      autoComplete="off"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Temps will access this repository with the selected Git
+                      connection. It does not need to be synced first.
+                    </p>
+                    {manualRepositoryReference && !manualRepository && (
+                      <p className="text-xs text-destructive">
+                        Enter a repository as owner/repository, an HTTPS clone
+                        URL, or an SSH clone URL.
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
             </div>
           )}
           {!selectedConnectionId && (

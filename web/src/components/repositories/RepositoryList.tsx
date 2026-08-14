@@ -299,19 +299,26 @@ export function RepositoryList({
               <Button
                 type="button"
                 variant="outline"
-                size="icon"
-                className="relative shrink-0"
-                onClick={() => refetch()}
-                disabled={isLoading}
-                aria-label="Refresh repositories"
+                size="sm"
+                className="relative shrink-0 gap-1.5"
+                onClick={handleSyncRepositories}
+                disabled={syncMutation.isPending || isConnectionSyncing}
+                aria-label="Sync repositories from provider"
               >
                 <span
                   className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
                   aria-hidden="true"
                 />
                 <RefreshCw
-                  className={cn('size-4 shrink-0', isLoading && 'animate-spin')}
+                  className={cn(
+                    'size-4 shrink-0',
+                    (syncMutation.isPending || isConnectionSyncing) &&
+                      'animate-spin'
+                  )}
                 />
+                {syncMutation.isPending || isConnectionSyncing
+                  ? 'Syncing…'
+                  : 'Sync repositories'}
               </Button>
             </div>
           </div>
