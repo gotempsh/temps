@@ -117,13 +117,21 @@ impl From<OtelError> for Problem {
 /// Checks `Authorization: Bearer <token>` and `X-Temps-Api-Key: <token>`.
 /// Works for `tk_`, `dt_`, and `si_` token prefixes. Handles both plain
 /// `Bearer <token>` and percent-encoded `Bearer%20<token>` from OTLP SDKs.
+fn authorization_scheme(value: &str) -> &'static str {
+    if value.starts_with("Bearer ") || value.starts_with("Bearer%20") {
+        "Bearer"
+    } else {
+        "other"
+    }
+}
+
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(value) = auth.to_str() {
             // SECURITY: never log the raw header — it carries a live, mostly
             // non-expiring credential (Bearer dt_/tk_/si_). Log only its shape.
             tracing::debug!(
-                scheme = value.split_whitespace().next().unwrap_or(""),
+                scheme = authorization_scheme(value),
                 len = value.len(),
                 "OTLP extract_token"
             );
@@ -1092,6 +1100,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-temps-api-key", "tk_xyz789".parse().unwrap());
         assert_eq!(extract_token(&headers), Some("tk_xyz789".to_string()));
+    }
+
+    #[test]
+    fn test_authorization_scheme_never_contains_token_material() {
+        let token = "dt_live_credential_must_not_be_logged";
+
+        for value in [
+            format!("Bearer {token}"),
+            format!("Bearer%20{token}"),
+            format!("Custom {token}"),
+        ] {
+            let scheme = authorization_scheme(&value);
+            assert!(!scheme.contains(token));
+        }
+
+        assert_eq!(authorization_scheme(&format!("Bearer {token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Bearer%20{token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Custom {token}")), "other");
     }
 
     #[test]
