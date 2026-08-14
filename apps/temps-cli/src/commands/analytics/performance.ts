@@ -19,6 +19,7 @@ import { colors, info, json as jsonOut, newline } from '../../ui/output.js'
 import { parsePeriod } from './period.js'
 
 const DEVICES = ['desktop', 'mobile'] as const
+const MAX_BACKEND_ID = 2_147_483_647
 const GROUP_BY_DIMENSIONS = [
   'path',
   'country',
@@ -79,7 +80,11 @@ function parsePositiveInteger(value: string | undefined, label: string): number 
   if (!/^[1-9]\d*$/.test(value)) {
     throw new Error(`${label} must be a positive integer`)
   }
-  return Number.parseInt(value, 10)
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isSafeInteger(parsed) || parsed > MAX_BACKEND_ID) {
+    throw new Error(`${label} must be between 1 and ${MAX_BACKEND_ID}`)
+  }
+  return parsed
 }
 
 function parseDevice(value: string | undefined): Device | undefined {
@@ -223,7 +228,10 @@ export async function performanceInsights(options: PerformanceOptions): Promise<
     client,
     path: { slug: resolved.slug },
   })
-  if (projectError || !project) {
+  if (projectError) {
+    throw new Error(getErrorMessage(projectError))
+  }
+  if (!project) {
     throw new Error(`Project "${resolved.slug}" not found`)
   }
 

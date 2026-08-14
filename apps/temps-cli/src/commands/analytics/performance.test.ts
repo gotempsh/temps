@@ -38,6 +38,11 @@ describe('Performance Insights option validation', () => {
         /positive integer/
       )
     }
+    for (const tooLarge of ['2147483648', '9007199254740992']) {
+      expect(() => parsePositiveIntegerForTest(tooLarge, 'Environment ID')).toThrow(
+        /between 1 and 2147483647/
+      )
+    }
   })
 })
 
