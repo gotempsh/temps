@@ -10397,6 +10397,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "utoipa",
  "uuid",
