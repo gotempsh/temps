@@ -3527,6 +3527,7 @@ impl GitProviderManager {
         &self,
         repository_id: i32,
         branch: Option<String>,
+        root_directory: &str,
     ) -> Result<RepositoryEnvExampleDomain, GitProviderManagerError> {
         let repository = self.get_repository_for_user(repository_id).await?;
 
@@ -3557,9 +3558,10 @@ impl GitProviderManager {
             })
             .await?;
 
-        let Some(env_path) = temps_presets::detect_env_example_files(&files)
-            .into_iter()
-            .next()
+        let Some(env_path) =
+            temps_presets::detect_env_example_files_in_directory(&files, root_directory)
+                .into_iter()
+                .next()
         else {
             return Ok(RepositoryEnvExampleDomain {
                 repository_id,

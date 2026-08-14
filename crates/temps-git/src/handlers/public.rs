@@ -42,6 +42,15 @@ pub struct PresetQueryParams {
     pub fresh: bool,
 }
 
+/// Query parameters for env-example detection.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct EnvExampleQueryParams {
+    /// Branch name to inspect (default: repository's default branch)
+    pub branch: Option<String>,
+    /// Project root directory to search (default: repository root)
+    pub root_directory: Option<String>,
+}
+
 /// Public repository information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PublicRepositoryInfo {
@@ -525,7 +534,7 @@ fn decode_file_content(content: &str, encoding: &str) -> String {
         ("provider" = String, Path, description = "Git provider (github or gitlab)"),
         ("owner" = String, Path, description = "Repository owner"),
         ("repo" = String, Path, description = "Repository name"),
-        PresetQueryParams
+        EnvExampleQueryParams
     ),
     responses(
         (status = 200, description = "Detected env-example variables", body = PublicEnvExampleResponse),
@@ -540,7 +549,7 @@ pub async fn detect_public_env_example(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
-    Query(params): Query<PresetQueryParams>,
+    Query(params): Query<EnvExampleQueryParams>,
 ) -> Result<Json<PublicEnvExampleResponse>, Problem> {
     let (repo_provider, repo_info) = provider_for_public_request(
         state.as_ref(),
@@ -562,10 +571,12 @@ pub async fn detect_public_env_example(
         .await
         .map_err(|e| map_error(e, &owner, &repo))?;
 
-    let Some(env_path) = temps_presets::detect_env_example_files(&files)
-        .into_iter()
-        .next()
-    else {
+    let Some(env_path) = temps_presets::detect_env_example_files_in_directory(
+        &files,
+        params.root_directory.as_deref().unwrap_or("./"),
+    )
+    .into_iter()
+    .next() else {
         return Ok(Json(PublicEnvExampleResponse {
             branch: target_branch,
             path: None,

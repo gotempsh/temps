@@ -17,7 +17,8 @@ pub use mod_rs::docker_compose::{
     ComposeParseError, ComposeServicePreview, EffectiveComposePreview,
 };
 pub use mod_rs::env_example::{
-    detect_env_example_files, parse_env_example, EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
+    detect_env_example_files, detect_env_example_files_in_directory, parse_env_example,
+    EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
 };
 pub use {
     all_presets, detect_all_presets_from_files, detect_node_framework,

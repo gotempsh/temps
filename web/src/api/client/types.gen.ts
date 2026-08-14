@@ -32905,13 +32905,13 @@ export type DetectPublicEnvExampleData = {
     };
     query?: {
         /**
-         * Branch name to detect presets for (default: repository's default branch)
+         * Branch name to inspect (default: repository's default branch)
          */
         branch?: string | null;
         /**
-         * Force fetch fresh data, bypassing cache (default: false)
+         * Project root directory to search (default: repository root)
          */
-        fresh?: boolean;
+        root_directory?: string | null;
     };
     url: '/git/public/{provider}/{owner}/{repo}/env-example';
 };
@@ -48867,6 +48867,10 @@ export type GetRepositoryEnvExampleLiveData = {
          * Git branch to check (defaults to repository's default branch)
          */
         branch?: string;
+        /**
+         * Project root directory to search (defaults to repository root)
+         */
+        root_directory?: string;
     };
     url: '/repositories/{repository_id}/env-example/live';
 };

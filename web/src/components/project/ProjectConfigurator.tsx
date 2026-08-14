@@ -3,6 +3,7 @@ import {
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
   getRepositoryEnvExampleLiveOptions,
+  detectPublicEnvExampleOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
   listPresetsOptions,
@@ -561,19 +562,17 @@ interface ProjectConfiguratorProps {
    */
   onRefreshPresets?: () => Promise<unknown>
   /**
-   * Pre-loaded env-example detection (for public repos, where this
-   * component's own `getRepositoryEnvExampleLive` query can't run — same
-   * `repository.id` caveat as `presetData` above).
+   * Fallback env-example detection for callers that cannot identify either a
+   * connected repository or a public repository.
    */
   envExampleData?: {
     path: string | null
     variables: EnvExampleVariableResponse[]
   }
   /**
-   * Set for public "git URL" imports, so the docker-compose service preview
-   * (used to offer excluding a service, e.g. an unmanaged database) can query
-   * the public-repo endpoint instead of `repository.id`, which is synthetic
-   * for this flow.
+   * Set for public "git URL" imports, so repository previews (env examples
+   * and docker-compose services) query public endpoints instead of using the
+   * synthetic `repository.id` from this flow.
    */
   publicRepo?: { provider: string; owner: string; repo: string } | null
 
@@ -719,6 +718,10 @@ export function ProjectConfigurator({
     control: form.control,
     name: 'branch',
   })
+  const selectedRootDirectory = useWatch({
+    control: form.control,
+    name: 'rootDirectory',
+  })
 
   // Fetch preset data (will refetch when branch changes due to query key)
   // Skip fetching if presetData is already provided (e.g., for public repos)
@@ -761,26 +764,69 @@ export function ProjectConfigurator({
     return fetchedPresetData
   }, [providedPresetData, fetchedPresetData])
 
-  // Detect a .env.example (or common variant) in the repo so the user can
-  // fill in the app's expected env vars instead of hunting for them —
-  // mirrors the presetData override pattern: `repository.id` is only real
-  // for connected repos, public "git URL" imports pass envExampleData instead.
-  const { data: fetchedEnvExampleData } = useQuery({
+  // Detect a .env.example (or common variant) directly inside the selected
+  // project root. Including the root directory in the query key makes preset
+  // and manual-directory changes replace the detected variables.
+  const {
+    data: fetchedEnvExampleData,
+    isFetching: isFetchingConnectedEnvExample,
+  } = useQuery({
     ...getRepositoryEnvExampleLiveOptions({
       path: { repository_id: repository.id || 0 },
-      query: { branch: selectedBranch },
+      query: {
+        branch: selectedBranch,
+        root_directory: selectedRootDirectory || './',
+      },
     }),
-    enabled: !providedEnvExampleData && !!repository.id && !!selectedBranch,
+    enabled: !publicRepo && !!repository.id && !!selectedBranch,
   })
 
-  const envExamplePath =
-    providedEnvExampleData?.path ?? fetchedEnvExampleData?.path ?? null
+  const {
+    data: fetchedPublicEnvExampleData,
+    isFetching: isFetchingPublicEnvExample,
+  } = useQuery({
+    ...detectPublicEnvExampleOptions({
+      path: {
+        provider: publicRepo?.provider || 'github',
+        owner: publicRepo?.owner || '',
+        repo: publicRepo?.repo || '',
+      },
+      query: {
+        branch: selectedBranch,
+        root_directory: selectedRootDirectory || './',
+      },
+    }),
+    enabled: !!publicRepo && !!selectedBranch,
+  })
+
+  const isFetchingEnvExample = publicRepo
+    ? isFetchingPublicEnvExample
+    : isFetchingConnectedEnvExample
+  const envExamplePath = isFetchingEnvExample
+    ? null
+    : fetchedEnvExampleData
+      ? fetchedEnvExampleData.path
+      : fetchedPublicEnvExampleData
+        ? fetchedPublicEnvExampleData.path
+        : (providedEnvExampleData?.path ?? null)
   const envExampleVariables = useMemo(
-    () =>
-      providedEnvExampleData?.variables ??
-      fetchedEnvExampleData?.variables ??
-      [],
-    [providedEnvExampleData, fetchedEnvExampleData]
+    () => {
+      if (isFetchingEnvExample) return []
+      if (fetchedEnvExampleData) return fetchedEnvExampleData.variables
+      if (fetchedPublicEnvExampleData) {
+        return fetchedPublicEnvExampleData.variables.map((variable) => ({
+          key: variable.key,
+          defaultValue: variable.default_value,
+          description: variable.description,
+        }))
+      }
+      return providedEnvExampleData?.variables ?? []
+    }, [
+      providedEnvExampleData,
+      fetchedEnvExampleData,
+      fetchedPublicEnvExampleData,
+      isFetchingEnvExample,
+    ]
   )
 
   const [envExampleDismissed, setEnvExampleDismissed] = useState(false)
@@ -806,14 +852,14 @@ export function ProjectConfigurator({
   // (new array reference), without clobbering edits the user made to the
   // current one on every re-render.
   useEffect(() => {
-    if (envExampleVariables.length === 0) return
+    setEnvExampleDismissed(false)
     setSelectedEnvExampleKeys(new Set(envExampleVariables.map((v) => v.key)))
     setEnvExampleValueDrafts(
       Object.fromEntries(
         envExampleVariables.map((v) => [v.key, v.defaultValue])
       )
     )
-  }, [envExampleVariables])
+  }, [envExamplePath, envExampleVariables, selectedRootDirectory])
 
   // Default project creation mutation
   const projectMutation = useMutation({

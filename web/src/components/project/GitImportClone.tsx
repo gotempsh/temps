@@ -1,15 +1,13 @@
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
-  getRepositoryEnvExampleLiveOptions,
   createProjectMutation,
   getPublicBranchesOptions,
   detectPublicPresetsOptions,
-  detectPublicEnvExampleOptions,
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -423,51 +421,6 @@ export function GitImportClone({
       }))
     : authenticatedPresetData?.presets
 
-  // Query for env-example detection from authenticated connection
-  const { data: authenticatedEnvExampleData } = useQuery({
-    ...getRepositoryEnvExampleLiveOptions({
-      path: {
-        repository_id: selectedRepository?.id || 0,
-      },
-    }),
-    enabled: !useGitUrl && !!selectedRepository && !!selectedRepository?.id,
-  })
-
-  // Query for env-example detection from public repository
-  const { data: publicEnvExampleData } = useQuery({
-    ...detectPublicEnvExampleOptions({
-      path: {
-        provider: parsedPublicRepo?.provider || 'github',
-        owner: parsedPublicRepo?.owner || '',
-        repo: parsedPublicRepo?.repo || '',
-      },
-      query: {
-        branch: selectedRepository?.default_branch,
-      },
-    }),
-    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-  })
-
-  // Transform public env-example data to match the camelCase shape the
-  // authenticated endpoint already returns
-  const envExampleData = useMemo(
-    () =>
-      useGitUrl
-        ? {
-            path: publicEnvExampleData?.path ?? null,
-            variables: (publicEnvExampleData?.variables ?? []).map((v) => ({
-              key: v.key,
-              defaultValue: v.default_value,
-              description: v.description,
-            })),
-          }
-        : {
-            path: authenticatedEnvExampleData?.path ?? null,
-            variables: authenticatedEnvExampleData?.variables ?? [],
-          },
-    [useGitUrl, publicEnvExampleData, authenticatedEnvExampleData]
-  )
-
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
@@ -696,7 +649,6 @@ export function GitImportClone({
               ? refetchPublicPresetData()
               : refetchAuthenticatedPresetData()
           }
-          envExampleData={envExampleData}
           branches={branches?.branches}
           mode="wizard"
           onSubmit={async (data) => {

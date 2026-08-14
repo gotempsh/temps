@@ -39,6 +39,36 @@ pub fn detect_env_example_files(files: &[String]) -> Vec<String> {
     matches
 }
 
+/// Finds env-example files directly inside `root_directory`.
+///
+/// Repository trees use paths relative to the repository root, while project
+/// root directories are commonly written with a leading `./`. A repository
+/// root of `.`, `./`, or an empty string therefore matches only root-level
+/// files; it does not fall through to env files belonging to nested apps.
+pub fn detect_env_example_files_in_directory(
+    files: &[String],
+    root_directory: &str,
+) -> Vec<String> {
+    let normalized_root = root_directory
+        .trim()
+        .strip_prefix("./")
+        .unwrap_or(root_directory.trim())
+        .trim_end_matches('/');
+    let normalized_root = if normalized_root == "." {
+        ""
+    } else {
+        normalized_root
+    };
+
+    detect_env_example_files(files)
+        .into_iter()
+        .filter(|path| {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            parent == normalized_root
+        })
+        .collect()
+}
+
 /// A single variable parsed out of an env-example file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvExampleVariable {
@@ -169,6 +199,35 @@ mod tests {
         let detected = detect_env_example_files(&files);
         assert_eq!(detected[0], ".env.example");
         assert_eq!(detected[1], "apps/api/.env.example");
+    }
+
+    #[test]
+    fn scopes_detection_to_selected_project_directory() {
+        let files = vec![
+            ".env.example".to_string(),
+            "apps/api/.env.sample".to_string(),
+            "apps/web/.env.example".to_string(),
+            "apps/web/nested/.env.example".to_string(),
+        ];
+
+        assert_eq!(
+            detect_env_example_files_in_directory(&files, "./apps/web"),
+            vec!["apps/web/.env.example"]
+        );
+        assert_eq!(
+            detect_env_example_files_in_directory(&files, "./"),
+            vec![".env.example"]
+        );
+    }
+
+    #[test]
+    fn selected_directory_without_env_example_does_not_fall_back() {
+        let files = vec![
+            ".env.example".to_string(),
+            "apps/api/.env.example".to_string(),
+        ];
+
+        assert!(detect_env_example_files_in_directory(&files, "apps/web").is_empty());
     }
 
     #[test]

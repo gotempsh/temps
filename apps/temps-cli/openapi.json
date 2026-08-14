@@ -64548,7 +64548,7 @@
             }
           },
           {
-            "description": "Branch name to detect presets for (default: repository's default branch)",
+            "description": "Branch name to inspect (default: repository's default branch)",
             "in": "query",
             "name": "branch",
             "required": false,
@@ -64560,12 +64560,15 @@
             }
           },
           {
-            "description": "Force fetch fresh data, bypassing cache (default: false)",
+            "description": "Project root directory to search (default: repository root)",
             "in": "query",
-            "name": "fresh",
+            "name": "root_directory",
             "required": false,
             "schema": {
-              "type": "boolean"
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -90723,6 +90726,15 @@
             "description": "Git branch to check (defaults to repository's default branch)",
             "in": "query",
             "name": "branch",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Project root directory to search (defaults to repository root)",
+            "in": "query",
+            "name": "root_directory",
             "required": false,
             "schema": {
               "type": "string"

@@ -2443,6 +2443,14 @@ pub struct PresetLiveQuery {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct EnvExampleLiveQuery {
+    pub branch: Option<String>,
+    /// Project root directory whose env-example file should be detected.
+    /// Defaults to the repository root.
+    pub root_directory: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvExampleVariableResponse {
@@ -2529,6 +2537,7 @@ pub async fn get_repository_preset_live(
     params(
         ("repository_id" = i32, Path, description = "Repository ID"),
         ("branch" = Option<String>, Query, description = "Git branch to check (defaults to repository's default branch)"),
+        ("root_directory" = Option<String>, Query, description = "Project root directory to search (defaults to repository root)"),
     ),
     responses(
         (status = 200, description = "Env-example variables detected (empty if the repository has no env-example file)", body = RepositoryEnvExampleResponse),
@@ -2545,14 +2554,18 @@ pub async fn get_repository_preset_live(
 pub async fn get_repository_env_example_live(
     State(state): State<Arc<AppState>>,
     Path(repository_id): Path<i32>,
-    Query(query): Query<PresetLiveQuery>,
+    Query(query): Query<EnvExampleLiveQuery>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
     let result = state
         .git_provider_manager
-        .calculate_repository_env_example_live(repository_id, query.branch)
+        .calculate_repository_env_example_live(
+            repository_id,
+            query.branch,
+            query.root_directory.as_deref().unwrap_or("./"),
+        )
         .await?;
 
     Ok((
