@@ -532,6 +532,18 @@ impl TempsPlugin for DeploymentsPlugin {
         // only when metrics collection is enabled on this server.
         let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
 
+        // Deploy-failure reporting (redact + preview + send). See
+        // `crate::services::failure_report_service` -- deliberately separate
+        // from the anonymous telemetry pipeline, which never carries free text.
+        let failure_report_service = Arc::new(
+            crate::services::FailureReportService::new(
+                deployment_service.clone(),
+                log_service.clone(),
+                encryption_service.clone(),
+            )
+            .expect("Failed to build FailureReportService HTTP client"),
+        );
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -554,6 +566,7 @@ impl TempsPlugin for DeploymentsPlugin {
             project_access_checker,
             hostname_resolver,
             metrics_store,
+            failure_report_service,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

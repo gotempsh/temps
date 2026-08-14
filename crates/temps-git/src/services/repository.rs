@@ -42,13 +42,17 @@ pub struct RepositoryModel {
 pub struct RepositoryFilter {
     pub git_provider_connection_id: Option<i32>,
     pub provider_id: Option<i32>,
-    /// Scopes `provider_id` lookups to a single caller's own
+    /// Optionally scopes `provider_id` lookups to a single caller's own
     /// `git_provider_connections` row(s) — `provider_id` identifies a
     /// shared, platform-level OAuth app/PAT config that many users can each
-    /// have their own connection to, so a `provider_id`-only filter would
-    /// return every user's repositories. Ignored when `provider_id` is
-    /// unset (`git_provider_connection_id`-scoped lookups already resolve
-    /// to a single connection).
+    /// have their own connection to, so a `provider_id`-only filter can
+    /// span connections across users. Callers currently pass `None` here
+    /// (connections are shared across all users for now — see
+    /// `list_repositories_by_provider`), but the field is kept so a future
+    /// per-user or per-org scope can opt back in without a signature
+    /// change. Ignored when `provider_id` is unset
+    /// (`git_provider_connection_id`-scoped lookups already resolve to a
+    /// single connection).
     pub user_id: Option<i32>,
     pub search: Option<String>,
     pub owner: Option<String>,

@@ -1,6 +1,7 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::proxy_logs;
@@ -621,6 +622,65 @@ impl ProxyLogService {
         Self::resolve_window(Some(start_time), Some(end_time), project_scoped).map(|_| ())
     }
 
+    /// Reject a `bucket_interval` that would emit more than
+    /// [`temps_core::time_window::MAX_SERIES_POINTS`] buckets over `[start, end)`.
+    ///
+    /// Window-width caps alone are not enough: `1 minute` over 7 days is a
+    /// legal interval string and a legal window, but ~10k `time_bucket_gapfill`
+    /// buckets. The UI already coarsens with window size; this is the API
+    /// backstop for a crafted query.
+    fn enforce_bucket_count(
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+    ) -> Result<(), ProxyLogServiceError> {
+        if !Self::is_valid_interval(bucket_interval) {
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            )));
+        }
+        let step_secs = Self::interval_to_seconds(bucket_interval).ok_or_else(|| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "Invalid bucket interval: {}",
+                bucket_interval
+            ))
+        })?;
+        let span_secs = (end_time - start_time).num_seconds().max(1);
+        let buckets = temps_core::time_window::bucket_count(span_secs, step_secs);
+        let max = temps_core::time_window::MAX_SERIES_POINTS;
+        if buckets > max {
+            let min_step_secs = temps_core::time_window::min_step_secs(span_secs);
+            return Err(ProxyLogServiceError::InvalidFilter(format!(
+                "bucket_interval '{bucket_interval}' would produce {buckets} buckets over this window, which exceeds the {max}-point maximum. Use an interval of at least {min_step_secs} seconds."
+            )));
+        }
+        Ok(())
+    }
+
+    /// Convert a validated `"N unit"` interval into seconds for the bucket-count
+    /// cap. Sub-second units collapse to 1-second buckets (same floor as the
+    /// ClickHouse path). Months/years are approximated; charts never request them.
+    pub(crate) fn interval_to_seconds(interval: &str) -> Option<i64> {
+        let parts: Vec<&str> = interval.split_whitespace().collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let n: i64 = parts[0].parse().ok()?;
+        let unit_secs: i64 = match parts[1] {
+            "microsecond" | "microseconds" | "millisecond" | "milliseconds" | "second"
+            | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 3_600,
+            "day" | "days" => 86_400,
+            "week" | "weeks" => 604_800,
+            "month" | "months" => 2_592_000,
+            "year" | "years" => 31_536_000,
+            _ => return None,
+        };
+        Some(n.saturating_mul(unit_secs).max(1))
+    }
+
     pub async fn list_with_filters(
         &self,
         start_date: Option<UtcDateTime>,
@@ -886,19 +946,14 @@ impl ProxyLogService {
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError> {
         let project_scoped = filters.as_ref().is_some_and(|f| f.project_id.is_some());
         Self::enforce_window_span(start_time, end_time, project_scoped)?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
 
         if let Some(storage) = &self.storage {
             return storage
                 .get_time_bucket_stats(start_time, end_time, bucket_interval, filters)
                 .await;
         }
-        // Validate bucket interval
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
-        }
+        // Interval already checked by enforce_bucket_count.
 
         // Serve from the 1-minute continuous aggregate when it can answer
         // this query: every set filter is a grouping column of the aggregate
@@ -909,9 +964,23 @@ impl ProxyLogService {
             && Self::is_minute_multiple_interval(&bucket_interval)
             && self.stats_cagg_exists().await
         {
-            return self
-                .get_time_bucket_stats_from_cagg(start_time, end_time, bucket_interval, filters)
-                .await;
+            let mut stats = self
+                .get_time_bucket_stats_from_cagg(
+                    start_time,
+                    end_time,
+                    bucket_interval.clone(),
+                    filters.clone(),
+                )
+                .await?;
+            self.attach_response_time_percentiles(
+                &mut stats,
+                start_time,
+                end_time,
+                &bucket_interval,
+                filters.as_ref(),
+            )
+            .await?;
+            return Ok(stats);
         }
 
         // Build the base WHERE clause for filters
@@ -969,13 +1038,22 @@ impl ProxyLogService {
         }
 
         // Add bucket_interval as parameterized value
-        values.push(bucket_interval.into());
+        values.push(bucket_interval.clone().into());
 
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
 
         let results = self.db.query_all(stmt).await?;
 
-        Ok(Self::rows_to_time_bucket_stats(&results, start_time))
+        let mut stats = Self::rows_to_time_bucket_stats(&results, start_time);
+        self.attach_response_time_percentiles(
+            &mut stats,
+            start_time,
+            end_time,
+            &bucket_interval,
+            filters.as_ref(),
+        )
+        .await?;
+        Ok(stats)
     }
 
     /// [`Self::get_time_bucket_stats`] served from the `proxy_logs_stats_1m`
@@ -1072,12 +1150,102 @@ impl ProxyLogService {
                     bucket: bucket.to_rfc3339(),
                     request_count,
                     avg_response_time_ms,
+                    p50_response_time_ms: 0.0,
+                    p95_response_time_ms: 0.0,
+                    p99_response_time_ms: 0.0,
                     error_count,
                     total_request_bytes,
                     total_response_bytes,
                 }
             })
             .collect()
+    }
+
+    /// Overlay p50/p95/p99 from the raw `proxy_logs` table onto already-bucketed
+    /// count/avg/byte stats.
+    ///
+    /// Counts come from the continuous aggregate when it can answer (sums roll
+    /// up losslessly). Percentiles cannot be reconstructed from those sums, so
+    /// this is a second, project-scoped scan of `response_time_ms` — the same
+    /// index the dashboard already uses, and only the timing column.
+    async fn attach_response_time_percentiles(
+        &self,
+        stats: &mut [TimeBucketStats],
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+        bucket_interval: &str,
+        filters: Option<&StatsFilters>,
+    ) -> Result<(), ProxyLogServiceError> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+
+        let mut where_clauses = vec!["timestamp >= $1".to_string(), "timestamp < $2".to_string()];
+        let mut param_index = 3;
+        if let Some(f) = filters {
+            Self::build_filter_sql(f, &mut param_index, &mut where_clauses);
+        }
+        let where_clause = format!("WHERE {}", where_clauses.join(" AND "));
+        let bucket_param_index = param_index;
+
+        let sql = format!(
+            r#"
+            SELECT
+                bucket::timestamptz as bucket,
+                COALESCE(p50, 0)::float8 as p50_response_time_ms,
+                COALESCE(p95, 0)::float8 as p95_response_time_ms,
+                COALESCE(p99, 0)::float8 as p99_response_time_ms
+            FROM (
+                SELECT
+                    time_bucket(${}::interval, timestamp) AS bucket,
+                    percentile_cont(0.50) WITHIN GROUP (ORDER BY response_time_ms) as p50,
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY response_time_ms) as p95,
+                    percentile_cont(0.99) WITHIN GROUP (ORDER BY response_time_ms) as p99
+                FROM proxy_logs
+                {}
+                GROUP BY bucket
+            ) sub
+            "#,
+            bucket_param_index, where_clause
+        );
+
+        let mut values: Vec<sea_orm::Value> = vec![start_time.into(), end_time.into()];
+        if let Some(f) = filters {
+            Self::add_filter_values(&mut values, f);
+        }
+        values.push(bucket_interval.to_string().into());
+
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        );
+        let rows = self.db.query_all(stmt).await?;
+
+        let mut by_epoch: HashMap<i64, (f64, f64, f64)> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let bucket: DateTime<Utc> = row.try_get("", "bucket").unwrap_or(start_time);
+            let p50: f64 = row.try_get("", "p50_response_time_ms").unwrap_or(0.0);
+            let p95: f64 = row.try_get("", "p95_response_time_ms").unwrap_or(0.0);
+            let p99: f64 = row.try_get("", "p99_response_time_ms").unwrap_or(0.0);
+            by_epoch.insert(bucket.timestamp(), (p50, p95, p99));
+        }
+
+        for bucket in stats.iter_mut() {
+            let Some(ts) = DateTime::parse_from_rfc3339(&bucket.bucket)
+                .ok()
+                .map(|d| d.timestamp())
+            else {
+                continue;
+            };
+            if let Some((p50, p95, p99)) = by_epoch.get(&ts) {
+                bucket.p50_response_time_ms = *p50;
+                bucket.p95_response_time_ms = *p95;
+                bucket.p99_response_time_ms = *p99;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get health summaries for multiple projects in a single query
@@ -1840,6 +2008,7 @@ impl ProxyLogService {
         group_by: AiTimelineGroupBy,
     ) -> Result<Vec<AiAgentTimelineRow>, ProxyLogServiceError> {
         Self::enforce_window_span(start_time, end_time, project_id.is_some())?;
+        Self::enforce_bucket_count(start_time, end_time, &bucket_interval)?;
 
         if let Some(storage) = &self.storage {
             return storage
@@ -1852,12 +2021,6 @@ impl ProxyLogService {
                     group_by,
                 )
                 .await;
-        }
-        if !Self::is_valid_interval(&bucket_interval) {
-            return Err(ProxyLogServiceError::InvalidFilter(format!(
-                "Invalid bucket interval: {}",
-                bucket_interval
-            )));
         }
 
         let known: Vec<&str> = crate::ai_agent_detector::known_agents()
@@ -2170,6 +2333,12 @@ pub struct TimeBucketStats {
     pub request_count: i64,
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
+    /// p50 response time in milliseconds (0 when the bucket has no timings)
+    pub p50_response_time_ms: f64,
+    /// p95 response time in milliseconds (0 when the bucket has no timings)
+    pub p95_response_time_ms: f64,
+    /// p99 response time in milliseconds (0 when the bucket has no timings)
+    pub p99_response_time_ms: f64,
     /// Number of errors (status >= 400)
     pub error_count: i64,
     /// Total request bytes
@@ -2424,6 +2593,60 @@ mod tests {
         // Invalid: special characters
         assert!(!ProxyLogService::is_valid_interval("1; DROP TABLE"));
         assert!(!ProxyLogService::is_valid_interval("1' OR '1'='1"));
+    }
+
+    fn fixture_range(start: &str, end: &str) -> (UtcDateTime, UtcDateTime) {
+        let start = chrono::DateTime::parse_from_rfc3339(start)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(end)
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        (start, end)
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_1m_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 minute")
+            .expect_err("1m over 7d exceeds MAX_SERIES_POINTS");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter so the handler returns 400, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!(
+                "{}-point maximum",
+                temps_core::time_window::MAX_SERIES_POINTS
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("1 minute"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_7d() {
+        let (start, end) = fixture_range("2026-08-06T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("7d at 1h is 168 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_allows_1h_over_30d_scoped() {
+        // Project-scoped windows may be 30d; the UI uses 1h buckets (720 points).
+        let (start, end) = fixture_range("2026-07-14T00:00:00Z", "2026-08-13T00:00:00Z");
+        ProxyLogService::enforce_bucket_count(start, end, "1 hour")
+            .expect("30d at 1h is 720 buckets");
+    }
+
+    #[test]
+    fn enforce_bucket_count_rejects_malformed_interval() {
+        let (start, end) = fixture_range("2026-08-13T00:00:00Z", "2026-08-13T01:00:00Z");
+        let err = ProxyLogService::enforce_bucket_count(start, end, "1 fortnight")
+            .expect_err("unknown unit");
+        let ProxyLogServiceError::InvalidFilter(msg) = err else {
+            panic!("expected InvalidFilter, got {err:?}");
+        };
+        assert!(msg.contains("Invalid bucket interval"), "{msg}");
     }
 
     #[test]
@@ -2869,6 +3092,15 @@ mod tests {
             .expect("populated raw bucket");
         assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
+
+        // Percentiles are computed from raw response_time_ms on both paths
+        // ([20, 30, 50, 100] → p50=40, p95=92.5, p99=98.5 via percentile_cont).
+        assert!((cagg_busy.p50_response_time_ms - 40.0).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - 92.5).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - 98.5).abs() < 1e-9);
+        assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);
     }
 
     fn sample_proxy_log_model(request_id: &str) -> proxy_logs::Model {

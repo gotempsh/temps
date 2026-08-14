@@ -369,7 +369,8 @@ pub struct TimeBucketStatsQuery {
     /// End time (ISO 8601 format)
     #[param(value_type = String, example = "2025-10-23T23:59:59Z")]
     pub end_time: UtcDateTime,
-    /// Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+    /// Bucket interval (e.g., "1 hour", "1 day", "5 minutes").
+    /// Must keep `span / interval` ≤ 1000 buckets (7 days at 1 minute is rejected).
     #[serde(default = "default_bucket_interval")]
     pub bucket_interval: String,
     /// Filter by HTTP method

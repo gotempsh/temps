@@ -1634,10 +1634,13 @@ impl GitProviderManager {
         Ok(connections)
     }
 
-    /// Get connections for a user with pagination and sorting
+    /// Get all connections with pagination and sorting.
+    ///
+    /// Connections are visible to every authenticated user (single-tenant:
+    /// "the team is the app" for now) rather than scoped to their creator,
+    /// so teammates can share and reuse each other's git connections.
     pub async fn get_user_connections_paginated(
         &self,
-        caller_user_id: i32,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1646,8 +1649,7 @@ impl GitProviderManager {
         use sea_orm::QueryOrder;
 
         let mut query = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true))
-            .filter(git_provider_connections::Column::UserId.eq(Some(caller_user_id)));
+            .filter(git_provider_connections::Column::IsActive.eq(true));
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {

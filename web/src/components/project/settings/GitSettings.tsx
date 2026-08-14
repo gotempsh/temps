@@ -6,6 +6,7 @@ import {
 } from '@/api/client'
 import {
   detectPublicPresetsOptions,
+  getPublicRepositoryOptions,
   getRepositoryByIdOptions,
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
@@ -18,6 +19,7 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
+import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
 import {
   AlertDialog,
@@ -2525,6 +2527,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     owner: string
     name: string
   } | null>(() => parsePublicRepositoryUrl(initialPublicUrl))
+  // Branch to connect. Seeded from the currently-connected project's branch,
+  // and reset whenever the user picks a different repository (below) so the
+  // selector never carries a branch name over from an unrelated repo.
+  const [branch, setBranch] = useState<string>(project.main_branch || '')
   const [directory, setDirectory] = useState(project.directory || './')
   // Holds the selector's composite `slug::path` key, not a bare slug — a
   // monorepo can expose the same preset at several paths, and a bare slug
@@ -2559,6 +2565,19 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   // had to know their own stack instead of being told.
   const publicPresetQuery = useQuery({
     ...detectPublicPresetsOptions({
+      path: {
+        provider: parsedPublic?.provider || 'github',
+        owner: parsedPublic?.owner || '',
+        repo: parsedPublic?.name || '',
+      },
+    }),
+    enabled: mode === 'public' && !!parsedPublic,
+  })
+  // Public branch listings don't flag which entry is the default, so the
+  // branch selector can't sort/pre-select it without this — fetched
+  // separately since repo metadata and branch listing are different endpoints.
+  const publicRepositoryQuery = useQuery({
+    ...getPublicRepositoryOptions({
       path: {
         provider: parsedPublic?.provider || 'github',
         owner: parsedPublic?.owner || '',
@@ -2648,6 +2667,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       // dockerfile::examples/go-error-tracking".
       preset: splitPresetSelection(preset).preset || project.preset || 'custom',
       main_branch:
+        branch ||
         (selectedRepo as { default_branch?: string })?.default_branch ||
         project.main_branch ||
         'main',
@@ -2710,6 +2730,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               setMode('connection')
               setModeTouched(true)
               setSelectedRepoState(null)
+              setBranch('')
               navigate(connectionBasePath)
             }}
           >
@@ -2722,6 +2743,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               setMode('public')
               setModeTouched(true)
               setSelectedRepoState(null)
+              setBranch('')
               navigate(connectionBasePath)
             }}
           >
@@ -2778,6 +2800,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 connectionId={selectedConnectionId}
                 onSelect={(repo) => {
                   setSelectedRepoState(repo)
+                  setBranch(repo?.default_branch || '')
                   navigate(
                     repo
                       ? repositorySelectionPath(
@@ -2817,7 +2840,14 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               onChange={(e) => {
                 const url = e.target.value
                 setPublicUrl(url)
-                setParsedPublic(parsePublicRepositoryUrl(url))
+                const parsed = parsePublicRepositoryUrl(url)
+                if (
+                  parsed?.owner !== parsedPublic?.owner ||
+                  parsed?.name !== parsedPublic?.name
+                ) {
+                  setBranch('')
+                }
+                setParsedPublic(parsed)
               }}
             />
             {parsedPublic && (
@@ -2836,6 +2866,35 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       {repoToConnect && (
         <Card>
           <CardContent className="space-y-4 p-6">
+            <div className="space-y-2">
+              <Label>Branch</Label>
+              <BranchSelector
+                repoOwner={repoToConnect.owner}
+                repoName={repoToConnect.name}
+                connectionId={
+                  mode === 'connection'
+                    ? (selectedConnectionId ?? undefined)
+                    : undefined
+                }
+                defaultBranch={
+                  mode === 'connection'
+                    ? selectedRepo?.default_branch
+                    : publicRepositoryQuery.data?.default_branch
+                }
+                gitUrl={
+                  mode === 'public' && parsedPublic
+                    ? `https://${parsedPublic.provider === 'gitlab' ? 'gitlab.com' : 'github.com'}/${parsedPublic.owner}/${parsedPublic.name}`
+                    : undefined
+                }
+                value={branch}
+                onChange={setBranch}
+                onBranchesLoaded={(loaded) => {
+                  if (!branch && loaded.length > 0) {
+                    setBranch(loaded[0])
+                  }
+                }}
+              />
+            </div>
             <FrameworkSelector
               presetData={detectedPresetData as any}
               isLoading={detectedPresetLoading}

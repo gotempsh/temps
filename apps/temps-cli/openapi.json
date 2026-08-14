@@ -16096,6 +16096,41 @@
         ],
         "type": "object"
       },
+      "FailureReportPreviewResponse": {
+        "properties": {
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_job_type": {
+            "type": "string"
+          },
+          "github_issue_body": {
+            "type": "string"
+          },
+          "github_issue_title": {
+            "type": "string"
+          },
+          "redacted_log": {
+            "description": "Redacted, editable draft of the failure trace. Shown in a textarea the\nuser can edit before sending — nothing is sent without their review.",
+            "type": "string"
+          },
+          "reporting_enabled": {
+            "description": "Whether \"send to Temps\" should be offered. False when the operator\nopted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "redacted_log",
+          "reporting_enabled",
+          "failed_job_type",
+          "github_issue_title",
+          "github_issue_body"
+        ],
+        "type": "object"
+      },
       "FieldResponse": {
         "properties": {
           "field_type": {
@@ -33975,6 +34010,18 @@
         "required": [
           "id",
           "status"
+        ],
+        "type": "object"
+      },
+      "SendFailureReportRequest": {
+        "properties": {
+          "report_text": {
+            "description": "The report text as reviewed (and possibly edited) by the user.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "report_text"
         ],
         "type": "object"
       },
@@ -76317,6 +76364,136 @@
           }
         },
         "summary": "Get jobs for a specific deployment",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report": {
+      "get": {
+        "operationId": "get_failure_report_preview",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Failed job ID",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailureReportPreviewResponse"
+                }
+              }
+            },
+            "description": "Redacted failure-report preview"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ],
+        "summary": "Preview a redacted, editable copy of a failed job's trace.",
+        "tags": [
+          "Deployments"
+        ]
+      },
+      "post": {
+        "operationId": "send_failure_report",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Failed job ID",
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendFailureReportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Report sent"
+          },
+          "404": {
+            "description": "Job not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Failed to reach the central reporting endpoint"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ],
+        "summary": "Send a user-reviewed failure report to the Temps team.",
         "tags": [
           "Deployments"
         ]

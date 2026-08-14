@@ -65,6 +65,7 @@ libc = { workspace = true }
 tempfile = { workspace = true }
 urlencoding = { workspace = true }
 tokio-tungstenite = { workspace = true }
+regex = { workspace = true }
 # mTLS for the terminal WebSocket proxy (ADR-020 WS-2.1): build a rustls
 # ClientConfig presenting the CP's cluster-CA-signed identity.
 rustls = { workspace = true }

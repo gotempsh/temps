@@ -7518,6 +7518,23 @@ export type ExternalServiceSummary = {
     service_type: string;
 };
 
+export type FailureReportPreviewResponse = {
+    error_message?: string | null;
+    failed_job_type: string;
+    github_issue_body: string;
+    github_issue_title: string;
+    /**
+     * Redacted, editable draft of the failure trace. Shown in a textarea the
+     * user can edit before sending — nothing is sent without their review.
+     */
+    redacted_log: string;
+    /**
+     * Whether "send to Temps" should be offered. False when the operator
+     * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+     */
+    reporting_enabled: boolean;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -15521,6 +15538,13 @@ export type SendEmailResponseBody = {
      * Email status
      */
     status: string;
+};
+
+export type SendFailureReportRequest = {
+    /**
+     * The report text as reviewed (and possibly edited) by the user.
+     */
+    report_text: string;
 };
 
 export type SendMessageRequest = {
@@ -40282,6 +40306,90 @@ export type GetDeploymentJobsResponses = {
 };
 
 export type GetDeploymentJobsResponse = GetDeploymentJobsResponses[keyof GetDeploymentJobsResponses];
+
+export type GetFailureReportPreviewData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type GetFailureReportPreviewErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFailureReportPreviewResponses = {
+    /**
+     * Redacted failure-report preview
+     */
+    200: FailureReportPreviewResponse;
+};
+
+export type GetFailureReportPreviewResponse = GetFailureReportPreviewResponses[keyof GetFailureReportPreviewResponses];
+
+export type SendFailureReportData = {
+    body: SendFailureReportRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+        /**
+         * Failed job ID
+         */
+        job_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report';
+};
+
+export type SendFailureReportErrors = {
+    /**
+     * Job not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Failed to reach the central reporting endpoint
+     */
+    502: unknown;
+};
+
+export type SendFailureReportResponses = {
+    /**
+     * Report sent
+     */
+    204: void;
+};
+
+export type SendFailureReportResponse = SendFailureReportResponses[keyof SendFailureReportResponses];
 
 export type GetDeploymentJobLogsData = {
     body?: never;

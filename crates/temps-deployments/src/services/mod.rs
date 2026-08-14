@@ -52,3 +52,9 @@ pub use remote_log_source::*;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;
+
+pub mod log_redaction;
+pub use log_redaction::*;
+
+pub mod failure_report_service;
+pub use failure_report_service::*;

@@ -810,7 +810,7 @@ pub async fn list_connections(
 
     let (connections, total_count) = state
         .git_provider_manager
-        .get_user_connections_paginated(auth.user_id(), page, per_page, sort, direction)
+        .get_user_connections_paginated(page, per_page, sort, direction)
         .await?;
 
     let response_connections: Vec<ConnectionResponse> = connections
@@ -859,17 +859,9 @@ pub async fn sync_repositories(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesSync);
 
-    // Ownership check, mirroring list_repositories_by_connection below:
-    // without this, any authenticated user could trigger a background sync
-    // (including an OAuth token refresh) on another user's git connection by
-    // guessing/enumerating an integer connection_id.
-    let connection = state
-        .git_provider_manager
-        .get_connection(connection_id)
-        .await?;
-    if connection.user_id != Some(auth.user_id()) {
-        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
-    }
+    // Connections are shared across all authenticated users (single-tenant:
+    // "the team is the app" for now), so any user with GitRepositoriesSync
+    // may sync any connection -- no per-owner ownership check here.
 
     // Fire and forget: the manager spawns a detached task owning a drop
     // guard that resets `syncing=false` on every exit path. We can
@@ -927,13 +919,13 @@ pub async fn list_repositories_by_connection(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    let connection = state
+    // 404s if the connection doesn't exist. Connections are shared across all
+    // authenticated users (single-tenant: "the team is the app" for now), so
+    // no per-owner ownership check here.
+    state
         .git_provider_manager
         .get_connection(connection_id)
         .await?;
-    if connection.user_id != Some(auth.user_id()) {
-        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
-    }
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(30).min(100);
@@ -1090,13 +1082,12 @@ pub async fn list_repositories_by_provider(
 
     // provider_id identifies a shared, platform-level OAuth app/PAT config --
     // many users can each have their own git_provider_connections row against
-    // the same provider, so this must stay scoped to the caller's own user_id
-    // or it leaks every other user's repositories (names, clone/SSH URLs,
-    // private flag).
-    let user_id = auth.user_id();
+    // the same provider. Connections (and their repositories) are shared
+    // across all authenticated users (single-tenant: "the team is the app"
+    // for now), so this is intentionally not scoped to the caller's user_id.
     let filter = RepositoryFilter {
         provider_id: Some(provider_id),
-        user_id: Some(user_id),
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),
@@ -1112,7 +1103,7 @@ pub async fn list_repositories_by_provider(
     // For total count, make a separate call without pagination.
     let count_filter = RepositoryFilter {
         provider_id: Some(provider_id),
-        user_id: Some(user_id),
+        user_id: None,
         search: query.search.clone(),
         owner: query.owner.clone(),
         language: query.language.clone(),

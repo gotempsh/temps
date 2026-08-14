@@ -4,3 +4,12 @@
 #
 # No cron jobs. No API key yet (ingest is open; auth + the dashboard UI ship
 # in a later deploy).
+#
+# NOTE: the production project is an image deployment (deploy:local-image),
+# not a git-linked one, so Temps does NOT read this file's `health` key today
+# -- image/static deployments only take their health path from the deploy
+# request (`--health-check-path`). This is kept in sync with that flag so the
+# repo stays self-documenting, and so it starts working automatically if the
+# project is ever switched to a git-based deploy.
+health:
+  path: /health

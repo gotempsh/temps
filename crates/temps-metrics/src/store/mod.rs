@@ -24,17 +24,47 @@ pub fn is_monotonic_counter(metric_name: &str) -> bool {
         || metric_name.ends_with(".count")
 }
 
+/// Widen `requested` so `window / step` stays ≤ [`temps_core::time_window::MAX_SERIES_POINTS`].
+///
+/// A 7-day window at 1 minute is 10_080 points. Preset steps from
+/// [`duration_to_step`] already sit under the cap; this is the backstop when a
+/// caller passes a finer `RangeQuery::step` than the window can support.
+pub fn clamp_step(window: Duration, requested: Duration) -> Duration {
+    let window_secs = window.num_seconds().max(1);
+    let requested_secs = requested.num_seconds().max(1);
+    let min_step_secs = temps_core::time_window::min_step_secs(window_secs);
+    Duration::seconds(requested_secs.max(min_step_secs))
+}
+
+/// Bucket step for a metric range query, matching the node-metrics UI
+/// presets: 1m for ≤1h, 5m for ≤6h, 15m for ≤24h, 1h otherwise.
+/// Always passed through [`clamp_step`] so a wide window cannot emit 1-minute
+/// buckets.
+pub fn duration_to_step(window: Duration) -> Duration {
+    let requested = if window <= Duration::hours(1) {
+        Duration::minutes(1)
+    } else if window <= Duration::hours(6) {
+        Duration::minutes(5)
+    } else if window <= Duration::hours(24) {
+        Duration::minutes(15)
+    } else {
+        Duration::hours(1)
+    };
+    clamp_step(window, requested)
+}
+
 /// Convert a UI `range` string (`1h`, `6h`, `24h`, `7d`) to
 /// `(window_duration, bucket_step)` for a [`RangeQuery`]. Unknown ranges
 /// fall back to the 1-hour window.
 pub fn range_to_step(range: &str) -> (Duration, Duration) {
-    match range {
-        "1h" => (Duration::hours(1), Duration::minutes(1)),
-        "6h" => (Duration::hours(6), Duration::minutes(5)),
-        "24h" => (Duration::hours(24), Duration::minutes(15)),
-        "7d" => (Duration::days(7), Duration::hours(1)),
-        _ => (Duration::hours(1), Duration::minutes(1)),
-    }
+    let window = match range {
+        "1h" => Duration::hours(1),
+        "6h" => Duration::hours(6),
+        "24h" => Duration::hours(24),
+        "7d" => Duration::days(7),
+        _ => Duration::hours(1),
+    };
+    (window, duration_to_step(window))
 }
 
 /// The kind of metric value being stored.
@@ -250,6 +280,43 @@ mod tests {
         let (window, step) = range_to_step("30d");
         assert_eq!(window, Duration::hours(1));
         assert_eq!(step, Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_duration_to_step_matches_preset_windows() {
+        assert_eq!(duration_to_step(Duration::hours(1)), Duration::minutes(1));
+        assert_eq!(duration_to_step(Duration::hours(6)), Duration::minutes(5));
+        assert_eq!(duration_to_step(Duration::hours(24)), Duration::minutes(15));
+        assert_eq!(duration_to_step(Duration::days(7)), Duration::hours(1));
+    }
+
+    #[test]
+    fn test_duration_to_step_custom_windows() {
+        assert_eq!(
+            duration_to_step(Duration::minutes(90)),
+            Duration::minutes(5)
+        );
+        assert_eq!(duration_to_step(Duration::hours(12)), Duration::minutes(15));
+        assert_eq!(duration_to_step(Duration::hours(48)), Duration::hours(1));
+    }
+
+    #[test]
+    fn test_clamp_step_coarsens_1m_over_7d() {
+        let window = Duration::days(7);
+        let clamped = clamp_step(window, Duration::minutes(1));
+        let points =
+            temps_core::time_window::bucket_count(window.num_seconds(), clamped.num_seconds());
+        assert!(
+            points <= temps_core::time_window::MAX_SERIES_POINTS,
+            "7d at 1m must not emit {points} points"
+        );
+        assert!(clamped > Duration::minutes(1));
+    }
+
+    #[test]
+    fn test_clamp_step_preserves_preset_7d_hourly() {
+        let window = Duration::days(7);
+        assert_eq!(clamp_step(window, Duration::hours(1)), Duration::hours(1));
     }
 
     #[test]

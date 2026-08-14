@@ -128,6 +128,15 @@ fn confined_archive_path(
     Ok(data_dir.join(relative))
 }
 
+/// A public git repository + branch, returned only for projects whose repo
+/// is actually public -- see [`DeploymentService::get_public_repo_reference`].
+#[derive(Clone, Debug)]
+pub struct RepoReference {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -2167,7 +2176,7 @@ impl DeploymentService {
 
                     // Update deploy job record to Success
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -2182,7 +2191,7 @@ impl DeploymentService {
 
                     // Update deploy job record to Failure
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -2250,7 +2259,7 @@ impl DeploymentService {
 
                     // Update complete job record to Success
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -2259,7 +2268,7 @@ impl DeploymentService {
 
                     // Update complete job record to Failure
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -2833,7 +2842,7 @@ impl DeploymentService {
                     promote_context = job_result.context;
 
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -2847,7 +2856,7 @@ impl DeploymentService {
                     };
 
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -2908,7 +2917,7 @@ impl DeploymentService {
                     info!("Promotion: Mark complete job executed successfully");
 
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -2916,7 +2925,7 @@ impl DeploymentService {
                     error!("Promotion: Mark complete job failed: {}", e);
 
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -3614,6 +3623,53 @@ impl DeploymentService {
             })?;
 
         Ok(jobs)
+    }
+
+    /// The project's git host reference (owner/repo + branch) for a
+    /// deployment, but ONLY when the repo is public -- returns `None` for a
+    /// private repo or a project with no git connection at all (e.g. a
+    /// manual/CLI upload). Callers that surface this externally (e.g. in a
+    /// GitHub issue template on a public repo) must never see a private
+    /// repo's URL, so the `is_public_repo` check happens here rather than
+    /// being left to each caller to remember.
+    pub async fn get_public_repo_reference(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+    ) -> Result<Option<RepoReference>, DeploymentError> {
+        use temps_entities::projects;
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "deployment {} for project {} not found",
+                    deployment_id, project_id
+                ))
+            })?;
+
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+
+        if !project.is_public_repo {
+            return Ok(None);
+        }
+
+        Ok(Some(RepoReference {
+            owner: project.repo_owner,
+            repo: project.repo_name,
+            branch: deployment.branch_ref.unwrap_or(project.main_branch),
+        }))
     }
 
     /// Cancel all running deployments with a given reason
@@ -7127,6 +7183,165 @@ mod tests {
             .get_deployment_jobs(deployment.project_id + 999, deployment.id)
             .await;
         assert!(matches!(foreign_result, Err(DeploymentError::NotFound(_))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failure_report_preview_stops_at_failed_job_and_redacts_secrets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping failure-report preview test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let enc = create_test_encryption_service();
+        let log_base = std::env::temp_dir();
+        let log_service = Arc::new(temps_logs::LogService::new(log_base.clone()));
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let mut secrets_config = serde_json::Map::new();
+        let mut secret_map = std::collections::HashMap::new();
+        secret_map.insert("DB_PASSWORD".to_string(), "super-secret-value".to_string());
+        crate::services::sensitive_envelope::write_sealed(
+            &mut secrets_config,
+            enc.as_ref(),
+            "secrets",
+            &secret_map,
+        )?;
+
+        let jobs = [
+            (
+                "download_repo",
+                "Download Repo",
+                0,
+                temps_entities::types::JobStatus::Success,
+                None,
+                None,
+            ),
+            (
+                "build_image",
+                "Build Image",
+                1,
+                temps_entities::types::JobStatus::Failure,
+                Some("build failed: exit code 1".to_string()),
+                Some(serde_json::Value::Object(secrets_config)),
+            ),
+            (
+                "deploy_container",
+                "Deploy Container",
+                2,
+                temps_entities::types::JobStatus::Skipped,
+                None,
+                None,
+            ),
+        ];
+
+        for (job_id, name, order, status, error_message, job_config) in jobs {
+            let log_id = format!("{unique}-{job_id}");
+            // `download_repo` deliberately never writes its log file, to
+            // exercise a job that finished too fast to log anything (e.g.
+            // PrepareSourceBundleJob) -- the preview must still succeed.
+            if job_id != "download_repo" {
+                tokio::fs::write(
+                    log_base.join(format!("{log_id}.log")),
+                    format!("log output for {job_id}, secret is super-secret-value\n"),
+                )
+                .await?;
+            }
+
+            temps_entities::deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set(format!("{job_id}Job")),
+                name: Set(name.to_string()),
+                log_id: Set(log_id),
+                status: Set(status),
+                error_message: Set(error_message),
+                job_config: Set(job_config),
+                execution_order: Set(Some(order)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let deployment_service = Arc::new(create_deployment_service_for_test(db.clone()));
+        let failure_service =
+            crate::services::FailureReportService::new(deployment_service, log_service, enc)?;
+
+        let preview = failure_service
+            .build_preview(deployment.project_id, deployment.id, "build_image")
+            .await?;
+
+        assert_eq!(
+            preview.error_message.as_deref(),
+            Some("build failed: exit code 1")
+        );
+        assert!(preview.redacted_log.contains("download_repo"));
+        assert!(
+            preview
+                .redacted_log
+                .contains("no log output for this stage"),
+            "a job with no log file must degrade to a placeholder, not fail the whole preview"
+        );
+        assert!(preview.redacted_log.contains("build_image"));
+        assert!(
+            !preview.redacted_log.contains("deploy_container"),
+            "trace must stop at the failed job, not include later jobs"
+        );
+        assert!(
+            !preview.redacted_log.contains("super-secret-value"),
+            "known secret value must be redacted from the trace"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_public_repo_reference_none_for_private_none_for_public(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        // setup_test_data's project doesn't set is_public_repo, so it defaults
+        // to private -- must never leak repo_owner/repo_name into a public
+        // GitHub issue template.
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let private_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?;
+        assert!(
+            private_result.is_none(),
+            "a private (or unlinked) repo must never be surfaced"
+        );
+
+        let mut project_update: projects::ActiveModel = project.clone().into();
+        project_update.is_public_repo = Set(true);
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.clone().into();
+        deployment_update.branch_ref = Set(Some("feat/some-branch".to_string()));
+        deployment_update.update(db.as_ref()).await?;
+
+        let public_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?
+            .expect("public repo must return a reference");
+        assert_eq!(public_result.owner, "test-owner");
+        assert_eq!(public_result.repo, "test-repo");
+        assert_eq!(public_result.branch, "feat/some-branch");
 
         Ok(())
     }
