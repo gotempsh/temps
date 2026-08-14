@@ -128,18 +128,27 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
                 "OTLP extract_token"
             );
             if let Some(key) = value.strip_prefix("Bearer ") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
             // Some OTLP exporters send the literal string "Bearer%20<token>"
             if let Some(key) = value.strip_prefix("Bearer%20") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
         }
     }
 
     if let Some(key) = headers.get("x-temps-api-key") {
         if let Ok(value) = key.to_str() {
-            return Some(value.trim().to_string());
+            let key = value.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
         }
     }
 
@@ -1092,6 +1101,19 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_token_treats_empty_credentials_as_missing() {
+        for (header, value) in [
+            ("authorization", "Bearer "),
+            ("authorization", "Bearer%20"),
+            ("x-temps-api-key", ""),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(extract_token(&headers), None, "header: {header}");
+        }
+    }
+
+    #[test]
     fn test_extract_token_bearer_takes_priority() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer tk_first".parse().unwrap());
@@ -1176,6 +1198,22 @@ mod tests {
             error,
             OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
         ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_malformed_hex_slug() {
+        let oversized_slug = "61".repeat(65);
+        for encoded_slug in ["not-hex", "ff", oversized_slug.as_str()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-temps-project-slug-hex", encoded_slug.parse().unwrap());
+
+            let error = missing_auth_token_error(&headers);
+
+            assert!(matches!(
+                error,
+                OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+            ));
+        }
     }
 
     // ── content_encoding tests ─────────────────────────────────────
