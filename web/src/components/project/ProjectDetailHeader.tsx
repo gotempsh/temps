@@ -11,7 +11,7 @@ import {
   type GitProviderKind,
 } from '@/lib/project-header-actions'
 import { useQuery } from '@tanstack/react-query'
-import { GitFork, Globe2, Rocket, Users } from 'lucide-react'
+import { ExternalLink, GitFork, Rocket, Users } from 'lucide-react'
 import BitbucketIcon from '@/icons/Bitbucket'
 import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
@@ -160,18 +160,18 @@ export function ProjectDetailHeader({
             </button>
           )}
           {repositoryUrl && (
-            <Button variant="outline" size="sm" asChild>
+            <Button variant="outline" size="icon" className="size-9" asChild>
               <a
                 href={repositoryUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="Open repository in a new window"
+                title="Open repository"
               >
                 <RepositoryProviderIcon
                   provider={repositoryProvider}
                   className="size-4"
                 />
-                <span className="hidden md:inline">Repository</span>
               </a>
             </Button>
           )}
@@ -184,7 +184,7 @@ export function ProjectDetailHeader({
                 aria-label="Visit deployed site in a new window"
                 title="Visit deployed site"
               >
-                <Globe2 className="size-4" />
+                <ExternalLink className="size-4" />
               </a>
             </Button>
           )}
