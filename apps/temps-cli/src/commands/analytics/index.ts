@@ -11,6 +11,7 @@ import {
   apiCallers,
   apiSummary,
 } from './api-traffic.js'
+import { performanceInsights } from './performance.js'
 
 export function registerAnalyticsCommands(program: Command): void {
   const analytics = program
@@ -57,6 +58,35 @@ export function registerAnalyticsCommands(program: Command): void {
     )
     .option('--json', 'Output in JSON format')
     .action(funnelsOverview)
+
+  analytics
+    .command('performance')
+    .alias('speed')
+    .description('Show real-user Web Vitals and optional dimension breakdowns')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option(
+      '--period <period>',
+      'Time period: today, <n>h, <n>d, <n>m (ignored with --start-date/--end-date)',
+      '7d'
+    )
+    .option('--start-date <date>', 'Explicit window start (RFC 3339; requires --end-date)')
+    .option('--end-date <date>', 'Explicit window end (RFC 3339; requires --start-date)')
+    .option('--environment-id <id>', 'Restrict samples to one environment ID')
+    .option('--deployment-id <id>', 'Restrict samples to one deployment ID')
+    .option('--device <device>', 'Device filter: desktop or mobile')
+    .option('--include-bots', 'Include crawler and datacenter bot samples')
+    .option(
+      '--group-by <dimension>',
+      'Break down by path, country, region, city, device_type, browser, or operating_system'
+    )
+    .option('--path <path>', 'Restrict samples to one page pathname')
+    .option('--country <country>', 'Restrict samples to one country')
+    .option('--region <region>', 'Restrict samples to one region')
+    .option('--city <city>', 'Restrict samples to one city')
+    .option('--browser <browser>', 'Restrict samples to one browser')
+    .option('--os <operating-system>', 'Restrict samples to one operating system')
+    .option('--json', 'Output in JSON format')
+    .action(performanceInsights)
 
   analytics
     .command('ai-agents')
@@ -196,6 +226,12 @@ Examples:
   $ temps analytics top referrers --period 1h
   $ temps analytics top browsers --period 48h --json
   $ temps analytics top countries --period 3m --limit 50
+
+  Performance Insights (real-user Web Vitals):
+  $ temps analytics performance -p my-app --period 7d --device desktop
+  $ temps analytics speed -p my-app --period 7d --device mobile
+  $ temps analytics performance -p my-app --group-by path --device mobile
+  $ temps analytics performance -p my-app --start-date 2026-08-01T00:00:00Z --end-date 2026-08-08T00:00:00Z --json
 
   AI agents (mirrors /analytics/ai-agents):
   $ temps analytics ai-agents -p my-app --period 24h

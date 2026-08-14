@@ -1,6 +1,6 @@
 ---
 name: temps-cli
-description: Operate Temps through the pinned `@temps-sdk/cli` package with bunx or npx. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a CLI command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
+description: Operate Temps through the pinned `@temps-sdk/cli` package with bunx or npx. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a CLI command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, browser Performance Insights/Core Web Vitals, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
 ---
 
 # Temps CLI
@@ -78,6 +78,10 @@ npx @temps-sdk/cli@0.1.33 --version
 Never use unpinned `bunx @temps-sdk/cli`, `npx @temps-sdk/cli`, a globally
 installed mutable version, or a downloaded script.
 
+For Performance Insights, confirm `analytics performance --help` exists in the
+reviewed runtime. If it does not, report the version gap instead of silently
+substituting OTel `metrics` or the traffic-only `analytics top devices` query.
+
 ## Discover commands efficiently
 
 The generated catalog contains every command, subcommand, alias, and option for
@@ -100,7 +104,7 @@ Use these routing hints:
 | Manage databases and storage | `services`, `backups`, `data`, `kv`, `blob` |
 | Configure traffic and TLS | `domains`, `custom-domains`, `dns`, `dns-provider` |
 | Inspect runtime behavior | `containers`, `runtime-logs`, `proxy-logs`, `services` |
-| Operate observability | `analytics`, `errors`, `traces`, `session-replay`, `monitors`, `incidents` |
+| Operate observability or review desktop/mobile Web Vitals | `analytics`, `errors`, `traces`, `session-replay`, `monitors`, `incidents` |
 | Configure telemetry forwarding | `otel-forward` |
 | Manage Cloud integration | `cloud` |
 | Manage agent capabilities | `sandbox`, `skills`, `mcp-servers`, `secrets`, `workflow`, `ai` |
