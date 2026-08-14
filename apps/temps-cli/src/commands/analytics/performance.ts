@@ -152,9 +152,15 @@ export async function fetchPerformanceData(
     groupBy ? api.getBreakdown({ ...query, group_by: groupBy }) : Promise.resolve(undefined),
   ])
 
-  if (summaryResult.error) throw new Error(getErrorMessage(summaryResult.error))
-  if (timelineResult.error) throw new Error(getErrorMessage(timelineResult.error))
-  if (breakdownResult?.error) throw new Error(getErrorMessage(breakdownResult.error))
+  if (summaryResult.error) {
+    throw new Error(sanitizeTerminalText(getErrorMessage(summaryResult.error)))
+  }
+  if (timelineResult.error) {
+    throw new Error(sanitizeTerminalText(getErrorMessage(timelineResult.error)))
+  }
+  if (breakdownResult?.error) {
+    throw new Error(sanitizeTerminalText(getErrorMessage(breakdownResult.error)))
+  }
 
   return {
     summary: summaryResult.data,
@@ -251,7 +257,7 @@ function formatGroupKey(value: string): string {
 
 function renderBreakdown(groups: GroupedPageMetric[], groupedBy: string, totalEvents: number): void {
   newline()
-  console.log(`  ${chalk.bold.white(`Breakdown by ${groupedBy}`)}`)
+  console.log(`  ${chalk.bold.white(`Breakdown by ${sanitizeTerminalText(groupedBy)}`)}`)
   console.log(
     `  ${chalk.gray('Value'.padEnd(36))}${chalk.gray('Samples'.padStart(10))}${chalk.gray('LCP'.padStart(10))}${chalk.gray('INP'.padStart(10))}${chalk.gray('CLS'.padStart(10))}${chalk.gray('FCP'.padStart(10))}${chalk.gray('TTFB'.padStart(10))}`
   )
@@ -283,7 +289,7 @@ export async function performanceInsights(options: PerformanceOptions): Promise<
     path: { slug: resolved.slug },
   })
   if (projectError) {
-    throw new Error(getErrorMessage(projectError))
+    throw new Error(sanitizeTerminalText(getErrorMessage(projectError)))
   }
   if (!project) {
     throw new Error(`Project "${safeProjectSlug}" not found`)
