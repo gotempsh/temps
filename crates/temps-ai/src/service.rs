@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::streaming::{
-    ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream, ToolExecutor,
-    TurnServices,
+    ChatMessage, ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream,
+    ToolExecutor, TurnServices,
 };
 use crate::{ProviderCapabilities, RefreshPolicy};
 
@@ -34,6 +34,9 @@ pub struct AiRequest {
     pub max_tokens: Option<u32>,
     /// Sampling temperature (provider default when `None`).
     pub temperature: Option<f32>,
+    /// Provider-normalized reasoning depth. Callers must validate this value
+    /// against [`ProviderCapabilities`] before dispatching it.
+    pub thinking_level: Option<String>,
     /// When set, the provider is asked to return JSON matching this JSON Schema.
     /// Usually populated by [`crate::complete_typed`] from a Rust type rather than
     /// by hand.
@@ -121,6 +124,44 @@ pub trait AiService: Send + Sync {
     /// Low-level completion. Prefer the [`crate::complete_text`] /
     /// [`crate::complete_typed`] helpers for everyday use.
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError>;
+
+    /// Stream a single-pass completion. Providers with native structured
+    /// streaming override this method so `response_schema` is enforced by the
+    /// provider. The default adapter keeps every [`AiService`] reusable: it
+    /// translates the request into a tool-less chat stream and embeds the JSON
+    /// Schema in the system instruction for providers (notably host CLIs) that
+    /// cannot accept a native response-format argument.
+    async fn complete_stream(&self, request: AiRequest) -> Result<TokenStream, AiError> {
+        let mut system = request.system.unwrap_or_default();
+        if let Some(schema) = request.response_schema {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(
+                "Return only one JSON object matching this JSON Schema. Do not use Markdown fences:\n",
+            );
+            system.push_str(&schema.to_string());
+        }
+
+        let mut messages = Vec::with_capacity(2);
+        if !system.is_empty() {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(request.prompt));
+
+        self.chat_stream(ChatTurnRequest {
+            purpose: request.purpose,
+            project_id: request.project_id,
+            provider: request.provider,
+            messages,
+            model: request.model,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            thinking_level: request.thinking_level,
+            ..Default::default()
+        })
+        .await
+    }
 
     /// Multi-turn streaming completion (ADR-023): replays the supplied history
     /// and streams the assistant reply token-by-token. The substrate for

@@ -7,7 +7,7 @@ export const metadata = {
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-08-07
+> Generated on: 2026-08-14
 
 ## Installation
 
@@ -225,6 +225,9 @@ Update deployment configuration (resources, replicas)
 | `--memory-limit <limit>` | Memory limit in MB | - | Yes |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
+| `--request-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | Yes |
+| `--sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | Yes |
+| `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 
@@ -343,6 +346,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
 
@@ -444,6 +448,40 @@ Show deployment build logs
 | `-n, --lines <number>` | Number of lines to show | `100` | Yes |
 | `-d, --deployment <id>` | Specific deployment ID | - | Yes |
 
+### `deployments failure-report`
+
+Preview or send a redacted deploy-failure trace
+
+**Subcommands:**
+
+- `preview` - Preview the redacted, editable failure-report text for a failed job
+- `send` - Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+#### `deployments failure-report preview`
+
+Preview the redacted, editable failure-report text for a failed job
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+
+#### `deployments failure-report send`
+
+Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+| `--text-file <path>` | Read the (already-reviewed) report text from a file | - | Yes |
+
 ## `domains` (alias: `domain`)
 
 Manage custom domains
@@ -456,6 +494,7 @@ Manage custom domains
 - `remove` (`rm`) - Remove a domain
 - `ssl` - Manage SSL certificate
 - `status` - Check domain status
+- `renewal-attempts` - Show the certificate renewal-attempt history for a domain
 - `orders` (`order`) - Manage ACME orders for SSL certificate provisioning
 - `dns-challenge` - Setup DNS challenge records automatically using a DNS provider
 - `http-debug` - Debug HTTP-01 challenge for a domain
@@ -524,6 +563,19 @@ Check domain status
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
+
+### `domains renewal-attempts`
+
+Show the certificate renewal-attempt history for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
+| `--page <page>` | Page number (1-indexed) | `1` | Yes |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ### `domains orders` (alias: `order`)
 
@@ -623,6 +675,7 @@ Manage environments and environment variables
 - `delete` (`rm`) - Delete an environment
 - `vars` - Manage environment variables
 - `resources` - View or set CPU/memory resources for an environment
+- `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
 - `crons` - Manage cron jobs
@@ -762,6 +815,21 @@ View or set CPU/memory resources for an environment
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | Yes |
 | `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | Yes |
 | `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `environments timeouts`
+
+View or set upstream request/idle timeouts for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--request <seconds>` | Timeout for regular (non-streaming) HTTP requests, in seconds | - | Yes |
+| `--sse-idle <seconds>` | Idle timeout for Server-Sent Events streams, in seconds | - | Yes |
+| `--websocket-idle <seconds>` | Idle timeout for WebSocket connections, in seconds | - | Yes |
+| `--inherit` | Clear all three overrides (inherit the project/global defaults) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments force-https`
@@ -1970,6 +2038,10 @@ Update platform settings
 | `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | Yes |
 | `--rate-limiting-rpm <rpm>` | Requests per minute | - | Yes |
 | `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | Yes |
+| `--max-request-timeout <seconds>` | Hard ceiling for all upstream request/idle timeouts, in seconds | - | Yes |
+| `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | Yes |
+| `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | Yes |
+| `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
@@ -2119,7 +2191,7 @@ Create a new user
 | `-u, --username <username>` | Username | - | Yes |
 | `-e, --email <email>` | Email address | - | Yes |
 | `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | Yes |
-| `-r, --roles <roles>` | Comma-separated roles (admin, developer, viewer) | - | Yes |
+| `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `users me`
@@ -2199,7 +2271,7 @@ Create a new API key
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | API key name | - | Yes |
-| `-r, --role <role>` | Role type (admin, developer, viewer, readonly) | - | Yes |
+| `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | Yes |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | Yes |
 | `-p, --permissions <permissions>` | Comma-separated list of permissions | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -2815,6 +2887,160 @@ Show or set whether the built-in AI assistant may read this service's rows
 |------|-------------|---------|----------|
 | `--enable` | Allow the built-in assistant to read row data | - | No |
 | `--disable` | Stop the built-in assistant reading row data | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `analytics` (alias: `stats`)
+
+View project analytics
+
+**Subcommands:**
+
+- `overview` (`o`) - Show analytics dashboard overview
+- `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `funnels` - Show funnel conversion metrics for all funnels
+- `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
+- `ai-pages` - Show pages crawled by AI agents, with distinct-agent counts
+- `ai-page` - Show which agents/providers crawled a single page (e.g. /docs)
+- `api-overview` - Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+- `api-routes` - Show top API routes by request count from /api-analytics/routes
+- `api-callers` - Show top API callers by client IP from /api-analytics/callers
+- `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+### `analytics overview` (alias: `o`)
+
+Show analytics dashboard overview
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics top`
+
+Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics funnels`
+
+Show funnel conversion metrics for all funnels
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-agents`
+
+Show AI crawler / provider breakdown (web /analytics/ai-agents)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of rows to fetch (default: 20, max: 100) | - | Yes |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
+| `--path <path>` | Restrict to one URL path (e.g. /docs) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-pages`
+
+Show pages crawled by AI agents, with distinct-agent counts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of pages to fetch (default: 20, max: 100) | - | Yes |
+| `--path <path>` | Restrict to one URL path (returns just that row) | - | Yes |
+| `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-page`
+
+Show which agents/providers crawled a single page (e.g. /docs)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | Yes |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-overview`
+
+Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-routes`
+
+Show top API routes by request count from /api-analytics/routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of routes to return (default: 20, max: 100) | - | Yes |
+| `--offset <n>` | Number of ranked routes to skip (default: 0) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-callers`
+
+Show top API callers by client IP from /api-analytics/callers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of callers to return (default: 20, max: 100) | - | Yes |
+| `--offset <n>` | Number of ranked callers to skip (default: 0) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-summary`
+
+Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
 | `--json` | Output in JSON format | - | No |
 
 

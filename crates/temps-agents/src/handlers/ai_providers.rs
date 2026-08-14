@@ -104,6 +104,12 @@ pub struct ProviderCatalogDto {
     /// process environment (for example `chatgpt_subscription` or
     /// `host_auth_store`). Never contains credential material.
     pub host_auth_method: Option<String>,
+    /// Installed CLI version used as part of the model-cache identity.
+    pub host_version: Option<String>,
+    /// `live`, `cache`, `stale_cache`, or `bootstrap`.
+    pub model_source: String,
+    /// Time of the last successful account-aware CLI model discovery.
+    pub models_refreshed_at: Option<String>,
     /// Explains why `host_authenticated` is false (not installed vs.
     /// installed-but-not-authenticated), or `None` when it's true.
     pub host_auth_hint: Option<String>,
@@ -234,23 +240,77 @@ pub async fn list_ai_providers(
             None
         };
 
-        let (host_authenticated, host_auth_method, host_auth_hint) =
-            match crate::ai_cli::create_provider(entry.id) {
-                Some(provider) => {
-                    let status = provider.get_status().await;
-                    let authenticated = status.installed && status.authenticated;
-                    (
-                        authenticated,
-                        status.auth_method,
-                        if authenticated {
-                            None
-                        } else {
-                            status.setup_hint
-                        },
+        let (
+            host_authenticated,
+            host_auth_method,
+            host_auth_hint,
+            host_version,
+            discovered_models,
+            discovered_source,
+            models_refreshed_at,
+        ) = match crate::ai_cli::create_provider(entry.id) {
+            Some(provider) => {
+                let status = provider.get_status().await;
+                let authenticated = status.installed && status.authenticated;
+                let version = status.version.clone();
+                let identity = format!(
+                    "{}|{}|{}|{}",
+                    version.as_deref().unwrap_or("unknown"),
+                    status.auth_method.as_deref().unwrap_or("unknown"),
+                    status.email.as_deref().unwrap_or("unknown"),
+                    status.subscription_type.as_deref().unwrap_or("unknown")
+                );
+                let snapshot = if status.installed {
+                    Some(
+                        crate::ai_cli::discover_model_capabilities_cached(
+                            provider.as_ref(),
+                            identity,
+                            false,
+                        )
+                        .await,
                     )
-                }
-                None => (false, None, None),
-            };
+                } else {
+                    None
+                };
+                let models = snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        snapshot
+                            .models
+                            .iter()
+                            .map(|model| model.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    authenticated,
+                    status.auth_method,
+                    if authenticated {
+                        None
+                    } else {
+                        status.setup_hint
+                    },
+                    version,
+                    models,
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.source)
+                        .unwrap_or("unavailable"),
+                    snapshot.as_ref().and_then(|snapshot| {
+                        (!snapshot.models.is_empty()).then(|| snapshot.refreshed_at.to_rfc3339())
+                    }),
+                )
+            }
+            None => (false, None, None, None, Vec::new(), "unavailable", None),
+        };
+        let (models, model_source) = if discovered_models.is_empty() {
+            (
+                entry.models.iter().map(|model| model.to_string()).collect(),
+                "bootstrap".to_string(),
+            )
+        } else {
+            (discovered_models, discovered_source.to_string())
+        };
 
         providers.push(ProviderCatalogDto {
             id: entry.id.to_string(),
@@ -276,7 +336,7 @@ pub async fn list_ai_providers(
                     },
                 })
                 .collect(),
-            models: entry.models.iter().map(|m| m.to_string()).collect(),
+            models,
             credential_saved,
             current_auth_type,
             default_model: provider_cfg.default_model.clone(),
@@ -288,6 +348,9 @@ pub async fn list_ai_providers(
             supports_max_turns: entry.id == "claude_cli",
             host_authenticated,
             host_auth_method,
+            host_version,
+            model_source,
+            models_refreshed_at,
             host_auth_hint,
         });
     }

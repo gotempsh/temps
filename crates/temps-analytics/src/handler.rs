@@ -1,3 +1,5 @@
+use crate::api_traffic::ApiTrafficService;
+use crate::types::api_traffic::*;
 use crate::types::requests::{self, *};
 use crate::types::responses::*;
 use crate::{Analytics, AnalyticsError};
@@ -9,11 +11,12 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use temps_auth::permissions::Permission;
 use temps_auth::RequireAuth;
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
 };
-use temps_core::error_builder::{bad_request, internal_server_error};
+use temps_core::error_builder::{bad_request, internal_server_error, too_many_requests};
 use temps_core::problemdetails::Problem;
 use temps_core::{not_found, DateTime, UtcDateTime};
 use tracing::error;
@@ -23,11 +26,17 @@ pub struct AppState {
     pub analytics_service: Arc<dyn Analytics>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// API traffic analytics service (proxy_logs GROUP BY queries + optional AI summary).
+    pub api_traffic_service: Arc<ApiTrafficService>,
 }
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        get_api_timeseries,
+        get_api_routes,
+        get_api_callers,
+        get_api_summary,
         get_analytics_events_count,
         get_event_detail,
         get_event_visitors,
@@ -58,6 +67,15 @@ pub struct AppState {
         get_recent_activity,
     ),
     components(schemas(
+        // API traffic analytics types
+        ApiTimeseriesPoint,
+        ApiTimeseriesResponse,
+        ApiRouteEntry,
+        ApiRoutesResponse,
+        ApiCallerEntry,
+        ApiCallersResponse,
+        ApiTrafficSummary,
+        ApiTrafficSummaryResponse,
         ViewsOverTime,
         ViewItem,
         PathVisitorsResponse,
@@ -178,6 +196,23 @@ pub struct AnalyticsApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        // API traffic analytics (proxy_logs) -- project-scoped path params
+        .route(
+            "/projects/{project_id}/api-analytics/timeseries",
+            get(get_api_timeseries),
+        )
+        .route(
+            "/projects/{project_id}/api-analytics/routes",
+            get(get_api_routes),
+        )
+        .route(
+            "/projects/{project_id}/api-analytics/callers",
+            get(get_api_callers),
+        )
+        .route(
+            "/projects/{project_id}/api-analytics/summary",
+            get(get_api_summary),
+        )
         .route("/analytics/general-stats", get(get_general_stats))
         .route("/analytics/events", get(get_analytics_events_count))
         .route("/analytics/event-detail", get(get_event_detail))
@@ -240,6 +275,280 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/analytics/page-flow", get(get_page_flow))
         .route("/analytics/recent-activity", get(get_recent_activity))
 }
+
+// ---------------------------------------------------------------------------
+// API traffic analytics handlers
+// ---------------------------------------------------------------------------
+
+/// Query parameters shared by all API traffic endpoints.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+pub struct ApiTrafficQuery {
+    /// Filter to a specific environment. When omitted, all environments are
+    /// included in the aggregation.
+    pub environment_id: Option<i32>,
+    /// Window start (ISO 8601). Must precede `end_date`.
+    pub start_date: DateTime,
+    /// Window end (ISO 8601).
+    pub end_date: DateTime,
+}
+
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+pub struct ApiTrafficSummaryQuery {
+    pub environment_id: Option<i32>,
+    pub start_date: DateTime,
+    pub end_date: DateTime,
+    /// Bypass and replace the backend AI-result cache.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Query parameters for top-routes and top-callers endpoints.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+pub struct ApiTrafficLimitQuery {
+    pub environment_id: Option<i32>,
+    pub start_date: DateTime,
+    pub end_date: DateTime,
+    /// Maximum rows to return (default: 20, max: 100).
+    pub limit: Option<i64>,
+    /// Number of ranked rows to skip (default: 0, max: 10,000).
+    pub offset: Option<i64>,
+}
+
+const MAX_API_TRAFFIC_WINDOW_DAYS: i64 = 31;
+
+fn validate_api_traffic_window(start: UtcDateTime, end: UtcDateTime) -> Result<(), Problem> {
+    if start >= end {
+        return Err(bad_request()
+            .detail("start_date must be earlier than end_date")
+            .build());
+    }
+    if end - start > chrono::Duration::days(MAX_API_TRAFFIC_WINDOW_DAYS) {
+        return Err(bad_request()
+            .detail(format!(
+                "API traffic windows cannot exceed {MAX_API_TRAFFIC_WINDOW_DAYS} days"
+            ))
+            .build());
+    }
+    Ok(())
+}
+
+/// Return a time-bucketed series of request volume, error rate, and latency
+/// percentiles for a project's API traffic.
+///
+/// Bucket granularity is auto-selected based on the requested window:
+/// ≤6 h → 5 min, ≤24 h → 1 h, ≤72 h → 6 h, else → 1 day.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/projects/{project_id}/api-analytics/timeseries",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Window start (ISO 8601)"),
+        ("end_date" = String, Query, description = "Window end (ISO 8601)"),
+    ),
+    responses(
+        (status = 200, description = "Time-series of request volume, errors, and latency", body = ApiTimeseriesResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_api_timeseries(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(project_id): axum::extract::Path<i32>,
+    Query(query): Query<ApiTrafficQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let start: UtcDateTime = query.start_date.into();
+    let end: UtcDateTime = query.end_date.into();
+    validate_api_traffic_window(start, end)?;
+
+    app_state
+        .api_traffic_service
+        .get_timeseries(project_id, query.environment_id, start, end)
+        .await
+        .map(Json)
+        .map_err(handle_analytics_error)
+}
+
+/// Return the top routes (by request count) in a project's API traffic,
+/// grouped by raw `(method, path)`.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/projects/{project_id}/api-analytics/routes",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Window start (ISO 8601)"),
+        ("end_date" = String, Query, description = "Window end (ISO 8601)"),
+        ("limit" = Option<i64>, Query, description = "Max routes to return (default: 20, max: 100)"),
+        ("offset" = Option<i64>, Query, description = "Ranked routes to skip (default: 0)"),
+    ),
+    responses(
+        (status = 200, description = "Top routes by request count", body = ApiRoutesResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_api_routes(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(project_id): axum::extract::Path<i32>,
+    Query(query): Query<ApiTrafficLimitQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let start: UtcDateTime = query.start_date.into();
+    let end: UtcDateTime = query.end_date.into();
+    validate_api_traffic_window(start, end)?;
+    let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
+
+    app_state
+        .api_traffic_service
+        .get_top_routes(project_id, query.environment_id, start, end, limit, offset)
+        .await
+        .map(Json)
+        .map_err(handle_analytics_error)
+}
+
+/// Return the top callers (by client IP, ranked by request count) in a
+/// project's API traffic window.
+///
+/// IP addresses are returned as-is from `proxy_logs.client_ip`. The caller
+/// is responsible for any presentation-layer masking required by their privacy
+/// policy.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/projects/{project_id}/api-analytics/callers",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Window start (ISO 8601)"),
+        ("end_date" = String, Query, description = "Window end (ISO 8601)"),
+        ("limit" = Option<i64>, Query, description = "Max callers to return (default: 20, max: 100)"),
+        ("offset" = Option<i64>, Query, description = "Ranked callers to skip (default: 0)"),
+    ),
+    responses(
+        (status = 200, description = "Top callers by request count", body = ApiCallersResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_api_callers(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(project_id): axum::extract::Path<i32>,
+    Query(query): Query<ApiTrafficLimitQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let start: UtcDateTime = query.start_date.into();
+    let end: UtcDateTime = query.end_date.into();
+    validate_api_traffic_window(start, end)?;
+    let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
+
+    app_state
+        .api_traffic_service
+        .get_top_callers(project_id, query.environment_id, start, end, limit, offset)
+        .await
+        .map(Json)
+        .map_err(handle_analytics_error)
+}
+
+/// Return an AI-generated summary of API traffic for the given window.
+///
+/// The response always includes `enabled` and `unavailable_reason` so the
+/// client can render a meaningful onboarding state even when no AI provider
+/// is configured or the project has not opted in. The `summary` field is
+/// non-null only when all of the following are true:
+///
+/// - `projects.ai_api_traffic_summary_enabled = true`
+/// - An AI provider is configured and available
+/// - The AI call returns parseable JSON within the bounded summary deadline
+///
+/// This endpoint never returns a 5xx from an AI failure — it always returns
+/// 200 with `summary: null` and a human-readable `unavailable_reason`.
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/projects/{project_id}/api-analytics/summary",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Window start (ISO 8601)"),
+        ("end_date" = String, Query, description = "Window end (ISO 8601)"),
+        ("refresh" = Option<bool>, Query, description = "Bypass and replace the backend AI summary cache"),
+    ),
+    responses(
+        (status = 200, description = "AI traffic summary (summary field may be null when AI is unavailable)", body = ApiTrafficSummaryResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error (DB errors only; AI failures return 200 with summary: null)")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_api_summary(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(project_id): axum::extract::Path<i32>,
+    Query(query): Query<ApiTrafficSummaryQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    // Summary generation can spend provider credits or launch an authenticated
+    // host CLI, so analytics read access alone must never authorize it.
+    if !api_summary_permissions_granted(
+        auth.has_permission(&Permission::AnalyticsRead),
+        auth.has_permission(&Permission::AiGatewayExecute),
+    ) {
+        return Err(
+            temps_core::problemdetails::new(axum::http::StatusCode::FORBIDDEN)
+                .with_title("Insufficient Permissions")
+                .with_detail("AI traffic summaries require AnalyticsRead and AiGatewayExecute"),
+        );
+    }
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let start: UtcDateTime = query.start_date.into();
+    let end: UtcDateTime = query.end_date.into();
+    validate_api_traffic_window(start, end)?;
+
+    app_state
+        .api_traffic_service
+        .get_summary(project_id, query.environment_id, start, end, query.refresh)
+        .await
+        .map(Json)
+        .map_err(handle_analytics_error)
+}
+
+fn api_summary_permissions_granted(analytics_read: bool, ai_execute: bool) -> bool {
+    analytics_read && ai_execute
+}
+
+// ---------------------------------------------------------------------------
+// Existing analytics handlers
+// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     tag = "Analytics",
@@ -884,6 +1193,14 @@ pub(super) fn handle_analytics_error(error: AnalyticsError) -> Problem {
             tracing::error!("Session not found: {}", e);
             not_found().detail("Session not found").build()
         }
+        AnalyticsError::ProjectNotFound(project_id) => {
+            tracing::error!(
+                project_id,
+                "Project not found while fetching analytics data"
+            );
+            not_found().detail("Project not found").build()
+        }
+        AnalyticsError::AiRateLimited { reason } => too_many_requests().detail(reason).build(),
     }
 }
 
@@ -1739,5 +2056,39 @@ pub async fn get_event_entries(
             error!("Analytics error: {:?}", e);
             Err(handle_analytics_error(e))
         }
+    }
+}
+
+#[cfg(test)]
+mod api_traffic_window_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_reversed_api_traffic_window() {
+        let end: UtcDateTime = chrono::Utc::now();
+        let start = end + chrono::Duration::minutes(1);
+        assert!(validate_api_traffic_window(start, end).is_err());
+    }
+
+    #[test]
+    fn rejects_api_traffic_window_beyond_retention_bound() {
+        let start: UtcDateTime = chrono::Utc::now();
+        let end = start + chrono::Duration::days(MAX_API_TRAFFIC_WINDOW_DAYS + 1);
+        assert!(validate_api_traffic_window(start, end).is_err());
+    }
+
+    #[test]
+    fn accepts_bounded_api_traffic_window() {
+        let start: UtcDateTime = chrono::Utc::now();
+        let end = start + chrono::Duration::hours(24);
+        assert!(validate_api_traffic_window(start, end).is_ok());
+    }
+
+    #[test]
+    fn ai_summary_requires_both_read_and_execute_permissions() {
+        assert!(api_summary_permissions_granted(true, true));
+        assert!(!api_summary_permissions_granted(true, false));
+        assert!(!api_summary_permissions_granted(false, true));
+        assert!(!api_summary_permissions_granted(false, false));
     }
 }

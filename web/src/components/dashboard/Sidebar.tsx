@@ -966,6 +966,7 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'AI Agents', url: 'analytics/ai-agents', icon: Bot },
       { title: 'Funnels', url: 'analytics/funnels', icon: Filter },
       { title: 'Session Replays', url: 'analytics/replays', icon: Play },
+      { title: 'API Traffic', url: 'analytics/api-traffic', icon: Server },
       { title: 'Speed', url: 'speed', icon: Zap },
       { title: 'Revenue', url: 'revenue', icon: CreditCard },
     ],

@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod api_traffic;
 pub mod channel;
 pub mod handler;
 pub mod plugin;

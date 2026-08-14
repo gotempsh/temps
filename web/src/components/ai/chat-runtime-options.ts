@@ -6,6 +6,7 @@ export interface ChatSelectOption {
 
 export interface ChatModelOption extends ChatSelectOption {
   thinking_options: ChatSelectOption[]
+  tool_thinking_options?: ChatSelectOption[] | null
   default_thinking_option_id?: string | null
 }
 
@@ -67,7 +68,10 @@ export function resolveChatRuntimeSelection(
     provider.default_model_id
   )
   const model = provider.models.find((option) => option.id === modelId)
-  const thinkingOptions = model?.thinking_options ?? []
+  // Project chat always sends function tools. Prefer a model's narrower tool
+  // compatibility when it differs from its general reasoning capabilities.
+  const thinkingOptions =
+    model?.tool_thinking_options ?? model?.thinking_options ?? []
   const thinkingOptionId = firstValidId(
     thinkingOptions,
     preferred?.thinkingOptionId,

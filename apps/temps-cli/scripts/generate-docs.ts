@@ -32,6 +32,7 @@ import { registerWebhooksCommands } from '../src/commands/webhooks/index.js'
 import { registerContainersCommands } from '../src/commands/containers/index.js'
 import { registerFlagsCommands } from '../src/commands/flags/index.js'
 import { registerDataCommands } from '../src/commands/data/index.js'
+import { registerAnalyticsCommands } from '../src/commands/analytics/index.js'
 
 interface CommandInfo {
   name: string
@@ -78,7 +79,8 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
   const options: OptionInfo[] = cmd.options.map((opt: any) => ({
     flags: opt.flags,
     description: opt.description || '',
-    defaultValue: opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
+    defaultValue:
+      opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
     required: opt.required || opt.flags.includes('<'),
   }))
 
@@ -102,12 +104,17 @@ function escapeForMdx(text: string): string {
   return text.replace(/('[^']*\{[^']*')/g, '`$1`')
 }
 
-function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown' | 'mdx' = 'markdown'): string {
+function generateMarkdown(
+  commands: CommandInfo[],
+  level = 2,
+  format: 'markdown' | 'mdx' = 'markdown'
+): string {
   let md = ''
 
   for (const cmd of commands) {
     const heading = '#'.repeat(level)
-    const aliasText = cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
+    const aliasText =
+      cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
 
     md += `${heading} \`${cmd.name}\`${aliasText}\n\n`
 
@@ -121,7 +128,8 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
       md += '|------|-------------|---------|----------|\n'
 
       for (const opt of cmd.options) {
-        const defaultVal = opt.defaultValue !== undefined ? `\`${opt.defaultValue}\`` : '-'
+        const defaultVal =
+          opt.defaultValue !== undefined ? `\`${opt.defaultValue}\`` : '-'
         const required = opt.required ? 'Yes' : 'No'
         let escapedDesc = opt.description.replace(/\|/g, '\\|')
         if (format === 'mdx') {
@@ -135,7 +143,8 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
     if (cmd.subcommands.length > 0) {
       md += '**Subcommands:**\n\n'
       for (const sub of cmd.subcommands) {
-        const subAliases = sub.aliases.length > 0 ? ` (\`${sub.aliases.join('`, `')}\`)` : ''
+        const subAliases =
+          sub.aliases.length > 0 ? ` (\`${sub.aliases.join('`, `')}\`)` : ''
         md += `- \`${sub.name.split(' ').pop()}\`${subAliases} - ${sub.description}\n`
       }
       md += '\n'
@@ -290,7 +299,10 @@ async function assertEveryCommandGroupIsRegistered(program: Command) {
   const { join, dirname } = await import('node:path')
   const { fileURLToPath } = await import('node:url')
 
-  const commandsDir = join(dirname(fileURLToPath(import.meta.url)), '../src/commands')
+  const commandsDir = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '../src/commands'
+  )
   const normalise = (s: string) => s.replace(/[-_\s]/g, '').toLowerCase()
 
   const registered = new Set<string>()
@@ -305,7 +317,9 @@ async function assertEveryCommandGroupIsRegistered(program: Command) {
     .filter((dir) => {
       const key = normalise(dir)
       // Registered directly, or as part of a multi-word command name.
-      return ![...registered].some((r) => r === key || r.includes(key) || key.includes(r))
+      return ![...registered].some(
+        (r) => r === key || r.includes(key) || key.includes(r)
+      )
     })
 
   if (missing.length > 0) {
@@ -318,7 +332,7 @@ async function assertEveryCommandGroupIsRegistered(program: Command) {
       `\n⚠  ${missing.length} command group(s) exist under src/commands/ but are not ` +
         `registered in generate-docs.ts, so they are ABSENT from the generated docs:\n` +
         `   ${missing.join(', ')}\n` +
-        `   Fix: add the matching register*Commands import + call below, then re-run.\n`,
+        `   Fix: add the matching register*Commands import + call below, then re-run.\n`
     )
   }
 }
@@ -351,8 +365,9 @@ async function main() {
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
-registerFlagsCommands(program)
-registerDataCommands(program)
+  registerFlagsCommands(program)
+  registerDataCommands(program)
+  registerAnalyticsCommands(program)
 
   // Guard: this file keeps its own hand-maintained registration list rather
   // than auto-discovering, so a new command group is silently absent from the

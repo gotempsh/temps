@@ -30,6 +30,7 @@ import { PageFlow } from '@/components/analytics/PageFlow'
 import { PageDetail } from '@/components/analytics/PageDetail'
 import { Pages } from '@/components/analytics/Pages'
 import { SessionReplays } from '@/components/analytics/SessionReplays'
+import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
@@ -1510,6 +1511,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<SegmentVisitorsTab project={project} />}
       />
       <Route path="replays" element={<SessionReplaysTab project={project} />} />
+      <Route path="api-traffic" element={<ApiTrafficTab project={project} />} />
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
       <Route path="live" element={<LiveGlobePage project={project} />} />
       <Route path="globe" element={<VisitorGlobePage project={project} />} />

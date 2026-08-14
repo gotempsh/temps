@@ -2387,3 +2387,65 @@ async fn feature_flag_table_count(db: &DatabaseConnection) -> anyhow::Result<i32
         .expect("table count");
     Ok(row.try_get("", "n")?)
 }
+
+/// Existing installations must gain both the project opt-in column and the
+/// provider-key model catalog with its ownership constraint after a normal
+/// forward migration.
+#[tokio::test]
+async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping AI catalog migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+    Migrator::up(&db, None).await?;
+
+    let schema = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' AND table_name = 'projects' \
+                    AND column_name = 'ai_api_traffic_summary_enabled') AS consent_column, \
+                EXISTS (SELECT 1 FROM information_schema.tables \
+                  WHERE table_schema = 'public' AND table_name = 'ai_provider_models') AS model_table, \
+                EXISTS (SELECT 1 FROM pg_constraint \
+                  WHERE conname = 'fk_ai_provider_models_key') AS model_key_fk, \
+                (SELECT COUNT(*)::int FROM information_schema.columns \
+                  WHERE table_schema = 'public' AND table_name = 'ai_gateway_config' \
+                    AND column_name IN ('summary_provider_id', 'summary_model', \
+                                        'summary_thinking_level')) AS summary_columns"
+                .to_string(),
+        ))
+        .await?
+        .expect("migration schema query");
+    assert!(schema.try_get::<bool>("", "consent_column")?);
+    assert!(schema.try_get::<bool>("", "model_table")?);
+    assert!(schema.try_get::<bool>("", "model_key_fk")?);
+    assert_eq!(schema.try_get::<i32>("", "summary_columns")?, 3);
+
+    Ok(())
+}

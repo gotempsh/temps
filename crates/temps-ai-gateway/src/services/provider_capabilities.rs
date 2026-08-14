@@ -16,21 +16,80 @@ fn option(id: &str, name: &str, description: &str) -> SelectOption {
 }
 
 fn thinking_modes(provider: &str, model: &str) -> (Vec<SelectOption>, Option<String>) {
+    if provider == "openai" && model.starts_with("gpt-5.6") {
+        return thinking_options(&["none", "low", "medium", "high", "xhigh", "max"], "medium");
+    }
     if provider == "openai" && (model.starts_with("gpt-5") || model.starts_with('o')) {
-        return (
-            [
-                ("low", "Low"),
-                ("medium", "Medium"),
-                ("high", "High"),
-                ("xhigh", "Extra high"),
-            ]
-            .into_iter()
-            .map(|(id, name)| option(id, name, "Provider-specific reasoning depth"))
-            .collect(),
-            Some("medium".to_string()),
-        );
+        return thinking_options(&["low", "medium", "high", "xhigh"], "medium");
+    }
+    if provider == "xai" && model.starts_with("grok-4.5") {
+        return thinking_options(&["low", "medium", "high"], "high");
+    }
+    if provider == "anthropic"
+        && (model.starts_with("claude-sonnet-5")
+            || model.starts_with("claude-opus-5")
+            || model.starts_with("claude-fable-5"))
+    {
+        // Adaptive thinking effort values differ between Claude SKUs and can
+        // change independently. Advertise the portable intersection here;
+        // live model discovery remains the source of truth for model ids.
+        return thinking_options(&["low", "medium", "high"], "high");
+    }
+    if provider == "gemini"
+        && model.starts_with("gemini-3")
+        && (model.contains("flash") || model.contains("lite"))
+    {
+        return thinking_options(&["minimal", "low", "medium", "high"], "medium");
+    }
+    if provider == "gemini" && model.starts_with("gemini-3") {
+        return thinking_options(&["low", "medium", "high"], "medium");
     }
     (Vec::new(), None)
+}
+
+/// Select the OpenAI wire API for a discovered model. OpenAI's model-list
+/// endpoint only returns identifiers, so transport support cannot be inferred
+/// from discovery metadata. GPT 5.4 and newer use the Responses API, which is
+/// required for reasoning plus function tools and is OpenAI's recommended API
+/// for new integrations.
+pub(crate) fn uses_openai_responses_api(provider: &str, model: &str) -> bool {
+    if provider != "openai" {
+        return false;
+    }
+    let normalized_model = model.to_ascii_lowercase();
+    let Some(version) = normalized_model.strip_prefix("gpt-") else {
+        return false;
+    };
+    let mut components = version.split(['.', '-']);
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    matches!(
+        (major, minor),
+        (Some(major), _) if major > 5
+    ) || matches!((major, minor), (Some(5), Some(minor)) if minor >= 4)
+}
+
+fn thinking_options(ids: &[&str], default: &str) -> (Vec<SelectOption>, Option<String>) {
+    let names = |id: &str| match id {
+        "none" => "None",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Maximum",
+        _ => "Custom",
+    };
+    (
+        ids.iter()
+            .map(|id| option(id, names(id), "Provider-specific reasoning depth"))
+            .collect(),
+        Some(default.to_string()),
+    )
 }
 
 pub fn gateway_provider_capabilities(
@@ -56,6 +115,7 @@ pub fn gateway_provider_capabilities(
             let (thinking_modes, default_thinking_mode_id) = thinking_modes(provider, &model);
             ModelCapability {
                 name: model.clone(),
+                tool_thinking_modes: None,
                 id: model,
                 thinking_modes,
                 default_thinking_mode_id,
@@ -104,5 +164,38 @@ mod tests {
             capabilities.default_model_id.as_deref(),
             Some("custom-model")
         );
+    }
+
+    #[test]
+    fn gemini_pro_does_not_advertise_unsupported_minimal_thinking() {
+        let (modes, _) = thinking_modes("gemini", "gemini-3.1-pro");
+        assert!(!modes.iter().any(|mode| mode.id == "minimal"));
+    }
+
+    #[test]
+    fn gemini_flash_advertises_minimal_thinking() {
+        let (modes, _) = thinking_modes("gemini", "gemini-3.6-flash");
+        assert!(modes.iter().any(|mode| mode.id == "minimal"));
+    }
+
+    #[test]
+    fn gpt_5_6_luna_uses_responses_and_keeps_tool_reasoning() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenAI".to_string(),
+            "openai",
+            Some("gpt-5.6-luna".to_string()),
+            vec!["gpt-5.6-luna".to_string()],
+        );
+        let model = capabilities
+            .model("gpt-5.6-luna")
+            .expect("discovered model should be normalized");
+        assert!(model.thinking_modes.iter().any(|mode| mode.id == "medium"));
+        assert!(model.tool_thinking_modes.is_none());
+        assert!(uses_openai_responses_api("openai", "gpt-5.6-luna"));
+        assert!(uses_openai_responses_api("openai", "gpt-5.4"));
+        assert!(!uses_openai_responses_api("openai", "gpt-5"));
+        assert!(uses_openai_responses_api("openai", "gpt-6"));
+        assert!(!uses_openai_responses_api("xai", "gpt-5.6-luna"));
     }
 }

@@ -2061,6 +2061,7 @@ mod tests {
                     id: "sonnet".to_string(),
                     name: "Sonnet".to_string(),
                     thinking_modes: Vec::new(),
+                    tool_thinking_modes: None,
                     default_thinking_mode_id: None,
                 }],
                 default_model_id: Some("sonnet".to_string()),
@@ -2109,6 +2110,9 @@ mod tests {
             provider_type: "agent_cli".to_string(),
             agent_cli_provider_id: Some("claude_cli".to_string()),
             interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
@@ -2205,6 +2209,7 @@ mod tests {
             git_provider_connection_id: None,
             attack_mode: false,
             ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
             ai_debug_chat_enabled: toggle,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

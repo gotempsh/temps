@@ -32,26 +32,23 @@ fn cancellation_safe_command() -> Command {
 }
 
 fn apply_chat_mcp(cmd: &mut Command, config: &AiRunConfig) {
+    let mut runtime_config = serde_json::json!({
+        // Tool-less completions and chat runs must not inherit the selected
+        // host agent's bash/filesystem/web permissions. A prompt can contain
+        // untrusted product data even when the server authored its template.
+        "permission": { "*": "deny" }
+    });
     if let Some(server) = &config.mcp_server {
-        cmd.env(
-            "OPENCODE_CONFIG_CONTENT",
-            serde_json::json!({
-                "mcp": { "temps-chat": {
+        runtime_config["mcp"] = serde_json::json!({
+            "temps-chat": {
                     "type": "remote",
                     "url": server.url,
                     "headers": { "Authorization": format!("Bearer {}", server.authorization_token) }
-                }},
-                // Chat runs may invoke only the ephemeral, authenticated MCP
-                // bridge. Deny OpenCode's host bash/filesystem/web tools even
-                // when the selected host agent normally enables them.
-                "permission": {
-                    "*": "deny",
-                    "temps_chat_*": "allow"
-                }
-            })
-            .to_string(),
-        );
+            }
+        });
+        runtime_config["permission"]["temps_chat_*"] = serde_json::json!("allow");
     }
+    cmd.env("OPENCODE_CONFIG_CONTENT", runtime_config.to_string());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -738,6 +735,38 @@ ollama/qwen3.5:9b
         assert!(json["mcp"]["temps-chat"].get("enabled").is_none());
         assert_eq!(json["permission"]["*"], "deny");
         assert_eq!(json["permission"]["temps_chat_*"], "allow");
+    }
+
+    #[test]
+    fn opencode_toolless_completion_denies_native_host_tools() {
+        let config = AiRunConfig {
+            work_dir: std::env::temp_dir(),
+            prompt: "summarize numbers".to_string(),
+            api_key: String::new(),
+            max_turns: 1,
+            timeout: std::time::Duration::from_secs(30),
+            model: None,
+            thinking_level: None,
+            permission_mode: None,
+            on_event: None,
+            permission_bridge: None,
+            resume_session_id: None,
+            mcp_server: None,
+        };
+        let mut command = cancellation_safe_command();
+        apply_chat_mcp(&mut command, &config);
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == "OPENCODE_CONFIG_CONTENT")
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            })
+            .expect("OpenCode config env");
+        let json: serde_json::Value = serde_json::from_str(&value).expect("parse config JSON");
+        assert_eq!(json["permission"]["*"], "deny");
+        assert!(json.get("mcp").is_none());
     }
 
     #[test]

@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
@@ -108,10 +109,16 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { AI_CLI_PROVIDER_SHELL } from '@/lib/ai-cli-providers'
 import {
   listProviderKeys,
   createProviderKey,
   deleteProviderKey,
+  getProviderKey,
+  addProviderModel,
+  refreshProviderModels,
+  deleteProviderModel,
+  updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
   saveAiProviderCredential,
@@ -122,6 +129,7 @@ import {
   getAiProviderStatusOptions,
   getAiProviderStatusQueryKey,
   updateAiProviderPreferenceMutation,
+  updateAiSummaryPreferenceMutation,
   listAiProvidersOptions,
   listAiProvidersQueryKey,
   refreshAiProviderStatusMutation,
@@ -136,6 +144,10 @@ import {
   getAiProvider,
 } from '@/lib/ai-providers'
 import { hostAuthLabel } from '@/lib/ai-cli-auth'
+import {
+  compareAiModelIdsByRelevance,
+  sortAiModelIdsByRelevance,
+} from '@/lib/ai-model-ranking'
 // ============================================================================
 // Usage Analytics types & fetchers
 // ============================================================================
@@ -215,6 +227,444 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json()
 }
 
+interface SummarySelectOption {
+  id: string
+  name: string
+}
+
+interface SummaryModelOption {
+  id: string
+  name: string
+  thinking_options: SummarySelectOption[]
+}
+
+interface SummaryProviderOption {
+  id: string
+  name: string
+  models: SummaryModelOption[]
+  default_model_id?: string | null
+}
+
+function AiSummaryDefaultsCard({
+  providers,
+  initialProviderId,
+  initialModel,
+  initialThinking,
+  onSaved,
+}: {
+  providers: SummaryProviderOption[]
+  initialProviderId?: string | null
+  initialModel?: string | null
+  initialThinking?: string | null
+  onSaved: () => void
+}) {
+  const inherit = '__inherit__'
+  const [providerId, setProviderId] = useState(initialProviderId ?? inherit)
+  const [model, setModel] = useState(initialModel ?? inherit)
+  const [thinking, setThinking] = useState(initialThinking ?? inherit)
+  const provider = providers.find((item) => item.id === providerId)
+  const effectiveModelId =
+    model === inherit ? provider?.default_model_id : model
+  const selectedModel = provider?.models.find(
+    (item) => item.id === effectiveModelId
+  )
+  const modelOptions = [
+    {
+      value: inherit,
+      label: provider?.default_model_id
+        ? `Use provider/key default (${provider.default_model_id})`
+        : 'Use provider/key default',
+    },
+    ...sortAiModelIdsByRelevance(
+      provider?.models.map((item) => item.id) ?? []
+    ).map((modelId) => ({
+      value: modelId,
+      label:
+        provider?.models.find((item) => item.id === modelId)?.name ?? modelId,
+      keywords: modelId,
+    })),
+  ]
+  const saveMutation = useMutation({
+    ...updateAiSummaryPreferenceMutation(),
+    onSuccess: () => {
+      toast.success('AI summary defaults saved')
+      onSaved()
+    },
+    onError: (error) =>
+      toast.error('Could not save AI summary defaults', {
+        description: String(error),
+      }),
+  })
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg">
+          AI summary defaults (all screens)
+        </CardTitle>
+        <CardDescription>
+          Controls only AI summaries across Temps. This is separate from each
+          gateway key&apos;s default model; choose “Use provider/key default” to
+          inherit that setting.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
+        <div className="space-y-2">
+          <Label>Summary provider</Label>
+          <Select
+            value={providerId}
+            onValueChange={(value) => {
+              setProviderId(value)
+              setModel(inherit)
+              setThinking(inherit)
+            }}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={inherit}>Use active provider</SelectItem>
+              {providers.map((item) => (
+                <SelectItem key={item.id} value={item.id}>
+                  {item.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-2">
+          <Label>Summary model</Label>
+          <SearchableSelect
+            value={model}
+            disabled={!provider}
+            options={modelOptions}
+            placeholder="Use provider/key default"
+            searchPlaceholder="Search models by name..."
+            emptyText="No matching models."
+            searchMode="contains"
+            onValueChange={(value) => {
+              setModel(value)
+              setThinking(inherit)
+            }}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label>Thinking</Label>
+          <Select
+            value={thinking}
+            disabled={!selectedModel?.thinking_options.length}
+            onValueChange={setThinking}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Model default" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={inherit}>Use model default</SelectItem>
+              {selectedModel?.thinking_options.map((item) => (
+                <SelectItem key={item.id} value={item.id}>
+                  {item.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <Button
+          onClick={() =>
+            saveMutation.mutate({
+              body: {
+                provider_id: providerId === inherit ? null : providerId,
+                model: model === inherit ? null : model,
+                thinking_level: thinking === inherit ? null : thinking,
+              },
+            })
+          }
+          disabled={saveMutation.isPending}
+        >
+          {saveMutation.isPending && (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          )}
+          Save defaults
+        </Button>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ProviderKeyModelDetail({
+  providerKey,
+}: {
+  providerKey: ProviderKeyResponse
+}) {
+  const queryClient = useQueryClient()
+  const [modelId, setModelId] = useState('')
+  const [modelFilter, setModelFilter] = useState('')
+  const queryKey = ['providerModelInventory', providerKey.id]
+  const detailQuery = useQuery({
+    queryKey,
+    queryFn: async () => {
+      const { data } = await getProviderKey({
+        path: { id: providerKey.id },
+        throwOnError: true,
+      })
+      return data
+    },
+  })
+  const refreshMutation = useMutation({
+    mutationFn: () =>
+      refreshProviderModels({
+        path: { id: providerKey.id },
+        throwOnError: true,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey })
+      toast.success(`${providerKey.display_name} models refreshed`)
+    },
+    onError: (error) =>
+      toast.error('Model refresh failed', { description: String(error) }),
+  })
+  const addMutation = useMutation({
+    mutationFn: () =>
+      addProviderModel({
+        path: { id: providerKey.id },
+        body: { model_id: modelId.trim() },
+        throwOnError: true,
+      }),
+    onSuccess: () => {
+      setModelId('')
+      queryClient.invalidateQueries({ queryKey })
+      toast.success('Manual model added')
+    },
+    onError: (error) =>
+      toast.error('Could not add model', { description: String(error) }),
+  })
+  const updateMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      updateProviderModel({
+        path: { id: providerKey.id, model_row_id: id },
+        body: { is_enabled: enabled },
+        throwOnError: true,
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+    onError: (error) =>
+      toast.error('Could not update model', { description: String(error) }),
+  })
+  const defaultMutation = useMutation({
+    mutationFn: (modelId: string) =>
+      updateProviderKey({
+        path: { id: providerKey.id },
+        body: { default_model: modelId },
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey })
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      toast.success('Default model updated')
+    },
+    onError: (error) =>
+      toast.error('Could not set default model', {
+        description: String(error),
+      }),
+  })
+  const deleteMutation = useMutation({
+    mutationFn: (id: number) =>
+      deleteProviderModel({
+        path: { id: providerKey.id, model_row_id: id },
+        throwOnError: true,
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+    onError: (error) =>
+      toast.error('Could not delete model', { description: String(error) }),
+  })
+
+  const models = useMemo(
+    () => detailQuery.data?.models ?? [],
+    [detailQuery.data?.models]
+  )
+  const currentDefaultModel = providerKey.default_model
+  const visibleModels = useMemo(() => {
+    const needle = modelFilter.trim().toLowerCase()
+    return [...models]
+      .filter((model) => model.model_id.toLowerCase().includes(needle))
+      .sort((a, b) => {
+        const defaultDifference =
+          Number(b.model_id === currentDefaultModel) -
+          Number(a.model_id === currentDefaultModel)
+        if (defaultDifference) return defaultDifference
+        const enabledDifference = Number(b.is_enabled) - Number(a.is_enabled)
+        if (enabledDifference) return enabledDifference
+        const availableDifference =
+          Number(b.is_available) - Number(a.is_available)
+        if (availableDifference) return availableDifference
+        return compareAiModelIdsByRelevance(a.model_id, b.model_id)
+      })
+  }, [currentDefaultModel, modelFilter, models])
+
+  if (detailQuery.isLoading) {
+    return <Skeleton className="h-24 w-full" />
+  }
+  if (detailQuery.isError) {
+    return (
+      <div className="rounded-md border border-destructive/30 p-3 text-sm text-destructive">
+        Could not load this key’s model inventory.
+      </div>
+    )
+  }
+  const refreshTimes = models
+    .map((model) => model.last_seen_at)
+    .filter(Boolean)
+    .sort()
+  const lastRefresh = refreshTimes[refreshTimes.length - 1]
+
+  return (
+    <div className="space-y-3 rounded-md border bg-background p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium">
+            Gateway key models and default
+          </div>
+          <div className="text-xs text-muted-foreground">
+            {models.length} model{models.length === 1 ? '' : 's'}
+            {lastRefresh
+              ? ` · refreshed ${new Date(lastRefresh).toLocaleString()}`
+              : ' · bootstrap catalog; refresh to discover live access'}
+            {' · '}The key default applies to gateway requests; AI summaries can
+            override it above.
+          </div>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => refreshMutation.mutate()}
+          disabled={refreshMutation.isPending}
+        >
+          <RefreshCw
+            className={`mr-2 h-3.5 w-3.5 ${refreshMutation.isPending ? 'animate-spin' : ''}`}
+          />
+          Refresh models
+        </Button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={modelFilter}
+          onChange={(event) => setModelFilter(event.target.value)}
+          placeholder="Filter models by name..."
+          aria-label="Filter models by name"
+          className="max-w-sm"
+        />
+        <span className="text-xs text-muted-foreground">
+          {visibleModels.length} shown · sorted by relevance
+        </span>
+      </div>
+      <div className="max-h-64 overflow-auto rounded-md border">
+        {models.length === 0 ? (
+          <div className="p-4 text-sm text-muted-foreground">
+            No models yet. Refresh from the provider or add a model manually.
+          </div>
+        ) : visibleModels.length === 0 ? (
+          <div className="p-4 text-sm text-muted-foreground">
+            No models match “{modelFilter}”.
+          </div>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Model</TableHead>
+                <TableHead className="w-28">Source</TableHead>
+                <TableHead className="w-28">Availability</TableHead>
+                <TableHead className="w-24 text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {visibleModels.map((model) => (
+                <TableRow key={model.id}>
+                  <TableCell className="py-2">
+                    <div className="flex items-center gap-2">
+                      <code className="text-xs">{model.model_id}</code>
+                      {currentDefaultModel === model.model_id && (
+                        <Badge variant="secondary" className="text-[10px]">
+                          Default
+                        </Badge>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell className="py-2">
+                    <Badge variant="outline" className="text-[10px]">
+                      {model.source}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="py-2 text-xs">
+                    {model.is_available ? 'Available' : 'Not seen'}
+                  </TableCell>
+                  <TableCell className="py-2 text-right">
+                    <div className="flex justify-end gap-1">
+                      {model.is_available && model.is_enabled && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={
+                            currentDefaultModel === model.model_id ||
+                            defaultMutation.isPending
+                          }
+                          onClick={() => defaultMutation.mutate(model.model_id)}
+                        >
+                          Use as key default
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          updateMutation.mutate({
+                            id: model.id,
+                            enabled: !model.is_enabled,
+                          })
+                        }
+                      >
+                        {model.is_enabled ? 'Disable' : 'Enable'}
+                      </Button>
+                      {model.source === 'manual' && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => deleteMutation.mutate(model.id)}
+                          title="Delete manual model"
+                        >
+                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                        </Button>
+                      )}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+      <form
+        className="flex gap-2"
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (modelId.trim()) addMutation.mutate()
+        }}
+      >
+        <Input
+          value={modelId}
+          onChange={(event) => setModelId(event.target.value)}
+          placeholder="Add model ID manually"
+          className="h-8 text-xs"
+        />
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!modelId.trim() || addMutation.isPending}
+        >
+          Add model
+        </Button>
+      </form>
+    </div>
+  )
+}
+
 function buildUsageUrl(
   path: string,
   params: Record<string, string | undefined>
@@ -291,6 +741,21 @@ const TIME_RANGES = [
   { label: '30d', hours: 720 },
 ] as const
 
+type TimeRange = (typeof TIME_RANGES)[number]
+
+function useTimeRangeSelection(): [
+  { range: TimeRange; endMs: number },
+  (range: TimeRange) => void,
+] {
+  const [selection, setSelection] = useState<{
+    range: TimeRange
+    endMs: number
+  }>(() => ({ range: TIME_RANGES[0], endMs: Date.now() }))
+  const selectRange = (range: TimeRange) =>
+    setSelection({ range, endMs: Date.now() })
+  return [selection, selectRange]
+}
+
 // Back-compat local aliases — the shared registry now lives in
 // `@/lib/ai-providers` and is reused by AiQuickstart, provider detail
 // pages, and the sandbox UI.
@@ -336,16 +801,14 @@ function LogCostCell({
 }
 
 export function UsageAnalytics() {
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
-    TIME_RANGES[0]
-  )
+  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
-    const to = new Date().toISOString()
-    const from = new Date(Date.now() - timeRange.hours * 3600_000).toISOString()
+    const to = new Date(endMs).toISOString()
+    const from = new Date(endMs - timeRange.hours * 3600_000).toISOString()
     const bucket = timeRange.hours <= 24 ? 'hour' : 'day'
     return { from, to, bucket }
-  }, [timeRange])
+  }, [endMs, timeRange])
 
   const { data: summary, isLoading: summaryLoading } = useQuery({
     queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
@@ -535,7 +998,7 @@ export function UsageAnalytics() {
               key={range.label}
               variant={timeRange.label === range.label ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setTimeRange(range)}
+              onClick={() => selectTimeRange(range)}
             >
               {range.label}
             </Button>
@@ -1321,26 +1784,29 @@ function buildSpanTree(spans: GenAiSpanDetail[]): SpanTreeNode[] {
   return roots
 }
 
-function spanIcon(span: GenAiSpanDetail) {
-  if (span.gen_ai_operation === 'execute_tool' || span.tool_name) return Wrench
+function spanIcon(span: GenAiSpanDetail, className: string) {
+  if (span.gen_ai_operation === 'execute_tool' || span.tool_name)
+    return <Wrench className={className} />
   if (
     span.agent_name ||
     span.gen_ai_operation === 'invoke_agent' ||
     span.gen_ai_operation === 'create_agent'
   )
-    return Bot
-  if (span.gen_ai_operation === 'embeddings') return Database
-  if (span.gen_ai_operation === 'retrieval') return Globe
+    return <Bot className={className} />
+  if (span.gen_ai_operation === 'embeddings')
+    return <Database className={className} />
+  if (span.gen_ai_operation === 'retrieval')
+    return <Globe className={className} />
   if (
     span.gen_ai_operation === 'chat' ||
     span.gen_ai_operation === 'generate_content' ||
     span.gen_ai_operation === 'text_completion'
   )
-    return MessageSquare
-  if (span.gen_ai_system) return Cpu
-  if (span.kind === 'CLIENT') return Globe
-  if (span.kind === 'SERVER') return Activity
-  return Hash
+    return <MessageSquare className={className} />
+  if (span.gen_ai_system) return <Cpu className={className} />
+  if (span.kind === 'CLIENT') return <Globe className={className} />
+  if (span.kind === 'SERVER') return <Activity className={className} />
+  return <Hash className={className} />
 }
 
 function spanLabel(span: GenAiSpanDetail): string {
@@ -1372,7 +1838,6 @@ function SpanTreeRow({
   const [open, setOpen] = useState(depth < 3)
   const span = node.span
   const hasChildren = node.children.length > 0
-  const Icon = spanIcon(span)
   const durationPct =
     maxDuration > 0 ? (span.duration_ms / maxDuration) * 100 : 0
   const isGenAi = !!span.gen_ai_system || !!span.gen_ai_operation
@@ -1405,9 +1870,10 @@ function SpanTreeRow({
         )}
 
         {/* Icon */}
-        <Icon
-          className={`h-3.5 w-3.5 shrink-0 ${isGenAi ? 'text-primary' : 'text-muted-foreground'}`}
-        />
+        {spanIcon(
+          span,
+          `h-3.5 w-3.5 shrink-0 ${isGenAi ? 'text-primary' : 'text-muted-foreground'}`
+        )}
 
         {/* Name */}
         <span
@@ -1854,7 +2320,6 @@ function SpanDetailSheet({
   allSpans?: GenAiSpanDetail[]
 }) {
   if (!span) return null
-  const Icon = spanIcon(span)
   const isError = span.status_code === 'ERROR'
 
   const totalTokens = (span.input_tokens ?? 0) + (span.output_tokens ?? 0)
@@ -1884,7 +2349,7 @@ function SpanDetailSheet({
       <SheetContent className="w-full sm:max-w-lg overflow-y-auto">
         <SheetHeader className="pb-4">
           <div className="flex items-center gap-2">
-            <Icon className="h-4 w-4 text-primary" />
+            {spanIcon(span, 'h-4 w-4 text-primary')}
             <SheetTitle className="text-sm font-mono">
               {spanLabel(span)}
             </SheetTitle>
@@ -2337,7 +2802,6 @@ function InvocationCard({
   onOpenSpan: (span: GenAiSpanDetail) => void
 }) {
   const [open, setOpen] = useState(true)
-  const Icon = spanIcon(span)
   const isError = span.status_code === 'ERROR'
   const hasContent = spanHasContent(span)
   const model = span.gen_ai_response_model || span.gen_ai_model
@@ -2361,7 +2825,7 @@ function InvocationCard({
                     : 'bg-primary/10 text-primary'
                 }`}
               >
-                <Icon className="h-3.5 w-3.5" />
+                {spanIcon(span, 'h-3.5 w-3.5')}
               </span>
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2828,19 +3292,17 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
-    TIME_RANGES[0]
-  )
+  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
 
   const projectId = selectedProjectId ?? projects[0]?.id
 
   const timeParams = useMemo(() => {
-    const to = new Date().toISOString()
-    const from = new Date(Date.now() - timeRange.hours * 3600_000).toISOString()
+    const to = new Date(endMs).toISOString()
+    const from = new Date(endMs - timeRange.hours * 3600_000).toISOString()
     return { from, to }
-  }, [timeRange])
+  }, [endMs, timeRange])
 
   const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
     queryKey: [
@@ -2936,7 +3398,7 @@ export function AgentActivity() {
                   timeRange.label === range.label ? 'default' : 'outline'
                 }
                 size="sm"
-                onClick={() => setTimeRange(range)}
+                onClick={() => selectTimeRange(range)}
               >
                 {range.label}
               </Button>
@@ -3137,9 +3599,7 @@ export function AgentActivity() {
 // ── ProjectAgentActivity (exported for project detail page) ─────────
 
 export function ProjectAgentActivity({ projectId }: { projectId: number }) {
-  const [timeRange, setTimeRange] = useState<(typeof TIME_RANGES)[number]>(
-    TIME_RANGES[0]
-  )
+  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3153,10 +3613,10 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
   }
 
   const timeParams = useMemo(() => {
-    const to = new Date().toISOString()
-    const from = new Date(Date.now() - timeRange.hours * 3600_000).toISOString()
+    const to = new Date(endMs).toISOString()
+    const from = new Date(endMs - timeRange.hours * 3600_000).toISOString()
     return { from, to }
-  }, [timeRange])
+  }, [endMs, timeRange])
 
   const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
     queryKey: [
@@ -3233,7 +3693,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                   timeRange.label === range.label ? 'default' : 'outline'
                 }
                 size="sm"
-                onClick={() => setTimeRange(range)}
+                onClick={() => selectTimeRange(range)}
               >
                 {range.label}
               </Button>
@@ -3661,12 +4121,17 @@ export function AiGatewayPage() {
   // spawning a subprocess per CLI to check host auth status. Only the
   // Status/Actions cells (which depend on that check) show a skeleton;
   // provider name/description are known ahead of time.
-  const CLI_PROVIDER_SHELL: Array<{ id: string; name: string }> = [
-    { id: 'claude_cli', name: 'Claude Code' },
-    { id: 'codex_cli', name: 'Codex (OpenAI)' },
-    { id: 'opencode_cli', name: 'OpenCode' },
-  ]
   const { data: providerPreference } = useQuery(getAiProviderStatusOptions())
+  const summaryStatus = providerPreference as
+    | (typeof providerPreference & {
+        available_providers: SummaryProviderOption[]
+        summary_preference?: {
+          provider_id?: string | null
+          model?: string | null
+          thinking_level?: string | null
+        }
+      })
+    | undefined
 
   const activeCliProviderId =
     providerPreference?.active_provider_type === 'agent_cli'
@@ -3687,8 +4152,28 @@ export function AiGatewayPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
       queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
-      toast.success('Provider authentication and models refreshed')
+      toast.success('Subscription provider authentication refreshed')
     },
+  })
+
+  const refreshAllGatewayModelsMutation = useMutation({
+    mutationFn: () =>
+      Promise.all(
+        keys.map((key) =>
+          refreshProviderModels({
+            path: { id: key.id },
+            throwOnError: true,
+          })
+        )
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providerModelInventory'] })
+      toast.success('Gateway model catalogs refreshed')
+    },
+    onError: (error) =>
+      toast.error('Some gateway model catalogs could not be refreshed', {
+        description: String(error),
+      }),
   })
 
   const activateCliProvider = (providerId: string, providerName: string) => {
@@ -4032,6 +4517,21 @@ console.log(response.choices[0].message.content);`,
         </div>
       </Card>
 
+      {summaryStatus && (
+        <AiSummaryDefaultsCard
+          key={JSON.stringify(summaryStatus.summary_preference ?? {})}
+          providers={summaryStatus.available_providers}
+          initialProviderId={summaryStatus.summary_preference?.provider_id}
+          initialModel={summaryStatus.summary_preference?.model}
+          initialThinking={summaryStatus.summary_preference?.thinking_level}
+          onSaved={() => {
+            queryClient.invalidateQueries({
+              queryKey: getAiProviderStatusQueryKey(),
+            })
+          }}
+        />
+      )}
+
       {/* Provider Keys — compact table: one row per supported provider.
           Click the chevron to expand and see individual keys with per-key
           test/toggle/delete actions. Keeps the screen dense so you can see
@@ -4047,12 +4547,21 @@ console.log(response.choices[0].message.content);`,
           <Button
             variant="outline"
             size="sm"
-            onClick={() => refreshProviderStatusMutation.mutate({})}
-            disabled={refreshProviderStatusMutation.isPending}
+            onClick={() => {
+              refreshProviderStatusMutation.mutate({})
+              refreshAllGatewayModelsMutation.mutate()
+            }}
+            disabled={
+              refreshProviderStatusMutation.isPending ||
+              refreshAllGatewayModelsMutation.isPending
+            }
           >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${
-                refreshProviderStatusMutation.isPending ? 'animate-spin' : ''
+                refreshProviderStatusMutation.isPending ||
+                refreshAllGatewayModelsMutation.isPending
+                  ? 'animate-spin'
+                  : ''
               }`}
             />
             Refresh auth &amp; models
@@ -4187,73 +4696,82 @@ console.log(response.choices[0].message.content);`,
 
                       {expanded &&
                         providerKeys.map((key) => (
-                          <TableRow
-                            key={key.id}
-                            className="bg-muted/30 hover:bg-muted/40"
-                          >
-                            <TableCell />
-                            <TableCell colSpan={3} className="py-2">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <span className="text-sm font-medium truncate">
-                                  {key.display_name}
-                                </span>
-                                {!key.is_active && (
-                                  <Badge
-                                    variant="secondary"
-                                    className="h-5 px-1.5 text-[10px]"
+                          <Fragment key={key.id}>
+                            <TableRow className="bg-muted/30 hover:bg-muted/40">
+                              <TableCell />
+                              <TableCell colSpan={3} className="py-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="text-sm font-medium truncate">
+                                    {key.display_name}
+                                  </span>
+                                  {!key.is_active && (
+                                    <Badge
+                                      variant="secondary"
+                                      className="h-5 px-1.5 text-[10px]"
+                                    >
+                                      Disabled
+                                    </Badge>
+                                  )}
+                                  <code className="text-xs text-muted-foreground truncate">
+                                    {key.api_key_masked}
+                                  </code>
+                                </div>
+                              </TableCell>
+                              <TableCell className="py-2 text-right">
+                                <div className="flex items-center justify-end gap-0.5">
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() =>
+                                      testKeyMutation.mutate(key.id)
+                                    }
+                                    disabled={testingKeyId === key.id}
+                                    title="Test key"
                                   >
-                                    Disabled
-                                  </Badge>
-                                )}
-                                <code className="text-xs text-muted-foreground truncate">
-                                  {key.api_key_masked}
-                                </code>
-                              </div>
-                            </TableCell>
-                            <TableCell className="py-2 text-right">
-                              <div className="flex items-center justify-end gap-0.5">
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8"
-                                  onClick={() => testKeyMutation.mutate(key.id)}
-                                  disabled={testingKeyId === key.id}
-                                  title="Test key"
-                                >
-                                  {testingKeyId === key.id ? (
-                                    <Loader2 className="h-4 w-4 animate-spin" />
-                                  ) : (
-                                    <Play className="h-4 w-4" />
-                                  )}
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8"
-                                  onClick={() => handleToggle(key)}
-                                  disabled={toggleMutation.isPending}
-                                  title={
-                                    key.is_active ? 'Disable key' : 'Enable key'
-                                  }
-                                >
-                                  {key.is_active ? (
-                                    <Power className="h-4 w-4" />
-                                  ) : (
-                                    <PowerOff className="h-4 w-4 text-muted-foreground" />
-                                  )}
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8"
-                                  onClick={() => handleDelete(key)}
-                                  title="Delete key"
-                                >
-                                  <Trash2 className="h-4 w-4 text-destructive" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
+                                    {testingKeyId === key.id ? (
+                                      <Loader2 className="h-4 w-4 animate-spin" />
+                                    ) : (
+                                      <Play className="h-4 w-4" />
+                                    )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() => handleToggle(key)}
+                                    disabled={toggleMutation.isPending}
+                                    title={
+                                      key.is_active
+                                        ? 'Disable key'
+                                        : 'Enable key'
+                                    }
+                                  >
+                                    {key.is_active ? (
+                                      <Power className="h-4 w-4" />
+                                    ) : (
+                                      <PowerOff className="h-4 w-4 text-muted-foreground" />
+                                    )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() => handleDelete(key)}
+                                    title="Delete key"
+                                  >
+                                    <Trash2 className="h-4 w-4 text-destructive" />
+                                  </Button>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                            <TableRow className="bg-muted/20 hover:bg-muted/20">
+                              <TableCell />
+                              <TableCell colSpan={4} className="pb-4 pt-1">
+                                <ProviderKeyModelDetail providerKey={key} />
+                              </TableCell>
+                            </TableRow>
+                          </Fragment>
                         ))}
                     </Fragment>
                   )
@@ -4271,7 +4789,7 @@ console.log(response.choices[0].message.content);`,
                       only the Status/Actions cells (the part that's
                       actually waiting on that check) show a skeleton. */}
                 {cliCatalogLoading
-                  ? CLI_PROVIDER_SHELL.map((shell) => (
+                  ? AI_CLI_PROVIDER_SHELL.map((shell) => (
                       <TableRow key={shell.id} className="hover:bg-transparent">
                         <TableCell className="py-2 pr-0" />
                         <TableCell className="py-2">
@@ -4309,120 +4827,172 @@ console.log(response.choices[0].message.content);`,
                     ))
                   : cliProviders.map((cli) => {
                       const isActive = activeCliProviderId === cli.id
+                      const expanded = expandedProvider === cli.id
                       return (
-                        <TableRow key={cli.id} className="hover:bg-transparent">
-                          <TableCell className="py-2 pr-0" />
-                          <TableCell className="py-2">
-                            <div className="flex items-center gap-3 min-w-0">
-                              <AiProviderIcon provider={cli.id} size={32} />
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-sm font-medium truncate">
-                                    {cli.name}
-                                  </span>
-                                  <Badge
-                                    variant="outline"
-                                    className="h-5 px-1.5 text-[10px] text-muted-foreground"
-                                  >
-                                    Subscription
-                                  </Badge>
-                                  {cli.host_authenticated && (
+                        <Fragment key={cli.id}>
+                          <TableRow
+                            className="cursor-pointer"
+                            onClick={() =>
+                              setExpandedProvider(expanded ? null : cli.id)
+                            }
+                          >
+                            <TableCell className="py-2 pr-0">
+                              <ChevronRight
+                                className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? 'rotate-90' : ''}`}
+                              />
+                            </TableCell>
+                            <TableCell className="py-2">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <AiProviderIcon provider={cli.id} size={32} />
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-sm font-medium truncate">
+                                      {cli.name}
+                                    </span>
                                     <Badge
-                                      variant="secondary"
-                                      className="h-5 px-1.5 text-[10px]"
+                                      variant="outline"
+                                      className="h-5 px-1.5 text-[10px] text-muted-foreground"
                                     >
-                                      Host environment
+                                      Subscription
                                     </Badge>
+                                    {cli.host_authenticated && (
+                                      <Badge
+                                        variant="secondary"
+                                        className="h-5 px-1.5 text-[10px]"
+                                      >
+                                        Host environment
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  <p className="text-xs text-muted-foreground truncate">
+                                    {cli.host_authenticated
+                                      ? `${hostAuthLabel(cli.host_auth_method)} — available for host-routed AI tasks; sandbox workflows require a separate credential`
+                                      : (cli.host_auth_hint ??
+                                        'Not authenticated on this host yet')}
+                                  </p>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
+                              <span className="line-clamp-1">
+                                {cli.models.length > 0
+                                  ? cli.models.join(', ')
+                                  : 'Model selection lives in the CLI’s own config'}
+                              </span>
+                            </TableCell>
+                            <TableCell className="hidden sm:table-cell py-2">
+                              {isActive ? (
+                                <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
+                                  Active
+                                </Badge>
+                              ) : cli.host_authenticated ? (
+                                <Badge
+                                  variant="secondary"
+                                  className="justify-center whitespace-nowrap"
+                                >
+                                  Configured
+                                </Badge>
+                              ) : (
+                                <Badge
+                                  variant="outline"
+                                  className="justify-center whitespace-nowrap text-muted-foreground"
+                                >
+                                  Not configured
+                                </Badge>
+                              )}
+                            </TableCell>
+                            <TableCell
+                              className="py-2 text-right"
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              <div className="flex items-center justify-end gap-1.5">
+                                {isActive ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={switchToGateway}
+                                    disabled={preferenceMutation.isPending}
+                                  >
+                                    Switch to Gateway
+                                  </Button>
+                                ) : cli.host_authenticated ? (
+                                  <Button
+                                    variant="default"
+                                    size="sm"
+                                    onClick={() =>
+                                      activateCliProvider(cli.id, cli.name)
+                                    }
+                                    disabled={preferenceMutation.isPending}
+                                  >
+                                    Use this provider
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled
+                                    title={
+                                      cli.host_auth_hint ??
+                                      'Not authenticated on this host yet'
+                                    }
+                                  >
+                                    Not authenticated
+                                  </Button>
+                                )}
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-8 w-8"
+                                  title={
+                                    cli.credential_saved
+                                      ? 'Update sandbox credential (used by the AI Workflows autofixer, not chat)'
+                                      : 'Configure sandbox credential (used by the AI Workflows autofixer, not chat)'
+                                  }
+                                  onClick={() => openCliDialog(cli)}
+                                >
+                                  <Wrench className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                          {expanded && (
+                            <TableRow className="bg-muted/20 hover:bg-muted/20">
+                              <TableCell />
+                              <TableCell colSpan={4} className="pb-4 pt-1">
+                                <div className="space-y-2 rounded-md border bg-background p-3">
+                                  <div className="text-sm font-medium">
+                                    Models available through {cli.name}
+                                  </div>
+                                  <p className="text-xs text-muted-foreground">
+                                    {cli.host_version
+                                      ? `CLI ${cli.host_version} · `
+                                      : ''}
+                                    Catalog source: {cli.model_source}
+                                    {cli.models_refreshed_at
+                                      ? ` · refreshed ${new Date(cli.models_refreshed_at).toLocaleString()}`
+                                      : ''}
+                                  </p>
+                                  {cli.models.length > 0 ? (
+                                    <div className="flex flex-wrap gap-2">
+                                      {cli.models.map((model) => (
+                                        <Badge key={model} variant="outline">
+                                          <code className="text-xs">
+                                            {model}
+                                          </code>
+                                        </Badge>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-sm text-muted-foreground">
+                                      This CLI manages model selection in its
+                                      own configuration.
+                                    </p>
                                   )}
                                 </div>
-                                <p className="text-xs text-muted-foreground truncate">
-                                  {cli.host_authenticated
-                                    ? `${hostAuthLabel(cli.host_auth_method)} — available for host-routed AI tasks; sandbox workflows require a separate credential`
-                                    : (cli.host_auth_hint ??
-                                      'Not authenticated on this host yet')}
-                                </p>
-                              </div>
-                            </div>
-                          </TableCell>
-                          <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
-                            <span className="line-clamp-1">
-                              {cli.models.length > 0
-                                ? cli.models.join(', ')
-                                : 'Model selection lives in the CLI’s own config'}
-                            </span>
-                          </TableCell>
-                          <TableCell className="hidden sm:table-cell py-2">
-                            {isActive ? (
-                              <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
-                                Active
-                              </Badge>
-                            ) : cli.host_authenticated ? (
-                              <Badge
-                                variant="secondary"
-                                className="justify-center whitespace-nowrap"
-                              >
-                                Configured
-                              </Badge>
-                            ) : (
-                              <Badge
-                                variant="outline"
-                                className="justify-center whitespace-nowrap text-muted-foreground"
-                              >
-                                Not configured
-                              </Badge>
-                            )}
-                          </TableCell>
-                          <TableCell className="py-2 text-right">
-                            <div className="flex items-center justify-end gap-1.5">
-                              {isActive ? (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={switchToGateway}
-                                  disabled={preferenceMutation.isPending}
-                                >
-                                  Switch to Gateway
-                                </Button>
-                              ) : cli.host_authenticated ? (
-                                <Button
-                                  variant="default"
-                                  size="sm"
-                                  onClick={() =>
-                                    activateCliProvider(cli.id, cli.name)
-                                  }
-                                  disabled={preferenceMutation.isPending}
-                                >
-                                  Use this provider
-                                </Button>
-                              ) : (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled
-                                  title={
-                                    cli.host_auth_hint ??
-                                    'Not authenticated on this host yet'
-                                  }
-                                >
-                                  Not authenticated
-                                </Button>
-                              )}
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-8 w-8"
-                                title={
-                                  cli.credential_saved
-                                    ? 'Update sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                    : 'Configure sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                }
-                                onClick={() => openCliDialog(cli)}
-                              >
-                                <Wrench className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          </TableCell>
-                        </TableRow>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </Fragment>
                       )
                     })}
               </TableBody>
@@ -4533,8 +5103,8 @@ console.log(response.choices[0].message.content);`,
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                We'll verify the key works before saving — this usually takes
-                1–2 seconds.
+                We&apos;ll verify the key works before saving — this usually
+                takes 1–2 seconds.
               </p>
               <DialogFooter>
                 <Button

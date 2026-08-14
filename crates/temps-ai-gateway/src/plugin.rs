@@ -13,7 +13,10 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
-    services::{GatewayService, ProviderKeyService, ProviderPreferenceService, UsageService},
+    services::{
+        GatewayService, ProviderKeyService, ProviderModelService, ProviderPreferenceService,
+        StructuredOutputService, UsageService,
+    },
 };
 
 pub struct AiGatewayPlugin;
@@ -55,6 +58,45 @@ impl TempsPlugin for AiGatewayPlugin {
 
             let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
             context.register_service(gateway_service.clone());
+            let provider_model_service = Arc::new(ProviderModelService::new(
+                db.clone(),
+                provider_key_service.clone(),
+                gateway_service.clone(),
+            ));
+            context.register_service(provider_model_service.clone());
+
+            // Upgrade-safe catalog bootstrap: keys created before the model
+            // inventory migration would otherwise advertise zero models until
+            // an administrator manually pressed Refresh. Static adapter models
+            // are inserted synchronously and live discovery replaces their
+            // availability metadata in the background without delaying boot.
+            match provider_key_service.list_active().await {
+                Ok(keys) => {
+                    for key in keys {
+                        if let Err(error) = provider_model_service.seed_bootstrap(&key).await {
+                            tracing::warn!(
+                                provider_key_id = key.id,
+                                %error,
+                                "Could not seed the upgraded AI model catalog"
+                            );
+                        }
+                        let models = provider_model_service.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = models.refresh(key.id).await {
+                                tracing::warn!(
+                                    provider_key_id = key.id,
+                                    %error,
+                                    "Background AI model catalog refresh failed; bootstrap models remain available"
+                                );
+                            }
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Could not enumerate provider keys for model catalog bootstrap"
+                ),
+            }
 
             // ADR-022: register the general AI foundation so any feature can get
             // text or typed/structured output from the configured model through
@@ -65,9 +107,10 @@ impl TempsPlugin for AiGatewayPlugin {
             // host harnesses receive the same scoped tools through the
             // turn-local MCP bridge. Chat and feature code never branches on
             // provider transport.
-            let gateway_ai_service: Arc<dyn temps_ai::AiService> = Arc::new(
-                crate::services::GatewayAiService::new(gateway_service.clone(), db.clone()),
-            );
+            let gateway_ai_service = Arc::new(crate::services::GatewayAiService::new(
+                gateway_service.clone(),
+                db.clone(),
+            ));
 
             // One AgentCliAiService per catalog entry (Claude Code, Codex,
             // OpenCode), built once here rather than per-request — each is
@@ -110,16 +153,27 @@ impl TempsPlugin for AiGatewayPlugin {
             let preference_reader: Arc<dyn temps_ai_agent_cli::ActiveProviderReader> =
                 provider_preference_service.clone();
             let ai_service = Arc::new(temps_ai_agent_cli::AiProviderRegistry::with_providers(
-                gateway_ai_service,
+                gateway_ai_service.clone() as Arc<dyn temps_ai::AiService>,
                 preference_reader,
                 agent_cli_services,
             ));
-            context.register_service(ai_service as Arc<dyn temps_ai::AiService>);
+            let ai_service: Arc<dyn temps_ai::AiService> = ai_service;
+            context.register_service(ai_service.clone());
 
-            let usage_service = Arc::new(UsageService::new(db));
+            // Browser-supplied generic prompts are intentionally restricted to
+            // tool-less gateway APIs. Host subscription CLIs can inspect the
+            // host and are reserved for server-authored, purpose-specific jobs.
+            let structured_output_service = Arc::new(StructuredOutputService::new(
+                gateway_ai_service as Arc<dyn temps_ai::AiService>,
+            ));
+            context.register_service(structured_output_service.clone());
+
+            let usage_service = Arc::new(UsageService::new(db.clone()));
             context.register_service(usage_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let project_access_checker =
+                context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
             let telemetry = context
                 .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
@@ -128,12 +182,16 @@ impl TempsPlugin for AiGatewayPlugin {
                 });
 
             let app_state = create_ai_gateway_app_state(
+                db,
                 gateway_service,
                 provider_key_service,
+                provider_model_service,
                 provider_preference_service,
                 usage_service,
                 audit_service,
                 telemetry,
+                structured_output_service,
+                project_access_checker,
             )
             .await;
             context.register_service(app_state);
@@ -155,6 +213,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_provider_status_routes())
+            .merge(handlers::configure_structured_output_routes())
             .with_state(app_state);
 
         Some(PluginRoutes::new(routes))
@@ -171,6 +230,9 @@ impl TempsPlugin for AiGatewayPlugin {
         let provider_status_schema =
             <handlers::provider_status::AiProviderStatusApiDoc as OpenApiTrait>::openapi();
         schema.merge(provider_status_schema);
+        let structured_output_schema =
+            <handlers::structured_output::StructuredOutputApiDoc as OpenApiTrait>::openapi();
+        schema.merge(structured_output_schema);
         Some(schema)
     }
 }

@@ -1285,6 +1285,7 @@ impl ProjectService {
         cross_project_trace_sharing: Option<bool>,
         error_source_context_enabled: Option<bool>,
         error_source_root: Option<String>,
+        ai_api_traffic_summary_enabled: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1423,6 +1424,7 @@ impl ProjectService {
             || ai_write_actions_enabled.is_some()
             || error_source_context_enabled.is_some()
             || error_source_root.is_some()
+            || ai_api_traffic_summary_enabled.is_some()
         {
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1440,6 +1442,9 @@ impl ProjectService {
             }
             if let Some(v) = ai_write_actions_enabled {
                 active_project.ai_write_actions_enabled = Set(v);
+            }
+            if let Some(v) = ai_api_traffic_summary_enabled {
+                active_project.ai_api_traffic_summary_enabled = Set(Some(v));
             }
             // Opt-in for native error-tracking source context (non-null bool).
             if let Some(v) = error_source_context_enabled {
@@ -3084,6 +3089,7 @@ impl ProjectService {
             ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
             ai_debug_chat_enabled: db_project.ai_debug_chat_enabled,
             ai_write_actions_enabled: db_project.ai_write_actions_enabled,
+            ai_api_traffic_summary_enabled: db_project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: db_project.error_source_context_enabled,
             error_source_root: db_project.error_source_root,
             enable_preview_environments: db_project.enable_preview_environments,
@@ -4028,6 +4034,7 @@ mod tests {
                 None, // cross_project_trace_sharing
                 None, // error_source_context_enabled
                 None, // error_source_root
+                None, // ai_api_traffic_summary_enabled
             )
             .await;
 
@@ -4396,6 +4403,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("partial preset_config patch");
@@ -4467,6 +4475,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("partial excludedServices patch");
@@ -4514,6 +4523,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("partial relaxedCapabilityServices patch");
@@ -4569,6 +4579,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
@@ -4620,6 +4631,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("unrelated excludedServices patch");
@@ -4692,6 +4704,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("relaxedCapabilityServices patch for a real non-database service");
@@ -4759,6 +4772,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await;
 
@@ -4817,6 +4831,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("explicit empty providers");
@@ -4916,6 +4931,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await;
 
@@ -5014,6 +5030,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await;
 
@@ -5135,6 +5152,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("update custom Dockerfile config");
@@ -5371,6 +5389,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("update preset and config together");
@@ -5762,6 +5781,7 @@ mod tests {
                 None, // cross_project_trace_sharing
                 None, // error_source_context_enabled
                 None, // error_source_root
+                None, // ai_api_traffic_summary_enabled
             )
             .await
             .expect("update_project_settings should succeed");

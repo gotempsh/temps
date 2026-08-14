@@ -1976,11 +1976,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let logs_plugin = Box::new(LogsPlugin::new(logs_dir));
     plugin_manager.register_plugin(logs_plugin);
 
-    // 3. AnalyticsPlugin - provides analytics services (depends on database)
-    debug!("Registering AnalyticsPlugin");
-    let analytics_plugin = Box::new(AnalyticsPlugin::new());
-    plugin_manager.register_plugin(analytics_plugin);
-
     // 3.1. EventsPlugin - provides custom events tracking (depends on database)
     debug!("Registering EventsPlugin");
     let events_plugin = Box::new(EventsPlugin);
@@ -2016,17 +2011,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let audit_plugin = Box::new(AuditPlugin::new());
     plugin_manager.register_plugin(audit_plugin);
 
-    // 5.5. TeamsPlugin - teams + project-scoped RBAC (depends on database
-    // and AuditLogger, hence after AuditPlugin).
-    //
-    // This registers the `ProjectAccessChecker` that every project-scoped
-    // plugin resolves in its own `configure_routes`. Registration order
-    // between plugins doesn't matter for that — all `register_services`
-    // calls complete before any `configure_routes` runs — but it must come
-    // after AuditPlugin, whose `AuditLogger` it requires.
+    // 5.1. TeamsPlugin - registers project-scoped RBAC. Project-facing
+    // plugins capture its ProjectAccessChecker while registering services,
+    // so Teams must precede them (and follow AuditPlugin, which it requires).
     debug!("Registering TeamsPlugin");
     let teams_plugin = Box::new(TeamsPlugin::new());
     plugin_manager.register_plugin(teams_plugin);
+
+    // 5.2. AI Gateway Plugin - registers the provider-neutral AiService.
+    // It depends on config, encryption, audit, and project access services.
+    debug!("Registering AiGatewayPlugin");
+    let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
+    plugin_manager.register_plugin(ai_gateway_plugin);
+
+    // 5.3. AnalyticsPlugin - depends on the database and AiService. The AI
+    // registry itself is always present; provider availability remains a
+    // runtime concern surfaced by the summary endpoint.
+    debug!("Registering AnalyticsPlugin");
+    let analytics_plugin = Box::new(AnalyticsPlugin::new());
+    plugin_manager.register_plugin(analytics_plugin);
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
@@ -2210,11 +2213,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering ObservabilityPlugin");
     let observability_plugin = Box::new(ObservabilityPlugin::new());
     plugin_manager.register_plugin(observability_plugin);
-
-    // AI Gateway Plugin - provides AI provider key management and OpenAI-compatible API
-    debug!("Registering AiGatewayPlugin");
-    let ai_gateway_plugin = Box::new(temps_ai_gateway::AiGatewayPlugin::new());
-    plugin_manager.register_plugin(ai_gateway_plugin);
 
     // AI Chat Plugin - persistent AI debugging conversations (ADR-023). After the
     // AI gateway so the AiService it provides is registered.

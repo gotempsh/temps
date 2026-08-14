@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures_util::StreamExt as FuturesStreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use crate::error::AiGatewayError;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::gemini::GeminiProvider;
 use crate::providers::openai_compat::OpenAiCompatProvider;
-use crate::providers::{route_model_to_provider, AiProvider};
+use crate::providers::{external_http_client, route_model_to_provider, AiProvider};
 use crate::services::provider_key_service::ProviderKeyService;
 use crate::types::*;
 
@@ -59,6 +60,147 @@ impl GatewayService {
             .get(provider_id)
             .map(|provider| provider.available_models())
             .unwrap_or_default()
+    }
+
+    /// Discover the models actually visible to one provider key. Static
+    /// adapter models are only a bootstrap fallback; this is the source used
+    /// by explicit catalog refreshes.
+    pub async fn discover_models_for_key(
+        &self,
+        key_id: i32,
+    ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        let key = self.provider_key_service.get_by_id(key_id).await?;
+        let provider = self.providers.get(key.provider.as_str()).ok_or_else(|| {
+            AiGatewayError::ProviderNotConfigured {
+                provider: key.provider.clone(),
+            }
+        })?;
+        if let Some(base_url) = key.base_url.as_deref() {
+            temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
+                AiGatewayError::InvalidProviderUrl {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        let api_key = self
+            .provider_key_service
+            .decrypt_api_key(&key.api_key_encrypted)?;
+        let base = key
+            .base_url
+            .as_deref()
+            .unwrap_or(provider.info().default_base_url)
+            .trim_end_matches('/');
+        let client = external_http_client(std::time::Duration::from_secs(30));
+
+        let response = match key.provider.as_str() {
+            "openai" | "xai" => {
+                client
+                    .get(format!("{base}/models"))
+                    .bearer_auth(&api_key)
+                    .send()
+                    .await?
+            }
+            "anthropic" => {
+                client
+                    .get(format!("{base}/v1/models?limit=1000"))
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .send()
+                    .await?
+            }
+            "gemini" => {
+                client
+                    .get(format!("{base}/v1beta/models"))
+                    .query(&[("pageSize", "1000"), ("key", api_key.as_str())])
+                    .send()
+                    .await?
+            }
+            _ => {
+                return Err(AiGatewayError::ProviderNotConfigured {
+                    provider: key.provider,
+                })
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AiGatewayError::UpstreamError {
+                model: "model-catalog".to_string(),
+                status: status.as_u16(),
+                message: "Provider rejected model discovery".to_string(),
+            });
+        }
+        const MAX_MODEL_CATALOG_BYTES: usize = 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_MODEL_CATALOG_BYTES as u64)
+        {
+            return Err(AiGatewayError::TranslationError {
+                provider: key.provider.clone(),
+                reason: "Provider model catalog exceeded the 1 MiB limit".to_string(),
+            });
+        }
+        let mut response_stream = response.bytes_stream();
+        let mut response_bytes = Vec::new();
+        while let Some(chunk) = response_stream.next().await {
+            let chunk = chunk?;
+            if response_bytes.len().saturating_add(chunk.len()) > MAX_MODEL_CATALOG_BYTES {
+                return Err(AiGatewayError::TranslationError {
+                    provider: key.provider.clone(),
+                    reason: "Provider model catalog exceeded the 1 MiB limit".to_string(),
+                });
+            }
+            response_bytes.extend_from_slice(&chunk);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|error| {
+            AiGatewayError::TranslationError {
+                provider: key.provider.clone(),
+                reason: format!("Failed to parse provider model catalog: {error}"),
+            }
+        })?;
+        let entries = if key.provider == "gemini" {
+            body.get("models")
+        } else {
+            body.get("data")
+        }
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AiGatewayError::TranslationError {
+            provider: key.provider.clone(),
+            reason: "Provider model catalog did not contain a model array".to_string(),
+        })?;
+
+        let mut models: Vec<ModelInfo> = entries
+            .iter()
+            .filter(|entry| {
+                key.provider != "gemini"
+                    || entry
+                        .get("supportedGenerationMethods")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|methods| {
+                            methods.iter().any(|method| method == "generateContent")
+                        })
+            })
+            .filter_map(|entry| {
+                let raw_id = entry.get("id").or_else(|| entry.get("name"))?.as_str()?;
+                let id = raw_id.strip_prefix("models/").unwrap_or(raw_id).to_string();
+                if !provider.supports_model(&id) {
+                    return None;
+                }
+                let owned_by = entry
+                    .get("owned_by")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(key.provider.as_str())
+                    .to_string();
+                Some(ModelInfo {
+                    id,
+                    object: "model".to_string(),
+                    owned_by,
+                })
+            })
+            .take(5_000)
+            .collect();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        models.dedup_by(|left, right| left.id == right.id);
+        Ok(models)
     }
 
     /// Route a model name to the provider and resolve the API key.
@@ -135,9 +277,21 @@ impl GatewayService {
                 })?
         };
 
+        self.provider_key_service
+            .ensure_model_selectable(key_record.id, model)
+            .await?;
+
         let decrypted_key = self
             .provider_key_service
             .decrypt_api_key(&key_record.api_key_encrypted)?;
+
+        if let Some(base_url) = key_record.base_url.as_deref() {
+            temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
+                AiGatewayError::InvalidProviderUrl {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
 
         debug!(
             provider = provider_id,
@@ -216,6 +370,13 @@ impl GatewayService {
         api_key: &str,
         base_url: Option<&str>,
     ) -> Result<(), AiGatewayError> {
+        if let Some(base_url) = base_url {
+            temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
+                AiGatewayError::InvalidProviderUrl {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         let provider = self.providers.get(provider_id).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
@@ -226,8 +387,8 @@ impl GatewayService {
         let test_model = match provider_id {
             "openai" => "gpt-5-nano",
             "anthropic" => "claude-haiku-4-5",
-            "xai" => "grok-4-1-fast-non-reasoning",
-            "gemini" => "gemini-2.5-flash-lite",
+            "xai" => "grok-4.5",
+            "gemini" => "gemini-3.5-flash-lite",
             _ => {
                 return Err(AiGatewayError::ProviderNotConfigured {
                     provider: provider_id.to_string(),

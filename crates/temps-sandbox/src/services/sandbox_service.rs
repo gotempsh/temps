@@ -3155,6 +3155,7 @@ mod storage_cleanup_tests {
             git_provider_connection_id: Some(3),
             attack_mode: false,
             ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

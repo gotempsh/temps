@@ -31,13 +31,14 @@ impl From<AiGatewayError> for Problem {
             AiGatewayError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
-            AiGatewayError::Database(_)
-            | AiGatewayError::Encryption(_)
-            | AiGatewayError::HttpClient(_) => {
+            AiGatewayError::Database(_) | AiGatewayError::Encryption(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::HttpClient(_) => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("AI Provider Unavailable")
+                .with_detail(error.to_string()),
             AiGatewayError::ProviderNotConfigured { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Provider Not Configured")
@@ -85,11 +86,16 @@ impl From<AiGatewayError> for Problem {
 #[openapi(
     paths(
         list_provider_keys,
+        get_provider_key,
         create_provider_key,
         update_provider_key,
         delete_provider_key,
         test_provider_key_inline,
         test_provider_key_by_id,
+        refresh_provider_models,
+        add_provider_model,
+        update_provider_model,
+        delete_provider_model,
     ),
     components(schemas(
         ProviderKeyResponse,
@@ -97,6 +103,10 @@ impl From<AiGatewayError> for Problem {
         UpdateProviderKeyRequest,
         TestProviderKeyRequest,
         TestProviderKeyResponse,
+        ProviderDetailResponse,
+        ProviderModelResponse,
+        AddProviderModelRequest,
+        UpdateProviderModelRequest,
     )),
     info(
         title = "AI Gateway Admin API",
@@ -113,10 +123,20 @@ pub fn configure_admin_routes() -> Router<Arc<AiGatewayAppState>> {
     Router::new()
         .route("/ai/providers", get(list_provider_keys))
         .route("/ai/providers", post(create_provider_key))
+        .route("/ai/providers/{id}", get(get_provider_key))
         .route("/ai/providers/{id}", patch(update_provider_key))
         .route("/ai/providers/{id}", delete(delete_provider_key))
         .route("/ai/providers/test", post(test_provider_key_inline))
         .route("/ai/providers/{id}/test", post(test_provider_key_by_id))
+        .route(
+            "/ai/providers/{id}/models/refresh",
+            post(refresh_provider_models),
+        )
+        .route("/ai/providers/{id}/models", post(add_provider_model))
+        .route(
+            "/ai/providers/{id}/models/{model_row_id}",
+            patch(update_provider_model).delete(delete_provider_model),
+        )
 }
 
 // ============================================================================
@@ -136,6 +156,54 @@ pub struct ProviderKeyResponse {
     pub is_active: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderModelResponse {
+    pub id: i32,
+    pub provider_key_id: i32,
+    pub model_id: String,
+    pub display_name: String,
+    pub source: String,
+    pub is_available: bool,
+    pub is_enabled: bool,
+    pub owned_by: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl From<temps_entities::ai_provider_models::Model> for ProviderModelResponse {
+    fn from(model: temps_entities::ai_provider_models::Model) -> Self {
+        Self {
+            id: model.id,
+            provider_key_id: model.provider_key_id,
+            model_id: model.model_id,
+            display_name: model.display_name,
+            source: model.source,
+            is_available: model.is_available,
+            is_enabled: model.is_enabled,
+            owned_by: model.owned_by,
+            last_seen_at: model.last_seen_at.map(|value| value.to_rfc3339()),
+            updated_at: model.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderDetailResponse {
+    pub key: ProviderKeyResponse,
+    pub models: Vec<ProviderModelResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AddProviderModelRequest {
+    pub model_id: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateProviderModelRequest {
+    pub is_enabled: bool,
 }
 
 impl From<temps_entities::ai_provider_keys::Model> for ProviderKeyResponse {
@@ -244,6 +312,28 @@ async fn list_provider_keys(
 
 #[utoipa::path(
     tag = "AI Gateway Admin",
+    get,
+    path = "/ai/providers/{id}",
+    params(("id" = i32, Path, description = "Provider key ID")),
+    responses((status = 200, body = ProviderDetailResponse), (status = 404, body = ProblemDetails)),
+    security(("bearer_auth" = []))
+)]
+async fn get_provider_key(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayRead);
+    let key = app_state.provider_key_service.get_by_id(id).await?;
+    let models = app_state.provider_model_service.list_for_key(id).await?;
+    Ok(Json(ProviderDetailResponse {
+        key: key.into(),
+        models: models.into_iter().map(Into::into).collect(),
+    }))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Admin",
     post,
     path = "/ai/providers",
     request_body = CreateProviderKeyRequest,
@@ -276,19 +366,138 @@ async fn create_provider_key(
             message: format!("API key verification failed: {}", e),
         })?;
 
-    let key = app_state
+    let mut key = app_state
         .provider_key_service
         .create(
             &request.provider,
             &request.display_name,
             &request.api_key,
             request.base_url.as_deref(),
-            request.default_model.as_deref(),
+            None,
         )
         .await?;
+    app_state
+        .provider_model_service
+        .seed_bootstrap(&key)
+        .await?;
+    if let Err(error) = app_state.provider_model_service.refresh(key.id).await {
+        tracing::warn!(provider_key_id = key.id, error = %error, "Initial provider model refresh failed; bootstrap catalog remains available");
+    }
+    if let Some(default_model) = request.default_model.as_deref() {
+        if let Err(error) = app_state
+            .provider_model_service
+            .ensure_selectable(key.id, default_model)
+            .await
+        {
+            // Roll back the just-created key; model rows cascade with it.
+            app_state.provider_key_service.delete(key.id).await?;
+            return Err(error.into());
+        }
+        key = app_state
+            .provider_key_service
+            .update(key.id, None, None, None, Some(Some(default_model)), None)
+            .await?;
+    }
     app_state.provider_status_cache.invalidate().await;
 
     Ok((StatusCode::CREATED, Json(ProviderKeyResponse::from(key))))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Admin",
+    post,
+    path = "/ai/providers/{id}/models/refresh",
+    params(("id" = i32, Path, description = "Provider key ID")),
+    responses((status = 200, body = Vec<ProviderModelResponse>), (status = 404, body = ProblemDetails)),
+    security(("bearer_auth" = []))
+)]
+async fn refresh_provider_models(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+    let models = app_state.provider_model_service.refresh(id).await?;
+    app_state.provider_status_cache.invalidate().await;
+    Ok(Json(
+        models
+            .into_iter()
+            .map(ProviderModelResponse::from)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Admin",
+    post,
+    path = "/ai/providers/{id}/models",
+    params(("id" = i32, Path, description = "Provider key ID")),
+    request_body = AddProviderModelRequest,
+    responses((status = 201, body = ProviderModelResponse), (status = 400, body = ProblemDetails)),
+    security(("bearer_auth" = []))
+)]
+async fn add_provider_model(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path(id): Path<i32>,
+    Json(request): Json<AddProviderModelRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+    let model = app_state
+        .provider_model_service
+        .add_manual(id, &request.model_id, request.display_name.as_deref())
+        .await?;
+    app_state.provider_status_cache.invalidate().await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ProviderModelResponse::from(model)),
+    ))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Admin",
+    patch,
+    path = "/ai/providers/{id}/models/{model_row_id}",
+    params(("id" = i32, Path), ("model_row_id" = i32, Path)),
+    request_body = UpdateProviderModelRequest,
+    responses((status = 200, body = ProviderModelResponse), (status = 404, body = ProblemDetails)),
+    security(("bearer_auth" = []))
+)]
+async fn update_provider_model(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path((id, model_row_id)): Path<(i32, i32)>,
+    Json(request): Json<UpdateProviderModelRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+    let model = app_state
+        .provider_model_service
+        .set_enabled(id, model_row_id, request.is_enabled)
+        .await?;
+    app_state.provider_status_cache.invalidate().await;
+    Ok(Json(ProviderModelResponse::from(model)))
+}
+
+#[utoipa::path(
+    tag = "AI Gateway Admin",
+    delete,
+    path = "/ai/providers/{id}/models/{model_row_id}",
+    params(("id" = i32, Path), ("model_row_id" = i32, Path)),
+    responses((status = 204), (status = 400, body = ProblemDetails)),
+    security(("bearer_auth" = []))
+)]
+async fn delete_provider_model(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    Path((id, model_row_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+    app_state
+        .provider_model_service
+        .delete_manual(id, model_row_id)
+        .await?;
+    app_state.provider_status_cache.invalidate().await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -312,6 +521,13 @@ async fn update_provider_key(
     Json(request): Json<UpdateProviderKeyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
+
+    if let Some(Some(model_id)) = request.default_model.as_ref() {
+        app_state
+            .provider_model_service
+            .ensure_selectable(id, model_id)
+            .await?;
+    }
 
     let key = app_state
         .provider_key_service

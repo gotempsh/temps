@@ -322,6 +322,8 @@ pub struct ProjectResponse {
     pub ai_debug_chat_enabled: Option<bool>,
     /// Opt-in to AI propose-then-confirm write capability (false = off).
     pub ai_write_actions_enabled: bool,
+    /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+    pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in to native error-tracking source context (false = off). When on,
     /// Temps stores uploaded source files and shows source code in stack traces.
     pub error_source_context_enabled: bool,
@@ -381,6 +383,7 @@ impl ProjectResponse {
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
             ai_debug_chat_enabled: project.ai_debug_chat_enabled,
             ai_write_actions_enabled: project.ai_write_actions_enabled,
+            ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
             error_source_root: project.error_source_root,
             enable_preview_environments: project.enable_preview_environments,
@@ -655,6 +658,8 @@ pub struct UpdateProjectSettingsRequest {
     pub ai_debug_chat_enabled: Option<bool>,
     /// Opt in to AI propose-then-confirm write capability.
     pub ai_write_actions_enabled: Option<bool>,
+    /// Opt in to AI summarization of API traffic analytics.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt in to native error-tracking source context (source-file upload +
     /// source code shown in stack traces).
     pub error_source_context_enabled: Option<bool>,

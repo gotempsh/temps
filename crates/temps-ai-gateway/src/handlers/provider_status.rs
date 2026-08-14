@@ -60,7 +60,8 @@ impl From<ProviderPreferenceError> for Problem {
     paths(
         get_ai_provider_status,
         refresh_ai_provider_status,
-        update_ai_provider_preference
+        update_ai_provider_preference,
+        update_ai_summary_preference
     ),
     components(schemas(
         AiProviderStatusResponse,
@@ -69,6 +70,8 @@ impl From<ProviderPreferenceError> for Problem {
         AiSelectOptionDto,
         AiCliStatusDto,
         UpdateProviderPreferenceRequest,
+        UpdateAiSummaryPreferenceRequest,
+        AiSummaryPreferenceDto,
     )),
     info(
         title = "AI Provider Status API",
@@ -92,6 +95,7 @@ pub fn configure_provider_status_routes() -> Router<Arc<AiGatewayAppState>> {
             "/ai/provider-preference",
             put(update_ai_provider_preference),
         )
+        .route("/ai/summary-preference", put(update_ai_summary_preference))
 }
 
 // ============================================================================
@@ -130,6 +134,19 @@ pub struct AiProviderStatusResponse {
     /// Health of normalized mid-turn user interactions, or `null` when the
     /// active adapter does not advertise them. Kept for API compatibility.
     pub interactive_bridge_status: Option<String>,
+    /// Instance-wide defaults inherited by all server-authored AI summaries.
+    pub summary_preference: AiSummaryPreferenceDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct AiSummaryPreferenceDto {
+    /// Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).
+    /// `null` inherits the active instance provider.
+    pub provider_id: Option<String>,
+    /// `null` uses the selected provider's default model.
+    pub model: Option<String>,
+    /// `null` uses the selected model's default reasoning depth.
+    pub thinking_level: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -155,6 +172,10 @@ pub struct AiModelOptionDto {
     pub id: String,
     pub name: String,
     pub thinking_options: Vec<AiSelectOptionDto>,
+    /// Model-specific reasoning options valid while project-chat function
+    /// tools are attached. Omitted when the normal options also apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_thinking_options: Option<Vec<AiSelectOptionDto>>,
     pub default_thinking_option_id: Option<String>,
 }
 
@@ -170,19 +191,21 @@ fn provider_option(capabilities: temps_ai::ProviderCapabilities) -> AvailableAiP
     let models = capabilities
         .models
         .into_iter()
-        .map(|model| AiModelOptionDto {
-            id: model.id,
-            name: model.name,
-            thinking_options: model
-                .thinking_modes
-                .into_iter()
-                .map(|option| AiSelectOptionDto {
-                    id: option.id,
-                    name: option.name,
-                    description: option.description,
-                })
-                .collect(),
-            default_thinking_option_id: model.default_thinking_mode_id,
+        .map(|model| {
+            let map_option = |option: temps_ai::SelectOption| AiSelectOptionDto {
+                id: option.id,
+                name: option.name,
+                description: option.description,
+            };
+            AiModelOptionDto {
+                id: model.id,
+                name: model.name,
+                thinking_options: model.thinking_modes.into_iter().map(&map_option).collect(),
+                tool_thinking_options: model
+                    .tool_thinking_modes
+                    .map(|options| options.into_iter().map(map_option).collect()),
+                default_thinking_option_id: model.default_thinking_mode_id,
+            }
         })
         .collect::<Vec<_>>();
     let model_discovery_status = if models.is_empty() {
@@ -317,6 +340,14 @@ pub struct UpdateProviderPreferenceRequest {
     pub interactive_bridge_enabled: Option<bool>,
 }
 
+/// Replace the instance-wide defaults inherited by every AI summary.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateAiSummaryPreferenceRequest {
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+}
+
 // ============================================================================
 // Audit event
 // ============================================================================
@@ -389,14 +420,29 @@ async fn build_status_response(
     let gateway_available = !active_keys.is_empty();
     let mut available_providers = Vec::new();
     for key in &active_keys {
-        let adapter_models = app_state
-            .gateway_service
-            .available_models_for_provider(&key.provider);
-        let mut model_ids: Vec<String> = adapter_models
+        let catalog_models = app_state
+            .provider_model_service
+            .list_for_key(key.id)
+            .await
+            .map_err(Problem::from)?;
+        let mut model_ids: Vec<String> = catalog_models
             .into_iter()
-            .map(|m| m.id)
+            .filter(|model| model.is_available && model.is_enabled)
+            .map(|model| model.model_id)
             .filter(|id| !id.starts_with("text-embedding-"))
             .collect();
+        // Upgrade/bootstrap fallback only: a key created before the inventory
+        // migration remains immediately usable while its persisted catalog is
+        // seeded/refreshed in the background.
+        if model_ids.is_empty() {
+            model_ids = app_state
+                .gateway_service
+                .available_models_for_provider(&key.provider)
+                .into_iter()
+                .map(|model| model.id)
+                .filter(|id| !id.starts_with("text-embedding-"))
+                .collect();
+        }
         if let Some(default_model) = key.default_model.as_deref().filter(|m| !m.is_empty()) {
             if !model_ids.iter().any(|model| model == default_model) {
                 model_ids.insert(0, default_model.to_string());
@@ -528,6 +574,13 @@ async fn build_status_response(
         agent_cli_status,
         supports_interactive_tools,
         interactive_bridge_status,
+        summary_preference: preference
+            .map(|row| AiSummaryPreferenceDto {
+                provider_id: row.summary_provider_id,
+                model: row.summary_model,
+                thinking_level: row.summary_thinking_level,
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -621,6 +674,7 @@ async fn refresh_ai_provider_status(
     permission_guard!(auth, AiGatewayWrite);
 
     app_state.provider_status_cache.invalidate().await;
+    temps_agents::ai_cli::invalidate_model_discovery_cache().await;
     let response = cached_status_response(&app_state).await?;
     Ok(Json(response))
 }
@@ -681,6 +735,124 @@ async fn update_ai_provider_preference(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    tag = "AI Provider Status",
+    put,
+    path = "/ai/summary-preference",
+    request_body = UpdateAiSummaryPreferenceRequest,
+    responses(
+        (status = 200, description = "Updated summary routing defaults", body = AiProviderStatusResponse),
+        (status = 400, description = "Unsupported provider, model, or thinking level", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_ai_summary_preference(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
+    Json(request): Json<UpdateAiSummaryPreferenceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+
+    let status = cached_status_response(&app_state).await?;
+    validate_summary_preference(&status, &request)?;
+    app_state
+        .provider_preference_service
+        .set_summary_preference(
+            request.provider_id.clone(),
+            request.model.clone(),
+            request.thinking_level.clone(),
+        )
+        .await
+        .map_err(Problem::from)?;
+    app_state.provider_status_cache.invalidate().await;
+
+    let audit = ProviderPreferenceUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        scope: "ai_summaries".to_string(),
+        provider_type: "summary_profile".to_string(),
+        agent_cli_provider_id: request.provider_id.clone(),
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(%error, "Failed to create audit log for AI summary preference update");
+    }
+
+    cached_status_response(&app_state).await.map(Json)
+}
+
+fn validate_summary_preference(
+    status: &AiProviderStatusResponse,
+    request: &UpdateAiSummaryPreferenceRequest,
+) -> Result<(), Problem> {
+    let Some(provider_id) = request.provider_id.as_deref() else {
+        if request.model.is_some() || request.thinking_level.is_some() {
+            return Err(summary_preference_validation_problem(
+                "Select a summary provider before choosing a model or thinking level",
+            ));
+        }
+        return Ok(());
+    };
+    let provider = status
+        .available_providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            summary_preference_validation_problem(format!(
+                "AI summary provider '{provider_id}' is not configured and available"
+            ))
+        })?;
+
+    let selected_model = request
+        .model
+        .as_deref()
+        .or(provider.default_model_id.as_deref());
+    let model = match selected_model {
+        Some(model_id) => Some(
+            provider
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .ok_or_else(|| {
+                    summary_preference_validation_problem(format!(
+                        "Model '{model_id}' is not available from provider '{}'",
+                        provider.name
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+    if let Some(thinking) = request.thinking_level.as_deref() {
+        let model = model.ok_or_else(|| {
+            summary_preference_validation_problem(
+                "Choose a discovered model before setting a thinking level",
+            )
+        })?;
+        if !model
+            .thinking_options
+            .iter()
+            .any(|option| option.id == thinking)
+        {
+            return Err(summary_preference_validation_problem(format!(
+                "Thinking level '{thinking}' is not supported by model '{}'",
+                model.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn summary_preference_validation_problem(detail: impl Into<String>) -> Problem {
+    problemdetails::new(StatusCode::BAD_REQUEST)
+        .with_title("Invalid AI Summary Preference")
+        .with_detail(detail.into())
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -701,6 +873,7 @@ mod tests {
             agent_cli_status: None,
             supports_interactive_tools: true,
             interactive_bridge_status: None,
+            summary_preference: AiSummaryPreferenceDto::default(),
         }
     }
 
@@ -743,5 +916,59 @@ mod tests {
         assert!(provider_status_permission_granted(false, true));
         assert!(provider_status_permission_granted(true, false));
         assert!(!provider_status_permission_granted(false, false));
+    }
+
+    #[test]
+    fn summary_preference_is_validated_against_live_provider_capabilities() {
+        let mut status = cached_response();
+        status.available_providers.push(AvailableAiProviderDto {
+            id: "gateway_key:7".to_string(),
+            name: "OpenAI".to_string(),
+            auth_source: "configured_key".to_string(),
+            models: vec![AiModelOptionDto {
+                id: "gpt-5.6".to_string(),
+                name: "GPT-5.6".to_string(),
+                thinking_options: vec![AiSelectOptionDto {
+                    id: "high".to_string(),
+                    name: "High".to_string(),
+                    description: None,
+                }],
+                tool_thinking_options: None,
+                default_thinking_option_id: Some("high".to_string()),
+            }],
+            default_model_id: Some("gpt-5.6".to_string()),
+            model_discovery_status: "ready".to_string(),
+            model_discovery_error: None,
+            permission_modes: Vec::new(),
+            default_permission_mode_id: None,
+        });
+
+        assert!(validate_summary_preference(
+            &status,
+            &UpdateAiSummaryPreferenceRequest {
+                provider_id: Some("gateway_key:7".to_string()),
+                model: Some("gpt-5.6".to_string()),
+                thinking_level: Some("high".to_string()),
+            }
+        )
+        .is_ok());
+        assert!(validate_summary_preference(
+            &status,
+            &UpdateAiSummaryPreferenceRequest {
+                provider_id: Some("gateway_key:7".to_string()),
+                model: Some("invented-model".to_string()),
+                thinking_level: None,
+            }
+        )
+        .is_err());
+        assert!(validate_summary_preference(
+            &status,
+            &UpdateAiSummaryPreferenceRequest {
+                provider_id: Some("gateway_key:7".to_string()),
+                model: Some("gpt-5.6".to_string()),
+                thinking_level: Some("invented".to_string()),
+            }
+        )
+        .is_err());
     }
 }

@@ -10,6 +10,7 @@
  *   bun run scripts/update-openapi.ts                     # localhost:8080
  *   bun run scripts/update-openapi.ts --url http://localhost:8220/api/api-docs/openapi.json
  *   TEMPS_API_KEY=tk_... bun run scripts/update-openapi.ts # if the server requires auth
+ *   TEMPS_API_COOKIE='session=...' bun run scripts/update-openapi.ts # local browser session
  *
  * Then regenerate the client from the file:
  *   bun run generate:api
@@ -34,9 +35,13 @@ function parseArgs(argv: string[]): { url: string } {
 
 const { url } = parseArgs(process.argv.slice(2))
 const apiKey = process.env.TEMPS_API_KEY
+const apiCookie = process.env.TEMPS_API_COOKIE
 
 const response = await fetch(url, {
-  headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+  headers: {
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    ...(apiCookie ? { Cookie: apiCookie } : {}),
+  },
 }).catch((error: unknown) => {
   console.error(`Could not reach ${url}: ${String(error)}`)
   console.error('Start a temps server first, or pass --url.')
@@ -46,7 +51,9 @@ const response = await fetch(url, {
 if (!response.ok) {
   console.error(`${url} returned ${response.status}`)
   if (response.status === 401 || response.status === 403) {
-    console.error('Set TEMPS_API_KEY to an admin key; the spec endpoint is authenticated.')
+    console.error(
+      'Set TEMPS_API_KEY to an admin key or TEMPS_API_COOKIE to an authenticated session; the spec endpoint is authenticated.'
+    )
   }
   process.exit(1)
 }

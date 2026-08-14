@@ -124,6 +124,11 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Opt-in for AI summarization of API traffic analytics for this project.
+    /// NULL/false = off; true = generate an AI summary when AI is configured
+    /// and the project calls `GET /projects/{id}/api-analytics/summary`.
+    /// Falls back to `null` summary gracefully when no AI provider is configured.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

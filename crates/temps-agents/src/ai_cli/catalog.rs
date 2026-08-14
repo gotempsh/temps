@@ -164,15 +164,14 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Model IDs the Claude CLI accepts. Short aliases (`sonnet`/`opus`/
-        // `haiku`) always pin to the latest release in that tier; the dated
-        // IDs let users opt into a specific snapshot.
+        // Bootstrap fallback when live CLI discovery is unavailable.
         models: &[
             "sonnet",
             "opus",
             "haiku",
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
             "claude-haiku-4-5",
         ],
         permission_modes: &[
@@ -232,14 +231,11 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Model IDs the Codex CLI exposes via its `Select Model and Effort`
-        // picker (run `codex` then `/model`). Verified against the CLI's
-        // interactive menu — GPT-5.4 is the current frontier family, with
-        // the `-codex` variants tuned for coding and `-max` trading latency
-        // for depth. The `5.1` family is kept as a cheaper/faster fallback.
-        // `gpt-5-codex` is kept as a legacy option but fails on many
-        // ChatGPT accounts ("model not supported"), so it's not the default.
+        // Bootstrap fallback when account-aware app-server discovery fails.
         models: &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5.4",
             "gpt-5.4-codex",
             "gpt-5.4-codex-max",

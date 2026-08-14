@@ -8,10 +8,14 @@ pub enum AnalyticsError {
     DatabaseError(#[from] DbErr),
     #[error("Session not found")]
     SessionNotFound(String),
+    #[error("Project {0} not found")]
+    ProjectNotFound(i32),
     #[error("Invalid visitor ID: {0}")]
     InvalidVisitorId(String),
     #[error("Other error: {0}")]
     Other(String),
+    #[error("AI summary request is rate limited: {reason}")]
+    AiRateLimited { reason: &'static str },
 }
 
 #[derive(Debug, Clone, Serialize)]

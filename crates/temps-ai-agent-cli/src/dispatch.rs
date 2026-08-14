@@ -23,6 +23,21 @@ pub trait ActiveProviderReader: Send + Sync {
     /// provider when the instance-scoped preference is `"agent_cli"`, or
     /// `None` when it's `"gateway"`, unset, or the row can't be read.
     async fn active_agent_cli_provider(&self) -> Option<String>;
+
+    /// Instance-wide defaults for server-authored summary workloads. The
+    /// provider id uses the normalized registry route (`gateway_key:{id}` or
+    /// an agent CLI catalog id). Missing fields inherit the ordinary active
+    /// provider and that provider's defaults.
+    async fn summary_preference(&self) -> Result<AiSummaryPreference, AiError> {
+        Ok(AiSummaryPreference::default())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AiSummaryPreference {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
 }
 
 /// A no-op reader that never selects an agent-CLI provider — used by
@@ -107,6 +122,23 @@ impl AiProviderRegistry {
         }
         Some(self.gateway.clone())
     }
+
+    async fn apply_summary_defaults(&self, request: &mut AiRequest) -> Result<(), AiError> {
+        if !request.purpose.ends_with(".summary") {
+            return Ok(());
+        }
+        let preference = self.preference.summary_preference().await?;
+        if request.provider.is_none() {
+            request.provider = preference.provider;
+        }
+        if request.model.is_none() {
+            request.model = preference.model;
+        }
+        if request.thinking_level.is_none() {
+            request.thinking_level = preference.thinking_level;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -157,7 +189,8 @@ impl AiService for AiProviderRegistry {
         service.capabilities_for(provider, refresh).await
     }
 
-    async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+    async fn complete(&self, mut request: AiRequest) -> Result<AiResponse, AiError> {
+        self.apply_summary_defaults(&mut request).await?;
         let service = self
             .routed(request.provider.as_deref())
             .await
@@ -169,6 +202,21 @@ impl AiService for AiProviderRegistry {
                 ),
             })?;
         service.complete(request).await
+    }
+
+    async fn complete_stream(&self, mut request: AiRequest) -> Result<TokenStream, AiError> {
+        self.apply_summary_defaults(&mut request).await?;
+        let service = self
+            .routed(request.provider.as_deref())
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    request.provider.as_deref().unwrap_or("unknown")
+                ),
+            })?;
+        service.complete_stream(request).await
     }
 
     async fn chat_stream(&self, request: ChatTurnRequest) -> Result<TokenStream, AiError> {
@@ -362,6 +410,23 @@ mod tests {
         }
     }
 
+    struct SummaryPreferenceReader;
+
+    #[async_trait]
+    impl ActiveProviderReader for SummaryPreferenceReader {
+        async fn active_agent_cli_provider(&self) -> Option<String> {
+            None
+        }
+
+        async fn summary_preference(&self) -> Result<AiSummaryPreference, AiError> {
+            Ok(AiSummaryPreference {
+                provider: Some("codex_cli".to_string()),
+                model: Some("gpt-5.6-codex".to_string()),
+                thinking_level: Some("high".to_string()),
+            })
+        }
+    }
+
     fn tagged_service(tag: &'static str) -> Arc<dyn AiService> {
         Arc::new(AlwaysOkService { tag })
     }
@@ -387,6 +452,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "claude_cli:test");
+    }
+
+    #[tokio::test]
+    async fn summary_defaults_route_and_configure_every_summary_request() {
+        struct EchoOptions;
+        #[async_trait]
+        impl AiService for EchoOptions {
+            async fn is_available(&self) -> bool {
+                true
+            }
+            async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+                Ok(AiResponse {
+                    text: format!(
+                        "{}:{}",
+                        request.model.as_deref().unwrap_or("default"),
+                        request.thinking_level.as_deref().unwrap_or("default")
+                    ),
+                    json: None,
+                    model: request.model.unwrap_or_default(),
+                })
+            }
+            async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+                Err(AiError::NotAvailable)
+            }
+        }
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "codex_cli".to_string(),
+            Arc::new(EchoOptions) as Arc<dyn AiService>,
+        );
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(SummaryPreferenceReader),
+            providers,
+        );
+
+        let response = registry
+            .complete(AiRequest {
+                purpose: "api_traffic.summary".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("summary profile should route through Codex");
+        assert_eq!(response.text, "gpt-5.6-codex:high");
+    }
+
+    #[tokio::test]
+    async fn explicit_summary_options_override_instance_defaults() {
+        let mut providers = HashMap::new();
+        providers.insert("codex_cli".to_string(), tagged_service("codex_cli"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(SummaryPreferenceReader),
+            providers,
+        );
+        let response = registry
+            .complete(AiRequest {
+                purpose: "alert.summary".to_string(),
+                provider: Some("gateway".to_string()),
+                model: Some("explicit-model".to_string()),
+                thinking_level: Some("low".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("explicit route remains authoritative");
+        assert_eq!(response.text, "gateway:alert.summary");
     }
 
     #[tokio::test]

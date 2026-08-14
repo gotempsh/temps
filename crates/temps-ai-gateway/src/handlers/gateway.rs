@@ -603,8 +603,15 @@ async fn list_models(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayRead);
 
-    match app_state.gateway_service.list_models().await {
-        Ok(models) => Ok((StatusCode::OK, Json(models)).into_response()),
+    match app_state.provider_model_service.list_active_catalog().await {
+        Ok(models) => Ok((
+            StatusCode::OK,
+            Json(ModelListResponse {
+                object: "list".to_string(),
+                data: models,
+            }),
+        )
+            .into_response()),
         Err(e) => Ok(error_to_response(e).into_response()),
     }
 }

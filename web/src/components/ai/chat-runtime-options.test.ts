@@ -90,6 +90,32 @@ describe('resolveChatRuntimeSelection', () => {
         .thinkingOptionId
     ).toBeNull()
   })
+
+  test('keeps reasoning for Responses API models with project tools', () => {
+    const responsesModel: ChatProviderOption[] = [
+      {
+        ...providers[0],
+        models: [
+          {
+            id: 'gpt-5.6-luna',
+            name: 'gpt-5.6-luna',
+            thinking_options: [
+              { id: 'none', name: 'None' },
+              { id: 'medium', name: 'Medium' },
+            ],
+            default_thinking_option_id: 'medium',
+          },
+        ],
+        default_model_id: 'gpt-5.6-luna',
+      },
+    ]
+
+    expect(
+      resolveChatRuntimeSelection(responsesModel, 'gateway_key:7', {
+        thinkingOptionId: 'medium',
+      }).thinkingOptionId
+    ).toBe('medium')
+  })
 })
 
 test('provider labels identify ambient host credentials', () => {

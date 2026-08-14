@@ -66,6 +66,7 @@ pub struct Project {
     pub ai_alert_summaries_enabled: Option<bool>,
     pub ai_debug_chat_enabled: Option<bool>,
     pub ai_write_actions_enabled: bool,
+    pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
     pub error_source_context_enabled: bool,
     /// Auto-capture source root (relative to the checkout); None = build context.

@@ -41,6 +41,7 @@ export default {
         // this can be revisited.
         exclude: [
           'POST /projects/{project_id}/ai/conversations/{public_id}/messages',
+          'POST /projects/{project_id}/ai/structured-output/stream',
           'POST /settings/sandbox-rebuild',
         ],
       },

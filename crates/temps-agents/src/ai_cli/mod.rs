@@ -9,11 +9,12 @@ pub use catalog::{
 };
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use temps_ai::streaming::{PermissionDecision, PermissionRequest};
 use tokio::process::Command;
@@ -158,6 +159,94 @@ pub struct AiCliModelCapability {
     pub default_reasoning_option: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AiCliModelSnapshot {
+    pub models: Vec<AiCliModelCapability>,
+    pub refreshed_at: chrono::DateTime<chrono::Utc>,
+    pub source: &'static str,
+}
+
+#[derive(Clone)]
+struct CachedAiCliModels {
+    identity: String,
+    models: Vec<AiCliModelCapability>,
+    refreshed_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Instant,
+}
+
+const MODEL_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+static MODEL_DISCOVERY_CACHE: OnceLock<tokio::sync::RwLock<HashMap<String, CachedAiCliModels>>> =
+    OnceLock::new();
+
+fn model_discovery_cache() -> &'static tokio::sync::RwLock<HashMap<String, CachedAiCliModels>> {
+    MODEL_DISCOVERY_CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+/// Cache account-aware harness discovery by provider plus CLI/auth identity.
+/// A failed refresh preserves the previous successful snapshot so a transient
+/// CLI problem never empties every model dropdown.
+pub async fn discover_model_capabilities_cached(
+    provider: &dyn AiCliProvider,
+    identity: String,
+    refresh: bool,
+) -> AiCliModelSnapshot {
+    let provider_id = provider.name().to_string();
+    let previous = model_discovery_cache()
+        .read()
+        .await
+        .get(&provider_id)
+        .cloned()
+        .filter(|cached| cached.identity == identity);
+    if !refresh {
+        if let Some(cached) = previous
+            .as_ref()
+            .filter(|cached| cached.expires_at > Instant::now())
+        {
+            return AiCliModelSnapshot {
+                models: cached.models.clone(),
+                refreshed_at: cached.refreshed_at,
+                source: "cache",
+            };
+        }
+    }
+
+    let discovered = provider.discover_model_capabilities().await;
+    if discovered.is_empty() {
+        if let Some(cached) = previous {
+            return AiCliModelSnapshot {
+                models: cached.models,
+                refreshed_at: cached.refreshed_at,
+                source: "stale_cache",
+            };
+        }
+        return AiCliModelSnapshot {
+            models: Vec::new(),
+            refreshed_at: chrono::Utc::now(),
+            source: "unavailable",
+        };
+    }
+
+    let refreshed_at = chrono::Utc::now();
+    model_discovery_cache().write().await.insert(
+        provider_id,
+        CachedAiCliModels {
+            identity,
+            models: discovered.clone(),
+            refreshed_at,
+            expires_at: Instant::now() + MODEL_DISCOVERY_CACHE_TTL,
+        },
+    );
+    AiCliModelSnapshot {
+        models: discovered,
+        refreshed_at,
+        source: "live",
+    }
+}
+
+pub async fn invalidate_model_discovery_cache() {
+    model_discovery_cache().write().await.clear();
+}
+
 pub async fn discover_model_capabilities(provider: &str) -> Vec<AiCliModelCapability> {
     match create_provider(provider) {
         Some(provider) => provider.discover_model_capabilities().await,
@@ -201,6 +290,7 @@ pub trait AiCliProvider: Send + Sync {
                         description: Some("Supported by this model".to_string()),
                     })
                     .collect(),
+                tool_thinking_modes: None,
                 default_thinking_mode_id: model.default_reasoning_option,
             })
             .collect::<Vec<_>>();

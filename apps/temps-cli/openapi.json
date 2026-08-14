@@ -146,7 +146,25 @@
         ],
         "type": "object"
       },
+      "ActiveVisitorCountResponse": {
+        "properties": {
+          "active_visitors": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "window_minutes": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "active_visitors",
+          "window_minutes"
+        ],
+        "type": "object"
+      },
       "ActiveVisitorsQuery": {
+        "description": "Query parameters for active visitors endpoint",
         "properties": {
           "deployment_id": {
             "format": "int32",
@@ -161,15 +179,35 @@
               "integer",
               "null"
             ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "window_minutes": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
+        "required": [
+          "project_id"
+        ],
         "type": "object"
       },
       "ActiveVisitorsResponse": {
         "properties": {
-          "active_visitors": {
+          "count": {
             "format": "int64",
             "type": "integer"
+          },
+          "visitors": {
+            "items": {
+              "$ref": "#/components/schemas/ActiveVisitor"
+            },
+            "type": "array"
           },
           "window_minutes": {
             "format": "int32",
@@ -177,7 +215,8 @@
           }
         },
         "required": [
-          "active_visitors",
+          "count",
+          "visitors",
           "window_minutes"
         ],
         "type": "object"
@@ -491,6 +530,23 @@
         },
         "required": [
           "domain"
+        ],
+        "type": "object"
+      },
+      "AddProviderModelRequest": {
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
         ],
         "type": "object"
       },
@@ -1524,6 +1580,13 @@
               "$ref": "#/components/schemas/AiSelectOptionDto"
             },
             "type": "array"
+          },
+          "tool_thinking_options": {
+            "description": "Model-specific reasoning options valid while project-chat function tools are attached. Omitted when the normal options also apply.",
+            "items": {
+              "$ref": "#/components/schemas/AiSelectOptionDto"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -1647,6 +1710,10 @@
               "null"
             ]
           },
+          "summary_preference": {
+            "$ref": "#/components/schemas/AiSummaryPreferenceDto",
+            "description": "Instance-wide defaults inherited by all server-authored AI summaries."
+          },
           "supports_interactive_tools": {
             "description": "Whether the active adapter's normalized realtime contract exposes tool\nevents. Kept under the legacy field name for API compatibility.",
             "type": "boolean"
@@ -1657,7 +1724,8 @@
           "configured",
           "gateway_available",
           "available_providers",
-          "supports_interactive_tools"
+          "supports_interactive_tools",
+          "summary_preference"
         ],
         "type": "object"
       },
@@ -1722,6 +1790,32 @@
           "status_class",
           "request_count"
         ],
+        "type": "object"
+      },
+      "AiSummaryPreferenceDto": {
+        "properties": {
+          "model": {
+            "description": "`null` uses the selected provider's default model.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "description": "Normalized provider route (`gateway_key:{id}`, `claude_cli`, etc.).\n`null` inherits the active instance provider.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thinking_level": {
+            "description": "`null` uses the selected model's default reasoning depth.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "AlarmListResponse": {
@@ -2205,6 +2299,59 @@
         ],
         "type": "object"
       },
+      "ApiCallerEntry": {
+        "description": "A single caller entry in the top-callers breakdown.",
+        "properties": {
+          "client_ip": {
+            "description": "Caller IP address as recorded in proxy_logs.client_ip.",
+            "type": "string"
+          },
+          "error_rate": {
+            "description": "Error rate for this caller (0.0–1.0).",
+            "format": "double",
+            "type": "number"
+          },
+          "last_seen": {
+            "description": "Timestamp of the most recent request from this IP in the period.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "request_count": {
+            "description": "Total request count from this IP in the period.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "client_ip",
+          "request_count",
+          "error_rate",
+          "last_seen"
+        ],
+        "type": "object"
+      },
+      "ApiCallersResponse": {
+        "description": "Top callers (by IP) ranked by request count for a given project + time window.",
+        "properties": {
+          "callers": {
+            "description": "Top callers, ordered by request_count descending.",
+            "items": {
+              "$ref": "#/components/schemas/ApiCallerEntry"
+            },
+            "type": "array"
+          },
+          "total_callers": {
+            "description": "Total distinct client IPs seen in the period (before the limit).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "callers",
+          "total_callers"
+        ],
+        "type": "object"
+      },
       "ApiKeyListResponse": {
         "properties": {
           "api_keys": {
@@ -2281,6 +2428,241 @@
           "role_type",
           "is_active",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ApiRouteEntry": {
+        "description": "A single route entry in the top-routes breakdown.\n\nRoutes are grouped by raw `(method, path)` — no template normalization.\nSee the module-level note on path cardinality.",
+        "properties": {
+          "avg_latency_ms": {
+            "description": "Mean response time in milliseconds for this route.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "error_rate": {
+            "description": "Error rate for this route (0.0–1.0): requests with status >= 400.",
+            "format": "double",
+            "type": "number"
+          },
+          "method": {
+            "description": "HTTP method (e.g. \"GET\", \"POST\").",
+            "type": "string"
+          },
+          "path": {
+            "description": "Raw request path (e.g. \"/api/users/123\"). High-cardinality paths with\ndynamic IDs will appear as separate rows until path normalization is\nimplemented.",
+            "type": "string"
+          },
+          "request_count": {
+            "description": "Total request count for this route in the period.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "request_count",
+          "error_rate"
+        ],
+        "type": "object"
+      },
+      "ApiRoutesResponse": {
+        "description": "Top routes by request count for a given project + time window.",
+        "properties": {
+          "routes": {
+            "description": "Top routes, ordered by request_count descending.",
+            "items": {
+              "$ref": "#/components/schemas/ApiRouteEntry"
+            },
+            "type": "array"
+          },
+          "total_routes": {
+            "description": "Total distinct (method, path) pairs in the period (before the limit).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "routes",
+          "total_routes"
+        ],
+        "type": "object"
+      },
+      "ApiTimeseriesPoint": {
+        "description": "A single time bucket in the API request timeseries.",
+        "properties": {
+          "avg_latency_ms": {
+            "description": "Mean response time in milliseconds. Null when no rows with a recorded\nresponse_time_ms exist in the bucket.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "error_count": {
+            "description": "Number of requests with status >= 400.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_rate": {
+            "description": "Error rate: error_count / request_count (0.0–1.0). Zero when\nrequest_count == 0.",
+            "format": "double",
+            "type": "number"
+          },
+          "p95_latency_ms": {
+            "description": "p95 response time in milliseconds. Null when insufficient data.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p99_latency_ms": {
+            "description": "p99 response time in milliseconds. Null when insufficient data.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "request_count": {
+            "description": "Total request count in this bucket.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "timestamp": {
+            "description": "Bucket start timestamp (ISO 8601 with Z suffix).",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timestamp",
+          "request_count",
+          "error_count",
+          "error_rate"
+        ],
+        "type": "object"
+      },
+      "ApiTimeseriesResponse": {
+        "description": "Timeseries of API request volume, error rate, and latency percentiles.",
+        "properties": {
+          "bucket_interval": {
+            "description": "Bucket interval used for time series (e.g. \"1 hour\", \"6 hours\", \"1 day\").",
+            "type": "string"
+          },
+          "overall_avg_latency_ms": {
+            "description": "Overall mean response time in milliseconds over the full period.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "overall_error_rate": {
+            "description": "Overall error rate over the full period (0.0–1.0).",
+            "format": "double",
+            "type": "number"
+          },
+          "points": {
+            "description": "Time-bucketed data points ordered ascending by timestamp.",
+            "items": {
+              "$ref": "#/components/schemas/ApiTimeseriesPoint"
+            },
+            "type": "array"
+          },
+          "total_errors": {
+            "description": "Aggregate error count (status >= 400) over the full period.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_requests": {
+            "description": "Aggregate request count over the full period.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "points",
+          "total_requests",
+          "total_errors",
+          "overall_error_rate",
+          "bucket_interval"
+        ],
+        "type": "object"
+      },
+      "ApiTrafficSummary": {
+        "description": "Structured AI summary of API traffic for a given project + time window.\n\nDerives `JsonSchema` so `complete_typed` can request this shape from the\nconfigured AI provider. All fields are intentionally short — the prompt\nfeeds aggregated stats (not raw log lines) to keep token usage bounded.\n\nWhen AI is not configured or the project has not opted in, the summary\nendpoint returns `null` for this field rather than an error.",
+        "properties": {
+          "anomalies": {
+            "description": "Anomalies or concerns worth investigating (0–3 items). Empty when\ntraffic appears normal.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "findings": {
+            "description": "Bullet-point findings (2–4 items). Each finding is a single sentence.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "headline": {
+            "description": "One-sentence headline describing the traffic pattern.",
+            "type": "string"
+          },
+          "recommendation": {
+            "description": "Optional single actionable recommendation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "headline",
+          "findings",
+          "anomalies"
+        ],
+        "type": "object"
+      },
+      "ApiTrafficSummaryResponse": {
+        "description": "Response from the AI traffic summary endpoint.",
+        "properties": {
+          "cached": {
+            "description": "Whether this response was served from the backend AI-result cache.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether the project has `ai_api_traffic_summary_enabled = true`.",
+            "type": "boolean"
+          },
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiTrafficSummary",
+                "description": "The AI-generated summary, or `null` when AI is not configured or the\nproject has not opted in (`ai_api_traffic_summary_enabled = false`)."
+              }
+            ]
+          },
+          "unavailable_reason": {
+            "description": "Why the summary is null when `summary` is None and `enabled` is true:\neither AI is not configured or the call failed/timed out.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "cached"
         ],
         "type": "object"
       },
@@ -15485,12 +15867,17 @@
       },
       "EventsCountQuery": {
         "properties": {
-          "aggregation_level": {
-            "$ref": "#/components/schemas/AggregationLevel",
-            "description": "Aggregation level: events (raw count), sessions (unique sessions), or visitors (unique visitors)"
+          "breakdown": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventBreakdown"
+              }
+            ]
           },
           "custom_events_only": {
-            "description": "Only return custom events, excluding system events like page_view, page_leave, heartbeat (default: true)",
             "type": [
               "boolean",
               "null"
@@ -15514,6 +15901,10 @@
               "null"
             ]
           },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
           "start_date": {
             "format": "date-time",
             "type": "string"
@@ -15521,7 +15912,8 @@
         },
         "required": [
           "start_date",
-          "end_date"
+          "end_date",
+          "project_id"
         ],
         "type": "object"
       },
@@ -28063,6 +28455,13 @@
               "null"
             ]
           },
+          "ai_api_traffic_summary_enabled": {
+            "description": "Opt-in to AI summarization of API traffic analytics (NULL/false = off).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "ai_debug_chat_enabled": {
             "description": "Opt-in to AI debugging chat, e.g. on deployment failures (NULL/false = off).",
             "type": [
@@ -28790,6 +29189,13 @@
             "description": "True when the CLI is installed AND authenticated on **this host** —\nthe machine running the Temps server process. This is a completely\ndifferent signal from `credential_saved`: that field is about a\ncredential seeded into a *sandboxed autofixer container*, while this\none is what actually gates whether the AI Gateway can route requests\nto this provider (ADR-037's `AgentCliAiService` uses only the host's\nambient CLI session — ordering `claude setup-token`/`codex login` on\nthis machine — and never reads the sandbox credential at all). A\nprovider can show `credential_saved: true` and `host_authenticated:\nfalse` at the same time; only the latter means chat/gateway routing\nwill actually work.",
             "type": "boolean"
           },
+          "host_version": {
+            "description": "Installed CLI version used as part of the model-cache identity.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -28820,12 +29226,23 @@
               "null"
             ]
           },
+          "model_source": {
+            "description": "`live`, `cache`, `stale_cache`, or `bootstrap`.",
+            "type": "string"
+          },
           "models": {
             "description": "Model ids this provider accepts, in display order. The first entry is\nthe recommended default. Empty when the provider doesn't expose model\nselection (e.g. OpenCode), which the UI uses to hide the dropdown.",
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "models_refreshed_at": {
+            "description": "Time of the last successful account-aware CLI model discovery.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -28844,7 +29261,8 @@
           "models",
           "credential_saved",
           "supports_max_turns",
-          "host_authenticated"
+          "host_authenticated",
+          "model_source"
         ],
         "type": "object"
       },
@@ -28982,6 +29400,24 @@
         ],
         "type": "object"
       },
+      "ProviderDetailResponse": {
+        "properties": {
+          "key": {
+            "$ref": "#/components/schemas/ProviderKeyResponse"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderModelResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "models"
+        ],
+        "type": "object"
+      },
       "ProviderKeyResponse": {
         "properties": {
           "api_key_masked": {
@@ -29060,6 +29496,59 @@
           "description",
           "icon_url",
           "color"
+        ],
+        "type": "object"
+      },
+      "ProviderModelResponse": {
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_available": {
+            "type": "boolean"
+          },
+          "is_enabled": {
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "owned_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_key_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "provider_key_id",
+          "model_id",
+          "display_name",
+          "source",
+          "is_available",
+          "is_enabled",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -35183,40 +35672,33 @@
         "properties": {
           "event_data": {},
           "event_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "event_type": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "id": {
             "format": "int32",
             "type": "integer"
           },
-          "page_title": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "page_url": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "timestamp": {
+          "occurred_at": {
+            "example": "2024-01-01T00:00:00",
+            "format": "date-time",
             "type": "string"
+          },
+          "request_path": {
+            "type": "string"
+          },
+          "request_query": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
-          "timestamp"
+          "event_name",
+          "occurred_at",
+          "event_data",
+          "request_path"
         ],
         "type": "object"
       },
@@ -35253,7 +35735,28 @@
       },
       "SessionEventsQuery": {
         "properties": {
+          "end_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "offset": {
             "format": "int32",
             "type": [
               "integer",
@@ -35263,6 +35766,19 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "sort_order": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_date": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -38450,6 +38966,69 @@
         ],
         "type": "object"
       },
+      "StreamStructuredOutputRequest": {
+        "properties": {
+          "cache_key": {
+            "description": "Optional screen-owned cache identity. Prompt and schema hashes are also\nincluded automatically, preventing stale output when input data changes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cache_ttl_seconds": {
+            "description": "Backend cache lifetime in seconds (default 60, clamped to 1-300).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Optional enabled model id for the selected key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "The complete, already-authorized context and instructions for the model.",
+            "type": "string"
+          },
+          "provider_key_id": {
+            "description": "Optional configured gateway key. Omit to use the active gateway key.\nHost subscription CLIs are intentionally not accepted here.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "purpose": {
+            "description": "Stable product use-case identifier, for example `api_traffic.summary`.",
+            "type": "string"
+          },
+          "refresh": {
+            "description": "Bypass any matching backend cache entry and replace it with this result.",
+            "type": "boolean"
+          },
+          "schema": {
+            "description": "JSON Schema describing the required response object."
+          },
+          "thinking_level": {
+            "description": "Optional normalized reasoning depth advertised for the selected model.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "purpose",
+          "prompt",
+          "schema"
+        ],
+        "type": "object"
+      },
       "StripeConfig": {
         "properties": {
           "include_unpriced_charges": {
@@ -40200,6 +40779,30 @@
         ],
         "type": "object"
       },
+      "UpdateAiSummaryPreferenceRequest": {
+        "description": "Replace the instance-wide defaults inherited by every AI summary.",
+        "properties": {
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateAlertRuleRequest": {
         "properties": {
           "cooldown_minutes": {
@@ -41665,6 +42268,13 @@
               "null"
             ]
           },
+          "ai_api_traffic_summary_enabled": {
+            "description": "Opt in to AI summarization of API traffic analytics.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "ai_debug_chat_enabled": {
             "description": "Opt in to AI debugging chat, e.g. on deployment failures (ADR-023).",
             "type": [
@@ -41891,6 +42501,17 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateProviderModelRequest": {
+        "properties": {
+          "is_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "is_enabled"
+        ],
         "type": "object"
       },
       "UpdateProviderPreferenceRequest": {
@@ -46508,6 +47129,51 @@
           "AI Gateway Admin"
         ]
       },
+      "get": {
+        "operationId": "get_provider_key",
+        "parameters": [
+          {
+            "description": "Provider key ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDetailResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ]
+      },
       "patch": {
         "operationId": "update_provider_key",
         "parameters": [
@@ -46593,6 +47259,224 @@
         ]
       }
     },
+    "/ai/providers/{id}/models": {
+      "post": {
+        "operationId": "add_provider_model",
+        "parameters": [
+          {
+            "description": "Provider key ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddProviderModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderModelResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ]
+      }
+    },
+    "/ai/providers/{id}/models/refresh": {
+      "post": {
+        "operationId": "refresh_provider_models",
+        "parameters": [
+          {
+            "description": "Provider key ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderModelResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ]
+      }
+    },
+    "/ai/providers/{id}/models/{model_row_id}": {
+      "delete": {
+        "operationId": "delete_provider_model",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "model_row_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ]
+      },
+      "patch": {
+        "operationId": "update_provider_model",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "model_row_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProviderModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderModelResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ]
+      }
+    },
     "/ai/providers/{id}/test": {
       "post": {
         "operationId": "test_provider_key_by_id",
@@ -46656,6 +47540,71 @@
         ],
         "tags": [
           "AI Gateway Admin"
+        ]
+      }
+    },
+    "/ai/summary-preference": {
+      "put": {
+        "operationId": "update_ai_summary_preference",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAiSummaryPreferenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProviderStatusResponse"
+                }
+              }
+            },
+            "description": "Updated summary routing defaults"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unsupported provider, model, or thinking level"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Provider Status"
         ]
       }
     },
@@ -72775,7 +73724,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ActiveVisitorsResponse"
+                  "$ref": "#/components/schemas/ActiveVisitorCountResponse"
                 }
               }
             },
@@ -74599,6 +75548,61 @@
         ]
       }
     },
+    "/projects/{project_id}/ai/structured-output/stream": {
+      "post": {
+        "operationId": "stream_structured_output",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamStructuredOutputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {}
+            },
+            "description": "SSE events: started, partial, complete, or error"
+          },
+          "400": {
+            "description": "Invalid prompt or JSON Schema"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "No active AI provider"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway"
+        ]
+      }
+    },
     "/projects/{project_id}/alarms": {
       "get": {
         "operationId": "listProjectAlarms",
@@ -74899,6 +75903,370 @@
         "summary": "Resolve an alarm.",
         "tags": [
           "Alarms"
+        ]
+      }
+    },
+    "/projects/{project_id}/api-analytics/callers": {
+      "get": {
+        "description": "IP addresses are returned as-is from `proxy_logs.client_ip`. The caller\nis responsible for any presentation-layer masking required by their privacy\npolicy.",
+        "operationId": "get_api_callers",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID (optional)",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start (ISO 8601)",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (ISO 8601)",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max callers to return (default: 20, max: 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Ranked callers to skip (default: 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiCallersResponse"
+                }
+              }
+            },
+            "description": "Top callers by request count"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return the top callers (by client IP, ranked by request count) in a\nproject's API traffic window.",
+        "tags": [
+          "Analytics"
+        ]
+      }
+    },
+    "/projects/{project_id}/api-analytics/routes": {
+      "get": {
+        "operationId": "get_api_routes",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID (optional)",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start (ISO 8601)",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (ISO 8601)",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max routes to return (default: 20, max: 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Ranked routes to skip (default: 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiRoutesResponse"
+                }
+              }
+            },
+            "description": "Top routes by request count"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return the top routes (by request count) in a project's API traffic,\ngrouped by raw `(method, path)`.",
+        "tags": [
+          "Analytics"
+        ]
+      }
+    },
+    "/projects/{project_id}/api-analytics/summary": {
+      "get": {
+        "description": "The response always includes `enabled` and `unavailable_reason` so the\nclient can render a meaningful onboarding state even when no AI provider\nis configured or the project has not opted in. The `summary` field is\nnon-null only when all of the following are true:\n\n- `projects.ai_api_traffic_summary_enabled = true`\n- An AI provider is configured and available\n- The AI call returns parseable JSON within the bounded summary deadline\n\nThis endpoint never returns a 5xx from an AI failure — it always returns\n200 with `summary: null` and a human-readable `unavailable_reason`.",
+        "operationId": "get_api_summary",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID (optional)",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start (ISO 8601)",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (ISO 8601)",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bypass and replace the backend AI summary cache",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTrafficSummaryResponse"
+                }
+              }
+            },
+            "description": "AI traffic summary (summary field may be null when AI is unavailable)"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error (DB errors only; AI failures return 200 with summary: null)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return an AI-generated summary of API traffic for the given window.",
+        "tags": [
+          "Analytics"
+        ]
+      }
+    },
+    "/projects/{project_id}/api-analytics/timeseries": {
+      "get": {
+        "description": "Bucket granularity is auto-selected based on the requested window:\n≤6 h → 5 min, ≤24 h → 1 h, ≤72 h → 6 h, else → 1 day.",
+        "operationId": "get_api_timeseries",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID (optional)",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window start (ISO 8601)",
+            "in": "query",
+            "name": "start_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Window end (ISO 8601)",
+            "in": "query",
+            "name": "end_date",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTimeseriesResponse"
+                }
+              }
+            },
+            "description": "Time-series of request volume, errors, and latency"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Return a time-bucketed series of request volume, error rate, and latency\npercentiles for a project's API traffic.",
+        "tags": [
+          "Analytics"
         ]
       }
     },
@@ -95792,6 +97160,26 @@
       "name": "Teams"
     },
     {
+      "description": "OpenAI-compatible chat, embeddings, and model endpoints",
+      "name": "AI Gateway"
+    },
+    {
+      "description": "Provider key management endpoints",
+      "name": "AI Gateway Admin"
+    },
+    {
+      "description": "Usage analytics and reporting endpoints",
+      "name": "AI Gateway Usage"
+    },
+    {
+      "description": "Model pricing endpoints",
+      "name": "AI Gateway Pricing"
+    },
+    {
+      "description": "Provider preference and availability endpoints",
+      "name": "AI Provider Status"
+    },
+    {
       "description": "Git provider management endpoints",
       "name": "Git Providers"
     },
@@ -95982,26 +97370,6 @@
     {
       "description": "Unified observability event stream — runtime logs, requests, spans, errors, revenue",
       "name": "Observability"
-    },
-    {
-      "description": "OpenAI-compatible chat, embeddings, and model endpoints",
-      "name": "AI Gateway"
-    },
-    {
-      "description": "Provider key management endpoints",
-      "name": "AI Gateway Admin"
-    },
-    {
-      "description": "Usage analytics and reporting endpoints",
-      "name": "AI Gateway Usage"
-    },
-    {
-      "description": "Model pricing endpoints",
-      "name": "AI Gateway Pricing"
-    },
-    {
-      "description": "Provider preference and availability endpoints",
-      "name": "AI Provider Status"
     },
     {
       "description": "API key management endpoints",

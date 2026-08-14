@@ -60,6 +60,7 @@ interface FormData {
   attack_mode?: boolean
   ai_debug_chat_enabled?: boolean
   ai_alert_summaries_enabled?: boolean
+  ai_api_traffic_summary_enabled?: boolean
   ai_write_actions_enabled?: boolean
 }
 
@@ -93,6 +94,8 @@ export function ProjectSecuritySettings({
       attack_mode: project.attack_mode ?? false,
       ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
+      ai_api_traffic_summary_enabled:
+        project.ai_api_traffic_summary_enabled ?? false,
       ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
       security: {
         enabled: project.deployment_config?.security?.enabled ?? undefined,
@@ -141,6 +144,7 @@ export function ProjectSecuritySettings({
         attack_mode?: boolean
         ai_debug_chat_enabled?: boolean
         ai_alert_summaries_enabled?: boolean
+        ai_api_traffic_summary_enabled?: boolean
         ai_write_actions_enabled?: boolean
       } = {}
       if (data.attack_mode !== project.attack_mode) {
@@ -158,6 +162,13 @@ export function ProjectSecuritySettings({
       ) {
         projectSettings.ai_alert_summaries_enabled =
           data.ai_alert_summaries_enabled
+      }
+      if (
+        (data.ai_api_traffic_summary_enabled ?? false) !==
+        (project.ai_api_traffic_summary_enabled ?? false)
+      ) {
+        projectSettings.ai_api_traffic_summary_enabled =
+          data.ai_api_traffic_summary_enabled
       }
       if (
         (data.ai_write_actions_enabled ?? false) !==
@@ -375,6 +386,28 @@ export function ProjectSecuritySettings({
               checked={watch('ai_alert_summaries_enabled') ?? false}
               onCheckedChange={(checked) =>
                 setValue('ai_alert_summaries_enabled', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+          <Separator />
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label htmlFor="ai-api-traffic-summary">
+                AI API traffic summary
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                Summarize the API Traffic tab&apos;s routes, callers, and error
+                rates into a plain-language headline with findings and
+                anomalies.
+              </p>
+            </div>
+            <Switch
+              id="ai-api-traffic-summary"
+              checked={watch('ai_api_traffic_summary_enabled') ?? false}
+              onCheckedChange={(checked) =>
+                setValue('ai_api_traffic_summary_enabled', checked, {
                   shouldDirty: true,
                 })
               }

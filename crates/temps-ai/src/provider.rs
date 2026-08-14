@@ -33,6 +33,10 @@ pub struct ModelCapability {
     pub id: String,
     pub name: String,
     pub thinking_modes: Vec<SelectOption>,
+    /// Optional reasoning modes valid when function tools are attached. `None`
+    /// inherits `thinking_modes`; `Some` is a model-specific restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_thinking_modes: Option<Vec<SelectOption>>,
     pub default_thinking_mode_id: Option<String>,
 }
 
@@ -85,6 +89,7 @@ mod tests {
                     name: "High".to_string(),
                     description: None,
                 }],
+                tool_thinking_modes: None,
                 default_thinking_mode_id: Some("high".to_string()),
             }],
             default_model_id: Some("model-1".to_string()),

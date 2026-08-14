@@ -136,6 +136,43 @@ impl ProviderPreferenceService {
         }
     }
 
+    /// Persist the defaults inherited by every server-authored `*.summary`
+    /// request. Validation against the live capability catalog happens in the
+    /// HTTP handler before this write; runtime adapters validate again before
+    /// dispatch so stale models fail closed after provider changes.
+    pub async fn set_summary_preference(
+        &self,
+        provider_id: Option<String>,
+        model: Option<String>,
+        thinking_level: Option<String>,
+    ) -> Result<ai_gateway_config::Model, ProviderPreferenceError> {
+        let existing = self.get("instance").await?;
+        let mut active = if let Some(existing) = existing {
+            ai_gateway_config::ActiveModel::from(existing)
+        } else {
+            ai_gateway_config::ActiveModel {
+                scope: Set("instance".to_string()),
+                provider_type: Set("gateway".to_string()),
+                interactive_bridge_enabled: Set(false),
+                ..Default::default()
+            }
+        };
+        active.summary_provider_id = Set(provider_id);
+        active.summary_model = Set(model);
+        active.summary_thinking_level = Set(thinking_level);
+        if active.id.is_not_set() {
+            active
+                .insert(self.db.as_ref())
+                .await
+                .map_err(ProviderPreferenceError::Database)
+        } else {
+            active
+                .update(self.db.as_ref())
+                .await
+                .map_err(ProviderPreferenceError::Database)
+        }
+    }
+
     /// Resolve the agent-CLI provider that should actually receive routed
     /// requests right now.
     ///
@@ -201,6 +238,23 @@ impl temps_ai_agent_cli::ActiveProviderReader for ProviderPreferenceService {
     async fn active_agent_cli_provider(&self) -> Option<String> {
         self.resolve_active_agent_cli_provider().await
     }
+
+    async fn summary_preference(
+        &self,
+    ) -> Result<temps_ai_agent_cli::AiSummaryPreference, temps_ai::AiError> {
+        match self.get("instance").await {
+            Ok(Some(row)) => Ok(temps_ai_agent_cli::AiSummaryPreference {
+                provider: row.summary_provider_id,
+                model: row.summary_model,
+                thinking_level: row.summary_thinking_level,
+            }),
+            Ok(None) => Ok(temps_ai_agent_cli::AiSummaryPreference::default()),
+            Err(error) => Err(temps_ai::AiError::Provider {
+                purpose: "summary.preference".to_string(),
+                reason: format!("failed to read configured AI summary routing: {error}"),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +281,9 @@ mod tests {
             provider_type: "gateway".to_string(),
             agent_cli_provider_id: None,
             interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         }
     }
 
@@ -316,6 +373,9 @@ mod tests {
             provider_type: "gateway".to_string(),
             agent_cli_provider_id: None,
             interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
@@ -358,6 +418,9 @@ mod tests {
             provider_type: "agent_cli".to_string(),
             agent_cli_provider_id: Some("claude_cli".to_string()),
             interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
@@ -486,6 +549,9 @@ mod tests {
             provider_type: "agent_cli".to_string(),
             agent_cli_provider_id: Some("claude_cli".to_string()),
             interactive_bridge_enabled: true,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         };
         // The DB returns a model reflecting the forced-disable update.
         let updated = ai_gateway_config::Model {

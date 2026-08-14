@@ -30,6 +30,14 @@ pub struct Model {
     /// path instead of the one-shot `--dangerously-skip-permissions` path (ADR-038 Phase 2).
     /// Opt-in: defaults to `false` so existing deployments are unaffected.
     pub interactive_bridge_enabled: bool,
+    /// Provider route used by server-authored AI summaries. Values use the
+    /// normalized capability id (`gateway_key:{id}`, `claude_cli`, etc.).
+    /// `NULL` inherits the instance-wide active provider.
+    pub summary_provider_id: Option<String>,
+    /// Optional model override shared by every server-authored AI summary.
+    pub summary_model: Option<String>,
+    /// Optional normalized reasoning depth shared by AI summaries.
+    pub summary_thinking_level: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

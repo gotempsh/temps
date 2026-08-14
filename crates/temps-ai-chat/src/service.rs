@@ -863,28 +863,46 @@ impl ConversationService {
                 "model '{model}' is not available for provider '{provider}'"
             )));
         }
-        let thinking_level = discovered_model
-            .and_then(|model| {
-                requested_thinking_level
+        let thinking_level = match discovered_model {
+            Some(discovered) => {
+                // Project chat always attaches function tools. Providers may
+                // advertise a narrower set of reasoning modes for tool turns.
+                let valid_modes = discovered
+                    .tool_thinking_modes
+                    .as_ref()
+                    .unwrap_or(&discovered.thinking_modes);
+                let desired = requested_thinking_level
                     .map(str::to_string)
-                    .or_else(|| model.default_thinking_mode_id.clone())
-            })
-            .or_else(|| requested_thinking_level.map(str::to_string));
-        let thinking_is_valid = match discovered_model {
-            Some(model) => thinking_level.as_deref().is_none_or(|thinking| {
-                model
-                    .thinking_modes
-                    .iter()
-                    .any(|option| option.id == thinking)
-            }),
-            None => thinking_level.is_none(),
+                    .or_else(|| discovered.default_thinking_mode_id.clone());
+                match desired {
+                    Some(value) if valid_modes.iter().any(|option| option.id == value) => {
+                        Some(value)
+                    }
+                    Some(value)
+                        if discovered.tool_thinking_modes.is_some()
+                            && discovered
+                                .thinking_modes
+                                .iter()
+                                .any(|option| option.id == value) =>
+                    {
+                        valid_modes.first().map(|option| option.id.clone())
+                    }
+                    Some(value) => {
+                        return Err(ChatError::Ai(format!(
+                            "thinking option '{value}' is not available for model '{model}'"
+                        )));
+                    }
+                    None => valid_modes.first().map(|option| option.id.clone()),
+                }
+            }
+            None if requested_thinking_level.is_some() => {
+                return Err(ChatError::Ai(format!(
+                    "thinking option '{}' is not available for model '{model}'",
+                    requested_thinking_level.unwrap_or_default()
+                )));
+            }
+            None => None,
         };
-        if !thinking_is_valid {
-            return Err(ChatError::Ai(format!(
-                "thinking option '{}' is not available for model '{model}'",
-                thinking_level.as_deref().unwrap_or("")
-            )));
-        }
         let permission_mode = requested_permission_mode
             .map(str::to_string)
             .or(capabilities.default_permission_mode_id.clone())
@@ -2887,6 +2905,7 @@ mod tests {
                             name: "High".to_string(),
                             description: None,
                         }],
+                        tool_thinking_modes: None,
                         default_thinking_mode_id: None,
                     },
                     temps_ai::ModelCapability {
@@ -2897,7 +2916,26 @@ mod tests {
                             name: "Low".to_string(),
                             description: None,
                         }],
+                        tool_thinking_modes: None,
                         default_thinking_mode_id: Some("low".to_string()),
+                    },
+                    temps_ai::ModelCapability {
+                        id: "gpt-5.6-luna".to_string(),
+                        name: "GPT-5.6 Luna".to_string(),
+                        thinking_modes: vec![
+                            temps_ai::SelectOption {
+                                id: "none".to_string(),
+                                name: "None".to_string(),
+                                description: None,
+                            },
+                            temps_ai::SelectOption {
+                                id: "medium".to_string(),
+                                name: "Medium".to_string(),
+                                description: None,
+                            },
+                        ],
+                        tool_thinking_modes: None,
+                        default_thinking_mode_id: Some("medium".to_string()),
                     },
                 ],
                 default_model_id: Some("gpt-4o-mini".to_string()),
@@ -3584,6 +3622,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_chat_preserves_reasoning_supported_by_responses_api() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = db_service(db);
+
+        let runtime = service
+            .resolve_conversation_runtime(
+                Some("gateway_key:1"),
+                Some("gpt-5.6-luna"),
+                Some("medium"),
+                Some("confirm-actions"),
+            )
+            .await
+            .expect("Responses API supports reasoning with function tools");
+
+        assert_eq!(runtime.thinking_level.as_deref(), Some("medium"));
+    }
+
+    #[tokio::test]
     async fn update_runtime_options_changes_model_without_switching_provider_and_resets_session() {
         let mut conversation = test_conversation();
         conversation.ai_provider = "codex_cli".to_string();
@@ -3717,6 +3773,9 @@ mod tests {
             provider_type: "agent_cli".to_string(),
             agent_cli_provider_id: provider_id.map(str::to_string),
             interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         }
     }
 
@@ -3795,6 +3854,7 @@ mod tests {
             git_provider_connection_id: None,
             attack_mode: false,
             ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
             ai_debug_chat_enabled: toggle,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

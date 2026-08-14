@@ -2546,7 +2546,8 @@ export function DebugChatPanel({
                   )}
 
                 {selectedModelOption &&
-                  selectedModelOption.thinking_options.length > 0 && (
+                  (selectedModelOption.tool_thinking_options ??
+                    selectedModelOption.thinking_options).length > 0 && (
                     <Select
                       value={runtimeSelection.thinkingOptionId ?? undefined}
                       onValueChange={(thinkingOptionId) =>
@@ -2568,7 +2569,9 @@ export function DebugChatPanel({
                         <SelectValue placeholder="Thinking" />
                       </SelectTrigger>
                       <SelectContent>
-                        {selectedModelOption.thinking_options.map((option) => (
+                        {(selectedModelOption.tool_thinking_options ??
+                          selectedModelOption.thinking_options
+                        ).map((option) => (
                           <SelectItem key={option.id} value={option.id}>
                             <span className="flex items-center gap-2">
                               <Brain
