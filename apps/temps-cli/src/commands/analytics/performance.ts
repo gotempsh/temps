@@ -11,15 +11,19 @@ import {
 import type {
   GetPerformanceMetricsData,
   GroupedPageMetric,
+  GroupedPageMetricsResponse,
   MetricsOverTimeResponse,
   PerformanceMetricsResponse,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { colors, info, json as jsonOut, newline } from '../../ui/output.js'
+import { sanitizeTerminalText } from '../../ui/terminal.js'
 import { parsePeriod } from './period.js'
 
 const DEVICES = ['desktop', 'mobile'] as const
 const MAX_BACKEND_ID = 2_147_483_647
+const RFC3339_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 const GROUP_BY_DIMENSIONS = [
   'path',
   'country',
@@ -66,6 +70,19 @@ interface MetricDefinition {
   unit: 'ms' | 'score'
 }
 
+interface PerformanceRequestResult<T> {
+  data?: T
+  error?: unknown
+}
+
+export interface PerformanceApi {
+  getSummary(query: PerformanceQuery): Promise<PerformanceRequestResult<PerformanceMetricsResponse>>
+  getTimeline(query: PerformanceQuery): Promise<PerformanceRequestResult<MetricsOverTimeResponse>>
+  getBreakdown(
+    query: PerformanceQuery & { group_by: GroupByDimension }
+  ): Promise<PerformanceRequestResult<GroupedPageMetricsResponse>>
+}
+
 const METRICS: MetricDefinition[] = [
   { key: 'lcp', label: 'LCP', unit: 'ms' },
   { key: 'inp', label: 'INP', unit: 'ms' },
@@ -104,11 +121,46 @@ function parseGroupBy(value: string | undefined): GroupByDimension | undefined {
 }
 
 function parseDate(value: string, label: string): string {
+  if (!RFC3339_DATE_TIME.test(value)) {
+    throw new Error(`${label} must be a valid RFC 3339 date`)
+  }
   const timestamp = Date.parse(value)
   if (Number.isNaN(timestamp)) {
     throw new Error(`${label} must be a valid RFC 3339 date`)
   }
   return new Date(timestamp).toISOString()
+}
+
+const defaultPerformanceApi: PerformanceApi = {
+  getSummary: (query) => getPerformanceMetrics({ client, query }),
+  getTimeline: (query) => getMetricsOverTime({ client, query }),
+  getBreakdown: (query) => getGroupedPageMetrics({ client, query }),
+}
+
+export async function fetchPerformanceData(
+  query: PerformanceQuery,
+  groupBy?: GroupByDimension,
+  api: PerformanceApi = defaultPerformanceApi
+): Promise<{
+  summary?: PerformanceMetricsResponse
+  timeline?: MetricsOverTimeResponse
+  breakdown?: GroupedPageMetricsResponse
+}> {
+  const [summaryResult, timelineResult, breakdownResult] = await Promise.all([
+    api.getSummary(query),
+    api.getTimeline(query),
+    groupBy ? api.getBreakdown({ ...query, group_by: groupBy }) : Promise.resolve(undefined),
+  ])
+
+  if (summaryResult.error) throw new Error(getErrorMessage(summaryResult.error))
+  if (timelineResult.error) throw new Error(getErrorMessage(timelineResult.error))
+  if (breakdownResult?.error) throw new Error(getErrorMessage(breakdownResult.error))
+
+  return {
+    summary: summaryResult.data,
+    timeline: timelineResult.data,
+    breakdown: breakdownResult?.data,
+  }
 }
 
 export function resolvePerformanceWindow(options: PerformanceOptions): ResolvedWindow {
@@ -193,7 +245,8 @@ function renderSummary(data: PerformanceMetricsResponse): void {
 }
 
 function formatGroupKey(value: string): string {
-  return value.length > 34 ? `${value.slice(0, 31)}...` : value
+  const safeValue = sanitizeTerminalText(value)
+  return safeValue.length > 34 ? `${safeValue.slice(0, 31)}...` : safeValue
 }
 
 function renderBreakdown(groups: GroupedPageMetric[], groupedBy: string, totalEvents: number): void {
@@ -219,9 +272,10 @@ export async function performanceInsights(options: PerformanceOptions): Promise<
   const window = resolvePerformanceWindow(options)
   const groupBy = parseGroupBy(options.groupBy)
   const resolved = await requireProjectSlug(options.project)
+  const safeProjectSlug = sanitizeTerminalText(resolved.slug)
 
   if (resolved.source !== 'flag') {
-    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
+    info(`Using project ${colors.bold(safeProjectSlug)} (from ${resolved.source})`)
   }
 
   const { data: project, error: projectError } = await getProjectBySlug({
@@ -232,29 +286,13 @@ export async function performanceInsights(options: PerformanceOptions): Promise<
     throw new Error(getErrorMessage(projectError))
   }
   if (!project) {
-    throw new Error(`Project "${resolved.slug}" not found`)
+    throw new Error(`Project "${safeProjectSlug}" not found`)
   }
 
   const query = buildPerformanceQuery(project.id, window, options)
-  const result = await withSpinner('Fetching Performance Insights...', async () => {
-    const [summaryResult, timelineResult, breakdownResult] = await Promise.all([
-      getPerformanceMetrics({ client, query }),
-      getMetricsOverTime({ client, query }),
-      groupBy
-        ? getGroupedPageMetrics({ client, query: { ...query, group_by: groupBy } })
-        : Promise.resolve(undefined),
-    ])
-
-    if (summaryResult.error) throw new Error(getErrorMessage(summaryResult.error))
-    if (timelineResult.error) throw new Error(getErrorMessage(timelineResult.error))
-    if (breakdownResult?.error) throw new Error(getErrorMessage(breakdownResult.error))
-
-    return {
-      summary: summaryResult.data,
-      timeline: timelineResult.data,
-      breakdown: breakdownResult?.data,
-    }
-  })
+  const result = await withSpinner('Fetching Performance Insights...', () =>
+    fetchPerformanceData(query, groupBy)
+  )
 
   if (options.json) {
     jsonOut({
@@ -286,7 +324,7 @@ export async function performanceInsights(options: PerformanceOptions): Promise<
   newline()
   console.log(line)
   console.log(
-    `   ${chalk.bold.white('Performance Insights:')} ${chalk.bold.cyan(resolved.slug)} ${chalk.gray(`(${window.label}${deviceLabel})`)}`
+    `   ${chalk.bold.white('Performance Insights:')} ${chalk.bold.cyan(safeProjectSlug)} ${chalk.gray(`(${window.label}${deviceLabel})`)}`
   )
   console.log(line)
   newline()
@@ -320,3 +358,4 @@ export const parseDeviceForTest = parseDevice
 export const parseGroupByForTest = parseGroupBy
 export const parsePositiveIntegerForTest = parsePositiveInteger
 export const formatMetricForTest = formatMetric
+export const formatGroupKeyForTest = formatGroupKey

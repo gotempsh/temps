@@ -101,12 +101,10 @@ Use `analytics performance` (alias `speed`) to query the same real-user Web
 Vitals surface as the project's Performance Insights page. Compare desktop and
 mobile with identical windows and segment filters:
 
-```bash
-temps --target-context production \
-  analytics performance -p my-app --period 7d --device desktop
-temps --target-context production \
-  analytics performance -p my-app --period 7d --device mobile
-```
+After runtime help confirms support, append either
+`analytics performance -p my-app --period 7d --device desktop` or
+`analytics performance -p my-app --period 7d --device mobile` to the verified,
+pinned invocation from [../cli-runtime.md](../cli-runtime.md).
 
 Add `--group-by path` to locate slow pages, or group by `country`, `region`,
 `city`, `device_type`, `browser`, or `operating_system`. Narrow the same query
@@ -118,10 +116,8 @@ the aggregate percentiles, time series, and optional breakdown payload.
 
 Do not confuse this with `metrics query`, which reads OpenTelemetry application
 metrics, or `analytics top devices`, which reports traffic counts rather than
-browser performance. Runtime `--help` is authoritative; replace
-`temps` with the verified pinned invocation from
-[../cli-runtime.md](../cli-runtime.md) only after that runtime's help lists the
-command.
+browser performance. Runtime `--help` is authoritative; do not substitute an
+ambient executable while the reviewed pinned version predates the command.
 
 ## What belongs here vs. other pillars
 
