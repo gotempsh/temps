@@ -220,6 +220,9 @@ pub struct AppSettingsResponse {
     /// Upstream request/connection timeouts (hard ceiling + defaults) applied
     /// by the proxy to customer app traffic. No sensitive content.
     pub request_timeouts: RequestTimeoutSettings,
+    /// Per-upstream concurrent-connection cap applied by the proxy to
+    /// customer app traffic. No sensitive content. See issue #646.
+    pub connection_limits: temps_core::ConnectionLimitSettings,
     /// Whether admins may apply a release from the console. This is the
     /// database-backed toggle only — a server started with
     /// `--disable-self-update` refuses regardless of what this says, which
@@ -447,6 +450,7 @@ impl From<AppSettings> for AppSettingsResponse {
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
             request_timeouts: settings.request_timeouts,
+            connection_limits: settings.connection_limits,
             self_update,
         }
     }

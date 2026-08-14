@@ -2926,6 +2926,9 @@ impl ProjectService {
         if let Some(websocket_idle_timeout_seconds) = config.websocket_idle_timeout_seconds {
             deployment_config.websocket_idle_timeout_seconds = Some(websocket_idle_timeout_seconds);
         }
+        if let Some(max_concurrent_connections) = config.max_concurrent_connections {
+            deployment_config.max_concurrent_connections = Some(max_concurrent_connections);
+        }
 
         // Validate the deployment config
         deployment_config

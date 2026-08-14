@@ -2353,6 +2353,17 @@
               }
             ]
           },
+          "connection_limits": {
+            "default": {
+              "default_max_concurrent_connections": 0
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionLimitSettings",
+                "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. `0` (the default) is unlimited. See issue #646."
+              }
+            ]
+          },
           "console_version": {
             "default": null,
             "description": "Binary version tag (e.g. \"v0.1.0\") of the *console* process\n(`temps serve`, role=all or role=console) that last started. Written\non console startup; read by the standalone `temps proxy` to detect\nversion skew during a rolling upgrade (ADR-017 Phase 3). `None` on\ninstalls that never ran a console build carrying this field.\n\nThis is informational state written by the binary itself — NOT an\noperator-tunable setting. It is intentionally absent from\n`AppSettingsResponse` and the PATCH path so an operator cannot\naccidentally overwrite the self-recorded value.",
@@ -2647,6 +2658,10 @@
             "$ref": "#/components/schemas/ClusterDnsSettings",
             "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). No masking\nneeded — `enabled` is a plain bool with no sensitive content. Passed\nthrough as-is so the settings UI can read and toggle the flag."
           },
+          "connection_limits": {
+            "$ref": "#/components/schemas/ConnectionLimitSettings",
+            "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. No sensitive content. See issue #646."
+          },
           "container_logs": {
             "$ref": "#/components/schemas/ContainerLogSettings"
           },
@@ -2780,6 +2795,7 @@
           "build_limits",
           "ai_chat_limits",
           "request_timeouts",
+          "connection_limits",
           "self_update"
         ],
         "type": "object"
@@ -5456,6 +5472,20 @@
           "looksLikeDatabase",
           "ports"
         ],
+        "type": "object"
+      },
+      "ConnectionLimitSettings": {
+        "description": "Per-upstream concurrent-connection limiting. Protects the proxy's own\nconnection/file-descriptor budget from a single slow or malicious\ncustomer upstream — independent of the request/idle timeouts in\n`RequestTimeoutSettings`, which bound how long a connection may stay\nopen, not how many may exist at once. See issue #646.",
+        "properties": {
+          "default_max_concurrent_connections": {
+            "default": 0,
+            "description": "Default max concurrent in-flight requests to a single\nproject/environment's upstream, used when the project/environment\nhasn't set its own `max_concurrent_connections` override. `0` (the\ndefault) means unlimited — matches the \"opt-in, never breaks an\nexisting app on upgrade\" philosophy already established for\n`RequestTimeoutSettings`.",
+            "example": 200,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "ConnectionListQuery": {
@@ -9712,6 +9742,14 @@
             "description": "Seconds of inactivity before containers are stopped in on-demand mode.\nOnly used when `on_demand` is true. Min: 60, Max: 86400 (24h).\nDefault: 300 (5 minutes).",
             "format": "int32",
             "type": "integer"
+          },
+          "maxConcurrentConnections": {
+            "description": "Override for the proxy's cap on concurrent in-flight requests to this\nproject/environment's upstream, independent of the timeout overrides\nabove. `None` = inherit the global\n`connection_limits.default_max_concurrent_connections`. `Some(0)`\nexplicitly forces \"unlimited\" for this project/environment, overriding\na nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —\nthere is no global ceiling clamp here (unlike the timeout settings):\nan operator who has explicitly set a per-project value has made a\ndeliberate choice and the platform should respect it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "memoryLimit": {
             "description": "Memory limit in megabytes. Three-state semantics:\n- `None`     → inherit the parent layer (env inherits project, project\n  inherits the seeded default); used by the settings UI's \"Use default\".\n- `Some(0)`  → explicit **uncapped**: stop inheriting and run with no\n  memory limit. This is the deliberate escape hatch for dedicated\n  workloads, distinct from `None`.\n- `Some(n)`  → hard cap of `n` MB.\n\n`merge`/resolution keep `Some(0)` as a present value (it wins precedence\nover a parent cap), and the deployer collapses it to \"no limit\" before\ntalking to Docker.",
@@ -40561,6 +40599,14 @@
               "null"
             ]
           },
+          "maxConcurrentConnections": {
+            "description": "Project-level default cap on concurrent in-flight requests to a\nsingle environment's upstream (0 = unlimited). Environments may\noverride this. Absent leaves the current value unchanged. See\nissue #646.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "memoryLimit": {
             "format": "int32",
             "type": [
@@ -40589,7 +40635,7 @@
             ]
           },
           "requestTimeoutSeconds": {
-            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (1-86400). Environments may override this; always\nclamped to the operator's global hard ceiling regardless of what's set\nhere. Absent leaves the current value unchanged.",
+            "description": "Project-level default timeout for regular (non-streaming) HTTP\nrequests, in seconds (0 = no timeout, or 1-86400). Environments may\noverride this; always clamped to the operator's global hard ceiling\nregardless of what's set here. Absent leaves the current value\nunchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40613,7 +40659,7 @@
             ]
           },
           "sseIdleTimeoutSeconds": {
-            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "description": "Project-level default idle timeout for Server-Sent Events streams, in\nseconds (0 = no timeout, or 1-86400). Environments may override this;\nalways clamped to the operator's global hard ceiling. Absent leaves\nthe current value unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40621,7 +40667,7 @@
             ]
           },
           "websocketIdleTimeoutSeconds": {
-            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (1-86400). Environments may override this; always clamped to\nthe operator's global hard ceiling. Absent leaves the current value\nunchanged.",
+            "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (0 = no timeout, or 1-86400). Environments may override this;\nalways clamped to the operator's global hard ceiling. Absent leaves\nthe current value unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -40846,6 +40892,14 @@
               "null"
             ]
           },
+          "max_concurrent_connections": {
+            "description": "Override the proxy's cap on concurrent in-flight requests to this\nenvironment's upstream (0 = unlimited). Absent leaves the current\nvalue unchanged. Send JSON `null` to clear the override (inherit\nthe project/global default). See issue #646.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "memory_limit": {
             "description": "Maximum (limit) memory in MB. Send JSON `null` to clear → \"no limit\".\nAbsent leaves the current value unchanged.",
             "format": "int32",
@@ -40898,7 +40952,7 @@
             ]
           },
           "request_timeout_seconds": {
-            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
+            "description": "Override the proxy's timeout for regular (non-streaming) HTTP requests\nto this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the\noperator's global hard ceiling regardless of what's set here.\nAbsent leaves the current value unchanged. Send JSON `null` to clear\nthe override (inherit the project/global default).",
             "format": "int32",
             "type": [
               "integer",
@@ -40924,7 +40978,7 @@
             ]
           },
           "sse_idle_timeout_seconds": {
-            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",
@@ -40954,7 +41008,7 @@
             ]
           },
           "websocket_idle_timeout_seconds": {
-            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
+            "description": "Override the proxy's idle timeout for WebSocket connections to this\nenvironment, in seconds (0 = no timeout, or 1-86400). Always clamped to the operator's\nglobal hard ceiling. Absent leaves the current value unchanged. Send\nJSON `null` to clear the override.",
             "format": "int32",
             "type": [
               "integer",

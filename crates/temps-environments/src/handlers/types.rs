@@ -465,6 +465,12 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// JSON `null` to clear the override.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
     pub websocket_idle_timeout_seconds: Option<Option<i32>>,
+    /// Override the proxy's cap on concurrent in-flight requests to this
+    /// environment's upstream (0 = unlimited). Absent leaves the current
+    /// value unchanged. Send JSON `null` to clear the override (inherit
+    /// the project/global default). See issue #646.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub max_concurrent_connections: Option<Option<i32>>,
     /// Set a password to protect this environment. The proxy will show an HTML
     /// password form before allowing access. The password is bcrypt-hashed
     /// server-side and never stored in plaintext.

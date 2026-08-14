@@ -1463,6 +1463,12 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
+    if config.max_concurrent_connections.is_some() {
+        updated_fields.insert(
+            "max_concurrent_connections".to_string(),
+            "updated".to_string(),
+        );
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,

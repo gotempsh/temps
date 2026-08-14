@@ -12,14 +12,18 @@ import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import type { RequestTimeoutSettings } from '@/api/client/types.gen'
-import { AlertCircle, Loader2, Save, Timer } from 'lucide-react'
+import type {
+  RequestTimeoutSettings,
+  ConnectionLimitSettings,
+} from '@/api/client/types.gen'
+import { AlertCircle, Gauge, Loader2, Save, Timer } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 
 interface RequestTimeoutsFormData {
   request_timeouts: RequestTimeoutSettings
+  connection_limits: ConnectionLimitSettings
 }
 
 const DEFAULTS: RequestTimeoutSettings = {
@@ -27,6 +31,10 @@ const DEFAULTS: RequestTimeoutSettings = {
   default_http_timeout_seconds: 0,
   default_sse_idle_timeout_seconds: 0,
   default_websocket_idle_timeout_seconds: 0,
+}
+
+const CONNECTION_LIMIT_DEFAULTS: ConnectionLimitSettings = {
+  default_max_concurrent_connections: 0,
 }
 
 /**
@@ -49,7 +57,10 @@ export function RequestTimeoutsPage() {
     formState: { isDirty, isSubmitting, errors },
     reset,
   } = useForm<RequestTimeoutsFormData>({
-    defaultValues: { request_timeouts: DEFAULTS },
+    defaultValues: {
+      request_timeouts: DEFAULTS,
+      connection_limits: CONNECTION_LIMIT_DEFAULTS,
+    },
   })
 
   useEffect(() => {
@@ -65,6 +76,8 @@ export function RequestTimeoutsPage() {
     if (settings) {
       reset({
         request_timeouts: settings.request_timeouts || DEFAULTS,
+        connection_limits:
+          settings.connection_limits || CONNECTION_LIMIT_DEFAULTS,
       })
     }
   }, [settings, reset])
@@ -106,16 +119,15 @@ export function RequestTimeoutsPage() {
             Request Timeouts
           </CardTitle>
           <CardDescription>
-            How long the proxy waits on upstream app traffic before closing
-            the connection. Timeouts are opt-in — 0 means no timeout, and
+            How long the proxy waits on upstream app traffic before closing the
+            connection. Timeouts are opt-in — 0 means no timeout, and
             that&apos;s the default for every traffic class, so existing apps
             are unaffected until you configure one. Server-Sent Events and
-            WebSocket connections get their own idle timeout since
-            they&apos;re long-lived by design — a plain HTTP request uses the
-            regular timeout instead. Projects and environments can set their
-            own override under Deployment Config; the ceiling below only
-            applies once a timeout is actually configured, and never longer
-            than that.
+            WebSocket connections get their own idle timeout since they&apos;re
+            long-lived by design — a plain HTTP request uses the regular timeout
+            instead. Projects and environments can set their own override under
+            Deployment Config; the ceiling below only applies once a timeout is
+            actually configured, and never longer than that.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -137,8 +149,8 @@ export function RequestTimeoutsPage() {
             />
             <p className="text-xs text-muted-foreground">
               No project/environment override, and no default below, can exceed
-              this — but only applies once a timeout is actually configured.
-              Min 5, max 86400 (24h). Default 600 (10m).
+              this — but only applies once a timeout is actually configured. Min
+              5, max 86400 (24h). Default 600 (10m).
             </p>
             {errors.request_timeouts?.max_request_timeout_seconds && (
               <p className="text-xs text-destructive">
@@ -218,6 +230,50 @@ export function RequestTimeoutsPage() {
                 </p>
               )}
             </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Gauge className="h-5 w-5" />
+            Concurrent Connection Limit
+          </CardTitle>
+          <CardDescription>
+            Caps how many concurrent in-flight requests the proxy allows to a
+            single project/environment&apos;s upstream, independent of the
+            timeouts above — protects the proxy&apos;s own connection budget
+            from a single stalled or malicious app. 0 = unlimited, and
+            that&apos;s the default, so existing apps are unaffected until you
+            configure a limit. Matters most when multiple apps share one
+            node/instance — a project or environment can override this under
+            Deployment Config.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2 max-w-xs">
+            <Label htmlFor="default_max_concurrent_connections">
+              Max concurrent connections
+            </Label>
+            <Input
+              id="default_max_concurrent_connections"
+              type="number"
+              min={0}
+              {...register(
+                'connection_limits.default_max_concurrent_connections',
+                { valueAsNumber: true, required: true, min: 0 }
+              )}
+            />
+            <p className="text-xs text-muted-foreground">
+              0 = unlimited (default). Requests over the limit get an immediate
+              503 instead of queuing.
+            </p>
+            {errors.connection_limits?.default_max_concurrent_connections && (
+              <p className="text-xs text-destructive">
+                Must be 0 (unlimited) or greater
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>

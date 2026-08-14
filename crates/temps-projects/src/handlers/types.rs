@@ -630,6 +630,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// the current value unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<i32>,
+    /// Project-level default cap on concurrent in-flight requests to a
+    /// single environment's upstream (0 = unlimited). Environments may
+    /// override this. Absent leaves the current value unchanged. See
+    /// issue #646.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_connections: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]

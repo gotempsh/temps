@@ -705,6 +705,9 @@ impl EnvironmentService {
         if let Some(websocket_idle_timeout_seconds) = settings.websocket_idle_timeout_seconds {
             deployment_config.websocket_idle_timeout_seconds = websocket_idle_timeout_seconds;
         }
+        if let Some(max_concurrent_connections) = settings.max_concurrent_connections {
+            deployment_config.max_concurrent_connections = max_concurrent_connections;
+        }
 
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
@@ -1354,6 +1357,7 @@ mod tests {
                     request_timeout_seconds: None,
                     sse_idle_timeout_seconds: None,
                     websocket_idle_timeout_seconds: None,
+                    max_concurrent_connections: None,
                     password: None,
                 },
             )
@@ -1459,6 +1463,7 @@ mod tests {
                     request_timeout_seconds: Some(None),
                     sse_idle_timeout_seconds: None,
                     websocket_idle_timeout_seconds: None,
+                    max_concurrent_connections: None,
                     password: None,
                 },
             )

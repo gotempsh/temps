@@ -29,6 +29,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Clock,
   GitBranch,
+  Gauge,
   KeyRound,
   Loader2,
   Moon,
@@ -167,6 +168,8 @@ export function EnvironmentConfigurationCard({
     websocket_idle_timeout_seconds:
       environment.deployment_config?.websocketIdleTimeoutSeconds?.toString() ??
       '',
+    max_concurrent_connections:
+      environment.deployment_config?.maxConcurrentConnections?.toString() ?? '',
     password_enabled:
       environment.deployment_config?.security?.passwordProtection?.enabled ??
       false,
@@ -235,6 +238,9 @@ export function EnvironmentConfigurationCard({
         environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
       websocket_idle_timeout_seconds:
         environment.deployment_config?.websocketIdleTimeoutSeconds?.toString() ??
+        '',
+      max_concurrent_connections:
+        environment.deployment_config?.maxConcurrentConnections?.toString() ??
         '',
       password_enabled:
         environment.deployment_config?.security?.passwordProtection?.enabled ??
@@ -341,6 +347,13 @@ export function EnvironmentConfigurationCard({
           : null,
         websocket_idle_timeout_seconds: formData.websocket_idle_timeout_seconds
           ? parseInt(formData.websocket_idle_timeout_seconds)
+          : null,
+        // Same semantics as the timeout overrides above: empty string clears
+        // the override (inherit project/global default, itself unlimited by
+        // default), "0" is a valid, distinct override meaning "explicitly
+        // unlimited for this environment."
+        max_concurrent_connections: formData.max_concurrent_connections
+          ? parseInt(formData.max_concurrent_connections)
           : null,
         security: formData.security,
         password: formData.password_enabled
@@ -692,11 +705,11 @@ export function EnvironmentConfigurationCard({
               </div>
               <p className="text-xs text-muted-foreground mb-4">
                 Override the global request timeout defaults for this
-                environment. Leave blank to inherit the project/global
-                default (no timeout, unless an operator configured one).
-                Enter 0 to explicitly force no timeout for this environment.
-                Nonzero values are always clamped server-side to the
-                operator&apos;s global hard ceiling.
+                environment. Leave blank to inherit the project/global default
+                (no timeout, unless an operator configured one). Enter 0 to
+                explicitly force no timeout for this environment. Nonzero values
+                are always clamped server-side to the operator&apos;s global
+                hard ceiling.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
@@ -747,6 +760,41 @@ export function EnvironmentConfigurationCard({
                     placeholder="Inherit"
                   />
                 </div>
+              </div>
+            </div>
+
+            {/* Concurrent Connection Limit */}
+            <div className="border-t pt-6">
+              <div className="flex items-center gap-2 mb-4">
+                <Gauge className="h-4 w-4" />
+                <h3 className="text-sm font-medium">
+                  Concurrent Connection Limit
+                </h3>
+              </div>
+              <p className="text-xs text-muted-foreground mb-4">
+                Cap on concurrent in-flight requests to this environment&apos;s
+                upstream. Protects the proxy&apos;s own connection budget from a
+                stalled or malicious app — mainly relevant when this environment
+                shares a node with other tenants. Leave blank to inherit the
+                project/global default (unlimited, unless an operator configured
+                one). Enter 0 to explicitly force unlimited for this
+                environment. Requests over the limit get an immediate 503
+                instead of queuing.
+              </p>
+              <div className="max-w-xs">
+                <Label>Max concurrent connections</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  value={formData.max_concurrent_connections}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      max_concurrent_connections: e.target.value,
+                    }))
+                  }
+                  placeholder="Inherit"
+                />
               </div>
             </div>
 
