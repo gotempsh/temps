@@ -11737,7 +11737,7 @@ mod tests {
         params.insert("port".to_string(), JsonValue::String(port.to_string()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:17-bookworm".to_string()),
+            JsonValue::String("timescale/timescaledb-ha:pg17".to_string()),
         );
         let svc = manager
             .create_service(CreateExternalServiceRequest {
@@ -11781,8 +11781,8 @@ mod tests {
                 service_id: Set(svc.id),
                 from_version: Set("17".to_string()),
                 to_version: Set("18".to_string()),
-                from_image: Set("postgres:17-bookworm".to_string()),
-                to_image: Set("postgres:18-bookworm".to_string()),
+                from_image: Set("timescale/timescaledb-ha:pg17".to_string()),
+                to_image: Set("timescale/timescaledb-ha:pg18".to_string()),
                 status: Set(status::PENDING.to_string()),
                 phase: Set(status::PENDING.to_string()),
                 pre_upgrade_backup_id: Set(None),
