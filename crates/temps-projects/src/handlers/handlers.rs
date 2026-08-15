@@ -1226,7 +1226,6 @@ pub async fn update_git_settings(
         .project_service
         .update_git_settings(
             project_id,
-            auth.user_id(),
             settings.git_provider_connection_id,
             settings.main_branch.clone(),
             settings.repo_owner.clone(),
