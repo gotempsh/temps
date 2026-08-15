@@ -1071,115 +1071,36 @@ impl PostgresService {
     /// the exact bug we're trying to avoid.
     async fn compute_desired_enable_archiving(&self) -> bool {
         let container_name = self.get_container_name();
-        let volume_name = format!("{}_data", container_name);
-        self.walg_env_exists_on_volume(&volume_name).await
+        self.walg_env_exists_in_container(&container_name).await
     }
 
-    /// Returns true iff `/var/lib/postgresql/walg.env` exists on the named
-    /// Docker volume. Runs a one-shot `busybox` container with the volume
-    /// mounted read-only. Any error (image pull, exec failure) returns
+    /// Returns true iff `/var/lib/postgresql/walg.env` exists in this service's
+    /// container filesystem.
+    ///
+    /// Use Docker's native archive API instead of starting a helper container:
+    /// the path lives on the service's mounted data volume, and `docker cp` /
+    /// `download_from_container` can read it from a stopped container without
+    /// executing third-party image code against the Postgres volume.
+    /// Any error (missing container, missing file, Docker API failure) returns
     /// false — we err on the side of not enabling archiving.
-    async fn walg_env_exists_on_volume(&self, volume_name: &str) -> bool {
-        use bollard::query_parameters::{
-            CreateContainerOptions, CreateImageOptions, RemoveContainerOptions,
-            StartContainerOptions, WaitContainerOptions,
-        };
+    async fn walg_env_exists_in_container(&self, container_name: &str) -> bool {
+        use bollard::query_parameters::DownloadFromContainerOptions;
         use futures::StreamExt;
 
-        // Pull busybox; cheap (~700 KB) and cached after first use.
-        let mut pull_stream = self.docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some("busybox".to_string()),
-                tag: Some("latest".to_string()),
-                ..Default::default()
+        let mut archive_stream = self.docker.download_from_container(
+            container_name,
+            Some(DownloadFromContainerOptions {
+                path: "/var/lib/postgresql/walg.env".to_string(),
             }),
-            None,
-            None,
         );
-        while let Some(result) = pull_stream.next().await {
-            if result.is_err() {
-                // Best-effort; treat unavailability as "no archiving".
+
+        while let Some(chunk) = archive_stream.next().await {
+            if chunk.is_err() {
                 return false;
             }
         }
 
-        let probe_name = format!("temps-walg-probe-{}", uuid::Uuid::new_v4());
-        let host_config = bollard::models::HostConfig {
-            mounts: Some(vec![bollard::models::Mount {
-                target: Some("/var/lib/postgresql".to_string()),
-                source: Some(volume_name.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
-                read_only: Some(true),
-                ..Default::default()
-            }]),
-            auto_remove: Some(false),
-            ..Default::default()
-        };
-
-        let create_result = self
-            .docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(probe_name.clone()),
-                    ..Default::default()
-                }),
-                bollard::models::ContainerCreateBody {
-                    image: Some("busybox:latest".to_string()),
-                    cmd: Some(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "test -f /var/lib/postgresql/walg.env".to_string(),
-                    ]),
-                    host_config: Some(host_config),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-        if create_result.is_err() {
-            return false;
-        }
-
-        // Best effort cleanup: always try to remove the probe container.
-        let cleanup = |name: String| async move {
-            let _ = self
-                .docker
-                .remove_container(
-                    &name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-        };
-
-        if self
-            .docker
-            .start_container(&probe_name, None::<StartContainerOptions>)
-            .await
-            .is_err()
-        {
-            cleanup(probe_name).await;
-            return false;
-        }
-
-        let mut wait_stream = self
-            .docker
-            .wait_container(&probe_name, None::<WaitContainerOptions>);
-
-        let mut exit_code: Option<i64> = None;
-        while let Some(item) = wait_stream.next().await {
-            if let Ok(resp) = item {
-                exit_code = Some(resp.status_code);
-                break;
-            }
-        }
-
-        cleanup(probe_name).await;
-
-        // `test -f` exits 0 when the file is present.
-        matches!(exit_code, Some(0))
+        true
     }
 
     /// Returns true when the running container's CMD specifies an
