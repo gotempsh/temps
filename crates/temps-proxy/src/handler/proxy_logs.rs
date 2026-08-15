@@ -106,8 +106,13 @@ pub struct ProxyLogsQuery {
     pub host: Option<String>,
     /// Filter by path (supports partial match)
     pub path: Option<String>,
+    /// Filter by an exact request path
+    pub path_exact: Option<String>,
     /// Filter by client IP address
     pub client_ip: Option<String>,
+    /// Exclude Temps status-monitor requests, including legacy monitor rows
+    /// identified only by their user-agent.
+    pub exclude_synthetic: Option<bool>,
 
     // Response filters
     /// Filter by HTTP status code
@@ -202,6 +207,50 @@ pub struct ProxyLogsPaginatedResponse {
     pub total_pages: u64,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProxyLogAccessResponse {
+    pub allowed: bool,
+    pub reason: Option<String>,
+}
+
+async fn authorize_proxy_log_scope(
+    auth: &temps_auth::AuthContext,
+    checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_id: Option<i32>,
+) -> Result<(), Problem> {
+    if let Some(project_id) = project_id {
+        project_permission_guard!(auth, LogsRead, project_id, checker);
+        project_scope_guard!(auth, project_id);
+    } else {
+        // An unscoped proxy-log query spans every project on the instance.
+        // Project-level roles cannot be reduced to one safe SQL predicate here,
+        // so only instance administrators may use the global view.
+        permission_guard!(auth, SystemAdmin);
+    }
+    Ok(())
+}
+
+async fn authorize_proxy_analytics_scope(
+    auth: &temps_auth::AuthContext,
+    checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_id: Option<i32>,
+) -> Result<(), Problem> {
+    if let Some(project_id) = project_id {
+        project_permission_guard!(auth, AnalyticsRead, project_id, checker);
+        project_scope_guard!(auth, project_id);
+    } else {
+        permission_guard!(auth, SystemAdmin);
+    }
+    Ok(())
+}
+
+fn proxy_log_matches_requested_project(
+    log_project_id: Option<i32>,
+    requested_project_id: Option<i32>,
+) -> bool {
+    requested_project_id.is_none() || log_project_id == requested_project_id
+}
+
 /// Run a backend-neutral, multi-dimensional API traffic aggregation.
 #[utoipa::path(
     post,
@@ -260,7 +309,12 @@ pub async fn get_proxy_logs(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<ProxyLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, LogsRead);
+    authorize_proxy_log_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
@@ -284,9 +338,62 @@ pub async fn get_proxy_logs(
     Ok(Json(response))
 }
 
+/// Report whether the current principal may drill into a project's proxy logs.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/api-analytics/proxy-log-access",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    responses(
+        (status = 200, description = "Proxy-log drilldown capability", body = ProxyLogAccessResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient analytics permissions", body = ProblemDetails),
+        (status = 500, description = "Project permission check failed", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy Logs"
+)]
+pub async fn get_api_traffic_proxy_log_access(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProxyLogsState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        AnalyticsRead,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+
+    match authorize_proxy_log_scope(
+        &auth,
+        state.project_access_checker.clone(),
+        Some(project_id),
+    )
+    .await
+    {
+        Ok(()) => Ok(Json(ProxyLogAccessResponse {
+            allowed: true,
+            reason: None,
+        })),
+        Err(problem) if problem.status_code == StatusCode::FORBIDDEN => {
+            Ok(Json(ProxyLogAccessResponse {
+                allowed: false,
+                reason: Some(
+                    "Your role on this project does not include proxy-log access".to_string(),
+                ),
+            }))
+        }
+        Err(problem) => Err(problem),
+    }
+}
+
 /// Query parameters for the single proxy-log lookup
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ProxyLogByIdQuery {
+    /// Project scope for the lookup. Required for non-administrator callers.
+    /// Instance administrators may omit it for legacy global deep links.
+    pub project_id: Option<i32>,
     /// Event time of the log row (ISO 8601). When provided, the lookup is
     /// bounded to the hypertable chunks around this instant instead of
     /// scanning (and decompressing) the whole retention window. The list
@@ -319,7 +426,12 @@ pub async fn get_proxy_log_by_id(
     Path(id): Path<i32>,
     Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, LogsRead);
+    authorize_proxy_log_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let log = service
         .get_by_id(id, query.timestamp.map(|t| t.into()))
@@ -327,7 +439,12 @@ pub async fn get_proxy_log_by_id(
         .map_err(Problem::from)?;
 
     match log {
-        Some(log) => Ok(Json(ProxyLogResponse::from(log))),
+        Some(log) if proxy_log_matches_requested_project(log.project_id, query.project_id) => {
+            Ok(Json(ProxyLogResponse::from(log)))
+        }
+        Some(_) => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Proxy Log Not Found")
+            .with_detail(format!("Proxy log {id} not found"))),
         None => Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Proxy Log Not Found")
             .with_detail(format!("Proxy log {id} not found"))),
@@ -358,7 +475,12 @@ pub async fn get_proxy_log_by_request_id(
     Path(request_id): Path<String>,
     Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, LogsRead);
+    authorize_proxy_log_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let log = service
         .get_by_request_id(&request_id, query.timestamp.map(|t| t.into()))
@@ -366,7 +488,12 @@ pub async fn get_proxy_log_by_request_id(
         .map_err(Problem::from)?;
 
     match log {
-        Some(log) => Ok(Json(ProxyLogResponse::from(log))),
+        Some(log) if proxy_log_matches_requested_project(log.project_id, query.project_id) => {
+            Ok(Json(ProxyLogResponse::from(log)))
+        }
+        Some(_) => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Proxy Log Not Found")
+            .with_detail(format!("Proxy log with request ID {request_id} not found"))),
         None => Err(problemdetails::new(StatusCode::NOT_FOUND)
             .with_title("Proxy Log Not Found")
             .with_detail(format!("Proxy log with request ID {request_id} not found"))),
@@ -499,7 +626,12 @@ async fn get_today_stats(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let filters = if query.method.is_some()
         || query.client_ip.is_some()
@@ -552,7 +684,12 @@ async fn get_time_bucket_stats(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<TimeBucketStatsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let filters = if query.method.is_some()
         || query.client_ip.is_some()
@@ -648,18 +785,6 @@ async fn get_projects_health(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<ProjectsHealthQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
-    // NOTE (tracked follow-up — cross-project authorization): none of the
-    // proxy-log handlers yet scope reads to the caller's team membership. This
-    // affects three classes: (a) handlers with a `project_id`/`project_ids`
-    // filter (this one, get_proxy_logs, and the stats/AI endpoints), (b) the
-    // by-id/by-request-id lookups which carry no project filter at all and must
-    // check the returned row's project_id post-fetch, and (c) deployment-token
-    // cross-project access (`project_scope_guard!`). Closing it needs a
-    // `ProjectAccessChecker` threaded onto this plugin's route state, which
-    // these handlers don't yet carry. The anonymous-access hole is already
-    // closed by the RequireAuth + permission_guard! above.
-
     let project_ids: Vec<i32> = query
         .project_ids
         .split(',')
@@ -676,6 +801,15 @@ async fn get_projects_health(
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Parameters")
             .with_detail("Maximum 100 project IDs allowed"));
+    }
+
+    for project_id in &project_ids {
+        authorize_proxy_analytics_scope(
+            &auth,
+            service.project_access_checker.clone(),
+            Some(*project_id),
+        )
+        .await?;
     }
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
@@ -765,7 +899,12 @@ async fn get_ai_agent_breakdown(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
@@ -827,7 +966,12 @@ async fn get_ai_page_breakdown(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
@@ -937,7 +1081,12 @@ async fn get_ai_agent_timeline(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentTimelineQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
@@ -1034,7 +1183,12 @@ async fn get_ai_status_breakdown(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
     let start_time = query
@@ -1144,7 +1298,12 @@ async fn get_ai_agent_pages(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentPagesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AnalyticsRead);
+    authorize_proxy_analytics_scope(
+        &auth,
+        service.project_access_checker.clone(),
+        query.project_id,
+    )
+    .await?;
 
     if query.agent.trim().is_empty() {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1194,6 +1353,10 @@ pub fn create_routes() -> axum::Router<Arc<ProxyLogsState>> {
             "/projects/{project_id}/api-analytics/query",
             post(aggregate_api_traffic),
         )
+        .route(
+            "/projects/{project_id}/api-analytics/proxy-log-access",
+            get(get_api_traffic_proxy_log_access),
+        )
         .route("/proxy-logs", get(get_proxy_logs))
         .route("/proxy-logs/{id}", get(get_proxy_log_by_id))
         .route(
@@ -1225,6 +1388,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     #[openapi(
         paths(
             aggregate_api_traffic,
+            get_api_traffic_proxy_log_access,
             get_proxy_logs,
             get_proxy_log_by_id,
             get_proxy_log_by_request_id,
@@ -1253,6 +1417,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             crate::traffic_aggregation::TrafficSortDirection,
             ProxyLogResponse,
             ProxyLogsPaginatedResponse,
+            ProxyLogAccessResponse,
             TodayStatsResponse,
             TimeBucketStatsResponse,
             TimeBucketStats,
@@ -1281,6 +1446,77 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use temps_auth::{AuthContext, Role};
+    use temps_core::ProjectAccessChecker;
+    use temps_entities::users;
+
+    fn test_auth(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            users::Model {
+                id: 42,
+                name: "Proxy Log Tester".to_string(),
+                email: "proxy-log-tester@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    enum PermissionOutcome {
+        Allow,
+        Deny,
+        Error,
+    }
+
+    struct TestProjectAccessChecker(PermissionOutcome);
+
+    #[async_trait]
+    impl ProjectAccessChecker for TestProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            match self.0 {
+                PermissionOutcome::Allow => Ok(Some(vec![
+                    "logs:read".to_string(),
+                    "analytics:read".to_string(),
+                ])),
+                PermissionOutcome::Deny => Ok(Some(Vec::new())),
+                PermissionOutcome::Error => {
+                    Err(Box::new(std::io::Error::other("permission store offline")))
+                }
+            }
+        }
+    }
+
+    fn checker(outcome: PermissionOutcome) -> Option<Arc<dyn ProjectAccessChecker>> {
+        Some(Arc::new(TestProjectAccessChecker(outcome)))
+    }
 
     fn window(hours: i64) -> (UtcDateTime, UtcDateTime) {
         // Fixed anchor so the test is deterministic (no `Utc::now()`).
@@ -1290,6 +1526,94 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let end = start + chrono::Duration::hours(hours);
         (start, end)
+    }
+
+    #[tokio::test]
+    async fn proxy_log_list_requires_project_logs_permission() {
+        let auth = test_auth(Role::Reader);
+        assert!(
+            authorize_proxy_log_scope(&auth, checker(PermissionOutcome::Allow), Some(7))
+                .await
+                .is_ok()
+        );
+
+        let denied = authorize_proxy_log_scope(&auth, checker(PermissionOutcome::Deny), Some(7))
+            .await
+            .expect_err("project role without logs:read must be denied");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn proxy_log_list_fails_closed_when_project_permission_check_fails() {
+        let error = authorize_proxy_log_scope(
+            &test_auth(Role::Reader),
+            checker(PermissionOutcome::Error),
+            Some(7),
+        )
+        .await
+        .expect_err("permission infrastructure failure must deny the request");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn unscoped_proxy_log_list_is_admin_only() {
+        let denied = authorize_proxy_log_scope(&test_auth(Role::User), None, None)
+            .await
+            .expect_err("ordinary users must not list logs across all projects");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        assert!(
+            authorize_proxy_log_scope(&test_auth(Role::Admin), None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_only_role_cannot_open_proxy_logs() {
+        let denied = authorize_proxy_log_scope(
+            &test_auth(Role::ApiReader),
+            checker(PermissionOutcome::Allow),
+            Some(7),
+        )
+        .await
+        .expect_err("analytics-only role lacks instance logs:read permission");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn analytics_stats_require_project_scope_or_an_instance_admin() {
+        let reader = test_auth(Role::Reader);
+        assert!(authorize_proxy_analytics_scope(
+            &reader,
+            checker(PermissionOutcome::Allow),
+            Some(7),
+        )
+        .await
+        .is_ok());
+
+        let denied =
+            authorize_proxy_analytics_scope(&reader, checker(PermissionOutcome::Deny), Some(7))
+                .await
+                .expect_err("analytics for another project must be denied");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        let unscoped = authorize_proxy_analytics_scope(&reader, None, None)
+            .await
+            .expect_err("global analytics are administrator-only");
+        assert_eq!(unscoped.status_code, StatusCode::FORBIDDEN);
+        assert!(
+            authorize_proxy_analytics_scope(&test_auth(Role::Admin), None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn single_log_lookup_never_crosses_the_authorized_project_scope() {
+        assert!(proxy_log_matches_requested_project(Some(7), Some(7)));
+        assert!(!proxy_log_matches_requested_project(Some(8), Some(7)));
+        assert!(!proxy_log_matches_requested_project(None, Some(7)));
+        assert!(proxy_log_matches_requested_project(Some(8), None));
     }
 
     #[test]

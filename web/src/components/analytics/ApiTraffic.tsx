@@ -1,5 +1,6 @@
 import {
   getApiCallersOptions,
+  getApiTrafficProxyLogAccessOptions,
   getApiRoutesOptions,
   getApiSummaryOptions,
   getApiTimeseriesOptions,
@@ -78,6 +79,7 @@ import {
   trafficPageCount,
   type TrafficSort,
 } from '@/lib/api-traffic-sort'
+import { apiTrafficProxyLogsUrl } from '@/lib/api-traffic-navigation'
 
 interface ApiTrafficTabProps {
   project: ProjectResponse
@@ -279,6 +281,12 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
 
   const enabled = !!startIso && !!endIso
   const pageSize = 20
+  const proxyLogAccessQuery = useQuery({
+    ...getApiTrafficProxyLogAccessOptions({
+      path: { project_id: project.id },
+    }),
+    staleTime: 5 * 60 * 1000,
+  })
 
   const timeseriesQuery = useQuery({
     ...getApiTimeseriesOptions({
@@ -319,6 +327,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           'latency_max',
           'latency_p95',
           'unique_ips',
+          'bot_requests',
+          'robots_txt_requests',
           'last_seen',
         ],
         filters: [],
@@ -362,6 +372,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           'latency_max',
           'latency_p95',
           'unique_paths',
+          'bot_requests',
+          'robots_txt_requests',
           'last_seen',
         ],
         filters: [],
@@ -417,6 +429,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           'latency_min',
           'latency_max',
           'latency_p95',
+          'bot_requests',
+          'robots_txt_requests',
           'last_seen',
         ],
         filters,
@@ -842,6 +856,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                               <span className="truncate font-mono text-xs">
                                 {path}
                               </span>
+                              <CrawlerSignals row={r} />
                             </div>
                           </TableCell>
                           <TableCell className="text-right">
@@ -932,8 +947,11 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                             setDetail({ kind: 'ip', value: ip })
                           }}
                         >
-                          <TableCell className="font-mono text-xs">
-                            {ip}
+                          <TableCell>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs">{ip}</span>
+                              <CrawlerSignals row={c} />
+                            </div>
                           </TableCell>
                           <TableCell className="text-right">
                             {formatNumber(c.metrics.requests ?? 0)}
@@ -967,6 +985,17 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         page={detailPage}
         pageSize={pageSize}
         sort={detailSort}
+        projectId={project.id}
+        startDate={startIso ?? ''}
+        endDate={endIso ?? ''}
+        environmentId={selectedEnvironment}
+        canOpenProxyLogs={proxyLogAccessQuery.data?.allowed === true}
+        proxyLogAccessReason={
+          proxyLogAccessQuery.data?.reason ??
+          (proxyLogAccessQuery.isLoading
+            ? 'Checking proxy-log access…'
+            : 'Proxy-log access is unavailable')
+        }
         onPageChange={setDetailPage}
         onSort={(metric) => {
           setDetailSort((current) => nextTrafficSort(current, metric))
@@ -1020,6 +1049,12 @@ function TrafficDetailSheet({
   page,
   pageSize,
   sort,
+  projectId,
+  startDate,
+  endDate,
+  environmentId,
+  canOpenProxyLogs,
+  proxyLogAccessReason,
   onPageChange,
   onSort,
 }: {
@@ -1031,6 +1066,12 @@ function TrafficDetailSheet({
   page: number
   pageSize: number
   sort: TrafficSort<TrafficMetric>
+  projectId: number
+  startDate: string
+  endDate: string
+  environmentId?: number
+  canOpenProxyLogs: boolean
+  proxyLogAccessReason: string
   onPageChange: (page: number) => void
   onSort: (metric: TrafficMetric) => void
 }) {
@@ -1046,6 +1087,7 @@ function TrafficDetailSheet({
           <SheetDescription>
             Analytics use the active dashboard time and environment filters.
             Temps monitor checks are excluded.
+            {!canOpenProxyLogs && ` ${proxyLogAccessReason}.`}
           </SheetDescription>
         </SheetHeader>
         <div className="mt-6">
@@ -1154,40 +1196,83 @@ function TrafficDetailSheet({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {data?.rows.map((row, index) => (
-                    <TableRow
-                      key={`${row.dimensions.map((item) => item.value).join(':')}-${index}`}
-                    >
-                      <TableCell className="max-w-[260px] font-mono text-xs">
-                        {detail?.kind === 'ip'
-                          ? `${trafficDimension(row, 'method')} ${trafficDimension(row, 'path')}`
-                          : trafficDimension(row, 'client_ip')}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatNumber(row.metrics.requests ?? 0)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatMs(row.metrics.latency_min_ms)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatMs(row.metrics.latency_avg_ms)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatMs(row.metrics.latency_max_ms)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatMs(row.metrics.latency_p95_ms)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatPercent(row.metrics.error_rate ?? 0)}
-                      </TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground">
-                        {row.metrics.last_seen
-                          ? new Date(row.metrics.last_seen).toLocaleString()
-                          : '—'}
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  {data?.rows.map((row, index) => {
+                    const clientIp =
+                      detail?.kind === 'ip'
+                        ? detail.value
+                        : trafficDimension(row, 'client_ip')
+                    const method =
+                      detail?.kind === 'ip'
+                        ? trafficDimension(row, 'method')
+                        : (detail?.method ?? '')
+                    const path =
+                      detail?.kind === 'ip'
+                        ? trafficDimension(row, 'path')
+                        : (detail?.value ?? '')
+                    const logsUrl = apiTrafficProxyLogsUrl({
+                      projectId,
+                      clientIp,
+                      method,
+                      path,
+                      startDate,
+                      endDate,
+                      environmentId,
+                    })
+                    return (
+                      <TableRow
+                        key={`${row.dimensions.map((item) => item.value).join(':')}-${index}`}
+                      >
+                        <TableCell className="max-w-[300px]">
+                          <div className="flex items-center gap-2">
+                            {canOpenProxyLogs ? (
+                              <Link
+                                to={logsUrl}
+                                className="truncate font-mono text-xs underline-offset-4 hover:underline"
+                                title="View matching request logs"
+                              >
+                                {detail?.kind === 'ip'
+                                  ? `${method} ${path}`
+                                  : clientIp}
+                              </Link>
+                            ) : (
+                              <span
+                                className="truncate font-mono text-xs"
+                                title={proxyLogAccessReason}
+                              >
+                                {detail?.kind === 'ip'
+                                  ? `${method} ${path}`
+                                  : clientIp}
+                              </span>
+                            )}
+                            <CrawlerSignals row={row} />
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatNumber(row.metrics.requests ?? 0)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatMs(row.metrics.latency_min_ms)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatMs(row.metrics.latency_avg_ms)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatMs(row.metrics.latency_max_ms)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatMs(row.metrics.latency_p95_ms)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatPercent(row.metrics.error_rate ?? 0)}
+                        </TableCell>
+                        <TableCell className="text-right text-xs text-muted-foreground">
+                          {row.metrics.last_seen
+                            ? new Date(row.metrics.last_seen).toLocaleString()
+                            : '—'}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
                 </TableBody>
               </Table>
               <TrafficPagination
@@ -1244,6 +1329,37 @@ function TrafficPagination({
           <ChevronRight className="h-4 w-4" />
         </Button>
       </div>
+    </div>
+  )
+}
+
+function CrawlerSignals({ row }: { row: TrafficAggregationRow }) {
+  const botRequests = row.metrics.bot_requests ?? 0
+  const robotsTxtRequests = row.metrics.robots_txt_requests ?? 0
+  const requests = row.metrics.requests ?? 0
+  const entirelyCrawlerTraffic = requests > 0 && botRequests === requests
+  if (botRequests === 0 && robotsTxtRequests === 0) return null
+
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      {botRequests > 0 && (
+        <Badge
+          variant="secondary"
+          className="px-1.5 py-0 text-[10px]"
+          title={`${formatNumber(botRequests)} request${botRequests === 1 ? '' : 's'} classified as bot traffic from user-agent metadata`}
+        >
+          {entirelyCrawlerTraffic ? 'Crawler' : 'Bot traffic'}
+        </Badge>
+      )}
+      {robotsTxtRequests > 0 && (
+        <Badge
+          variant="outline"
+          className="px-1.5 py-0 text-[10px]"
+          title={`${formatNumber(robotsTxtRequests)} request${robotsTxtRequests === 1 ? '' : 's'} to /robots.txt`}
+        >
+          robots.txt
+        </Badge>
+      )}
     </div>
   )
 }

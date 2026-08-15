@@ -563,6 +563,8 @@ struct ChTrafficAggregationRow {
     latency_p99_ms: Option<f64>,
     unique_ips: Option<u64>,
     unique_paths: Option<u64>,
+    bot_requests: Option<u64>,
+    robots_txt_requests: Option<u64>,
     last_seen_ms: Option<i64>,
     total_groups: u64,
 }
@@ -757,8 +759,13 @@ impl ClickHouseProxyLogStore {
             binds.push(Bv::I64(start.timestamp_millis()));
         }
         if let Some(end) = end_date {
-            clauses.push("timestamp <= fromUnixTimestamp64Milli(?)".into());
+            clauses.push("timestamp < fromUnixTimestamp64Milli(?)".into());
             binds.push(Bv::I64(end.timestamp_millis()));
+        }
+
+        if filters.exclude_synthetic == Some(true) {
+            clauses.push("request_source != 'temps_monitor'".into());
+            clauses.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".into());
         }
 
         // Request
@@ -773,6 +780,10 @@ impl ClickHouseProxyLogStore {
         if let Some(ref path) = filters.path {
             clauses.push("path ILIKE ?".into());
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(path))));
+        }
+        if let Some(ref path) = filters.path_exact {
+            clauses.push("path = ?".into());
+            binds.push(Bv::Str(path.clone()));
         }
         if let Some(ref ip) = filters.client_ip {
             clauses.push("client_ip = ?".into());
@@ -1899,6 +1910,8 @@ fn ch_metric_alias(metric: TrafficMetric) -> &'static str {
         TrafficMetric::LatencyP99 => "latency_p99_ms",
         TrafficMetric::UniqueIps => "unique_ips",
         TrafficMetric::UniquePaths => "unique_paths",
+        TrafficMetric::BotRequests => "bot_requests",
+        TrafficMetric::RobotsTxtRequests => "robots_txt_requests",
         TrafficMetric::LastSeen => "last_seen_ms",
     }
 }
@@ -1924,6 +1937,8 @@ fn ch_metric_expression(metric: TrafficMetric) -> &'static str {
         }
         TrafficMetric::UniqueIps => "toNullable(uniqExactIf(client_ip, client_ip != ''))",
         TrafficMetric::UniquePaths => "toNullable(uniqExact(path))",
+        TrafficMetric::BotRequests => "toNullable(countIf(ifNull(is_bot, 0) = 1))",
+        TrafficMetric::RobotsTxtRequests => "toNullable(countIf(path = '/robots.txt'))",
         TrafficMetric::LastSeen => "toNullable(toUnixTimestamp64Milli(max(timestamp)))",
     }
 }
@@ -1933,7 +1948,9 @@ fn ch_null_metric(metric: TrafficMetric) -> &'static str {
         TrafficMetric::Requests
         | TrafficMetric::Errors
         | TrafficMetric::UniqueIps
-        | TrafficMetric::UniquePaths => "CAST(NULL AS Nullable(UInt64))",
+        | TrafficMetric::UniquePaths
+        | TrafficMetric::BotRequests
+        | TrafficMetric::RobotsTxtRequests => "CAST(NULL AS Nullable(UInt64))",
         TrafficMetric::LastSeen => "CAST(NULL AS Nullable(Int64))",
         _ => "CAST(NULL AS Nullable(Float64))",
     }
@@ -2057,6 +2074,8 @@ fn build_traffic_query(
         TrafficMetric::LatencyP99,
         TrafficMetric::UniqueIps,
         TrafficMetric::UniquePaths,
+        TrafficMetric::BotRequests,
+        TrafficMetric::RobotsTxtRequests,
         TrafficMetric::LastSeen,
     ];
     let metrics = all_metrics.map(|metric| {
@@ -2178,6 +2197,8 @@ fn ch_traffic_response(
                 latency_p99_ms: row.latency_p99_ms,
                 unique_ips: ch_count(row.unique_ips, "unique_ips")?,
                 unique_paths: ch_count(row.unique_paths, "unique_paths")?,
+                bot_requests: ch_count(row.bot_requests, "bot_requests")?,
+                robots_txt_requests: ch_count(row.robots_txt_requests, "robots_txt_requests")?,
                 last_seen: row
                     .last_seen_ms
                     .and_then(|millis| Utc.timestamp_millis_opt(millis).single()),
@@ -2472,10 +2493,55 @@ mod tests {
         monitor.is_system_request = true;
         monitor.user_agent = Some("Temps-Status-Monitor/1.0".to_string());
 
+        let mut crawler = make_entry("traffic-crawler-robots");
+        crawler.path = "/robots.txt".to_string();
+        crawler.client_ip = Some("203.0.113.10".to_string());
+        crawler.response_time_ms = Some(6);
+        crawler.is_bot = Some(true);
+        crawler.bot_name = Some("ExampleBot".to_string());
+
         store
-            .write_batch(vec![fast, slow_error, monitor])
+            .write_batch(vec![fast, slow_error, monitor, crawler])
             .await
             .expect("insert traffic aggregation fixtures");
+
+        let list_start = Utc::now() - chrono::Duration::minutes(2);
+        let list_end = Utc::now() + chrono::Duration::minutes(2);
+        let (_, excluded_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7),
+                    environment_id: Some(3),
+                    path_exact: Some("/api/health".to_string()),
+                    exclude_synthetic: Some(true),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact path while excluding monitor traffic");
+        assert_eq!(excluded_total, 0);
+
+        let (monitor_rows, included_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7),
+                    environment_id: Some(3),
+                    path_exact: Some("/api/health".to_string()),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact monitor path without exclusion");
+        assert_eq!(included_total, 1);
+        assert_eq!(monitor_rows[0].request_source, "temps_monitor");
 
         let request = TrafficAggregationRequest {
             start_time: Utc::now() - chrono::Duration::minutes(2),
@@ -2496,6 +2562,8 @@ mod tests {
                 TrafficMetric::LatencyP50,
                 TrafficMetric::LatencyP95,
                 TrafficMetric::LatencyP99,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
             ],
             filters: Vec::new(),
             order_by: vec![TrafficOrderBy {
@@ -2511,7 +2579,7 @@ mod tests {
             .await
             .expect("aggregate ClickHouse traffic");
 
-        assert_eq!(response.total_groups, 1);
+        assert_eq!(response.total_groups, 2);
         assert!(response.synthetic_excluded);
         let row = response.rows.first().expect("customer traffic row");
         assert_eq!(row.dimensions[0].value.as_deref(), Some("203.0.113.10"));
@@ -2534,6 +2602,17 @@ mod tests {
                 "{name} must remain within the observed latency range"
             );
         }
+        assert_eq!(row.metrics.bot_requests, Some(0));
+        assert_eq!(row.metrics.robots_txt_requests, Some(0));
+
+        let crawler = response
+            .rows
+            .iter()
+            .find(|row| row.dimensions[1].value.as_deref() == Some("/robots.txt"))
+            .expect("crawler robots.txt traffic row");
+        assert_eq!(crawler.metrics.requests, Some(1));
+        assert_eq!(crawler.metrics.bot_requests, Some(1));
+        assert_eq!(crawler.metrics.robots_txt_requests, Some(1));
 
         let false_bot_response = store
             .aggregate_traffic(
@@ -2563,7 +2642,7 @@ mod tests {
             .await
             .expect("aggregate out-of-range ClickHouse traffic page");
         assert!(empty_page.rows.is_empty());
-        assert_eq!(empty_page.total_groups, 1);
+        assert_eq!(empty_page.total_groups, 2);
         assert_eq!(empty_page.total_pages, 1);
 
         let mut no_latency = make_entry("traffic-no-latency");
@@ -2786,7 +2865,9 @@ mod tests {
             method: Some("GET".into()),
             host: None,
             path: Some("admin%".into()),
+            path_exact: Some("/api/users/a b?source=admin".into()),
             client_ip: Some("1.1.1.1".into()),
+            exclude_synthetic: Some(true),
             status_code: Some(200),
             response_time_min: Some(5),
             response_time_max: None,
@@ -2817,14 +2898,24 @@ mod tests {
             sort_order: None,
         };
 
+        let start = chrono::DateTime::parse_from_rfc3339("2026-08-15T10:00:00Z")
+            .expect("valid start")
+            .with_timezone(&chrono::Utc);
+        let end = start + chrono::Duration::hours(1);
         let (clauses, binds, impossible) =
-            ClickHouseProxyLogStore::build_list_where(None, None, &filters);
+            ClickHouseProxyLogStore::build_list_where(Some(start), Some(end), &filters);
         assert!(!impossible);
         let joined = clauses.join(" AND ");
         // Every value-carrying predicate uses a bound `?`.
         assert!(joined.contains("project_id = ?"));
+        assert!(joined.contains("timestamp >= fromUnixTimestamp64Milli(?)"));
+        assert!(joined.contains("timestamp < fromUnixTimestamp64Milli(?)"));
+        assert!(!joined.contains("timestamp <= fromUnixTimestamp64Milli(?)"));
         assert!(joined.contains("method = ?"));
         assert!(joined.contains("path ILIKE ?"));
+        assert!(joined.contains("path = ?"));
+        assert!(joined.contains("request_source != 'temps_monitor'"));
+        assert!(joined.contains("Temps-Status-Monitor/%"));
         assert!(joined.contains("client_ip = ?"));
         assert!(joined.contains("status_code = ?"));
         assert!(joined.contains("response_time_ms >= ?"));
@@ -2835,6 +2926,7 @@ mod tests {
         // The raw user path value must NOT appear in the SQL — only in the binds,
         // wrapped + escaped.
         assert!(!joined.contains("admin"));
+        assert!(!joined.contains("source=admin"));
         // The bind list carries the escaped LIKE pattern.
         let has_escaped_path = binds.iter().any(|b| match b {
             Bv::Str(s) => s == "%admin\\%%",
@@ -2844,6 +2936,9 @@ mod tests {
             has_escaped_path,
             "escaped LIKE pattern must be a bind value"
         );
+        assert!(binds.iter().any(|bind| {
+            matches!(bind, Bv::Str(value) if value == "/api/users/a b?source=admin")
+        }));
     }
 
     /// exclude_bots=true is the NULL-keeping bot exclusion used by the
@@ -2947,6 +3042,8 @@ mod tests {
                 TrafficMetric::LatencyP50,
                 TrafficMetric::LatencyP95,
                 TrafficMetric::LatencyP99,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
                 TrafficMetric::ErrorRate,
             ],
             filters: vec![TrafficFilter {
@@ -2972,6 +3069,8 @@ mod tests {
                 "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf({quantile})"
             )));
         }
+        assert!(sql.contains("countIf(ifNull(is_bot, 0) = 1)"));
+        assert!(sql.contains("countIf(path = '/robots.txt')"));
         assert!(sql.contains("request_source != 'temps_monitor'"));
         assert!(sql.contains("Temps-Status-Monitor/%"));
         assert!(sql

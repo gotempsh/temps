@@ -29706,6 +29706,23 @@
           }
         ]
       },
+      "ProxyLogAccessResponse": {
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "allowed"
+        ],
+        "type": "object"
+      },
       "ProxyLogResponse": {
         "description": "Response model for proxy logs",
         "properties": {
@@ -40499,12 +40516,21 @@
           "latency_p99",
           "unique_ips",
           "unique_paths",
+          "bot_requests",
+          "robots_txt_requests",
           "last_seen"
         ],
         "type": "string"
       },
       "TrafficMetricValues": {
         "properties": {
+          "bot_requests": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "error_rate": {
             "format": "double",
             "type": [
@@ -40569,6 +40595,13 @@
             ]
           },
           "requests": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "robots_txt_requests": {
             "format": "int64",
             "type": [
               "integer",
@@ -76400,6 +76433,74 @@
         ]
       }
     },
+    "/projects/{project_id}/api-analytics/proxy-log-access": {
+      "get": {
+        "operationId": "get_api_traffic_proxy_log_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProxyLogAccessResponse"
+                }
+              }
+            },
+            "description": "Proxy-log drilldown capability"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient analytics permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project permission check failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Report whether the current principal may drill into a project's proxy logs.",
+        "tags": [
+          "Proxy Logs"
+        ]
+      }
+    },
     "/projects/{project_id}/api-analytics/query": {
       "post": {
         "operationId": "aggregate_api_traffic",
@@ -88719,6 +88820,18 @@
             }
           },
           {
+            "description": "Filter by an exact request path",
+            "in": "query",
+            "name": "path_exact",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Filter by client IP address",
             "in": "query",
             "name": "client_ip",
@@ -88726,6 +88839,18 @@
             "schema": {
               "type": [
                 "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Exclude Temps status-monitor requests, including legacy monitor rows\nidentified only by their user-agent.",
+            "in": "query",
+            "name": "exclude_synthetic",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
                 "null"
               ]
             }
@@ -89189,6 +89314,19 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Project scope for the lookup. Required for non-administrator callers.\nInstance administrators may omit it for legacy global deep links.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           {
@@ -90548,6 +90686,19 @@
             "schema": {
               "format": "int32",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Project scope for the lookup. Required for non-administrator callers.\nInstance administrators may omit it for legacy global deep links.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           {

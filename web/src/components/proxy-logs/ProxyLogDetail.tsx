@@ -48,6 +48,8 @@ interface ProxyLogDetailProps {
    * wider (slower) scan.
    */
   timestamp?: string
+  /** Project scope required for non-administrator detail lookups. */
+  projectId?: number
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -70,28 +72,28 @@ function getDeviceIcon(deviceType: string | null | undefined) {
   }
 }
 
-export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
+export function ProxyLogDetail({
+  logId,
+  timestamp,
+  projectId,
+}: ProxyLogDetailProps) {
   const isLegacyNumericId = /^\d+$/.test(logId)
 
   const byId = useQuery({
     ...getProxyLogByIdOptions({
       path: { id: parseInt(logId, 10) },
-      query: timestamp ? { timestamp } : undefined,
+      query: { timestamp, project_id: projectId },
     }),
     enabled: isLegacyNumericId,
   })
   const byRequestId = useQuery({
     ...getProxyLogByRequestIdOptions({
       path: { request_id: logId },
-      query: timestamp ? { timestamp } : undefined,
+      query: { timestamp, project_id: projectId },
     }),
     enabled: !isLegacyNumericId,
   })
-  const {
-    data: log,
-    isLoading,
-    error,
-  } = isLegacyNumericId ? byId : byRequestId
+  const { data: log, isLoading, error } = isLegacyNumericId ? byId : byRequestId
 
   if (isLoading) {
     return (

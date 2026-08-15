@@ -34,11 +34,13 @@ interface ListOptions {
 
 interface ShowOptions {
   id: string
+  projectId?: string
   json?: boolean
 }
 
 interface ByRequestOptions {
   requestId?: string
+  projectId?: string
   json?: boolean
 }
 
@@ -81,6 +83,7 @@ export function registerProxyLogsCommands(program: Command): void {
     .command('show')
     .description('Show proxy log details')
     .requiredOption('--id <id>', 'Proxy log ID')
+    .option('--project-id <id>', 'Authorize the lookup within this project')
     .option('--json', 'Output in JSON format')
     .action(showProxyLogAction)
 
@@ -88,6 +91,7 @@ export function registerProxyLogsCommands(program: Command): void {
     .command('by-request')
     .description('Get proxy log by request ID')
     .option('--request-id <id>', 'Request ID')
+    .option('--project-id <id>', 'Authorize the lookup within this project')
     .option('--json', 'Output in JSON format')
     .action(byRequestAction)
 
@@ -122,6 +126,14 @@ function statusCodeColor(code: number): string {
   if (code >= 300 && code < 400) return colors.muted(code.toString())
   if (code >= 400 && code < 500) return colors.warning(code.toString())
   return colors.error(code.toString())
+}
+
+export function parseOptionalProjectId(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  if (!/^\d+$/.test(value)) throw new Error('Project ID must be a positive integer')
+  const projectId = parseInt(value, 10)
+  if (projectId < 1) throw new Error('Project ID must be a positive integer')
+  return projectId
 }
 
 async function listProxyLogsAction(options: ListOptions): Promise<void> {
@@ -202,6 +214,7 @@ async function showProxyLogAction(options: ShowOptions): Promise<void> {
   await setupClient()
 
   const id = parseInt(options.id, 10)
+  const projectId = parseOptionalProjectId(options.projectId)
   if (isNaN(id)) {
     warning('Invalid proxy log ID')
     return
@@ -211,6 +224,7 @@ async function showProxyLogAction(options: ShowOptions): Promise<void> {
     const { data, error } = await getProxyLogById({
       client,
       path: { id },
+      query: { project_id: projectId },
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error) ?? `Proxy log ${options.id} not found`)
@@ -231,6 +245,7 @@ async function byRequestAction(options: ByRequestOptions): Promise<void> {
   await setupClient()
 
   let requestId: string
+  const projectId = parseOptionalProjectId(options.projectId)
 
   if (options.requestId) {
     requestId = options.requestId
@@ -245,6 +260,7 @@ async function byRequestAction(options: ByRequestOptions): Promise<void> {
     const { data, error } = await getProxyLogByRequestId({
       client,
       path: { request_id: requestId },
+      query: { project_id: projectId },
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error) ?? `Log for request ${requestId} not found`)

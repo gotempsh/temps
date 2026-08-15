@@ -2,6 +2,7 @@ import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
+import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -110,6 +111,26 @@ function isTimeRange(v: string | null): v is TimeRange {
   return !!v && TIME_RANGES.some((r) => r.value === v)
 }
 
+function positiveIntegerParam(value: string | null): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function dateTimeLocalValue(value: string | undefined): string {
+  if (!value) return ''
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime())
+    ? value
+    : format(parsed, "yyyy-MM-dd'T'HH:mm")
+}
+
+function dateTimeLocalIso(value: string): string | undefined {
+  if (!value) return undefined
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
+}
+
 /**
  * Resolve a preset to the ISO start instant to send as `start_date`.
  *
@@ -127,7 +148,9 @@ interface FilterState {
   method?: string
   host?: string
   path?: string
+  path_exact?: string
   client_ip?: string
+  exclude_synthetic?: boolean | null
   status_code?: string
   response_time_min?: string
   response_time_max?: string
@@ -209,7 +232,9 @@ function parseFiltersFromParams(params: URLSearchParams): FilterState {
   f.method = str('method')
   f.host = str('host')
   f.path = str('path')
+  f.path_exact = str('path_exact')
   f.client_ip = str('client_ip')
+  f.exclude_synthetic = bool('exclude_synthetic')
   f.status_code = str('status_code')
   f.response_time_min = str('response_time_min')
   f.response_time_max = str('response_time_max')
@@ -251,7 +276,9 @@ function serializeFiltersToParams(
     'method',
     'host',
     'path',
+    'path_exact',
     'client_ip',
+    'exclude_synthetic',
     'status_code',
     'response_time_min',
     'response_time_max',
@@ -300,6 +327,10 @@ export function ProxyLogsDataTable({
 }: ProxyLogsDataTableProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const isInitialMount = useRef(true)
+  const scopedProjectId =
+    projectId ?? positiveIntegerParam(searchParams.get('project_id'))
+  const scopedEnvironmentId =
+    environmentId ?? positiveIntegerParam(searchParams.get('environment_id'))
 
   // Initialize ALL state from URL search params
   const [page, setPage] = useState(() => {
@@ -354,6 +385,12 @@ export function ProxyLogsDataTable({
   // Sync ALL state to URL search params
   const syncToUrl = useCallback(() => {
     const params = new URLSearchParams()
+    if (scopedProjectId !== undefined) {
+      params.set('project_id', scopedProjectId.toString())
+    }
+    if (scopedEnvironmentId !== undefined) {
+      params.set('environment_id', scopedEnvironmentId.toString())
+    }
     if (page !== 1) params.set('page', page.toString())
     if (pageSize !== 20) params.set('page_size', pageSize.toString())
     if (sortBy !== 'timestamp') params.set('sort_by', sortBy)
@@ -370,6 +407,8 @@ export function ProxyLogsDataTable({
     showFilters,
     timeRange,
     filters,
+    scopedProjectId,
+    scopedEnvironmentId,
     setSearchParams,
   ])
 
@@ -415,8 +454,8 @@ export function ProxyLogsDataTable({
   const { data, isLoading, error } = useQuery({
     ...getProxyLogsOptions({
       query: {
-        project_id: projectId || null,
-        environment_id: environmentId || null,
+        project_id: scopedProjectId ?? null,
+        environment_id: scopedEnvironmentId ?? null,
         deployment_id: filters.deployment_id
           ? parseInt(filters.deployment_id)
           : null,
@@ -425,7 +464,9 @@ export function ProxyLogsDataTable({
         method: filters.method || null,
         host: filters.host || null,
         path: filters.path || null,
+        path_exact: filters.path_exact || null,
         client_ip: filters.client_ip || null,
+        exclude_synthetic: filters.exclude_synthetic,
         status_code: filters.status_code ? parseInt(filters.status_code) : null,
         response_time_min: filters.response_time_min
           ? parseInt(filters.response_time_min)
@@ -597,6 +638,28 @@ export function ProxyLogsDataTable({
 
   return (
     <div className="space-y-4">
+      {(scopedProjectId !== undefined ||
+        scopedEnvironmentId !== undefined ||
+        filters.path_exact ||
+        filters.exclude_synthetic === true) && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span>Scoped to:</span>
+          {scopedProjectId !== undefined && (
+            <Badge variant="outline">Project {scopedProjectId}</Badge>
+          )}
+          {scopedEnvironmentId !== undefined && (
+            <Badge variant="outline">Environment {scopedEnvironmentId}</Badge>
+          )}
+          {filters.path_exact && (
+            <Badge variant="outline" className="font-mono">
+              Exact path: {filters.path_exact}
+            </Badge>
+          )}
+          {filters.exclude_synthetic === true && (
+            <Badge variant="outline">Temps monitor excluded</Badge>
+          )}
+        </div>
+      )}
       {/* AI Agents quick-filter row. Clicking a provider pill sets
           ai_provider + flips is_ai_agent so the table re-fetches with the
           server-side `bot_name IN (agents_of_provider)` predicate. */}
@@ -771,11 +834,11 @@ export function ProxyLogsDataTable({
                 <Label>Start Date</Label>
                 <Input
                   type="datetime-local"
-                  value={pendingFilters.start_date || ''}
+                  value={dateTimeLocalValue(pendingFilters.start_date)}
                   onChange={(e) =>
                     setPendingFilters({
                       ...pendingFilters,
-                      start_date: e.target.value,
+                      start_date: dateTimeLocalIso(e.target.value),
                     })
                   }
                   onKeyDown={handleFilterKeyDown}
@@ -785,11 +848,11 @@ export function ProxyLogsDataTable({
                 <Label>End Date</Label>
                 <Input
                   type="datetime-local"
-                  value={pendingFilters.end_date || ''}
+                  value={dateTimeLocalValue(pendingFilters.end_date)}
                   onChange={(e) =>
                     setPendingFilters({
                       ...pendingFilters,
-                      end_date: e.target.value,
+                      end_date: dateTimeLocalIso(e.target.value),
                     })
                   }
                   onKeyDown={handleFilterKeyDown}
@@ -848,6 +911,21 @@ export function ProxyLogsDataTable({
                     setPendingFilters({
                       ...pendingFilters,
                       path: e.target.value,
+                    })
+                  }
+                  onKeyDown={handleFilterKeyDown}
+                />
+              </div>
+
+              <div>
+                <Label>Exact Path</Label>
+                <Input
+                  placeholder="/api/orders"
+                  value={pendingFilters.path_exact || ''}
+                  onChange={(e) =>
+                    setPendingFilters({
+                      ...pendingFilters,
+                      path_exact: e.target.value,
                     })
                   }
                   onKeyDown={handleFilterKeyDown}
@@ -1277,6 +1355,20 @@ export function ProxyLogsDataTable({
                   }
                 />
                 <Label htmlFor="is-system">System Request</Label>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="exclude-synthetic"
+                  checked={pendingFilters.exclude_synthetic === true}
+                  onCheckedChange={(checked) =>
+                    setPendingFilters({
+                      ...pendingFilters,
+                      exclude_synthetic: checked ? true : null,
+                    })
+                  }
+                />
+                <Label htmlFor="exclude-synthetic">Exclude Temps monitor</Label>
               </div>
 
               <div className="flex items-center space-x-2">
@@ -1754,7 +1846,11 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
       {/* Link to full detail page */}
       <div className="flex justify-end">
         <Link
-          to={`/proxy-logs/${encodeURIComponent(log.request_id)}?ts=${encodeURIComponent(log.timestamp)}`}
+          to={proxyLogDetailUrl({
+            requestId: log.request_id,
+            timestamp: log.timestamp,
+            projectId: log.project_id,
+          })}
           className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
           onClick={(e) => e.stopPropagation()}
         >

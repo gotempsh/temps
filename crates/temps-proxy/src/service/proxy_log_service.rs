@@ -436,7 +436,9 @@ impl ProxyLogService {
             || filters.method.is_some()
             || filters.host.is_some()
             || filters.path.is_some()
+            || filters.path_exact.is_some()
             || filters.client_ip.is_some()
+            || filters.exclude_synthetic == Some(true)
             || filters.status_code.is_some()
             || filters.response_time_min.is_some()
             || filters.response_time_max.is_some()
@@ -484,7 +486,17 @@ impl ProxyLogService {
             query = query.filter(proxy_logs::Column::Timestamp.gte(start_date));
         }
         if let Some(end_date) = end_date {
-            query = query.filter(proxy_logs::Column::Timestamp.lte(end_date));
+            query = query.filter(proxy_logs::Column::Timestamp.lt(end_date));
+        }
+
+        if filters.exclude_synthetic == Some(true) {
+            query = query
+                .filter(proxy_logs::Column::RequestSource.ne("temps_monitor"))
+                .filter(
+                    Condition::any()
+                        .add(proxy_logs::Column::UserAgent.is_null())
+                        .add(proxy_logs::Column::UserAgent.not_like("Temps-Status-Monitor/%")),
+                );
         }
 
         // Request filters
@@ -496,6 +508,9 @@ impl ProxyLogService {
         }
         if let Some(path) = filters.path {
             query = query.filter(proxy_logs::Column::Path.contains(&path));
+        }
+        if let Some(path) = filters.path_exact {
+            query = query.filter(proxy_logs::Column::Path.eq(path));
         }
         if let Some(ip) = filters.client_ip {
             query = query.filter(proxy_logs::Column::ClientIp.eq(ip));
@@ -863,7 +878,9 @@ impl ProxyLogService {
             method: None,
             host: None,
             path: None,
+            path_exact: None,
             client_ip: None,
+            exclude_synthetic: None,
             status_code,
             response_time_min: None,
             response_time_max: None,

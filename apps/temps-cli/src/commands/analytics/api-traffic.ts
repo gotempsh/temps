@@ -76,6 +76,8 @@ const TRAFFIC_METRICS = new Set<TrafficMetric>([
   'latency_p99',
   'unique_ips',
   'unique_paths',
+  'bot_requests',
+  'robots_txt_requests',
   'last_seen',
 ])
 
@@ -230,6 +232,8 @@ export const formatPercentForTest = formatPercent
 export const parseNonNegativeIntegerForTest = parseNonNegativeInteger
 export const parsePageSizeForTest = parsePageSize
 export const parseTrafficFilterForTest = parseFilter
+export const parseTrafficMetricsForTest = (raw: string): TrafficMetric[] =>
+  parseCsv(raw, TRAFFIC_METRICS, 'metric')
 
 async function resolveProjectId(
   projectOption: string | undefined,
@@ -363,6 +367,8 @@ export async function apiRoutes(
           'latency_avg',
           'latency_min',
           'latency_max',
+          'bot_requests',
+          'robots_txt_requests',
           'last_seen',
         ],
         filters: [],
@@ -464,6 +470,8 @@ export async function apiCallers(
           'error_rate',
           'latency_avg',
           'unique_paths',
+          'bot_requests',
+          'robots_txt_requests',
           'last_seen',
         ],
         filters: [],
@@ -638,6 +646,8 @@ export async function apiIp(
       'latency_min',
       'latency_max',
       'latency_p95',
+      'bot_requests',
+      'robots_txt_requests',
       'last_seen',
     ],
     [{ dimension: 'client_ip', operator: 'eq', values: [ip] }],
@@ -662,6 +672,8 @@ export async function apiPath(
       'latency_min',
       'latency_max',
       'latency_p95',
+      'bot_requests',
+      'robots_txt_requests',
       'last_seen',
     ],
     [{ dimension: 'path', operator: 'eq', values: [path] }],

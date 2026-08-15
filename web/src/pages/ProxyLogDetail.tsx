@@ -17,6 +17,11 @@ export default function ProxyLogDetailPage() {
   // Row timestamp forwarded by list links; bounds the backend's hypertable
   // lookup. Absent on bare deep-links, which fall back to a wider scan.
   const ts = searchParams.get('ts') ?? undefined
+  const projectIdParam = searchParams.get('project_id')
+  const projectId =
+    projectIdParam && /^\d+$/.test(projectIdParam)
+      ? Number(projectIdParam)
+      : undefined
 
   useEffect(() => {
     setBreadcrumbs([
@@ -70,7 +75,7 @@ export default function ProxyLogDetailPage() {
         </div>
 
         {/* Detail Component */}
-        <ProxyLogDetail logId={logId} timestamp={ts} />
+        <ProxyLogDetail logId={logId} timestamp={ts} projectId={projectId} />
       </div>
     </div>
   )

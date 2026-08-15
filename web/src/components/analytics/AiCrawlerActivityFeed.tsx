@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
+import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { Bot, ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react'
@@ -268,7 +269,11 @@ function FeedRow({ log }: { log: ProxyLogResponse }) {
 
   return (
     <Link
-      to={`/proxy-logs/${encodeURIComponent(log.request_id)}?ts=${encodeURIComponent(log.timestamp)}`}
+      to={proxyLogDetailUrl({
+        requestId: log.request_id,
+        timestamp: log.timestamp,
+        projectId: log.project_id,
+      })}
       className="flex items-center gap-3 px-3 py-2.5 text-sm transition-colors hover:bg-muted/50"
     >
       <AiAgentLogo provider={providerName} agent={log.bot_name} size={22} />

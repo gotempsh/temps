@@ -5,6 +5,7 @@ import {
   parseNonNegativeIntegerForTest,
   parsePageSizeForTest,
   parseTrafficFilterForTest,
+  parseTrafficMetricsForTest,
   trafficOffsetPlanForTest,
 } from './api-traffic.js'
 
@@ -79,5 +80,13 @@ describe('traffic filters', () => {
     expect(() => parseTrafficFilterForTest('raw_sql:eq:anything')).toThrow(
       'Unknown filter dimension',
     )
+  })
+})
+
+describe('crawler traffic metrics', () => {
+  test('accepts bot and robots.txt request counts in generic queries', () => {
+    expect(
+      parseTrafficMetricsForTest('requests,bot_requests,robots_txt_requests'),
+    ).toEqual(['requests', 'bot_requests', 'robots_txt_requests'])
   })
 })

@@ -414,6 +414,8 @@ fn metric_alias(metric: TrafficMetric) -> &'static str {
         TrafficMetric::LatencyP99 => "latency_p99_ms",
         TrafficMetric::UniqueIps => "unique_ips",
         TrafficMetric::UniquePaths => "unique_paths",
+        TrafficMetric::BotRequests => "bot_requests",
+        TrafficMetric::RobotsTxtRequests => "robots_txt_requests",
         TrafficMetric::LastSeen => "last_seen",
     }
 }
@@ -439,6 +441,10 @@ fn pg_metric_expression(metric: TrafficMetric) -> &'static str {
         }
         TrafficMetric::UniqueIps => "COUNT(DISTINCT NULLIF(client_ip, ''))::bigint",
         TrafficMetric::UniquePaths => "COUNT(DISTINCT path)::bigint",
+        TrafficMetric::BotRequests => "COUNT(*) FILTER (WHERE is_bot IS TRUE)::bigint",
+        TrafficMetric::RobotsTxtRequests => {
+            "COUNT(*) FILTER (WHERE path = '/robots.txt')::bigint"
+        }
         TrafficMetric::LastSeen => "MAX(timestamp)",
     }
 }
@@ -448,7 +454,9 @@ fn null_metric_expression(metric: TrafficMetric) -> &'static str {
         TrafficMetric::Requests
         | TrafficMetric::Errors
         | TrafficMetric::UniqueIps
-        | TrafficMetric::UniquePaths => "NULL::bigint",
+        | TrafficMetric::UniquePaths
+        | TrafficMetric::BotRequests
+        | TrafficMetric::RobotsTxtRequests => "NULL::bigint",
         TrafficMetric::LastSeen => "NULL::timestamptz",
         _ => "NULL::double precision",
     }
@@ -582,6 +590,8 @@ fn build_traffic_query(
         TrafficMetric::LatencyP99,
         TrafficMetric::UniqueIps,
         TrafficMetric::UniquePaths,
+        TrafficMetric::BotRequests,
+        TrafficMetric::RobotsTxtRequests,
         TrafficMetric::LastSeen,
     ];
     let metric_selects = all_metrics.map(|metric| {
@@ -696,6 +706,8 @@ fn traffic_response_from_rows(
                 latency_p99_ms: row.try_get("", "latency_p99_ms")?,
                 unique_ips: row.try_get("", "unique_ips")?,
                 unique_paths: row.try_get("", "unique_paths")?,
+                bot_requests: row.try_get("", "bot_requests")?,
+                robots_txt_requests: row.try_get("", "robots_txt_requests")?,
                 last_seen: row.try_get("", "last_seen")?,
             },
         });
@@ -762,6 +774,8 @@ mod tests {
                 TrafficMetric::Requests,
                 TrafficMetric::LatencyMin,
                 TrafficMetric::LatencyMax,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
                 TrafficMetric::ErrorRate,
             ],
             filters: vec![TrafficFilter {
@@ -782,6 +796,8 @@ mod tests {
         assert!(sql.contains("CAST(path AS TEXT) AS d1"));
         assert!(sql.contains("MIN(response_time_ms)::double precision"));
         assert!(sql.contains("MAX(response_time_ms)::double precision"));
+        assert!(sql.contains("COUNT(*) FILTER (WHERE is_bot IS TRUE)::bigint"));
+        assert!(sql.contains("COUNT(*) FILTER (WHERE path = '/robots.txt')::bigint"));
         assert!(sql.contains("request_source <> 'temps_monitor'"));
         assert!(sql.contains("Temps-Status-Monitor/%"));
         assert!(sql
@@ -858,7 +874,7 @@ mod tests {
             browser_version: None,
             operating_system: None,
             device_type: None,
-            is_bot: Some(false),
+            is_bot: Some(user_agent.contains("Bot")),
             bot_name: None,
             request_size_bytes: None,
             response_size_bytes: None,
@@ -899,9 +915,54 @@ mod tests {
                     "temps_monitor",
                     "Temps-Status-Monitor/1.0",
                 ),
+                make_entry(
+                    "traffic-crawler-robots",
+                    "/robots.txt",
+                    "203.0.113.10",
+                    200,
+                    6,
+                    "proxy",
+                    "ExampleBot/1.0",
+                ),
             ])
             .await
             .expect("insert Timescale traffic fixtures");
+
+        let list_start = Utc::now() - chrono::Duration::minutes(2);
+        let list_end = Utc::now() + chrono::Duration::minutes(2);
+        let (_, excluded_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7001),
+                    path_exact: Some("/api/health".to_string()),
+                    exclude_synthetic: Some(true),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact path while excluding monitor traffic");
+        assert_eq!(excluded_total, 0);
+
+        let (monitor_rows, included_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7001),
+                    path_exact: Some("/api/health".to_string()),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact monitor path without exclusion");
+        assert_eq!(included_total, 1);
+        assert_eq!(monitor_rows[0].request_source, "temps_monitor");
 
         let request = TrafficAggregationRequest {
             start_time: Utc::now() - chrono::Duration::minutes(2),
@@ -919,6 +980,8 @@ mod tests {
                 TrafficMetric::LatencyMin,
                 TrafficMetric::LatencyAvg,
                 TrafficMetric::LatencyMax,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
             ],
             filters: Vec::new(),
             order_by: vec![TrafficOrderBy {
@@ -934,7 +997,7 @@ mod tests {
             .await
             .expect("aggregate Timescale traffic");
 
-        assert_eq!(response.total_groups, 1);
+        assert_eq!(response.total_groups, 2);
         assert!(response.synthetic_excluded);
         let row = response.rows.first().expect("customer traffic row");
         assert_eq!(row.dimensions[0].value.as_deref(), Some("203.0.113.10"));
@@ -946,13 +1009,24 @@ mod tests {
         assert_eq!(row.metrics.latency_min_ms, Some(10.0));
         assert_eq!(row.metrics.latency_avg_ms, Some(50.0));
         assert_eq!(row.metrics.latency_max_ms, Some(90.0));
+        assert_eq!(row.metrics.bot_requests, Some(0));
+        assert_eq!(row.metrics.robots_txt_requests, Some(0));
+
+        let crawler = response
+            .rows
+            .iter()
+            .find(|row| row.dimensions[1].value.as_deref() == Some("/robots.txt"))
+            .expect("crawler robots.txt traffic row");
+        assert_eq!(crawler.metrics.requests, Some(1));
+        assert_eq!(crawler.metrics.bot_requests, Some(1));
+        assert_eq!(crawler.metrics.robots_txt_requests, Some(1));
 
         let empty_page = store
             .aggregate_traffic(7001, TrafficAggregationRequest { page: 2, ..request })
             .await
             .expect("aggregate out-of-range Timescale traffic page");
         assert!(empty_page.rows.is_empty());
-        assert_eq!(empty_page.total_groups, 1);
+        assert_eq!(empty_page.total_groups, 2);
         assert_eq!(empty_page.total_pages, 1);
     }
 }

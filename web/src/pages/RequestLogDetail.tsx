@@ -45,7 +45,7 @@ export default function RequestLogDetail({
       path: {
         id: parseInt(logId || '0'),
       },
-      query: ts ? { timestamp: ts } : undefined,
+      query: { timestamp: ts ?? undefined, project_id: projectResponse.id },
     }),
     enabled: !!logId && isLegacyNumericId,
   })
@@ -54,7 +54,7 @@ export default function RequestLogDetail({
       path: {
         request_id: logId || '',
       },
-      query: ts ? { timestamp: ts } : undefined,
+      query: { timestamp: ts ?? undefined, project_id: projectResponse.id },
     }),
     enabled: !!logId && !isLegacyNumericId,
   })

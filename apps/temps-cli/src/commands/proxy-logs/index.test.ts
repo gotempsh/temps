@@ -1,5 +1,9 @@
 import { test, expect, describe } from 'bun:test'
-import { formatBytes, summarizeBucketStats } from './index.js'
+import {
+  formatBytes,
+  parseOptionalProjectId,
+  summarizeBucketStats,
+} from './index.js'
 
 describe('formatBytes', () => {
   test('zero is reported literally, not treated as a log(0) edge case', () => {
@@ -48,5 +52,14 @@ describe('summarizeBucketStats', () => {
       { request_count: 0, error_count: 0, avg_response_time_ms: 0 },
     ])
     expect(summary.errorRatePercent).toBe(0)
+  })
+})
+
+describe('project-scoped detail lookup', () => {
+  test('accepts a positive project ID and rejects ambiguous values', () => {
+    expect(parseOptionalProjectId(undefined)).toBeUndefined()
+    expect(parseOptionalProjectId('42')).toBe(42)
+    expect(() => parseOptionalProjectId('0')).toThrow('positive integer')
+    expect(() => parseOptionalProjectId('7x')).toThrow('positive integer')
   })
 })

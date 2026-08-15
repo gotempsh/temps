@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 use crate::service::proxy_log_service::ProxyLogServiceError;
 
 pub const MAX_TRAFFIC_DIMENSIONS: usize = 4;
-pub const MAX_TRAFFIC_METRICS: usize = 12;
+pub const MAX_TRAFFIC_METRICS: usize = 14;
 pub const MAX_TRAFFIC_FILTERS: usize = 12;
 pub const MAX_TRAFFIC_PAGE_SIZE: u64 = 100;
 pub const MAX_TRAFFIC_PAGE: u64 = 10_000;
@@ -70,6 +70,8 @@ pub enum TrafficMetric {
     LatencyP99,
     UniqueIps,
     UniquePaths,
+    BotRequests,
+    RobotsTxtRequests,
     LastSeen,
 }
 
@@ -87,6 +89,8 @@ impl TrafficMetric {
             Self::LatencyP99 => "latency_p99",
             Self::UniqueIps => "unique_ips",
             Self::UniquePaths => "unique_paths",
+            Self::BotRequests => "bot_requests",
+            Self::RobotsTxtRequests => "robots_txt_requests",
             Self::LastSeen => "last_seen",
         }
     }
@@ -186,6 +190,8 @@ pub struct TrafficMetricValues {
     pub latency_p99_ms: Option<f64>,
     pub unique_ips: Option<i64>,
     pub unique_paths: Option<i64>,
+    pub bot_requests: Option<i64>,
+    pub robots_txt_requests: Option<i64>,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub last_seen: Option<UtcDateTime>,
 }
