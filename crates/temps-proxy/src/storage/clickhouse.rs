@@ -1914,13 +1914,13 @@ fn ch_metric_expression(metric: TrafficMetric) -> &'static str {
         TrafficMetric::LatencyMin => "min(toFloat64(response_time_ms))",
         TrafficMetric::LatencyMax => "max(toFloat64(response_time_ms))",
         TrafficMetric::LatencyP50 => {
-            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.50)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.50)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
         }
         TrafficMetric::LatencyP95 => {
-            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.95)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.95)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
         }
         TrafficMetric::LatencyP99 => {
-            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.99)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.99)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
         }
         TrafficMetric::UniqueIps => "toNullable(uniqExactIf(client_ip, client_ip != ''))",
         TrafficMetric::UniquePaths => "toNullable(uniqExact(path))",
@@ -2493,6 +2493,9 @@ mod tests {
                 TrafficMetric::LatencyMin,
                 TrafficMetric::LatencyAvg,
                 TrafficMetric::LatencyMax,
+                TrafficMetric::LatencyP50,
+                TrafficMetric::LatencyP95,
+                TrafficMetric::LatencyP99,
             ],
             filters: Vec::new(),
             order_by: vec![TrafficOrderBy {
@@ -2520,6 +2523,17 @@ mod tests {
         assert_eq!(row.metrics.latency_min_ms, Some(10.0));
         assert_eq!(row.metrics.latency_avg_ms, Some(50.0));
         assert_eq!(row.metrics.latency_max_ms, Some(90.0));
+        for (name, percentile) in [
+            ("p50", row.metrics.latency_p50_ms),
+            ("p95", row.metrics.latency_p95_ms),
+            ("p99", row.metrics.latency_p99_ms),
+        ] {
+            let percentile = percentile.unwrap_or_else(|| panic!("{name} must be returned"));
+            assert!(
+                (10.0..=90.0).contains(&percentile),
+                "{name} must remain within the observed latency range"
+            );
+        }
 
         let false_bot_response = store
             .aggregate_traffic(
@@ -2539,12 +2553,49 @@ mod tests {
         assert_eq!(false_bot_response.rows[0].metrics.requests, Some(2));
 
         let empty_page = store
-            .aggregate_traffic(7, TrafficAggregationRequest { page: 2, ..request })
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    page: 2,
+                    ..request.clone()
+                },
+            )
             .await
             .expect("aggregate out-of-range ClickHouse traffic page");
         assert!(empty_page.rows.is_empty());
         assert_eq!(empty_page.total_groups, 1);
         assert_eq!(empty_page.total_pages, 1);
+
+        let mut no_latency = make_entry("traffic-no-latency");
+        no_latency.path = "/api/no-latency".to_string();
+        no_latency.response_time_ms = None;
+        store
+            .write_batch(vec![no_latency])
+            .await
+            .expect("insert traffic fixture without latency");
+
+        let null_percentiles = store
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    filters: vec![TrafficFilter {
+                        dimension: TrafficDimension::Path,
+                        operator: TrafficFilterOperator::Eq,
+                        values: vec!["/api/no-latency".to_string()],
+                    }],
+                    page: 1,
+                    ..request
+                },
+            )
+            .await
+            .expect("aggregate ClickHouse traffic without latency values");
+        let row = null_percentiles
+            .rows
+            .first()
+            .expect("traffic row without latency values");
+        assert_eq!(row.metrics.latency_p50_ms, None);
+        assert_eq!(row.metrics.latency_p95_ms, None);
+        assert_eq!(row.metrics.latency_p99_ms, None);
     }
 
     #[test]
@@ -2893,6 +2944,9 @@ mod tests {
                 TrafficMetric::Requests,
                 TrafficMetric::LatencyMin,
                 TrafficMetric::LatencyMax,
+                TrafficMetric::LatencyP50,
+                TrafficMetric::LatencyP95,
+                TrafficMetric::LatencyP99,
                 TrafficMetric::ErrorRate,
             ],
             filters: vec![TrafficFilter {
@@ -2913,6 +2967,11 @@ mod tests {
         assert!(sql.contains("AS d1"));
         assert!(sql.contains("min(toFloat64(response_time_ms))"));
         assert!(sql.contains("max(toFloat64(response_time_ms))"));
+        for quantile in ["0.50", "0.95", "0.99"] {
+            assert!(sql.contains(&format!(
+                "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf({quantile})"
+            )));
+        }
         assert!(sql.contains("request_source != 'temps_monitor'"));
         assert!(sql.contains("Temps-Status-Monitor/%"));
         assert!(sql
