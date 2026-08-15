@@ -4408,10 +4408,7 @@ mod tests {
         );
 
         service
-            .write_walg_env_file(
-                &container_name,
-                &["AWS_ACCESS_KEY_ID=test".to_string()],
-            )
+            .write_walg_env_file(&container_name, &["AWS_ACCESS_KEY_ID=test".to_string()])
             .await
             .expect("failed to write walg.env");
 
