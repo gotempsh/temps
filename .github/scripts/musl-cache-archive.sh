@@ -15,8 +15,17 @@ case "$operation" in
     mkdir -p "$(dirname "$target_path")"
     # A tarball preserves Cargo's hidden .fingerprint directories and
     # executable build scripts, which upload-artifact's ZIP does not. Resolve
-    # symlinks while packing so the cross-run archive needs no link members.
-    tar --create --auto-compress --dereference --file "$target_path" -C "$source_path" .
+    # symlinks and hard links while packing so the cross-run archive needs no
+    # link members. BSD tar already emits dereferenced links as regular files;
+    # GNU tar needs the extra flag to prevent a hard-link optimization.
+    tar_help="$(tar --help 2>&1 || true)"
+    if [[ "$tar_help" == *"--hard-dereference"* ]]; then
+      tar --create --auto-compress --dereference --hard-dereference \
+        --file "$target_path" -C "$source_path" .
+    else
+      tar --create --auto-compress --dereference \
+        --file "$target_path" -C "$source_path" .
+    fi
     ;;
   unpack)
     member_list="${source_path}.members"
