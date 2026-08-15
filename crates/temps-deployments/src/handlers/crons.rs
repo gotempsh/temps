@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use tracing::info;
@@ -147,6 +147,8 @@ async fn get_environment_crons(
     Path((project_id, env_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, CronsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     info!(
         "Getting cron jobs for project {} environment {}",
@@ -198,6 +200,8 @@ async fn get_cron_by_id(
     Path((project_id, env_id, cron_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, CronsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     info!(
         "Getting cron job {} for project {} environment {}",
@@ -249,6 +253,8 @@ async fn get_cron_executions(
     Query(pagination): Query<PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, CronsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     info!(
         "Getting executions for cron job {} (page {}, per_page {})",
