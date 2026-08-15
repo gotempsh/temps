@@ -1070,6 +1070,7 @@ mod tests {
         let expected_crates: &[&str] = &[
             "temps-agents",
             "temps-ai-chat",
+            "temps-ai-gateway",
             "temps-analytics",
             "temps-analytics-events",
             "temps-analytics-funnels",
