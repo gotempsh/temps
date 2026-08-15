@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -37,7 +38,12 @@ def artifact(
         "created_at": created_at,
         "expires_at": expires_at,
         "expired": expired,
-        "workflow_run": {"id": run_id, "head_branch": branch},
+        "workflow_run": {
+            "id": run_id,
+            "head_branch": branch,
+            "repository_id": 100,
+            "head_repository_id": 100,
+        },
     }
 
 
@@ -50,6 +56,7 @@ class SeedSelectionTests(unittest.TestCase):
                 artifact(current, 11, "2026-08-02T00:00:00Z"),
             ],
             current,
+            {10, 11},
         )
         self.assertEqual(candidates[0]["workflow_run"]["id"], 11)
 
@@ -70,8 +77,18 @@ class SeedSelectionTests(unittest.TestCase):
                     "created_at": "2026-08-01T00:00:00Z",
                     "workflow_run": {},
                 },
+                {
+                    **artifact(current, 5, "2026-08-01T00:00:00Z"),
+                    "workflow_run": {
+                        "id": 5,
+                        "head_branch": "main",
+                        "repository_id": 100,
+                        "head_repository_id": 200,
+                    },
+                },
             ],
             current,
+            {1, 2, 3, 4},
         )
         self.assertEqual(candidates, [])
 
@@ -91,9 +108,52 @@ class SeedSelectionTests(unittest.TestCase):
             "2026-08-14T00:00:00Z",
             expires_at="2026-08-25T00:00:00Z",
         )
-        self.assertTrue(MODULE.should_publish([unrelated], current, now))
-        self.assertTrue(MODULE.should_publish([expiring], current, now))
-        self.assertFalse(MODULE.should_publish([fresh], current, now))
+        self.assertTrue(MODULE.should_publish([unrelated], current, {1}, now))
+        self.assertTrue(MODULE.should_publish([expiring], current, {2}, now))
+        self.assertFalse(MODULE.should_publish([fresh], current, {3}, now))
+
+    def test_rejects_seed_from_untrusted_workflow_run(self) -> None:
+        current = MODULE.SEED_NAME
+        candidates = MODULE.eligible_artifacts(
+            [artifact(current, 99, "2026-08-01T00:00:00Z")],
+            current,
+            {100},
+        )
+        self.assertEqual(candidates, [])
+
+    def test_only_successful_rust_tests_push_runs_are_trusted(self) -> None:
+        current = MODULE.SEED_NAME
+        artifacts_payload = {"artifacts": [artifact(current, 10, "2026-08-01T00:00:00Z")]}
+
+        def run(run_id: int, path: str, event: str = "push") -> dict:
+            return {
+                "id": run_id,
+                "event": event,
+                "head_branch": "main",
+                "conclusion": "success",
+                "path": path,
+                "repository": {"full_name": "gotempsh/temps"},
+                "head_repository": {"full_name": "gotempsh/temps"},
+            }
+
+        runs_payload = {
+            "workflow_runs": [
+                run(10, ".github/workflows/rust-tests.yml"),
+                run(11, ".github/workflows/unrelated.yml"),
+                run(12, ".github/workflows/rust-tests.yml", event="pull_request"),
+            ]
+        }
+        with mock.patch.object(
+            MODULE, "github_json", side_effect=[artifacts_payload, runs_payload]
+        ) as github_json:
+            artifacts, trusted = MODULE.github_seed_data(
+                "gotempsh/temps", "test-token", current
+            )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(trusted, {10})
+        self.assertIn("name=temps-musl-fast-seed-v1", github_json.call_args_list[0].args[0])
+        self.assertIn("rust-tests.yml/runs", github_json.call_args_list[1].args[0])
 
     def test_api_failure_builds_cold_without_publishing(self) -> None:
         current = MODULE.SEED_NAME
@@ -105,7 +165,7 @@ class SeedSelectionTests(unittest.TestCase):
                 "GITHUB_OUTPUT": str(output_path),
             }
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                MODULE, "github_artifacts", side_effect=OSError("offline")
+                MODULE, "github_seed_data", side_effect=OSError("offline")
             ):
                 self.assertEqual(MODULE.find_seed(current), 0)
             self.assertEqual(
@@ -200,8 +260,27 @@ class WorkflowContractTests(unittest.TestCase):
                 )
             )
             self.assertTrue(
-                (restored / "target/fast/build/example/build-script-link").is_symlink()
+                (restored / "target/fast/build/example/build-script-link").is_file()
             )
+
+    def test_archive_rejects_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path = root / "unsafe.tar"
+            restored = root / "restored"
+            with tarfile.open(archive_path, "w") as archive:
+                member = tarfile.TarInfo("../escape")
+                member.size = 0
+                archive.addfile(member)
+
+            result = subprocess.run(
+                ["bash", str(ARCHIVE_SCRIPT), "unpack", str(archive_path), str(restored)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "escape").exists())
 
 
 if __name__ == "__main__":

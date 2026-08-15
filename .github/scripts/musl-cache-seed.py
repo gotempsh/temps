@@ -24,7 +24,7 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def eligible_artifacts(
-    artifacts: list[dict[str, Any]], current_name: str
+    artifacts: list[dict[str, Any]], current_name: str, trusted_run_ids: set[int]
 ) -> list[dict[str, Any]]:
     """Return newest-first cache seeds produced by trusted main runs."""
     candidates = [
@@ -34,6 +34,12 @@ def eligible_artifacts(
         and not artifact.get("expired", False)
         and artifact.get("workflow_run", {}).get("head_branch") == "main"
         and isinstance(artifact.get("workflow_run", {}).get("id"), int)
+        # A fork can name its source branch `main` and upload artifacts from
+        # PR-controlled workflow code. Trust only runs whose head repository
+        # is this repository, not merely runs whose branch string is `main`.
+        and artifact.get("workflow_run", {}).get("head_repository_id")
+        == artifact.get("workflow_run", {}).get("repository_id")
+        and artifact.get("workflow_run", {}).get("id") in trusted_run_ids
     ]
     return sorted(
         candidates,
@@ -43,11 +49,14 @@ def eligible_artifacts(
 
 
 def should_publish(
-    artifacts: list[dict[str, Any]], current_name: str, now: datetime
+    artifacts: list[dict[str, Any]],
+    current_name: str,
+    trusted_run_ids: set[int],
+    now: datetime,
 ) -> bool:
     exact = [
         artifact
-        for artifact in eligible_artifacts(artifacts, current_name)
+        for artifact in eligible_artifacts(artifacts, current_name, trusted_run_ids)
         if artifact["name"] == current_name
     ]
     if not exact:
@@ -58,16 +67,9 @@ def should_publish(
     return parse_timestamp(expires_at) <= now + timedelta(days=2)
 
 
-def github_artifacts(
-    repository: str, token: str, artifact_name: str
-) -> list[dict[str, Any]]:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-        raise ValueError("GITHUB_REPOSITORY must be an owner/repository pair")
-
-    base_url = f"https://api.github.com/repos/{repository}/actions/artifacts"
-    query = urllib.parse.urlencode({"per_page": 100, "name": artifact_name})
+def github_json(url: str, token: str) -> dict[str, Any]:
     request = urllib.request.Request(
-        f"{base_url}?{query}",
+        url,
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -77,10 +79,55 @@ def github_artifacts(
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub API response was not an object")
+    return payload
+
+
+def github_seed_data(
+    repository: str, token: str, artifact_name: str
+) -> tuple[list[dict[str, Any]], set[int]]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("GITHUB_REPOSITORY must be an owner/repository pair")
+
+    base_url = f"https://api.github.com/repos/{repository}/actions/artifacts"
+    query = urllib.parse.urlencode({"per_page": 100, "name": artifact_name})
+    payload = github_json(f"{base_url}?{query}", token)
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, list):
         raise ValueError("GitHub artifacts response did not contain an artifacts list")
-    return artifacts
+
+    # Resolve runs through this workflow-specific endpoint rather than trusting
+    # repository-wide artifact metadata alone. Only successful pushes to main
+    # can seed executable Cargo intermediates for later jobs.
+    runs_query = urllib.parse.urlencode(
+        {
+            "branch": "main",
+            "event": "push",
+            "status": "success",
+            "per_page": 100,
+        }
+    )
+    runs_url = (
+        f"https://api.github.com/repos/{repository}/actions/workflows/"
+        f"rust-tests.yml/runs?{runs_query}"
+    )
+    runs_payload = github_json(runs_url, token)
+    workflow_runs = runs_payload.get("workflow_runs")
+    if not isinstance(workflow_runs, list):
+        raise ValueError("GitHub workflow-runs response did not contain a list")
+    trusted_run_ids = {
+        run["id"]
+        for run in workflow_runs
+        if isinstance(run.get("id"), int)
+        and run.get("event") == "push"
+        and run.get("head_branch") == "main"
+        and run.get("conclusion") == "success"
+        and run.get("path") == ".github/workflows/rust-tests.yml"
+        and run.get("repository", {}).get("full_name") == repository
+        and run.get("head_repository", {}).get("full_name") == repository
+    }
+    return artifacts, trusted_run_ids
 
 
 def append_outputs(output_path: Path, values: dict[str, str]) -> None:
@@ -104,14 +151,19 @@ def find_seed(current_name: str) -> int:
         return 2
 
     try:
-        artifacts = github_artifacts(repository, token, current_name)
-        candidates = eligible_artifacts(artifacts, current_name)
+        artifacts, trusted_run_ids = github_seed_data(repository, token, current_name)
+        candidates = eligible_artifacts(artifacts, current_name, trusted_run_ids)
         selected = candidates[0] if candidates else None
         values = {
             "artifact-name": selected["name"] if selected else "",
             "run-id": str(selected["workflow_run"]["id"]) if selected else "",
             "publish-current": str(
-                should_publish(artifacts, current_name, datetime.now(timezone.utc))
+                should_publish(
+                    artifacts,
+                    current_name,
+                    trusted_run_ids,
+                    datetime.now(timezone.utc),
+                )
             ).lower(),
         }
         append_outputs(Path(output_path), values)
