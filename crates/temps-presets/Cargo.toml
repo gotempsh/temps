@@ -24,9 +24,9 @@ utoipa = { workspace = true, optional = true }
 # The build engine. Pinned to a commit rather than a branch: a build plan that
 # changes underneath a release would change what every project's image contains
 # without anything in this repository moving.
-autopack-core = { git = "https://github.com/gotempsh/autopack", rev = "7de6ced1f2a3399f234fc444cec8361f4b5ac87f" }
-autopack-providers = { git = "https://github.com/gotempsh/autopack", rev = "7de6ced1f2a3399f234fc444cec8361f4b5ac87f" }
-autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", rev = "7de6ced1f2a3399f234fc444cec8361f4b5ac87f" }
+autopack-core = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.2" }
+autopack-providers = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.2" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.2" }
 
 [features]
 openapi = ["utoipa"]

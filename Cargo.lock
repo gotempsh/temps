@@ -462,8 +462,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "autopack-core"
-version = "0.1.1"
-source = "git+https://github.com/gotempsh/autopack?rev=7de6ced1f2a3399f234fc444cec8361f4b5ac87f#7de6ced1f2a3399f234fc444cec8361f4b5ac87f"
+version = "0.1.2"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.2#0c4a11cc79349aa28791121f95c4e837b224a899"
 dependencies = [
  "globset",
  "indexmap 2.14.0",
@@ -477,16 +477,16 @@ dependencies = [
 
 [[package]]
 name = "autopack-dockerfile"
-version = "0.1.1"
-source = "git+https://github.com/gotempsh/autopack?rev=7de6ced1f2a3399f234fc444cec8361f4b5ac87f#7de6ced1f2a3399f234fc444cec8361f4b5ac87f"
+version = "0.1.2"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.2#0c4a11cc79349aa28791121f95c4e837b224a899"
 dependencies = [
  "autopack-core",
 ]
 
 [[package]]
 name = "autopack-providers"
-version = "0.1.1"
-source = "git+https://github.com/gotempsh/autopack?rev=7de6ced1f2a3399f234fc444cec8361f4b5ac87f#7de6ced1f2a3399f234fc444cec8361f4b5ac87f"
+version = "0.1.2"
+source = "git+https://github.com/gotempsh/autopack?tag=v0.1.2#0c4a11cc79349aa28791121f95c4e837b224a899"
 dependencies = [
  "autopack-core",
  "indexmap 2.14.0",
