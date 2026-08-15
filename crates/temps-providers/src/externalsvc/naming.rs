@@ -32,18 +32,24 @@ pub fn managed_instance_name(service_name: &str, _service_type: ServiceType) -> 
     service_name.to_string()
 }
 
-/// Instance names an earlier revision may have used for this service.
+/// Instance names an earlier revision may have used for this built-in service.
 ///
 /// Installs created before the naming split was fixed have a container under
 /// the prefixed name. Callers use these to reach those containers — to sweep
-/// them on delete, or to tell the operator they are there. Returns empty for
-/// every type whose name was never rewritten.
+/// them on delete, or to tell the operator they are there.
+///
+/// The sweep is intentionally limited to the two built-in services that the
+/// plugins manage. For arbitrary user-created services, deriving
+/// `blob-{service_name}` or `kv-{service_name}` can collide with a normal
+/// RustFS/Redis service that already uses that name, so returning a legacy
+/// alias for those names would let one service delete another service's
+/// container and volumes.
 pub fn legacy_managed_instance_names(service_name: &str, service_type: ServiceType) -> Vec<String> {
-    match service_type {
+    match (service_name, service_type) {
         // `ExternalServiceManager::create_service_instance` prefixed these
-        // two, and only these two, before the fix for #495.
-        ServiceType::Blob => vec![format!("blob-{}", service_name)],
-        ServiceType::Kv => vec![format!("kv-{}", service_name)],
+        // two built-in services before the fix for #495.
+        ("temps-blob", ServiceType::Blob) => vec!["blob-temps-blob".to_string()],
+        ("temps-kv", ServiceType::Kv) => vec!["kv-temps-kv".to_string()],
         _ => Vec::new(),
     }
 }
@@ -99,7 +105,7 @@ mod tests {
     /// The sweep in `delete_service` reaches the pre-fix containers through
     /// these names, so they must stay exactly what the old code produced.
     #[test]
-    fn legacy_names_reproduce_the_pre_fix_prefixes() {
+    fn legacy_names_reproduce_the_pre_fix_prefixes_for_builtin_services_only() {
         assert_eq!(
             legacy_managed_instance_names("temps-blob", ServiceType::Blob),
             vec!["blob-temps-blob".to_string()],
@@ -109,6 +115,18 @@ mod tests {
             legacy_managed_instance_names("temps-kv", ServiceType::Kv),
             vec!["kv-temps-kv".to_string()],
             "old container was redis-kv-temps-kv"
+        );
+    }
+
+    #[test]
+    fn legacy_names_are_not_derived_for_user_chosen_names() {
+        assert!(
+            legacy_managed_instance_names("foo", ServiceType::Blob).is_empty(),
+            "deleting Blob `foo` must not sweep an unrelated RustFS/S3 service named `blob-foo`"
+        );
+        assert!(
+            legacy_managed_instance_names("foo", ServiceType::Kv).is_empty(),
+            "deleting KV `foo` must not sweep an unrelated Redis service named `kv-foo`"
         );
     }
 }
