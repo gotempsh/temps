@@ -2670,21 +2670,9 @@ impl ProjectService {
             .encrypt_string(&token)
             .map_err(|e| format!("Failed to encrypt Generic webhook token: {e}"))?;
 
-        let external_url = self
-            .config_service
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.external_url)
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-
         info!(
-            "Generated Generic webhook token for project {} (conn {}). \
-             Configure your git host to POST to: {}/api/webhook/git/generic/events/{}",
-            project_id,
-            connection_id,
-            external_url.trim_end_matches('/'),
-            token // plaintext token is only logged here; stored value is encrypted
+            "Generated and encrypted Generic webhook token for project {} (conn {})",
+            project_id, connection_id
         );
 
         Ok(Some(encrypted_token))
