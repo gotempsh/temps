@@ -1582,11 +1582,14 @@
             "type": "array"
           },
           "tool_thinking_options": {
-            "description": "Model-specific reasoning options valid while project-chat function tools are attached. Omitted when the normal options also apply.",
+            "description": "Model-specific reasoning options valid while project-chat function\ntools are attached. Omitted when the normal options also apply.",
             "items": {
               "$ref": "#/components/schemas/AiSelectOptionDto"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "required": [
@@ -38494,6 +38497,10 @@
               "null"
             ]
           },
+          "exclude_synthetic": {
+            "description": "Exclude Temps status-monitor traffic, including legacy rows written\nbefore monitor requests received their own `request_source` value.",
+            "type": "boolean"
+          },
           "has_project": {
             "description": "When true, only count requests that matched a project (project_id IS NOT NULL).\nUsed by the health dashboard so totals match the per-project cards.",
             "type": [
@@ -39692,6 +39699,11 @@
             "format": "int64",
             "type": "integer"
           },
+          "latency_count": {
+            "description": "Number of requests in this bucket that recorded a latency value.",
+            "format": "int64",
+            "type": "integer"
+          },
           "p50_response_time_ms": {
             "description": "p50 response time in milliseconds (0 when the bucket has no timings)",
             "format": "double",
@@ -39726,6 +39738,7 @@
         "required": [
           "bucket",
           "request_count",
+          "latency_count",
           "avg_response_time_ms",
           "p50_response_time_ms",
           "p95_response_time_ms",
@@ -40261,6 +40274,385 @@
           "created_at"
         ],
         "type": "object"
+      },
+      "TrafficAggregationRequest": {
+        "properties": {
+          "dimensions": {
+            "description": "Zero to four grouping dimensions. Zero returns one overall rollup;\nmultiple dimensions form a tuple.",
+            "items": {
+              "$ref": "#/components/schemas/TrafficDimension"
+            },
+            "type": "array"
+          },
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficFilter"
+            },
+            "type": "array"
+          },
+          "include_synthetic": {
+            "description": "Include Temps status-monitor requests. They are excluded by default.",
+            "type": "boolean"
+          },
+          "metrics": {
+            "description": "Aggregates to calculate. Unrequested response fields remain null.",
+            "items": {
+              "$ref": "#/components/schemas/TrafficMetric"
+            },
+            "type": "array"
+          },
+          "order_by": {
+            "description": "Ordered sort keys. Multiple keys provide stable pagination when the\nprimary metric ties. Every field must be requested/grouped.",
+            "items": {
+              "$ref": "#/components/schemas/TrafficOrderBy"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start_time",
+          "end_time",
+          "dimensions",
+          "metrics"
+        ],
+        "type": "object"
+      },
+      "TrafficAggregationResponse": {
+        "properties": {
+          "dimensions": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficDimension"
+            },
+            "type": "array"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficMetric"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficAggregationRow"
+            },
+            "type": "array"
+          },
+          "synthetic_excluded": {
+            "type": "boolean"
+          },
+          "total_groups": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "total_groups",
+          "page",
+          "page_size",
+          "total_pages",
+          "dimensions",
+          "metrics",
+          "synthetic_excluded"
+        ],
+        "type": "object"
+      },
+      "TrafficAggregationRow": {
+        "properties": {
+          "dimensions": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficDimensionValue"
+            },
+            "type": "array"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/TrafficMetricValues"
+          }
+        },
+        "required": [
+          "dimensions",
+          "metrics"
+        ],
+        "type": "object"
+      },
+      "TrafficDimension": {
+        "enum": [
+          "client_ip",
+          "method",
+          "path",
+          "host",
+          "status_code",
+          "status_class",
+          "environment_id",
+          "deployment_id",
+          "request_source",
+          "is_bot",
+          "browser",
+          "operating_system",
+          "device_type",
+          "cache_status"
+        ],
+        "type": "string"
+      },
+      "TrafficDimensionValue": {
+        "properties": {
+          "dimension": {
+            "$ref": "#/components/schemas/TrafficDimension"
+          },
+          "value": {
+            "description": "Dimensions are serialized as display-safe strings across both storage\nbackends. Null database values remain null rather than becoming empty.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "dimension"
+        ],
+        "type": "object"
+      },
+      "TrafficFilter": {
+        "properties": {
+          "dimension": {
+            "$ref": "#/components/schemas/TrafficDimension"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/TrafficFilterOperator"
+          },
+          "values": {
+            "description": "One value for scalar operators; one or more values for `in`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dimension",
+          "operator",
+          "values"
+        ],
+        "type": "object"
+      },
+      "TrafficFilterOperator": {
+        "enum": [
+          "eq",
+          "not_eq",
+          "contains",
+          "starts_with",
+          "in"
+        ],
+        "type": "string"
+      },
+      "TrafficMetric": {
+        "enum": [
+          "requests",
+          "errors",
+          "error_rate",
+          "latency_avg",
+          "latency_min",
+          "latency_max",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "unique_ips",
+          "unique_paths",
+          "last_seen"
+        ],
+        "type": "string"
+      },
+      "TrafficMetricValues": {
+        "properties": {
+          "error_rate": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "errors": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_seen": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latency_avg_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_max_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_min_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_p50_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_p95_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_p99_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "requests": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unique_ips": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unique_paths": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TrafficOrderBy": {
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/TrafficSortDirection"
+          },
+          "field": {
+            "$ref": "#/components/schemas/TrafficOrderField"
+          }
+        },
+        "required": [
+          "field",
+          "direction"
+        ],
+        "type": "object"
+      },
+      "TrafficOrderField": {
+        "oneOf": [
+          {
+            "properties": {
+              "field": {
+                "$ref": "#/components/schemas/TrafficDimension"
+              },
+              "kind": {
+                "enum": [
+                  "dimension"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "field",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "field": {
+                "$ref": "#/components/schemas/TrafficMetric"
+              },
+              "kind": {
+                "enum": [
+                  "metric"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "field",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TrafficSortDirection": {
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "type": "string"
       },
       "TriggerAgentRequest": {
         "properties": {
@@ -76002,6 +76394,114 @@
         "summary": "Return the top callers (by client IP, ranked by request count) in a\nproject's API traffic window.",
         "tags": [
           "Analytics"
+        ]
+      }
+    },
+    "/projects/{project_id}/api-analytics/query": {
+      "post": {
+        "operationId": "aggregate_api_traffic",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrafficAggregationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficAggregationResponse"
+                }
+              }
+            },
+            "description": "Aggregated API traffic"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid dimensions, metrics, filters, or time range"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Aggregation request budget exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage query failed"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Aggregation query timed out"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Run a backend-neutral, multi-dimensional API traffic aggregation.",
+        "tags": [
+          "Proxy Logs"
         ]
       }
     },

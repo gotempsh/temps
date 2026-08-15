@@ -27,6 +27,7 @@ pub mod services;
 pub mod storage;
 pub mod tls_cert_loader;
 pub mod tls_fingerprint;
+pub mod traffic_aggregation;
 pub mod traits;
 pub use crawler_detector::CrawlerDetector;
 pub use handler::*;

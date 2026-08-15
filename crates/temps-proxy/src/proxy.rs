@@ -740,6 +740,16 @@ impl LoadBalancer {
             .any(|ext| path_lower.ends_with(ext))
     }
 
+    fn traffic_classification(path: &str, user_agent: &str) -> (&'static str, bool) {
+        if user_agent.starts_with("Temps-Status-Monitor/") {
+            ("temps_monitor", true)
+        } else if path.starts_with(ROUTE_PREFIX_TEMPS) {
+            ("proxy", true)
+        } else {
+            ("proxy", false)
+        }
+    }
+
     fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
         let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
             host.to_str()
@@ -1500,6 +1510,8 @@ impl LoadBalancer {
                 .and_then(|h| h.get("x-cache").or_else(|| h.get("cf-cache-status")))
                 .cloned();
 
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
             let proxy_log_request = CreateProxyLogRequest {
                 method: ctx.method.clone(),
                 path: ctx.path.clone(),
@@ -1507,8 +1519,8 @@ impl LoadBalancer {
                 host: ctx.host.clone(),
                 status_code: status_code as i16,
                 response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: "proxy".to_string(),
-                is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                request_source: request_source.to_string(),
+                is_system_request,
                 routing_status: ctx.routing_status.clone(),
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -1625,6 +1637,8 @@ impl LoadBalancer {
             return;
         }
 
+        let (request_source, is_system_request) =
+            Self::traffic_classification(&ctx.path, &ctx.user_agent);
         let proxy_log_request = CreateProxyLogRequest {
             method: ctx.method.clone(),
             path: ctx.path.clone(),
@@ -1632,8 +1646,8 @@ impl LoadBalancer {
             host: ctx.host.clone(),
             status_code,
             response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-            request_source: "proxy".to_string(),
-            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+            request_source: request_source.to_string(),
+            is_system_request,
             routing_status: routing_status.to_string(),
             project_id: ctx.project.as_ref().map(|p| p.id),
             environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -5256,6 +5270,8 @@ impl ProxyHttp for LoadBalancer {
             // For failed requests, response size is the error message size
             let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
 
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
             let proxy_log_request = CreateProxyLogRequest {
                 method: ctx.method.clone(),
                 path: ctx.path.clone(),
@@ -5263,8 +5279,8 @@ impl ProxyHttp for LoadBalancer {
                 host: ctx.host.clone(),
                 status_code: error_code as i16,
                 response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: "proxy".to_string(),
-                is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                request_source: request_source.to_string(),
+                is_system_request,
                 routing_status: ctx.routing_status.clone(),
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -6923,5 +6939,26 @@ mod content_type_tests {
         assert!(!is_event_stream_content_type(""));
         // A prefix match must not count either.
         assert!(!is_event_stream_content_type("text/event-stream-x"));
+    }
+}
+
+#[cfg(test)]
+mod traffic_classification_tests {
+    use super::LoadBalancer;
+
+    #[test]
+    fn classifies_temps_monitor_as_synthetic_system_traffic() {
+        assert_eq!(
+            LoadBalancer::traffic_classification("/api/health", "Temps-Status-Monitor/1.0"),
+            ("temps_monitor", true)
+        );
+    }
+
+    #[test]
+    fn leaves_customer_requests_as_proxy_traffic() {
+        assert_eq!(
+            LoadBalancer::traffic_classification("/api/health", "Mozilla/5.0"),
+            ("proxy", false)
+        );
     }
 }

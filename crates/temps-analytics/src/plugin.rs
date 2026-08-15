@@ -92,6 +92,29 @@ impl TempsPlugin for AnalyticsPlugin {
         Some(PluginRoutes::new(routes))
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            let service = context.require_service::<ApiTrafficService>();
+            if let Some(source) =
+                context.get_service::<dyn crate::api_traffic::ApiTrafficDataSource>()
+            {
+                if !service.set_data_source(source) {
+                    tracing::warn!(
+                        "analytics: API traffic data source was already initialized; keeping the first source"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "analytics: no storage-neutral API traffic source registered; falling back to TimescaleDB"
+                );
+            }
+            Ok(())
+        })
+    }
+
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(AnalyticsApiDoc::openapi())
     }

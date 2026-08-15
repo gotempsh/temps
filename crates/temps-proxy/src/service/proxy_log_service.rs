@@ -1,8 +1,12 @@
+use crate::traffic_aggregation::{
+    TrafficAggregationRequest, TrafficAggregationResponse, MAX_TRAFFIC_PAGE_SIZE,
+};
 use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use temps_core::UtcDateTime;
 use temps_entities::proxy_logs;
 use thiserror::Error;
@@ -10,11 +14,17 @@ use utoipa::ToSchema;
 
 #[derive(Error, Debug)]
 pub enum ProxyLogServiceError {
-    #[error("Database error")]
+    #[error("Database error: {0}")]
     DatabaseError(#[from] sea_orm::DbErr),
 
     #[error("Invalid filter parameters: {0}")]
     InvalidFilter(String),
+
+    #[error("Traffic aggregation rate limit exceeded: {reason}")]
+    TrafficAggregationRateLimited { reason: &'static str },
+
+    #[error("Traffic aggregation exceeded its {timeout_seconds}-second execution deadline")]
+    TrafficAggregationTimeout { timeout_seconds: u64 },
 
     /// A ClickHouse operation failed. `operation` names the storage method
     /// (e.g. `list_with_filters`, `write_batch`) so logs/responses can identify
@@ -167,6 +177,42 @@ pub struct ProxyLogService {
     /// [`crate::storage::TimescaleDbProxyLogStore`] holds internally as its read
     /// relay, so the TimescaleDB trait impl never recurses back into a dispatch.
     storage: Option<Arc<dyn crate::storage::ProxyLogStorage>>,
+    aggregate_slots: Arc<tokio::sync::Semaphore>,
+    aggregate_limits: moka::future::Cache<i32, Arc<AggregateLimitState>>,
+}
+
+const MAX_CONCURRENT_TRAFFIC_AGGREGATIONS: usize = 4;
+const MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE: usize = 60;
+const TRAFFIC_AGGREGATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct AggregateLimitState {
+    recent_requests: Mutex<VecDeque<Instant>>,
+}
+
+impl AggregateLimitState {
+    fn record_request(&self, now: Instant) -> bool {
+        let mut requests = self
+            .recent_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = now - Duration::from_secs(60);
+        while requests.front().is_some_and(|started| *started <= cutoff) {
+            requests.pop_front();
+        }
+        if requests.len() >= MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE {
+            return false;
+        }
+        requests.push_back(now);
+        true
+    }
+}
+
+fn aggregate_limit_cache() -> moka::future::Cache<i32, Arc<AggregateLimitState>> {
+    moka::future::Cache::builder()
+        .max_capacity(1_024)
+        .time_to_idle(Duration::from_secs(10 * 60))
+        .build()
 }
 
 /// The ±1-day lookup window around a row's event time, used to bound
@@ -192,6 +238,10 @@ impl ProxyLogService {
             db,
             ip_service,
             storage: None,
+            aggregate_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRAFFIC_AGGREGATIONS,
+            )),
+            aggregate_limits: aggregate_limit_cache(),
         }
     }
 
@@ -209,7 +259,51 @@ impl ProxyLogService {
             db,
             ip_service,
             storage: Some(storage),
+            aggregate_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_TRAFFIC_AGGREGATIONS,
+            )),
+            aggregate_limits: aggregate_limit_cache(),
         }
+    }
+
+    pub async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+        request.validate()?;
+        let project_limit = self
+            .aggregate_limits
+            .get_with(project_id, async {
+                Arc::new(AggregateLimitState::default())
+            })
+            .await;
+        if !project_limit.record_request(Instant::now()) {
+            return Err(ProxyLogServiceError::TrafficAggregationRateLimited {
+                reason: "project request budget exhausted",
+            });
+        }
+        let _permit = self.aggregate_slots.try_acquire().map_err(|_| {
+            ProxyLogServiceError::TrafficAggregationRateLimited {
+                reason: "server aggregation capacity exhausted",
+            }
+        })?;
+
+        let query = async {
+            if let Some(storage) = &self.storage {
+                return storage.aggregate_traffic(project_id, request).await;
+            }
+            let storage = crate::storage::TimescaleDbProxyLogStore::new(
+                self.db.clone(),
+                self.ip_service.clone(),
+            );
+            crate::storage::ProxyLogStorage::aggregate_traffic(&storage, project_id, request).await
+        };
+        tokio::time::timeout(TRAFFIC_AGGREGATION_TIMEOUT, query)
+            .await
+            .map_err(|_| ProxyLogServiceError::TrafficAggregationTimeout {
+                timeout_seconds: TRAFFIC_AGGREGATION_TIMEOUT.as_secs(),
+            })?
     }
 
     /// Create a new proxy log entry asynchronously
@@ -1005,6 +1099,7 @@ impl ProxyLogService {
             SELECT
                 bucket::timestamptz as bucket,
                 COALESCE(count, 0) as request_count,
+                COALESCE(latency_count, 0)::bigint as latency_count,
                 COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0) as error_count,
                 COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
@@ -1013,6 +1108,7 @@ impl ProxyLogService {
                 SELECT
                     time_bucket_gapfill(${}::interval, timestamp) AS bucket,
                     COUNT(*) as count,
+                    COUNT(response_time_ms) as latency_count,
                     AVG(response_time_ms) as avg_response_time,
                     SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) as error_count,
                     SUM(request_size_bytes) as total_request_bytes,
@@ -1089,6 +1185,7 @@ impl ProxyLogService {
             SELECT
                 bucket::timestamptz as bucket,
                 COALESCE(count, 0)::bigint as request_count,
+                COALESCE(latency_count, 0)::bigint as latency_count,
                 COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0)::bigint as error_count,
                 COALESCE(total_request_bytes, 0)::bigint as total_request_bytes,
@@ -1097,6 +1194,7 @@ impl ProxyLogService {
                 SELECT
                     time_bucket_gapfill(${}::interval, bucket) AS bucket,
                     SUM(request_count) as count,
+                    SUM(response_time_count) as latency_count,
                     SUM(sum_response_time_ms)::float8
                         / NULLIF(SUM(response_time_count), 0)::float8 as avg_response_time,
                     SUM(error_4xx_plus_count) as error_count,
@@ -1139,6 +1237,7 @@ impl ProxyLogService {
                 let bucket: chrono::DateTime<Utc> =
                     row.try_get("", "bucket").unwrap_or(fallback_bucket);
                 let request_count: i64 = row.try_get("", "request_count").unwrap_or(0);
+                let latency_count: i64 = row.try_get("", "latency_count").unwrap_or(0);
                 let avg_response_time_ms: f64 =
                     row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
                 let error_count: i64 = row.try_get("", "error_count").unwrap_or(0);
@@ -1149,6 +1248,7 @@ impl ProxyLogService {
                 TimeBucketStats {
                     bucket: bucket.to_rfc3339(),
                     request_count,
+                    latency_count,
                     avg_response_time_ms,
                     p50_response_time_ms: 0.0,
                     p95_response_time_ms: 0.0,
@@ -1442,6 +1542,14 @@ impl ProxyLogService {
         if let Some(device_type) = filters.device_type {
             query = query.filter(proxy_logs::Column::DeviceType.eq(device_type));
         }
+        if filters.exclude_synthetic {
+            query = query.filter(proxy_logs::Column::RequestSource.ne("temps_monitor"));
+            query = query.filter(
+                Condition::any()
+                    .add(proxy_logs::Column::UserAgent.is_null())
+                    .add(proxy_logs::Column::UserAgent.not_like("Temps-Status-Monitor/%")),
+            );
+        }
         query
     }
 
@@ -1512,6 +1620,11 @@ impl ProxyLogService {
                 "project_id IS NULL".to_string()
             });
             // no parameterized value — the predicate is fully in SQL
+        }
+        if filters.exclude_synthetic {
+            where_clauses.push("request_source <> 'temps_monitor'".to_string());
+            where_clauses
+                .push("COALESCE(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string());
         }
         String::new()
     }
@@ -1633,6 +1746,7 @@ impl ProxyLogService {
             && f.routing_status.is_none()
             && f.request_source.is_none()
             && f.device_type.is_none()
+            && !f.exclude_synthetic
     }
 
     /// True for intervals that are whole multiples of the aggregate's
@@ -2302,6 +2416,292 @@ impl ProxyLogService {
     }
 }
 
+fn analytics_storage_error(
+    operation: &'static str,
+    error: ProxyLogServiceError,
+) -> temps_analytics::types::analytics::AnalyticsError {
+    temps_analytics::types::analytics::AnalyticsError::Other(format!(
+        "API traffic {operation} failed in the configured request-log backend: {error}"
+    ))
+}
+
+async fn aggregate_traffic_offset(
+    service: &ProxyLogService,
+    project_id: i32,
+    mut request: TrafficAggregationRequest,
+    limit: u64,
+    offset: u64,
+) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+    const STORAGE_PAGE_SIZE: u64 = MAX_TRAFFIC_PAGE_SIZE;
+    request.page_size = STORAGE_PAGE_SIZE;
+    request.page = offset / STORAGE_PAGE_SIZE + 1;
+
+    let first = service
+        .aggregate_traffic(project_id, request.clone())
+        .await?;
+    let total_groups = first.total_groups;
+    let total_pages = total_groups.div_ceil(limit);
+    let mut rows = first
+        .rows
+        .into_iter()
+        .skip((offset % STORAGE_PAGE_SIZE) as usize)
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+
+    if rows.len() < limit as usize && request.page < first.total_pages {
+        request.page += 1;
+        let remaining = limit as usize - rows.len();
+        let next = service
+            .aggregate_traffic(project_id, request.clone())
+            .await?;
+        rows.extend(next.rows.into_iter().take(remaining));
+    }
+
+    Ok(TrafficAggregationResponse {
+        rows,
+        total_groups,
+        page: offset / limit + 1,
+        page_size: limit,
+        total_pages,
+        dimensions: request.dimensions,
+        metrics: request.metrics,
+        synthetic_excluded: !request.include_synthetic,
+    })
+}
+
+#[async_trait::async_trait]
+impl temps_analytics::api_traffic::ApiTrafficDataSource for ProxyLogService {
+    async fn get_timeseries(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        bucket_interval: String,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiTimeseriesResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use temps_analytics::types::api_traffic::{ApiTimeseriesPoint, ApiTimeseriesResponse};
+
+        let stats_filters = StatsFilters {
+            project_id: Some(project_id),
+            environment_id,
+            exclude_synthetic: true,
+            ..Default::default()
+        };
+        let rollup_request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: Vec::new(),
+            metrics: vec![
+                crate::traffic_aggregation::TrafficMetric::Requests,
+                crate::traffic_aggregation::TrafficMetric::Errors,
+                crate::traffic_aggregation::TrafficMetric::ErrorRate,
+                crate::traffic_aggregation::TrafficMetric::LatencyAvg,
+            ],
+            filters: Vec::new(),
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 1,
+        };
+        let (buckets, rollup) = tokio::try_join!(
+            self.get_time_bucket_stats(
+                start_date,
+                end_date,
+                bucket_interval.clone(),
+                Some(stats_filters),
+            ),
+            self.aggregate_traffic(project_id, rollup_request),
+        )
+        .map_err(|error| analytics_storage_error("timeseries query", error))?;
+
+        let points = buckets
+            .into_iter()
+            .map(|bucket| {
+                let timestamp = DateTime::parse_from_rfc3339(&bucket.bucket)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|error| {
+                        temps_analytics::types::analytics::AnalyticsError::Other(format!(
+                            "API traffic backend returned invalid bucket timestamp '{}': {error}",
+                            bucket.bucket
+                        ))
+                    })?;
+                let error_rate = if bucket.request_count > 0 {
+                    bucket.error_count as f64 / bucket.request_count as f64
+                } else {
+                    0.0
+                };
+                Ok(ApiTimeseriesPoint {
+                    timestamp,
+                    request_count: bucket.request_count,
+                    error_count: bucket.error_count,
+                    error_rate,
+                    avg_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.avg_response_time_ms),
+                    p95_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.p95_response_time_ms),
+                    p99_latency_ms: (bucket.latency_count > 0)
+                        .then_some(bucket.p99_response_time_ms),
+                })
+            })
+            .collect::<Result<Vec<_>, temps_analytics::types::analytics::AnalyticsError>>()?;
+        let metrics = rollup.rows.first().map(|row| &row.metrics);
+        let total_requests = metrics.and_then(|value| value.requests).unwrap_or(0);
+        let total_errors = metrics.and_then(|value| value.errors).unwrap_or(0);
+
+        Ok(ApiTimeseriesResponse {
+            points,
+            total_requests,
+            total_errors,
+            overall_error_rate: metrics.and_then(|value| value.error_rate).unwrap_or(0.0),
+            overall_avg_latency_ms: metrics.and_then(|value| value.latency_avg_ms),
+            bucket_interval,
+        })
+    }
+
+    async fn get_top_routes(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiRoutesResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use crate::traffic_aggregation::{
+            TrafficDimension, TrafficMetric, TrafficOrderBy, TrafficOrderField,
+            TrafficSortDirection,
+        };
+        use temps_analytics::types::api_traffic::{ApiRouteEntry, ApiRoutesResponse};
+
+        let request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: vec![TrafficDimension::Method, TrafficDimension::Path],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LatencyAvg,
+            ],
+            filters: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: MAX_TRAFFIC_PAGE_SIZE,
+        };
+        let response = aggregate_traffic_offset(
+            self,
+            project_id,
+            request,
+            limit.clamp(1, 100) as u64,
+            offset.clamp(0, 10_000) as u64,
+        )
+        .await
+        .map_err(|error| analytics_storage_error("route aggregation", error))?;
+        let routes = response
+            .rows
+            .into_iter()
+            .map(|row| ApiRouteEntry {
+                method: row
+                    .dimensions
+                    .first()
+                    .and_then(|value| value.value.clone())
+                    .unwrap_or_default(),
+                path: row
+                    .dimensions
+                    .get(1)
+                    .and_then(|value| value.value.clone())
+                    .unwrap_or_default(),
+                request_count: row.metrics.requests.unwrap_or(0),
+                avg_latency_ms: row.metrics.latency_avg_ms,
+                error_rate: row.metrics.error_rate.unwrap_or(0.0),
+            })
+            .collect();
+        Ok(ApiRoutesResponse {
+            routes,
+            total_routes: i64::try_from(response.total_groups).unwrap_or(i64::MAX),
+        })
+    }
+
+    async fn get_top_callers(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<
+        temps_analytics::types::api_traffic::ApiCallersResponse,
+        temps_analytics::types::analytics::AnalyticsError,
+    > {
+        use crate::traffic_aggregation::{
+            TrafficDimension, TrafficFilter, TrafficFilterOperator, TrafficMetric, TrafficOrderBy,
+            TrafficOrderField, TrafficSortDirection,
+        };
+        use temps_analytics::types::api_traffic::{ApiCallerEntry, ApiCallersResponse};
+
+        let request = TrafficAggregationRequest {
+            start_time: start_date,
+            end_time: end_date,
+            environment_id,
+            dimensions: vec![TrafficDimension::ClientIp],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LastSeen,
+            ],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::ClientIp,
+                operator: TrafficFilterOperator::NotEq,
+                values: vec![String::new()],
+            }],
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: MAX_TRAFFIC_PAGE_SIZE,
+        };
+        let response = aggregate_traffic_offset(
+            self,
+            project_id,
+            request,
+            limit.clamp(1, 100) as u64,
+            offset.clamp(0, 10_000) as u64,
+        )
+        .await
+        .map_err(|error| analytics_storage_error("caller aggregation", error))?;
+        let callers = response
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(ApiCallerEntry {
+                    client_ip: row.dimensions.first()?.value.clone()?,
+                    request_count: row.metrics.requests.unwrap_or(0),
+                    error_rate: row.metrics.error_rate.unwrap_or(0.0),
+                    last_seen: row.metrics.last_seen?,
+                })
+            })
+            .collect();
+        Ok(ApiCallersResponse {
+            callers,
+            total_callers: i64::try_from(response.total_groups).unwrap_or(i64::MAX),
+        })
+    }
+}
+
 /// Filters for statistics queries
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct StatsFilters {
@@ -2321,6 +2721,10 @@ pub struct StatsFilters {
     /// When true, only count requests that matched a project (project_id IS NOT NULL).
     /// Used by the health dashboard so totals match the per-project cards.
     pub has_project: Option<bool>,
+    /// Exclude Temps status-monitor traffic, including legacy rows written
+    /// before monitor requests received their own `request_source` value.
+    #[serde(default)]
+    pub exclude_synthetic: bool,
 }
 
 /// Time bucket statistics response
@@ -2331,6 +2735,8 @@ pub struct TimeBucketStats {
     pub bucket: String,
     /// Total number of requests in this bucket
     pub request_count: i64,
+    /// Number of requests in this bucket that recorded a latency value.
+    pub latency_count: i64,
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
     /// p50 response time in milliseconds (0 when the bucket has no timings)
@@ -2453,6 +2859,17 @@ pub struct ProjectHealthSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_aggregation_project_budget_is_bounded_and_recovers() {
+        let state = AggregateLimitState::default();
+        let start = Instant::now();
+        for _ in 0..MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE {
+            assert!(state.record_request(start));
+        }
+        assert!(!state.record_request(start));
+        assert!(state.record_request(start + Duration::from_secs(61)));
+    }
 
     // ── Listing window ────────────────────────────────────────────────────
     // `GET /proxy-logs` must never issue an unbounded scan (on a 100M-row
@@ -2716,6 +3133,7 @@ mod tests {
             is_bot: Some(false),
             device_type: Some("desktop".to_string()),
             has_project: None,
+            exclude_synthetic: false,
         };
         let mut where_clauses = Vec::new();
         let mut param_index = 1;
@@ -2783,6 +3201,7 @@ mod tests {
             is_bot: Some(false),
             device_type: Some("desktop".to_string()),
             has_project: None,
+            exclude_synthetic: false,
         };
         let mut values: Vec<sea_orm::Value> = vec![];
 
@@ -2887,6 +3306,10 @@ mod tests {
             },
             StatsFilters {
                 device_type: Some("mobile".to_string()),
+                ..Default::default()
+            },
+            StatsFilters {
+                exclude_synthetic: true,
                 ..Default::default()
             },
         ];

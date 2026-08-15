@@ -7,8 +7,14 @@ import {
   getProjectDeploymentsOptions,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { getApiSummary } from '@/api/client'
-import { ProjectResponse } from '@/api/client/types.gen'
+import { aggregateApiTraffic, getApiSummary } from '@/api/client'
+import type {
+  ProjectResponse,
+  TrafficAggregationRequest,
+  TrafficAggregationResponse,
+  TrafficAggregationRow,
+  TrafficFilter,
+} from '@/api/client/types.gen'
 import {
   ThresholdLineChart,
   type ThresholdMarker,
@@ -24,6 +30,13 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import {
   Table,
   TableBody,
@@ -42,6 +55,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  ArrowUpDown,
   ChevronLeft,
   ChevronRight,
   Loader2,
@@ -52,7 +66,11 @@ import * as React from 'react'
 import { useSearchParams } from 'react-router'
 import { useStructuredAi } from '@/hooks/useStructuredAi'
 import { toast } from 'sonner'
-import { shouldRequestApiTrafficSummary } from '@/lib/ai-summary'
+import {
+  apiTrafficSummaryCacheKey,
+  canStartApiTrafficSummary,
+  shouldRequestApiTrafficSummary,
+} from '@/lib/ai-summary'
 
 interface ApiTrafficTabProps {
   project: ProjectResponse
@@ -63,6 +81,30 @@ interface ApiTrafficAiSummary {
   findings?: string[]
   anomalies?: string[]
   recommendation?: string | null
+}
+
+type TrafficMetric = 'requests' | 'error_rate' | 'latency_avg'
+
+interface TrafficDetail {
+  kind: 'ip' | 'path'
+  value: string
+  method?: string
+}
+
+function trafficDimension(row: TrafficAggregationRow, name: string): string {
+  return row.dimensions.find((item) => item.dimension === name)?.value ?? '—'
+}
+
+async function queryTraffic(
+  projectId: number,
+  body: TrafficAggregationRequest
+): Promise<TrafficAggregationResponse> {
+  const { data, error } = await aggregateApiTraffic({
+    path: { project_id: projectId },
+    body,
+  })
+  if (error || !data) throw new Error(JSON.stringify(error ?? 'No response'))
+  return data
 }
 
 const API_TRAFFIC_SUMMARY_SCHEMA = {
@@ -111,24 +153,6 @@ function formatBucketLabel(bucket: string): string {
   })
 }
 
-export function apiTrafficSummaryCacheKey({
-  environmentId,
-  filter,
-  startIso,
-  endIso,
-}: {
-  environmentId?: number
-  filter: QuickFilter
-  startIso?: string
-  endIso?: string
-}): string {
-  const environment = environmentId ?? 'all'
-  if (filter === 'custom') {
-    return `api-traffic:v2:${environment}:custom:${startIso}:${endIso}`
-  }
-  return `api-traffic:v2:${environment}:${filter}`
-}
-
 export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -159,6 +183,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const forceCliSummaryRefresh = React.useRef(false)
   const [routePage, setRoutePage] = React.useState(0)
   const [callerPage, setCallerPage] = React.useState(0)
+  const [routeSort, setRouteSort] = React.useState<TrafficMetric>('requests')
+  const [callerSort, setCallerSort] = React.useState<TrafficMetric>('requests')
+  const [detail, setDetail] = React.useState<TrafficDetail | null>(null)
   const queryClient = useQueryClient()
 
   // getDateRangeFromFilter computes `new Date()` internally, so calling it
@@ -204,7 +231,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       predicate: (query) => {
         const key = query.queryKey[0] as { _id?: string } | string
         const id = typeof key === 'string' ? key : key?._id
-        return !!id && /getApi(Timeseries|Routes|Callers)/.test(id)
+        return (
+          (typeof key === 'string' && key === 'api-traffic-query') ||
+          (!!id && /getApi(Timeseries|Routes|Callers)/.test(id))
+        )
       },
     })
     setTimeout(() => setIsRefreshing(false), 1000)
@@ -239,36 +269,136 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   })
 
   const routesQuery = useQuery({
-    ...getApiRoutesOptions({
-      path: { project_id: project.id },
-      query: {
-        start_date: startIso ?? '',
-        end_date: endIso ?? '',
+    queryKey: [
+      'api-traffic-query',
+      project.id,
+      startIso,
+      endIso,
+      selectedEnvironment,
+      'routes',
+      routePage,
+      routeSort,
+    ],
+    queryFn: () =>
+      queryTraffic(project.id, {
+        start_time: startIso ?? '',
+        end_time: endIso ?? '',
         environment_id: selectedEnvironment,
-        limit: pageSize,
-        offset: routePage * pageSize,
-      },
-    }),
+        dimensions: ['method', 'path'],
+        metrics: [
+          'requests',
+          'errors',
+          'error_rate',
+          'latency_avg',
+          'latency_min',
+          'latency_max',
+          'latency_p95',
+          'unique_ips',
+          'last_seen',
+        ],
+        filters: [],
+        order_by: [
+          { field: { kind: 'metric', field: routeSort }, direction: 'desc' },
+        ],
+        include_synthetic: false,
+        page: routePage + 1,
+        page_size: pageSize,
+      }),
     enabled,
   })
 
   const callersQuery = useQuery({
-    ...getApiCallersOptions({
-      path: { project_id: project.id },
-      query: {
-        start_date: startIso ?? '',
-        end_date: endIso ?? '',
+    queryKey: [
+      'api-traffic-query',
+      project.id,
+      startIso,
+      endIso,
+      selectedEnvironment,
+      'callers',
+      callerPage,
+      callerSort,
+    ],
+    queryFn: () =>
+      queryTraffic(project.id, {
+        start_time: startIso ?? '',
+        end_time: endIso ?? '',
         environment_id: selectedEnvironment,
-        limit: pageSize,
-        offset: callerPage * pageSize,
-      },
-    }),
+        dimensions: ['client_ip'],
+        metrics: [
+          'requests',
+          'errors',
+          'error_rate',
+          'latency_avg',
+          'latency_min',
+          'latency_max',
+          'latency_p95',
+          'unique_paths',
+          'last_seen',
+        ],
+        filters: [],
+        order_by: [
+          { field: { kind: 'metric', field: callerSort }, direction: 'desc' },
+        ],
+        include_synthetic: false,
+        page: callerPage + 1,
+        page_size: pageSize,
+      }),
     enabled,
   })
 
-  // Stable first-page context for the summary. React Query deduplicates these
-  // with the visible queries on page 1 and retains them when the user pages
-  // through the tables, preventing pagination from triggering new AI calls.
+  const detailQuery = useQuery({
+    queryKey: [
+      'api-traffic-query',
+      project.id,
+      startIso,
+      endIso,
+      selectedEnvironment,
+      'detail',
+      detail,
+    ],
+    queryFn: () => {
+      if (!detail) throw new Error('No traffic detail selected')
+      const filters: TrafficFilter[] =
+        detail.kind === 'ip'
+          ? [{ dimension: 'client_ip', operator: 'eq', values: [detail.value] }]
+          : [{ dimension: 'path', operator: 'eq', values: [detail.value] }]
+      if (detail.kind === 'path' && detail.method) {
+        filters.push({
+          dimension: 'method',
+          operator: 'eq',
+          values: [detail.method],
+        })
+      }
+      return queryTraffic(project.id, {
+        start_time: startIso ?? '',
+        end_time: endIso ?? '',
+        environment_id: selectedEnvironment,
+        dimensions: detail.kind === 'ip' ? ['method', 'path'] : ['client_ip'],
+        metrics: [
+          'requests',
+          'errors',
+          'error_rate',
+          'latency_avg',
+          'latency_min',
+          'latency_max',
+          'latency_p95',
+          'last_seen',
+        ],
+        filters,
+        order_by: [
+          { field: { kind: 'metric', field: 'requests' }, direction: 'desc' },
+        ],
+        include_synthetic: false,
+        page: 1,
+        page_size: 100,
+      })
+    },
+    enabled: enabled && detail !== null,
+  })
+
+  // Stable first-page context for the summary. These legacy response shapes
+  // differ from the visible generic aggregates, so defer both scans until the
+  // user explicitly asks to spend AI credits.
   const summaryRoutesQuery = useQuery({
     ...getApiRoutesOptions({
       path: { project_id: project.id },
@@ -280,7 +410,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         offset: 0,
       },
     }),
-    enabled,
+    enabled: enabled && summaryRequested,
   })
   const summaryCallersQuery = useQuery({
     ...getApiCallersOptions({
@@ -293,15 +423,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         offset: 0,
       },
     }),
-    enabled,
+    enabled: enabled && summaryRequested,
   })
 
-  // Wait for the visible aggregates before requesting the summary. The
-  // backend keeps a tiny, short-lived cache keyed by this exact window, so
-  // the summary reuses these results instead of repeating three proxy_logs
-  // scans while the first requests are still in flight.
+  // Wait for the on-demand context queries before requesting the summary. The
+  // backend keeps a small, short-lived cache keyed by this exact window.
   const summaryDataReady =
     enabled &&
+    summaryRequested &&
     !timeseriesQuery.isPending &&
     !summaryRoutesQuery.isPending &&
     !summaryCallersQuery.isPending
@@ -517,8 +646,16 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         }
         enabled={project.ai_api_traffic_summary_enabled === true}
         requested={summaryRequested}
-        canGenerate={summaryDataReady}
+        canGenerate={canStartApiTrafficSummary({
+          analyticsEnabled: enabled,
+          timeseriesPending: timeseriesQuery.isPending,
+          timeseriesError: timeseriesQuery.isError,
+        })}
         isPending={
+          (summaryRequested &&
+            (timeseriesQuery.isPending ||
+              summaryRoutesQuery.isPending ||
+              summaryCallersQuery.isPending)) ||
           structuredSummary.isPending ||
           (structuredSummary.failureStatus === 409 && cliSummaryQuery.isPending)
         }
@@ -575,7 +712,6 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               ]}
               markers={deployMarkers}
               tooltipValueFormatter={(v) => `${v.toFixed(0)}ms`}
-              emptyMessage="No API traffic in this period."
             />
           )}
         </CardContent>
@@ -587,7 +723,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             <CardTitle>Top routes</CardTitle>
             <CardDescription>
               Grouped by method + raw path — not yet template-normalized, so
-              routes with dynamic IDs may appear as separate rows.
+              routes with dynamic IDs may appear as separate rows. Temps monitor
+              checks are excluded. Select a route to inspect its callers.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -595,7 +732,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               <Skeleton className="h-[240px] w-full" />
             ) : routesQuery.isError ? (
               <QueryErrorState label="route data" />
-            ) : (routesQuery.data?.routes.length ?? 0) === 0 ? (
+            ) : (routesQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
               </p>
@@ -605,43 +742,76 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Route</TableHead>
-                      <TableHead className="text-right">Requests</TableHead>
-                      <TableHead className="text-right hidden sm:table-cell">
-                        Avg
-                      </TableHead>
-                      <TableHead className="text-right">Err %</TableHead>
+                      <SortableTrafficHead
+                        label="Requests"
+                        metric="requests"
+                        active={routeSort}
+                        onSort={(metric) => {
+                          setRouteSort(metric)
+                          setRoutePage(0)
+                        }}
+                      />
+                      <SortableTrafficHead
+                        className="hidden sm:table-cell"
+                        label="Avg"
+                        metric="latency_avg"
+                        active={routeSort}
+                        onSort={(metric) => {
+                          setRouteSort(metric)
+                          setRoutePage(0)
+                        }}
+                      />
+                      <SortableTrafficHead
+                        label="Err %"
+                        metric="error_rate"
+                        active={routeSort}
+                        onSort={(metric) => {
+                          setRouteSort(metric)
+                          setRoutePage(0)
+                        }}
+                      />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {routesQuery.data?.routes.map((r, i) => (
-                      <TableRow key={`${r.method}-${r.path}-${i}`}>
-                        <TableCell className="max-w-[220px]">
-                          <div className="flex items-center gap-2">
-                            <Badge variant="outline" className="shrink-0">
-                              {r.method}
-                            </Badge>
-                            <span className="truncate font-mono text-xs">
-                              {r.path}
-                            </span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {formatNumber(r.request_count)}
-                        </TableCell>
-                        <TableCell className="text-right hidden sm:table-cell">
-                          {formatMs(r.avg_latency_ms)}
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {formatPercent(r.error_rate)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {routesQuery.data?.rows.map((r, i) => {
+                      const method = trafficDimension(r, 'method')
+                      const path = trafficDimension(r, 'path')
+                      return (
+                        <TableRow
+                          key={`${method}-${path}-${i}`}
+                          className="cursor-pointer"
+                          onClick={() =>
+                            setDetail({ kind: 'path', value: path, method })
+                          }
+                        >
+                          <TableCell className="max-w-[220px]">
+                            <div className="flex items-center gap-2">
+                              <Badge variant="outline" className="shrink-0">
+                                {method}
+                              </Badge>
+                              <span className="truncate font-mono text-xs">
+                                {path}
+                              </span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {formatNumber(r.metrics.requests ?? 0)}
+                          </TableCell>
+                          <TableCell className="text-right hidden sm:table-cell">
+                            {formatMs(r.metrics.latency_avg_ms)}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {formatPercent(r.metrics.error_rate ?? 0)}
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
                   </TableBody>
                 </Table>
                 <TrafficPagination
                   page={routePage}
                   pageSize={pageSize}
-                  total={routesQuery.data?.total_routes ?? 0}
+                  total={routesQuery.data?.total_groups ?? 0}
                   onPageChange={setRoutePage}
                 />
               </>
@@ -653,7 +823,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           <CardHeader>
             <CardTitle>Top callers</CardTitle>
             <CardDescription>
-              Client IPs ranked by request count in this window.
+              Client IPs in this window. Temps monitor checks are excluded.
+              Select an IP to inspect every route it called.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -661,7 +832,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               <Skeleton className="h-[240px] w-full" />
             ) : callersQuery.isError ? (
               <QueryErrorState label="caller data" />
-            ) : (callersQuery.data?.callers.length ?? 0) === 0 ? (
+            ) : (callersQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
               </p>
@@ -671,30 +842,53 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                   <TableHeader>
                     <TableRow>
                       <TableHead>Client IP</TableHead>
-                      <TableHead className="text-right">Requests</TableHead>
-                      <TableHead className="text-right">Err %</TableHead>
+                      <SortableTrafficHead
+                        label="Requests"
+                        metric="requests"
+                        active={callerSort}
+                        onSort={(metric) => {
+                          setCallerSort(metric)
+                          setCallerPage(0)
+                        }}
+                      />
+                      <SortableTrafficHead
+                        label="Err %"
+                        metric="error_rate"
+                        active={callerSort}
+                        onSort={(metric) => {
+                          setCallerSort(metric)
+                          setCallerPage(0)
+                        }}
+                      />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {callersQuery.data?.callers.map((c) => (
-                      <TableRow key={c.client_ip}>
-                        <TableCell className="font-mono text-xs">
-                          {c.client_ip}
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {formatNumber(c.request_count)}
-                        </TableCell>
-                        <TableCell className="text-right">
-                          {formatPercent(c.error_rate)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {callersQuery.data?.rows.map((c) => {
+                      const ip = trafficDimension(c, 'client_ip')
+                      return (
+                        <TableRow
+                          key={ip}
+                          className="cursor-pointer"
+                          onClick={() => setDetail({ kind: 'ip', value: ip })}
+                        >
+                          <TableCell className="font-mono text-xs">
+                            {ip}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {formatNumber(c.metrics.requests ?? 0)}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {formatPercent(c.metrics.error_rate ?? 0)}
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
                   </TableBody>
                 </Table>
                 <TrafficPagination
                   page={callerPage}
                   pageSize={pageSize}
-                  total={callersQuery.data?.total_callers ?? 0}
+                  total={callersQuery.data?.total_groups ?? 0}
                   onPageChange={setCallerPage}
                 />
               </>
@@ -702,7 +896,176 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           </CardContent>
         </Card>
       </div>
+
+      <TrafficDetailSheet
+        detail={detail}
+        onClose={() => setDetail(null)}
+        data={detailQuery.data}
+        isPending={detailQuery.isPending}
+        isError={detailQuery.isError}
+      />
     </div>
+  )
+}
+
+function SortableTrafficHead({
+  label,
+  metric,
+  active,
+  onSort,
+  className,
+}: {
+  label: string
+  metric: TrafficMetric
+  active: TrafficMetric
+  onSort: (metric: TrafficMetric) => void
+  className?: string
+}) {
+  return (
+    <TableHead className={`text-right ${className ?? ''}`}>
+      <button
+        type="button"
+        className={`ml-auto flex items-center gap-1 ${active === metric ? 'text-foreground' : ''}`}
+        onClick={() => onSort(metric)}
+      >
+        {label}
+        <ArrowUpDown className="h-3 w-3" />
+      </button>
+    </TableHead>
+  )
+}
+
+function TrafficDetailSheet({
+  detail,
+  onClose,
+  data,
+  isPending,
+  isError,
+}: {
+  detail: TrafficDetail | null
+  onClose: () => void
+  data: TrafficAggregationResponse | undefined
+  isPending: boolean
+  isError: boolean
+}) {
+  return (
+    <Sheet open={detail !== null} onOpenChange={(open) => !open && onClose()}>
+      <SheetContent className="w-full overflow-y-auto sm:max-w-5xl">
+        <SheetHeader>
+          <SheetTitle className="font-mono text-base">
+            {detail?.kind === 'ip'
+              ? `Routes called by ${detail.value}`
+              : `IPs calling ${detail?.method ?? ''} ${detail?.value ?? ''}`}
+          </SheetTitle>
+          <SheetDescription>
+            Analytics use the active dashboard time and environment filters.
+            Temps monitor checks are excluded.
+          </SheetDescription>
+        </SheetHeader>
+        <div className="mt-6">
+          {isPending ? (
+            <Skeleton className="h-[360px] w-full" />
+          ) : isError ? (
+            <QueryErrorState label="traffic detail" />
+          ) : (data?.rows.length ?? 0) === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No matching traffic in this period.
+            </p>
+          ) : (
+            <>
+              <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <StatTile
+                  label="Groups"
+                  value={formatNumber(data?.total_groups ?? 0)}
+                  loading={false}
+                  error={false}
+                />
+                <StatTile
+                  label="Requests"
+                  value={formatNumber(
+                    data?.rows.reduce(
+                      (sum, row) => sum + (row.metrics.requests ?? 0),
+                      0
+                    ) ?? 0
+                  )}
+                  loading={false}
+                  error={false}
+                />
+                <StatTile
+                  label="Errors"
+                  value={formatNumber(
+                    data?.rows.reduce(
+                      (sum, row) => sum + (row.metrics.errors ?? 0),
+                      0
+                    ) ?? 0
+                  )}
+                  loading={false}
+                  error={false}
+                />
+                <StatTile
+                  label="Monitor"
+                  value="Excluded"
+                  loading={false}
+                  error={false}
+                />
+              </div>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>
+                      {detail?.kind === 'ip' ? 'Route' : 'Client IP'}
+                    </TableHead>
+                    <TableHead className="text-right">Requests</TableHead>
+                    <TableHead className="text-right">Min</TableHead>
+                    <TableHead className="text-right">Avg</TableHead>
+                    <TableHead className="text-right">Max</TableHead>
+                    <TableHead className="text-right">p95</TableHead>
+                    <TableHead className="text-right">Err %</TableHead>
+                    <TableHead className="text-right">Last seen</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {data?.rows.map((row, index) => (
+                    <TableRow
+                      key={`${row.dimensions.map((item) => item.value).join(':')}-${index}`}
+                    >
+                      <TableCell className="max-w-[260px] font-mono text-xs">
+                        {detail?.kind === 'ip'
+                          ? `${trafficDimension(row, 'method')} ${trafficDimension(row, 'path')}`
+                          : trafficDimension(row, 'client_ip')}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatNumber(row.metrics.requests ?? 0)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatMs(row.metrics.latency_min_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatMs(row.metrics.latency_avg_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatMs(row.metrics.latency_max_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatMs(row.metrics.latency_p95_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {formatPercent(row.metrics.error_rate ?? 0)}
+                      </TableCell>
+                      <TableCell className="text-right text-xs text-muted-foreground">
+                        {row.metrics.last_seen
+                          ? new Date(row.metrics.last_seen).toLocaleString()
+                          : '—'}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
   )
 }
 

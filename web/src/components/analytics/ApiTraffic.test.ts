@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { parseStructuredSseFrame } from '@/hooks/useStructuredAi'
-import { apiTrafficSummaryCacheKey } from './ApiTraffic'
-import { shouldRequestApiTrafficSummary } from '@/lib/ai-summary'
+import {
+  apiTrafficSummaryCacheKey,
+  canStartApiTrafficSummary,
+  shouldRequestApiTrafficSummary,
+} from '@/lib/ai-summary'
 
 describe('structured AI SSE parsing', () => {
   test('parses a partial JSON event', () => {
@@ -64,6 +67,36 @@ describe('API traffic summary cache identity', () => {
 })
 
 describe('API traffic summary request gating', () => {
+  test('lets the user start an on-demand summary before context is loaded', () => {
+    expect(
+      canStartApiTrafficSummary({
+        analyticsEnabled: true,
+        timeseriesPending: false,
+        timeseriesError: false,
+      })
+    ).toBe(true)
+  })
+
+  test('waits for the base timeseries before starting context queries', () => {
+    expect(
+      canStartApiTrafficSummary({
+        analyticsEnabled: true,
+        timeseriesPending: true,
+        timeseriesError: false,
+      })
+    ).toBe(false)
+  })
+
+  test('does not start when the required base analytics failed', () => {
+    expect(
+      canStartApiTrafficSummary({
+        analyticsEnabled: true,
+        timeseriesPending: false,
+        timeseriesError: true,
+      })
+    ).toBe(false)
+  })
+
   test('never spends AI credits before an explicit request', () => {
     expect(
       shouldRequestApiTrafficSummary({
