@@ -1074,16 +1074,60 @@ impl PostgresService {
         self.walg_env_exists_in_container(&container_name).await
     }
 
-    /// Returns true iff `/var/lib/postgresql/walg.env` exists in this service's
-    /// container filesystem.
+    /// Returns true iff `/var/lib/postgresql/walg.env` exists on this
+    /// service's data volume.
     ///
-    /// Use Docker's native archive API instead of starting a helper container:
-    /// the path lives on the service's mounted data volume, and `docker cp` /
-    /// `download_from_container` can read it from a stopped container without
-    /// executing third-party image code against the Postgres volume.
-    /// Any error (missing container, missing file, Docker API failure) returns
-    /// false — we err on the side of not enabling archiving.
+    /// Use Docker's native archive API instead of starting a helper
+    /// container: the path lives on the service's mounted data volume, and
+    /// `docker cp` / `download_from_container` can read it from a stopped
+    /// container without executing third-party image code against the
+    /// Postgres volume. Any error (missing container, missing file, Docker
+    /// API failure) returns false — we err on the side of not enabling
+    /// archiving.
+    ///
+    /// The live container is probed directly when it exists. Otherwise
+    /// (fresh create, `force_recreate`, an externally-removed container, or
+    /// node failover) there's no container to probe, but the volume can
+    /// still hold a `walg.env` from a prior life -- probed via a throwaway
+    /// container that only mounts the named volume and is never started
+    /// (see `walg_env_exists_on_volume`).
     async fn walg_env_exists_in_container(&self, container_name: &str) -> bool {
+        let live = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map(|containers| !containers.is_empty())
+            .unwrap_or(false);
+
+        if live {
+            return self.download_walg_env(container_name).await;
+        }
+
+        let volume_name = format!("{container_name}_data");
+        let probe_image = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.docker_image.clone())
+            .unwrap_or_else(|| {
+                let (image, tag) = self.get_default_docker_image();
+                format!("{image}:{tag}")
+            });
+        self.walg_env_exists_on_volume(&volume_name, &probe_image)
+            .await
+    }
+
+    /// Reads `/var/lib/postgresql/walg.env` from a live container's
+    /// filesystem via Docker's archive API.
+    async fn download_walg_env(&self, container_name: &str) -> bool {
         use bollard::query_parameters::DownloadFromContainerOptions;
         use futures::StreamExt;
 
@@ -1093,14 +1137,82 @@ impl PostgresService {
                 path: "/var/lib/postgresql/walg.env".to_string(),
             }),
         );
-
+        let mut saw_archive_data = false;
         while let Some(chunk) = archive_stream.next().await {
-            if chunk.is_err() {
-                return false;
+            match chunk {
+                Ok(bytes) if !bytes.is_empty() => saw_archive_data = true,
+                Ok(_) => {}
+                Err(_) => return false,
             }
         }
 
-        true
+        saw_archive_data
+    }
+
+    /// Probes `volume_name` for `walg.env` by creating a never-started
+    /// container that mounts it at `/var/lib/postgresql`, reading it via
+    /// the same archive API `download_walg_env` uses, then removing the
+    /// probe container. The probe container is never started, so
+    /// `probe_image`'s content never executes -- it only needs to exist so
+    /// Docker can materialize the container's filesystem for the archive
+    /// read. `probe_image` is the service's own already-vetted image
+    /// (already local from the container that used to run against this
+    /// volume), so this never pulls or trusts anything new.
+    async fn walg_env_exists_on_volume(&self, volume_name: &str, probe_image: &str) -> bool {
+        let probe_name = format!("{volume_name}-walg-probe");
+
+        let _ = self
+            .docker
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let create_result = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&probe_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(probe_image.to_string()),
+                    host_config: Some(bollard::models::HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            target: Some("/var/lib/postgresql".to_string()),
+                            source: Some(volume_name.to_string()),
+                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let exists = match create_result {
+            Ok(_) => self.download_walg_env(&probe_name).await,
+            Err(_) => false,
+        };
+
+        let _ = self
+            .docker
+            .remove_container(
+                &probe_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        exists
     }
 
     /// Returns true when the running container's CMD specifies an
@@ -4248,6 +4360,92 @@ mod tests {
 
         // Cleanup
         let _ = service.cleanup().await;
+    }
+
+    /// Regression test: `compute_desired_enable_archiving()` must find a
+    /// pre-existing `walg.env` on the data volume even when there is no
+    /// live container to probe directly. Without the volume-probe fallback,
+    /// `start()`'s `need_create` path (force_recreate, node failover, or an
+    /// externally-removed container) would silently bake `archive_mode=off`
+    /// into the recreated container even though WAL-G was already
+    /// configured on the volume.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_walg_env_probed_from_volume_when_container_missing() {
+        use std::net::TcpListener;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind for port allocation")
+            .local_addr()
+            .expect("failed to read local addr")
+            .port();
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-walg-volume-probe".to_string(), docker.clone());
+
+        let config = ServiceConfig {
+            name: "test-walg-volume-probe".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port.to_string(),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "max_connections": 100,
+                "ssl_mode": "disable",
+                "docker_image": "gotempsh/postgres-walg:18-bookworm"
+            }),
+        };
+
+        service.init(config).await.expect("init should succeed");
+        let container_name = service.get_container_name();
+
+        // No walg.env written yet -- archiving must read as not desired.
+        assert!(
+            !service.compute_desired_enable_archiving().await,
+            "fresh service should not have archiving enabled"
+        );
+
+        service
+            .write_walg_env_file(
+                &container_name,
+                &["AWS_ACCESS_KEY_ID=test".to_string()],
+            )
+            .await
+            .expect("failed to write walg.env");
+
+        // Sanity check: the live container reports archiving desired.
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "live container should report walg.env as present"
+        );
+
+        // Remove the container but keep the volume, simulating
+        // force_recreate / node failover / an externally-removed container.
+        docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("failed to remove container");
+
+        assert!(
+            service.compute_desired_enable_archiving().await,
+            "archiving must still read as desired from the volume once the container is gone"
+        );
+
+        // Cleanup: volume (container is already gone).
+        let _ = docker
+            .remove_volume(
+                &format!("{container_name}_data"),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
     }
 
     /// Regression test for a bug where `init()` persisted the *requested*
