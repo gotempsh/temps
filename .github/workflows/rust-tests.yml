@@ -45,6 +45,9 @@ jobs:
         # twice already (dependency-scan.yml, network-kernel-tests.yml).
         run: python3 .github/scripts/check-cache-save-guards.py
 
+      - name: Verify nextest target seed contracts
+        run: python3 .github/scripts/test-nextest-cache-seed.py
+
   # ---------------------------------------------------------------------------
   # One `temps` binary, two consumers.
   #
@@ -432,12 +435,17 @@ jobs:
   build-test-binaries:
     name: Build Test Binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
-          sudo apt-get autoremove -y && sudo apt-get clean
+          # The explicit directories reclaim the bulk of the space. Running
+          # apt autoremove as well cost ~80 seconds in the measured job.
+          sudo apt-get clean
 
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -461,6 +469,37 @@ jobs:
           # cache pool. See the check job for the full reasoning.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Find inherited nextest target seed
+        id: nextest-seed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v1
+
+      - name: Download inherited nextest target seed
+        id: nextest-seed-download
+        if: steps.nextest-seed.outputs.run-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.nextest-seed.outputs.artifact-name }}
+          path: ci-nextest-seed
+          run-id: ${{ steps.nextest-seed.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Unpack inherited nextest target seed
+        if: steps.nextest-seed.outputs.run-id != '' && steps.nextest-seed-download.outcome == 'success'
+        run: |
+          if ! .github/scripts/nextest-cache-archive.sh unpack ci-nextest-seed/nextest-target-seed.tar.zst .; then
+            echo 'warning: inherited nextest seed was invalid; continuing with dependency cache only' >&2
+          fi
+          rm -f ci-nextest-seed/nextest-target-seed.tar.zst*
+
+      - name: Invalidate commit-stamped temps-cli artifacts
+        # build.rs embeds the commit and build timestamp but only watches Git
+        # metadata for release builds. Never let an inherited debug artifact
+        # retain the seed run's version metadata.
+        run: cargo clean --profile dev --package temps-cli
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -478,15 +517,29 @@ jobs:
         # deps), so this only recompiles temps-providers/temps-backup
         # themselves on top of the previous step's already-built dependency
         # graph, not the whole workspace again.
-        run: cargo nextest archive --workspace --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
+        run: cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
         env:
           CARGO_INCREMENTAL: 0
+
+      - name: Package nextest target seed
+        if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
+        run: .github/scripts/nextest-cache-archive.sh pack . nextest-target-seed.tar.zst
+
+      - name: Publish nextest target seed
+        if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-nextest-target-seed-v1
+          path: nextest-target-seed.tar.zst
+          compression-level: 0
+          retention-days: 7
 
       - name: Upload default-feature archive
         uses: actions/upload-artifact@v7
         with:
           name: test-binaries-default
           path: test-binaries-default.tar.zst
+          compression-level: 0
           retention-days: 1
 
       - name: Upload docker-tests archive
@@ -494,6 +547,7 @@ jobs:
         with:
           name: test-binaries-docker-tests
           path: test-binaries-docker-tests.tar.zst
+          compression-level: 0
           retention-days: 1
 
   # ---------------------------------------------------------------------------
