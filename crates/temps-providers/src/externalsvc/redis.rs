@@ -595,6 +595,15 @@ impl RedisService {
     /// selected from DBs 1-15 and recorded in Redis before their connection
     /// details are returned, so two resources cannot silently receive the same
     /// logical DB. When all databases are in use, allocation fails closed.
+    ///
+    /// The "read mapping, then claim" sequence below isn't a single atomic
+    /// transaction, so a concurrent `drop_database` for the same resource
+    /// could in principle interleave between the mapping read and the
+    /// `SETNX` claim. This is an accepted race: a single Redis instance and
+    /// the short critical section make it low-risk in practice, and
+    /// allocate/drop for the same resource aren't expected to run
+    /// concurrently (provision and deprovision are serialized per resource
+    /// at the caller).
     async fn allocate_database(&self, resource_name: &str) -> Result<u8> {
         let mut conn = self.get_connection().await?;
         redis::cmd("SELECT")
@@ -3076,6 +3085,115 @@ mod tests {
         assert!(new_local_addr.contains("7544"), "New port should be 7544");
 
         // Cleanup
+        let _ = service.cleanup().await;
+    }
+
+    /// Regression coverage for the DB-collision bug this fix closes: two
+    /// distinct resources must never share a logical DB, re-allocating the
+    /// same resource must be idempotent, and `drop_database` must actually
+    /// free the slot for reuse rather than leaking it.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_allocate_database_isolation_and_reuse() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-db-alloc".to_string(), docker);
+
+        let config = super::ServiceConfig {
+            name: "test-db-alloc".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "7549",
+                "password": "allocpass123"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+
+        // Two distinct resources must get distinct DBs.
+        let db_a = service
+            .allocate_database("project-a/prod")
+            .await
+            .expect("allocate resource A");
+        let db_b = service
+            .allocate_database("project-b/prod")
+            .await
+            .expect("allocate resource B");
+        assert_ne!(
+            db_a, db_b,
+            "distinct resources must not collide on the same DB"
+        );
+        assert!((1..=15).contains(&db_a), "allocated DB must be in 1-15");
+        assert!((1..=15).contains(&db_b), "allocated DB must be in 1-15");
+
+        // Re-allocating the same resource is idempotent.
+        let db_a_again = service
+            .allocate_database("project-a/prod")
+            .await
+            .expect("re-allocate resource A");
+        assert_eq!(
+            db_a, db_a_again,
+            "re-allocating the same resource must return the same DB"
+        );
+
+        // drop_database frees the slot for reuse by a different resource.
+        service
+            .drop_database("project-a/prod")
+            .await
+            .expect("drop resource A");
+        let db_c = service
+            .allocate_database("project-c/prod")
+            .await
+            .expect("allocate resource C after drop");
+        assert_eq!(
+            db_c, db_a,
+            "a freed DB must be reusable by a new resource"
+        );
+
+        // Cleanup
+        let _ = service.drop_database("project-b/prod").await;
+        let _ = service.drop_database("project-c/prod").await;
+        let _ = service.cleanup().await;
+    }
+
+    /// When all 15 workload DBs (1-15) are claimed, allocation for a new
+    /// resource must fail closed instead of silently colliding with an
+    /// existing resource's DB.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_allocate_database_fails_closed_when_exhausted() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-db-exhaust".to_string(), docker);
+
+        let config = super::ServiceConfig {
+            name: "test-db-exhaust".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "7550",
+                "password": "exhaustpass123"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+
+        for i in 0..15 {
+            service
+                .allocate_database(&format!("resource-{i}"))
+                .await
+                .unwrap_or_else(|e| panic!("allocate resource-{i} should succeed: {e}"));
+        }
+
+        let result = service.allocate_database("resource-overflow").await;
+        assert!(
+            result.is_err(),
+            "allocation must fail closed once all 15 workload DBs are claimed"
+        );
+
+        // Cleanup
+        for i in 0..15 {
+            let _ = service.drop_database(&format!("resource-{i}")).await;
+        }
         let _ = service.cleanup().await;
     }
 
