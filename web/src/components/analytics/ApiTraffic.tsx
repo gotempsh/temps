@@ -55,6 +55,8 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   ArrowUpDown,
   ChevronLeft,
   ChevronRight,
@@ -71,6 +73,11 @@ import {
   canStartApiTrafficSummary,
   shouldRequestApiTrafficSummary,
 } from '@/lib/ai-summary'
+import {
+  nextTrafficSort,
+  trafficPageCount,
+  type TrafficSort,
+} from '@/lib/api-traffic-sort'
 
 interface ApiTrafficTabProps {
   project: ProjectResponse
@@ -83,7 +90,14 @@ interface ApiTrafficAiSummary {
   recommendation?: string | null
 }
 
-type TrafficMetric = 'requests' | 'error_rate' | 'latency_avg'
+type TrafficMetric =
+  | 'requests'
+  | 'error_rate'
+  | 'latency_avg'
+  | 'latency_min'
+  | 'latency_max'
+  | 'latency_p95'
+  | 'last_seen'
 
 interface TrafficDetail {
   kind: 'ip' | 'path'
@@ -183,9 +197,18 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const forceCliSummaryRefresh = React.useRef(false)
   const [routePage, setRoutePage] = React.useState(0)
   const [callerPage, setCallerPage] = React.useState(0)
-  const [routeSort, setRouteSort] = React.useState<TrafficMetric>('requests')
-  const [callerSort, setCallerSort] = React.useState<TrafficMetric>('requests')
+  const [routeSort, setRouteSort] = React.useState<TrafficSort<TrafficMetric>>({
+    metric: 'requests',
+    direction: 'desc',
+  })
+  const [callerSort, setCallerSort] = React.useState<
+    TrafficSort<TrafficMetric>
+  >({ metric: 'requests', direction: 'desc' })
   const [detail, setDetail] = React.useState<TrafficDetail | null>(null)
+  const [detailPage, setDetailPage] = React.useState(0)
+  const [detailSort, setDetailSort] = React.useState<
+    TrafficSort<TrafficMetric>
+  >({ metric: 'requests', direction: 'desc' })
   const queryClient = useQueryClient()
 
   // getDateRangeFromFilter computes `new Date()` internally, so calling it
@@ -206,6 +229,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       setDateFilter(next)
       setRoutePage(0)
       setCallerPage(0)
+      setDetailPage(0)
       setSummaryRequested(false)
       const params = new URLSearchParams(searchParams)
       params.set('filter', next.quickFilter)
@@ -277,7 +301,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       selectedEnvironment,
       'routes',
       routePage,
-      routeSort,
+      routeSort.metric,
+      routeSort.direction,
     ],
     queryFn: () =>
       queryTraffic(project.id, {
@@ -298,7 +323,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         ],
         filters: [],
         order_by: [
-          { field: { kind: 'metric', field: routeSort }, direction: 'desc' },
+          {
+            field: { kind: 'metric', field: routeSort.metric },
+            direction: routeSort.direction,
+          },
         ],
         include_synthetic: false,
         page: routePage + 1,
@@ -316,7 +344,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       selectedEnvironment,
       'callers',
       callerPage,
-      callerSort,
+      callerSort.metric,
+      callerSort.direction,
     ],
     queryFn: () =>
       queryTraffic(project.id, {
@@ -337,7 +366,10 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         ],
         filters: [],
         order_by: [
-          { field: { kind: 'metric', field: callerSort }, direction: 'desc' },
+          {
+            field: { kind: 'metric', field: callerSort.metric },
+            direction: callerSort.direction,
+          },
         ],
         include_synthetic: false,
         page: callerPage + 1,
@@ -355,6 +387,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       selectedEnvironment,
       'detail',
       detail,
+      detailPage,
+      detailSort.metric,
+      detailSort.direction,
     ],
     queryFn: () => {
       if (!detail) throw new Error('No traffic detail selected')
@@ -386,11 +421,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         ],
         filters,
         order_by: [
-          { field: { kind: 'metric', field: 'requests' }, direction: 'desc' },
+          {
+            field: { kind: 'metric', field: detailSort.metric },
+            direction: detailSort.direction,
+          },
         ],
         include_synthetic: false,
-        page: 1,
-        page_size: 100,
+        page: detailPage + 1,
+        page_size: pageSize,
       })
     },
     enabled: enabled && detail !== null,
@@ -629,6 +667,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           setSelectedEnvironment(environmentId)
           setRoutePage(0)
           setCallerPage(0)
+          setDetailPage(0)
           setSummaryRequested(false)
         }}
         onRefresh={handleRefresh}
@@ -747,7 +786,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         metric="requests"
                         active={routeSort}
                         onSort={(metric) => {
-                          setRouteSort(metric)
+                          setRouteSort((current) =>
+                            nextTrafficSort(current, metric)
+                          )
                           setRoutePage(0)
                         }}
                       />
@@ -757,7 +798,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         metric="latency_avg"
                         active={routeSort}
                         onSort={(metric) => {
-                          setRouteSort(metric)
+                          setRouteSort((current) =>
+                            nextTrafficSort(current, metric)
+                          )
                           setRoutePage(0)
                         }}
                       />
@@ -766,7 +809,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         metric="error_rate"
                         active={routeSort}
                         onSort={(metric) => {
-                          setRouteSort(metric)
+                          setRouteSort((current) =>
+                            nextTrafficSort(current, metric)
+                          )
                           setRoutePage(0)
                         }}
                       />
@@ -780,9 +825,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         <TableRow
                           key={`${method}-${path}-${i}`}
                           className="cursor-pointer"
-                          onClick={() =>
+                          onClick={() => {
+                            setDetailPage(0)
+                            setDetailSort({
+                              metric: 'requests',
+                              direction: 'desc',
+                            })
                             setDetail({ kind: 'path', value: path, method })
-                          }
+                          }}
                         >
                           <TableCell className="max-w-[220px]">
                             <div className="flex items-center gap-2">
@@ -847,7 +897,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         metric="requests"
                         active={callerSort}
                         onSort={(metric) => {
-                          setCallerSort(metric)
+                          setCallerSort((current) =>
+                            nextTrafficSort(current, metric)
+                          )
                           setCallerPage(0)
                         }}
                       />
@@ -856,7 +908,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         metric="error_rate"
                         active={callerSort}
                         onSort={(metric) => {
-                          setCallerSort(metric)
+                          setCallerSort((current) =>
+                            nextTrafficSort(current, metric)
+                          )
                           setCallerPage(0)
                         }}
                       />
@@ -869,7 +923,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                         <TableRow
                           key={ip}
                           className="cursor-pointer"
-                          onClick={() => setDetail({ kind: 'ip', value: ip })}
+                          onClick={() => {
+                            setDetailPage(0)
+                            setDetailSort({
+                              metric: 'requests',
+                              direction: 'desc',
+                            })
+                            setDetail({ kind: 'ip', value: ip })
+                          }}
                         >
                           <TableCell className="font-mono text-xs">
                             {ip}
@@ -903,6 +964,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         data={detailQuery.data}
         isPending={detailQuery.isPending}
         isError={detailQuery.isError}
+        page={detailPage}
+        pageSize={pageSize}
+        sort={detailSort}
+        onPageChange={setDetailPage}
+        onSort={(metric) => {
+          setDetailSort((current) => nextTrafficSort(current, metric))
+          setDetailPage(0)
+        }}
       />
     </div>
   )
@@ -917,7 +986,7 @@ function SortableTrafficHead({
 }: {
   label: string
   metric: TrafficMetric
-  active: TrafficMetric
+  active: TrafficSort<TrafficMetric>
   onSort: (metric: TrafficMetric) => void
   className?: string
 }) {
@@ -925,11 +994,18 @@ function SortableTrafficHead({
     <TableHead className={`text-right ${className ?? ''}`}>
       <button
         type="button"
-        className={`ml-auto flex items-center gap-1 ${active === metric ? 'text-foreground' : ''}`}
+        className={`ml-auto flex items-center gap-1 ${active.metric === metric ? 'text-foreground' : ''}`}
         onClick={() => onSort(metric)}
+        aria-label={`Sort by ${label} ${active.metric === metric && active.direction === 'desc' ? 'ascending' : 'descending'}`}
       >
         {label}
-        <ArrowUpDown className="h-3 w-3" />
+        {active.metric !== metric ? (
+          <ArrowUpDown className="h-3 w-3" />
+        ) : active.direction === 'asc' ? (
+          <ArrowUp className="h-3 w-3" />
+        ) : (
+          <ArrowDown className="h-3 w-3" />
+        )}
       </button>
     </TableHead>
   )
@@ -941,12 +1017,22 @@ function TrafficDetailSheet({
   data,
   isPending,
   isError,
+  page,
+  pageSize,
+  sort,
+  onPageChange,
+  onSort,
 }: {
   detail: TrafficDetail | null
   onClose: () => void
   data: TrafficAggregationResponse | undefined
   isPending: boolean
   isError: boolean
+  page: number
+  pageSize: number
+  sort: TrafficSort<TrafficMetric>
+  onPageChange: (page: number) => void
+  onSort: (metric: TrafficMetric) => void
 }) {
   return (
     <Sheet open={detail !== null} onOpenChange={(open) => !open && onClose()}>
@@ -968,9 +1054,17 @@ function TrafficDetailSheet({
           ) : isError ? (
             <QueryErrorState label="traffic detail" />
           ) : (data?.rows.length ?? 0) === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No matching traffic in this period.
-            </p>
+            <>
+              <p className="text-sm text-muted-foreground">
+                No matching traffic on this page.
+              </p>
+              <TrafficPagination
+                page={page}
+                pageSize={pageSize}
+                total={data?.total_groups ?? 0}
+                onPageChange={onPageChange}
+              />
+            </>
           ) : (
             <>
               <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -981,7 +1075,7 @@ function TrafficDetailSheet({
                   error={false}
                 />
                 <StatTile
-                  label="Requests"
+                  label="Page requests"
                   value={formatNumber(
                     data?.rows.reduce(
                       (sum, row) => sum + (row.metrics.requests ?? 0),
@@ -992,7 +1086,7 @@ function TrafficDetailSheet({
                   error={false}
                 />
                 <StatTile
-                  label="Errors"
+                  label="Page errors"
                   value={formatNumber(
                     data?.rows.reduce(
                       (sum, row) => sum + (row.metrics.errors ?? 0),
@@ -1015,13 +1109,48 @@ function TrafficDetailSheet({
                     <TableHead>
                       {detail?.kind === 'ip' ? 'Route' : 'Client IP'}
                     </TableHead>
-                    <TableHead className="text-right">Requests</TableHead>
-                    <TableHead className="text-right">Min</TableHead>
-                    <TableHead className="text-right">Avg</TableHead>
-                    <TableHead className="text-right">Max</TableHead>
-                    <TableHead className="text-right">p95</TableHead>
-                    <TableHead className="text-right">Err %</TableHead>
-                    <TableHead className="text-right">Last seen</TableHead>
+                    <SortableTrafficHead
+                      label="Requests"
+                      metric="requests"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="Min"
+                      metric="latency_min"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="Avg"
+                      metric="latency_avg"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="Max"
+                      metric="latency_max"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="p95"
+                      metric="latency_p95"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="Err %"
+                      metric="error_rate"
+                      active={sort}
+                      onSort={onSort}
+                    />
+                    <SortableTrafficHead
+                      label="Last seen"
+                      metric="last_seen"
+                      active={sort}
+                      onSort={onSort}
+                    />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -1061,6 +1190,12 @@ function TrafficDetailSheet({
                   ))}
                 </TableBody>
               </Table>
+              <TrafficPagination
+                page={page}
+                pageSize={pageSize}
+                total={data?.total_groups ?? 0}
+                onPageChange={onPageChange}
+              />
             </>
           )}
         </div>
@@ -1080,7 +1215,7 @@ function TrafficPagination({
   total: number
   onPageChange: (page: number) => void
 }) {
-  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+  const pageCount = trafficPageCount(total, pageSize)
   if (pageCount <= 1) return null
   return (
     <div className="mt-3 flex items-center justify-between border-t pt-3">

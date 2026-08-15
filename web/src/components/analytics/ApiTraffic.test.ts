@@ -5,6 +5,26 @@ import {
   canStartApiTrafficSummary,
   shouldRequestApiTrafficSummary,
 } from '@/lib/ai-summary'
+import { nextTrafficSort, trafficPageCount } from '@/lib/api-traffic-sort'
+
+describe('API traffic server-side sorting', () => {
+  test('toggles an active metric from descending to ascending', () => {
+    expect(
+      nextTrafficSort({ metric: 'error_rate', direction: 'desc' }, 'error_rate')
+    ).toEqual({ metric: 'error_rate', direction: 'asc' })
+  })
+
+  test('starts a newly selected metric in descending order', () => {
+    expect(
+      nextTrafficSort({ metric: 'requests', direction: 'asc' }, 'latency_avg')
+    ).toEqual({ metric: 'latency_avg', direction: 'desc' })
+  })
+
+  test('paginates high-cardinality route and caller drilldowns', () => {
+    expect(trafficPageCount(100_000, 20)).toBe(5_000)
+    expect(trafficPageCount(1_000, 20)).toBe(50)
+  })
+})
 
 describe('structured AI SSE parsing', () => {
   test('parses a partial JSON event', () => {

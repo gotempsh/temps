@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn traffic_query_supports_multi_dimension_metrics_and_excludes_monitor() {
-        let request = TrafficAggregationRequest {
+        let mut request = TrafficAggregationRequest {
             start_time: chrono::Utc::now() - chrono::Duration::hours(1),
             end_time: chrono::Utc::now(),
             environment_id: Some(3),
@@ -769,7 +769,10 @@ mod tests {
                 operator: TrafficFilterOperator::Eq,
                 values: vec!["/api/health' OR TRUE --".to_string()],
             }],
-            order_by: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::ErrorRate),
+                direction: TrafficSortDirection::Asc,
+            }],
             include_synthetic: false,
             page: 1,
             page_size: 20,
@@ -781,8 +784,15 @@ mod tests {
         assert!(sql.contains("MAX(response_time_ms)::double precision"));
         assert!(sql.contains("request_source <> 'temps_monitor'"));
         assert!(sql.contains("Temps-Status-Monitor/%"));
+        assert!(sql
+            .contains("ORDER BY error_rate ASC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
         assert!(!sql.contains("OR TRUE"), "filter values must remain bound");
         assert_eq!(values.len(), 5);
+
+        request.order_by[0].direction = TrafficSortDirection::Desc;
+        let (sql, _, _) = build_traffic_query(7, &request).expect("valid descending query");
+        assert!(sql
+            .contains("ORDER BY error_rate DESC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
     }
 
     #[tokio::test]

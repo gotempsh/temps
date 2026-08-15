@@ -2884,7 +2884,7 @@ mod tests {
 
     #[test]
     fn traffic_query_matches_timescale_shape_and_binds_filters() {
-        let request = TrafficAggregationRequest {
+        let mut request = TrafficAggregationRequest {
             start_time: Utc::now() - chrono::Duration::hours(1),
             end_time: Utc::now(),
             environment_id: Some(3),
@@ -2900,7 +2900,10 @@ mod tests {
                 operator: TrafficFilterOperator::Eq,
                 values: vec!["/api/health' OR 1=1 --".to_string()],
             }],
-            order_by: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::ErrorRate),
+                direction: TrafficSortDirection::Asc,
+            }],
             include_synthetic: false,
             page: 1,
             page_size: 20,
@@ -2912,8 +2915,15 @@ mod tests {
         assert!(sql.contains("max(toFloat64(response_time_ms))"));
         assert!(sql.contains("request_source != 'temps_monitor'"));
         assert!(sql.contains("Temps-Status-Monitor/%"));
+        assert!(sql
+            .contains("ORDER BY error_rate ASC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
         assert!(!sql.contains("OR 1=1"), "filter values must remain bound");
         assert_eq!(binds.len(), 5);
+
+        request.order_by[0].direction = TrafficSortDirection::Desc;
+        let (sql, _, _) = build_traffic_query(7, &request).expect("valid descending query");
+        assert!(sql
+            .contains("ORDER BY error_rate DESC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
     }
 
     #[test]
