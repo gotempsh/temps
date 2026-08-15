@@ -581,7 +581,13 @@ impl PostgresService {
         ];
 
         let mut host_config = bollard::models::HostConfig {
-            port_bindings: Some(crate::utils::local_port_binding("5432/tcp", &config.port)),
+            port_bindings: Some(HashMap::from([(
+                "5432/tcp".to_string(),
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(config.port.clone()),
+                }]),
+            )])),
             mounts: Some(vec![bollard::models::Mount {
                 // Always mount at /var/lib/postgresql - PGDATA env var controls subdirectory
                 target: Some("/var/lib/postgresql".to_string()),
