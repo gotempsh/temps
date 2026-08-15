@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-SEED_PREFIX = "temps-musl-fast-seed-v1-"
-MAX_PAGES = 10
+SEED_NAME = "temps-musl-fast-seed-v1"
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -27,23 +26,18 @@ def parse_timestamp(value: str) -> datetime:
 def eligible_artifacts(
     artifacts: list[dict[str, Any]], current_name: str
 ) -> list[dict[str, Any]]:
-    """Return trusted seeds, preferring an exact dependency-key match."""
+    """Return newest-first cache seeds produced by trusted main runs."""
     candidates = [
         artifact
         for artifact in artifacts
-        if re.fullmatch(
-            rf"{re.escape(SEED_PREFIX)}[A-Za-z0-9_.-]+", artifact.get("name", "")
-        )
+        if artifact.get("name") == current_name
         and not artifact.get("expired", False)
         and artifact.get("workflow_run", {}).get("head_branch") == "main"
         and isinstance(artifact.get("workflow_run", {}).get("id"), int)
     ]
     return sorted(
         candidates,
-        key=lambda artifact: (
-            artifact.get("name") == current_name,
-            artifact.get("created_at", ""),
-        ),
+        key=lambda artifact: artifact.get("created_at", ""),
         reverse=True,
     )
 
@@ -64,31 +58,28 @@ def should_publish(
     return parse_timestamp(expires_at) <= now + timedelta(days=2)
 
 
-def github_artifacts(repository: str, token: str) -> list[dict[str, Any]]:
+def github_artifacts(
+    repository: str, token: str, artifact_name: str
+) -> list[dict[str, Any]]:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("GITHUB_REPOSITORY must be an owner/repository pair")
 
-    artifacts: list[dict[str, Any]] = []
     base_url = f"https://api.github.com/repos/{repository}/actions/artifacts"
-    for page in range(1, MAX_PAGES + 1):
-        query = urllib.parse.urlencode({"per_page": 100, "page": page})
-        request = urllib.request.Request(
-            f"{base_url}?{query}",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "temps-musl-cache-seed",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-        page_artifacts = payload.get("artifacts")
-        if not isinstance(page_artifacts, list):
-            raise ValueError("GitHub artifacts response did not contain an artifacts list")
-        artifacts.extend(page_artifacts)
-        if len(page_artifacts) < 100:
-            break
+    query = urllib.parse.urlencode({"per_page": 100, "name": artifact_name})
+    request = urllib.request.Request(
+        f"{base_url}?{query}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "temps-musl-cache-seed",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("GitHub artifacts response did not contain an artifacts list")
     return artifacts
 
 
@@ -101,9 +92,7 @@ def append_outputs(output_path: Path, values: dict[str, str]) -> None:
 
 
 def find_seed(current_name: str) -> int:
-    if not current_name.startswith(SEED_PREFIX) or not re.fullmatch(
-        r"[A-Za-z0-9_.-]+", current_name
-    ):
+    if current_name != SEED_NAME:
         print("invalid musl cache seed artifact name", file=sys.stderr)
         return 2
 
@@ -115,7 +104,7 @@ def find_seed(current_name: str) -> int:
         return 2
 
     try:
-        artifacts = github_artifacts(repository, token)
+        artifacts = github_artifacts(repository, token, current_name)
         candidates = eligible_artifacts(artifacts, current_name)
         selected = candidates[0] if candidates else None
         values = {

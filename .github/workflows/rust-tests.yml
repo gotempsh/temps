@@ -144,7 +144,7 @@ jobs:
         id: musl-seed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CURRENT_SEED_NAME: temps-musl-fast-seed-v1-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          CURRENT_SEED_NAME: temps-musl-fast-seed-v1
         run: python3 .github/scripts/musl-cache-seed.py "$CURRENT_SEED_NAME"
 
       - name: Download inherited musl cache seed
@@ -206,9 +206,9 @@ jobs:
           key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
 
       # Keep an artifact-backed copy outside the eviction-prone Actions cache
-      # pool. Publish only when the current dependency key has no healthy seed
-      # (or it is within two days of expiry), so storage does not grow with
-      # every main commit. A new seed naturally supersedes the old 7-day one.
+      # pool. Publish only when the rolling seed is missing or within two days
+      # of expiry, so storage does not grow with every main commit. Cargo
+      # invalidates incompatible intermediates after lockfile/toolchain changes.
       - name: Package inherited musl cache seed
         if: github.ref == 'refs/heads/main' && steps.musl-seed.outputs.publish-current == 'true'
         run: .github/scripts/musl-cache-archive.sh pack ci-build-cache ci-musl-seed-upload/musl-cache-seed.tar.zst
@@ -217,7 +217,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.musl-seed.outputs.publish-current == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: temps-musl-fast-seed-v1-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          name: temps-musl-fast-seed-v1
           path: ci-musl-seed-upload/musl-cache-seed.tar.zst
           retention-days: 7
           compression-level: 0

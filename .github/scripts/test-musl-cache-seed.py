@@ -42,19 +42,8 @@ def artifact(
 
 
 class SeedSelectionTests(unittest.TestCase):
-    def test_exact_key_beats_newer_compatible_fallback(self) -> None:
-        current = f"{MODULE.SEED_PREFIX}current"
-        candidates = MODULE.eligible_artifacts(
-            [
-                artifact(current, 10, "2026-08-01T00:00:00Z"),
-                artifact(f"{MODULE.SEED_PREFIX}newer", 11, "2026-08-02T00:00:00Z"),
-            ],
-            current,
-        )
-        self.assertEqual(candidates[0]["workflow_run"]["id"], 10)
-
-    def test_newest_exact_seed_wins(self) -> None:
-        current = f"{MODULE.SEED_PREFIX}current"
+    def test_newest_main_seed_wins(self) -> None:
+        current = MODULE.SEED_NAME
         candidates = MODULE.eligible_artifacts(
             [
                 artifact(current, 10, "2026-08-01T00:00:00Z"),
@@ -65,14 +54,14 @@ class SeedSelectionTests(unittest.TestCase):
         self.assertEqual(candidates[0]["workflow_run"]["id"], 11)
 
     def test_rejects_pr_expired_and_unrelated_artifacts(self) -> None:
-        current = f"{MODULE.SEED_PREFIX}current"
+        current = MODULE.SEED_NAME
         candidates = MODULE.eligible_artifacts(
             [
                 artifact(current, 1, "2026-08-01T00:00:00Z", branch="feature"),
                 artifact(current, 2, "2026-08-01T00:00:00Z", expired=True),
                 artifact("unrelated", 3, "2026-08-01T00:00:00Z"),
                 artifact(
-                    f"{MODULE.SEED_PREFIX}bad\noutput=true",
+                    f"{MODULE.SEED_NAME}\nbad",
                     4,
                     "2026-08-01T00:00:00Z",
                 ),
@@ -88,8 +77,8 @@ class SeedSelectionTests(unittest.TestCase):
 
     def test_refreshes_missing_or_expiring_exact_seed(self) -> None:
         now = datetime(2026, 8, 15, tzinfo=timezone.utc)
-        current = f"{MODULE.SEED_PREFIX}current"
-        fallback = artifact(f"{MODULE.SEED_PREFIX}old", 1, "2026-08-01T00:00:00Z")
+        current = MODULE.SEED_NAME
+        unrelated = artifact("old-musl-seed", 1, "2026-08-01T00:00:00Z")
         expiring = artifact(
             current,
             2,
@@ -102,12 +91,12 @@ class SeedSelectionTests(unittest.TestCase):
             "2026-08-14T00:00:00Z",
             expires_at="2026-08-25T00:00:00Z",
         )
-        self.assertTrue(MODULE.should_publish([fallback], current, now))
+        self.assertTrue(MODULE.should_publish([unrelated], current, now))
         self.assertTrue(MODULE.should_publish([expiring], current, now))
         self.assertFalse(MODULE.should_publish([fresh], current, now))
 
     def test_api_failure_builds_cold_without_publishing(self) -> None:
-        current = f"{MODULE.SEED_PREFIX}current"
+        current = MODULE.SEED_NAME
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "outputs"
             environment = {
