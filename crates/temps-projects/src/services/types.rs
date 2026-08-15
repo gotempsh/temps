@@ -209,6 +209,9 @@ pub enum ProjectError {
     #[error("Project not found")]
     NotFound(String),
 
+    #[error("Git provider connection {connection_id} not found or not accessible")]
+    GitProviderConnectionNotFound { connection_id: i32 },
+
     #[error("Template not found")]
     TemplateNotFound,
 

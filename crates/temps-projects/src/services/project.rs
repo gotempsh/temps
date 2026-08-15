@@ -1376,10 +1376,7 @@ impl ProjectService {
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -1717,16 +1714,10 @@ impl ProjectService {
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if connection.user_id != Some(caller_user_id) {
-                    return Err(ProjectError::NotFound(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )));
+                    return Err(ProjectError::GitProviderConnectionNotFound { connection_id });
                 }
 
                 if !connection.is_active {
@@ -5668,12 +5659,15 @@ mod tests {
             )
             .await;
 
-        // Assert: ownership mismatch must surface as NotFound — not a server
-        // error and not a silent success that would hand the caller access to
-        // another user's git tokens.
+        // Assert: ownership mismatch must surface as GitProviderConnectionNotFound
+        // — not a server error and not a silent success that would hand the
+        // caller access to another user's git tokens.
         assert!(
-            matches!(result, Err(ProjectError::NotFound(_))),
-            "expected NotFound for cross-user connection; ownership IDOR guard did not fire"
+            matches!(
+                result,
+                Err(ProjectError::GitProviderConnectionNotFound { .. })
+            ),
+            "expected GitProviderConnectionNotFound for cross-user connection; ownership IDOR guard did not fire"
         );
     }
 

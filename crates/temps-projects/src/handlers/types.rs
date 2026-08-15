@@ -946,6 +946,14 @@ impl From<ProjectError> for Problem {
                     "The requested project could not be found: {}",
                     reason
                 )),
+            ProjectError::GitProviderConnectionNotFound { connection_id } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Git Provider Connection Not Found")
+                    .with_detail(format!(
+                        "Git provider connection {} not found or not accessible",
+                        connection_id
+                    ))
+            }
 
             ProjectError::TemplateNotFound => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Template Not Found")
