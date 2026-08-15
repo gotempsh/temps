@@ -1376,10 +1376,7 @@ impl ProjectService {
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -1679,7 +1676,6 @@ impl ProjectService {
     pub async fn update_git_settings(
         &self,
         project_id: i32,
-        caller_user_id: i32,
         git_provider_connection_id: Option<i32>,
         main_branch: String,
         repo_owner: String,
@@ -1710,24 +1706,21 @@ impl ProjectService {
         // acceptable for v1 (no stored ID to call DELETE with).
         // Generic: no remote API at all — just regenerate the token.
 
-        // Verify git provider connection if provided
+        // Verify git provider connection if provided.
+        //
+        // Connections are scoped to the installation (workspace-wide), not to
+        // the user who created them: a GitHub App installation is shared by
+        // design, and PAT connections are intended to be usable by anyone
+        // with write access to the project, not just their creator. Access
+        // control for this endpoint is enforced by `permission_guard!` and
+        // `project_scope_guard!` in the handler, not by connection ownership.
         if let Some(connection_id) = git_provider_connection_id {
             if connection_id > 0 {
                 use temps_entities::git_provider_connections;
                 let connection = git_provider_connections::Entity::find_by_id(connection_id)
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or(ProjectError::Other(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )))?;
-
-                if connection.user_id != Some(caller_user_id) {
-                    return Err(ProjectError::NotFound(format!(
-                        "Git provider connection {} not found",
-                        connection_id
-                    )));
-                }
+                    .ok_or(ProjectError::GitProviderConnectionNotFound { connection_id })?;
 
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
@@ -5076,7 +5069,6 @@ mod tests {
         let result = project_service
             .update_git_settings(
                 created.id,
-                1,
                 None,
                 "main".to_string(),
                 "owner".to_string(),
@@ -5211,7 +5203,6 @@ mod tests {
         project_service
             .update_git_settings(
                 created.id,
-                1,
                 None,
                 "main".to_string(),
                 "owner".to_string(),
@@ -5314,7 +5305,6 @@ mod tests {
         let updated = project_service
             .update_git_settings(
                 created.id,
-                1,
                 None,
                 "main".to_string(),
                 "owner".to_string(),
@@ -5559,14 +5549,18 @@ mod tests {
         assert!(!super::super::types::is_unique_violation(&err));
     }
 
-    // ── IDOR regression tests for update_git_settings ────────────────────────
+    // ── Regression test: git provider connections are installation-scoped ───
     //
-    // Security fix: update_git_settings must reject a git_provider_connection
-    // that belongs to a different user than the caller, returning NotFound so
-    // the caller learns nothing about the existence of someone else's connection.
+    // Connections belong to the installation (workspace-wide), not to the
+    // user who created them — a GitHub App installation is inherently
+    // shared, and PAT connections are meant to be usable by any project
+    // maintainer, not gated to their creator. update_git_settings must not
+    // reject a connection just because a different user created it; access
+    // to the project itself is what `permission_guard!`/`project_scope_guard!`
+    // already enforce in the handler.
 
     #[tokio::test]
-    async fn test_update_git_settings_rejects_connection_owned_by_another_user() {
+    async fn test_update_git_settings_allows_connection_created_by_different_user() {
         if !docker_available().await {
             println!("Docker not available, skipping");
             return;
@@ -5576,20 +5570,10 @@ mod tests {
         let mock_queue = Arc::new(MockJobQueue::new());
         let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
 
-        // Create two users so the FK on git_provider_connections.user_id is satisfied.
         use temps_entities::{git_provider_connections, git_providers, users};
-        let user1 = users::ActiveModel {
-            email: Set("git-idor-user1@example.com".to_string()),
-            name: Set("IDOR User One".to_string()),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .unwrap();
-
-        let user2 = users::ActiveModel {
-            email: Set("git-idor-user2@example.com".to_string()),
-            name: Set("IDOR User Two".to_string()),
+        let creator = users::ActiveModel {
+            email: Set("git-connection-creator@example.com".to_string()),
+            name: Set("Connection Creator".to_string()),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -5598,7 +5582,7 @@ mod tests {
 
         // Create a git provider (required FK for connections).
         let provider = git_providers::ActiveModel {
-            name: Set("IDOR Test Provider".to_string()),
+            name: Set("Scoping Test Provider".to_string()),
             provider_type: Set("github".to_string()),
             base_url: Set(None),
             api_url: Set(None),
@@ -5613,11 +5597,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Connection belonging to user2 — the caller will present themselves as user1.
-        let other_users_connection = git_provider_connections::ActiveModel {
+        // Connection created by `creator` — a different caller must still be
+        // able to attach it to a project they have write access to.
+        let connection = git_provider_connections::ActiveModel {
             provider_id: Set(provider.id),
-            user_id: Set(Some(user2.id)),
-            account_name: Set("user2-account".to_string()),
+            user_id: Set(Some(creator.id)),
+            account_name: Set("creator-account".to_string()),
             account_type: Set("User".to_string()),
             access_token: Set(None),
             refresh_token: Set(None),
@@ -5635,10 +5620,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Create a project to operate on.
         let project = temps_entities::projects::ActiveModel {
-            name: Set("IDOR Test Project".to_string()),
-            slug: Set("idor-test-project".to_string()),
+            name: Set("Scoping Test Project".to_string()),
+            slug: Set("scoping-test-project".to_string()),
             repo_name: Set("test-repo".to_string()),
             repo_owner: Set("test-owner".to_string()),
             directory: Set(".".to_string()),
@@ -5651,12 +5635,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Act: caller is user1 but supplies a connection owned by user2.
         let result = project_service
             .update_git_settings(
                 project.id,
-                user1.id, // caller_user_id
-                Some(other_users_connection.id),
+                Some(connection.id),
                 "main".to_string(),
                 "test-owner".to_string(),
                 "test-repo".to_string(),
@@ -5668,69 +5650,16 @@ mod tests {
             )
             .await;
 
-        // Assert: ownership mismatch must surface as NotFound — not a server
-        // error and not a silent success that would hand the caller access to
-        // another user's git tokens.
+        // The connection lookup itself must succeed regardless of who
+        // created it — GitProviderConnectionNotFound must not fire here.
+        // (The call may still fail later, e.g. verifying the branch against
+        // a real git host, which this test doesn't stub.)
         assert!(
-            matches!(result, Err(ProjectError::NotFound(_))),
-            "expected NotFound for cross-user connection; ownership IDOR guard did not fire"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_git_settings_accepts_connection_owned_by_caller() {
-        if !docker_available().await {
-            println!("Docker not available, skipping");
-            return;
-        }
-        let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
-        let mock_queue = Arc::new(MockJobQueue::new());
-        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
-
-        // Create a project to operate on. No git_provider_connection_id is set,
-        // so the caller's connection_id will be None — the ownership guard is
-        // skipped entirely and the call must succeed.
-        let project = temps_entities::projects::ActiveModel {
-            name: Set("Caller Owner Project".to_string()),
-            slug: Set("caller-owner-project".to_string()),
-            repo_name: Set("test-repo".to_string()),
-            repo_owner: Set("test-owner".to_string()),
-            directory: Set(".".to_string()),
-            git_provider_connection_id: Set(None),
-            main_branch: Set("main".to_string()),
-            preset: Set(Preset::Nixpacks),
-            ..Default::default()
-        }
-        .insert(db.as_ref())
-        .await
-        .unwrap();
-
-        // Act: no connection_id — skips ownership guard entirely. The
-        // caller_user_id value is accepted without triggering NotFound.
-        let result = project_service
-            .update_git_settings(
-                project.id,
-                1,    // caller_user_id — arbitrary; guard never evaluates with None
-                None, // no connection_id → ownership check is bypassed
-                "main".to_string(),
-                "test-owner".to_string(), // same as inserted — repo_changed=false
-                "test-repo".to_string(),
-                None,
-                ".".to_string(),
-                None,
-                None,
-                None,
-            )
-            .await;
-
-        // The ownership guard must NOT produce a NotFound error.  Any other
-        // result (Ok or a different error variant) is acceptable — we only care
-        // that the guard does not false-positive on a caller that hasn't even
-        // supplied a connection_id.
-        assert!(
-            !matches!(result, Err(ProjectError::NotFound(_))),
-            "caller_user_id with no connection_id must not be rejected by the ownership guard"
+            !matches!(
+                result,
+                Err(ProjectError::GitProviderConnectionNotFound { .. })
+            ),
+            "connection created by a different user was rejected; connections must be installation-scoped, not user-scoped"
         );
     }
 
@@ -5822,7 +5751,6 @@ mod tests {
         project_service
             .update_git_settings(
                 inserted_project.id,
-                1,
                 None,
                 "main".to_string(),
                 "test-owner".to_string(),
@@ -5883,7 +5811,6 @@ mod tests {
         project_service
             .update_git_settings(
                 inserted_project.id,
-                1,
                 None,
                 "main".to_string(),
                 "owner".to_string(),

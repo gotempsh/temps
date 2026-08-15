@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.33`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.33`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -76,6 +76,7 @@ When the user opts in:
 | Automate Temps from CI | [howtos/ci-automation.md](howtos/ci-automation.md) |
 | Add or review observability end to end | [howtos/observability-onboarding.md](howtos/observability-onboarding.md), then one framework guide |
 | Add browser/product analytics | [references/observability/analytics.md](references/observability/analytics.md) |
+| Review Performance Insights, Core Web Vitals, or desktop/mobile speed | [references/commands/analytics.md](references/commands/analytics.md), then [references/observability/analytics.md](references/observability/analytics.md) only when capture/setup also needs review |
 | Add exception capture | [references/observability/error-tracking.md](references/observability/error-tracking.md) |
 | Add distributed traces | [references/observability/tracing.md](references/observability/tracing.md) |
 | Add metrics or structured logs | [references/observability/metrics.md](references/observability/metrics.md) or [references/observability/logs.md](references/observability/logs.md) |
@@ -97,6 +98,11 @@ bunx @temps-sdk/cli@0.1.33 <group> <command> --help
 
 Use `npx @temps-sdk/cli@0.1.33` only when Bun is unavailable. Never omit the
 reviewed version and never assume a global `temps` binary exists.
+
+For Performance Insights, confirm `analytics performance --help` exists in the
+reviewed runtime before querying. If the current reviewed version predates that
+command, report the version gap instead of silently substituting OTel `metrics`
+or a traffic-only `analytics top devices` query.
 
 ## Verification standards
 

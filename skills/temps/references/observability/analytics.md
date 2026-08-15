@@ -95,6 +95,30 @@ For browser-side tracking in a non-React frontend (vanilla JS, Vue, Svelte, a mo
 
 Do not place secrets, emails, raw identifiers, payment data, or sensitive URL query values in `event_data`, `request_query`, URLs, or referrers. The endpoint stores application-provided event data; see [hygiene.md](hygiene.md).
 
+## Review Performance Insights from the CLI
+
+Use `analytics performance` (alias `speed`) to query the same real-user Web
+Vitals surface as the project's Performance Insights page. Compare desktop and
+mobile with identical windows and segment filters:
+
+After runtime help confirms support, append either
+`analytics performance -p my-app --period 7d --device desktop` or
+`analytics performance -p my-app --period 7d --device mobile` to the verified,
+pinned invocation from [../cli-runtime.md](../cli-runtime.md).
+
+Add `--group-by path` to locate slow pages, or group by `country`, `region`,
+`city`, `device_type`, `browser`, or `operating_system`. Narrow the same query
+with `--environment-id`, `--deployment-id`, `--path`, `--country`, `--region`,
+`--city`, `--browser`, or `--os`. Use paired RFC 3339 `--start-date` and
+`--end-date` values for an exact comparison window. Bot samples are excluded by
+default; include them only deliberately with `--include-bots`. Use `--json` for
+the aggregate percentiles, time series, and optional breakdown payload.
+
+Do not confuse this with `metrics query`, which reads OpenTelemetry application
+metrics, or `analytics top devices`, which reports traffic counts rather than
+browser performance. Runtime `--help` is authoritative; do not substitute an
+ambient executable while the reviewed pinned version predates the command.
+
 ## What belongs here vs. other pillars
 
 - Page views, custom product events ("signed up", "clicked upgrade"), scroll/engagement/Web Vitals — all analytics.

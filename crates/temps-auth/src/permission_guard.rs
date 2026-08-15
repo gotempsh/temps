@@ -1000,7 +1000,9 @@ mod tests {
     // ADR-028 Phase B: Coverage enumeration
     //
     // Every Rust source file that contains `project_scope_guard!` must also
-    // contain `project_access_guard!` — the two guards are always paired.
+    // contain either `project_access_guard!` or the stricter, self-contained
+    // `project_permission_guard!` — the scope guard is always paired with one
+    // of these project-access checks.
     // This test scans the workspace at test time and fails if any file has one
     // without the other, catching handlers added in future crates that omit the
     // companion guard.
@@ -1033,13 +1035,14 @@ mod tests {
             // doc-comment references like `[`project_scope_guard!`]`.
             let has_scope_guard = contents.contains("project_scope_guard!(");
             let has_access_guard = contents.contains("project_access_guard!(");
+            let has_permission_guard = contents.contains("project_permission_guard!(");
             // Skip the file that defines the macros themselves.
             let is_definition_file = contents.contains("macro_rules! project_scope_guard")
                 || contents.contains("macro_rules! project_access_guard");
             if is_definition_file {
                 continue;
             }
-            if has_scope_guard && !has_access_guard {
+            if has_scope_guard && !has_access_guard && !has_permission_guard {
                 violations.push(format!("{}", path.display()));
             }
         }
@@ -1047,7 +1050,8 @@ mod tests {
         assert!(
             violations.is_empty(),
             "The following files have `project_scope_guard!` but are missing \
-             `project_access_guard!` (ADR-028 Phase B requires both to be paired):\n{}",
+             both `project_access_guard!` and `project_permission_guard!` \
+             (ADR-028 requires project scope and access checks to be paired):\n{}",
             violations.join("\n")
         );
     }
@@ -1070,6 +1074,7 @@ mod tests {
         let expected_crates: &[&str] = &[
             "temps-agents",
             "temps-ai-chat",
+            "temps-ai-gateway",
             "temps-analytics",
             "temps-analytics-events",
             "temps-analytics-funnels",
@@ -1193,8 +1198,12 @@ mod tests {
     /// both accidental removal and silent, unreviewed expansion.
     #[test]
     fn project_permission_guard_coverage_snapshot() {
-        let expected_crates: &[&str] =
-            &["temps-deployments", "temps-environments", "temps-projects"];
+        let expected_crates: &[&str] = &[
+            "temps-deployments",
+            "temps-environments",
+            "temps-projects",
+            "temps-proxy",
+        ];
 
         let mut sorted = expected_crates.to_vec();
         sorted.sort_unstable();

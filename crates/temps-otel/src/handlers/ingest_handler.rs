@@ -31,6 +31,15 @@ use temps_metrics::{
 impl From<OtelError> for Problem {
     fn from(error: OtelError) -> Self {
         match error {
+            OtelError::MissingAuthToken { .. } => {
+                // The slug is carried in the error message for diagnostics but
+                // deliberately not emitted as a structured project dimension:
+                // authentication has not established that the caller owns it.
+                warn!(error = %error, "OTel ingest auth failed");
+                problemdetails::new(StatusCode::UNAUTHORIZED)
+                    .with_title("Authentication Failed")
+                    .with_detail(error.to_string())
+            }
             OtelError::AuthFailed { .. } | OtelError::InvalidApiKey => {
                 warn!(error = %error, "OTel ingest auth failed");
                 problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -108,29 +117,46 @@ impl From<OtelError> for Problem {
 /// Checks `Authorization: Bearer <token>` and `X-Temps-Api-Key: <token>`.
 /// Works for `tk_`, `dt_`, and `si_` token prefixes. Handles both plain
 /// `Bearer <token>` and percent-encoded `Bearer%20<token>` from OTLP SDKs.
+fn authorization_scheme(value: &str) -> &'static str {
+    if value.starts_with("Bearer ") || value.starts_with("Bearer%20") {
+        "Bearer"
+    } else {
+        "other"
+    }
+}
+
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(value) = auth.to_str() {
             // SECURITY: never log the raw header — it carries a live, mostly
             // non-expiring credential (Bearer dt_/tk_/si_). Log only its shape.
             tracing::debug!(
-                scheme = value.split_whitespace().next().unwrap_or(""),
+                scheme = authorization_scheme(value),
                 len = value.len(),
                 "OTLP extract_token"
             );
             if let Some(key) = value.strip_prefix("Bearer ") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
             // Some OTLP exporters send the literal string "Bearer%20<token>"
             if let Some(key) = value.strip_prefix("Bearer%20") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
         }
     }
 
     if let Some(key) = headers.get("x-temps-api-key") {
         if let Ok(value) = key.to_str() {
-            return Some(value.trim().to_string());
+            let key = value.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
         }
     }
 
@@ -145,6 +171,47 @@ fn extract_project_id_header(headers: &HeaderMap) -> Option<i32> {
         .get("x-temps-project-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i32>().ok())
+}
+
+/// Extract a caller-claimed diagnostic project slug.
+///
+/// This header is not trusted for authentication. It only preserves project
+/// context when authentication cannot run because the credential is missing.
+/// Generated deployments use a hex transport header so persisted Unicode
+/// slugs remain valid HTTP metadata. The plain header remains accepted for
+/// manually configured exporters with canonical ASCII slugs.
+fn extract_claimed_project_slug(headers: &HeaderMap) -> Option<String> {
+    let is_valid_slug = |slug: &str| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
+    };
+
+    if let Some(encoded_slug) = headers
+        .get("x-temps-project-slug-hex")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+    {
+        let slug = hex::decode(encoded_slug)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        return is_valid_slug(&slug).then_some(slug);
+    }
+
+    headers
+        .get("x-temps-project-slug")
+        .and_then(|value| value.to_str().ok())
+        .filter(|slug| is_valid_slug(slug))
+        .map(str::to_string)
+}
+
+fn missing_auth_token_error(headers: &HeaderMap) -> OtelError {
+    OtelError::MissingAuthToken {
+        claimed_project_slug: extract_claimed_project_slug(headers)
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
 }
 
 /// Extract Content-Encoding from headers.
@@ -811,9 +878,7 @@ pub async fn ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_metrics(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest metrics (header auth)");
@@ -846,9 +911,7 @@ pub async fn ingest_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_traces(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest traces (header auth)");
@@ -882,9 +945,7 @@ pub async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_logs(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest logs (header auth)");
@@ -933,9 +994,7 @@ pub async fn ingest_metrics_by_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_metrics(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest metrics (path auth)");
@@ -971,9 +1030,7 @@ pub async fn ingest_traces_by_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_traces(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest traces (path auth)");
@@ -1009,9 +1066,7 @@ pub async fn ingest_logs_by_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_logs(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest logs (path auth)");
@@ -1048,9 +1103,40 @@ mod tests {
     }
 
     #[test]
+    fn test_authorization_scheme_never_contains_token_material() {
+        let token = "dt_live_credential_must_not_be_logged";
+
+        for value in [
+            format!("Bearer {token}"),
+            format!("Bearer%20{token}"),
+            format!("Custom {token}"),
+        ] {
+            let scheme = authorization_scheme(&value);
+            assert!(!scheme.contains(token));
+        }
+
+        assert_eq!(authorization_scheme(&format!("Bearer {token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Bearer%20{token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Custom {token}")), "other");
+    }
+
+    #[test]
     fn test_extract_token_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_treats_empty_credentials_as_missing() {
+        for (header, value) in [
+            ("authorization", "Bearer "),
+            ("authorization", "Bearer%20"),
+            ("x-temps-api-key", ""),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(extract_token(&headers), None, "header: {header}");
+        }
     }
 
     #[test]
@@ -1098,6 +1184,64 @@ mod tests {
         assert_eq!(extract_project_id_header(&headers), None);
     }
 
+    #[test]
+    fn test_missing_auth_token_error_includes_valid_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-temps-project-slug-hex",
+            "6578616d706c652d70726f6a656374".parse().unwrap(),
+        );
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "example-project"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_decodes_unicode_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-temps-project-slug-hex", "636166c3a9".parse().unwrap());
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "café"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_untrusted_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-temps-project-slug", "invalid slug".parse().unwrap());
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_malformed_hex_slug() {
+        let oversized_slug = "61".repeat(65);
+        for encoded_slug in ["not-hex", "ff", oversized_slug.as_str()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-temps-project-slug-hex", encoded_slug.parse().unwrap());
+
+            let error = missing_auth_token_error(&headers);
+
+            assert!(matches!(
+                error,
+                OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+            ));
+        }
+    }
+
     // ── content_encoding tests ─────────────────────────────────────
 
     #[test]
@@ -1119,6 +1263,15 @@ mod tests {
     fn test_error_auth_failed_maps_to_401() {
         let err = OtelError::AuthFailed {
             reason: "bad key".into(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_error_missing_auth_token_maps_to_401() {
+        let err = OtelError::MissingAuthToken {
+            claimed_project_slug: "example-project".into(),
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);

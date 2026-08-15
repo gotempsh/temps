@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{DateTime, UtcDateTime};
 use utoipa::{IntoParams, ToSchema};
@@ -16,6 +16,20 @@ use crate::service::proxy_log_service::{
     AiStatusBreakdownRow, AiTimelineGroupBy, ProjectHealthSummary, ProxyLogResponse,
     ProxyLogService, ProxyLogServiceError, StatsFilters, TimeBucketStats, TodayStatsResponse,
 };
+use crate::traffic_aggregation::{TrafficAggregationRequest, TrafficAggregationResponse};
+
+pub struct ProxyLogsState {
+    pub service: Arc<ProxyLogService>,
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+}
+
+impl std::ops::Deref for ProxyLogsState {
+    type Target = ProxyLogService;
+
+    fn deref(&self) -> &Self::Target {
+        self.service.as_ref()
+    }
+}
 
 impl From<ProxyLogServiceError> for Problem {
     fn from(error: ProxyLogServiceError) -> Self {
@@ -23,6 +37,16 @@ impl From<ProxyLogServiceError> for Problem {
             ProxyLogServiceError::InvalidFilter(_) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Filter Parameters")
                 .with_detail(error.to_string()),
+            ProxyLogServiceError::TrafficAggregationRateLimited { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Traffic Aggregation Rate Limited")
+                    .with_detail(error.to_string())
+            }
+            ProxyLogServiceError::TrafficAggregationTimeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("Traffic Aggregation Timed Out")
+                    .with_detail(error.to_string())
+            }
             // The ClickHouse error's `reason` is the stringified client error,
             // which can embed the internal endpoint host or schema fragments —
             // don't reflect it to the caller. Log the full detail and surface
@@ -178,6 +202,45 @@ pub struct ProxyLogsPaginatedResponse {
     pub total_pages: u64,
 }
 
+/// Run a backend-neutral, multi-dimensional API traffic aggregation.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/api-analytics/query",
+    params(("project_id" = i32, Path, description = "Project ID")),
+    request_body = TrafficAggregationRequest,
+    responses(
+        (status = 200, description = "Aggregated API traffic", body = TrafficAggregationResponse),
+        (status = 400, description = "Invalid dimensions, metrics, filters, or time range", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 429, description = "Aggregation request budget exceeded", body = ProblemDetails),
+        (status = 504, description = "Aggregation query timed out", body = ProblemDetails),
+        (status = 500, description = "Storage query failed", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy Logs"
+)]
+pub async fn aggregate_api_traffic(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProxyLogsState>>,
+    Path(project_id): Path<i32>,
+    Json(request): Json<TrafficAggregationRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(
+        auth,
+        AnalyticsRead,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
+
+    state
+        .aggregate_traffic(project_id, request)
+        .await
+        .map(Json)
+        .map_err(Problem::from)
+}
+
 /// Get proxy logs with optional filters and pagination
 #[utoipa::path(
     get,
@@ -194,7 +257,7 @@ pub struct ProxyLogsPaginatedResponse {
 )]
 pub async fn get_proxy_logs(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<ProxyLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
@@ -252,7 +315,7 @@ pub struct ProxyLogByIdQuery {
 )]
 pub async fn get_proxy_log_by_id(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Path(id): Path<i32>,
     Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -291,7 +354,7 @@ pub async fn get_proxy_log_by_id(
 )]
 pub async fn get_proxy_log_by_request_id(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Path(request_id): Path<String>,
     Query(query): Query<ProxyLogByIdQuery>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -355,6 +418,7 @@ impl From<StatsQuery> for StatsFilters {
             is_bot: query.is_bot,
             device_type: query.device_type,
             has_project: None,
+            exclude_synthetic: false,
         }
     }
 }
@@ -432,7 +496,7 @@ pub struct TimeBucketStatsResponse {
 )]
 async fn get_today_stats(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -485,7 +549,7 @@ async fn get_today_stats(
 )]
 async fn get_time_bucket_stats(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<TimeBucketStatsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -518,6 +582,7 @@ async fn get_time_bucket_stats(
             is_bot: query.is_bot,
             device_type: query.device_type,
             has_project: query.has_project,
+            exclude_synthetic: false,
         })
     } else {
         None
@@ -580,7 +645,7 @@ pub struct ProjectsHealthResponse {
 )]
 async fn get_projects_health(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<ProjectsHealthQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -697,7 +762,7 @@ pub struct KnownAiAgentsResponse {
 )]
 async fn get_ai_agent_breakdown(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -759,7 +824,7 @@ pub struct AiPageBreakdownResponse {
 )]
 async fn get_ai_page_breakdown(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -869,7 +934,7 @@ fn auto_bucket_for_window(start: UtcDateTime, end: UtcDateTime) -> &'static str 
 )]
 async fn get_ai_agent_timeline(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentTimelineQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -966,7 +1031,7 @@ pub struct AiStatusBreakdownResponse {
 )]
 async fn get_ai_status_breakdown(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentBreakdownQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -1076,7 +1141,7 @@ pub struct AiAgentPagesResponse {
 )]
 async fn get_ai_agent_pages(
     RequireAuth(auth): RequireAuth,
-    State(service): State<Arc<ProxyLogService>>,
+    State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<AiAgentPagesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
@@ -1121,10 +1186,14 @@ async fn get_ai_agent_pages(
 }
 
 /// Create router for proxy log handlers
-pub fn create_routes() -> axum::Router<Arc<ProxyLogService>> {
-    use axum::routing::get;
+pub fn create_routes() -> axum::Router<Arc<ProxyLogsState>> {
+    use axum::routing::{get, post};
 
     axum::Router::new()
+        .route(
+            "/projects/{project_id}/api-analytics/query",
+            post(aggregate_api_traffic),
+        )
         .route("/proxy-logs", get(get_proxy_logs))
         .route("/proxy-logs/{id}", get(get_proxy_log_by_id))
         .route(
@@ -1155,6 +1224,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     #[derive(OpenApi)]
     #[openapi(
         paths(
+            aggregate_api_traffic,
             get_proxy_logs,
             get_proxy_log_by_id,
             get_proxy_log_by_request_id,
@@ -1169,6 +1239,18 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             list_known_ai_agents,
         ),
         components(schemas(
+            TrafficAggregationRequest,
+            TrafficAggregationResponse,
+            crate::traffic_aggregation::TrafficAggregationRow,
+            crate::traffic_aggregation::TrafficDimensionValue,
+            crate::traffic_aggregation::TrafficMetricValues,
+            crate::traffic_aggregation::TrafficDimension,
+            crate::traffic_aggregation::TrafficMetric,
+            crate::traffic_aggregation::TrafficFilter,
+            crate::traffic_aggregation::TrafficFilterOperator,
+            crate::traffic_aggregation::TrafficOrderBy,
+            crate::traffic_aggregation::TrafficOrderField,
+            crate::traffic_aggregation::TrafficSortDirection,
             ProxyLogResponse,
             ProxyLogsPaginatedResponse,
             TodayStatsResponse,

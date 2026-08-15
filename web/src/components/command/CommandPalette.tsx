@@ -35,6 +35,7 @@ import {
   Database,
   DatabaseBackup,
   FileLock2,
+  Flag,
   Folder,
   FolderPlus,
   Gauge,
@@ -120,8 +121,11 @@ const CROSS_PROJECT_PAGE_URLS = new Set([
   'monitors',
   'metrics',
   'settings/general',
-  'settings/domains',
-  'settings/environment-variables',
+  'domains',
+  'environment-variables',
+  'flags',
+  'git',
+  'build',
 ])
 
 /**
@@ -638,6 +642,12 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['setup', 'configuration', 'install', 'analytics'],
   },
   {
+    title: 'API Traffic',
+    url: 'analytics/api-traffic',
+    icon: Server,
+    keywords: ['api', 'traffic', 'requests', 'analytics'],
+  },
+  {
     title: 'Databases',
     url: 'storage',
     icon: Database,
@@ -707,8 +717,14 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['settings', 'configuration', 'general'],
   },
   {
-    title: 'Project Domains',
-    url: 'settings/domains',
+    title: 'Feature Flags',
+    url: 'flags',
+    icon: Flag,
+    keywords: ['flags', 'feature flags', 'toggles', 'rollout'],
+  },
+  {
+    title: 'Domains',
+    url: 'domains',
     icon: Globe,
     keywords: ['domains', 'dns', 'custom domain'],
   },
@@ -720,7 +736,7 @@ const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Environment Variables',
-    url: 'settings/environment-variables',
+    url: 'environment-variables',
     icon: Key,
     keywords: ['variables', 'env', 'config'],
   },
@@ -731,13 +747,13 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
-    title: 'Git Settings',
-    url: 'settings/git',
+    title: 'Git',
+    url: 'git',
     icon: GitBranch,
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
-    title: 'Build & Deployment',
+    title: 'Build & Deploy',
     url: 'build',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
@@ -747,6 +763,12 @@ const projectNavItems: NavigationItem[] = [
     url: 'settings/security',
     icon: Shield,
     keywords: ['security', 'headers', 'rate limiting', 'protection'],
+  },
+  {
+    title: 'Access',
+    url: 'settings/access',
+    icon: Users,
+    keywords: ['access', 'permissions', 'members', 'roles', 'team'],
   },
   {
     title: 'Cron Jobs',
@@ -806,6 +828,12 @@ const projectNavItems: NavigationItem[] = [
       'timeline',
       'all events',
     ],
+  },
+  {
+    title: 'Telemetry Logs',
+    url: 'telemetry-logs',
+    icon: ScrollText,
+    keywords: ['logs', 'opentelemetry', 'otel', 'observe'],
   },
   {
     title: 'Services',

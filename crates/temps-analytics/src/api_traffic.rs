@@ -28,6 +28,44 @@ use crate::types::api_traffic::{
     ApiTimeseriesResponse, ApiTrafficSummary, ApiTrafficSummaryResponse,
 };
 
+/// Storage-neutral source for API traffic aggregates.
+///
+/// The proxy plugin implements this over whichever request-log backend the
+/// installation selected (TimescaleDB or ClickHouse). `ApiTrafficService`
+/// keeps its direct PostgreSQL implementation as a fallback for reduced test
+/// binaries that do not register the proxy plugin.
+#[async_trait::async_trait]
+pub trait ApiTrafficDataSource: Send + Sync {
+    async fn get_timeseries(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        bucket_interval: String,
+    ) -> Result<ApiTimeseriesResponse, AnalyticsError>;
+
+    async fn get_top_routes(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<ApiRoutesResponse, AnalyticsError>;
+
+    async fn get_top_callers(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<ApiCallersResponse, AnalyticsError>;
+}
+
 /// Hard cap on the AI summary call. Subscription-backed Claude Code, Codex,
 /// and OpenCode adapters have an internal 30-second subprocess deadline, so
 /// this outer deadline must leave enough room for that adapter to finish and
@@ -98,6 +136,7 @@ pub struct ApiTrafficService {
     summary_cache: Cache<AggregateCacheKey, ApiTrafficSummaryResponse>,
     summary_singleflight: Cache<AggregateCacheKey, Arc<tokio::sync::Mutex<()>>>,
     summary_limits: Cache<i32, Arc<SummaryLimitState>>,
+    data_source: tokio::sync::OnceCell<Arc<dyn ApiTrafficDataSource>>,
 }
 
 struct SummaryLimitState {
@@ -136,7 +175,14 @@ impl ApiTrafficService {
                 .max_capacity(AGGREGATE_CACHE_CAPACITY)
                 .time_to_idle(SUMMARY_REQUEST_WINDOW)
                 .build(),
+            data_source: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Attach the runtime-selected request-log backend after all plugins have
+    /// registered their services. Returns false only when already initialized.
+    pub fn set_data_source(&self, source: Arc<dyn ApiTrafficDataSource>) -> bool {
+        self.data_source.set(source).is_ok()
     }
 
     /// Return the bucket interval string to use for `time_bucket` given the
@@ -167,12 +213,29 @@ impl ApiTrafficService {
         }
 
         let interval = Self::bucket_interval(&start_date, &end_date);
+        if let Some(source) = self.data_source.get() {
+            let response = source
+                .get_timeseries(
+                    project_id,
+                    environment_id,
+                    start_date,
+                    end_date,
+                    interval.to_string(),
+                )
+                .await?;
+            self.timeseries_cache
+                .insert(cache_key, response.clone())
+                .await;
+            return Ok(response);
+        }
 
         // Build WHERE clause and bind values.
         let mut conditions = vec![
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp < $3".to_string(),
+            "request_source <> 'temps_monitor'".to_string(),
+            "COALESCE(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string(),
         ];
         let mut values: Vec<Value> = vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_idx = 4usize;
@@ -299,10 +362,27 @@ impl ApiTrafficService {
             return Ok(cached);
         }
 
+        if let Some(source) = self.data_source.get() {
+            let response = source
+                .get_top_routes(
+                    project_id,
+                    environment_id,
+                    start_date,
+                    end_date,
+                    limit,
+                    offset,
+                )
+                .await?;
+            self.routes_cache.insert(cache_key, response.clone()).await;
+            return Ok(response);
+        }
+
         let mut conditions = vec![
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp < $3".to_string(),
+            "request_source <> 'temps_monitor'".to_string(),
+            "COALESCE(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string(),
         ];
         let mut values: Vec<Value> = vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_idx = 4usize;
@@ -418,10 +498,27 @@ impl ApiTrafficService {
             return Ok(cached);
         }
 
+        if let Some(source) = self.data_source.get() {
+            let response = source
+                .get_top_callers(
+                    project_id,
+                    environment_id,
+                    start_date,
+                    end_date,
+                    limit,
+                    offset,
+                )
+                .await?;
+            self.callers_cache.insert(cache_key, response.clone()).await;
+            return Ok(response);
+        }
+
         let mut conditions = vec![
             "project_id = $1".to_string(),
             "timestamp >= $2".to_string(),
             "timestamp < $3".to_string(),
+            "request_source <> 'temps_monitor'".to_string(),
+            "COALESCE(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string(),
             "client_ip IS NOT NULL".to_string(),
         ];
         let mut values: Vec<Value> = vec![project_id.into(), start_date.into(), end_date.into()];
@@ -827,8 +924,65 @@ mod tests {
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct UnavailableAiService;
+
+    struct TestTrafficDataSource {
+        timeseries_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ApiTrafficDataSource for TestTrafficDataSource {
+        async fn get_timeseries(
+            &self,
+            _project_id: i32,
+            _environment_id: Option<i32>,
+            _start_date: UtcDateTime,
+            _end_date: UtcDateTime,
+            bucket_interval: String,
+        ) -> Result<ApiTimeseriesResponse, AnalyticsError> {
+            self.timeseries_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ApiTimeseriesResponse {
+                points: Vec::new(),
+                total_requests: 7,
+                total_errors: 1,
+                overall_error_rate: 1.0 / 7.0,
+                overall_avg_latency_ms: Some(42.0),
+                bucket_interval,
+            })
+        }
+
+        async fn get_top_routes(
+            &self,
+            _project_id: i32,
+            _environment_id: Option<i32>,
+            _start_date: UtcDateTime,
+            _end_date: UtcDateTime,
+            _limit: i64,
+            _offset: i64,
+        ) -> Result<ApiRoutesResponse, AnalyticsError> {
+            Ok(ApiRoutesResponse {
+                routes: Vec::new(),
+                total_routes: 0,
+            })
+        }
+
+        async fn get_top_callers(
+            &self,
+            _project_id: i32,
+            _environment_id: Option<i32>,
+            _start_date: UtcDateTime,
+            _end_date: UtcDateTime,
+            _limit: i64,
+            _offset: i64,
+        ) -> Result<ApiCallersResponse, AnalyticsError> {
+            Ok(ApiCallersResponse {
+                callers: Vec::new(),
+                total_callers: 0,
+            })
+        }
+    }
 
     #[async_trait]
     impl AiService for UnavailableAiService {
@@ -942,6 +1096,32 @@ mod tests {
         drop(service);
         let connection = Arc::try_unwrap(db).expect("service should release database Arc");
         assert_eq!(connection.into_transaction_log().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registered_data_source_drives_and_caches_timeseries() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let source = Arc::new(TestTrafficDataSource {
+            timeseries_calls: AtomicUsize::new(0),
+        });
+        let service = ApiTrafficService::new(db, Arc::new(UnavailableAiService));
+        assert!(service.set_data_source(source.clone()));
+        assert!(!service.set_data_source(source.clone()));
+        let start = chrono::Utc::now() - chrono::Duration::hours(1);
+        let end = chrono::Utc::now();
+
+        let first = service
+            .get_timeseries(7, None, start, end)
+            .await
+            .expect("registered source should answer traffic query");
+        let second = service
+            .get_timeseries(7, None, start, end)
+            .await
+            .expect("second query should use aggregate cache");
+
+        assert_eq!(first.total_requests, 7);
+        assert_eq!(second.total_requests, 7);
+        assert_eq!(source.timeseries_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -549,13 +549,16 @@ impl WorkflowPlanner {
                 "http/protobuf".to_string(),
             );
 
-            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
-            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
-                env_vars_map.insert(
-                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
-                    format!("Authorization=Bearer {}", token),
-                );
-            }
+            // Always include the project slug so authentication failures retain
+            // project context. Authorization is added when token provisioning
+            // succeeded (the token is already in TEMPS_API_TOKEN).
+            let token = env_vars_map.get("TEMPS_API_TOKEN").map(String::as_str);
+            let existing_headers = env_vars_map
+                .get("OTEL_EXPORTER_OTLP_HEADERS")
+                .map(String::as_str);
+            let otel_headers =
+                super::env_resolver::otel_exporter_headers(token, existing_headers, &project.slug);
+            env_vars_map.insert("OTEL_EXPORTER_OTLP_HEADERS".to_string(), otel_headers);
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 

@@ -50,6 +50,7 @@ use crate::service::proxy_log_service::{
     AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogServiceError,
     StatsFilters, TimeBucketStats,
 };
+use crate::traffic_aggregation::{TrafficAggregationRequest, TrafficAggregationResponse};
 
 /// Backend-neutral storage interface for proxy / request logs.
 ///
@@ -70,6 +71,15 @@ pub trait ProxyLogStorage: Send + Sync {
         &self,
         entries: Vec<CreateProxyLogRequest>,
     ) -> Result<(), ProxyLogServiceError>;
+
+    /// Generic, client-shaped traffic aggregation. Implementations must keep
+    /// dimension/filter identifiers on a static allowlist and return an
+    /// identical response for equivalent TimescaleDB and ClickHouse data.
+    async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError>;
 
     /// Paginated, filtered, sorted list of proxy logs.
     ///

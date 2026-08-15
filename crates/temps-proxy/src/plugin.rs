@@ -105,6 +105,9 @@ impl TempsPlugin for ProxyPlugin {
                 ip_service,
                 proxy_log_storage,
             ));
+            let api_traffic_data_source: Arc<
+                dyn temps_analytics::api_traffic::ApiTrafficDataSource,
+            > = proxy_log_service.clone();
 
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
@@ -115,6 +118,7 @@ impl TempsPlugin for ProxyPlugin {
             // Register the services for other plugins to use
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
+            context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(challenge_service);
 
@@ -155,6 +159,7 @@ impl TempsPlugin for ProxyPlugin {
         // Get the required services from the service registry
         let lb_service = context.require_service::<LbService>();
         let proxy_log_service = context.require_service::<ProxyLogService>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
         let challenge_service = context.require_service::<ChallengeService>();
         let db = context.require_service::<DbConnection>();
@@ -168,10 +173,15 @@ impl TempsPlugin for ProxyPlugin {
             challenge_service: challenge_service.clone(),
         });
 
+        let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
+            service: proxy_log_service,
+            project_access_checker,
+        });
+
         // Configure routes with the app state
         let router = crate::handler::handler::configure_routes()
             .with_state(app_state)
-            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_log_service))
+            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
                     .with_state(ip_access_control_service),

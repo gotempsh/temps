@@ -60,6 +60,11 @@ use crate::service::proxy_log_service::{
     AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogService,
     ProxyLogServiceError, StatsFilters, TimeBucketStats,
 };
+use crate::traffic_aggregation::{
+    TrafficAggregationRequest, TrafficAggregationResponse, TrafficAggregationRow, TrafficDimension,
+    TrafficDimensionValue, TrafficFilter, TrafficFilterOperator, TrafficMetric,
+    TrafficMetricValues, TrafficOrderField, TrafficSortDirection,
+};
 
 /// Maximum rows per ClickHouse HTTP insert request. Bounds peak buffer memory
 /// in the `clickhouse` client on large batches. Proxy log batches flush at 200
@@ -164,6 +169,7 @@ fn interval_to_seconds(interval: &str) -> Option<i64> {
 /// A bind value queued while a dynamic WHERE clause is assembled, applied to
 /// the query builder in order after the SQL string is finalized. Mirrors the
 /// `Bv` pattern in `temps-otel`'s `query_spans`.
+#[derive(Clone)]
 enum Bv {
     I16(i16),
     I32(i32),
@@ -488,6 +494,7 @@ struct ChCountRow {
 struct ChTimeBucketRow {
     bucket_ms: i64,
     request_count: u64,
+    latency_count: u64,
     avg_response_time_ms: f64,
     p50_response_time_ms: f64,
     p95_response_time_ms: f64,
@@ -537,6 +544,27 @@ struct ChAiTimelineRow {
 struct ChAiStatusRow {
     status_class: String,
     request_count: u64,
+}
+
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChTrafficAggregationRow {
+    d0: Option<String>,
+    d1: Option<String>,
+    d2: Option<String>,
+    d3: Option<String>,
+    requests: Option<u64>,
+    errors: Option<u64>,
+    error_rate: Option<f64>,
+    latency_avg_ms: Option<f64>,
+    latency_min_ms: Option<f64>,
+    latency_max_ms: Option<f64>,
+    latency_p50_ms: Option<f64>,
+    latency_p95_ms: Option<f64>,
+    latency_p99_ms: Option<f64>,
+    unique_ips: Option<u64>,
+    unique_paths: Option<u64>,
+    last_seen_ms: Option<i64>,
+    total_groups: u64,
 }
 
 /// Convert a Unix-ms value to an RFC3339 string (matching the Postgres path's
@@ -950,6 +978,53 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         Ok(())
     }
 
+    async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+        request.validate()?;
+        let (sql, binds, count_sql) = build_traffic_query(project_id, &request)?;
+        let count_binds = binds.clone();
+        let query_client = self
+            .client
+            .clone()
+            .with_setting("max_execution_time", "15")
+            .with_setting("max_rows_to_group_by", "100000")
+            .with_setting("group_by_overflow_mode", "throw")
+            .with_setting("max_bytes_before_external_group_by", "67108864")
+            // Four concurrent endpoint queries therefore reserve at most
+            // roughly 512 MiB even for exact distinct aggregate states.
+            .with_setting("max_memory_usage", "134217728");
+        let rows = apply_binds(query_client.query(&sql), binds)
+            .fetch_all::<ChTrafficAggregationRow>()
+            .await
+            .map_err(|error| ProxyLogServiceError::ClickHouse {
+                operation: "aggregate_traffic".to_string(),
+                reason: error.to_string(),
+            })?;
+        let empty_page_total = if rows.is_empty() {
+            Some(
+                apply_binds(query_client.query(&count_sql), count_binds)
+                    .fetch_one::<ChCountRow>()
+                    .await
+                    .map_err(|error| ProxyLogServiceError::ClickHouse {
+                        operation: "aggregate_traffic (empty-page count)".to_string(),
+                        reason: error.to_string(),
+                    })?
+                    .cnt,
+            )
+        } else {
+            None
+        };
+        let mut response = ch_traffic_response(&request, rows)?;
+        if let Some(total_groups) = empty_page_total {
+            response.total_groups = total_groups;
+            response.total_pages = total_groups.div_ceil(request.page_size);
+        }
+        Ok(response)
+    }
+
     async fn list_with_filters(
         &self,
         start_date: Option<UtcDateTime>,
@@ -1257,6 +1332,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             "SELECT \
                 toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 count() AS request_count, \
+                count(response_time_ms) AS latency_count, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms, \
                 ifNull(quantile(0.50)(response_time_ms), 0) AS p50_response_time_ms, \
                 ifNull(quantile(0.95)(response_time_ms), 0) AS p95_response_time_ms, \
@@ -1294,6 +1370,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             .map(|r| TimeBucketStats {
                 bucket: ms_to_rfc3339(r.bucket_ms),
                 request_count: r.request_count as i64,
+                latency_count: r.latency_count as i64,
                 // SQL already coerces avg over an empty/all-NULL bucket to 0 via
                 // ifNull (matching Postgres COALESCE(avg, 0)). The is_nan guard
                 // is a defensive belt-and-braces for any future SQL change.
@@ -1776,6 +1853,349 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
     }
 }
 
+fn ch_dimension_expression(dimension: TrafficDimension) -> &'static str {
+    match dimension {
+        TrafficDimension::ClientIp => "nullIf(client_ip, '')",
+        TrafficDimension::Method => "method",
+        TrafficDimension::Path => "path",
+        TrafficDimension::Host => "host",
+        TrafficDimension::StatusCode => "status_code",
+        TrafficDimension::StatusClass => {
+            "if(status_code >= 100 AND status_code < 600, concat(toString(intDiv(status_code, 100)), 'xx'), 'other')"
+        }
+        TrafficDimension::EnvironmentId => "environment_id",
+        TrafficDimension::DeploymentId => "deployment_id",
+        TrafficDimension::RequestSource => "request_source",
+        TrafficDimension::IsBot => {
+            "if(isNull(is_bot), CAST(NULL AS Nullable(String)), if(assumeNotNull(is_bot) = 1, 'true', 'false'))"
+        }
+        TrafficDimension::Browser => "nullIf(browser, '')",
+        TrafficDimension::OperatingSystem => "nullIf(operating_system, '')",
+        TrafficDimension::DeviceType => "nullIf(device_type, '')",
+        TrafficDimension::CacheStatus => "nullIf(cache_status, '')",
+    }
+}
+
+fn ch_filter_expression(dimension: TrafficDimension) -> &'static str {
+    match dimension {
+        // The display expression intentionally returns "true"/"false" strings
+        // for cross-backend response parity. Filters must compare against the
+        // raw Nullable(UInt8) column because their bound values are booleans.
+        TrafficDimension::IsBot => "is_bot",
+        _ => ch_dimension_expression(dimension),
+    }
+}
+
+fn ch_metric_alias(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests => "requests",
+        TrafficMetric::Errors => "errors",
+        TrafficMetric::ErrorRate => "error_rate",
+        TrafficMetric::LatencyAvg => "latency_avg_ms",
+        TrafficMetric::LatencyMin => "latency_min_ms",
+        TrafficMetric::LatencyMax => "latency_max_ms",
+        TrafficMetric::LatencyP50 => "latency_p50_ms",
+        TrafficMetric::LatencyP95 => "latency_p95_ms",
+        TrafficMetric::LatencyP99 => "latency_p99_ms",
+        TrafficMetric::UniqueIps => "unique_ips",
+        TrafficMetric::UniquePaths => "unique_paths",
+        TrafficMetric::LastSeen => "last_seen_ms",
+    }
+}
+
+fn ch_metric_expression(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests => "toNullable(count())",
+        TrafficMetric::Errors => "toNullable(countIf(status_code >= 400))",
+        TrafficMetric::ErrorRate => {
+            "toNullable(toFloat64(countIf(status_code >= 400)) / nullIf(toFloat64(count()), 0.0))"
+        }
+        TrafficMetric::LatencyAvg => "avg(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyMin => "min(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyMax => "max(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyP50 => {
+            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.50)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+        }
+        TrafficMetric::LatencyP95 => {
+            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.95)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+        }
+        TrafficMetric::LatencyP99 => {
+            "if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.99)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms)))"
+        }
+        TrafficMetric::UniqueIps => "toNullable(uniqExactIf(client_ip, client_ip != ''))",
+        TrafficMetric::UniquePaths => "toNullable(uniqExact(path))",
+        TrafficMetric::LastSeen => "toNullable(toUnixTimestamp64Milli(max(timestamp)))",
+    }
+}
+
+fn ch_null_metric(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests
+        | TrafficMetric::Errors
+        | TrafficMetric::UniqueIps
+        | TrafficMetric::UniquePaths => "CAST(NULL AS Nullable(UInt64))",
+        TrafficMetric::LastSeen => "CAST(NULL AS Nullable(Int64))",
+        _ => "CAST(NULL AS Nullable(Float64))",
+    }
+}
+
+fn ch_filter_bind(dimension: TrafficDimension, raw: &str) -> Result<Bv, ProxyLogServiceError> {
+    match dimension {
+        TrafficDimension::StatusCode => raw.parse::<i16>().map(Bv::I16).map_err(|_| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "status_code filter value '{raw}' is not a valid HTTP status"
+            ))
+        }),
+        TrafficDimension::EnvironmentId | TrafficDimension::DeploymentId => {
+            raw.parse::<i32>().map(Bv::I32).map_err(|_| {
+                ProxyLogServiceError::InvalidFilter(format!(
+                    "{} filter value '{raw}' is not a valid integer",
+                    dimension.api_name()
+                ))
+            })
+        }
+        TrafficDimension::IsBot => raw.parse::<bool>().map(Bv::Bool).map_err(|_| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "is_bot filter value '{raw}' must be true or false"
+            ))
+        }),
+        _ => Ok(Bv::Str(raw.to_owned())),
+    }
+}
+
+fn append_ch_filter(
+    filter: &TrafficFilter,
+    conditions: &mut Vec<String>,
+    binds: &mut Vec<Bv>,
+) -> Result<(), ProxyLogServiceError> {
+    let expression = ch_filter_expression(filter.dimension);
+    let condition = match filter.operator {
+        TrafficFilterOperator::Eq | TrafficFilterOperator::NotEq => {
+            binds.push(ch_filter_bind(filter.dimension, &filter.values[0])?);
+            let operator = if filter.operator == TrafficFilterOperator::Eq {
+                "="
+            } else {
+                "!="
+            };
+            format!("{expression} {operator} ?")
+        }
+        TrafficFilterOperator::Contains => {
+            binds.push(Bv::Str(filter.values[0].clone()));
+            format!("positionCaseInsensitiveUTF8(toString({expression}), ?) > 0")
+        }
+        TrafficFilterOperator::StartsWith => {
+            binds.push(Bv::Str(filter.values[0].clone()));
+            format!("startsWith(lowerUTF8(toString({expression})), lowerUTF8(?))")
+        }
+        TrafficFilterOperator::In => {
+            for raw in &filter.values {
+                binds.push(ch_filter_bind(filter.dimension, raw)?);
+            }
+            format!(
+                "{expression} IN ({})",
+                std::iter::repeat_n("?", filter.values.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    conditions.push(condition);
+    Ok(())
+}
+
+fn build_traffic_query(
+    project_id: i32,
+    request: &TrafficAggregationRequest,
+) -> Result<(String, Vec<Bv>, String), ProxyLogServiceError> {
+    let mut conditions = vec![
+        "project_id = ?".to_string(),
+        "timestamp >= fromUnixTimestamp64Milli(?)".to_string(),
+        "timestamp < fromUnixTimestamp64Milli(?)".to_string(),
+    ];
+    let mut binds = vec![
+        Bv::I32(project_id),
+        Bv::I64(request.start_time.timestamp_millis()),
+        Bv::I64(request.end_time.timestamp_millis()),
+    ];
+    if let Some(environment_id) = request.environment_id {
+        conditions.push("environment_id = ?".to_string());
+        binds.push(Bv::I32(environment_id));
+    }
+    if !request.include_synthetic {
+        conditions.push("request_source != 'temps_monitor'".to_string());
+        conditions.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string());
+    }
+    for filter in &request.filters {
+        append_ch_filter(filter, &mut conditions, &mut binds)?;
+    }
+
+    let mut dimensions = Vec::with_capacity(4);
+    let mut groups = Vec::with_capacity(request.dimensions.len());
+    let mut count_groups = Vec::with_capacity(request.dimensions.len());
+    for index in 0..4 {
+        if let Some(dimension) = request.dimensions.get(index).copied() {
+            dimensions.push(format!(
+                "toNullable(toString({})) AS d{index}",
+                ch_dimension_expression(dimension)
+            ));
+            groups.push(format!("d{index}"));
+            count_groups.push(ch_dimension_expression(dimension));
+        } else {
+            dimensions.push(format!("CAST(NULL AS Nullable(String)) AS d{index}"));
+        }
+    }
+
+    let all_metrics = [
+        TrafficMetric::Requests,
+        TrafficMetric::Errors,
+        TrafficMetric::ErrorRate,
+        TrafficMetric::LatencyAvg,
+        TrafficMetric::LatencyMin,
+        TrafficMetric::LatencyMax,
+        TrafficMetric::LatencyP50,
+        TrafficMetric::LatencyP95,
+        TrafficMetric::LatencyP99,
+        TrafficMetric::UniqueIps,
+        TrafficMetric::UniquePaths,
+        TrafficMetric::LastSeen,
+    ];
+    let metrics = all_metrics.map(|metric| {
+        let expression = if request.metrics.contains(&metric) {
+            ch_metric_expression(metric)
+        } else {
+            ch_null_metric(metric)
+        };
+        format!("{expression} AS {}", ch_metric_alias(metric))
+    });
+    let mut orders = request
+        .order_by
+        .iter()
+        .map(|order| {
+            let field = match order.field {
+                TrafficOrderField::Dimension(dimension) => {
+                    let index = request
+                        .dimensions
+                        .iter()
+                        .position(|candidate| *candidate == dimension)
+                        .unwrap_or(0);
+                    format!("d{index}")
+                }
+                TrafficOrderField::Metric(metric) => ch_metric_alias(metric).to_string(),
+            };
+            let direction = match order.direction {
+                TrafficSortDirection::Asc => "ASC",
+                TrafficSortDirection::Desc => "DESC",
+            };
+            format!("{field} {direction} NULLS LAST")
+        })
+        .collect::<Vec<_>>();
+    if orders.is_empty() {
+        let metric = request
+            .metrics
+            .first()
+            .copied()
+            .unwrap_or(TrafficMetric::Requests);
+        orders.push(format!("{} DESC NULLS LAST", ch_metric_alias(metric)));
+    }
+    for index in 0..request.dimensions.len() {
+        let prefix = format!("d{index} ");
+        if !orders.iter().any(|order| order.starts_with(&prefix)) {
+            orders.push(format!("d{index} ASC NULLS LAST"));
+        }
+    }
+    let order = orders.join(", ");
+    let offset = (request.page - 1).saturating_mul(request.page_size);
+    let selects = dimensions
+        .into_iter()
+        .chain(metrics)
+        .collect::<Vec<_>>()
+        .join(",\n                ");
+    let sql = format!(
+        "SELECT {selects}, count() OVER() AS total_groups\n\
+         FROM proxy_logs\n\
+         WHERE {conditions}\n\
+         {group_by}\n\
+         ORDER BY {order}\n\
+         LIMIT {limit} OFFSET {offset}",
+        conditions = conditions.join(" AND "),
+        group_by = if groups.is_empty() {
+            String::new()
+        } else {
+            format!("GROUP BY {}", groups.join(", "))
+        },
+        limit = request.page_size,
+    );
+    let count_sql = if groups.is_empty() {
+        "SELECT toUInt64(1) AS cnt".to_string()
+    } else {
+        format!(
+            "SELECT count() AS cnt FROM (SELECT 1 FROM proxy_logs WHERE {conditions} GROUP BY {groups})",
+            conditions = conditions.join(" AND "),
+            groups = count_groups.join(", "),
+        )
+    };
+    Ok((sql, binds, count_sql))
+}
+
+fn ch_count(value: Option<u64>, metric: &str) -> Result<Option<i64>, ProxyLogServiceError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                ProxyLogServiceError::InvalidFilter(format!(
+                    "ClickHouse {metric} aggregate exceeded the supported i64 range"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn ch_traffic_response(
+    request: &TrafficAggregationRequest,
+    rows: Vec<ChTrafficAggregationRow>,
+) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+    let total_groups = rows.first().map(|row| row.total_groups).unwrap_or(0);
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let dimension_values = [row.d0, row.d1, row.d2, row.d3];
+        let dimensions = request
+            .dimensions
+            .iter()
+            .copied()
+            .zip(dimension_values)
+            .map(|(dimension, value)| TrafficDimensionValue { dimension, value })
+            .collect();
+        result.push(TrafficAggregationRow {
+            dimensions,
+            metrics: TrafficMetricValues {
+                requests: ch_count(row.requests, "requests")?,
+                errors: ch_count(row.errors, "errors")?,
+                error_rate: row.error_rate,
+                latency_avg_ms: row.latency_avg_ms,
+                latency_min_ms: row.latency_min_ms,
+                latency_max_ms: row.latency_max_ms,
+                latency_p50_ms: row.latency_p50_ms,
+                latency_p95_ms: row.latency_p95_ms,
+                latency_p99_ms: row.latency_p99_ms,
+                unique_ips: ch_count(row.unique_ips, "unique_ips")?,
+                unique_paths: ch_count(row.unique_paths, "unique_paths")?,
+                last_seen: row
+                    .last_seen_ms
+                    .and_then(|millis| Utc.timestamp_millis_opt(millis).single()),
+            },
+        });
+    }
+    Ok(TrafficAggregationResponse {
+        rows: result,
+        total_groups,
+        page: request.page,
+        page_size: request.page_size,
+        total_pages: total_groups.div_ceil(request.page_size),
+        dimensions: request.dimensions.clone(),
+        metrics: request.metrics.clone(),
+        synthetic_excluded: !request.include_synthetic,
+    })
+}
+
 impl ClickHouseProxyLogStore {
     /// Append the `StatsFilters` predicates (used by `today` + `time-buckets`)
     /// as bound `?` clauses. Mirrors the Postgres `build_filter_sql` /
@@ -1842,6 +2262,10 @@ impl ClickHouseProxyLogStore {
                 "project_id IS NULL".into()
             });
         }
+        if f.exclude_synthetic {
+            clauses.push("request_source != 'temps_monitor'".into());
+            clauses.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".into());
+        }
     }
 }
 
@@ -1861,6 +2285,7 @@ fn status_class_range(class: &str) -> Option<(i16, i16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traffic_aggregation::TrafficOrderBy;
 
     /// Start a real ClickHouse matching the production major version. Docker
     /// is optional for local/unit-test environments, so startup failures skip
@@ -2021,6 +2446,105 @@ mod tests {
                 .any(|bucket| bucket.key == "GPTBot" && bucket.request_count == 1),
             "inserted AI request must appear in the agent timeline"
         );
+    }
+
+    #[tokio::test]
+    async fn clickhouse_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut fast = make_entry("traffic-fast");
+        fast.path = "/api/users".to_string();
+        fast.client_ip = Some("203.0.113.10".to_string());
+        fast.response_time_ms = Some(10);
+
+        let mut slow_error = make_entry("traffic-slow-error");
+        slow_error.path = "/api/users".to_string();
+        slow_error.client_ip = Some("203.0.113.10".to_string());
+        slow_error.status_code = 500;
+        slow_error.response_time_ms = Some(90);
+
+        let mut monitor = make_entry("traffic-monitor");
+        monitor.path = "/api/health".to_string();
+        monitor.client_ip = Some("203.0.113.99".to_string());
+        monitor.request_source = "temps_monitor".to_string();
+        monitor.is_system_request = true;
+        monitor.user_agent = Some("Temps-Status-Monitor/1.0".to_string());
+
+        store
+            .write_batch(vec![fast, slow_error, monitor])
+            .await
+            .expect("insert traffic aggregation fixtures");
+
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::minutes(2),
+            end_time: Utc::now() + chrono::Duration::minutes(2),
+            environment_id: Some(3),
+            dimensions: vec![
+                TrafficDimension::ClientIp,
+                TrafficDimension::Path,
+                TrafficDimension::Method,
+            ],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::Errors,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LatencyMin,
+                TrafficMetric::LatencyAvg,
+                TrafficMetric::LatencyMax,
+            ],
+            filters: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let response = store
+            .aggregate_traffic(7, request.clone())
+            .await
+            .expect("aggregate ClickHouse traffic");
+
+        assert_eq!(response.total_groups, 1);
+        assert!(response.synthetic_excluded);
+        let row = response.rows.first().expect("customer traffic row");
+        assert_eq!(row.dimensions[0].value.as_deref(), Some("203.0.113.10"));
+        assert_eq!(row.dimensions[1].value.as_deref(), Some("/api/users"));
+        assert_eq!(row.dimensions[2].value.as_deref(), Some("GET"));
+        assert_eq!(row.metrics.requests, Some(2));
+        assert_eq!(row.metrics.errors, Some(1));
+        assert_eq!(row.metrics.error_rate, Some(0.5));
+        assert_eq!(row.metrics.latency_min_ms, Some(10.0));
+        assert_eq!(row.metrics.latency_avg_ms, Some(50.0));
+        assert_eq!(row.metrics.latency_max_ms, Some(90.0));
+
+        let false_bot_response = store
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    filters: vec![TrafficFilter {
+                        dimension: TrafficDimension::IsBot,
+                        operator: TrafficFilterOperator::Eq,
+                        values: vec!["false".to_string()],
+                    }],
+                    ..request.clone()
+                },
+            )
+            .await
+            .expect("filter ClickHouse traffic by raw nullable boolean");
+        assert_eq!(false_bot_response.total_groups, 1);
+        assert_eq!(false_bot_response.rows[0].metrics.requests, Some(2));
+
+        let empty_page = store
+            .aggregate_traffic(7, TrafficAggregationRequest { page: 2, ..request })
+            .await
+            .expect("aggregate out-of-range ClickHouse traffic page");
+        assert!(empty_page.rows.is_empty());
+        assert_eq!(empty_page.total_groups, 1);
+        assert_eq!(empty_page.total_pages, 1);
     }
 
     #[test]
@@ -2356,5 +2880,72 @@ mod tests {
             .expect("impossible query => empty, no round-trip");
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn traffic_query_matches_timescale_shape_and_binds_filters() {
+        let mut request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::hours(1),
+            end_time: Utc::now(),
+            environment_id: Some(3),
+            dimensions: vec![TrafficDimension::ClientIp, TrafficDimension::Path],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::LatencyMin,
+                TrafficMetric::LatencyMax,
+                TrafficMetric::ErrorRate,
+            ],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::Path,
+                operator: TrafficFilterOperator::Eq,
+                values: vec!["/api/health' OR 1=1 --".to_string()],
+            }],
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::ErrorRate),
+                direction: TrafficSortDirection::Asc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("AS d0"));
+        assert!(sql.contains("AS d1"));
+        assert!(sql.contains("min(toFloat64(response_time_ms))"));
+        assert!(sql.contains("max(toFloat64(response_time_ms))"));
+        assert!(sql.contains("request_source != 'temps_monitor'"));
+        assert!(sql.contains("Temps-Status-Monitor/%"));
+        assert!(sql
+            .contains("ORDER BY error_rate ASC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
+        assert!(!sql.contains("OR 1=1"), "filter values must remain bound");
+        assert_eq!(binds.len(), 5);
+
+        request.order_by[0].direction = TrafficSortDirection::Desc;
+        let (sql, _, _) = build_traffic_query(7, &request).expect("valid descending query");
+        assert!(sql
+            .contains("ORDER BY error_rate DESC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
+    }
+
+    #[test]
+    fn is_bot_filter_uses_raw_boolean_expression() {
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::hours(1),
+            end_time: Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::IsBot],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::IsBot,
+                operator: TrafficFilterOperator::Eq,
+                values: vec!["false".to_string()],
+            }],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _) = build_traffic_query(7, &request).expect("valid is_bot filter");
+        assert!(sql.contains("AND is_bot = ?"));
+        assert!(matches!(binds.last(), Some(Bv::Bool(false))));
     }
 }
