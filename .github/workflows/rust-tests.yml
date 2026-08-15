@@ -45,6 +45,9 @@ jobs:
         # twice already (dependency-scan.yml, network-kernel-tests.yml).
         run: python3 .github/scripts/check-cache-save-guards.py
 
+      - name: Verify musl cache inheritance
+        run: python3 .github/scripts/test-musl-cache-seed.py
+
   # ---------------------------------------------------------------------------
   # One `temps` binary, two consumers.
   #
@@ -55,13 +58,17 @@ jobs:
   # with its own web-UI + WASM build in front of it. Now this job compiles
   # once and both consume the artifact.
   #
-  # musl-static is the right target for both: it is exactly the binary that
-  # ships in the Docker image, and a static binary runs fine directly on the
-  # runner. E2E therefore now tests the artifact users actually get.
+  # musl-static is the right runtime target for both, and a static binary runs
+  # directly on the runner. This uses the incremental `fast` profile for CI;
+  # tagged production releases still use the fully optimized release profile.
   # ---------------------------------------------------------------------------
   build-binary:
     name: Build temps Binary (musl)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read artifact metadata and download trusted cache seeds from main.
+      actions: read
     # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
     # which took 81 minutes the last time the cargo cache was evicted — a
     # tighter bound would turn a slow run into a failed one.
@@ -128,6 +135,34 @@ jobs:
             temps-musl-fast-
             compose-security-musl-
 
+      # The Actions cache is a 10GB LRU pool shared with every workflow. If
+      # the ~5GB Cargo target is evicted, inherit the latest seed published by
+      # a trusted main run instead of recompiling all 55+ crates from zero.
+      # This is only an intermediate target/registry snapshot: the next step
+      # always compiles the checked-out SHA and produces a fresh binary.
+      - name: Find inherited musl cache seed
+        id: musl-seed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SEED_NAME: temps-musl-fast-seed-v1-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+        run: python3 .github/scripts/musl-cache-seed.py "$CURRENT_SEED_NAME"
+
+      - name: Download inherited musl cache seed
+        # `cache-hit == 'false'` means restore-keys already supplied a useful
+        # partial Cargo cache. Only the empty output is a total cache miss.
+        if: steps.musl-cache.outputs.cache-hit == '' && steps.musl-seed.outputs.run-id != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.musl-seed.outputs.artifact-name }}
+          path: ci-musl-seed
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.musl-seed.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Unpack inherited musl cache seed
+        if: steps.musl-cache.outputs.cache-hit == '' && steps.musl-seed.outputs.run-id != ''
+        run: .github/scripts/musl-cache-archive.sh unpack ci-musl-seed/musl-cache-seed.tar.zst ci-build-cache
+
       # Mirrors the Dockerfile builder stage (WASM -> web UI -> cargo build)
       # inside the toolchain container, with target/ and the cargo registry
       # mounted from the persistent cache so rebuilds are incremental. Uses
@@ -147,13 +182,21 @@ jobs:
               cd /build/web && bun install && \
                 RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
               cd /build
-              cargo build --profile fast --bin temps --package temps-cli
+              # The build script embeds the current SHA and timestamp. Git
+              # changes do not invalidate the custom `fast` profile, so force
+              # only the final package to rebuild after inheriting target/.
+              cargo clean --profile fast --package temps-cli
+              # The web bundle was built directly above; do not make build.rs
+              # run the same Bun build a second time during the forced relink.
+              SKIP_WEB_BUILD=1 cargo build --profile fast --bin temps --package temps-cli
               cp target/fast/temps ci-prebuilt/temps
               chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
                 ci-prebuilt crates/temps-cli/dist
             '
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
+          expected_sha="$(git rev-parse --short HEAD)"
+          ci-prebuilt/temps --version | grep -F -- "$expected_sha"
 
       - name: Save cargo target dir (musl, fast profile)
         if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
@@ -161,6 +204,23 @@ jobs:
         with:
           path: ci-build-cache
           key: temps-musl-fast-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+
+      # Keep an artifact-backed copy outside the eviction-prone Actions cache
+      # pool. Publish only when the current dependency key has no healthy seed
+      # (or it is within two days of expiry), so storage does not grow with
+      # every main commit. A new seed naturally supersedes the old 7-day one.
+      - name: Package inherited musl cache seed
+        if: github.ref == 'refs/heads/main' && steps.musl-seed.outputs.publish-current == 'true'
+        run: .github/scripts/musl-cache-archive.sh pack ci-build-cache ci-musl-seed-upload/musl-cache-seed.tar.zst
+
+      - name: Publish inherited musl cache seed
+        if: github.ref == 'refs/heads/main' && steps.musl-seed.outputs.publish-current == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: temps-musl-fast-seed-v1-${{ hashFiles('Cargo.lock', 'Dockerfile') }}
+          path: ci-musl-seed-upload/musl-cache-seed.tar.zst
+          retention-days: 7
+          compression-level: 0
 
       - name: Upload temps binary
         uses: actions/upload-artifact@v7

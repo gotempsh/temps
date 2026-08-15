@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Regression tests and workflow contract for musl cache inheritance."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / ".github/scripts/musl-cache-seed.py"
+WORKFLOW = ROOT / ".github/workflows/rust-tests.yml"
+ARCHIVE_SCRIPT = ROOT / ".github/scripts/musl-cache-archive.sh"
+SPEC = importlib.util.spec_from_file_location("musl_cache_seed", SCRIPT)
+assert SPEC and SPEC.loader
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+def artifact(
+    name: str,
+    run_id: int,
+    created_at: str,
+    expires_at: str = "2026-08-30T00:00:00Z",
+    branch: str = "main",
+    expired: bool = False,
+) -> dict:
+    return {
+        "name": name,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "expired": expired,
+        "workflow_run": {"id": run_id, "head_branch": branch},
+    }
+
+
+class SeedSelectionTests(unittest.TestCase):
+    def test_exact_key_beats_newer_compatible_fallback(self) -> None:
+        current = f"{MODULE.SEED_PREFIX}current"
+        candidates = MODULE.eligible_artifacts(
+            [
+                artifact(current, 10, "2026-08-01T00:00:00Z"),
+                artifact(f"{MODULE.SEED_PREFIX}newer", 11, "2026-08-02T00:00:00Z"),
+            ],
+            current,
+        )
+        self.assertEqual(candidates[0]["workflow_run"]["id"], 10)
+
+    def test_newest_exact_seed_wins(self) -> None:
+        current = f"{MODULE.SEED_PREFIX}current"
+        candidates = MODULE.eligible_artifacts(
+            [
+                artifact(current, 10, "2026-08-01T00:00:00Z"),
+                artifact(current, 11, "2026-08-02T00:00:00Z"),
+            ],
+            current,
+        )
+        self.assertEqual(candidates[0]["workflow_run"]["id"], 11)
+
+    def test_rejects_pr_expired_and_unrelated_artifacts(self) -> None:
+        current = f"{MODULE.SEED_PREFIX}current"
+        candidates = MODULE.eligible_artifacts(
+            [
+                artifact(current, 1, "2026-08-01T00:00:00Z", branch="feature"),
+                artifact(current, 2, "2026-08-01T00:00:00Z", expired=True),
+                artifact("unrelated", 3, "2026-08-01T00:00:00Z"),
+                artifact(
+                    f"{MODULE.SEED_PREFIX}bad\noutput=true",
+                    4,
+                    "2026-08-01T00:00:00Z",
+                ),
+                {
+                    "name": current,
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "workflow_run": {},
+                },
+            ],
+            current,
+        )
+        self.assertEqual(candidates, [])
+
+    def test_refreshes_missing_or_expiring_exact_seed(self) -> None:
+        now = datetime(2026, 8, 15, tzinfo=timezone.utc)
+        current = f"{MODULE.SEED_PREFIX}current"
+        fallback = artifact(f"{MODULE.SEED_PREFIX}old", 1, "2026-08-01T00:00:00Z")
+        expiring = artifact(
+            current,
+            2,
+            "2026-08-14T00:00:00Z",
+            expires_at="2026-08-16T00:00:00Z",
+        )
+        fresh = artifact(
+            current,
+            3,
+            "2026-08-14T00:00:00Z",
+            expires_at="2026-08-25T00:00:00Z",
+        )
+        self.assertTrue(MODULE.should_publish([fallback], current, now))
+        self.assertTrue(MODULE.should_publish([expiring], current, now))
+        self.assertFalse(MODULE.should_publish([fresh], current, now))
+
+    def test_api_failure_builds_cold_without_publishing(self) -> None:
+        current = f"{MODULE.SEED_PREFIX}current"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "outputs"
+            environment = {
+                "GITHUB_REPOSITORY": "gotempsh/temps",
+                "GH_TOKEN": "test-token",
+                "GITHUB_OUTPUT": str(output_path),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE, "github_artifacts", side_effect=OSError("offline")
+            ):
+                self.assertEqual(MODULE.find_seed(current), 0)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8").splitlines(),
+                ["artifact-name=", "run-id=", "publish-current=false"],
+            )
+
+
+class WorkflowContractTests(unittest.TestCase):
+    def test_binary_build_inherits_and_publishes_main_seed(self) -> None:
+        parsed = subprocess.check_output(
+            [
+                "ruby",
+                "-ryaml",
+                "-rjson",
+                "-e",
+                "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]), aliases: true))",
+                str(WORKFLOW),
+            ],
+            text=True,
+        )
+        workflow = json.loads(parsed)
+        job = workflow["jobs"]["build-binary"]
+        steps = {step["name"]: step for step in job["steps"]}
+        total_miss = (
+            "steps.musl-cache.outputs.cache-hit == '' && "
+            "steps.musl-seed.outputs.run-id != ''"
+        )
+
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(
+            job["permissions"], {"contents": "read", "actions": "read"}
+        )
+        self.assertEqual(steps["Find inherited musl cache seed"]["id"], "musl-seed")
+        self.assertIn(
+            "python3 .github/scripts/musl-cache-seed.py",
+            steps["Find inherited musl cache seed"]["run"],
+        )
+        self.assertEqual(steps["Download inherited musl cache seed"]["if"], total_miss)
+        self.assertEqual(steps["Unpack inherited musl cache seed"]["if"], total_miss)
+        download = steps["Download inherited musl cache seed"]["with"]
+        self.assertEqual(download["path"], "ci-musl-seed")
+        self.assertEqual(download["run-id"], "${{ steps.musl-seed.outputs.run-id }}")
+        self.assertEqual(download["github-token"], "${{ secrets.GITHUB_TOKEN }}")
+
+        build_command = steps["Build temps binary in toolchain container"]["run"]
+        self.assertIn("cargo clean --profile fast --package temps-cli", build_command)
+        self.assertIn("git rev-parse --short HEAD", build_command)
+        publish_condition = (
+            "github.ref == 'refs/heads/main' && "
+            "steps.musl-seed.outputs.publish-current == 'true'"
+        )
+        self.assertEqual(steps["Package inherited musl cache seed"]["if"], publish_condition)
+        self.assertEqual(steps["Publish inherited musl cache seed"]["if"], publish_condition)
+        self.assertEqual(
+            steps["Publish inherited musl cache seed"]["with"]["compression-level"], 0
+        )
+        self.assertNotIn("actions: write", parsed)
+
+    def test_archive_preserves_hidden_files_and_executable_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            restored = root / "restored"
+            archive_path = root / "seed.tar.zst"
+            fingerprint = source / "target/fast/.fingerprint/example"
+            executable = source / "target/fast/build/example/build-script-build"
+            symlink = source / "target/fast/build/example/build-script-link"
+            fingerprint.parent.mkdir(parents=True)
+            executable.parent.mkdir(parents=True)
+            fingerprint.write_text("fingerprint", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            symlink.symlink_to("build-script-build")
+
+            subprocess.run(
+                ["bash", str(ARCHIVE_SCRIPT), "pack", str(source), str(archive_path)],
+                check=True,
+            )
+            subprocess.run(
+                ["bash", str(ARCHIVE_SCRIPT), "unpack", str(archive_path), str(restored)],
+                check=True,
+            )
+
+            self.assertEqual(
+                (restored / "target/fast/.fingerprint/example").read_text(encoding="utf-8"),
+                "fingerprint",
+            )
+            self.assertTrue(
+                os.access(
+                    restored / "target/fast/build/example/build-script-build", os.X_OK
+                )
+            )
+            self.assertTrue(
+                (restored / "target/fast/build/example/build-script-link").is_symlink()
+            )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
