@@ -3145,10 +3145,7 @@ mod tests {
             .allocate_database("project-c/prod")
             .await
             .expect("allocate resource C after drop");
-        assert_eq!(
-            db_c, db_a,
-            "a freed DB must be reusable by a new resource"
-        );
+        assert_eq!(db_c, db_a, "a freed DB must be reusable by a new resource");
 
         // Cleanup
         let _ = service.drop_database("project-b/prod").await;
