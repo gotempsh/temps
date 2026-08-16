@@ -21,7 +21,7 @@ use bollard::Docker;
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1940,6 +1940,46 @@ impl ExternalServiceManager {
             .await?;
 
         let mut result = Vec::new();
+        for service in services {
+            result.push(self.get_service_info(service.id).await?);
+        }
+
+        Ok(result)
+    }
+
+    /// List services linked to at least one project visible to the caller.
+    ///
+    /// `hidden_project_ids` comes from the registered `ProjectAccessChecker`.
+    /// The join deliberately excludes unlinked services and applies the access
+    /// filter before pagination, so restricted callers cannot enumerate a
+    /// service through sparse or misleading pages. `DISTINCT` prevents a
+    /// service linked to multiple visible projects from appearing twice.
+    pub async fn list_project_accessible_services_paginated(
+        &self,
+        page: u64,
+        page_size: u64,
+        hidden_project_ids: &[i32],
+    ) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
+        let mut query = external_services::Entity::find()
+            .inner_join(project_services::Entity)
+            .distinct()
+            .order_by_desc(external_services::Column::CreatedAt);
+
+        if !hidden_project_ids.is_empty() {
+            query = query.filter(
+                project_services::Column::ProjectId.is_not_in(hidden_project_ids.iter().copied()),
+            );
+        }
+
+        let services = query
+            .paginate(self.db.as_ref(), page_size)
+            .fetch_page(page - 1)
+            .await
+            .map_err(|error| ExternalServiceError::DatabaseError {
+                reason: format!("failed to list project-accessible external services: {error}"),
+            })?;
+
+        let mut result = Vec::with_capacity(services.len());
         for service in services {
             result.push(self.get_service_info(service.id).await?);
         }
@@ -11737,7 +11777,7 @@ mod tests {
         params.insert("port".to_string(), JsonValue::String(port.to_string()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:17-bookworm".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:17-bookworm".to_string()),
         );
         let svc = manager
             .create_service(CreateExternalServiceRequest {
@@ -11781,8 +11821,8 @@ mod tests {
                 service_id: Set(svc.id),
                 from_version: Set("17".to_string()),
                 to_version: Set("18".to_string()),
-                from_image: Set("postgres:17-bookworm".to_string()),
-                to_image: Set("postgres:18-bookworm".to_string()),
+                from_image: Set("gotempsh/postgres-walg:17-bookworm".to_string()),
+                to_image: Set("gotempsh/postgres-walg:18-bookworm".to_string()),
                 status: Set(status::PENDING.to_string()),
                 phase: Set(status::PENDING.to_string()),
                 pre_upgrade_backup_id: Set(None),
@@ -12709,6 +12749,48 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn project_accessible_service_list_filters_links_before_pagination() {
+        let model = encrypted_service_model(17, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // Filtered page query.
+                .append_query_results([vec![model.clone()]])
+                // Existing service-info hydration query.
+                .append_query_results([vec![model]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+
+        let services = manager
+            .list_project_accessible_services_paginated(1, 25, &[10, 11])
+            .await
+            .expect("project-scoped external-service list should succeed");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, 17);
+
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("test database still has owners"));
+        let log = db.into_transaction_log();
+        let list_sql = &log[0].statements()[0].sql;
+        assert!(
+            list_sql.contains("INNER JOIN \"project_services\""),
+            "unlinked services must be excluded by the database query: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("\"project_services\".\"project_id\" NOT IN ($1, $2)"),
+            "hidden projects must be excluded before pagination: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("SELECT DISTINCT"),
+            "services linked to multiple accessible projects must be deduplicated: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("LIMIT $3 OFFSET $4"),
+            "access filtering must be part of the paginated query: {list_sql}"
+        );
+    }
+
     /// `check_service_health` backed `GET /external-services/{id}/health` with
     /// a hardcoded `false`, so the endpoint called every service unhealthy no
     /// matter what the health monitor had just written to the row.
@@ -12861,13 +12943,12 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
     async fn test_upgrade_postgres_image_parameter_update() {
-        // This test verifies that the docker_image parameter can be updated.
-        // Uses same-major-version update (18 -> 18-alpine) to avoid data format
-        // incompatibility issues that occur with cross-major-version upgrades.
+        // This test verifies that an allowlisted docker_image parameter can be
+        // supplied again through the update path without changing major version.
         let (manager, _test_db) = setup_test_manager_or_skip!();
         let random_unused_port = get_unused_port();
 
-        // Step 1: Create a PostgreSQL service with postgres:18
+        // Step 1: Create a PostgreSQL service with the managed PostgreSQL 18 image.
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
@@ -12892,7 +12973,7 @@ mod tests {
         params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -12916,11 +12997,11 @@ mod tests {
         let initial_params = initial_details.current_parameters.unwrap();
         assert_eq!(
             initial_params.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18"),
-            "Initial docker_image should be postgres:18"
+            Some("gotempsh/postgres-walg:18-bookworm"),
+            "Initial docker_image should be gotempsh/postgres-walg:18-bookworm"
         );
 
-        // Step 2: Update docker_image parameter to gotempsh/postgres-walg:18-bookworm (same major version, different variant).
+        // Step 2: Exercise the image update path with the same allowlisted image.
         // Only include updateable parameters - readonly params (database, username, password, host)
         // are rejected by validate_for_update().
         let mut update_params = HashMap::new();
@@ -13322,7 +13403,7 @@ mod tests {
         // Explicitly set docker_image so the test is deterministic
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -13341,9 +13422,7 @@ mod tests {
             .expect("Failed to create service");
         let service_id = service.id;
 
-        // Update docker_image to a compatible variant (same major version, different tag).
-        // Changing to a different major version (e.g., 18 -> 17) would fail because
-        // PostgreSQL data files are not backward-compatible across major versions.
+        // Exercise an idempotent update with the allowlisted managed image.
         let update_params = HashMap::new();
 
         let update_request = UpdateExternalServiceRequest {

@@ -5,7 +5,9 @@ import {
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { DropButton } from '@/components/dashboard/DropButton'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { featureKeyForPath } from '@/lib/feature-maturity'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useQuery } from '@tanstack/react-query'
 import { Check, ChevronsUpDown, Plus } from 'lucide-react'
@@ -171,6 +173,7 @@ export function Header() {
     !['new', 'import-wizard', 'import'].includes(projectSlugMatch[1])
       ? projectSlugMatch[1]
       : null
+  const featureKey = featureKeyForPath(location.pathname)
 
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
@@ -215,6 +218,7 @@ export function Header() {
               })}
             </BreadcrumbList>
           </Breadcrumb>
+          <FeatureMaturityBadge featureKey={featureKey} className="ml-2" />
         </div>
         <div className="ml-auto flex shrink-0 items-center space-x-2">
           {headerActions?.map((action) => (

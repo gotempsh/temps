@@ -590,13 +590,27 @@ fn ensure_context_read_permission(auth: &AuthContext, context_type: &str) -> Res
     if !can_read_context(auth, context_type) {
         return Err(problemdetails::new(axum::http::StatusCode::FORBIDDEN)
             .with_title("Insufficient Permissions")
-            .with_detail("The otel:read permission is required for alert suggestion chats."));
+            .with_detail(format!(
+                "The {} permission is required for this AI conversation context.",
+                required_context_permission(context_type)
+                    .map(|permission| permission.to_string())
+                    .unwrap_or_else(|| "corresponding read".to_string())
+            )));
     }
     Ok(())
 }
 
 fn can_read_context(auth: &AuthContext, context_type: &str) -> bool {
-    context_type != "alert_suggest" || auth.has_permission(&Permission::OtelRead)
+    required_context_permission(context_type)
+        .is_none_or(|permission| auth.has_permission(&permission))
+}
+
+fn required_context_permission(context_type: &str) -> Option<Permission> {
+    match context_type {
+        "alert" | "alert_suggest" => Some(Permission::OtelRead),
+        "deployment" => Some(Permission::DeploymentsRead),
+        _ => None,
+    }
 }
 
 fn ensure_conversation_read_permission(
@@ -1897,6 +1911,22 @@ mod tests {
             "test-key".to_string(),
             1,
         )
+    }
+
+    #[test]
+    fn seeded_contexts_require_their_domain_read_permissions() {
+        let project_writer = custom_auth(vec![Permission::ProjectsWrite]);
+        assert!(!can_read_context(&project_writer, "deployment"));
+        assert!(!can_read_context(&project_writer, "alert"));
+        assert!(!can_read_context(&project_writer, "alert_suggest"));
+
+        let deployment_reader = custom_auth(vec![Permission::DeploymentsRead]);
+        assert!(can_read_context(&deployment_reader, "deployment"));
+        assert!(!can_read_context(&deployment_reader, "alert"));
+
+        let telemetry_reader = custom_auth(vec![Permission::OtelRead]);
+        assert!(can_read_context(&telemetry_reader, "alert"));
+        assert!(can_read_context(&telemetry_reader, "alert_suggest"));
     }
 
     fn conversation_with_runtime(provider: &str, permission_mode: &str) -> ai_conversations::Model {

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, error, info};
+use url::Url;
 
 /// Output from PullExternalImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +116,51 @@ impl PullExternalImageJob {
         self
     }
 
+    /// Extract the explicit registry host from an image reference.
+    pub(crate) fn registry_from_image_ref(image_ref: &str) -> Option<String> {
+        let image_name = Self::image_name_without_tag(image_ref);
+        let registry = image_name.split('/').next()?;
+
+        if registry.contains('.') || registry.contains(':') || registry == "localhost" {
+            Some(registry.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    /// Normalize a configured registry URL to the host[:port] Docker uses.
+    pub(crate) fn registry_host_from_url(registry_url: &str) -> Option<String> {
+        let registry_url = registry_url.trim();
+        if registry_url.is_empty() {
+            return None;
+        }
+
+        let parsed = if registry_url.contains("://") {
+            Url::parse(registry_url).ok()?
+        } else {
+            Url::parse(&format!("https://{registry_url}")).ok()?
+        };
+
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        match parsed.port() {
+            Some(port) => Some(format!("{host}:{port}")),
+            None => Some(host),
+        }
+    }
+
+    fn image_name_without_tag(image_ref: &str) -> &str {
+        if let Some(idx) = image_ref.rfind(':') {
+            let potential_tag = &image_ref[idx + 1..];
+            if potential_tag.contains('/') {
+                image_ref
+            } else {
+                &image_ref[..idx]
+            }
+        } else {
+            image_ref
+        }
+    }
+
     /// Parse image reference to extract registry, image name, and tag
     fn parse_image_ref(&self) -> (Option<String>, String, String) {
         let image_ref = &self.image_ref;
@@ -133,13 +179,7 @@ impl PullExternalImageJob {
             (image_ref.as_str(), "latest")
         };
 
-        // Extract registry (before first '/')
-        let parts: Vec<&str> = image_name.split('/').collect();
-        let registry = if parts.len() > 1 && (parts[0].contains('.') || parts[0].contains(':')) {
-            Some(parts[0].to_string())
-        } else {
-            None // Default to Docker Hub
-        };
+        let registry = Self::registry_from_image_ref(image_ref);
 
         (registry, image_name.to_string(), tag.to_string())
     }
@@ -396,6 +436,39 @@ mod tests {
         assert_eq!(registry, Some("myregistry.io".to_string()));
         assert_eq!(image_name, "myregistry.io/app");
         assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn registry_from_image_ref_normalizes_explicit_hosts() {
+        assert_eq!(
+            PullExternalImageJob::registry_from_image_ref("GHCR.IO/org/app:v1"),
+            Some("ghcr.io".to_string())
+        );
+        assert_eq!(
+            PullExternalImageJob::registry_from_image_ref("localhost:5000/myapp:v2"),
+            Some("localhost:5000".to_string())
+        );
+        assert_eq!(
+            PullExternalImageJob::registry_from_image_ref("nginx:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_host_from_url_rejects_invalid_urls_and_normalizes_hosts() {
+        assert_eq!(
+            PullExternalImageJob::registry_host_from_url("https://REGISTRY.example.com/v2"),
+            Some("registry.example.com".to_string())
+        );
+        assert_eq!(
+            PullExternalImageJob::registry_host_from_url("registry.example.com:5000"),
+            Some("registry.example.com:5000".to_string())
+        );
+        assert_eq!(PullExternalImageJob::registry_host_from_url(""), None);
+        assert_eq!(
+            PullExternalImageJob::registry_host_from_url("https://"),
+            None
+        );
     }
 
     /// Even a bare tag already present locally must never satisfy a registry

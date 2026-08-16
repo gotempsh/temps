@@ -681,6 +681,30 @@ mod traces {
             status_message: r.status_message.clone().unwrap_or_default(),
             attributes: r.attributes.clone().unwrap_or_else(|| "{}".into()),
             events: r.events.clone().unwrap_or_else(|| "[]".into()),
+            // This backfill reads from the legacy Postgres `otel_spans` table, which
+            // predates span facets — there is no facet data to carry over, so every
+            // slot is unpopulated. A facet created after this backfill runs will
+            // retroactively populate these rows via its own backfill mutation.
+            facet_attr_1: None,
+            facet_attr_2: None,
+            facet_attr_3: None,
+            facet_attr_4: None,
+            facet_attr_5: None,
+            facet_attr_6: None,
+            facet_attr_7: None,
+            facet_attr_8: None,
+            facet_attr_9: None,
+            facet_attr_10: None,
+            facet_attr_11: None,
+            facet_attr_12: None,
+            facet_attr_13: None,
+            facet_attr_14: None,
+            facet_attr_15: None,
+            facet_attr_16: None,
+            facet_attr_17: None,
+            facet_attr_18: None,
+            facet_attr_19: None,
+            facet_attr_20: None,
             // Source start_time ms as the dedup version — stable across re-runs.
             _version: r.start_time.timestamp_millis() as u64,
             retention_days: temps_core::RetentionTable::Spans.default_days(),

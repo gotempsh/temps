@@ -19,6 +19,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import {
+  targetLabelsToPayload,
+  targetNodesToPayload,
+} from '@/lib/environment-placement'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -321,12 +325,8 @@ export function EnvironmentConfigurationCard({
         // certificate-driven default), true/false force it.
         force_https: forceHttpsToPayload(formData.force_https),
         anti_affinity: formData.anti_affinity,
-        target_nodes:
-          formData.target_nodes.length > 0 ? formData.target_nodes : null,
-        target_labels:
-          Object.keys(formData.target_labels).length > 0
-            ? formData.target_labels
-            : null,
+        target_nodes: targetNodesToPayload(formData.target_nodes),
+        target_labels: targetLabelsToPayload(formData.target_labels),
         on_demand: formData.on_demand,
         idle_timeout_seconds: formData.idle_timeout_seconds
           ? parseInt(formData.idle_timeout_seconds)

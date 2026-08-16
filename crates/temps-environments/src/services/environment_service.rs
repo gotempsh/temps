@@ -1,6 +1,6 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
@@ -12,6 +12,22 @@ use temps_core::{
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
+
+/// An empty target-node list means "remove this environment override".
+/// Persisting `Some([])` would instead create an explicit placement constraint
+/// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
+    (!target_nodes.is_empty()).then_some(target_nodes)
+}
+
+/// An empty target-label object means "remove this environment override" so
+/// the environment inherits any project-level placement constraint.
+fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_json::Value> {
+    (!target_labels
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty))
+    .then_some(target_labels)
+}
 
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
@@ -190,6 +206,28 @@ impl EnvironmentService {
         )
     }
 
+    /// Serialize every activation of a preview hostname and reject an active
+    /// owner. This must be called inside the transaction that creates,
+    /// restores, or renames the environment.
+    async fn claim_environment_subdomain(
+        &self,
+        txn: &DatabaseTransaction,
+        subdomain: &str,
+        excluding_environment_id: Option<i32>,
+    ) -> Result<(), EnvironmentError> {
+        let excluded = excluding_environment_id.into_iter().collect::<Vec<_>>();
+        if environments::claim_subdomain(txn, subdomain, &excluded)
+            .await?
+            .is_some()
+        {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Subdomain '{}' is already in use",
+                subdomain
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
@@ -219,11 +257,17 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}' in project {}",
                 deleted_env.id, branch, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self.db.begin().await?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
-            let restored = active_env.update(self.db.as_ref()).await?;
+            let restored = active_env.update(&txn).await?;
+            txn.commit().await?;
             return Ok(restored);
         }
 
@@ -231,10 +275,12 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Start a transaction for insert + domain creation
         let txn = self.db.begin().await?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -432,13 +478,25 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}'",
                 deleted_env.id, branch
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -506,6 +564,15 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} ('{}') in project {}",
                 deleted_env.id, name, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.branch = Set(Some(branch));
@@ -519,9 +586,12 @@ impl EnvironmentService {
                     }));
             }
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -530,7 +600,7 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -558,6 +628,8 @@ impl EnvironmentService {
             .begin()
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Insert the environment
         let environment = new_environment
@@ -669,11 +741,11 @@ impl EnvironmentService {
             }
             deployment_config.security = Some(security);
         }
-        if settings.target_nodes.is_some() {
-            deployment_config.target_nodes = settings.target_nodes;
+        if let Some(target_nodes) = settings.target_nodes {
+            deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
-        if settings.target_labels.is_some() {
-            deployment_config.target_labels = settings.target_labels;
+        if let Some(target_labels) = settings.target_labels {
+            deployment_config.target_labels = normalize_target_labels(target_labels);
         }
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
@@ -790,8 +862,8 @@ impl EnvironmentService {
     /// the proxy reloads its route table.
     ///
     /// Returns `InvalidInput` if the slugified value is empty, exceeds the
-    /// DNS label length limit, or collides with another environment in the
-    /// same project.
+    /// DNS label length limit, or collides with another active environment
+    /// globally because preview hostnames are keyed by subdomain.
     pub async fn update_environment_subdomain(
         &self,
         project_id: i32,
@@ -819,28 +891,18 @@ impl EnvironmentService {
             return Ok(environment);
         }
 
-        // Reject collisions with any other environment in the same project.
-        let conflict = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .filter(environments::Column::Subdomain.eq(&normalized))
-            .filter(environments::Column::Id.ne(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
-            .await?;
-        if let Some(other) = conflict {
-            return Err(EnvironmentError::InvalidInput(format!(
-                "Subdomain '{}' is already used by environment '{}' in this project",
-                normalized, other.name
-            )));
-        }
-
-        let previous_subdomain = environment.subdomain.clone();
-
         let txn = self
             .db
             .begin()
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+
+        // A row lock cannot protect the "no conflict exists" case, and a new
+        // unique index would fail upgrades that already contain duplicates.
+        self.claim_environment_subdomain(&txn, &normalized, Some(env_id))
+            .await?;
+
+        let previous_subdomain = environment.subdomain.clone();
 
         let mut active_model: environments::ActiveModel = environment.clone().into();
         active_model.subdomain = Set(normalized.clone());
@@ -1118,6 +1180,21 @@ impl EnvironmentService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[test]
+    fn empty_target_nodes_clears_environment_placement_override() {
+        assert_eq!(normalize_target_nodes(Vec::new()), None);
+        assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn empty_target_labels_clear_environment_placement_override() {
+        assert_eq!(normalize_target_labels(serde_json::json!({})), None);
+        assert_eq!(
+            normalize_target_labels(serde_json::json!({"region": "eu"})),
+            Some(serde_json::json!({"region": "eu"}))
+        );
+    }
 
     #[test]
     fn public_url_preserves_external_http_scheme_and_non_default_port() {
@@ -1665,6 +1742,10 @@ mod tests {
             .append_query_results(vec![vec![env]])
             // 2. conflict check returns the sibling env
             .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let svc = make_service(db);
 
@@ -1675,17 +1756,53 @@ mod tests {
         match result {
             Err(EnvironmentError::InvalidInput(msg)) => {
                 assert!(
-                    msg.contains("already used"),
+                    msg.contains("already in use"),
                     "Error should describe conflict: {}",
                     msg
                 );
                 assert!(
-                    msg.contains("production"),
-                    "Error should name the conflicting env: {}",
+                    !msg.contains("production"),
+                    "Error must not disclose the conflicting environment: {}",
                     msg
                 );
             }
             other => panic!("Expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_subdomain_rejects_conflict_across_projects() {
+        let env = make_env_model(false, false);
+        let conflict = environments::Model {
+            id: 2,
+            name: "victim-production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "victim".to_string(),
+            project_id: 99,
+            ..make_env_model(false, false)
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env]])
+            .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = make_service(db);
+
+        let result = svc
+            .update_environment_subdomain(10, 1, "victim".to_string())
+            .await;
+
+        match result {
+            Err(EnvironmentError::InvalidInput(msg)) => {
+                assert!(msg.contains("already in use"), "got: {msg}");
+                assert!(!msg.contains("victim-production"), "got: {msg}");
+                assert!(!msg.contains("project 99"), "got: {msg}");
+            }
+            other => panic!("Expected InvalidInput, got {other:?}"),
         }
     }
 

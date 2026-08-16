@@ -52,6 +52,15 @@ pub enum NodeError {
         excluded: String,
     },
 
+    #[error(
+        "Placement constraints selected node(s) that cannot run this image ({excluded}); \
+         refusing to fall back to the control plane"
+    )]
+    PlacementConstraintsUnsatisfied {
+        /// Constrained nodes that were dropped from the pool and why.
+        excluded: String,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }

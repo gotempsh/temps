@@ -679,6 +679,14 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         ctx.db.clone(),
         Arc::new(TimescaleDbStorage::new(ctx.db.clone(), None)),
     ));
+    let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::new(),
+    ));
+    let facet_service = Arc::new(temps_otel::services::FacetService::new(
+        ctx.db.clone(),
+        None,
+        facet_cache,
+    ));
     let app_state = OtelAppState {
         otel_service: ctx.otel_service.clone(),
         metrics_store: None,
@@ -691,6 +699,7 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         trace_hint_tx: None,
         otel_relay_tx: None,
         project_access_checker: None,
+        facet_service,
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

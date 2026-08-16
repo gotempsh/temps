@@ -408,19 +408,75 @@ async fn list_services(
 
     let (page, page_size) = pagination.normalize();
 
-    match app_state
-        .external_service_manager
-        .list_services_paginated(page, page_size)
-        .await
-    {
+    let scope =
+        resolve_external_service_list_scope(&auth, app_state.project_access_checker.as_deref())
+            .await?;
+
+    let services = match scope {
+        ExternalServiceListScope::FleetWide => {
+            app_state
+                .external_service_manager
+                .list_services_paginated(page, page_size)
+                .await
+        }
+        ExternalServiceListScope::ProjectLinked { hidden_project_ids } => {
+            app_state
+                .external_service_manager
+                .list_project_accessible_services_paginated(page, page_size, &hidden_project_ids)
+                .await
+        }
+    };
+
+    match services {
         Ok(services) => Ok((StatusCode::OK, Json(services))),
         Err(e) => {
-            error!("Failed to list services: {}", e);
+            error!(error = %e, "Failed to list external services");
             Err(internal_server_error()
-                .detail(format!("Failed to list services: {}", e))
+                .detail("Failed to list external services")
                 .build())
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalServiceListScope {
+    FleetWide,
+    ProjectLinked { hidden_project_ids: Vec<i32> },
+}
+
+async fn resolve_external_service_list_scope(
+    auth: &temps_auth::AuthContext,
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+) -> Result<ExternalServiceListScope, Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(ExternalServiceListScope::FleetWide);
+    }
+
+    let Some(checker) = checker else {
+        return Ok(ExternalServiceListScope::ProjectLinked {
+            hidden_project_ids: Vec::new(),
+        });
+    };
+    let Some(user_id) = auth.user_id_opt() else {
+        return Err(forbidden()
+            .title("Project Access Denied")
+            .detail("Could not resolve caller identity")
+            .build());
+    };
+
+    checker
+        .hidden_project_ids(user_id)
+        .await
+        .map(|hidden| ExternalServiceListScope::ProjectLinked {
+            hidden_project_ids: hidden.unwrap_or_default(),
+        })
+        .map_err(|error| {
+            error!(user_id, error = %error, "Failed to resolve external-service list access");
+            internal_server_error()
+                .title("Project Access Check Failed")
+                .detail("Could not verify project access; please try again")
+                .build()
+        })
 }
 
 /// Get external service details
@@ -2857,7 +2913,43 @@ mod tests {
         }
     }
 
+    struct ListProjectAccessChecker {
+        hidden_project_ids: Vec<i32>,
+        fail: bool,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for ListProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+
+        async fn hidden_project_ids(
+            &self,
+            _user_id: i32,
+        ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
+            *self
+                .calls
+                .lock()
+                .expect("list checker mutex should not be poisoned") += 1;
+            if self.fail {
+                Err("project access database unavailable".into())
+            } else {
+                Ok(Some(self.hidden_project_ids.clone()))
+            }
+        }
+    }
+
     fn test_auth_context() -> temps_auth::AuthContext {
+        test_auth_context_with_role(temps_auth::Role::Admin)
+    }
+
+    fn test_auth_context_with_role(role: temps_auth::Role) -> temps_auth::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -2879,7 +2971,66 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_auth::AuthContext::new_session(user, role)
+    }
+
+    #[tokio::test]
+    async fn external_service_list_restricts_non_admin_to_project_linked_scope() {
+        let checker = ListProjectAccessChecker {
+            hidden_project_ids: vec![10, 11],
+            fail: false,
+            calls: Mutex::new(0),
+        };
+        let auth = test_auth_context_with_role(temps_auth::Role::Reader);
+
+        let scope = resolve_external_service_list_scope(&auth, Some(&checker))
+            .await
+            .expect("restricted caller access should resolve");
+
+        assert_eq!(
+            scope,
+            ExternalServiceListScope::ProjectLinked {
+                hidden_project_ids: vec![10, 11]
+            }
+        );
+        assert_eq!(*checker.calls.lock().expect("calls mutex"), 1);
+    }
+
+    #[tokio::test]
+    async fn external_service_list_keeps_admin_fleet_wide() {
+        let checker = ListProjectAccessChecker {
+            hidden_project_ids: vec![10, 11],
+            fail: true,
+            calls: Mutex::new(0),
+        };
+        let auth = test_auth_context_with_role(temps_auth::Role::Admin);
+
+        let scope = resolve_external_service_list_scope(&auth, Some(&checker))
+            .await
+            .expect("admin list scope should bypass project access filtering");
+
+        assert_eq!(scope, ExternalServiceListScope::FleetWide);
+        assert_eq!(*checker.calls.lock().expect("calls mutex"), 0);
+    }
+
+    #[tokio::test]
+    async fn external_service_list_fails_closed_when_access_lookup_fails() {
+        let checker = ListProjectAccessChecker {
+            hidden_project_ids: Vec::new(),
+            fail: true,
+            calls: Mutex::new(0),
+        };
+        let auth = test_auth_context_with_role(temps_auth::Role::User);
+
+        let problem = resolve_external_service_list_scope(&auth, Some(&checker))
+            .await
+            .expect_err("access-check failure must not fall back to fleet-wide listing");
+
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(*checker.calls.lock().expect("calls mutex"), 1);
     }
 
     fn test_request_metadata() -> RequestMetadata {

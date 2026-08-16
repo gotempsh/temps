@@ -6,13 +6,17 @@ import {
   listConnectionsOptions,
   listGitProvidersOptions,
   updateProjectSettingsMutation,
+  deployFromImageMutation,
+  triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
+import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
 import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
+import { ProjectToolsPage } from '@/components/project/ProjectToolsPage'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
@@ -44,6 +48,10 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { resolveStableUrl } from '@/lib/deployment-url'
+import {
+  deploymentsAfterStartPath,
+  projectDeployLaunchMode,
+} from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
@@ -64,7 +72,7 @@ import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotPage } from '@/components/agents/AutopilotPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Navigate,
   Route,
@@ -84,6 +92,7 @@ export function ProjectDetail() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
+  const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
 
   // Check for confetti query parameter
   const showConfetti = searchParams.get('showConfetti') === 'true'
@@ -102,38 +111,32 @@ export function ProjectDetail() {
     enabled: !!slug,
   })
 
-  const {
-    data: lastDeployment,
-    isLoading: isLoadingLastDeployment,
-    refetch: refetchLastDeployment,
-  } = useQuery({
-    ...getLastDeploymentOptions({
-      path: {
-        id: project?.id || 0,
+  const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
+    {
+      ...getLastDeploymentOptions({
+        path: {
+          id: project?.id || 0,
+        },
+      }),
+      enabled: !!project?.id,
+      refetchInterval: (query) => {
+        const data = query.state.data
+        // Poll more frequently for active deployments
+        if (
+          data &&
+          (data.status === 'pending' ||
+            data.status === 'running' ||
+            data.status === 'building')
+        ) {
+          return 2500 // 2.5 seconds for active deployments
+        }
+        // Keep checking periodically for new deployments
+        return 10000 // 10 seconds for completed/failed deployments
       },
-    }),
-    enabled: !!project?.id,
-    refetchInterval: (query) => {
-      const data = query.state.data
-      // Poll more frequently for active deployments
-      if (
-        data &&
-        (data.status === 'pending' ||
-          data.status === 'running' ||
-          data.status === 'building')
-      ) {
-        return 2500 // 2.5 seconds for active deployments
-      }
-      // Poll while waiting for screenshot to be generated
-      if (data && data.status === 'completed' && !data.screenshot_location) {
-        return 3000 // 3 seconds while waiting for screenshot
-      }
-      // Keep checking periodically for new deployments
-      return 10000 // 10 seconds for completed/failed deployments
-    },
-    // Also refetch when window regains focus
-    refetchOnWindowFocus: true,
-  })
+      // Also refetch when window regains focus
+      refetchOnWindowFocus: true,
+    }
+  )
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -191,11 +194,21 @@ export function ProjectDetail() {
       toast.success('Attack mode disabled successfully')
       refetch()
     },
-    onError: (error: any) => {
+    onError: (error: Error) => {
       toast.error(
-        error?.message || 'Failed to disable attack mode. Please try again.'
+        error.message || 'Failed to disable attack mode. Please try again.'
       )
     },
+  })
+
+  const createDeployment = useMutation({
+    ...triggerProjectPipelineMutation(),
+    meta: { errorTitle: 'Failed to trigger deployment' },
+  })
+
+  const deployImage = useMutation({
+    ...deployFromImageMutation(),
+    meta: { errorTitle: 'Failed to deploy image' },
   })
 
   // Register the current project so the assistant's "new chat" defaults to it.
@@ -212,15 +225,46 @@ export function ProjectDetail() {
     })
   }
 
+  const handleHeaderDeployment = async ({
+    branch,
+    commit,
+    tag,
+    environmentId,
+  }: {
+    branch?: string
+    commit?: string
+    tag?: string
+    environmentId: number
+  }) => {
+    if (!project) return
+
+    if (project.source_type === 'docker_image') {
+      const imageRef = lastDeployment?.metadata?.externalImageRef
+      if (!imageRef) {
+        toast.error('No image reference found for this project')
+        return
+      }
+      await deployImage.mutateAsync({
+        path: { project_id: project.id, environment_id: environmentId },
+        body: { image_ref: imageRef },
+      })
+    } else {
+      await createDeployment.mutateAsync({
+        path: { id: project.id },
+        body: { branch, commit, tag, environment_id: environmentId },
+      })
+    }
+
+    toast.success('Deployment started')
+    setIsDeployDialogOpen(false)
+    navigate(deploymentsAfterStartPath(project.slug))
+  }
+
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
       { label: project?.slug || 'Project Details' },
     ])
-    // Refresh last deployment when component mounts
-    if (project?.id) {
-      refetchLastDeployment()
-    }
     // Remove confetti parameter after showing
     if (showConfetti) {
       const timer = setTimeout(() => {
@@ -229,14 +273,7 @@ export function ProjectDetail() {
       }, 500)
       return () => clearTimeout(timer)
     }
-  }, [
-    setBreadcrumbs,
-    project,
-    refetchLastDeployment,
-    showConfetti,
-    searchParams,
-    setSearchParams,
-  ])
+  }, [setBreadcrumbs, project, showConfetti, searchParams, setSearchParams])
 
   usePageTitle(project?.slug ? `${project.slug}` : '')
 
@@ -339,21 +376,33 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
+          lastDeployment={lastDeployment}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
           isLoadingLastDeployment={isLoadingLastDeployment}
           onDeploy={() => {
-            if (project.source_type === 'uploaded_source') {
+            if (projectDeployLaunchMode(project.source_type) === 'upload') {
               navigate(`/projects/${project.slug}/drop`)
               return
             }
-            navigate(`/projects/${project.slug}/deployments?deploy=true`)
+            setIsDeployDialogOpen(true)
           }}
+        />
+        <RedeploymentModal
+          project={project}
+          isOpen={isDeployDialogOpen}
+          onClose={() => setIsDeployDialogOpen(false)}
+          onConfirm={handleHeaderDeployment}
+          mode="new"
+          defaultBranch={project.main_branch}
+          imageRef={lastDeployment?.metadata?.externalImageRef}
+          isLoading={createDeployment.isPending || deployImage.isPending}
         />
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
           {/* Attack Mode Banner */}
-          {(project as any).attack_mode && (
+          {(project as typeof project & { attack_mode?: boolean })
+            .attack_mode && (
             <Alert className="mb-4 border-primary bg-primary/10">
               <ShieldAlert className="h-4 w-4 text-primary" />
               <AlertDescription className="flex items-center justify-between">
@@ -383,6 +432,10 @@ export function ProjectDetail() {
                   lastDeployment={lastDeployment}
                 />
               }
+            />
+            <Route
+              path="tools"
+              element={<ProjectToolsPage project={project} />}
             />
             <Route path="setup" element={<ProjectSetup project={project} />} />
             <Route

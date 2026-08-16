@@ -122,6 +122,11 @@ pub struct TimescaleDbStorage {
     /// Per-project storage quota. `None` disables quota enforcement: ingest
     /// never runs the per-project usage estimate (see `get_storage_quota`).
     quota_bytes_per_project: Option<u64>,
+    /// Shared attribute-key -> slot mapping, populated by `FacetService`.
+    /// `None` when facets aren't wired up (e.g. some test harnesses); ingest
+    /// and query both fall back to unfaceted behavior in that case, same as
+    /// the ClickHouse backend.
+    facet_cache: Option<crate::services::FacetCache>,
 }
 
 /// S3 log archiver configuration.
@@ -238,21 +243,25 @@ impl TimescaleDbStorage {
             s3_client,
             retention_days: 7,
             quota_bytes_per_project: None,
+            facet_cache: None,
         }
     }
 
-    /// Create a new storage backend with custom retention and quota settings.
+    /// Create a new storage backend with custom retention, quota, and facet
+    /// settings.
     pub fn with_config(
         db: Arc<DatabaseConnection>,
         s3_client: Option<Arc<S3LogArchiver>>,
         retention_days: u32,
         quota_bytes_per_project: Option<u64>,
+        facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
         Self {
             db,
             s3_client,
             retention_days,
             quota_bytes_per_project,
+            facet_cache,
         }
     }
 
@@ -400,15 +409,31 @@ impl TimescaleDbStorage {
             return Ok(0);
         }
 
+        // Load the facet cache once for this batch (lock-free ArcSwap read),
+        // same pattern as ClickHouseOtelStorage's ingest path.
+        let facet_snapshot = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert key->slot into slot->key once per batch, not once per span
+        // per slot — see `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
+
         let mut sql = String::from(
             "INSERT INTO otel_spans (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, trace_id, span_id, parent_span_id,
                 name, kind, start_time, end_time, duration_ms,
-                status_code, status_message, attributes, events
+                status_code, status_message, attributes, events,
+                facet_attr_1, facet_attr_2, facet_attr_3, facet_attr_4, facet_attr_5,
+                facet_attr_6, facet_attr_7, facet_attr_8, facet_attr_9, facet_attr_10,
+                facet_attr_11, facet_attr_12, facet_attr_13, facet_attr_14, facet_attr_15,
+                facet_attr_16, facet_attr_17, facet_attr_18, facet_attr_19, facet_attr_20
             ) VALUES ",
         );
 
+        const COLS_PER_ROW: u32 = 37;
         let mut values: Vec<sea_orm::Value> = Vec::new();
         let mut param_idx = 1u32;
 
@@ -416,15 +441,15 @@ impl TimescaleDbStorage {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                param_idx, param_idx + 1, param_idx + 2, param_idx + 3,
-                param_idx + 4, param_idx + 5, param_idx + 6, param_idx + 7,
-                param_idx + 8, param_idx + 9, param_idx + 10, param_idx + 11,
-                param_idx + 12, param_idx + 13, param_idx + 14, param_idx + 15,
-                param_idx + 16
-            ));
-            param_idx += 17;
+            sql.push('(');
+            for col in 0..COLS_PER_ROW {
+                if col > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("${}", param_idx + col));
+            }
+            sql.push(')');
+            param_idx += COLS_PER_ROW;
 
             let attrs_json = serde_json::to_value(&s.attributes).unwrap_or_default();
             let events_json = serde_json::to_value(&s.events).unwrap_or_default();
@@ -448,6 +473,10 @@ impl TimescaleDbStorage {
                 attrs_json.into(),
                 events_json.into(),
             ]);
+            for key in &facet_slots {
+                let value: Option<String> = key.and_then(|k| s.attributes.get(k).cloned());
+                values.push(value.into());
+            }
         }
 
         let result = self
@@ -1411,15 +1440,35 @@ impl OtelStorage for TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap
+            // read), same pattern as ClickHouseOtelStorage::query_spans.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column + its
+                    // B-tree index (full index speed on uncompressed chunks;
+                    // see storage::timescaledb module docs for the
+                    // compressed-chunk caveat).
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_clauses.push(format!(
+                        "attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -2879,15 +2928,32 @@ impl TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            // Same facet-routing as `query_spans`: a faceted key gets the
+            // index-backed slot column, everything else falls back to JSON
+            // extraction. See storage::timescaledb module docs for the
+            // compressed-chunk caveat.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("s.{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    where_clauses.push(format!(
+                        "s.attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -3069,15 +3135,28 @@ impl TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("s.{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    where_clauses.push(format!(
+                        "s.attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {

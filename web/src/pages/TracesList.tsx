@@ -8,6 +8,7 @@ import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   hasTracesOptions,
+  listFacetsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -65,6 +66,7 @@ import {
   RefreshCw,
   Search,
   Settings2,
+  Tag,
   Terminal,
   Workflow,
 } from 'lucide-react'
@@ -644,6 +646,17 @@ export default function TracesList({ project }: TracesListProps) {
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
+  // Attribute filter: restricted to registered facets only (see ADR-039 /
+  // the FacetToggle in TraceDetail) — an unfaceted attribute would force a
+  // JSON scan over every span in the project's whole retention window, which
+  // is exactly the query this platform can't afford at 500M+ rows.
+  const [attrKey, setAttrKey] = useState(
+    () => searchParams.get('attr_key') || ''
+  )
+  const [attrValue, setAttrValue] = useState(
+    () => searchParams.get('attr_value') || ''
+  )
+  const debouncedAttrValue = useDebounce(attrValue, 300)
   const [page, setPage] = useState(() => {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
@@ -678,6 +691,30 @@ export default function TracesList({ project }: TracesListProps) {
     enabled: !!project.id,
   })
 
+  // Registered facets — platform-global, so no project scoping. Backs the
+  // attribute-key dropdown below; only faceted keys are offered since only
+  // those are fast to filter on.
+  const { data: facetsData } = useQuery({
+    ...listFacetsOptions(),
+    staleTime: 30_000,
+  })
+  const facets = facetsData?.data ?? []
+
+  // If the URL names an attribute key (e.g. from a shared link, or one whose
+  // facet was since removed) that isn't a currently registered facet, drop
+  // it once the facet list has loaded. Otherwise the dropdown — which only
+  // lists registered facets — has no matching option to show, renders blank,
+  // and looks like "the selection disappeared" even though the filter is
+  // still silently applied underneath via the slow JSON-scan fallback.
+  useEffect(() => {
+    if (!facetsData || !attrKey) return
+    if (!facets.some((f) => f.attribute_key === attrKey)) {
+      setAttrKey('')
+      setAttrValue('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [facetsData])
+
   // Fetch deployments for the selected environment (or all)
   const { data: deploymentsData } = useQuery({
     ...getProjectDeploymentsOptions({
@@ -703,12 +740,14 @@ export default function TracesList({ project }: TracesListProps) {
     if (debouncedNamePattern) params.set('name', debouncedNamePattern)
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
+    if (attrKey) params.set('attr_key', attrKey)
+    if (attrKey && debouncedAttrValue) params.set('attr_value', debouncedAttrValue)
     if (page > 1) params.set('page', page.toString())
     if (sortBy === null) params.set('sort', 'none')
     else if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
+  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, attrKey, debouncedAttrValue, page, sortBy, sortOrder, setSearchParams])
 
   // Cycle sort on a column header through three states: clicking a new column
   // selects it descending; clicking the active column goes desc → asc → unsorted
@@ -760,6 +799,10 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
+        attributes:
+          attrKey && debouncedAttrValue
+            ? `${attrKey}=${debouncedAttrValue}`
+            : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
         // Explicit: this list renders "Showing X–Y of Z" and a page count, so
@@ -806,7 +849,8 @@ export default function TracesList({ project }: TracesListProps) {
     !!serviceName ||
     status !== 'all' ||
     environmentId !== 'all' ||
-    deploymentId !== 'all'
+    deploymentId !== 'all' ||
+    !!attrKey
 
   // Copy for the in-window empty state, in priority order:
   //  1. filters/window active → suggest adjusting them
@@ -866,6 +910,11 @@ export default function TracesList({ project }: TracesListProps) {
     },
     []
   )
+  const handleAttrKeyChange = useCallback((v: string) => {
+    setAttrKey(v === '__none__' ? '' : v)
+    setAttrValue('')
+    setPage(1)
+  }, [])
 
   return (
     <div className="space-y-4">
@@ -1060,6 +1109,42 @@ export default function TracesList({ project }: TracesListProps) {
                 className="h-9"
               />
             </div>
+
+            {facets.length > 0 && (
+              <>
+                <Select
+                  value={attrKey || '__none__'}
+                  onValueChange={handleAttrKeyChange}
+                >
+                  <SelectTrigger className="h-9 w-full sm:w-[200px]">
+                    <Tag className="mr-2 h-3.5 w-3.5" />
+                    <SelectValue placeholder="Attribute" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">No attribute filter</SelectItem>
+                    {facets.map((f) => (
+                      <SelectItem key={f.attribute_key} value={f.attribute_key}>
+                        {f.attribute_key}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {attrKey && (
+                  <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
+                    <Input
+                      placeholder={`Value for ${attrKey}…`}
+                      value={attrValue}
+                      onChange={(e) => {
+                        setAttrValue(e.target.value)
+                        setPage(1)
+                      }}
+                      className="h-9"
+                    />
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </CardContent>
       </Card>

@@ -536,6 +536,25 @@ impl DeploymentConfig {
         Self::default()
     }
 
+    /// Return a node selector only when it names at least one node.
+    ///
+    /// Empty lists are the API sentinel for clearing an environment override.
+    /// Treating a legacy stored empty list as an override would either make the
+    /// workload unschedulable or erase a project-level placement constraint.
+    pub fn configured_target_nodes(&self) -> Option<&[i32]> {
+        self.target_nodes
+            .as_deref()
+            .filter(|nodes| !nodes.is_empty())
+    }
+
+    /// Return a label selector only when it contains at least one label.
+    /// Empty objects are the API sentinel for clearing an environment override.
+    pub fn configured_target_labels(&self) -> Option<&serde_json::Value> {
+        self.target_labels
+            .as_ref()
+            .filter(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
+    }
+
     /// Merge this config with another, preferring values from `other`
     ///
     /// This is useful for merging environment-level config (other) with
@@ -568,16 +587,17 @@ impl DeploymentConfig {
                 (None, Some(override_security)) => Some(override_security.clone()),
                 (None, None) => None,
             },
-            // Environment-level target_nodes overrides project-level
+            // A non-empty environment selector overrides the project. Empty
+            // selectors mean "clear this override", so inherit the project
+            // selector instead of erasing its placement boundary.
             target_nodes: other
-                .target_nodes
-                .clone()
-                .or_else(|| self.target_nodes.clone()),
-            // Environment-level target_labels overrides project-level
+                .configured_target_nodes()
+                .map(<[i32]>::to_vec)
+                .or_else(|| self.configured_target_nodes().map(<[i32]>::to_vec)),
             target_labels: other
-                .target_labels
-                .clone()
-                .or_else(|| self.target_labels.clone()),
+                .configured_target_labels()
+                .cloned()
+                .or_else(|| self.configured_target_labels().cloned()),
             anti_affinity: other.anti_affinity,
             // Env-wins, inheriting the project when unset — same semantics as
             // `automatic_deploy`. Deliberately not `||`: an environment must be
@@ -914,9 +934,37 @@ mod tests {
         let merged2 = project_config.merge(&env_no_nodes);
         assert_eq!(merged2.target_nodes, Some(vec![1, 2]));
 
+        // A legacy persisted empty environment selector means the override was
+        // cleared; it must inherit rather than erase the project constraint.
+        let env_empty_nodes = DeploymentConfig {
+            target_nodes: Some(vec![]),
+            ..Default::default()
+        };
+        let merged3 = project_config.merge(&env_empty_nodes);
+        assert_eq!(merged3.target_nodes, Some(vec![1, 2]));
+
         // Both None → None
         let both_none = DeploymentConfig::default().merge(&DeploymentConfig::default());
         assert_eq!(both_none.target_nodes, None);
+    }
+
+    #[test]
+    fn test_empty_environment_target_labels_inherit_project_constraint() {
+        let project_config = DeploymentConfig {
+            target_labels: Some(serde_json::json!({"region": "eu"})),
+            ..Default::default()
+        };
+        let env_config = DeploymentConfig {
+            target_labels: Some(serde_json::json!({})),
+            ..Default::default()
+        };
+
+        let merged = project_config.merge(&env_config);
+
+        assert_eq!(
+            merged.target_labels,
+            Some(serde_json::json!({"region": "eu"}))
+        );
     }
 
     #[test]

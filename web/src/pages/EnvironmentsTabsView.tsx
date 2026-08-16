@@ -5,7 +5,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Route, Routes } from 'react-router'
+import { Route, Routes, useSearchParams } from 'react-router'
 import { EnvironmentDashboard } from './EnvironmentDashboard'
 import { ContainerDetailPage } from './ContainerDetailPage'
 import { ProjectResponse } from '@/api/client'
@@ -13,15 +13,17 @@ import { CreateEnvironmentDialog } from '@/components/project/settings/environme
 import { Button } from '@/components/ui/button'
 import { Plus } from 'lucide-react'
 import { toast } from 'sonner'
+import {
+  resolveEnvironmentSelection,
+  updateEnvironmentSearchParams,
+} from '@/lib/environment-navigation'
 
 export function EnvironmentsTabsView({
   project,
 }: {
   project: ProjectResponse
 }) {
-  const [selectedEnvId, setSelectedEnvId] = useState<number | undefined>(
-    undefined
-  )
+  const [searchParams, setSearchParams] = useSearchParams()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
 
   const {
@@ -44,12 +46,15 @@ export function EnvironmentsTabsView({
       refetchEnvironments()
       setIsCreateDialogOpen(false)
     },
-    onError: (error: any) => {
-      toast.error(error?.message || 'Failed to create environment')
+    onError: (error: Error) => {
+      toast.error(error.message || 'Failed to create environment')
     },
   })
 
-  const activeEnvId = selectedEnvId ?? environments?.[0]?.id
+  const activeEnvId = resolveEnvironmentSelection(
+    searchParams.get('environment'),
+    environments ?? []
+  )
 
   if (isEnvironmentsLoading) {
     return (
@@ -105,7 +110,17 @@ export function EnvironmentsTabsView({
   const handleDelete = async (deletedId: number) => {
     const remaining = environments.filter((e) => e.id !== deletedId)
     await refetchEnvironments()
-    setSelectedEnvId(remaining.length > 0 ? remaining[0].id : undefined)
+    const nextParams = updateEnvironmentSearchParams(searchParams, {
+      environmentId: remaining[0]?.id ?? null,
+    })
+    setSearchParams(nextParams, { replace: true })
+  }
+
+  const handleEnvironmentChange = (id: number) => {
+    const nextParams = updateEnvironmentSearchParams(searchParams, {
+      environmentId: id,
+    })
+    setSearchParams(nextParams)
   }
 
   return (
@@ -123,7 +138,7 @@ export function EnvironmentsTabsView({
               project={project}
               environmentId={activeEnvId}
               environments={environments}
-              onEnvironmentChange={(id) => setSelectedEnvId(id)}
+              onEnvironmentChange={handleEnvironmentChange}
               onCreateEnvironment={() => setIsCreateDialogOpen(true)}
               onDelete={() => handleDelete(activeEnvId)}
             />

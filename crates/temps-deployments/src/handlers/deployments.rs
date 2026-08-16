@@ -12,7 +12,7 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json,
@@ -180,6 +180,44 @@ fn public_compose_service_url(
     )
 )]
 pub struct DeploymentsApiDoc;
+
+fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let origin = origin.to_str().map_err(|_| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_detail("WebSocket Origin header is invalid")
+    })?;
+    let origin = url::Url::parse(origin).map_err(|_| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_detail("WebSocket Origin header is not allowed")
+    })?;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail("WebSocket Host header is required when Origin is present")
+        })?;
+    let origin_authority = origin.host_str().map(|name| match origin.port() {
+        Some(port) => format!("{name}:{port}"),
+        None => name.to_string(),
+    });
+    if origin_authority
+        .as_deref()
+        .is_some_and(|authority| authority.eq_ignore_ascii_case(host.trim()))
+    {
+        return Ok(());
+    }
+    warn!(origin = %origin, host = %host, "Rejected cross-origin WebSocket request");
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Forbidden")
+        .with_detail("WebSocket Origin header is not allowed"))
+}
 
 pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
     Router::new()
@@ -1005,10 +1043,12 @@ pub async fn get_container_logs_by_id(
     Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container {} logs in environment {} of project: {}",
@@ -1199,10 +1239,12 @@ pub async fn get_container_logs(
     Path((project_id, environment_id)): Path<(i32, i32)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container logs in environment {} of project: {}",
@@ -1538,10 +1580,12 @@ pub async fn tail_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for tailing logs for job {} in deployment {}",
@@ -2379,6 +2423,37 @@ mod tests {
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    fn websocket_origin_headers(origin: &str, host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, origin.parse().expect("valid test origin"));
+        headers.insert(header::HOST, host.parse().expect("valid test host"));
+        headers
+    }
+
+    #[test]
+    fn websocket_origin_requires_same_authority() {
+        assert!(validate_websocket_origin(&websocket_origin_headers(
+            "https://console.example.com",
+            "console.example.com"
+        ))
+        .is_ok());
+        assert!(validate_websocket_origin(&websocket_origin_headers(
+            "https://attacker.example.com",
+            "console.example.com"
+        ))
+        .is_err());
+        assert!(validate_websocket_origin(&websocket_origin_headers(
+            "http://localhost:4000",
+            "localhost:3000"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn websocket_origin_allows_non_browser_clients_without_origin() {
+        assert!(validate_websocket_origin(&HeaderMap::new()).is_ok());
+    }
 
     #[test]
     fn compose_visit_urls_match_environment_url_for_primary_service() {

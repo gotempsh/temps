@@ -216,8 +216,8 @@ bun run src/index.ts backup-restore-scenario --registry localhost:5111
 # wait time so a WAL segment actually archives -- see the steps section below.
 bun run src/index.ts pitr-scenario --registry localhost:5111
 
-# pg-upgrade: Postgres major-version upgrade (16 → 17) -- provision a service
-# pinned to postgres:16-bookworm, write 5 marker rows, trigger the upgrade
+# pg-upgrade: Postgres major-version upgrade (17 → 18) -- provision a service
+# pinned to gotempsh/postgres-walg:17-bookworm, write 5 marker rows, trigger the upgrade
 # (pre_backup → snapshot → dump → new_container → restore → swap → analyze),
 # and prove via the read-only data-browser API that the marker rows survived
 # the pg_dumpall → psql restore cycle. Needs MinIO (docker-compose.e2e.yml).
@@ -891,13 +891,13 @@ reading the rows back after it finishes, not just watching a status field flip.
 1. build + push the db-probe Go app (`lib/probe-app.ts`) -- the same app
    `backup-restore-scenario` and `pitr-scenario` use. On every `/probe` hit
    it inserts a row into `e2e_probe` and returns the total count
-2. provision a real standalone Postgres service pinned to `postgres:16-bookworm`
-   via `parameters.docker_image` at creation time. Standard official postgres
-   images are used; `extract_postgres_version("postgres:16-bookworm")` returns
-   `"16"` and PGDATA is set to `/var/lib/postgresql/16/docker`. The explicit
+2. provision a real standalone Postgres service pinned to `gotempsh/postgres-walg:17-bookworm`
+   via `parameters.docker_image` at creation time. Published, platform-reviewed
+   images are used; `extract_postgres_version("gotempsh/postgres-walg:17-bookworm")` returns
+   `"17"`. The explicit
    pin is required because the upgrade API validates that `to_version > from_version`
    and both images are on the same OS family (Alpine ↔ Alpine, Debian ↔ Debian)
-   -- using the platform default 18-bookworm image would leave nowhere to
+   -- using the platform default PostgreSQL 18 image would leave nowhere to
    upgrade to in an e2e test
 3. create a **default** S3 source (`is_default: true`) pointed at the local
    MinIO. `phase_pre_backup` in the orchestrator calls
@@ -912,8 +912,8 @@ reading the rows back after it finishes, not just watching a status field flip.
    `normalize_database_name("{project_slug}_{env_slug}")` as computed by
    `normalizePostgresDatabaseName` in `flows.ts`
 6. `POST /external-services/{service_id}/upgrades` with
-   from_version="16" / to_version="17" / from_image="postgres:16-bookworm" /
-   to_image="postgres:17-bookworm". The orchestrator spawns a
+   from_version="17" / to_version="18" / from_image="gotempsh/postgres-walg:17-bookworm" /
+   to_image="gotempsh/postgres-walg:18-bookworm". The orchestrator spawns a
    tokio task and returns immediately with status="pending". It then runs
    seven real phases synchronously:
      - `pre_backup`: wal-g backup to the default MinIO S3 source (safety net)
@@ -922,7 +922,7 @@ reading the rows back after it finishes, not just watching a status field flip.
      - `dump`: boot throwaway old-version container with rollback volume
        mounted, run `pg_dumpall`, write dump to a separate volume
      - `new_container`: `lifecycle.create_and_start(service_id, to_image)` --
-       boots a fresh 17-bookworm container (empty data volume → initdb)
+       boots a fresh PostgreSQL 18 container (empty data volume → initdb)
      - `restore`: boot a psql container with the dump volume, run
        `psql < data.sql` against the new container
      - `swap`: persist `to_image` onto the service's `parameters.docker_image`
@@ -946,7 +946,7 @@ reading the rows back after it finishes, not just watching a status field flip.
    PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we assert count and
    monotonicity, not the exact new id
 10. assert `GET /external-services/{id}`'s `current_parameters.docker_image`
-    now equals `postgres:17-bookworm`. `phase_swap` calls
+    now equals `gotempsh/postgres-walg:18-bookworm`. `phase_swap` calls
     `lifecycle.set_docker_image` which persists the new image into
     `external_services.parameters`; this checks the API-visible result
 11. teardown (deployment, project, service, S3 source)
@@ -1300,22 +1300,19 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     healthy status field.
 11. deploy `nginxinc/nginx-unprivileged:alpine` as a second worker-pinned
     application, then `docker exec` into it and `wget`
-    `http://production.<project>.temps.local`. The response must be the real
-    `whoami` body, proving app-to-app DNS from inside an application container.
-12. provision a real 1-monitor + 2-data-node Postgres HA service, link it to a
-    control-plane probe application, and replace only the injected DSN address
-    with the service member's published `.temps.local` FQDN. The probe must
-    report that DNS host and complete a real INSERT + SELECT. This catches DNS
-    records that resolve but advertise an unreachable IP/port pair.
-13. drain the worker (`POST /internal/nodes/{id}/drain`), poll
+    `http://production.<project>.temps.local`. DNS must resolve inside the
+    deployed container, and the proxy must return 403 because applications
+    cannot use internal DNS to cross project boundaries.
+12. clear the test's worker-only placement override with `target_nodes: []`,
+    then drain the worker (`POST /internal/nodes/{id}/drain`) and poll
     `GET /internal/nodes/{id}/drain` until `drain_complete`, then re-run the
     same `docker ps` side-channel check on both containers to confirm the
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+13. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-15. teardown (in a `finally`, same discipline as every other scenario):
+14. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres

@@ -274,6 +274,15 @@ pub struct DeploymentJobConfig {
     pub exclude_node_ids: Vec<i32>,
 }
 
+fn has_explicit_placement_constraints(
+    target_node_ids: Option<&[i32]>,
+    target_labels: Option<&serde_json::Value>,
+) -> bool {
+    crate::services::node_scheduler::placement_node_ids(target_node_ids).is_some()
+        || target_labels
+            .is_some_and(|labels| !labels.as_object().is_some_and(serde_json::Map::is_empty))
+}
+
 impl Default for DeploymentJobConfig {
     fn default() -> Self {
         Self {
@@ -1004,6 +1013,8 @@ impl DeployImageJob {
         let node_assignments = if let Some(ref scheduler) = self.node_scheduler {
             let target_ids = self.config.target_nodes.as_deref();
             let target_labels = self.config.target_labels.as_ref();
+            let has_explicit_constraints =
+                has_explicit_placement_constraints(target_ids, target_labels);
             // Which architectures do we actually have an image for? Nodes that
             // match none of them are excluded from the pool instead of being
             // handed a container that cannot start.
@@ -1075,11 +1086,25 @@ impl DeployImageJob {
                 // on one machine, which is the opposite of what was asked for,
                 // and reporting it as success would hide that.
                 Err(
-                    e @ crate::services::node_service::NodeError::InsufficientCompatibleNodes {
+                    e @ (crate::services::node_service::NodeError::InsufficientCompatibleNodes {
                         ..
-                    },
+                    }
+                    | crate::services::node_service::NodeError::PlacementConstraintsUnsatisfied {
+                        ..
+                    }
+                    | crate::services::node_service::NodeError::Validation {
+                        ..
+                    }),
                 ) => {
                     let msg = format!("Cannot schedule this deployment: {}", e);
+                    self.log(context, format!("ERROR: {}", msg)).await?;
+                    return Err(WorkflowError::JobExecutionFailed(msg));
+                }
+                Err(e) if has_explicit_constraints => {
+                    let msg = format!(
+                        "Cannot enforce this deployment's placement constraints: {}",
+                        e
+                    );
                     self.log(context, format!("ERROR: {}", msg)).await?;
                     return Err(WorkflowError::JobExecutionFailed(msg));
                 }
@@ -1105,8 +1130,20 @@ impl DeployImageJob {
                 }
             }
         } else {
-            // No scheduler injected — pure single-node mode. Same guard: an
-            // image built for another architecture cannot run here either.
+            // A worker-only placement policy cannot be honoured without a
+            // scheduler. Failing closed also protects tests/custom embeddings
+            // that omit the scheduler even though production normally injects it.
+            if has_explicit_placement_constraints(
+                self.config.target_nodes.as_deref(),
+                self.config.target_labels.as_ref(),
+            ) {
+                let msg = "Cannot enforce placement constraints: no node scheduler is configured"
+                    .to_string();
+                self.log(context, format!("ERROR: {}", msg)).await?;
+                return Err(WorkflowError::JobExecutionFailed(msg));
+            }
+            // Pure single-node mode. Same architecture guard: an image built
+            // for another architecture cannot run here either.
             let image_platforms = self.available_image_platforms(image_output).await;
             self.ensure_local_can_run(&image_platforms, context, "no node scheduler is configured")
                 .await?;
@@ -3289,6 +3326,28 @@ mod tests {
         assert_eq!(config.target_nodes, None);
     }
 
+    #[test]
+    fn explicit_placement_constraints_are_fail_closed_for_every_scheduler_error() {
+        assert!(!has_explicit_placement_constraints(None, None));
+        assert!(!has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!({}))
+        ));
+        // Empty selectors of either kind name nothing, so they constrain
+        // nothing — the two must agree, and an empty label object has always
+        // read that way.
+        assert!(!has_explicit_placement_constraints(Some(&[]), None));
+        assert!(has_explicit_placement_constraints(Some(&[1]), None));
+        assert!(has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!({"region": "eu"}))
+        ));
+        assert!(has_explicit_placement_constraints(
+            None,
+            Some(&serde_json::json!(["malformed"]))
+        ));
+    }
+
     /// Test that node scheduling produces correct assignments when integrated with DeployImageJob.
     /// We test the scheduling logic directly (not the full deploy flow which needs real containers).
     #[tokio::test]
@@ -3455,7 +3514,7 @@ mod tests {
             .unwrap();
         assert_eq!(assignments.len(), 4);
 
-        // Pool is [Local, worker-a(1), worker-c(3)] → round-robin includes Local
+        // Explicit targets restrict the pool to worker-a(1) and worker-c(3).
         for a in &assignments {
             match a {
                 crate::services::NodeAssignment::Remote { node_id, .. } => {
@@ -3466,16 +3525,16 @@ mod tests {
                     );
                 }
                 crate::services::NodeAssignment::Local => {
-                    // Local (control plane) is always part of the pool
+                    panic!("explicit target nodes must exclude the control plane")
                 }
             }
         }
     }
 
-    /// Test that target_nodes with no matching active nodes falls back to local
+    /// Explicit target constraints must never silently fall back to local.
     #[tokio::test]
-    async fn test_node_scheduling_target_nodes_no_match_falls_back_to_local() {
-        use crate::services::{NodeScheduler, NodeService};
+    async fn test_node_scheduling_target_nodes_no_match_fails_closed() {
+        use crate::services::{NodeError, NodeScheduler, NodeService};
         use sea_orm::{DatabaseBackend, MockDatabase};
         use temps_entities::nodes;
 
@@ -3509,16 +3568,20 @@ mod tests {
 
         // Target node 99 doesn't exist
         let target_ids = vec![99];
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, None, Some(&target_ids), false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(
-                a.is_local(),
-                "Should fall back to local when no target nodes match"
-            );
+            .expect_err("an unmatched explicit target must not run on the control plane");
+        match error {
+            NodeError::PlacementConstraintsUnsatisfied { excluded } => {
+                assert!(
+                    excluded.contains("no active node matched"),
+                    "unexpected placement diagnostic: {excluded}"
+                );
+            }
+            other => {
+                panic!("expected PlacementConstraintsUnsatisfied, got {other:?}");
+            }
         }
     }
 

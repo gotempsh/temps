@@ -48,6 +48,75 @@ pub struct ProjectUpdatedFields {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignmentRequestedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignmentRequestedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNMENT_REQUESTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result;
+        // preserve the serialization source while adding operation context.
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("Failed to serialize domain reassignment request: {error}")
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub domain: String,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result.
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize domain reassignment: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PipelineTriggeredAudit {
     pub context: AuditContext,
     pub project_id: i32,

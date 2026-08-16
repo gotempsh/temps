@@ -75,6 +75,19 @@ fn credential_type_str(ct: CredentialType) -> &'static str {
     }
 }
 
+fn reject_deployment_token_base_url(
+    auth: &temps_auth::AuthContext,
+    byok: &ByokOverride,
+) -> Option<AiGatewayError> {
+    if auth.is_deployment_token() && byok.base_url.is_some() {
+        return Some(AiGatewayError::InvalidProviderUrl {
+            reason: "X-Provider-Base-URL is not allowed for deployment tokens".to_string(),
+        });
+    }
+
+    None
+}
+
 // ============================================================================
 // Streaming usage extraction
 // ============================================================================
@@ -401,6 +414,9 @@ async fn chat_completions(
     }
 
     let byok = extract_byok(&headers);
+    if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
+        return Ok(error_to_response(error).into_response());
+    }
     let ai_context = extract_ai_context(&headers);
     let start = Instant::now();
     let model = request.model.clone();
@@ -667,6 +683,9 @@ async fn embeddings(
     }
 
     let byok = extract_byok(&headers);
+    if let Some(error) = reject_deployment_token_base_url(&auth, &byok) {
+        return Ok(error_to_response(error).into_response());
+    }
     let ai_context = extract_ai_context(&headers);
     let start = Instant::now();
     let user_id = auth.user_id_opt();
@@ -1009,6 +1028,45 @@ mod tests {
     fn test_credential_type_str_values() {
         assert_eq!(credential_type_str(CredentialType::System), "system");
         assert_eq!(credential_type_str(CredentialType::Byok), "byok");
+    }
+    #[test]
+    fn test_deployment_token_rejects_custom_byok_base_url() {
+        let auth = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deployment-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let byok = ByokOverride {
+            api_key: Some("sk-user-key-123".to_string()),
+            base_url: Some("https://custom.openai.azure.com".to_string()),
+            system_key_id: None,
+        };
+
+        let error = reject_deployment_token_base_url(&auth, &byok)
+            .expect("deployment tokens must not set provider base URLs");
+        assert!(matches!(error, AiGatewayError::InvalidProviderUrl { .. }));
+    }
+
+    #[test]
+    fn test_deployment_token_allows_byok_without_custom_base_url() {
+        let auth = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deployment-token".to_string(),
+            vec![temps_entities::deployment_tokens::DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let byok = ByokOverride {
+            api_key: Some("sk-user-key-123".to_string()),
+            base_url: None,
+            system_key_id: None,
+        };
+
+        assert!(reject_deployment_token_base_url(&auth, &byok).is_none());
     }
 
     #[test]

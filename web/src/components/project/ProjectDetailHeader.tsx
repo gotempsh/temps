@@ -1,5 +1,4 @@
-import { ProjectResponse } from '@/api/client'
-import { getLastDeploymentOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -10,7 +9,6 @@ import {
   repositoryWebUrl,
   type GitProviderKind,
 } from '@/lib/project-header-actions'
-import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, GitFork, Rocket, Users } from 'lucide-react'
 import BitbucketIcon from '@/icons/Bitbucket'
 import GiteaIcon from '@/icons/Gitea'
@@ -20,12 +18,14 @@ import { Link, useNavigate } from 'react-router'
 
 const healthDotColors: Record<string, string> = {
   operational: 'bg-emerald-500',
+  healthy: 'bg-emerald-500',
   degraded: 'bg-amber-500',
   down: 'bg-red-500',
 }
 
 const healthLabels: Record<string, string> = {
   operational: 'Operational',
+  healthy: 'Healthy',
   degraded: 'Degraded',
   down: 'Down',
 }
@@ -35,6 +35,7 @@ interface ProjectDetailHeaderProps {
   activeVisitorsCount?: { active_visitors: number }
   repositoryCloneUrl?: string | null
   repositoryProviderType?: string | null
+  lastDeployment?: DeploymentResponse
   lastDeploymentUrl?: string | null
   isLoadingLastDeployment?: boolean
   onDeploy: () => void
@@ -59,6 +60,7 @@ export function ProjectDetailHeader({
   activeVisitorsCount,
   repositoryCloneUrl,
   repositoryProviderType,
+  lastDeployment,
   lastDeploymentUrl,
   isLoadingLastDeployment = false,
   onDeploy,
@@ -66,11 +68,6 @@ export function ProjectDetailHeader({
   const navigate = useNavigate()
   const healthQuery = useDashboardHealth([project.id])
   const health = healthQuery.data?.projects?.[String(project.id)]
-  const { data: lastDeployment } = useQuery({
-    ...getLastDeploymentOptions({ path: { id: project.id } }),
-    enabled: !!project.id,
-    refetchOnWindowFocus: true,
-  })
   const screenshotLocation = lastDeployment?.screenshot_location
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)

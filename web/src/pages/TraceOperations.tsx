@@ -452,9 +452,9 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                         // operation, sorted slowest-first: the report says
                         // "this is slow", the list says "here is one".
                         navigate(
-                          `/projects/${project.slug}/traces?search=${encodeURIComponent(
+                          `/projects/${project.slug}/traces?name=${encodeURIComponent(
                             row.span_name
-                          )}&service=${encodeURIComponent(row.service_name)}&sort_by=duration&range=${timeRange}`
+                          )}&service=${encodeURIComponent(row.service_name)}&sort=duration&range=${timeRange}`
                         )
                       }
                     >

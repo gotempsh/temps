@@ -416,6 +416,7 @@ pub async fn rotate_api_key(
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
+    permission_guard!(auth, ApiKeysCreate);
 
     crate::require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),

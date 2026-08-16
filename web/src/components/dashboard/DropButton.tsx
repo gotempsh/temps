@@ -3,7 +3,7 @@ import { UploadCloud } from 'lucide-react'
 import { Link, useLocation } from 'react-router'
 
 /**
- * Global top-bar entry point to `/drop` — deploy by dropping a folder or ZIP,
+ * Global top-bar entry point to the Drop tab in New Project — deploy by dropping a folder or ZIP,
  * no Git remote and no CLI.
  *
  * Drop is reachable from the Projects header, the empty-state onboarding, the
@@ -22,7 +22,7 @@ import { Link, useLocation } from 'react-router'
  */
 export function DropButton() {
   const { pathname } = useLocation()
-  const isActive = pathname === '/drop'
+  const isActive = pathname === '/projects/new'
 
   return (
     <Button
@@ -32,7 +32,7 @@ export function DropButton() {
       title="Drop files to deploy"
       aria-current={isActive ? 'page' : undefined}
     >
-      <Link to="/drop">
+      <Link to="/projects/new?source=drop">
         <UploadCloud className="size-4" />
         <span className="sr-only">Drop files to deploy</span>
       </Link>

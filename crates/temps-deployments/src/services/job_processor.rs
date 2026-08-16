@@ -2,7 +2,7 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
     sea_query::{Expr, Query},
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -943,14 +943,30 @@ async fn find_environments_for_branch(
                 "Restoring soft-deleted preview environment {} for branch '{}'",
                 deleted_preview.id, branch_name
             );
+            let deleted_preview_id = deleted_preview.id;
+            let subdomain = deleted_preview.subdomain.clone();
+            let txn = db
+                .begin()
+                .await
+                .map_err(|error| format!("Failed to begin preview restore: {error}"))?;
+            if environments::claim_subdomain(&txn, &subdomain, &[deleted_preview_id])
+                .await
+                .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+                .is_some()
+            {
+                return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+            }
             let mut active_env: environments::ActiveModel = deleted_preview.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
             let restored = active_env
-                .update(db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
+            txn.commit()
+                .await
+                .map_err(|error| format!("Failed to commit preview restore: {error}"))?;
             return Ok(vec![restored]);
         }
 
@@ -990,10 +1006,11 @@ async fn find_environments_for_branch(
     use chrono::Utc;
     use temps_entities::upstream_config::UpstreamList;
 
+    let subdomain = format!("{}-preview", project.slug).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set("preview".to_string()),
         slug: Set("preview".to_string()),
-        subdomain: Set(format!("{}-preview", project.slug)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(None), // No specific branch - matches all unmatched branches
         project_id: Set(project.id),
@@ -1008,10 +1025,24 @@ async fn find_environments_for_branch(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created generic preview environment '{}' for project {}",
@@ -1054,10 +1085,11 @@ async fn create_preview_environment(
         None
     };
 
+    let subdomain = format!("{}-{}", project.slug, slugified_branch).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set(slugified_branch.to_string()),
         slug: Set(slugified_branch.to_string()),
-        subdomain: Set(format!("{}-{}", project.slug, slugified_branch)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(Some(branch_name.to_string())), // Link to specific branch (used for both deployment and tracking)
         project_id: Set(project.id),
@@ -1072,10 +1104,24 @@ async fn create_preview_environment(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created preview environment '{}' (ID: {}) for branch '{}'",
@@ -1193,6 +1239,10 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
+fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
+    !auto_deploy_enabled && !manual_trigger
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -1295,40 +1345,16 @@ async fn process_git_push_event(
         // the answer is false (opt-in, not opt-out). Manual triggers bypass this
         // gate entirely — the user clicked deploy, so they unambiguously want one.
         //
-        // Exception: the FIRST deployment for an environment always runs even when
-        // automatic_deploy=false, so a freshly-created opt-out env still boots.
         let auto_deploy_enabled = is_automatic_deploy_enabled(
             project.deployment_config.as_ref(),
             environment.deployment_config.as_ref(),
         );
-        if !auto_deploy_enabled && !job.manual_trigger {
-            let existing_count = match deployments::Entity::find()
-                .filter(deployments::Column::EnvironmentId.eq(environment.id))
-                .count(db.as_ref())
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    error!(
-                        "Failed to count existing deployments for environment {}: {}",
-                        environment.id, e
-                    );
-                    continue;
-                }
-            };
-
-            if existing_count > 0 {
-                info!(
-                    "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
-                    project.id, environment.id, environment.name
-                );
-                continue;
-            }
-
+        if should_skip_git_push_for_auto_deploy(auto_deploy_enabled, job.manual_trigger) {
             info!(
-                "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
+                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
                 project.id, environment.id, environment.name
             );
+            continue;
         } else if job.manual_trigger && !auto_deploy_enabled {
             info!(
                 "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
@@ -2851,6 +2877,21 @@ mod tests {
             Some(&project_cfg),
             Some(&env_cfg)
         ));
+    }
+
+    #[test]
+    fn webhook_push_is_skipped_when_auto_deploy_disabled_even_for_first_deploy() {
+        assert!(should_skip_git_push_for_auto_deploy(false, false));
+    }
+
+    #[test]
+    fn manual_trigger_bypasses_auto_deploy_disabled() {
+        assert!(!should_skip_git_push_for_auto_deploy(false, true));
+    }
+
+    #[test]
+    fn auto_deploy_enabled_allows_webhook_push() {
+        assert!(!should_skip_git_push_for_auto_deploy(true, false));
     }
 
     #[test]

@@ -163,10 +163,9 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///   regardless of their (often-unreliable) `required` flag; the real router is
 ///   the source of truth and returns a real 4xx if needed.
 /// - **Enum check**: `ApiToolError::BadEnum` if a value is not in `param.enum_values`.
-/// - **Project scoping**: if a param is named `project_id` (exact match) and
-///   `allowed_project_ids` is non-empty, the value is validated ∈
-///   `allowed_project_ids`.  If the param is absent and `allowed_project_ids.len() == 1`,
-///   it is auto-filled with the single accessible project.
+/// - **Project scoping**: when `allowed_project_ids` is non-empty, the operation
+///   must expose a recognized project selector. The selector is validated
+///   against the allowed set and auto-filled when exactly one project is allowed.
 /// - **Limit injection**: if a param named `limit` exists in the operation:
 ///   - absent → `default_limit` is injected.
 ///   - present → clamped to `[1, max_limit]`.
@@ -274,6 +273,17 @@ pub fn build_request_parts(
     let mut path = op.path.clone();
     let mut query_parts: Vec<String> = Vec::new();
     let mut body_map = serde_json::Map::new();
+
+    if !allowed_project_ids.is_empty()
+        && !op
+            .params
+            .iter()
+            .any(|param| is_project_scope_param(op, param))
+    {
+        return Err(ApiToolError::UnscopedOperation {
+            operation_id: op.operation_id.clone(),
+        });
+    }
 
     for param in &op.params {
         // Special handling: auto-fill the project selector when the caller has
@@ -2305,16 +2315,29 @@ mod tests {
     }
 
     #[test]
-    fn non_project_id_path_param_stays_required() {
+    fn non_project_id_path_param_is_rejected_for_project_scoped_call() {
         // An `id` that is NOT the leading `/projects/{id}` segment (here a
-        // resource id) is a genuine required path param the model must supply —
-        // it must not be silently filled with the project id.
+        // resource id) cannot prove the replay stays inside the chat project.
         let op = make_op("get_thing", "/things/{id}", vec![path_param("id")]);
 
-        let err = build_request_parts(&op, &serde_json::json!({}), &[42], 20, 100)
-            .expect_err("non-project id must stay required");
+        let err = build_request_parts(&op, &serde_json::json!({ "id": 99 }), &[42], 20, 100)
+            .expect_err("resource-id-only operation must be rejected");
         assert!(
-            matches!(err, ApiToolError::MissingParam { ref name, .. } if name == "id"),
+            matches!(err, ApiToolError::UnscopedOperation { ref operation_id } if operation_id == "get_thing"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn global_operation_is_rejected_for_project_scoped_call() {
+        let mut limit = query_param("limit", false);
+        limit.ty = "integer".to_string();
+        let op = make_op("list_audit_logs", "/audit/logs", vec![limit]);
+
+        let err = build_request_parts(&op, &serde_json::json!({ "limit": 20 }), &[42], 20, 100)
+            .expect_err("global operation must be rejected in project scope");
+        assert!(
+            matches!(err, ApiToolError::UnscopedOperation { ref operation_id } if operation_id == "list_audit_logs"),
             "unexpected error: {err:?}"
         );
     }

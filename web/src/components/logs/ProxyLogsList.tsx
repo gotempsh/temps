@@ -77,8 +77,13 @@ export default function ProxyLogsList({
   const [environment, setEnvironment] = useState<string>(() => {
     return searchParams.get('environment') || 'all'
   })
+  // Default to showing all traffic: this page's whole purpose is a complete
+  // request log, and a project whose traffic is mostly programmatic API
+  // callers (not human pageloads) would otherwise silently render as near-
+  // empty, since "Hide bots" was previously the default and API/service
+  // clients are routinely bot-classified (curl, SDKs, monitoring probes).
   const [showBots, setShowBots] = useState<string>(() => {
-    return searchParams.get('show_bots') || 'no'
+    return searchParams.get('show_bots') || 'all'
   })
   // AI / path context, set by the analytics drill-downs (AI Agents card, AI
   // Agents detail page, Page detail). When present we scope the table to that
@@ -207,7 +212,7 @@ export default function ProxyLogsList({
       newParams.set('status_code', statusCode)
     }
 
-    if (showBots && showBots !== 'no') {
+    if (showBots && showBots !== 'all') {
       newParams.set('show_bots', showBots)
     }
 
@@ -290,7 +295,7 @@ export default function ProxyLogsList({
     if (method !== 'all') n += 1
     if (statusCode !== 'all') n += 1
     if (environment !== 'all') n += 1
-    if (showBots !== 'no') n += 1
+    if (showBots !== 'all') n += 1
     return n
   }, [timeRange, method, statusCode, environment, showBots])
 
@@ -299,7 +304,7 @@ export default function ProxyLogsList({
     setMethod('all')
     setStatusCode('all')
     setEnvironment('all')
-    setShowBots('no')
+    setShowBots('all')
     setPage(1)
   }
 

@@ -24,7 +24,7 @@
 //! the store is empty and the proxy returns 503 until the first sync
 //! round finishes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -65,6 +65,7 @@ struct DiskSnapshot {
 
 pub struct RouteStore {
     inner: RwLock<HashMap<String, RouteEntry>>,
+    container_projects: RwLock<HashMap<String, HashSet<i32>>>,
     generation: RwLock<u64>,
     snapshot_path: PathBuf,
 }
@@ -73,6 +74,7 @@ impl RouteStore {
     pub fn new(snapshot_path: PathBuf) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            container_projects: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
             snapshot_path,
         }
@@ -82,10 +84,12 @@ impl RouteStore {
     /// to disk best-effort. Returns the new generation.
     pub fn apply_snapshot(&self, generation: u64, routes: Vec<RouteEntry>) -> u64 {
         let mut map = HashMap::with_capacity(routes.len());
+        let container_projects = container_project_index(&routes);
         for r in &routes {
             map.insert(r.host.to_ascii_lowercase(), r.clone());
         }
         *self.inner.write() = map;
+        *self.container_projects.write() = container_projects;
         *self.generation.write() = generation;
 
         // Best-effort disk persistence. We tolerate any error here —
@@ -112,6 +116,17 @@ impl RouteStore {
     pub fn lookup(&self, host: &str) -> Option<RouteEntry> {
         let key = host.to_ascii_lowercase();
         self.inner.read().get(&key).cloned()
+    }
+
+    /// Return whether a Docker container belongs to `project_id` according to
+    /// the control-plane route snapshot. Container IDs are trusted workload
+    /// identity; backend addresses are destinations and may be hostnames or
+    /// shared node IPs, so they must never be used as caller identity.
+    pub fn container_id_has_project(&self, container_id: &str, project_id: i32) -> bool {
+        self.container_projects
+            .read()
+            .get(container_id)
+            .is_some_and(|projects| projects.contains(&project_id))
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -154,10 +169,12 @@ impl RouteStore {
             }
         };
         let mut map = HashMap::with_capacity(snap.routes.len());
+        let container_projects = container_project_index(&snap.routes);
         for r in &snap.routes {
             map.insert(r.host.to_ascii_lowercase(), r.clone());
         }
         *self.inner.write() = map;
+        *self.container_projects.write() = container_projects;
         *self.generation.write() = snap.generation;
         debug!(
             generation = snap.generation,
@@ -183,6 +200,23 @@ impl RouteStore {
     }
 }
 
+fn container_project_index(routes: &[RouteEntry]) -> HashMap<String, HashSet<i32>> {
+    let mut index: HashMap<String, HashSet<i32>> = HashMap::new();
+    for route in routes {
+        if let Some(project_id) = route.project_id {
+            for backend in &route.backends {
+                if let Some(container_id) = backend.container_id.as_deref() {
+                    index
+                        .entry(container_id.to_string())
+                        .or_default()
+                        .insert(project_id);
+                }
+            }
+        }
+    }
+    index
+}
+
 pub type SharedRouteStore = Arc<RouteStore>;
 
 #[cfg(test)]
@@ -191,6 +225,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn entry(host: &str, addr: &str) -> RouteEntry {
+        entry_with_project(host, addr, Some(1))
+    }
+
+    fn entry_with_project(host: &str, addr: &str, project_id: Option<i32>) -> RouteEntry {
         RouteEntry {
             host: host.into(),
             backends: vec![RouteBackend {
@@ -199,7 +237,7 @@ mod tests {
                 container_name: None,
             }],
             deployment_id: Some(1),
-            project_id: Some(1),
+            project_id,
             environment_id: Some(1),
         }
     }
@@ -228,6 +266,21 @@ mod tests {
         s2.load_from_disk();
         assert_eq!(s2.current_generation(), 7);
         assert!(s2.lookup("a.temps.local").is_some());
+    }
+
+    #[test]
+    fn project_ids_are_indexed_by_trusted_container_id() {
+        let dir = TempDir::new().unwrap();
+        let store = RouteStore::new(dir.path().join("routes.json"));
+        let mut alpha = entry_with_project("prod.alpha.temps.local", "alpha:3000", Some(10));
+        alpha.backends[0].container_id = Some("container-alpha".to_string());
+        let mut beta = entry_with_project("prod.beta.temps.local", "10.0.0.2:8080", Some(20));
+        beta.backends[0].container_id = Some("container-beta".to_string());
+        store.apply_snapshot(1, vec![alpha, beta]);
+
+        assert!(store.container_id_has_project("container-alpha", 10));
+        assert!(!store.container_id_has_project("container-alpha", 20));
+        assert!(!store.container_id_has_project("unknown", 10));
     }
 
     #[test]

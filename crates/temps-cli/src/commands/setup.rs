@@ -503,6 +503,7 @@ async fn create_git_provider(
     encryption_service: &EncryptionService,
     token: &str,
     github_username: &str,
+    admin_user_id: i32,
 ) -> anyhow::Result<GitProviderCreationResult> {
     // Check if GitHub provider already exists
     let existing = git_providers::Entity::find()
@@ -553,8 +554,19 @@ async fn create_git_provider(
         .await?;
 
     let connection = if let Some(connection) = existing_connection {
-        debug!("GitHub connection for '{}' already exists", github_username);
-        connection
+        if connection.user_id != Some(admin_user_id) {
+            let mut active: git_provider_connections::ActiveModel = connection.into();
+            active.user_id = Set(Some(admin_user_id));
+            let connection = active.update(conn).await?;
+            debug!(
+                "Assigned existing GitHub connection for '{}' to admin user {}",
+                github_username, admin_user_id
+            );
+            connection
+        } else {
+            debug!("GitHub connection for '{}' already exists", github_username);
+            connection
+        }
     } else {
         // Encrypt the PAT token for the connection
         let encrypted_token = encryption_service
@@ -564,7 +576,7 @@ async fn create_git_provider(
         // Create connection
         let new_connection = git_provider_connections::ActiveModel {
             provider_id: Set(provider.id),
-            user_id: Set(None), // No user in CLI setup
+            user_id: Set(Some(admin_user_id)),
             account_name: Set(github_username.to_string()),
             account_type: Set("User".to_string()),
             access_token: Set(Some(encrypted_token)),
@@ -1809,6 +1821,7 @@ impl SetupCommand {
                 &encryption_service,
                 github_token,
                 &github_user.username,
+                user.id,
             ))?;
             print_success("GitHub provider configured");
             print_success(&format!(

@@ -1,12 +1,10 @@
 import { DeploymentResponse } from '@/api/client'
-import { getSettingsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import { useQuery } from '@tanstack/react-query'
-import { Camera, ExternalLink, GitBranch, Settings } from 'lucide-react'
+import { ArrowRight, Camera, ExternalLink, GitBranch } from 'lucide-react'
 import { Link } from 'react-router'
 import { normalizeUrl } from '@/lib/deployment-url'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
@@ -14,109 +12,144 @@ import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 interface LastDeploymentProps {
   deployment: DeploymentResponse
   projectName: string
+  screenshotsEnabled?: boolean
 }
 
 export function LastDeployment({
   deployment,
   projectName,
+  screenshotsEnabled,
 }: LastDeploymentProps) {
-  // Fetch platform settings to check if screenshots are enabled
-  const { data: settings } = useQuery({
-    ...getSettingsOptions(),
-    retry: false,
-  })
-
-  const screenshotsEnabled = settings?.screenshots?.enabled ?? false
+  const primaryUrl = deployment.environment.domains[0] ?? deployment.url
+  const primaryHref = normalizeUrl(primaryUrl)
+  const screenshotLocation = deployment.screenshot_location
+  const screenshotUrl = screenshotLocation
+    ? `/api/files${screenshotLocation.startsWith('/') ? screenshotLocation : `/${screenshotLocation}`}`
+    : null
 
   return (
-    <Card>
-      <CardContent className="p-4 sm:p-6">
-        <div className="flex flex-col gap-4 md:flex-row md:gap-4">
-          <div className="w-full md:w-1/3">
-            {!screenshotsEnabled ? (
-              <div className="flex items-center justify-center">
-                <Card className="w-full bg-muted/50 border-dashed">
-                  <CardContent className="flex flex-col items-center justify-center h-48 text-center p-4">
-                    <Camera className="h-8 w-8 text-muted-foreground mb-2" />
-                    <p className="text-sm text-muted-foreground mb-3">
-                      Screenshot generation is disabled
-                    </p>
-                    <Link to="/settings">
-                      <Button variant="outline" size="sm">
-                        <Settings className="h-3 w-3 mr-1" />
-                        Enable in Settings
-                      </Button>
-                    </Link>
-                  </CardContent>
-                </Card>
-              </div>
-            ) : deployment.screenshot_location ? (
-              <ReloadableImage
-                src={`/api/files${deployment.screenshot_location?.startsWith('/') ? deployment.screenshot_location : '/' + deployment.screenshot_location}`}
-                alt={`${projectName} deployment ${deployment.id}`}
-                className="w-full rounded-md"
-              />
-            ) : deployment.status === 'failed' ? (
-              <div className="flex items-center justify-center">
-                <Card className="w-full max-w-md bg-gray-900 border-gray-800">
-                  <CardContent className="flex items-center justify-center h-48">
-                    <p className="text-gray-400 text-lg">Failed to deploy</p>
-                  </CardContent>
-                </Card>
-              </div>
-            ) : (
-              <div className="flex items-center justify-center">
-                <Card className="w-full max-w-md bg-gray-900 border-gray-800">
-                  <CardContent className="flex items-center justify-center h-48">
-                    <p className="text-gray-400 text-lg">
-                      {deployment.status === 'completed'
-                        ? 'Generating screenshot...'
-                        : deployment.status === 'running'
-                          ? 'Deployment in progress...'
-                          : 'Waiting for deployment...'}
-                    </p>
-                  </CardContent>
-                </Card>
-              </div>
-            )}
-          </div>
-          <div className="w-full md:w-2/3">
-            <h3 className="text-lg font-semibold mb-2">
-              Deployment Information
-            </h3>
-            <div className="flex flex-col items-start gap-2 mb-4">
-              {deployment.environment.domains.map((domain) => (
-                <DeploymentUrlRow key={domain} value={domain} />
-              ))}
-              <DeploymentUrlRow value={deployment.url} />
-            </div>
+    <Card className="overflow-hidden">
+      <CardContent className="p-0">
+        <div className="grid lg:grid-cols-[minmax(18rem,0.85fr)_minmax(0,1.15fr)]">
+          <DeploymentPreview
+            screenshotUrl={screenshotUrl}
+            primaryHref={primaryHref}
+            alt={`${projectName} latest deployment preview`}
+            status={deployment.status}
+            screenshotsEnabled={screenshotsEnabled}
+          />
 
-            <h4 className="text-sm font-semibold mb-2">Status</h4>
-            <div className="flex items-center mb-4">
-              <DeploymentStatusBadge deployment={deployment} className="mr-2" />
-              <span className="text-xs text-muted-foreground">
-                <TimeAgo date={deployment.created_at} /> by{' '}
-                {deployment.commit_author}
-              </span>
-            </div>
-
-            <h4 className="text-sm font-semibold mb-2">Source</h4>
-            <div className="text-sm space-y-1">
-              <p className="flex items-center text-muted-foreground">
-                <GitBranch className="mr-2 h-4 w-4" />
-                {deployment.branch}
-              </p>
-              <p className="flex items-start text-muted-foreground">
-                {deployment.commit_hash?.slice(0, 7)}&nbsp;
-                <span className="font-medium text-foreground ml-1">
-                  {deployment.commit_message}
+          <div className="flex min-w-0 flex-col justify-between gap-5 p-4 sm:p-5 lg:p-6">
+            <div className="min-w-0 space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-semibold">Latest deployment</h3>
+                <DeploymentStatusBadge deployment={deployment} />
+                <span className="text-xs text-muted-foreground">
+                  <TimeAgo date={deployment.created_at} />
+                  {deployment.commit_author
+                    ? ` by ${deployment.commit_author}`
+                    : ''}
                 </span>
-              </p>
+              </div>
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium">
+                  {deployment.commit_message || 'Manual deployment'}
+                </p>
+                <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <GitBranch className="size-3.5 shrink-0" />
+                  <span className="truncate">
+                    {deployment.branch || 'uploaded source'}
+                    {deployment.commit_hash
+                      ? ` · ${deployment.commit_hash.slice(0, 7)}`
+                      : ''}
+                  </span>
+                </p>
+              </div>
+              {primaryUrl && <DeploymentUrlRow value={primaryUrl} />}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {primaryHref && (
+                <Button variant="outline" size="sm" asChild>
+                  <a
+                    href={primaryHref}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open site
+                    <ExternalLink className="ml-1.5 size-3.5" />
+                  </a>
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" asChild>
+                <Link
+                  to={`/projects/${projectName}/deployments/${deployment.id}`}
+                >
+                  Details
+                  <ArrowRight className="ml-1.5 size-3.5" />
+                </Link>
+              </Button>
             </div>
           </div>
         </div>
       </CardContent>
     </Card>
+  )
+}
+
+function DeploymentPreview({
+  screenshotUrl,
+  primaryHref,
+  alt,
+  status,
+  screenshotsEnabled,
+}: {
+  screenshotUrl: string | null
+  primaryHref: string | null
+  alt: string
+  status: DeploymentResponse['status']
+  screenshotsEnabled: boolean | undefined
+}) {
+  const preview = screenshotUrl ? (
+    <ReloadableImage
+      src={screenshotUrl}
+      alt={alt}
+      className="size-full object-cover object-top transition-transform duration-300 group-hover/preview:scale-[1.015]"
+    />
+  ) : screenshotsEnabled === false ? (
+    <div className="flex size-full flex-col items-center justify-center gap-2 bg-muted/35 px-6 text-center text-muted-foreground">
+      <Camera className="size-5" />
+      <span className="text-xs">Screenshot previews are off</span>
+      <Button variant="outline" size="sm" asChild>
+        <Link to="/settings">Enable in settings</Link>
+      </Button>
+    </div>
+  ) : (
+    <div className="flex size-full flex-col items-center justify-center gap-2 bg-muted/35 px-6 text-center text-muted-foreground">
+      <Camera className="size-5" />
+      <span className="text-xs">
+        {status === 'completed'
+          ? 'Generating preview…'
+          : 'Preview available after deployment'}
+      </span>
+    </div>
+  )
+
+  const className =
+    'group/preview aspect-[16/9] min-h-44 overflow-hidden border-b bg-muted/25 lg:aspect-auto lg:min-h-56 lg:border-b-0 lg:border-r'
+
+  return screenshotUrl && primaryHref ? (
+    <a
+      href={primaryHref}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={`block ${className}`}
+      aria-label="Open latest deployment"
+    >
+      {preview}
+    </a>
+  ) : (
+    <div className={className}>{preview}</div>
   )
 }
 

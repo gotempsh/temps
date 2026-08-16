@@ -185,6 +185,17 @@ fn format_permission_answer(decision: &PermissionDecision) -> String {
 /// Tool name for the write-proposal (confirm-gated) tool.
 const TEMPS_WRITE_TOOL_NAME: &str = "temps_write";
 
+/// Client-visible tool results must not contain raw data fetched through
+/// server-side credentials. The model keeps the full result for reasoning;
+/// the live stream and persisted transcript receive only this safe status.
+fn public_tool_result(name: &str, result: &str) -> String {
+    if name == TEMPS_WRITE_TOOL_NAME {
+        return redact_json_string(result);
+    }
+
+    "Tool completed; detailed result is withheld from the chat transcript.".to_string()
+}
+
 /// System prompt for the one-shot title generator. Kept terse so even small
 /// local models return a clean label rather than a sentence.
 const TITLE_SYSTEM_PROMPT: &str = "You write a short title for a chat based on the user's first message. \
@@ -1220,7 +1231,10 @@ impl ConversationService {
         let mut tools: Vec<ChatTool> = Vec::new();
         if chat_capable {
             if let Some(p) = &provider {
-                tools.extend(p.tools(conv.project_id, &conv.context_id).await);
+                tools.extend(
+                    p.tools_with_auth(conv.project_id, &conv.context_id, auth)
+                        .await,
+                );
             }
             // ADR-024: merge the generic API meta-tools from the sentinel provider.
             // This is done for EVERY conversation context so the model can always
@@ -1228,7 +1242,7 @@ impl ConversationService {
             if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
                 tools.extend(
                     api_tools_provider
-                        .tools(conv.project_id, &conv.context_id)
+                        .tools_with_auth(conv.project_id, &conv.context_id, auth)
                         .await,
                 );
             }
@@ -1241,7 +1255,7 @@ impl ConversationService {
             if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
                 tools.extend(
                     repo_tools_provider
-                        .tools(conv.project_id, &conv.context_id)
+                        .tools_with_auth(conv.project_id, &conv.context_id, auth)
                         .await,
                 );
             }
@@ -1836,7 +1850,7 @@ impl ConversationService {
                         .await
                     };
                     let display_arguments = redact_json_string(&tc.arguments);
-                    let display_result = redact_json_string(&result);
+                    let display_result = public_tool_result(&tc.name, &result);
                     // Surface the result right after — live.
                     if tx
                         .send(Ok(ChatStreamEvent::ToolResult {
@@ -2345,7 +2359,7 @@ async fn dispatch_conversation_tool(
     ) {
         if let Some(provider) = repo_tools {
             provider
-                .execute_tool(project_id, context_id, &call.name, &call.arguments)
+                .execute_tool_with_auth(project_id, context_id, &call.name, &call.arguments, auth)
                 .await
         } else {
             format!(
@@ -3226,6 +3240,18 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn public_tool_results_hide_privileged_read_data() {
+        assert_eq!(
+            public_tool_result("read_repo_file", "SECRET_TOKEN=abc123"),
+            "Tool completed; detailed result is withheld from the chat transcript."
+        );
+        assert_eq!(
+            public_tool_result(TEMPS_WRITE_TOOL_NAME, r#"{"status":"proposed"}"#),
+            r#"{"status":"proposed"}"#
+        );
+    }
+
     // (a) a round calls a tool, the next round answers in prose -> the tool is
     // executed (ToolCall -> ToolResult, live) and the prose streams as the answer.
     #[tokio::test]
@@ -3270,7 +3296,9 @@ mod tests {
                 ChatStreamEvent::ToolResult {
                     id: "c1".to_string(),
                     name: "echo".to_string(),
-                    content: "tool result".to_string(),
+                    content:
+                        "Tool completed; detailed result is withheld from the chat transcript."
+                            .to_string(),
                 },
                 ChatStreamEvent::Token("final ".to_string()),
                 ChatStreamEvent::Token("answer".to_string()),

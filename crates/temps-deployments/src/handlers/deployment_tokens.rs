@@ -323,6 +323,7 @@ async fn rotate_deployment_token(
     Path((project_id, token_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensWrite);
+    permission_guard!(auth, DeploymentTokensCreate);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let rotated = app_state

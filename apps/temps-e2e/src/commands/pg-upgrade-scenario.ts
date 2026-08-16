@@ -1,14 +1,12 @@
 /**
- * PostgreSQL major-version upgrade (16 → 17) against a live Temps instance,
+ * PostgreSQL major-version upgrade (17 → 18) against a live Temps instance,
  * using MinIO as the local S3-compatible target for the mandatory pre-upgrade
  * backup (same infra as `backup-restore-scenario` and `pitr-scenario`):
  *
  *   1. provision a real standalone postgres service pinned explicitly to
- *      `postgres:16-bookworm` (not the platform default which is 18).
- *      Standard official postgres images are used; the platform's
- *      extract_postgres_version() parses "16" from the tag correctly and
- *      sets PGDATA to /var/lib/postgresql/16/docker. The pre-upgrade backup
- *      falls back to the pg_dump sidecar since these images don't bundle wal-g.
+ *      `gotempsh/postgres-walg:17-bookworm` (not the platform default which is 18).
+ *      Published platform-reviewed images are used; the platform extracts
+ *      "17" from the tag.
  *   2. create a **default** S3 source (`is_default: true`) pointed at the
  *      local MinIO. `phase_pre_backup` in the orchestrator resolves the
  *      default source via `BackupService::default_s3_source_id` (a simple
@@ -24,13 +22,13 @@
  *      `database` parameter -- see `PostgresService::get_runtime_env_vars` /
  *      `normalizePostgresDatabaseName`'s doc comment in flows.ts).
  *   5. start the upgrade: `POST /external-services/{id}/upgrades` with
- *      from_version="16", to_version="17", from_image and to_image matching
- *      the same OS family (`-bookworm`). The orchestrator runs phases
+ *      from_version="17", to_version="18", with reviewed managed images.
+ *      The orchestrator runs phases
  *      synchronously inside a spawned tokio task:
  *        pre_backup  → wal-g backup to MinIO (pre-upgrade safety net)
  *        snapshot    → stop old container, copy PGDATA volume to rollback vol
  *        dump        → pg_dumpall from old container into a dump volume
- *        new_container → create fresh 17-bookworm container (initdb on empty vol)
+ *        new_container → create fresh PostgreSQL 18 container (initdb on empty vol)
  *        restore     → psql restore from dump into new container
  *        swap        → persist to_image onto service config; restart container
  *        analyze     → ANALYZE for planner stats
@@ -53,7 +51,7 @@
  *      the same reason PITR does (WAL-logged `SEQ_LOG_VALS` advance), so we
  *      assert the count and that the new row's id is > 5, not that it equals 6.
  *   9. assert the service's reported `docker_image` parameter now reflects
- *      the new image (`postgres:17-bookworm`). `phase_swap`
+ *      the new image (`gotempsh/postgres-walg:18-bookworm`). `phase_swap`
  *      calls `lifecycle.set_docker_image` which persists the new image into
  *      `external_services.parameters` -- `GET /external-services/{id}`'s
  *      `current_parameters.docker_image` is the API-visible proof.
@@ -93,15 +91,13 @@ import { buildProbeImage, PROBE_APP_HEALTH_PATH } from '../lib/probe-app.ts'
 
 // The from/to images MUST be on the same OS family (Alpine ↔ Alpine or
 // Debian ↔ Debian) -- `validate_os_family` in postgres_upgrade.rs enforces
-// this at start time. Both `-bookworm` means Debian; the versions differ.
-// Standard postgres:N-bookworm images are used here; the platform's
+// this at start time. Temps' reviewed managed images are used here; the platform's
 // extract_postgres_version() parses the major version from the tag correctly,
-// and the pre-upgrade backup falls back to the pg_dump sidecar path since
-// these images don't bundle wal-g (same fallback as any unmanaged image).
-const FROM_IMAGE = 'postgres:16-bookworm'
-const TO_IMAGE = 'postgres:17-bookworm'
-const FROM_VERSION = '16'
-const TO_VERSION = '17'
+// and the managed-service allowlist admits only platform-reviewed images.
+const FROM_IMAGE = 'gotempsh/postgres-walg:17-bookworm'
+const TO_IMAGE = 'gotempsh/postgres-walg:18-bookworm'
+const FROM_VERSION = '17'
+const TO_VERSION = '18'
 
 const PROBE_TABLE_ENTITY = 'e2e_probe'
 
@@ -212,13 +208,8 @@ export async function pgUpgradeScenarioCommand(opts: PgUpgradeScenarioOptions): 
 
     // Provision a postgres service explicitly pinned to the older major version.
     // The `docker_image` parameter overrides the platform default so the service
-    // actually runs Postgres 16. We use the standard `postgres:16-bookworm`
-    // (same OS family as `postgres:17-bookworm`) rather than a custom image
-    // because `validate_os_family` in postgres_upgrade.rs requires matching OS
-    // families, and the plain bookworm images are widely available without any
-    // registry auth. These images don't bundle wal-g, so the pre-upgrade backup
-    // falls back to the pg_dump sidecar path -- the same fallback documented at
-    // the top of this file and in the FROM_IMAGE/TO_IMAGE block above.
+    // actually runs Postgres 16. Both reviewed images use the same Debian
+    // family, as required by `validate_os_family` in postgres_upgrade.rs.
     const service = await step(`provision postgres service pinned to ${FROM_IMAGE}`, () =>
       createE2eService(client, {
         name: `${runId}-pg`,

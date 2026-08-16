@@ -144,6 +144,7 @@ async fn setup() -> Option<ChTestEnv> {
         ClickHouseOtelConfig::new(&url, CH_DB, "default", "test"),
         inner_tsdb,
         Arc::new(temps_core::FixedRetentionResolver),
+        None,
     ));
     // Seed one trace (root + child) through the REAL span write path.
     ch_otel

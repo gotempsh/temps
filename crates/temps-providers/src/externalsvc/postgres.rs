@@ -40,6 +40,18 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let valid_key = key
+        .chars()
+        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    valid_key.then(|| format!("export {key}={}", shell_escape(value)))
+}
+
 /// Rejections from same-version-only [`PostgresService::upgrade`]. The
 /// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
 /// across every provider, so this can't be a variant of a typed
@@ -327,6 +339,27 @@ fn default_docker_image() -> Option<String> {
     Some("gotempsh/postgres-walg:18-bookworm".to_string())
 }
 
+const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
+    "gotempsh/postgres-walg:15-bookworm",
+    "gotempsh/postgres-walg:16-bookworm",
+    "gotempsh/postgres-walg:17-bookworm",
+    "gotempsh/postgres-walg:18-bookworm",
+    "timescale/timescaledb-ha:pg17",
+    "timescale/timescaledb-ha:pg18",
+];
+
+pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
+    if ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}",
+            docker_image,
+            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", ")
+        ))
+    }
+}
+
 // Schema example functions
 fn example_host() -> &'static str {
     "localhost"
@@ -389,8 +422,13 @@ impl PostgresService {
         let input_config: PostgresInputConfig =
             serde_json::from_value(service_config.parameters)
                 .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
-        // Then convert to PostgresConfig which applies additional transformations
-        Ok(PostgresConfig::from(input_config))
+        let postgres_config = PostgresConfig::from(input_config);
+        // Imported-service metadata is client-deserializable and therefore
+        // cannot be used as an authorization signal. Every image must remain
+        // allowlisted because backup/restore helpers may pull and execute it
+        // even when the primary database container already exists.
+        validate_postgres_docker_image(&postgres_config.docker_image)?;
+        Ok(postgres_config)
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
@@ -861,7 +899,8 @@ impl PostgresService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -1075,15 +1114,9 @@ impl PostgresService {
     }
 
     /// Returns true iff `/var/lib/postgresql/walg.env` exists on this
-    /// service's data volume.
-    ///
-    /// Use Docker's native archive API instead of starting a helper
-    /// container: the path lives on the service's mounted data volume, and
-    /// `docker cp` / `download_from_container` can read it from a stopped
-    /// container without executing third-party image code against the
-    /// Postgres volume. Any error (missing container, missing file, Docker
-    /// API failure) returns false — we err on the side of not enabling
-    /// archiving.
+    /// service's data volume. Docker's archive API can read a stopped
+    /// container's mounted volume without pulling or executing a mutable
+    /// helper image against database data.
     ///
     /// The live container is probed directly when it exists. Otherwise
     /// (fresh create, `force_recreate`, an externally-removed container, or
@@ -4183,6 +4216,25 @@ mod tests {
     fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
         let cmd = postgres_healthcheck_cmd("a'user", "a'db");
         assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
+
+    #[test]
+    fn sourced_walg_values_are_shell_quoted() {
+        assert_eq!(
+            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
+            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
+        );
+        assert_eq!(
+            shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def"),
+            Some("export AWS_SECRET_ACCESS_KEY='abc'\\''def'".to_string())
+        );
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
+    }
+
+    #[test]
+    fn managed_postgres_images_are_allowlisted() {
+        assert!(validate_postgres_docker_image("gotempsh/postgres-walg:18-bookworm").is_ok());
+        assert!(validate_postgres_docker_image("attacker/postgres:latest").is_err());
     }
 
     #[test]

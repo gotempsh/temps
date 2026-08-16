@@ -170,6 +170,103 @@ impl AuditOperation for UnifiedTraceReadAudit {
     }
 }
 
+// ── Facet audit events ────────────────────────────────────────────────
+
+/// Audit event for registering a new OTel span attribute facet.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetCreatedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key that was registered.
+    pub attribute_key: String,
+    /// The slot column index assigned (1..=20).
+    pub slot: u8,
+}
+
+/// Audit event for deleting an OTel span attribute facet.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetDeletedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key that was removed.
+    pub attribute_key: String,
+}
+
+/// Audit event for retrying a failed OTel span attribute facet backfill.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetBackfillRetriedAudit {
+    pub context: AuditContext,
+    /// The OTel attribute key whose backfill is being retried.
+    pub attribute_key: String,
+}
+
+impl AuditOperation for FacetCreatedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+impl AuditOperation for FacetDeletedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+impl AuditOperation for FacetBackfillRetriedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_FACET_BACKFILL_RETRIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
 // ── Metric alert rule audit events ──────────────────────────────────
 
 /// Audit event for creating a metric alert rule.

@@ -148,6 +148,17 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+
+// Mutation errors here are thrown ProblemDetails response bodies, not Error
+// instances -- String(error) on an object stringifies to "[object Object]"
+// instead of the API's detail message.
+function apiErrorMessage(error: unknown): string {
+  if (error && typeof error === 'object' && 'detail' in error) {
+    const detail = (error as { detail?: unknown }).detail
+    if (typeof detail === 'string' && detail.length > 0) return detail
+  }
+  return String(error)
+}
 // ============================================================================
 // Usage Analytics types & fetchers
 // ============================================================================
@@ -292,7 +303,7 @@ function AiSummaryDefaultsCard({
     },
     onError: (error) =>
       toast.error('Could not save AI summary defaults', {
-        description: String(error),
+        description: apiErrorMessage(error),
       }),
   })
 
@@ -420,7 +431,9 @@ function ProviderKeyModelDetail({
       toast.success(`${providerKey.display_name} models refreshed`)
     },
     onError: (error) =>
-      toast.error('Model refresh failed', { description: String(error) }),
+      toast.error('Model refresh failed', {
+        description: apiErrorMessage(error),
+      }),
   })
   const addMutation = useMutation({
     mutationFn: () =>
@@ -435,7 +448,9 @@ function ProviderKeyModelDetail({
       toast.success('Manual model added')
     },
     onError: (error) =>
-      toast.error('Could not add model', { description: String(error) }),
+      toast.error('Could not add model', {
+        description: apiErrorMessage(error),
+      }),
   })
   const updateMutation = useMutation({
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
@@ -446,7 +461,9 @@ function ProviderKeyModelDetail({
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey }),
     onError: (error) =>
-      toast.error('Could not update model', { description: String(error) }),
+      toast.error('Could not update model', {
+        description: apiErrorMessage(error),
+      }),
   })
   const defaultMutation = useMutation({
     mutationFn: (modelId: string) =>
@@ -461,7 +478,7 @@ function ProviderKeyModelDetail({
     },
     onError: (error) =>
       toast.error('Could not set default model', {
-        description: String(error),
+        description: apiErrorMessage(error),
       }),
   })
   const deleteMutation = useMutation({
@@ -472,7 +489,9 @@ function ProviderKeyModelDetail({
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey }),
     onError: (error) =>
-      toast.error('Could not delete model', { description: String(error) }),
+      toast.error('Could not delete model', {
+        description: apiErrorMessage(error),
+      }),
   })
 
   const models = useMemo(
@@ -4172,7 +4191,7 @@ export function AiGatewayPage() {
     },
     onError: (error) =>
       toast.error('Some gateway model catalogs could not be refreshed', {
-        description: String(error),
+        description: apiErrorMessage(error),
       }),
   })
 
@@ -4309,7 +4328,9 @@ export function AiGatewayPage() {
       setTestingKeyId(null)
     },
     onError: (err) => {
-      toast.error('Failed to test provider key', { description: String(err) })
+      toast.error('Failed to test provider key', {
+        description: apiErrorMessage(err),
+      })
       setTestingKeyId(null)
     },
   })

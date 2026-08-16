@@ -73,6 +73,9 @@ pub struct OtelAppState {
     /// the payload are ignored by `otlp_to_store_point` — source assignment
     /// is an invariant of the ingest path, not a user-controlled field.
     pub metrics_write_tx: Option<tokio::sync::mpsc::Sender<Vec<temps_metrics::MetricPoint>>>,
+    /// Service managing OTel span attribute facets (Postgres config + ClickHouse
+    /// DDL mutations + shared in-memory cache for the hot ingest/query paths).
+    pub facet_service: std::sync::Arc<crate::services::FacetService>,
     /// Service backing per-project saved metric dashboard CRUD (Postgres-backed
     /// config/metadata, distinct from the ClickHouse/Timescale `OtelStorage`).
     pub dashboard_service: std::sync::Arc<crate::services::MetricDashboardService>,

@@ -299,34 +299,93 @@ pub struct ChSpanRow {
     // ── Retention ───────────────────────────────────────────────────────────
     /// retention_days  UInt16  DEFAULT 90
     ///
-    /// Added by migration 0004_retention_days.sql — must remain the last
-    /// field so its position matches the DDL column order (positional binary
-    /// serialization). The TTL expression in 0005_retention_ttl.sql reads
-    /// this column: `toDateTime(start_time) + toIntervalDay(retention_days)`.
+    /// Added by migration 0004_retention_days.sql. The TTL expression in
+    /// 0005_retention_ttl.sql reads this column.
     pub retention_days: u16,
+
+    // ── Facet slot columns (migration 0008_facet_slots.sql) ─────────────────
+    //
+    // Pre-allocated generic slot columns for fast attribute filtering. When an
+    // admin registers an attribute key as a "facet" via the API, new spans
+    // that carry that attribute have its value written here. The query layer
+    // emits `facet_attr_N = ?` instead of `JSONExtractString(attributes,?) = ?`
+    // for registered keys, letting ClickHouse use the bloom-filter skip index.
+    //
+    // All slots are NULL for spans ingested before the corresponding facet was
+    // registered (or for spans that do not carry the attribute). Historical
+    // spans are back-filled via an async ClickHouse mutation at registration
+    // time.
+    //
+    // IMPORTANT: field order here must match the DDL ALTER TABLE ADD COLUMN
+    // order in 0008_facet_slots.sql (positional binary serialisation).
+    pub facet_attr_1: Option<String>,
+    pub facet_attr_2: Option<String>,
+    pub facet_attr_3: Option<String>,
+    pub facet_attr_4: Option<String>,
+    pub facet_attr_5: Option<String>,
+    pub facet_attr_6: Option<String>,
+    pub facet_attr_7: Option<String>,
+    pub facet_attr_8: Option<String>,
+    pub facet_attr_9: Option<String>,
+    pub facet_attr_10: Option<String>,
+    pub facet_attr_11: Option<String>,
+    pub facet_attr_12: Option<String>,
+    pub facet_attr_13: Option<String>,
+    pub facet_attr_14: Option<String>,
+    pub facet_attr_15: Option<String>,
+    pub facet_attr_16: Option<String>,
+    pub facet_attr_17: Option<String>,
+    pub facet_attr_18: Option<String>,
+    pub facet_attr_19: Option<String>,
+    pub facet_attr_20: Option<String>,
 }
 
 // ── From<&SpanRecord> for ChSpanRow ────────────────────────────────────────
 
 impl From<&SpanRecord> for ChSpanRow {
+    /// Convert a [`SpanRecord`] to a [`ChSpanRow`] with all facet slots `None`.
+    ///
+    /// Use [`ChSpanRow::from_span_with_facets`] on the hot ingest path when a
+    /// facet cache is available — this variant is kept for tests and code paths
+    /// that do not have access to the shared cache.
     fn from(span: &SpanRecord) -> Self {
-        // Serialize attributes and events to JSON strings. These are
-        // BTreeMap<String,String> / Vec<SpanEvent>, both of which are
-        // trivially serializable. We fall back to "{}" / "[]" on the
-        // (unreachable in practice) serialization error path rather than
-        // propagating — ingest must not drop spans over a serialization
-        // hiccup in metadata.
+        let empty = std::collections::HashMap::new();
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&empty);
+        Self::from_span_with_facets(span, &facet_slots)
+    }
+}
+
+impl ChSpanRow {
+    /// Build a [`ChSpanRow`] from a [`SpanRecord`], populating facet slot
+    /// columns from a pre-inverted `slot -> key` lookup.
+    ///
+    /// `facet_slots[slot - 1]` is the attribute key assigned to that slot, if
+    /// any (see [`crate::services::facet_service::invert_facet_slots`]). For
+    /// each assigned slot, this function looks up the key in
+    /// `span.attributes` (span-level attributes only — the resource-level
+    /// attributes are not merged here because by ingest time the important
+    /// resource attrs are already in the denormalised columns like
+    /// `service_name`). If the key is present, its value goes into
+    /// `facet_attr_{slot}`; otherwise that slot is `None`.
+    ///
+    /// This is a lock-free, pure in-memory operation — the caller inverts the
+    /// `ArcSwap`-loaded cache once per batch, not once per span (the closure
+    /// here is then O(1) per slot per span, not O(MAX_FACET_SLOTS)).
+    pub fn from_span_with_facets(
+        span: &SpanRecord,
+        facet_slots: &[Option<&str>; crate::services::facet_service::MAX_FACET_SLOTS as usize],
+    ) -> Self {
         let attributes = serde_json::to_string(&span.attributes).unwrap_or_else(|_| "{}".into());
         let events = serde_json::to_string(&span.events).unwrap_or_else(|_| "[]".into());
 
-        // _version: Unix ms timestamp used as the ReplacingMergeTree dedup key.
-        // Using now() at conversion time (same moment as ingest). Spans retried
-        // by the OTLP exporter will produce a higher _version than the first
-        // attempt and win the dedup.
         let version = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        let slot_value = |slot: u8| -> Option<String> {
+            facet_slots[(slot - 1) as usize].and_then(|key| span.attributes.get(key).cloned())
+        };
 
         Self {
             project_id: span.project_id,
@@ -354,6 +413,26 @@ impl From<&SpanRecord> for ChSpanRow {
             // Callers that hold a RetentionResolver should override this field
             // after construction. The fixed default matches the DDL DEFAULT.
             retention_days: temps_core::RetentionTable::Spans.default_days(),
+            facet_attr_1: slot_value(1),
+            facet_attr_2: slot_value(2),
+            facet_attr_3: slot_value(3),
+            facet_attr_4: slot_value(4),
+            facet_attr_5: slot_value(5),
+            facet_attr_6: slot_value(6),
+            facet_attr_7: slot_value(7),
+            facet_attr_8: slot_value(8),
+            facet_attr_9: slot_value(9),
+            facet_attr_10: slot_value(10),
+            facet_attr_11: slot_value(11),
+            facet_attr_12: slot_value(12),
+            facet_attr_13: slot_value(13),
+            facet_attr_14: slot_value(14),
+            facet_attr_15: slot_value(15),
+            facet_attr_16: slot_value(16),
+            facet_attr_17: slot_value(17),
+            facet_attr_18: slot_value(18),
+            facet_attr_19: slot_value(19),
+            facet_attr_20: slot_value(20),
         }
     }
 }
@@ -1180,6 +1259,13 @@ pub struct ClickHouseOtelStorage {
     /// ingested span row. The default [`temps_core::FixedRetentionResolver`]
     /// always returns 90; a plugin can register an alternative implementation.
     resolver: Arc<dyn temps_core::RetentionResolver>,
+    /// Shared facet cache: attribute_key → slot (1..=20).
+    ///
+    /// Written by `FacetService` on create/delete and loaded once at startup.
+    /// Read lock-free via `ArcSwap::load()` on every span insert and query.
+    /// When `None`, all facet slot columns are written as NULL and queries
+    /// fall back to `JSONExtractString` predicates for all attributes.
+    facet_cache: Option<crate::services::FacetCache>,
 }
 
 impl ClickHouseOtelStorage {
@@ -1193,10 +1279,13 @@ impl ClickHouseOtelStorage {
     /// - `resolver`: resolves per-project `retention_days` at ingest time.
     ///   Pass `Arc::new(FixedRetentionResolver)` unless a plugin has
     ///   registered a project-aware implementation.
+    /// - `facet_cache`: shared attribute-key→slot mapping. Pass `None` if
+    ///   `FacetService` is not registered; all facet columns will be NULL.
     pub fn new(
         config: ClickHouseOtelConfig,
         inner: Arc<TimescaleDbStorage>,
         resolver: Arc<dyn temps_core::RetentionResolver>,
+        facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
         let ch = ::clickhouse::Client::default()
             .with_url(&config.url)
@@ -1207,6 +1296,7 @@ impl ClickHouseOtelStorage {
             ch,
             inner,
             resolver,
+            facet_cache,
         }
     }
 
@@ -1239,6 +1329,18 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         let total = spans.len() as u64;
 
+        // Load the facet cache once per batch (lock-free ArcSwap read).
+        // All spans in the batch share the same snapshot — a create/delete
+        // that races with this batch will apply to the NEXT batch.
+        let facet_snapshot = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert once per batch, not once per span — see
+        // `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
+
         for chunk in spans.chunks(MAX_SPAN_INSERT_BATCH) {
             let mut inserter = self
                 .ch
@@ -1247,7 +1349,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_spans (inserter setup)", e))?;
 
             for span in chunk {
-                let mut row = ChSpanRow::from(span);
+                let mut row = ChSpanRow::from_span_with_facets(span, &facet_slots);
                 row.retention_days = self
                     .resolver
                     .resolve(span.project_id, temps_core::RetentionTable::Spans);
@@ -1346,10 +1448,25 @@ impl OtelStorage for ClickHouseOtelStorage {
         // for the common case; environment_id is not resolvable in CH without
         // a separate Postgres lookup, so we skip that filter here.
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap read).
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
-                binds.push(Bv::Str(key.clone()));
-                binds.push(Bv::Str(value.clone()));
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column + bloom index.
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_sql.push_str(&format!(" AND {column} = ?"));
+                    binds.push(Bv::Str(value.clone()));
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
+                    binds.push(Bv::Str(key.clone()));
+                    binds.push(Bv::Str(value.clone()));
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -1666,10 +1783,27 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         // environment_id: skipped — no Postgres JOIN in CH (see doc comment).
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap read).
+            // If no cache is installed (facet feature disabled) we get an empty
+            // map and every key falls through to the JSON-extract fallback.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
-                binds.push(Bv::Str(key.clone()));
-                binds.push(Bv::Str(value.clone()));
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column (bloom-indexed).
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_parts.push(format!("{column} = ?"));
+                    binds.push(Bv::Str(value.clone()));
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
+                    binds.push(Bv::Str(key.clone()));
+                    binds.push(Bv::Str(value.clone()));
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {

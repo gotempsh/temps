@@ -100,6 +100,7 @@ fn storage_for(url: &str) -> ClickHouseOtelStorage {
         ClickHouseOtelConfig::new(url, DB, "default", "test"),
         inner,
         Arc::new(temps_core::FixedRetentionResolver),
+        None,
     )
 }
 

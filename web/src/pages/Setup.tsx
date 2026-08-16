@@ -13,6 +13,7 @@ import {
   PartyPopper,
   ShieldCheck,
   Sparkles,
+  Bot,
   Users,
   type LucideIcon,
 } from 'lucide-react'
@@ -30,6 +31,7 @@ import { useActivationSignals } from '@/hooks/useActivationSignals'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
+  ai: Bot,
   git: GitBranch,
   domain: Globe,
   notifications: Bell,
@@ -56,6 +58,18 @@ function buildRecommendations(
   s: ReturnType<typeof useActivationSignals>
 ): Recommendation[] {
   const recs: Recommendation[] = []
+
+  if (!s.aiProviderConfigured) {
+    recs.push({
+      key: 'ai-provider',
+      icon: Sparkles,
+      tone: 'default',
+      title: 'Enable built-in AI',
+      body: 'Separately connect a model provider for Temps chat, autofix, and AI summaries.',
+      href: '/ai-gateway',
+      cta: 'Choose provider',
+    })
+  }
 
   if (s.hasDatabase && !s.backupsConfigured) {
     recs.push({
@@ -156,10 +170,9 @@ export function Setup() {
               <PartyPopper className="h-7 w-7 text-emerald-500" />
             </div>
             <div>
-              <p className="text-lg font-semibold">You're all set</p>
+              <p className="text-lg font-semibold">You&apos;re all set</p>
               <p className="text-sm text-muted-foreground mt-1 max-w-sm">
-                Every setup step is complete. Your platform is
-                production-ready.
+                Every setup step is complete. Your platform is production-ready.
               </p>
             </div>
             <Button asChild className="mt-2">
@@ -316,9 +329,9 @@ export function Setup() {
                   <CardContent className="flex items-start gap-3 p-4">
                     <Lightbulb className="h-4 w-4 shrink-0 text-muted-foreground mt-0.5" />
                     <p className="text-xs text-muted-foreground leading-relaxed">
-                      No recommendations right now — you're following the
-                      best-practice defaults. New ones appear here as your
-                      setup evolves.
+                      No recommendations right now — you&apos;re following the
+                      best-practice defaults. New ones appear here as your setup
+                      evolves.
                     </p>
                   </CardContent>
                 </Card>

@@ -36,8 +36,8 @@ use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
 
-/// Pinned image reference. Bumped per release. Never `:latest`.
-pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway:latest";
+/// Immutable multi-platform manifest reference. Bumped per release.
+pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9";
 
 /// Filename inside `TEMPS_DATA_DIR` that holds the gateway shared secret.
 /// The file is created with 0600 perms on first boot if missing; the same
@@ -663,8 +663,8 @@ pub struct GatewayStatus {
     /// Higher-level health label: "running" | "restarting" | "crash_looping"
     /// | "stopped" | "missing". UI should prefer this over `running`.
     pub health: String,
-    /// Image reference the container was created with (e.g.
-    /// `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+    /// Image reference the container was created with (e.g. an immutable
+    /// `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
     pub image: Option<String>,
     /// Image digest if available (e.g. `sha256:…`).
     pub image_digest: Option<String>,
@@ -859,6 +859,15 @@ pub async fn tail_logs(docker: &Docker, tail: usize) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn default_gateway_image_is_immutable() {
+        assert_eq!(
+            PREVIEW_GATEWAY_IMAGE,
+            PreviewGatewaySettings::default().image
+        );
+        assert!(PREVIEW_GATEWAY_IMAGE.contains("@sha256:"));
+    }
 
     #[test]
     fn ensure_shared_secret_creates_file_on_first_call() {

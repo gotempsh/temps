@@ -1310,6 +1310,7 @@ export function EnvironmentVariablesSettings({
             key: variable.key,
             value: variable.value,
             environment_ids: variable.environments || [],
+            include_in_preview: false,
           },
         })
         successCount++

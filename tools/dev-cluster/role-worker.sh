@@ -61,6 +61,20 @@ if [[ ! -f "$JOIN_TOKEN_FILE" ]]; then
 fi
 JOIN_TOKEN="$(cat "$JOIN_TOKEN_FILE")"
 
+# Install the test topology's control-plane trust anchor on every container
+# boot. The join marker is volume-backed, while the system trust store is not,
+# so doing this only during the first join would break recreated workers.
+if [[ -n "${DEV_CLUSTER_CONTROL_PLANE_CA:-}" ]]; then
+  if [[ ! -s "$DEV_CLUSTER_CONTROL_PLANE_CA" ]]; then
+    log "control-plane CA certificate is missing: $DEV_CLUSTER_CONTROL_PLANE_CA"
+    exit 1
+  fi
+  install -m 0644 "$DEV_CLUSTER_CONTROL_PLANE_CA" \
+    /usr/local/share/ca-certificates/temps-dev-cluster-control-plane.crt
+  update-ca-certificates >/dev/null
+  log "trusted control-plane TLS certificate"
+fi
+
 # 4. join (idempotent: skip on subsequent boots)
 if [[ ! -f "$JOIN_MARKER" ]]; then
   # Wait until the control plane's HTTP listener actually accepts a
@@ -70,10 +84,13 @@ if [[ ! -f "$JOIN_MARKER" ]]; then
   # curl on `Connection refused` returns in <1ms — without an
   # explicit sleep AFTER the failure, the loop burns 60 iterations in
   # microseconds and we proceed to `temps join` against a closed port.
-  CP_HOST="${CONTROL_PLANE_URL#http://}"; CP_HOST="${CP_HOST%%/*}"
+  CP_SCHEME="${CONTROL_PLANE_URL%%://*}"
+  CP_HOST="${CONTROL_PLANE_URL#*://}"; CP_HOST="${CP_HOST%%/*}"
   CP_PROBE_HOST="${CP_HOST%:*}"
   CP_PROBE_PORT="${CP_HOST#*:}"
-  [[ "$CP_PROBE_PORT" == "$CP_HOST" ]] && CP_PROBE_PORT=80
+  if [[ "$CP_PROBE_PORT" == "$CP_HOST" ]]; then
+    [[ "$CP_SCHEME" == "https" ]] && CP_PROBE_PORT=443 || CP_PROBE_PORT=80
+  fi
   log "waiting for control plane at $CP_PROBE_HOST:$CP_PROBE_PORT"
   for _ in $(seq 1 90); do
     if (exec 3<>/dev/tcp/"$CP_PROBE_HOST"/"$CP_PROBE_PORT") 2>/dev/null; then

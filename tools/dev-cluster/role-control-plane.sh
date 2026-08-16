@@ -75,9 +75,37 @@ if [[ ! -f "$MARKER" ]]; then
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
+  WILDCARD_DOMAIN="${DEV_CLUSTER_WILDCARD_DOMAIN:-*.localho.st}"
+  EXTERNAL_URL="${DEV_CLUSTER_EXTERNAL_URL:-https://app.localho.st}"
+  SETUP_CERT_ARGS=()
+  if [[ "${DEV_CLUSTER_GENERATE_TLS_CERT:-false}" == "true" ]]; then
+    TLS_HOST="${DEV_CLUSTER_TLS_HOST:?DEV_CLUSTER_TLS_HOST is required when generating a TLS certificate}"
+    if [[ ! "$TLS_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || [[ ! "$WILDCARD_DOMAIN" =~ ^\*\.[A-Za-z0-9.-]+$ ]]; then
+      log "invalid TLS hostname or wildcard domain"
+      exit 1
+    fi
+    TLS_CERT_FILE="$STATE_DIR/control-plane.crt"
+    # The setup command imports an encrypted copy into Postgres. Keep the
+    # plaintext staging key off persistent volumes and remove it immediately
+    # after a successful import.
+    TLS_KEY_FILE=/run/temps-control-plane.key
+    log "generating throwaway TLS certificate for $TLS_HOST"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "$TLS_KEY_FILE" -out "$TLS_CERT_FILE" -days 1 -nodes \
+      -subj "/CN=$TLS_HOST" \
+      -addext "subjectAltName=DNS:$TLS_HOST,DNS:$WILDCARD_DOMAIN" \
+      >/dev/null 2>&1
+    chmod 600 "$TLS_KEY_FILE"
+    chmod 644 "$TLS_CERT_FILE"
+    SETUP_CERT_ARGS=(
+      --wildcard-domain-cert "$TLS_CERT_FILE"
+      --wildcard-domain-key "$TLS_KEY_FILE"
+    )
+  fi
+
   # --auto implies non-interactive, skip-ssl, skip-dns-records, skip-git.
-  # We pass --server-ip 10.42.0.10 because auto-detect probes the public
-  # internet and we don't need that here.
+  # We pass a loopback --server-ip because auto-detect probes the public
+  # internet and these local clusters do not need that here.
   ADMIN_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)"
 
   # --wildcard-domain + --external-url match the localho.st cert that
@@ -89,8 +117,9 @@ if [[ ! -f "$MARKER" ]]; then
     --auto \
     --admin-email "admin@local.dev" \
     --server-ip "127.0.0.1" \
-    --wildcard-domain "*.localho.st" \
-    --external-url "https://app.localho.st" \
+    --wildcard-domain "$WILDCARD_DOMAIN" \
+    --external-url "$EXTERNAL_URL" \
+    "${SETUP_CERT_ARGS[@]}" \
     --database-url "$TEMPS_DATABASE_URL" \
     --data-dir "$TEMPS_DATA_DIR" \
     --skip-geolite2-download \
@@ -98,6 +127,10 @@ if [[ ! -f "$MARKER" ]]; then
     log "setup failed; printing logs and exiting"
     exit 1
   }
+  if [[ -n "${TLS_KEY_FILE:-}" ]]; then
+    rm -f -- "$TLS_KEY_FILE"
+    log "removed plaintext TLS staging key after import"
+  fi
 
   printf 'admin@local.dev\n%s\n' "$ADMIN_PASSWORD" > "$ADMIN_PASSWORD_FILE"
   chmod 600 "$ADMIN_PASSWORD_FILE"

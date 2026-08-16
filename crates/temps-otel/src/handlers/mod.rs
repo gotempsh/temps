@@ -2,12 +2,13 @@
 
 pub mod audit;
 pub mod dashboard_handler;
+pub mod facet_handler;
 pub mod ingest_handler;
 pub mod metric_alert_handler;
 pub mod query_handler;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
 use crate::ingest::decode::MAX_DECOMPRESSED_SIZE;
@@ -129,6 +130,16 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route(
             "/otel/global/traces/{trace_id}",
             get(query_handler::get_unified_trace),
+        )
+        // Span attribute facets (platform-global fast-filter registration)
+        .route(
+            "/otel/facets",
+            get(facet_handler::list_facets).post(facet_handler::create_facet),
+        )
+        .route("/otel/facets/{key}", delete(facet_handler::delete_facet))
+        .route(
+            "/otel/facets/{key}/retry",
+            post(facet_handler::retry_facet_backfill),
         )
         // Metric dashboards (per-project saved dashboard CRUD)
         .route(

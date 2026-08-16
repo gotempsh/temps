@@ -311,10 +311,19 @@ impl NodeScheduler {
             return Ok(Vec::new());
         };
 
+        let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
             .await?;
+
+        let selector_map = labels
+            .map(|selector| {
+                selector.as_object().ok_or_else(|| NodeError::Validation {
+                    message: "target_labels must be a JSON object".to_string(),
+                })
+            })
+            .transpose()?;
 
         let mut platforms: Vec<String> = Vec::new();
         for node in active_nodes {
@@ -323,10 +332,8 @@ impl NodeScheduler {
                     continue;
                 }
             }
-            if let Some(selector) = labels {
-                if selector.as_object().map(|m| !m.is_empty()).unwrap_or(false)
-                    && !node_matches_labels(&node.labels, selector)
-                {
+            if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
+                if !selector_map.is_empty() && !node_matches_labels(&node.labels, selector) {
                     continue;
                 }
             }
@@ -445,10 +452,19 @@ impl NodeScheduler {
         exclude_node_ids: &[i32],
         image_platforms: &[String],
     ) -> Result<SchedulingOutcome, NodeError> {
+        let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
             .await?;
+
+        let selector_map = labels
+            .map(|selector| {
+                selector.as_object().ok_or_else(|| NodeError::Validation {
+                    message: "target_labels must be a JSON object".to_string(),
+                })
+            })
+            .transpose()?;
 
         // Filter by target node IDs if specified
         let mut eligible_nodes: Vec<_> = if let Some(target_ids) = target_node_ids {
@@ -461,11 +477,9 @@ impl NodeScheduler {
         };
 
         // Filter by label selectors if specified
-        if let Some(selector) = labels {
-            if let Some(selector_map) = selector.as_object() {
-                if !selector_map.is_empty() {
-                    eligible_nodes.retain(|node| node_matches_labels(&node.labels, selector));
-                }
+        if let (Some(selector), Some(selector_map)) = (labels, selector_map) {
+            if !selector_map.is_empty() {
+                eligible_nodes.retain(|node| node_matches_labels(&node.labels, selector));
             }
         }
 
@@ -550,7 +564,25 @@ impl NodeScheduler {
         // permanent.
         let architecture_exclusions: Vec<&NodeExclusion> =
             exclusions.iter().filter(|e| e.excluded).collect();
-        let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
+        let has_node_constraints = target_node_ids.is_some()
+            || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
+        if has_node_constraints && eligible_nodes.is_empty() {
+            let excluded = if architecture_exclusions.is_empty() {
+                "no active node matched the requested node IDs or labels".to_string()
+            } else {
+                architecture_exclusions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
+        }
+        // The control plane has no node ID or worker labels, so it can never
+        // satisfy an explicit worker constraint. Include it only for
+        // unconstrained scheduling.
+        let include_local = local_compatible && !has_node_constraints;
+        let compatible_slots = usize::from(include_local) + eligible_nodes.len();
         if anti_affinity
             && !architecture_exclusions.is_empty()
             && (compatible_slots as u32) < replica_count
@@ -578,11 +610,6 @@ impl NodeScheduler {
                         .unwrap_or_else(|| "unknown".to_string()),
                 });
             }
-            if target_node_ids.is_some() {
-                tracing::warn!(
-                    "No active target nodes found for deployment, falling back to local deployment"
-                );
-            }
             return Ok(SchedulingOutcome {
                 assignments: vec![NodeAssignment::Local; replica_count as usize],
                 exclusions,
@@ -593,7 +620,7 @@ impl NodeScheduler {
         // The control plane joins the pool only when it can actually run the
         // image — on a heterogeneous cluster it is just another node with an
         // architecture.
-        let full_pool: Vec<PoolEntry> = local_compatible
+        let full_pool: Vec<PoolEntry> = include_local
             .then_some(PoolEntry {
                 assignment: NodeAssignment::Local,
                 load_score: None, // Local node has no capacity reporting
@@ -631,7 +658,7 @@ impl NodeScheduler {
                     self.max_load_threshold * 100.0
                 );
                 // Re-build full pool (moved above)
-                local_compatible
+                include_local
                     .then_some(PoolEntry {
                         assignment: NodeAssignment::Local,
                         load_score: None,
@@ -677,7 +704,7 @@ impl NodeScheduler {
                     "All nodes are excluded for anti-affinity, relaxing exclusion"
                 );
                 // Re-build: we can't use pool since it was moved, rebuild from eligible_nodes
-                local_compatible
+                include_local
                     .then_some(PoolEntry {
                         assignment: NodeAssignment::Local,
                         load_score: None,
@@ -754,6 +781,24 @@ impl NodeScheduler {
         }
         assignments
     }
+}
+
+/// Normalize a `target_nodes` selector: an empty list names no node, so it
+/// expresses *no* constraint — exactly how an empty `target_labels` object is
+/// already treated a few lines below where both are applied.
+///
+/// Without this, `target_nodes: []` filters every node out of the pool and the
+/// deployment fails as unschedulable while blaming nodes it never named. It
+/// also matters for unpinning: `PUT .../settings` reads `None` as "leave
+/// unchanged", so an empty list is the only way an operator (or a UI node
+/// picker with everything deselected) can clear a pin. Treating that as "pin to
+/// nothing" would strand the environment permanently.
+///
+/// This is not a way around the placement hardening: a caller that can send an
+/// empty list can equally omit the field, and both mean unconstrained
+/// scheduling. A list that *does* name nodes is still honoured strictly.
+pub(crate) fn placement_node_ids(target_node_ids: Option<&[i32]>) -> Option<&[i32]> {
+    target_node_ids.filter(|ids| !ids.is_empty())
 }
 
 /// Entry in the scheduling pool with optional resource load score.
@@ -898,7 +943,7 @@ fn schedule_anti_affinity_least_loaded(
 fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
     let selector_map = match selector.as_object() {
         Some(m) => m,
-        None => return true, // Non-object selector matches everything
+        None => return false, // Public scheduling entry points reject malformed selectors.
     };
 
     let node_map = match node_labels.as_object() {
@@ -1150,6 +1195,138 @@ mod tests {
             }
             other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_target_node_excluded_by_architecture_does_not_fallback_to_local() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[1]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::PlacementConstraintsUnsatisfied { ref excluded } => {
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
+                assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+                assert!(excluded.contains("linux/amd64"), "got: {excluded}");
+            }
+            other => panic!("expected PlacementConstraintsUnsatisfied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_target_label_excluded_by_architecture_does_not_fallback_to_local() {
+        let mut arm = make_node_with_arch(1, "worker-arm", "linux/arm64");
+        arm.labels = serde_json::json!({"tier": "isolated"});
+        let scheduler = scheduler_with_nodes(vec![arm], "linux/amd64");
+        let selector = serde_json::json!({"tier": "isolated"});
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                Some(&selector),
+                None,
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
+    }
+
+    /// An empty `target_nodes` list names no node, so it constrains nothing —
+    /// the same reading an empty `target_labels` object already gets. Treating
+    /// it as "pin to nothing" made the environment unschedulable and reported a
+    /// placement failure listing no nodes.
+    #[tokio::test]
+    async fn test_empty_target_nodes_is_not_a_placement_constraint() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("an empty pin must schedule like an absent one, not fail");
+
+        assert_eq!(assignments.assignments.len(), 1);
+    }
+
+    /// The drain deadlock: an environment is unpinned (empty list) so its
+    /// workload can move, then the only worker goes `draining` and drops out of
+    /// the active pool. The redeploy must land on the control plane. Failing
+    /// here leaves the old container on the node forever, so `drain_complete`
+    /// never arrives and the node can never be removed.
+    #[tokio::test]
+    async fn test_empty_target_nodes_falls_back_to_local_when_pool_is_empty() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("unpinned workload must be placeable on the control plane");
+
+        assert_eq!(assignments.assignments.len(), 1);
+        assert!(
+            assignments.assignments.iter().all(NodeAssignment::is_local),
+            "the control plane is the only place left to run it"
+        );
+    }
+
+    /// The hardening itself is untouched: a list that actually names nodes is
+    /// still enforced strictly, with no control-plane fallback.
+    #[tokio::test]
+    async fn test_non_empty_target_nodes_still_refuses_local_fallback() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[1]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
     }
 
     /// A cluster that simply has fewer nodes than replicas keeps the
@@ -1794,13 +1971,15 @@ mod tests {
                         node_id
                     );
                 }
-                NodeAssignment::Local => {}
+                NodeAssignment::Local => {
+                    panic!("explicit target IDs must never schedule on the control plane")
+                }
             }
         }
     }
 
     #[tokio::test]
-    async fn test_schedule_with_target_nodes_none_active_falls_back_to_local() {
+    async fn test_schedule_with_target_nodes_none_active_fails_closed() {
         let node_a = make_node(1, "worker-a");
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1810,14 +1989,14 @@ mod tests {
         let scheduler = NodeScheduler::new(node_service);
 
         let target_ids = vec![99];
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, None, Some(&target_ids), false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(a.is_local());
-        }
+            .expect_err("explicit node constraints must never fall back to local");
+        assert!(matches!(
+            error,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
     }
 
     #[test]
@@ -2104,18 +2283,21 @@ mod tests {
         assert_eq!(assignments.len(), 4);
 
         for assignment in &assignments {
-            if let NodeAssignment::Remote { node_id, .. } = assignment {
-                assert!(
+            match assignment {
+                NodeAssignment::Remote { node_id, .. } => assert!(
                     *node_id == 1 || *node_id == 3,
                     "Expected node 1 (us) or 3 (asia), got {}",
                     node_id
-                );
+                ),
+                NodeAssignment::Local => {
+                    panic!("explicit labels must never schedule on the control plane")
+                }
             }
         }
     }
 
     #[tokio::test]
-    async fn test_schedule_with_labels_no_match_falls_back_to_local() {
+    async fn test_schedule_with_labels_no_match_fails_closed() {
         let node_eu = make_node_with_labels(1, "eu-worker", serde_json::json!({"region": "eu"}));
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -2125,17 +2307,30 @@ mod tests {
         let scheduler = NodeScheduler::new(node_service);
 
         let labels = serde_json::json!({"region": "us"});
-        let assignments = scheduler
+        let error = scheduler
             .schedule_replicas(2, Some(&labels), None, false)
             .await
-            .unwrap();
-        assert_eq!(assignments.len(), 2);
-        for a in &assignments {
-            assert!(
-                a.is_local(),
-                "Should fall back to local when no labels match"
-            );
-        }
+            .expect_err("label constraints must never fall back to local");
+        assert!(matches!(
+            error,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_label_selector_fails_closed() {
+        let node = make_node_with_labels(1, "worker", serde_json::json!({"region": "us"}));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))));
+        let malformed = serde_json::json!(["region", "us"]);
+
+        let error = scheduler
+            .schedule_replicas(1, Some(&malformed), None, false)
+            .await
+            .expect_err("a malformed selector must never become unconstrained");
+        assert!(matches!(error, NodeError::Validation { .. }));
     }
 
     // --- Anti-affinity tests ---

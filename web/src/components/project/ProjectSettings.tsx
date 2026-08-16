@@ -15,6 +15,7 @@ import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
+import { ProjectSettingsOverview } from './settings/ProjectSettingsOverview'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -25,7 +26,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
   return (
     <div>
       <Routes>
-        <Route index element={<Navigate to="general" replace />} />
+        <Route index element={<ProjectSettingsOverview project={project} />} />
         <Route
           path="general"
           element={<GeneralSettings project={project} refetch={refetch} />}

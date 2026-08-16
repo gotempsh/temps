@@ -1819,11 +1819,13 @@ WHERE project.id = $2
     /// Teardown all running/pending deployments for the same environment.
     /// This ensures only one active deployment per environment.
     ///
-    /// After a deployment's containers are torn down, the deployment's state is
-    /// flipped to "stopped" so it is no longer re-scanned by subsequent
+    /// After a deployment's recorded containers are torn down, the deployment's
+    /// state is flipped to "stopped" so it is no longer re-scanned by subsequent
     /// teardown passes — bounding this work regardless of how much deployment
-    /// history accumulates. The route table already points at the new
-    /// deployment (via `environments.current_deployment_id`) before this runs.
+    /// history accumulates. Deployments without authoritative container records
+    /// remain active for a future safe retry. The route table already points at
+    /// the new deployment (via `environments.current_deployment_id`) before this
+    /// runs.
     async fn cancel_previous_deployments(
         &self,
         environment_id: i32,
@@ -1926,27 +1928,16 @@ WHERE project.id = $2
             };
 
             if containers.is_empty() {
-                // Fallback: no deployment_containers records (pre-migration deployments).
-                // Try to stop the container by its slug name convention: {slug}
-                let slug = &deployment.slug;
+                // A slug is not proof of Docker-container ownership. Name
+                // collisions could otherwise stop or remove an unrelated
+                // container, so only recorded deployment containers are safe.
                 self.log(format!(
-                    "No container records for deployment {} — trying slug-based cleanup: {}",
-                    deployment_id, slug
+                    "No container records for deployment {} — skipping container teardown because ownership cannot be verified",
+                    deployment_id
                 ))
                 .await
                 .ok();
-
-                // Try stop + remove by container name (slug)
-                if let Err(e) = self.container_deployer.stop_container(slug).await {
-                    debug!("Could not stop container by slug {}: {}", slug, e);
-                }
-                if let Err(e) = self.container_deployer.remove_container(slug).await {
-                    debug!("Could not remove container by slug {}: {}", slug, e);
-                } else {
-                    self.log(format!("Removed orphaned container {}", slug))
-                        .await
-                        .ok();
-                }
+                continue;
             }
 
             // Tear down every container concurrently. Each container's
@@ -2738,6 +2729,40 @@ mod teardown_tests {
             "failed deployments must be left untouched"
         );
         assert!(deployer.stopped.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_teardown_without_container_records_never_uses_deployment_slug() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let (project, env) = seed_project_env(&db).await;
+        let previous =
+            insert_deployment(&db, project.id, env.id, "collision-name", "completed").await;
+        let current = insert_deployment(&db, project.id, env.id, "current", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), current.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, current.created_at)
+            .await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        assert!(deployer.removed.lock().unwrap().is_empty());
+        let previous_after = deployments::Entity::find_by_id(previous.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            previous_after.state, "completed",
+            "deployment must remain retryable when container ownership cannot be verified"
+        );
     }
 
     /// A slow older completion must never tear down a newer deployment that

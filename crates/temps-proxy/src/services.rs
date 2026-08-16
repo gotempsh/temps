@@ -220,20 +220,38 @@ impl ProjectContextResolverImpl {
     pub fn new(route_table: Arc<CachedPeerTable>) -> Self {
         Self { route_table }
     }
-}
 
-#[async_trait]
-impl ProjectContextResolver for ProjectContextResolverImpl {
-    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
-        // Get route info from O(1) route table lookup with cached models
+    fn project_context_from_route(&self, host: &str) -> Option<ProjectContext> {
         let route_info = self.route_table.get_route(host)?;
-
-        // Return cached models directly - no database queries!
         Some(ProjectContext {
             project: route_info.project?,
             environment: route_info.environment?,
             deployment: route_info.deployment?,
         })
+    }
+}
+
+#[async_trait]
+impl ProjectContextResolver for ProjectContextResolverImpl {
+    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
+        if let Some(context) = self.project_context_from_route(host) {
+            return Some(context);
+        }
+
+        // Upstream selection waits for the first route load before retrying.
+        // Context resolution must do the same or request filters can observe no
+        // project and skip project-scoped protections for a route that becomes
+        // available moments later in the same request.
+        if !self.route_table.has_loaded() {
+            debug!(
+                "Route table not loaded yet; waiting up to {:?} before resolving project context (host: {})",
+                FIRST_LOAD_WAIT, host
+            );
+            self.route_table.wait_until_loaded(FIRST_LOAD_WAIT).await;
+            return self.project_context_from_route(host);
+        }
+
+        None
     }
 
     async fn is_static_deployment(&self, host: &str) -> bool {

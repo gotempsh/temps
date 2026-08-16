@@ -1314,7 +1314,14 @@ mod tests {
             DeploymentTokenPermission::AnalyticsRead,
             DeploymentTokenPermission::EventsWrite,
             DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::AiGatewayExecute,
             DeploymentTokenPermission::FlagsRead,
+            DeploymentTokenPermission::BlobRead,
+            DeploymentTokenPermission::BlobWrite,
+            DeploymentTokenPermission::BlobDelete,
+            DeploymentTokenPermission::KvRead,
+            DeploymentTokenPermission::KvWrite,
+            DeploymentTokenPermission::KvDelete,
             DeploymentTokenPermission::FullAccess,
         ];
 
@@ -1338,7 +1345,7 @@ mod tests {
     #[test]
     fn test_permission_all() {
         let all = DeploymentTokenPermission::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 14);
         assert!(all.contains(&DeploymentTokenPermission::VisitorsEnrich));
         assert!(all.contains(&DeploymentTokenPermission::EmailsSend));
         assert!(all.contains(&DeploymentTokenPermission::AnalyticsRead));
@@ -1346,6 +1353,12 @@ mod tests {
         assert!(all.contains(&DeploymentTokenPermission::ErrorsRead));
         assert!(all.contains(&DeploymentTokenPermission::AiGatewayExecute));
         assert!(all.contains(&DeploymentTokenPermission::FlagsRead));
+        assert!(all.contains(&DeploymentTokenPermission::BlobRead));
+        assert!(all.contains(&DeploymentTokenPermission::BlobWrite));
+        assert!(all.contains(&DeploymentTokenPermission::BlobDelete));
+        assert!(all.contains(&DeploymentTokenPermission::KvRead));
+        assert!(all.contains(&DeploymentTokenPermission::KvWrite));
+        assert!(all.contains(&DeploymentTokenPermission::KvDelete));
         assert!(all.contains(&DeploymentTokenPermission::FullAccess));
     }
 
@@ -1574,6 +1587,13 @@ mod tests {
             "events:write",
             "errors:read",
             "ai_gateway:execute",
+            "flags:read",
+            "blob:read",
+            "blob:write",
+            "blob:delete",
+            "kv:read",
+            "kv:write",
+            "kv:delete",
             "*",
         ];
 

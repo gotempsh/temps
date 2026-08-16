@@ -89,7 +89,7 @@ function stageLabel(
   }
 }
 
-export function Drop() {
+export function Drop({ embedded = false }: { embedded?: boolean }) {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [files, setFiles] = useState<DropFile[]>([])
@@ -114,13 +114,14 @@ export function Drop() {
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
 
-  usePageTitle('Drop')
+  usePageTitle(embedded ? 'New Project' : 'Drop')
   useEffect(() => {
+    if (embedded) return
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
       { label: 'Drop' },
     ])
-  }, [setBreadcrumbs])
+  }, [embedded, setBreadcrumbs])
   useEffect(
     () => () => {
       detectionAbortRef.current?.abort()
@@ -367,70 +368,78 @@ export function Drop() {
   }
 
   if (stage === 'done' && project && environment) {
+    const completedContent = (
+      <div className="relative w-full overflow-hidden rounded-[2rem] border bg-card p-8 shadow-sm sm:p-12">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_80%_10%,hsl(var(--primary)/0.13),transparent_35%)]" />
+        <div className="relative max-w-3xl">
+          <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20">
+            <Check className="size-7" />
+          </div>
+          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-600 dark:text-emerald-400">
+            Drop accepted
+          </p>
+          <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
+            {project.name} is on its way live.
+          </h1>
+          <p className="mt-5 max-w-2xl text-lg leading-8 text-muted-foreground">
+            Temps accepted the bundle and started the deployment. The project
+            page has the live build log and final status.
+          </p>
+          <div className="mt-9 flex flex-wrap gap-3">
+            <Button asChild size="lg">
+              <Link to={`/projects/${project.slug}`}>
+                Watch deployment <ArrowRight className="ml-2 size-4" />
+              </Link>
+            </Button>
+            <Button asChild size="lg" variant="outline">
+              <a href={environment.main_url} target="_blank" rel="noreferrer">
+                Open URL
+              </a>
+            </Button>
+            <Button size="lg" variant="ghost" onClick={reset}>
+              <RotateCcw className="mr-2 size-4" /> Drop another
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+
+    if (embedded) return completedContent
+
     return (
       <PageContainer
         width="wide"
         innerClassName="min-h-[calc(100vh-8rem)] flex items-center"
       >
-        <div className="relative w-full overflow-hidden rounded-[2rem] border bg-card p-8 shadow-sm sm:p-12">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_80%_10%,hsl(var(--primary)/0.13),transparent_35%)]" />
-          <div className="relative max-w-3xl">
-            <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/20">
-              <Check className="size-7" />
-            </div>
-            <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-emerald-600 dark:text-emerald-400">
-              Drop accepted
-            </p>
-            <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
-              {project.name} is on its way live.
-            </h1>
-            <p className="mt-5 max-w-2xl text-lg leading-8 text-muted-foreground">
-              Temps accepted the bundle and started the deployment. The project
-              page has the live build log and final status.
-            </p>
-            <div className="mt-9 flex flex-wrap gap-3">
-              <Button asChild size="lg">
-                <Link to={`/projects/${project.slug}`}>
-                  Watch deployment <ArrowRight className="ml-2 size-4" />
-                </Link>
-              </Button>
-              <Button asChild size="lg" variant="outline">
-                <a href={environment.main_url} target="_blank" rel="noreferrer">
-                  Open URL
-                </a>
-              </Button>
-              <Button size="lg" variant="ghost" onClick={reset}>
-                <RotateCcw className="mr-2 size-4" /> Drop another
-              </Button>
-            </div>
-          </div>
-        </div>
+        {completedContent}
       </PageContainer>
     )
   }
 
-  return (
-    <PageContainer width="wide" innerClassName="space-y-8">
-      <header className="grid gap-6 border-b pb-8 lg:grid-cols-[1fr_auto] lg:items-end">
-        <div>
-          <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-primary">
-            Repository optional
-          </p>
-          <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-5xl">
-            Drop files. Get a deployment.
-          </h1>
-          <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground">
-            Ship a static site or application without Git or a CLI. Temps
-            detects the preset, creates a project, and starts the right build
-            pipeline in one pass.
-          </p>
-        </div>
-        <div className="flex gap-6 font-mono text-xs uppercase tracking-wider text-muted-foreground">
-          <span>01 Select</span>
-          <span>02 Name</span>
-          <span>03 Deploy</span>
-        </div>
-      </header>
+  const content = (
+    <>
+      {!embedded && (
+        <header className="grid gap-6 border-b pb-8 lg:grid-cols-[1fr_auto] lg:items-end">
+          <div>
+            <p className="mb-3 font-mono text-xs uppercase tracking-[0.28em] text-primary">
+              Repository optional
+            </p>
+            <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-5xl">
+              Drop files. Get a deployment.
+            </h1>
+            <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground">
+              Ship a static site or application without Git or a CLI. Temps
+              detects the preset, creates a project, and starts the right build
+              pipeline in one pass.
+            </p>
+          </div>
+          <div className="flex gap-6 font-mono text-xs uppercase tracking-wider text-muted-foreground">
+            <span>01 Select</span>
+            <span>02 Name</span>
+            <span>03 Deploy</span>
+          </div>
+        </header>
+      )}
 
       <div className="grid gap-6">
         <>
@@ -613,6 +622,14 @@ export function Drop() {
           )}
         </>
       </div>
+    </>
+  )
+
+  if (embedded) return <div className="space-y-6">{content}</div>
+
+  return (
+    <PageContainer width="wide" innerClassName="space-y-8">
+      {content}
     </PageContainer>
   )
 }

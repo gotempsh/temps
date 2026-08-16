@@ -19,12 +19,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
   CollapsibleContent,
@@ -59,7 +54,10 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { DebugChat } from '@/components/ai/DebugChat'
-import { AGGREGATIONS, formatMetricValue } from '@/components/metrics/metric-format'
+import {
+  AGGREGATIONS,
+  formatMetricValue,
+} from '@/components/metrics/metric-format'
 import { cn } from '@/lib/utils'
 import { AnomalyBacktest } from '@/components/metrics/AnomalyBacktest'
 import {
@@ -167,7 +165,7 @@ type AlertFormData = z.infer<typeof alertSchema>
 function coerce<T extends readonly string[]>(
   values: T,
   value: string,
-  fallback: T[number],
+  fallback: T[number]
 ): T[number] {
   return (values as readonly string[]).includes(value)
     ? (value as T[number])
@@ -214,7 +212,12 @@ interface AlertFormBodyProps {
  * values and then resetting via the `values` prop drops Radix `Select` values
  * whose value changes during the reset (e.g. aggregation, detection kind).
  */
-function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps) {
+function AlertFormBody({
+  project,
+  isEditing,
+  id,
+  existing,
+}: AlertFormBodyProps) {
   const navigate = useNavigate()
   const goBack = useGoBack(`/projects/${project.slug}/metrics/alerts`)
   const queryClient = useQueryClient()
@@ -229,7 +232,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
         value: n,
         label: n,
       })),
-    [namesQuery.data],
+    [namesQuery.data]
   )
 
   const defaultValues = useMemo<AlertFormData>(() => {
@@ -246,24 +249,24 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
         comparator: coerce(
           COMPARATOR_VALUES,
           isStatic ? cfg.comparator : 'gt',
-          'gt',
+          'gt'
         ),
         threshold: isStatic ? cfg.threshold : 0,
         algorithm: coerce(
           ALGORITHM_VALUES,
           isAnomaly ? (cfg.algorithm ?? 'robust') : 'robust',
-          'robust',
+          'robust'
         ),
         deviations: isAnomaly ? (cfg.deviations ?? 3) : 3,
         direction: coerce(
           DIRECTION_VALUES,
           isAnomaly ? (cfg.direction ?? 'both') : 'both',
-          'both',
+          'both'
         ),
         seasonality: coerce(
           SEASONALITY_VALUES,
           isAnomaly ? (cfg.seasonality ?? 'none') : 'none',
-          'none',
+          'none'
         ),
         window_secs: existing.window_secs,
         for_duration_secs: existing.for_duration_secs,
@@ -304,12 +307,16 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
   // Computed once at mount (not reactive) so opening/closing it afterward
   // isn't fought by a value the user is actively changing.
   const [scopeOpen, setScopeOpen] = useState(
-    () => defaultValues.label_filters.length > 0 || defaultValues.group_by.length > 0,
+    () =>
+      defaultValues.label_filters.length > 0 ||
+      defaultValues.group_by.length > 0
   )
   const scopeSummary = useMemo(() => {
     const parts: string[] = []
     if (labelFilters.length > 0) {
-      parts.push(`${labelFilters.length} filter${labelFilters.length === 1 ? '' : 's'}`)
+      parts.push(
+        `${labelFilters.length} filter${labelFilters.length === 1 ? '' : 's'}`
+      )
     }
     if (hasGroupBy) parts.push(`by ${groupBy.join(', ')}`)
     if (dynamicAlerts) parts.push('per series')
@@ -328,7 +335,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
           const bf = b.state === 'firing' ? 0 : 1
           return af - bf || Math.abs(b.value) - Math.abs(a.value)
         }),
-    [existing],
+    [existing]
   )
 
   // Per-series alerting needs a group_by to split the metric into series. The
@@ -347,7 +354,9 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
   // algorithm/seasonality the user already configured behind a collapsed
   // "Advanced" section when they open the form to edit this rule.
   const [anomalyAdvancedOpen, setAnomalyAdvancedOpen] = useState(
-    () => defaultValues.algorithm !== 'robust' || defaultValues.seasonality !== 'none',
+    () =>
+      defaultValues.algorithm !== 'robust' ||
+      defaultValues.seasonality !== 'none'
   )
 
   // History/eligibility for anomaly rules: a metric needs enough past data for a
@@ -377,7 +386,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
     const buckets = historyQuery.data?.data ?? []
     if (!buckets.length) return 0
     const earliest = Math.min(
-      ...buckets.map((b) => new Date(b.bucket).getTime()),
+      ...buckets.map((b) => new Date(b.bucket).getTime())
     )
     return Math.max(0, Math.round((Date.now() - earliest) / 86_400_000))
   }, [historyQuery.data])
@@ -535,8 +544,8 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                 <span>
                   {existing.last_dropped_series_count} series{' '}
                   {existing.last_dropped_series_count === 1 ? 'was' : 'were'}{' '}
-                  dropped by the cardinality cap on the last evaluation — consider
-                  raising <strong>Max series to track</strong>.
+                  dropped by the cardinality cap on the last evaluation —
+                  consider raising <strong>Max series to track</strong>.
                 </span>
               </div>
             )}
@@ -549,7 +558,9 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   <TableRow>
                     <TableHead className="w-[90px]">Status</TableHead>
                     <TableHead>Series</TableHead>
-                    <TableHead className="w-[100px] text-right">Value</TableHead>
+                    <TableHead className="w-[100px] text-right">
+                      Value
+                    </TableHead>
                     <TableHead className="w-[90px] text-right">Alarm</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -563,7 +574,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                             <span
                               className={cn(
                                 'inline-block size-2 shrink-0 rounded-full',
-                                isFiring ? 'bg-destructive' : 'bg-emerald-500',
+                                isFiring ? 'bg-destructive' : 'bg-emerald-500'
                               )}
                             />
                             {isFiring ? 'Firing' : 'OK'}
@@ -602,18 +613,22 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
       {isEditing &&
         (project.ai_debug_chat_enabled === true ||
           project.ai_write_actions_enabled === true) && (
-        <DebugChat
-          projectId={project.id}
-          contextType="alert"
-          contextId={id}
-          title={existing ? `Investigate alert: ${existing.name}` : 'Investigate alert'}
-          triggerLabel="Investigate with AI"
-          description="Ask AI what this alert means, why it may be firing, and the prioritized steps to act on it."
-          startPrompt="Explain what this alert means, why it may be firing, and the prioritized steps to investigate and resolve it."
-          projectSlug={project.slug}
-          projectName={project.name}
-        />
-      )}
+          <DebugChat
+            projectId={project.id}
+            contextType="alert"
+            contextId={id}
+            title={
+              existing
+                ? `Investigate alert: ${existing.name}`
+                : 'Investigate alert'
+            }
+            triggerLabel="Investigate with AI"
+            description="Ask AI what this alert means, why it may be firing, and the prioritized steps to act on it."
+            startPrompt="Explain what this alert means, why it may be firing, and the prioritized steps to investigate and resolve it."
+            projectSlug={project.slug}
+            projectName={project.name}
+          />
+        )}
 
       <Form {...form}>
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
@@ -673,7 +688,10 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>Aggregation</FormLabel>
-                      <Select onValueChange={field.onChange} value={field.value}>
+                      <Select
+                        onValueChange={field.onChange}
+                        value={field.value}
+                      >
                         <FormControl>
                           <SelectTrigger className="font-mono text-xs">
                             <SelectValue />
@@ -711,14 +729,17 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
               <span className="flex min-w-0 items-center gap-2">
                 <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
                 <span className="font-medium">Scope</span>
-                <Badge variant="secondary" className="ml-1 shrink-0 font-normal">
+                <Badge
+                  variant="secondary"
+                  className="ml-1 shrink-0 font-normal"
+                >
                   {scopeSummary}
                 </Badge>
               </span>
               <ChevronDown
                 className={cn(
                   'size-4 shrink-0 text-muted-foreground transition-transform',
-                  scopeOpen && 'rotate-180',
+                  scopeOpen && 'rotate-180'
                 )}
               />
             </CollapsibleTrigger>
@@ -834,7 +855,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                                   field.onChange(
                                     e.target.value === ''
                                       ? undefined
-                                      : e.target.valueAsNumber,
+                                      : e.target.valueAsNumber
                                   )
                                 }
                               />
@@ -853,7 +874,9 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                         name="grouped_notification_threshold"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Notification grouping threshold</FormLabel>
+                            <FormLabel>
+                              Notification grouping threshold
+                            </FormLabel>
                             <FormControl>
                               <Input
                                 type="number"
@@ -864,7 +887,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                                   field.onChange(
                                     e.target.value === ''
                                       ? undefined
-                                      : e.target.valueAsNumber,
+                                      : e.target.valueAsNumber
                                   )
                                 }
                               />
@@ -963,7 +986,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                               value={preset}
                               onValueChange={(v) => {
                                 const p = SENSITIVITY_PRESETS.find(
-                                  (x) => x.value === v,
+                                  (x) => x.value === v
                                 )
                                 // 'custom' keeps the value + reveals the σ input.
                                 if (p) field.onChange(p.deviations)
@@ -994,7 +1017,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                                     field.onChange(
                                       e.target.value === ''
                                         ? undefined
-                                        : e.target.valueAsNumber,
+                                        : e.target.valueAsNumber
                                     )
                                   }
                                 />
@@ -1052,7 +1075,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                       <ChevronDown
                         className={cn(
                           'size-4 shrink-0 transition-transform',
-                          anomalyAdvancedOpen && 'rotate-180',
+                          anomalyAdvancedOpen && 'rotate-180'
                         )}
                       />
                     </CollapsibleTrigger>
@@ -1182,7 +1205,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                               field.onChange(
                                 e.target.value === ''
                                   ? undefined
-                                  : e.target.valueAsNumber,
+                                  : e.target.valueAsNumber
                               )
                             }
                           />
@@ -1218,7 +1241,7 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                             field.onChange(
                               e.target.value === ''
                                 ? undefined
-                                : e.target.valueAsNumber,
+                                : e.target.valueAsNumber
                             )
                           }
                         />
@@ -1246,14 +1269,14 @@ function AlertFormBody({ project, isEditing, id, existing }: AlertFormBodyProps)
                             field.onChange(
                               e.target.value === ''
                                 ? undefined
-                                : e.target.valueAsNumber,
+                                : e.target.valueAsNumber
                             )
                           }
                         />
                       </FormControl>
                       <FormDescription>
-                        The breach must persist this long before the alert fires,
-                        to avoid flapping.
+                        The breach must persist this long before the alert
+                        fires, to avoid flapping.
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

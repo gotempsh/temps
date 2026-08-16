@@ -360,6 +360,10 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         })
     }
 
+    async fn docker_image(&self, service_id: i32) -> Result<String, String> {
+        Ok(self.load_postgres_config(service_id).await?.docker_image)
+    }
+
     async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {
         let svc = self.load_service_row(service_id).await?;
         let container_name = format!("postgres-{}", svc.name);

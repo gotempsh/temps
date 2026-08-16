@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 
 use temps_ai::ChatTool;
+use temps_auth::{context::AuthContext, permissions::Permission};
 use temps_entities::projects;
 use temps_git::GitProviderManager;
 
@@ -372,7 +373,16 @@ impl ConversationContextProvider for RepoToolsProvider {
         None
     }
 
-    async fn tools(&self, project_id: i32, _context_id: &str) -> Vec<ChatTool> {
+    async fn tools_with_auth(
+        &self,
+        project_id: i32,
+        _context_id: &str,
+        auth: &AuthContext,
+    ) -> Vec<ChatTool> {
+        if !auth.has_permission(&Permission::GitRepositoriesRead) {
+            return Vec::new();
+        }
+
         // No git manager → no tools.
         if self.git.is_none() {
             return Vec::new();
@@ -430,13 +440,18 @@ impl ConversationContextProvider for RepoToolsProvider {
         ]
     }
 
-    async fn execute_tool(
+    async fn execute_tool_with_auth(
         &self,
         project_id: i32,
         _context_id: &str,
         name: &str,
         arguments: &str,
+        auth: &AuthContext,
     ) -> String {
+        if !auth.has_permission(&Permission::GitRepositoriesRead) {
+            return "Repository tools require the git_repositories:read permission.".to_string();
+        }
+
         // Parse the JSON args. On failure return a readable message so the
         // model can self-correct rather than receiving a raw Rust error.
         let args: serde_json::Value = match serde_json::from_str(arguments) {
@@ -507,7 +522,7 @@ mod tests {
     async fn tools_empty_when_git_absent() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
-        let tools = provider.tools(1, "").await;
+        let tools = provider.tools_with_auth(1, "", &auth_with_git_read()).await;
         assert!(
             tools.is_empty(),
             "expected no tools when git manager is absent"
@@ -530,7 +545,9 @@ mod tests {
 
         // git = None → early return before DB query; result is still empty.
         let provider = RepoToolsProvider::new(Arc::new(db), None);
-        let tools = provider.tools(42, "").await;
+        let tools = provider
+            .tools_with_auth(42, "", &auth_with_git_read())
+            .await;
         assert!(tools.is_empty());
     }
 
@@ -624,7 +641,9 @@ mod tests {
     async fn execute_tool_unknown_name() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
-        let result = provider.execute_tool(1, "", "nonexistent_tool", "{}").await;
+        let result = provider
+            .execute_tool_with_auth(1, "", "nonexistent_tool", "{}", &auth_with_git_read())
+            .await;
         assert!(
             result.contains("Unknown repo tool"),
             "expected unknown-tool message, got: {result}"
@@ -637,7 +656,13 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let result = provider
-            .execute_tool(1, "", "read_repo_file", "not json {{{")
+            .execute_tool_with_auth(
+                1,
+                "",
+                "read_repo_file",
+                "not json {{{",
+                &auth_with_git_read(),
+            )
             .await;
         assert!(
             result.contains("not valid JSON") || result.contains("Invalid"),
@@ -651,12 +676,65 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         // Arguments have no "path" key at all.
-        let result = provider.execute_tool(1, "", "read_repo_file", "{}").await;
+        let result = provider
+            .execute_tool_with_auth(1, "", "read_repo_file", "{}", &auth_with_git_read())
+            .await;
         // The missing-path guard fires before any git access.
         assert!(
             result.contains("path"),
             "expected path-required message, got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn repo_tools_require_git_repository_read_permission() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = RepoToolsProvider::new(Arc::new(db), None);
+        let auth = auth_without_git_read();
+
+        assert!(provider.tools_with_auth(1, "", &auth).await.is_empty());
+        let result = provider
+            .execute_tool_with_auth(1, "", "read_repo_file", r#"{"path":"README.md"}"#, &auth)
+            .await;
+        assert!(result.contains("git_repositories:read"), "{result}");
+    }
+
+    fn test_user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn auth_with_git_read() -> AuthContext {
+        AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![Permission::GitRepositoriesRead]),
+            "test".to_string(),
+            1,
+        )
+    }
+
+    fn auth_without_git_read() -> AuthContext {
+        AuthContext::new_api_key(test_user(), None, Some(Vec::new()), "test".to_string(), 1)
     }
 
     // ---------------------------------------------------------------------------

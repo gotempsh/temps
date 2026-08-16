@@ -1,3 +1,5 @@
+import type { TrafficAggregationRequest } from '@/api/client/types.gen'
+
 export type TrafficSortDirection = 'asc' | 'desc'
 
 export interface TrafficSort<TMetric extends string> {
@@ -26,4 +28,18 @@ export function nextTrafficSort<TMetric extends string>(
 
 export function trafficPageCount(total: number, pageSize: number): number {
   return Math.max(1, Math.ceil(total / pageSize))
+}
+
+export function trafficQueryNeedsCompatibilityRetry(
+  body: TrafficAggregationRequest,
+  error: unknown
+): boolean {
+  const hasOptionalCrawlerMetric = body.metrics.some(
+    (metric) => metric === 'bot_requests' || metric === 'robots_txt_requests'
+  )
+  if (!hasOptionalCrawlerMetric || !error) return false
+
+  return /unknown variant [`'](?:bot_requests|robots_txt_requests)[`']/.test(
+    JSON.stringify(error)
+  )
 }

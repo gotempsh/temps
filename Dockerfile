@@ -30,14 +30,30 @@ RUN apk add --no-cache \
     git \
     curl \
     tar \
-    gzip
+    gzip \
+    unzip
 
 # Install Node.js and npm (needed for wasm-pack and bun)
 RUN apk add --no-cache nodejs npm
 
-# Install bun using the official installer (faster and doesn't require nightly Rust)
-RUN curl -fsSL https://bun.sh/install | bash && \
-    ln -s $HOME/.bun/bin/bun /usr/local/bin/bun
+# Install a pinned Bun archive and verify it before execution. Avoid piping a
+# mutable remote installer into a shell inside the release build.
+ARG BUN_VERSION=1.3.14
+ARG BUN_LINUX_X64_MUSL_SHA256=14bd9aedeebf1dba67e8def9531c89bc989ecfdf1de42e5bfcaf1b8cd9294719
+ARG BUN_LINUX_AARCH64_MUSL_SHA256=b98e0ad3625c5c00d1d5b5ff55605c7adddbfae151861e68ade57b2d3b8703bb
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) bun_arch="x64"; bun_sha256="$BUN_LINUX_X64_MUSL_SHA256" ;; \
+      arm64) bun_arch="aarch64"; bun_sha256="$BUN_LINUX_AARCH64_MUSL_SHA256" ;; \
+      *) echo "Unsupported Bun architecture: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
+    esac; \
+    bun_zip="bun-linux-${bun_arch}-musl.zip"; \
+    curl -fsSLo "/tmp/${bun_zip}" "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${bun_zip}"; \
+    echo "${bun_sha256}  /tmp/${bun_zip}" | sha256sum -c -; \
+    unzip -q "/tmp/${bun_zip}" -d /opt; \
+    ln -s "/opt/bun-linux-${bun_arch}-musl/bun" /usr/local/bin/bun; \
+    rm "/tmp/${bun_zip}"
 
 # Install the Rust-native WASM tooling. The npm wrapper tries to download a
 # prebuilt wasm-bindgen binary that does not exist for every Alpine architecture

@@ -29,6 +29,33 @@ async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, Ti
     Some((test_db, storage))
 }
 
+/// Same as [`setup_storage`], but with a populated facet cache so ingest
+/// writes `facet_attr_N` slot columns and `query_spans`/trace-summary
+/// queries route faceted keys through them instead of the JSON fallback.
+/// `facets` maps attribute key -> slot (1..=20).
+async fn setup_storage_with_facets(
+    facets: &[(&str, u8)],
+) -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Docker/TestDatabase not available, skipping test: {}", e);
+            return None;
+        }
+    };
+
+    let map: std::collections::HashMap<String, u8> = facets
+        .iter()
+        .map(|(key, slot)| (key.to_string(), *slot))
+        .collect();
+    let facet_cache: temps_otel::services::FacetCache =
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(map));
+
+    let storage =
+        TimescaleDbStorage::with_config(test_db.db.clone(), None, 7, None, Some(facet_cache));
+    Some((test_db, storage))
+}
+
 /// Build a test ResourceInfo.
 fn test_resource() -> ResourceInfo {
     ResourceInfo {
@@ -266,6 +293,102 @@ async fn test_query_spans_filters() {
         .await
         .unwrap();
     assert_eq!(by_svc.len(), 2);
+}
+
+#[tokio::test]
+async fn test_query_spans_faceted_attribute_routes_through_slot_column() {
+    let Some((_db, storage)) = setup_storage_with_facets(&[("enduser.id", 1)]).await else {
+        return;
+    };
+
+    let project_id = 21;
+
+    let mut faceted_span = sample_span(
+        project_id,
+        "trace_faceted",
+        "span_faceted",
+        None,
+        "faceted-op",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    );
+    faceted_span
+        .attributes
+        .insert("enduser.id".to_string(), "user-42".to_string());
+
+    let mut other_span = sample_span(
+        project_id,
+        "trace_other",
+        "span_other",
+        None,
+        "other-op",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    );
+    other_span
+        .attributes
+        .insert("enduser.id".to_string(), "someone-else".to_string());
+    // Also carries an unfaceted attribute, to prove the JSON fallback still
+    // works for keys that aren't registered as a facet.
+    other_span
+        .attributes
+        .insert("unfaceted.key".to_string(), "unfaceted-value".to_string());
+
+    storage
+        .store_spans(vec![faceted_span, other_span])
+        .await
+        .unwrap();
+
+    // 1. Prove ingest actually wrote the value into facet_attr_1, not just
+    //    that the query happens to return the right row for other reasons.
+    use sea_orm::ConnectionTrait;
+    let raw = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT facet_attr_1 FROM otel_spans WHERE span_id = $1",
+            vec!["span_faceted".into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let facet_attr_1: Option<String> = raw.try_get("", "facet_attr_1").unwrap();
+    assert_eq!(facet_attr_1.as_deref(), Some("user-42"));
+
+    // 2. Prove query_spans, given the same faceted key, returns exactly the
+    //    matching span — i.e. the facet_attr_1 = $x branch (not the JSON
+    //    fallback) is what's actually being evaluated, since a broken
+    //    routing (e.g. always-false column reference) would return zero
+    //    rows here instead of silently falling back.
+    let mut faceted_filter = BTreeMap::new();
+    faceted_filter.insert("enduser.id".to_string(), "user-42".to_string());
+    let matched = storage
+        .query_spans(TraceQuery {
+            project_id,
+            attributes: Some(faceted_filter),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].span_id, "span_faceted");
+
+    // 3. Control: an unfaceted key on the same query path still resolves via
+    //    the JSON `attributes->>` fallback.
+    let mut unfaceted_filter = BTreeMap::new();
+    unfaceted_filter.insert("unfaceted.key".to_string(), "unfaceted-value".to_string());
+    let matched_unfaceted = storage
+        .query_spans(TraceQuery {
+            project_id,
+            attributes: Some(unfaceted_filter),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(matched_unfaceted.len(), 1);
+    assert_eq!(matched_unfaceted[0].span_id, "span_other");
 }
 
 #[tokio::test]
@@ -532,8 +655,13 @@ async fn test_storage_quota() {
     assert!(!exceeded);
 
     // With an explicit quota, the check runs for real against a fresh DB.
-    let storage_with_quota =
-        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(10 * 1024 * 1024 * 1024));
+    let storage_with_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(10 * 1024 * 1024 * 1024),
+        None,
+    );
     let quota = storage_with_quota.get_storage_quota(1).await.unwrap();
     assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024);
     let exceeded = storage_with_quota.check_quota(1).await.unwrap();
@@ -607,8 +735,13 @@ async fn test_storage_quota_tracks_real_ingested_span_volume() {
     // 200KB sits with wide margin between the two, so this assertion is
     // only satisfied by a formula that actually accounts for chunk storage.
     const TEST_QUOTA_LIMIT_BYTES: u64 = 200 * 1024;
-    let storage_with_tiny_quota =
-        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(TEST_QUOTA_LIMIT_BYTES));
+    let storage_with_tiny_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(TEST_QUOTA_LIMIT_BYTES),
+        None,
+    );
     let quota = storage_with_tiny_quota
         .get_storage_quota(project_id)
         .await
@@ -640,8 +773,13 @@ async fn test_storage_quota_tracks_real_ingested_span_volume() {
     // Sanity check in the other direction: a generous limit against the
     // same real data must NOT report exceeded, proving usage_pct is a real
     // proportional measurement and not just pegged to 100%.
-    let storage_with_generous_quota =
-        TimescaleDbStorage::with_config(_db.db.clone(), None, 7, Some(10 * 1024 * 1024 * 1024));
+    let storage_with_generous_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(10 * 1024 * 1024 * 1024),
+        None,
+    );
     let generous_quota = storage_with_generous_quota
         .get_storage_quota(project_id)
         .await

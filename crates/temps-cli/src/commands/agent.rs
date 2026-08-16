@@ -175,6 +175,7 @@ impl AgentCommand {
             {
                 let bridge_slot = overlay_bridge_address.clone();
                 let store = route_store.clone();
+                let proxy_docker = docker.clone();
                 let proxy_shutdown = route_sync_shutdown.clone();
                 tokio::spawn(async move {
                     let bridge_ip = loop {
@@ -195,9 +196,14 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    if let Err(e) =
-                        temps_agent::internal_proxy::spawn(bridge_ip, 80, store, proxy_shutdown)
-                            .await
+                    if let Err(e) = temps_agent::internal_proxy::spawn(
+                        bridge_ip,
+                        80,
+                        store,
+                        proxy_docker,
+                        proxy_shutdown,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             error = %e,

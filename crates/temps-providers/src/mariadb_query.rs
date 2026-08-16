@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use sqlx::Row;
-use std::collections::HashMap;
+use sqlx::mysql::{MySqlArguments, MySqlPool, MySqlPoolOptions};
+use sqlx::{MySql, Row};
+use std::collections::{HashMap, HashSet};
 use temps_query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
@@ -537,6 +537,7 @@ impl Queryable for MariaDbSource {
         validate_identifier("table", entity_name)?;
         let schema = self.get_schema(container_path, entity_name).await?;
         let columns = self.query_columns(database_name, entity_name).await?;
+        let allowed_fields = schema_field_names(&schema);
 
         let start = std::time::Instant::now();
         let mut sql = format!(
@@ -545,12 +546,10 @@ impl Queryable for MariaDbSource {
             quote_identifier(entity_name)
         );
 
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                validate_where_clause(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
+        let filter = build_filter_clause(filters.as_ref(), &allowed_fields)?;
+        if let Some(filter) = &filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter.sql);
         }
 
         if let Some(sort_by) = &options.sort_by {
@@ -581,8 +580,8 @@ impl Queryable for MariaDbSource {
         // The caller's tokio deadline frees the control-plane task, but dropping
         // the future does not stop the server: it keeps executing and keeps
         // holding its share of the operator's database. That matters here
-        // because this backend accepts a caller-supplied WHERE clause and a
-        // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
+        // because this backend accepts structured caller-supplied filters and
+        // a caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
         //
         // See `apply_statement_timeout` for why both spellings are tried and
         // why this must share the query's connection.
@@ -595,7 +594,11 @@ impl Queryable for MariaDbSource {
         })?;
         apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
 
-        let mut stream = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql);
+        if let Some(filter) = &filter {
+            query = bind_filter_params(query, &filter.params);
+        }
+        let mut stream = query
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch(&mut *conn);
@@ -708,6 +711,8 @@ impl Queryable for MariaDbSource {
     ) -> Result<u64> {
         let database_name = database_from_path(container_path, &self.database_name)?;
         validate_identifier("table", entity_name)?;
+        let schema = self.get_schema(container_path, entity_name).await?;
+        let allowed_fields = schema_field_names(&schema);
 
         let mut sql = format!(
             "SELECT COUNT(*) AS row_count FROM {}.{}",
@@ -715,12 +720,10 @@ impl Queryable for MariaDbSource {
             quote_identifier(entity_name)
         );
 
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                validate_where_clause(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
+        let filter = build_filter_clause(filters.as_ref(), &allowed_fields)?;
+        if let Some(filter) = &filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter.sql);
         }
 
         // SECURITY: bound this the way `query` is bounded.
@@ -742,7 +745,11 @@ impl Queryable for MariaDbSource {
         })?;
         apply_statement_timeout(&mut conn, COUNT_TIMEOUT_MS, database_name).await;
 
-        let row = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql);
+        if let Some(filter) = &filter {
+            query = bind_filter_params(query, &filter.params);
+        }
+        let row = query
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| DataError::QueryFailed(format!("Count query failed: {}", e)))?;
@@ -787,22 +794,35 @@ impl QuerySchemaProvider for MariaDbSource {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "title": "MariaDB Query Filters",
-            "description": "Filter data using SQL WHERE clause syntax",
+            "description": "Filter data with structured, parameterized conditions",
             "properties": {
-                "where": {
+                "logic": {
                     "type": "string",
-                    "title": "WHERE Clause",
-                    "description": "SQL WHERE clause (without 'WHERE' keyword). Example: status = 'active' AND created_at > '2025-01-01'",
-                    "examples": [
-                        "status = 'active'",
-                        "created_at > '2025-01-01'",
-                        "age >= 18 AND country = 'US'",
-                        "name LIKE '%test%'",
-                        "id IN (1, 2, 3)"
-                    ],
-                    "x-ui-widget": "textarea",
-                    "x-ui-placeholder": "status = 'active' AND created_at > NOW() - INTERVAL 7 DAY",
-                    "x-ui-rows": 3
+                    "title": "Condition Logic",
+                    "enum": ["and", "or"],
+                    "default": "and"
+                },
+                "conditions": {
+                    "type": "array",
+                    "title": "Conditions",
+                    "items": {
+                        "type": "object",
+                        "required": ["field", "op", "value"],
+                        "properties": {
+                            "field": { "type": "string", "title": "Column" },
+                            "op": {
+                                "type": "string",
+                                "title": "Operator",
+                                "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "like", "in"],
+                                "default": "eq"
+                            },
+                            "value": {
+                                "title": "Value",
+                                "description": "Scalar value for comparisons, or an array when op is in"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 }
             },
             "additionalProperties": false
@@ -1024,6 +1044,193 @@ fn normalize_sort_field(sort_by: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum FilterParam {
+    Bool(bool),
+    F64(f64),
+    I64(i64),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FilterClause {
+    sql: String,
+    params: Vec<FilterParam>,
+}
+
+fn schema_field_names(schema: &DatasetSchema) -> HashSet<String> {
+    schema
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect()
+}
+
+fn build_filter_clause(
+    filters: Option<&serde_json::Value>,
+    allowed_fields: &HashSet<String>,
+) -> Result<Option<FilterClause>> {
+    let Some(filters) = filters else {
+        return Ok(None);
+    };
+    if filters.get("where").is_some() {
+        return Err(DataError::InvalidQuery(
+            "Raw SQL WHERE filters are not supported for MariaDB; use structured conditions"
+                .to_string(),
+        ));
+    }
+    let Some(conditions) = filters.get("conditions") else {
+        return if filters.as_object().is_some_and(|object| object.is_empty()) {
+            Ok(None)
+        } else {
+            Err(DataError::InvalidQuery(
+                "MariaDB filters require a 'conditions' array".to_string(),
+            ))
+        };
+    };
+    let conditions = conditions.as_array().ok_or_else(|| {
+        DataError::InvalidQuery("MariaDB filter 'conditions' must be an array".to_string())
+    })?;
+    if conditions.is_empty() {
+        return Ok(None);
+    }
+
+    let joiner = match filters
+        .get("logic")
+        .and_then(|value| value.as_str())
+        .unwrap_or("and")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "and" => " AND ",
+        "or" => " OR ",
+        _ => {
+            return Err(DataError::InvalidQuery(
+                "MariaDB filter 'logic' must be 'and' or 'or'".to_string(),
+            ))
+        }
+    };
+
+    let mut sql_parts = Vec::with_capacity(conditions.len());
+    let mut params = Vec::new();
+    for condition in conditions {
+        let field = condition
+            .get("field")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                DataError::InvalidQuery(
+                    "MariaDB filter condition requires a string 'field'".to_string(),
+                )
+            })?;
+        validate_identifier("filter field", field)?;
+        if !allowed_fields.contains(field) {
+            return Err(DataError::InvalidQuery(format!(
+                "Filter field '{}' does not exist on the selected MariaDB table",
+                field
+            )));
+        }
+        let op = condition
+            .get("op")
+            .and_then(|value| value.as_str())
+            .unwrap_or("eq")
+            .to_ascii_lowercase();
+        let value = condition.get("value").ok_or_else(|| {
+            DataError::InvalidQuery("MariaDB filter condition requires a 'value'".to_string())
+        })?;
+        let ident = quote_identifier(field);
+        match op.as_str() {
+            "eq" | "ne" => {
+                if value.is_null() {
+                    let operator = if op == "eq" { "IS NULL" } else { "IS NOT NULL" };
+                    sql_parts.push(format!("{ident} {operator}"));
+                } else {
+                    let operator = if op == "eq" { "=" } else { "<>" };
+                    sql_parts.push(format!("{ident} {operator} ?"));
+                    params.push(filter_param(value)?);
+                }
+            }
+            "gt" | "gte" | "lt" | "lte" | "like" => {
+                if value.is_null() {
+                    return Err(DataError::InvalidQuery(format!(
+                        "MariaDB filter operator '{}' cannot compare against null",
+                        op
+                    )));
+                }
+                let operator = match op.as_str() {
+                    "gt" => ">",
+                    "gte" => ">=",
+                    "lt" => "<",
+                    "lte" => "<=",
+                    "like" => "LIKE",
+                    _ => unreachable!(),
+                };
+                sql_parts.push(format!("{ident} {operator} ?"));
+                params.push(filter_param(value)?);
+            }
+            "in" => {
+                let values = value.as_array().ok_or_else(|| {
+                    DataError::InvalidQuery(
+                        "MariaDB 'in' filter value must be an array".to_string(),
+                    )
+                })?;
+                if values.is_empty() || values.iter().any(serde_json::Value::is_null) {
+                    return Err(DataError::InvalidQuery(
+                        "MariaDB 'in' filter requires non-null values".to_string(),
+                    ));
+                }
+                sql_parts.push(format!(
+                    "{ident} IN ({})",
+                    vec!["?"; values.len()].join(", ")
+                ));
+                for value in values {
+                    params.push(filter_param(value)?)
+                }
+            }
+            _ => {
+                return Err(DataError::InvalidQuery(format!(
+                    "Unsupported MariaDB filter operator '{}'",
+                    op
+                )))
+            }
+        }
+    }
+    Ok(Some(FilterClause {
+        sql: sql_parts.join(joiner),
+        params,
+    }))
+}
+
+fn filter_param(value: &serde_json::Value) -> Result<FilterParam> {
+    if let Some(value) = value.as_bool() {
+        Ok(FilterParam::Bool(value))
+    } else if let Some(value) = value.as_i64() {
+        Ok(FilterParam::I64(value))
+    } else if let Some(value) = value.as_f64() {
+        Ok(FilterParam::F64(value))
+    } else if let Some(value) = value.as_str() {
+        Ok(FilterParam::String(value.to_string()))
+    } else {
+        Err(DataError::InvalidQuery(
+            "MariaDB filter values must be strings, numbers, or booleans".to_string(),
+        ))
+    }
+}
+
+fn bind_filter_params<'q>(
+    mut query: sqlx::query::Query<'q, MySql, MySqlArguments>,
+    params: &'q [FilterParam],
+) -> sqlx::query::Query<'q, MySql, MySqlArguments> {
+    for param in params {
+        query = match param {
+            FilterParam::Bool(value) => query.bind(*value),
+            FilterParam::F64(value) => query.bind(*value),
+            FilterParam::I64(value) => query.bind(*value),
+            FilterParam::String(value) => query.bind(value),
+        };
+    }
+    query
+}
+
 /// Server-side ceiling for `count`, which takes no `QueryOptions` and so has no
 /// caller-supplied deadline to honour. See the call site for why it needs one.
 const COUNT_TIMEOUT_MS: u64 = 10_000;
@@ -1066,6 +1273,7 @@ async fn apply_statement_timeout(
     }
 }
 
+#[cfg(test)]
 fn strip_sql_string_literals(sql: &str) -> Result<String> {
     let mut result = String::with_capacity(sql.len());
     let mut in_string = false;
@@ -1184,6 +1392,7 @@ fn strip_sql_string_literals(sql: &str) -> Result<String> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn validate_where_clause(sql: &str) -> Result<()> {
     let sql_lower = sql.trim().to_ascii_lowercase();
 
@@ -1515,7 +1724,9 @@ mod tests {
             .query(
                 &path,
                 "rows_budget",
-                Some(serde_json::json!({"where": "id = 1"})),
+                Some(serde_json::json!({
+                    "conditions": [{"field": "id", "op": "eq", "value": 1}]
+                })),
                 QueryOptions::default(),
             )
             .await?;
@@ -1525,7 +1736,9 @@ mod tests {
             .query(
                 &path,
                 "rows_budget",
-                Some(serde_json::json!({"where": "id = 2"})),
+                Some(serde_json::json!({
+                    "conditions": [{"field": "id", "op": "eq", "value": 2}]
+                })),
                 QueryOptions {
                     limit: Some(1),
                     budget: QueryBudget {
@@ -1744,6 +1957,39 @@ mod tests {
         assert!(validate_where_clause("1=1; DROP TABLE users").is_err());
         assert!(validate_where_clause("id = 1 UNION SELECT password FROM users").is_err());
         assert!(validate_where_clause("name = 'x' -- comment").is_err());
+    }
+
+    #[test]
+    fn structured_filters_use_only_placeholders_and_known_fields() {
+        let fields = HashSet::from(["status".to_string(), "age".to_string(), "id".to_string()]);
+        let filters = serde_json::json!({
+            "logic": "and",
+            "conditions": [
+                {"field": "status", "op": "eq", "value": "active"},
+                {"field": "age", "op": "gte", "value": 18},
+                {"field": "id", "op": "in", "value": [1, 2, 3]}
+            ]
+        });
+        let clause = build_filter_clause(Some(&filters), &fields)
+            .expect("structured filter should validate")
+            .expect("structured filter should produce a clause");
+        assert_eq!(
+            clause.sql,
+            "`status` = ? AND `age` >= ? AND `id` IN (?, ?, ?)"
+        );
+        assert_eq!(clause.params.len(), 5);
+        assert!(!clause.sql.contains("active"));
+    }
+
+    #[test]
+    fn structured_filters_reject_raw_sql_and_unknown_fields() {
+        let fields = HashSet::from(["status".to_string()]);
+        let raw = serde_json::json!({"where": "EXISTS(SELECT 1 FROM mysql.user)"});
+        let unknown = serde_json::json!({
+            "conditions": [{"field": "password", "op": "eq", "value": "x"}]
+        });
+        assert!(build_filter_clause(Some(&raw), &fields).is_err());
+        assert!(build_filter_clause(Some(&unknown), &fields).is_err());
     }
 
     #[test]

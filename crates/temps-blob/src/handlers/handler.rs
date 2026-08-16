@@ -13,7 +13,7 @@ use axum::{
 use bytes::Bytes;
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
@@ -153,9 +153,12 @@ async fn blob_put(
     Query(query): Query<PutBlobQuery>,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobWrite);
+
     // Get project ID from query or auth context
     let project_id =
         extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
+    project_scope_guard!(auth, project_id);
 
     // Use pathname from query or default
     let pathname = query.pathname.as_deref().unwrap_or("upload");
@@ -190,8 +193,11 @@ async fn blob_delete(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<DeleteBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobDelete);
+
     let project_id =
         extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
+    project_scope_guard!(auth, project_id);
 
     let deleted = state
         .blob_service
@@ -224,8 +230,11 @@ async fn blob_list(
     State(state): State<Arc<BlobAppState>>,
     Query(query): Query<ListBlobsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobRead);
+
     let project_id =
         extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
+    project_scope_guard!(auth, project_id);
 
     let options = ListOptions {
         limit: query.limit,
@@ -258,8 +267,12 @@ async fn blob_copy(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<CopyBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobRead);
+    permission_guard!(auth, BlobWrite);
+
     let project_id =
         extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
+    project_scope_guard!(auth, project_id);
 
     // Extract pathname from URL (handles both full URLs and relative paths)
     let from_pathname = extract_pathname_from_url(&request.from_url);
@@ -336,22 +349,11 @@ async fn blob_head(
     State(state): State<Arc<BlobAppState>>,
     Path(params): Path<BlobPathParams>,
 ) -> Result<impl IntoResponse, Problem> {
-    // For deployment tokens, verify the token's project matches the path
-    // For API keys/sessions, use the project_id from the path (admins can access any project)
-    let project_id = if let Some(token_project_id) = auth.project_id() {
-        // Deployment token: must match path
-        if token_project_id != params.project_id {
-            return Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Access Denied")
-                .with_detail("You do not have access to this project's blobs"));
-        }
-        token_project_id
-    } else {
-        // API key/session: use path parameter, then verify the caller may
-        // reach that project (no-op in OSS; enforced with a team-access plugin).
-        authorize_project_access(&auth, params.project_id, &state.project_access_checker).await?;
-        params.project_id
-    };
+    permission_guard!(auth, BlobRead);
+
+    let project_id = params.project_id;
+    project_scope_guard!(auth, project_id);
+    authorize_project_access(&auth, project_id, &state.project_access_checker).await?;
 
     let blob_info = state.blob_service.head(project_id, &params.path).await?;
 
@@ -392,22 +394,11 @@ async fn blob_download(
     State(state): State<Arc<BlobAppState>>,
     Path(params): Path<BlobPathParams>,
 ) -> Result<impl IntoResponse, Problem> {
-    // For deployment tokens, verify the token's project matches the path
-    // For API keys/sessions, use the project_id from the path (admins can access any project)
-    let project_id = if let Some(token_project_id) = auth.project_id() {
-        // Deployment token: must match path
-        if token_project_id != params.project_id {
-            return Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Access Denied")
-                .with_detail("You do not have access to this project's blobs"));
-        }
-        token_project_id
-    } else {
-        // API key/session: use path parameter, then verify the caller may
-        // reach that project (no-op in OSS; enforced with a team-access plugin).
-        authorize_project_access(&auth, params.project_id, &state.project_access_checker).await?;
-        params.project_id
-    };
+    permission_guard!(auth, BlobRead);
+
+    let project_id = params.project_id;
+    project_scope_guard!(auth, project_id);
+    authorize_project_access(&auth, project_id, &state.project_access_checker).await?;
 
     let (stream, content_type, size) = state
         .blob_service

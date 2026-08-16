@@ -220,6 +220,14 @@ async fn setup_e2e() -> Option<(
         db.clone(),
         None,
     ));
+    let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::new(),
+    ));
+    let facet_service = Arc::new(temps_otel::services::FacetService::new(
+        db.clone(),
+        None,
+        facet_cache,
+    ));
     let app_state = OtelAppState {
         otel_service,
         metrics_store: None,
@@ -232,6 +240,7 @@ async fn setup_e2e() -> Option<(
         trace_hint_tx: None,
         otel_relay_tx: None,
         project_access_checker: None,
+        facet_service,
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{info, warn};
 
 use sea_orm::{
     prelude::Uuid, ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
@@ -1319,11 +1320,24 @@ impl ProjectService {
 
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
+            let slug_value = slugify(&slug_value);
+            if slug_value.is_empty() || slug_value.len() > 63 {
+                return Err(ProjectError::InvalidInput(
+                    "Project slug must contain 1-63 lowercase DNS-safe characters".to_string(),
+                ));
+            }
+            let txn = self.db.begin().await?;
+            txn.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtext('project-slug:' || $1))",
+                [slug_value.clone().into()],
+            ))
+            .await?;
             // Check if the slug is already taken by another project
             let existing = projects::Entity::find()
                 .filter(projects::Column::Slug.eq(&slug_value))
                 .filter(projects::Column::Id.ne(project_id))
-                .one(self.db.as_ref())
+                .one(&txn)
                 .await?;
 
             if existing.is_some() {
@@ -1334,28 +1348,94 @@ impl ProjectService {
             }
 
             let old_slug = project.slug.clone();
-            project.slug = slug_value.clone();
-
-            // Update the project in the database
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.slug = Set(slug_value.clone());
-            project = active_project.update(self.db.as_ref()).await?;
-
-            // Update the environment_domain in the environment if the slug has changed
-            if old_slug != project.slug {
+            if old_slug != slug_value {
                 let envs = temps_entities::environments::Entity::find()
                     .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
-                    .all(self.db.as_ref())
+                    .all(&txn)
                     .await?;
+                let project_environment_ids = envs.iter().map(|env| env.id).collect::<Vec<_>>();
+                let mut target_subdomains = HashSet::new();
+
+                // Acquire claims in deterministic order to avoid deadlocks when
+                // concurrent project renames touch multiple hostnames.
+                let mut active_claims = envs
+                    .iter()
+                    .filter(|env| env.deleted_at.is_none())
+                    .map(|env| {
+                        (
+                            format!("{}-{}", slug_value, env.slug).to_ascii_lowercase(),
+                            env.id,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                active_claims.sort_unstable();
+                for (new_subdomain, _) in &active_claims {
+                    if !target_subdomains.insert(new_subdomain.clone()) {
+                        return Err(ProjectError::InvalidInput(format!(
+                            "Project slug '{}' would create duplicate environment subdomain '{}'",
+                            slug_value, new_subdomain
+                        )));
+                    }
+                    if temps_entities::environments::claim_subdomain(
+                        &txn,
+                        new_subdomain,
+                        &project_environment_ids,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        return Err(ProjectError::InvalidInput(format!(
+                            "Project slug '{}' would use an environment subdomain that is already in use",
+                            slug_value
+                        )));
+                    }
+                }
+
+                project.slug = slug_value.clone();
+                let mut active_project: projects::ActiveModel = project.clone().into();
+                active_project.slug = Set(slug_value.clone());
+                active_project.update(&txn).await?;
 
                 for env in envs {
-                    let new_subdomain = format!("{}-{}", slug_value.clone(), env.slug);
+                    let previous_subdomain = env.subdomain.clone();
+                    let new_subdomain = format!("{}-{}", slug_value, env.slug).to_ascii_lowercase();
 
-                    // Update environment
+                    // Keep the environment and its auto-managed domain row in
+                    // the same transaction as the project rename.
                     let mut active_env: temps_entities::environments::ActiveModel = env.into();
                     active_env.subdomain = Set(new_subdomain.clone());
-                    active_env.update(self.db.as_ref()).await?;
+                    let updated_env = active_env.update(&txn).await?;
+
+                    let existing_domain = temps_entities::environment_domains::Entity::find()
+                        .filter(
+                            temps_entities::environment_domains::Column::EnvironmentId
+                                .eq(updated_env.id),
+                        )
+                        .filter(
+                            temps_entities::environment_domains::Column::Domain
+                                .eq(&previous_subdomain),
+                        )
+                        .one(&txn)
+                        .await?;
+                    if let Some(domain) = existing_domain {
+                        let mut active_domain: temps_entities::environment_domains::ActiveModel =
+                            domain.into();
+                        active_domain.domain = Set(new_subdomain);
+                        active_domain.update(&txn).await?;
+                    } else {
+                        let active_domain = temps_entities::environment_domains::ActiveModel {
+                            environment_id: Set(updated_env.id),
+                            domain: Set(new_subdomain),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        };
+                        active_domain.insert(&txn).await?;
+                    }
                 }
+
+                txn.commit().await?;
+            } else {
+                txn.rollback().await?;
             }
         }
 

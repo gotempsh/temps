@@ -16,7 +16,7 @@ Despliegues, analítica, session replay, error tracking, monitorización de disp
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Sitio web](https://temps.sh) · [Documentación](https://temps.sh/docs) · [Inicio rápido](https://temps.sh/docs/introduction) · [Discusiones](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
+[Sitio web](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_es) · [Documentación](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_es) · [Inicio rápido](https://temps.sh/docs/introduction?utm_source=github&utm_medium=repo&utm_content=header_es) · [Discusiones](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | Español | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -253,7 +253,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Probado en:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; También funciona en macOS
 
-¿Prefieres no gestionar un servidor? [Temps Cloud](https://temps.sh/pricing) ejecuta Temps por ti en infraestructura gestionada.
+¿Prefieres no gestionar un servidor? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_es) ejecuta Temps por ti en infraestructura gestionada.
 
 ---
 
@@ -303,7 +303,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Dónde ganan las alternativas.** Coolify y Dokploy tienen bibliotecas de plantillas de un clic (más de 280 aplicaciones en Coolify) que Temps todavía no tiene, y ambos cuentan con comunidades mucho más grandes — solo Coolify supera las 56k estrellas en GitHub, mientras que Temps es el proyecto más nuevo de esta lista. Kamal es la opción más sencilla si lo único que quieres son despliegues Docker sin tiempo de inactividad gestionados desde una CLI. Vercel y el resto de plataformas gestionadas te dan una red edge global, funciones edge y absorción de DDoS que un único VPS no puede igualar — y además operan la infraestructura por ti, lo cual tiene un valor real si nunca quieres preocuparte por un servidor.
 
-Comparativas detalladas y actualizadas regularmente: [temps.sh/compare](https://temps.sh/compare)
+Comparativas detalladas y actualizadas regularmente: [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_es)
 
 ---
 
@@ -416,6 +416,6 @@ Con doble licencia [MIT](LICENSE-MIT) o [Apache 2.0](LICENSE).
 
 <div align="center">
 
-[temps.sh](https://temps.sh) | [Documentación](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+[temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_es) | [Documentación](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_es) | [GitHub](https://github.com/gotempsh/temps)
 
 </div>

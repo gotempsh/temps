@@ -147,6 +147,9 @@ pub mod metric_dashboards;
 // Metric alert rules (first-class metric-centric alerting)
 pub mod metric_alert_rules;
 
+// OTel span attribute facets (pre-allocated slot columns for fast filtering)
+pub mod otel_span_facets;
+
 // Webhook entities
 pub mod webhook_deliveries;
 pub mod webhooks;

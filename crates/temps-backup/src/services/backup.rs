@@ -35,6 +35,18 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let valid_key = key
+        .chars()
+        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    valid_key.then(|| format!("export {key}={}", shell_escape(value)))
+}
+
 /// Classify a backup location into one of the known storage formats.
 /// Returns `None` for non-postgres / unknown locations so the UI can show
 /// a neutral badge without guessing.
@@ -1730,7 +1742,8 @@ impl BackupService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -8179,6 +8192,15 @@ mod tests {
             classify_backup_format(loc, Some("postgres")),
             Some("pg_dump".to_string())
         );
+    }
+
+    #[test]
+    fn sourced_internal_walg_values_are_shell_quoted() {
+        assert_eq!(
+            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
+            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
+        );
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
     }
 
     #[test]

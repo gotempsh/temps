@@ -1,5 +1,5 @@
 use moka::future::Cache;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_database::DbConnection;
@@ -33,8 +33,8 @@ const ASSET_STORE_CACHE_MAX_CAPACITY: u64 = 50_000;
 ///
 /// ## Cache strategy
 ///
-/// - **Key**: `(project_id, url_path)` — identifies the asset within its
-///   project regardless of deployment.
+/// - **Key**: `(project_id, environment_id, deployment_id, url_path)` — binds
+///   the asset to the exact route context that requested it.
 /// - **Value**: `Option<String>` — `Some(content_hash)` when a matching row
 ///   was found; `None` when no row exists. **Caching `None` (the miss case) is
 ///   the critical path**: container deployments serve most assets upstream, so
@@ -52,8 +52,8 @@ const ASSET_STORE_CACHE_MAX_CAPACITY: u64 = 50_000;
 /// for this PR.
 pub struct StaticAssetLookup {
     db: Arc<DbConnection>,
-    /// `(project_id, url_path) → Option<content_hash>`. TTL 60 s, cap 50 k.
-    cache: Cache<(i32, String), Option<String>>,
+    /// `(project_id, environment_id, deployment_id, url_path) → Option<content_hash>`.
+    cache: Cache<(i32, i32, i32, String), Option<String>>,
 }
 
 impl StaticAssetLookup {
@@ -72,14 +72,25 @@ impl StaticAssetLookup {
         Self { db, cache }
     }
 
-    /// Return the content hash for `(project_id, url_path)`, or `None` when no
-    /// matching row exists in `static_asset_cache`.
+    /// Return the content hash for the exact routed deployment, or `None` when
+    /// no matching row exists in `static_asset_cache`.
     ///
     /// Results are served from the in-memory cache when available. Both
     /// `Some(hash)` and `None` are cached so the common miss case never
     /// amplifies into Postgres load.
-    pub async fn get_content_hash(&self, project_id: i32, url_path: &str) -> Option<String> {
-        let key = (project_id, url_path.to_string());
+    pub async fn get_content_hash(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        url_path: &str,
+    ) -> Option<String> {
+        let key = (
+            project_id,
+            environment_id,
+            deployment_id,
+            url_path.to_string(),
+        );
 
         // Fast path: a previous lookup already resolved this key (hit or miss).
         if let Some(cached) = self.cache.get(&key).await {
@@ -90,8 +101,9 @@ impl StaticAssetLookup {
         // Cache miss: query the DB (most recent deployment wins).
         let result = static_asset_cache::Entity::find()
             .filter(static_asset_cache::Column::ProjectId.eq(project_id))
+            .filter(static_asset_cache::Column::EnvironmentId.eq(environment_id))
+            .filter(static_asset_cache::Column::DeploymentId.eq(deployment_id))
             .filter(static_asset_cache::Column::UrlPath.eq(url_path))
-            .order_by_desc(static_asset_cache::Column::DeploymentId)
             .one(self.db.as_ref())
             .await
             .ok()
@@ -153,14 +165,14 @@ mod tests {
 
         // First call: cache miss → 1 DB query → None cached.
         let first = lookup
-            .get_content_hash(42, "_next/static/chunks/main-abc.js")
+            .get_content_hash(42, 4, 9, "_next/static/chunks/main-abc.js")
             .await;
         assert!(first.is_none(), "first call should return None (no row)");
 
         // Second call: negative cache hit → 0 DB queries.
         // If this makes a DB query, the MockDatabase empty queue panics.
         let second = lookup
-            .get_content_hash(42, "_next/static/chunks/main-abc.js")
+            .get_content_hash(42, 4, 9, "_next/static/chunks/main-abc.js")
             .await;
         assert!(
             second.is_none(),
@@ -187,7 +199,7 @@ mod tests {
 
         // First call: cache miss → 1 DB query → hash cached.
         let first = lookup
-            .get_content_hash(7, "_next/static/chunks/page-abc.js")
+            .get_content_hash(7, 3, 99, "_next/static/chunks/page-abc.js")
             .await;
         assert_eq!(
             first.as_deref(),
@@ -197,7 +209,7 @@ mod tests {
 
         // Second call: positive cache hit → 0 DB queries → same hash returned.
         let second = lookup
-            .get_content_hash(7, "_next/static/chunks/page-abc.js")
+            .get_content_hash(7, 3, 99, "_next/static/chunks/page-abc.js")
             .await;
         assert_eq!(
             second.as_deref(),
@@ -222,17 +234,45 @@ mod tests {
 
         let lookup = StaticAssetLookup::new(Arc::new(db));
 
-        let res_a = lookup.get_content_hash(1, "assets/app.js").await;
+        let res_a = lookup.get_content_hash(1, 1, 10, "assets/app.js").await;
         assert_eq!(res_a.as_deref(), Some(hash_a.as_str()));
 
-        let res_b = lookup.get_content_hash(2, "assets/app.js").await;
+        let res_b = lookup.get_content_hash(2, 1, 20, "assets/app.js").await;
         assert_eq!(res_b.as_deref(), Some(hash_b.as_str()));
 
         // Both keys cached — no more DB queries allowed.
-        let res_a2 = lookup.get_content_hash(1, "assets/app.js").await;
-        let res_b2 = lookup.get_content_hash(2, "assets/app.js").await;
+        let res_a2 = lookup.get_content_hash(1, 1, 10, "assets/app.js").await;
+        let res_b2 = lookup.get_content_hash(2, 1, 20, "assets/app.js").await;
         assert_eq!(res_a2.as_deref(), Some(hash_a.as_str()));
         assert_eq!(res_b2.as_deref(), Some(hash_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_same_project_path_isolated_by_environment_and_deployment() {
+        let mut env_a = asset_model(1, "assets/app.js", "hash-a", 10);
+        env_a.environment_id = 11;
+        let mut env_b = asset_model(1, "assets/app.js", "hash-b", 20);
+        env_b.environment_id = 22;
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env_a], vec![env_b]])
+            .into_connection();
+        let lookup = StaticAssetLookup::new(Arc::new(db));
+
+        assert_eq!(
+            lookup
+                .get_content_hash(1, 11, 10, "assets/app.js")
+                .await
+                .as_deref(),
+            Some("hash-a")
+        );
+        assert_eq!(
+            lookup
+                .get_content_hash(1, 22, 20, "assets/app.js")
+                .await
+                .as_deref(),
+            Some("hash-b")
+        );
     }
 
     /// After a negative-cache entry expires, the loader retries the DB.
@@ -249,14 +289,14 @@ mod tests {
         // 1 ms TTL so we can expire it quickly in the test.
         let lookup = StaticAssetLookup::new_with_ttl(Arc::new(db), Duration::from_millis(1));
 
-        let first = lookup.get_content_hash(5, "static/vendor.js").await;
+        let first = lookup.get_content_hash(5, 2, 8, "static/vendor.js").await;
         assert!(first.is_none());
 
         // Wait for the negative cache entry to expire.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Second call: entry expired → DB queried again (consumes the second queued result).
-        let second = lookup.get_content_hash(5, "static/vendor.js").await;
+        let second = lookup.get_content_hash(5, 2, 8, "static/vendor.js").await;
         assert!(second.is_none());
     }
 }

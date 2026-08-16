@@ -4,14 +4,29 @@ import {
   finalizeOrderMutation,
   getDomainByIdOptions,
   getDomainOrderOptions,
+  getEnvironmentsOptions,
   getHttpChallengeDebugOptions,
+  getProjectsInfiniteOptions,
   getPublicIpOptions,
+  getVisibleCustomDomainByHostnameOptions,
+  listCustomDomainsForProjectOptions,
   listDnsProvidersOptions as listProvidersOptions,
   listRenewalAttemptsOptions,
+  reassignProjectCustomDomainMutation,
   renewDomainMutation,
   setupDnsChallengeMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { DnsProviderResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -21,6 +36,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { CopyButton } from '@/components/ui/copy-button'
+import { Label } from '@/components/ui/label'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -38,16 +54,27 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
-import { formatExpiryRemaining, formatLocalDateTime, formatUTCDate } from '@/lib/date'
+import {
+  formatExpiryRemaining,
+  formatLocalDateTime,
+  formatUTCDate,
+} from '@/lib/date'
 import {
   STATUS_ACTIVE_RENEWAL_FAILED,
   isServingCert,
 } from '@/lib/domain-status'
-import { useIsFetching, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useIsFetching,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { formatDistanceToNowStrict } from 'date-fns'
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowRightLeft,
   Calendar,
   CheckCircle,
   ChevronDown,
@@ -65,7 +92,7 @@ import {
   Wand2,
   XCircle,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -83,6 +110,9 @@ export function DomainDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [selectedDnsProvider, setSelectedDnsProvider] = useState<string>('')
+  const [isReassignOpen, setIsReassignOpen] = useState(false)
+  const [targetProjectId, setTargetProjectId] = useState('')
+  const [targetEnvironmentId, setTargetEnvironmentId] = useState('')
 
   const domainQueryKey = getDomainByIdOptions({
     path: { domain: Number(id) },
@@ -95,6 +125,106 @@ export function DomainDetail() {
     ...getDomainByIdOptions({ path: { domain: Number(id) } }),
     enabled: !!id,
   })
+
+  const assignmentOptions = getVisibleCustomDomainByHostnameOptions({
+    path: { hostname: domain?.domain || '' },
+  })
+  const assignmentQuery = useQuery({
+    ...assignmentOptions,
+    enabled: !!domain?.domain,
+    retry: false,
+  })
+
+  const projectsQuery = useInfiniteQuery({
+    ...getProjectsInfiniteOptions({ query: { per_page: 100 } }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      const loaded = lastPage.page * lastPage.per_page
+      return loaded < lastPage.total ? lastPage.page + 1 : undefined
+    },
+    enabled: isReassignOpen && !!assignmentQuery.data,
+  })
+
+  const selectedTargetProjectId = Number(targetProjectId)
+  const environmentsQuery = useQuery({
+    ...getEnvironmentsOptions({
+      path: { project_id: selectedTargetProjectId || 0 },
+    }),
+    enabled: isReassignOpen && selectedTargetProjectId > 0,
+  })
+
+  const targetProjects = (projectsQuery.data?.pages ?? [])
+    .flatMap((page) => page.projects)
+    .filter((project) => project.id !== assignmentQuery.data?.project_id)
+  const targetProject = targetProjects.find(
+    (project) => project.id === selectedTargetProjectId
+  )
+  const targetEnvironment = environmentsQuery.data?.find(
+    (environment) => environment.id === Number(targetEnvironmentId)
+  )
+
+  const reassignDomain = useMutation({
+    ...reassignProjectCustomDomainMutation(),
+    meta: { errorTitle: 'Failed to move domain' },
+    onSuccess: async () => {
+      const sourceProjectId = assignmentQuery.data?.project_id
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: domainQueryKey }),
+        queryClient.invalidateQueries({ queryKey: assignmentOptions.queryKey }),
+        ...(sourceProjectId
+          ? [
+              queryClient.invalidateQueries({
+                queryKey: listCustomDomainsForProjectOptions({
+                  path: { project_id: sourceProjectId },
+                }).queryKey,
+              }),
+            ]
+          : []),
+        ...(targetProject
+          ? [
+              queryClient.invalidateQueries({
+                queryKey: listCustomDomainsForProjectOptions({
+                  path: { project_id: targetProject.id },
+                }).queryKey,
+              }),
+            ]
+          : []),
+      ])
+      toast.success(`${domain?.domain ?? 'Domain'} moved successfully`)
+      setIsReassignOpen(false)
+      if (targetProject) {
+        navigate(`/projects/${targetProject.slug}/domains`)
+      }
+    },
+  })
+
+  const resetReassignment = () => {
+    setTargetProjectId('')
+    setTargetEnvironmentId('')
+  }
+
+  const handleReassignmentOpenChange = (open: boolean) => {
+    if (reassignDomain.isPending) return
+    setIsReassignOpen(open)
+    if (!open) resetReassignment()
+  }
+
+  const handleReassignDomain = () => {
+    const assignment = assignmentQuery.data
+    const environmentId = Number(targetEnvironmentId)
+    if (!assignment || !targetProject || !environmentId) return
+
+    reassignDomain.mutate({
+      path: {
+        source_project_id: assignment.project_id,
+        domain_id: assignment.id,
+      },
+      body: {
+        target_project_id: targetProject.id,
+        target_environment_id: environmentId,
+      },
+    })
+  }
 
   const { data: order, isLoading: isOrderLoading } = useQuery({
     ...getDomainOrderOptions({ path: { domain_id: Number(id) } }),
@@ -154,29 +284,28 @@ export function DomainDetail() {
   })
   const isRefreshing = fetchingCount > 0
 
-  const refreshAll = useCallback(
-    async (opts?: { clearOrder?: boolean }) => {
-      if (opts?.clearOrder) {
-        queryClient.removeQueries({ queryKey: orderQueryKey })
-      }
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: domainQueryKey }),
-        queryClient.invalidateQueries({ queryKey: orderQueryKey }),
-        queryClient.invalidateQueries({
-          predicate: (q) => {
-            const k = q.queryKey?.[0]
-            return (
-              typeof k === 'string' &&
-              (k.includes('getHttpChallengeDebug') ||
-                k.includes('getPublicIp') ||
-                k.includes('listProviders'))
-            )
-          },
-        }),
-      ])
-    },
-    [queryClient, domainQueryKey, orderQueryKey]
-  )
+  const refreshAll = async (opts?: { clearOrder?: boolean }) => {
+    if (opts?.clearOrder) {
+      queryClient.removeQueries({ queryKey: orderQueryKey })
+    }
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: domainQueryKey }),
+      queryClient.invalidateQueries({ queryKey: orderQueryKey }),
+      queryClient.invalidateQueries({
+        predicate: (q) => {
+          const key = q.queryKey?.[0]
+          return (
+            typeof key === 'object' &&
+            key !== null &&
+            '_id' in key &&
+            (key._id === 'getHttpChallengeDebug' ||
+              key._id === 'getPublicIp' ||
+              key._id === 'listDnsProviders')
+          )
+        },
+      }),
+    ])
+  }
 
   useEffect(() => {
     if (domain) {
@@ -210,8 +339,7 @@ export function DomainDetail() {
       const pollInterval = setInterval(async () => {
         await refreshAll()
         const latest = queryClient.getQueryData(domainQueryKey) as
-          | { status?: string }
-          | undefined
+          { status?: string } | undefined
         if (latest?.status === 'active') {
           clearInterval(pollInterval)
           toast.success('TLS certificate is now active!')
@@ -236,7 +364,6 @@ export function DomainDetail() {
     ...renewDomainMutation(),
     meta: { errorTitle: 'Failed to renew certificate' },
     onSuccess: async (data) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const response = data as any
       if (response?.txt_records && response.txt_records.length > 0) {
         toast.success(
@@ -290,14 +417,11 @@ export function DomainDetail() {
 
   const handleCancelOrder = () => {
     if (!domain) return
-    toast.promise(
-      cancelOrder.mutateAsync({ path: { domain_id: domain.id } }),
-      {
-        loading: 'Cancelling ACME order...',
-        success: 'ACME order cancelled successfully',
-        error: 'Failed to cancel ACME order',
-      }
-    )
+    toast.promise(cancelOrder.mutateAsync({ path: { domain_id: domain.id } }), {
+      loading: 'Cancelling ACME order...',
+      success: 'ACME order cancelled successfully',
+      error: 'Failed to cancel ACME order',
+    })
   }
 
   const handleRenewDomain = async () => {
@@ -380,8 +504,15 @@ export function DomainDetail() {
   // When the order is in any of these, no further action is possible on it — the user
   // must create a new order. Treat the order as "absent" for UI gating purposes so we
   // don't strand the user with hidden actions.
-  const TERMINAL_ORDER_STATUSES = ['cancelled', 'canceled', 'invalid', 'revoked', 'deactivated']
-  const isOrderTerminal = !!order && TERMINAL_ORDER_STATUSES.includes(order.status)
+  const TERMINAL_ORDER_STATUSES = [
+    'cancelled',
+    'canceled',
+    'invalid',
+    'revoked',
+    'deactivated',
+  ]
+  const isOrderTerminal =
+    !!order && TERMINAL_ORDER_STATUSES.includes(order.status)
   const activeOrder = order && !isOrderTerminal ? order : undefined
 
   const challengeData = activeOrder?.authorizations as ChallengeData | undefined
@@ -395,7 +526,9 @@ export function DomainDetail() {
   type KnownMethod = (typeof KNOWN_METHODS)[number]
   const isKnownMethod = (m?: string | null): m is KnownMethod =>
     !!m && (KNOWN_METHODS as readonly string[]).includes(m)
-  const effectiveMethod: KnownMethod | undefined = isKnownMethod(domain.verification_method)
+  const effectiveMethod: KnownMethod | undefined = isKnownMethod(
+    domain.verification_method
+  )
     ? domain.verification_method
     : isKnownMethod(challengeData?.challenge_type)
       ? challengeData?.challenge_type
@@ -417,14 +550,15 @@ export function DomainDetail() {
   // no order exists or the existing order is in a terminal state.
   const canCreateOrder = isPendingState && !activeOrder
 
-
   // Renew is meaningful for any ACME-issued certificate. DNS-01 renewals
   // require the user to re-add TXT records, so we expose it as "Start renewal"
   // instead of "Renew". Legacy/unknown values (e.g. "acme") are treated as
   // auto-renewable since the backend resolves the challenge type.
   const canRenew = canManageCertificates && !!domain.verification_method
   const renewLabel =
-    domain.verification_method === 'dns-01' ? 'Start renewal' : 'Renew certificate'
+    domain.verification_method === 'dns-01'
+      ? 'Start renewal'
+      : 'Renew certificate'
 
   const primaryActionButton = (() => {
     if (isServingCert(domain.status)) return null
@@ -471,93 +605,6 @@ export function DomainDetail() {
     return null
   })()
 
-  // Shared compact TXT record row
-  const DnsRecordsList = ({ keyPrefix }: { keyPrefix: string }) =>
-    hasDnsValues ? (
-      <div className="divide-y divide-gray-950/5 rounded-lg border border-gray-950/10 overflow-hidden">
-        {dnsTxtRecords.map((record, index) => (
-          <div key={`${keyPrefix}-${index}`} className="grid grid-cols-[auto_1fr_auto] items-start gap-x-3 gap-y-1 px-3 py-2.5 sm:px-4">
-            <Badge variant="outline" className="mt-0.5">TXT</Badge>
-            <div className="min-w-0 space-y-1">
-              <p className="font-mono text-xs break-all text-foreground">
-                <span className="text-muted-foreground">Name:</span> {record.name}
-              </p>
-              <p className="font-mono text-xs break-all text-foreground">
-                <span className="text-muted-foreground">Value:</span> {record.value}
-              </p>
-            </div>
-            <div className="flex flex-col gap-1">
-              <CopyButton
-                value={record.name}
-                minimal
-                className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
-              >
-                <span className="hidden sm:inline">Name</span>
-              </CopyButton>
-              <CopyButton
-                value={record.value}
-                minimal
-                className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
-              >
-                <span className="hidden sm:inline">Value</span>
-              </CopyButton>
-            </div>
-          </div>
-        ))}
-      </div>
-    ) : null
-
-  const DnsAutoProvision = () =>
-    dnsProviders && dnsProviders.length > 0 ? (
-      <div className="flex flex-col gap-3 rounded-lg border border-gray-950/10 bg-muted/40 p-4 sm:flex-row sm:items-center">
-        <div className="flex items-start gap-3 flex-1">
-          <div className="rounded-md bg-primary/10 p-2 shrink-0">
-            <Wand2 className="size-4 text-primary" />
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-medium">Auto-provision records</p>
-            <p className="text-xs text-muted-foreground">
-              Create TXT records using a configured DNS provider.
-            </p>
-          </div>
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:shrink-0">
-          <Select value={selectedDnsProvider} onValueChange={setSelectedDnsProvider}>
-            <SelectTrigger className="w-full sm:w-[200px]">
-              <SelectValue placeholder="Select provider" />
-            </SelectTrigger>
-            <SelectContent>
-              {dnsProviders.map((provider) => (
-                <SelectItem key={provider.id} value={provider.id.toString()}>
-                  {provider.name} ({provider.provider_type})
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleSetupDnsRecords}
-            disabled={
-              !selectedDnsProvider || setupDns.isPending || !canManageCertificates
-            }
-          >
-            {setupDns.isPending ? (
-              <>
-                <Loader2 className="mr-2 size-4 animate-spin" />
-                Creating…
-              </>
-            ) : (
-              <>
-                <Wand2 className="mr-2 size-4" />
-                Auto-create
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
-    ) : null
-
   const CurrentVariant = (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2 space-y-6">
@@ -568,9 +615,9 @@ export function DomainDetail() {
                 <AlertTriangle className="size-4" />
                 <AlertTitle>Certificate renewal failed</AlertTitle>
                 <AlertDescription>
-                  The current certificate is still valid and being served, but the
-                  last automatic renewal attempt failed. Renew it before it expires
-                  to avoid downtime.
+                  The current certificate is still valid and being served, but
+                  the last automatic renewal attempt failed. Renew it before it
+                  expires to avoid downtime.
                   {domain.last_error ? ` Last error: ${domain.last_error}` : ''}
                 </AlertDescription>
               </Alert>
@@ -589,8 +636,12 @@ export function DomainDetail() {
             {isPendingState && effectiveMethod === 'dns-01' && (
               <>
                 <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">DNS challenge required</h2>
-                  <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
+                  <h2 className="text-lg font-semibold">
+                    DNS challenge required
+                  </h2>
+                  <Badge variant={getStatusBadgeVariant(domain.status)}>
+                    {domain.status}
+                  </Badge>
                 </div>
                 {!activeOrder ? (
                   <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
@@ -611,7 +662,9 @@ export function DomainDetail() {
                       ) : (
                         <>
                           <Shield className="mr-2 size-4" />
-                          {isOrderTerminal ? 'Create new order' : 'Create order'}
+                          {isOrderTerminal
+                            ? 'Create new order'
+                            : 'Create order'}
                         </>
                       )}
                     </Button>
@@ -620,7 +673,10 @@ export function DomainDetail() {
                   <div className="overflow-hidden rounded-lg border border-gray-950/10">
                     <InlineStepStrip
                       steps={[
-                        { label: `Add record${dnsTxtRecords.length > 1 ? 's' : ''}`, state: 'current' },
+                        {
+                          label: `Add record${dnsTxtRecords.length > 1 ? 's' : ''}`,
+                          state: 'current',
+                        },
                         { label: 'Wait for propagation', state: 'upcoming' },
                         { label: 'Verify & finalize', state: 'upcoming' },
                       ]}
@@ -628,7 +684,8 @@ export function DomainDetail() {
                     <div className="space-y-4 border-t border-gray-950/5 p-4">
                       <div>
                         <p className="text-sm font-medium">
-                          Add TXT record{dnsTxtRecords.length > 1 ? 's' : ''} to your DNS provider
+                          Add TXT record{dnsTxtRecords.length > 1 ? 's' : ''} to
+                          your DNS provider
                         </p>
                         <p className="text-xs text-muted-foreground">
                           Propagation typically takes 5–15 min (up to 24 h).
@@ -648,12 +705,24 @@ export function DomainDetail() {
                           )}
                         </p>
                       </div>
-                      <DnsRecordsList keyPrefix="current-main" />
-                      <DnsAutoProvision />
+                      <DnsRecordsList
+                        keyPrefix="current-main"
+                        records={dnsTxtRecords}
+                      />
+                      <DnsAutoProvision
+                        providers={dnsProviders ?? []}
+                        selectedProvider={selectedDnsProvider}
+                        onProviderChange={setSelectedDnsProvider}
+                        onSetup={handleSetupDnsRecords}
+                        pending={setupDns.isPending}
+                        canManage={canManageCertificates}
+                      />
                       <div className="flex flex-wrap gap-2 pt-1">
                         <Button
                           onClick={handleCompleteDns}
-                          disabled={finalizeOrder.isPending || !canManageCertificates}
+                          disabled={
+                            finalizeOrder.isPending || !canManageCertificates
+                          }
                         >
                           {finalizeOrder.isPending ? (
                             <>
@@ -683,7 +752,8 @@ export function DomainDetail() {
                     <Clock className="size-4" />
                     <AlertTitle>Waiting for challenge data</AlertTitle>
                     <AlertDescription>
-                      The DNS challenge is being prepared. This usually takes a few moments.
+                      The DNS challenge is being prepared. This usually takes a
+                      few moments.
                     </AlertDescription>
                   </Alert>
                 )}
@@ -707,8 +777,12 @@ export function DomainDetail() {
                 ) : !activeOrder ? (
                   <>
                     <div className="flex items-center justify-between">
-                      <h2 className="text-lg font-semibold">HTTP-01 challenge required</h2>
-                      <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
+                      <h2 className="text-lg font-semibold">
+                        HTTP-01 challenge required
+                      </h2>
+                      <Badge variant={getStatusBadgeVariant(domain.status)}>
+                        {domain.status}
+                      </Badge>
                     </div>
                     <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
                       <p className="text-sm text-muted-foreground">
@@ -718,7 +792,9 @@ export function DomainDetail() {
                       </p>
                       <Button
                         onClick={handleCreateOrder}
-                        disabled={!canManageCertificates || createOrder.isPending}
+                        disabled={
+                          !canManageCertificates || createOrder.isPending
+                        }
                       >
                         {createOrder.isPending ? (
                           <>
@@ -728,7 +804,9 @@ export function DomainDetail() {
                         ) : (
                           <>
                             <Shield className="mr-2 size-4" />
-                            {isOrderTerminal ? 'Create new order' : 'Create order'}
+                            {isOrderTerminal
+                              ? 'Create new order'
+                              : 'Create order'}
                           </>
                         )}
                       </Button>
@@ -739,7 +817,8 @@ export function DomainDetail() {
                     <Clock className="size-4" />
                     <AlertTitle>Waiting for challenge data</AlertTitle>
                     <AlertDescription>
-                      The HTTP challenge is being prepared. This usually takes a few moments.
+                      The HTTP challenge is being prepared. This usually takes a
+                      few moments.
                     </AlertDescription>
                   </Alert>
                 )}
@@ -753,8 +832,12 @@ export function DomainDetail() {
             {isPendingState && !effectiveMethod && (
               <>
                 <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">Certificate challenge required</h2>
-                  <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
+                  <h2 className="text-lg font-semibold">
+                    Certificate challenge required
+                  </h2>
+                  <Badge variant={getStatusBadgeVariant(domain.status)}>
+                    {domain.status}
+                  </Badge>
                 </div>
                 <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
                   <p className="text-sm text-muted-foreground">
@@ -768,7 +851,9 @@ export function DomainDetail() {
                     {canCreateOrder ? (
                       <Button
                         onClick={handleCreateOrder}
-                        disabled={!canManageCertificates || createOrder.isPending}
+                        disabled={
+                          !canManageCertificates || createOrder.isPending
+                        }
                       >
                         {createOrder.isPending ? (
                           <>
@@ -778,7 +863,9 @@ export function DomainDetail() {
                         ) : (
                           <>
                             <Shield className="mr-2 size-4" />
-                            {isOrderTerminal ? 'Create new order' : 'Create order'}
+                            {isOrderTerminal
+                              ? 'Create new order'
+                              : 'Create order'}
                           </>
                         )}
                       </Button>
@@ -786,7 +873,9 @@ export function DomainDetail() {
                       <>
                         <Button
                           onClick={handleCompleteDns}
-                          disabled={finalizeOrder.isPending || !canManageCertificates}
+                          disabled={
+                            finalizeOrder.isPending || !canManageCertificates
+                          }
                         >
                           {finalizeOrder.isPending ? (
                             <>
@@ -814,9 +903,13 @@ export function DomainDetail() {
                   {hasDnsValues && (
                     <div className="space-y-2 pt-1">
                       <p className="text-xs text-muted-foreground">
-                        Challenge record{dnsTxtRecords.length > 1 ? 's' : ''} for this order:
+                        Challenge record{dnsTxtRecords.length > 1 ? 's' : ''}{' '}
+                        for this order:
                       </p>
-                      <DnsRecordsList keyPrefix="current-fallback" />
+                      <DnsRecordsList
+                        keyPrefix="current-fallback"
+                        records={dnsTxtRecords}
+                      />
                     </div>
                   )}
                 </div>
@@ -845,9 +938,13 @@ export function DomainDetail() {
             <div className="p-5 space-y-1.5">
               <div className="flex items-center gap-2">
                 <AlertTriangle className="size-4 text-destructive" />
-                <h3 className="text-sm font-semibold text-destructive">Order error</h3>
+                <h3 className="text-sm font-semibold text-destructive">
+                  Order error
+                </h3>
               </div>
-              <p className="text-sm font-medium text-destructive">{order.error_type}</p>
+              <p className="text-sm font-medium text-destructive">
+                {order.error_type}
+              </p>
               <p className="text-xs text-muted-foreground">{order.error}</p>
             </div>
           </Card>
@@ -876,7 +973,13 @@ export function DomainDetail() {
                 <KeyFact
                   label="Expires"
                   value={
-                    <span className={isExpiringSoon(domain.expiration_time) ? 'text-amber-600 dark:text-amber-400 font-medium' : ''}>
+                    <span
+                      className={
+                        isExpiringSoon(domain.expiration_time)
+                          ? 'text-amber-600 dark:text-amber-400 font-medium'
+                          : ''
+                      }
+                    >
                       {formatLocalDateTime(domain.expiration_time)}
                     </span>
                   }
@@ -905,10 +1008,19 @@ export function DomainDetail() {
                 <CompactDl label="Order ID" value={`#${order.id}`} mono />
                 <CompactDl label="Email" value={order.email} />
                 {order.expires_at && (
-                  <CompactDl label="Expires" value={formatLocalDateTime(order.expires_at)} />
+                  <CompactDl
+                    label="Expires"
+                    value={formatLocalDateTime(order.expires_at)}
+                  />
                 )}
-                <CompactDl label="Created" value={formatLocalDateTime(order.created_at)} />
-                <CompactDl label="Updated" value={formatLocalDateTime(order.updated_at)} />
+                <CompactDl
+                  label="Created"
+                  value={formatLocalDateTime(order.created_at)}
+                />
+                <CompactDl
+                  label="Updated"
+                  value={formatLocalDateTime(order.updated_at)}
+                />
               </dl>
             </div>
           </Card>
@@ -939,8 +1051,12 @@ export function DomainDetail() {
                 <h1 className="text-xl sm:text-2xl font-semibold tracking-tight truncate">
                   {domain.domain}
                 </h1>
-                <Badge variant={getStatusBadgeVariant(domain.status)}>{domain.status}</Badge>
-                {domain.is_wildcard && <Badge variant="outline">Wildcard</Badge>}
+                <Badge variant={getStatusBadgeVariant(domain.status)}>
+                  {domain.status}
+                </Badge>
+                {domain.is_wildcard && (
+                  <Badge variant="outline">Wildcard</Badge>
+                )}
               </div>
               <p className="text-sm text-muted-foreground mt-0.5">
                 TLS certificate &amp; order management
@@ -962,10 +1078,17 @@ export function DomainDetail() {
               )}
               Refresh
             </Button>
-            {(canRenew || canCreateOrder || (activeOrder && isPendingState)) && (
+            {(canRenew ||
+              canCreateOrder ||
+              (activeOrder && isPendingState) ||
+              assignmentQuery.data) && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="icon" aria-label="More actions">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    aria-label="More actions"
+                  >
                     <MoreHorizontal className="size-4" />
                   </Button>
                 </DropdownMenuTrigger>
@@ -990,14 +1113,33 @@ export function DomainDetail() {
                   )}
                   {activeOrder && isPendingState && (
                     <>
-                      {canRenew && isServingCert(domain.status) && <DropdownMenuSeparator />}
+                      {canRenew && isServingCert(domain.status) && (
+                        <DropdownMenuSeparator />
+                      )}
                       <DropdownMenuItem
                         onSelect={handleCancelOrder}
-                        disabled={!canManageCertificates || cancelOrder.isPending}
+                        disabled={
+                          !canManageCertificates || cancelOrder.isPending
+                        }
                         className="text-destructive focus:text-destructive"
                       >
                         <XCircle className="mr-2 size-4" />
                         Cancel order
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                  {assignmentQuery.data && (
+                    <>
+                      {(canRenew ||
+                        canCreateOrder ||
+                        (activeOrder && isPendingState)) && (
+                        <DropdownMenuSeparator />
+                      )}
+                      <DropdownMenuItem
+                        onSelect={() => setIsReassignOpen(true)}
+                      >
+                        <ArrowRightLeft className="mr-2 size-4" />
+                        Move assignment
                       </DropdownMenuItem>
                     </>
                   )}
@@ -1007,30 +1149,194 @@ export function DomainDetail() {
           </div>
         </div>
 
+        <AlertDialog
+          open={isReassignOpen}
+          onOpenChange={handleReassignmentOpenChange}
+        >
+          <AlertDialogContent className="w-[calc(100%-2rem)] max-w-xl">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Move {domain.domain}</AlertDialogTitle>
+              <AlertDialogDescription>
+                Choose the project first, then the environment that should
+                receive this hostname.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="target-project">Target project</Label>
+                <Select
+                  value={targetProjectId}
+                  onValueChange={(value) => {
+                    setTargetProjectId(value)
+                    setTargetEnvironmentId('')
+                  }}
+                  disabled={projectsQuery.isPending || reassignDomain.isPending}
+                >
+                  <SelectTrigger id="target-project" className="w-full">
+                    <SelectValue
+                      placeholder={
+                        projectsQuery.isPending
+                          ? 'Loading projects…'
+                          : 'Select a project'
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {targetProjects.map((project) => (
+                      <SelectItem key={project.id} value={String(project.id)}>
+                        {project.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {projectsQuery.hasNextPage && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => projectsQuery.fetchNextPage()}
+                    disabled={
+                      projectsQuery.isFetchingNextPage ||
+                      reassignDomain.isPending
+                    }
+                  >
+                    {projectsQuery.isFetchingNextPage
+                      ? 'Loading more projects…'
+                      : 'Load more projects'}
+                  </Button>
+                )}
+                {!projectsQuery.isPending &&
+                  !projectsQuery.isError &&
+                  targetProjects.length === 0 && (
+                    <p className="text-sm text-muted-foreground">
+                      No other accessible projects are available.
+                    </p>
+                  )}
+                {projectsQuery.isError && (
+                  <p className="text-sm text-destructive">
+                    Projects could not be loaded. Close and try again.
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="target-environment">Target environment</Label>
+                <Select
+                  value={targetEnvironmentId}
+                  onValueChange={setTargetEnvironmentId}
+                  disabled={
+                    !targetProjectId ||
+                    environmentsQuery.isPending ||
+                    reassignDomain.isPending
+                  }
+                >
+                  <SelectTrigger id="target-environment" className="w-full">
+                    <SelectValue
+                      placeholder={
+                        !targetProjectId
+                          ? 'Select a project first'
+                          : environmentsQuery.isPending
+                            ? 'Loading environments…'
+                            : 'Select an environment'
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(environmentsQuery.data ?? []).map((environment) => (
+                      <SelectItem
+                        key={environment.id}
+                        value={String(environment.id)}
+                      >
+                        {environment.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {environmentsQuery.isError && (
+                  <p className="text-sm text-destructive">
+                    Environments could not be loaded. Select the project again
+                    to retry.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <Alert>
+              <Info className="size-4" />
+              <AlertTitle>
+                Certificate and domain history are preserved
+              </AlertTitle>
+              <AlertDescription>
+                Temps changes the route atomically without deleting the domain
+                or its TLS certificate. Existing connections and a cold target
+                environment may still cause a brief interruption, so confirm the
+                destination is ready to serve this hostname.
+              </AlertDescription>
+            </Alert>
+
+            {targetProject && targetEnvironment && (
+              <p className="text-sm text-muted-foreground">
+                Confirm moving <strong>{domain.domain}</strong> to{' '}
+                <strong>{targetProject.name}</strong> /{' '}
+                <strong>{targetEnvironment.name}</strong>.
+              </p>
+            )}
+
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={reassignDomain.isPending}>
+                Cancel
+              </AlertDialogCancel>
+              <Button
+                onClick={handleReassignDomain}
+                disabled={
+                  !targetProject ||
+                  !targetEnvironment ||
+                  reassignDomain.isPending
+                }
+              >
+                {reassignDomain.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Moving…
+                  </>
+                ) : (
+                  'Confirm move'
+                )}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
         {/* Alerts (shared across variants) */}
         {isUsingCloudflare() && (
           <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
             <Info className="size-4 text-purple-600" />
             <AlertDescription>
-              Domain and certificate management is handled automatically by Cloudflare Tunnel.
+              Domain and certificate management is handled automatically by
+              Cloudflare Tunnel.
             </AlertDescription>
           </Alert>
         )}
 
-        {isServingCert(domain.status) && isExpiringSoon(domain.expiration_time) && (
-          <ExpiringSoonAlert
-            expirationTime={domain.expiration_time}
-            canRenew={canRenew}
-            renewLabel={renewLabel}
-            onRenew={handleRenewDomain}
-            renewing={renewDomain.isPending}
-          />
-        )}
+        {isServingCert(domain.status) &&
+          isExpiringSoon(domain.expiration_time) && (
+            <ExpiringSoonAlert
+              expirationTime={domain.expiration_time}
+              canRenew={canRenew}
+              renewLabel={renewLabel}
+              onRenew={handleRenewDomain}
+              renewing={renewDomain.isPending}
+            />
+          )}
 
         {domain.last_error && domain.status !== 'failed' && (
           <Alert variant="warning">
             <AlertTriangle className="size-4" />
-            <AlertTitle>Error: {domain.last_error_type || 'Certificate error'}</AlertTitle>
+            <AlertTitle>
+              Error: {domain.last_error_type || 'Certificate error'}
+            </AlertTitle>
             <AlertDescription>{domain.last_error}</AlertDescription>
           </Alert>
         )}
@@ -1044,11 +1350,128 @@ export function DomainDetail() {
               <Globe className="size-4" />
               <AlertTitle>HTTP-01 challenge</AlertTitle>
               <AlertDescription>
-                Your TLS certificate is being provisioned using HTTP-01 validation.
-                Ensure your domain&apos;s A record points to your server IP and port 80 is accessible.
+                Your TLS certificate is being provisioned using HTTP-01
+                validation. Ensure your domain&apos;s A record points to your
+                server IP and port 80 is accessible.
               </AlertDescription>
             </Alert>
           )}
+      </div>
+    </div>
+  )
+}
+
+function DnsRecordsList({
+  keyPrefix,
+  records,
+}: {
+  keyPrefix: string
+  records: Array<{ name: string; value: string }>
+}) {
+  if (records.length === 0) return null
+
+  return (
+    <div className="divide-y divide-gray-950/5 overflow-hidden rounded-lg border border-gray-950/10">
+      {records.map((record, index) => (
+        <div
+          key={`${keyPrefix}-${index}`}
+          className="grid grid-cols-[auto_1fr_auto] items-start gap-x-3 gap-y-1 px-3 py-2.5 sm:px-4"
+        >
+          <Badge variant="outline" className="mt-0.5">
+            TXT
+          </Badge>
+          <div className="min-w-0 space-y-1">
+            <p className="break-all font-mono text-xs text-foreground">
+              <span className="text-muted-foreground">Name:</span> {record.name}
+            </p>
+            <p className="break-all font-mono text-xs text-foreground">
+              <span className="text-muted-foreground">Value:</span>{' '}
+              {record.value}
+            </p>
+          </div>
+          <div className="flex flex-col gap-1">
+            <CopyButton
+              value={record.name}
+              minimal
+              className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
+            >
+              <span className="hidden sm:inline">Name</span>
+            </CopyButton>
+            <CopyButton
+              value={record.value}
+              minimal
+              className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
+            >
+              <span className="hidden sm:inline">Value</span>
+            </CopyButton>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function DnsAutoProvision({
+  providers,
+  selectedProvider,
+  onProviderChange,
+  onSetup,
+  pending,
+  canManage,
+}: {
+  providers: DnsProviderResponse[]
+  selectedProvider: string
+  onProviderChange: (value: string) => void
+  onSetup: () => void
+  pending: boolean
+  canManage: boolean
+}) {
+  if (providers.length === 0) return null
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-gray-950/10 bg-muted/40 p-4 sm:flex-row sm:items-center">
+      <div className="flex flex-1 items-start gap-3">
+        <div className="shrink-0 rounded-md bg-primary/10 p-2">
+          <Wand2 className="size-4 text-primary" />
+        </div>
+        <div className="min-w-0">
+          <p className="text-sm font-medium">Auto-provision records</p>
+          <p className="text-xs text-muted-foreground">
+            Create TXT records using a configured DNS provider.
+          </p>
+        </div>
+      </div>
+      <div className="flex flex-col gap-2 sm:shrink-0 sm:flex-row">
+        <Select value={selectedProvider} onValueChange={onProviderChange}>
+          <SelectTrigger className="w-full sm:w-[200px]">
+            <SelectValue placeholder="Select provider" />
+          </SelectTrigger>
+          <SelectContent>
+            {providers.map((provider) => (
+              <SelectItem key={provider.id} value={provider.id.toString()}>
+                {provider.name} ({provider.provider_type})
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onSetup}
+          disabled={!selectedProvider || pending || !canManage}
+        >
+          {pending ? (
+            <>
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              Creating…
+            </>
+          ) : (
+            <>
+              <Wand2 className="mr-2 size-4" />
+              Auto-create
+            </>
+          )}
+        </Button>
       </div>
     </div>
   )
@@ -1118,15 +1541,23 @@ function RenewalAttemptsTimeline({ domainName }: { domainName: string }) {
                       {attempt.verification_method}
                     </Badge>
                     {attempt.error_type && (
-                      <Badge variant="outline" className="text-xs text-muted-foreground">
+                      <Badge
+                        variant="outline"
+                        className="text-xs text-muted-foreground"
+                      >
                         {attempt.error_type}
                       </Badge>
                     )}
                   </div>
                   {attempt.error && (
-                    <p className="text-xs text-destructive break-words">{attempt.error}</p>
+                    <p className="text-xs text-destructive break-words">
+                      {attempt.error}
+                    </p>
                   )}
-                  <p className="text-xs text-muted-foreground" title={formatUTCDate(attempt.created_at)}>
+                  <p
+                    className="text-xs text-muted-foreground"
+                    title={formatUTCDate(attempt.created_at)}
+                  >
                     {formatLocalDateTime(attempt.created_at)}
                   </p>
                 </div>
@@ -1184,7 +1615,6 @@ type Domain = {
   updated_at: number
 }
 
-
 function ExpiringSoonAlert({
   expirationTime,
   canRenew,
@@ -1198,10 +1628,13 @@ function ExpiringSoonAlert({
   onRenew: () => void
   renewing: boolean
 }) {
-  const remaining = expirationTime ? formatExpiryRemaining(expirationTime) : null
-  const variant = remaining?.expired || (remaining && remaining.totalHours < 48)
-    ? 'destructive'
-    : 'warning'
+  const remaining = expirationTime
+    ? formatExpiryRemaining(expirationTime)
+    : null
+  const variant =
+    remaining?.expired || (remaining && remaining.totalHours < 48)
+      ? 'destructive'
+      : 'warning'
   return (
     <Alert variant={variant as 'destructive' | 'warning'}>
       <AlertTriangle className="size-4" />
@@ -1212,8 +1645,9 @@ function ExpiringSoonAlert({
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <span>
-          The TLS certificate {remaining?.expired ? 'expired' : 'will expire'} on{' '}
-          {formatLocalDateTime(expirationTime || 0)}. Renew it before expiration to avoid service interruption.
+          The TLS certificate {remaining?.expired ? 'expired' : 'will expire'}{' '}
+          on {formatLocalDateTime(expirationTime || 0)}. Renew it before
+          expiration to avoid service interruption.
         </span>
         {canRenew && (
           <Button size="sm" onClick={onRenew} disabled={renewing}>
@@ -1230,7 +1664,9 @@ function KeyFact({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 text-sm font-medium truncate tabular-nums">{value}</dd>
+      <dd className="mt-0.5 text-sm font-medium truncate tabular-nums">
+        {value}
+      </dd>
     </div>
   )
 }
@@ -1246,7 +1682,9 @@ function CompactDl({
 }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
-      <dt className="text-xs font-medium text-muted-foreground shrink-0">{label}</dt>
+      <dt className="text-xs font-medium text-muted-foreground shrink-0">
+        {label}
+      </dt>
       <dd
         className={
           mono
@@ -1273,14 +1711,14 @@ function InlineStepStrip({ steps }: { steps: InlineStep[] }) {
           step.state === 'current'
             ? 'text-foreground'
             : step.state === 'complete'
-            ? 'text-muted-foreground'
-            : 'text-muted-foreground/70'
+              ? 'text-muted-foreground'
+              : 'text-muted-foreground/70'
         const indicatorClasses =
           step.state === 'current'
             ? 'bg-foreground text-background'
             : step.state === 'complete'
-            ? 'bg-foreground/70 text-background'
-            : 'bg-muted-foreground/20 text-muted-foreground'
+              ? 'bg-foreground/70 text-background'
+              : 'bg-muted-foreground/20 text-muted-foreground'
         return (
           <li
             key={idx}
@@ -1298,8 +1736,6 @@ function InlineStepStrip({ steps }: { steps: InlineStep[] }) {
     </ol>
   )
 }
-
-
 
 function ActiveCertificateInner({
   domain,
@@ -1330,7 +1766,7 @@ function ActiveCertificateInner({
               onClick={onRenew}
               variant="outline"
               size="sm"
-              disabled={(canManage === false) || renewing}
+              disabled={canManage === false || renewing}
             >
               <RefreshCw className="mr-2 size-4" />
               {renewLabel}
@@ -1347,19 +1783,25 @@ function ActiveCertificateInner({
       <div className="grid grid-cols-1 gap-4 rounded-lg bg-muted/50 p-4 md:grid-cols-2">
         {domain.last_renewed ? (
           <div className="space-y-1">
-            <span className="text-xs font-medium text-muted-foreground">Last renewed</span>
+            <span className="text-xs font-medium text-muted-foreground">
+              Last renewed
+            </span>
             <p
               className="text-sm font-medium flex items-center gap-2"
               title={formatUTCDate(domain.last_renewed)}
             >
               <Clock className="size-4" />
-              {formatDistanceToNowStrict(new Date(domain.last_renewed), { addSuffix: true })}
+              {formatDistanceToNowStrict(new Date(domain.last_renewed), {
+                addSuffix: true,
+              })}
             </p>
           </div>
         ) : null}
         {domain.expiration_time ? (
           <div className="space-y-1">
-            <span className="text-xs font-medium text-muted-foreground">Expires</span>
+            <span className="text-xs font-medium text-muted-foreground">
+              Expires
+            </span>
             <p
               className="text-sm font-medium flex items-center gap-2"
               title={formatUTCDate(domain.expiration_time)}
@@ -1416,9 +1858,7 @@ function HttpChallengePanel({
 }: {
   domain: Domain
   challengeData: ChallengeData
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   publicIpData: any
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   httpDebugInfo: any
   onVerify: () => void
   onCancel: () => void
@@ -1486,7 +1926,11 @@ function HttpChallengePanel({
           <code className="flex-1 p-2.5 bg-muted rounded text-xs font-mono break-all">
             {challengeUrl}
           </code>
-          <CopyButton value={challengeUrl} minimal className="size-8 rounded-md" />
+          <CopyButton
+            value={challengeUrl}
+            minimal
+            className="size-8 rounded-md"
+          />
         </div>
         <div>
           <span className="text-sm font-medium">Expected response</span>
@@ -1510,7 +1954,8 @@ function HttpChallengePanel({
           <AlertDescription>
             <p>{httpDebugInfo.dns_error}</p>
             <p className="text-sm mt-2">
-              Ensure your domain&apos;s A record points to your server IP address.
+              Ensure your domain&apos;s A record points to your server IP
+              address.
             </p>
           </AlertDescription>
         </Alert>
@@ -1577,7 +2022,9 @@ function DnsKvRow({
 }) {
   return (
     <div className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-4 py-2.5">
-      <dt className="text-xs font-medium text-muted-foreground w-16">{label}</dt>
+      <dt className="text-xs font-medium text-muted-foreground w-16">
+        {label}
+      </dt>
       <dd className="min-w-0">
         <code className="text-xs font-mono break-all">{value}</code>
       </dd>
@@ -1619,7 +2066,9 @@ function FailedPanel({
       )}
       <Alert variant="destructive">
         <AlertTriangle className="size-4" />
-        <AlertTitle>Error: {domain.last_error_type || 'Validation failed'}</AlertTitle>
+        <AlertTitle>
+          Error: {domain.last_error_type || 'Validation failed'}
+        </AlertTitle>
         <AlertDescription>
           {domain.last_error ||
             'Certificate provisioning failed. Verify your DNS records and try again.'}
@@ -1647,7 +2096,11 @@ function FailedPanel({
       {dnsTxtRecords.length > 0 && (
         <div className="space-y-2">
           <p className="text-xs text-muted-foreground">
-            Reference — verify {dnsTxtRecords.length > 1 ? 'these records exist' : 'this record exists'} in DNS:
+            Reference — verify{' '}
+            {dnsTxtRecords.length > 1
+              ? 'these records exist'
+              : 'this record exists'}{' '}
+            in DNS:
           </p>
           <div className="divide-y divide-gray-950/5 rounded-lg border border-gray-950/10 overflow-hidden">
             {dnsTxtRecords.map((record, index) => (
@@ -1655,13 +2108,17 @@ function FailedPanel({
                 key={`${keyPrefix}-${index}`}
                 className="grid grid-cols-[auto_1fr_auto] items-start gap-3 px-4 py-2.5"
               >
-                <Badge variant="outline" className="mt-0.5">TXT</Badge>
+                <Badge variant="outline" className="mt-0.5">
+                  TXT
+                </Badge>
                 <div className="min-w-0 space-y-1">
                   <p className="font-mono text-xs break-all">
-                    <span className="text-muted-foreground">Name:</span> {record.name}
+                    <span className="text-muted-foreground">Name:</span>{' '}
+                    {record.name}
                   </p>
                   <p className="font-mono text-xs break-all">
-                    <span className="text-muted-foreground">Value:</span> {record.value}
+                    <span className="text-muted-foreground">Value:</span>{' '}
+                    {record.value}
                   </p>
                 </div>
                 <CopyButton

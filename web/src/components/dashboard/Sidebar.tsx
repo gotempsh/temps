@@ -16,26 +16,18 @@ import {
 } from '@/components/ui/sidebar'
 import {
   Activity,
-  AlarmClock,
   ArrowLeft,
   ArrowUpCircle,
   BadgeCheck,
   BarChart3,
   Bell,
   Bot,
-  Box,
   Boxes,
   ChevronsUpDown,
   Clock,
-  Cloud,
   Check,
-  CreditCard,
   Database,
   DatabaseBackup,
-  FileText,
-  FileLock2,
-  Filter,
-  Flag,
   Folder,
   Gauge,
   GitBranch,
@@ -46,16 +38,11 @@ import {
   Key,
   KeyRound,
   Layers,
-  LineChart,
   LogOut,
-  Mail,
   Monitor,
   Moon,
   Network,
-  Play,
   Puzzle,
-  Radio,
-  Rss,
   Search,
   ScrollText,
   MessageSquare,
@@ -65,16 +52,11 @@ import {
   Shield,
   ShieldAlert,
   Sun,
-  ShieldCheck,
-  SlidersHorizontal,
   Sparkles,
   Terminal,
   Users,
   UsersRound,
   Wand2,
-  Webhook,
-  Workflow,
-  Zap,
 } from 'lucide-react'
 
 import { ProjectResponse } from '@/api/client'
@@ -82,13 +64,23 @@ import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { useProjectSetup } from '@/hooks/useProjectSetup'
-import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
+import { usePinnedProjectTools } from '@/hooks/usePinnedProjectTools'
 import { usePluginsContext } from '@/contexts/PluginsContext'
+import { isPlatformToolsRoute } from '@/lib/platform-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
+import {
+  isProjectToolsRoute,
+  resolveProjectPrimaryRoute,
+} from '@/lib/project-navigation'
 import { cn } from '@/lib/utils'
+import {
+  flattenProjectTools,
+  projectToolGroups,
+  type ProjectToolItem,
+} from '@/components/project/project-tools'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight, Eye, type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronRight, type LucideIcon } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { Link, useLocation } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -104,67 +96,73 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
 import { useTheme } from 'next-themes'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 
-// Daily-use root: short, scannable list. Dense areas (AI, Source) drill
-// down into sub-views per the §6.12 sidebar standard.
 interface PlatformNavItem {
   title: string
   url: string
   icon: LucideIcon
-  subItems?: { title: string; url: string; icon: LucideIcon }[]
+  activeWhen?: (pathname: string) => boolean
+  featureKey?: string
 }
 
-const navWorkflow: PlatformNavItem[] = [
-  { title: 'Projects', url: '/projects', icon: Folder },
-  { title: 'Sandboxes', url: '/sandboxes', icon: Box },
+interface PlatformNavGroup {
+  label: string
+  items: PlatformNavItem[]
+}
+
+// The fresh-install sidebar stays focused on daily work, grouped by intent so
+// the short list is easy to scan. Every secondary capability remains visible
+// on /tools and in Cmd+K.
+const primaryPlatformGroups: PlatformNavGroup[] = [
   {
-    title: 'Domains',
-    url: '/domains',
-    icon: Globe,
-    subItems: [
+    label: 'Build & deliver',
+    items: [
+      { title: 'Projects', url: '/projects', icon: Folder },
+      { title: 'Git providers', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
-      { title: 'Certificates', url: '/certificates', icon: ShieldCheck },
     ],
   },
   {
-    title: 'Storage',
-    url: '/storage',
-    icon: Database,
-    subItems: [
+    label: 'Data',
+    items: [
       { title: 'Databases', url: '/storage', icon: Database },
       { title: 'Backups', url: '/backups', icon: DatabaseBackup },
     ],
   },
-  { title: 'Email', url: '/email', icon: Mail },
-  { title: 'AI', url: '/ai-gateway', icon: Sparkles },
   {
-    title: 'Source',
-    url: '/git-providers',
-    icon: GitBranch,
-    subItems: [
-      { title: 'Git Providers', url: '/git-providers', icon: GitBranch },
-      { title: 'DNS Providers', url: '/dns-providers', icon: Cloud },
+    label: 'Observe',
+    items: [
+      {
+        title: 'Monitoring',
+        url: '/monitoring/alerts',
+        icon: Gauge,
+        activeWhen: (pathname) => pathname.startsWith('/monitoring'),
+        featureKey: 'alerts-metric-alerts',
+      },
+      { title: 'Proxy', url: '/proxy', icon: Activity },
     ],
   },
-]
-
-// Observability section
-const navObservability = [
-  { title: 'Monitoring', url: '/monitoring', icon: Gauge },
-  { title: 'Proxy', url: '/proxy', icon: Activity },
-  { title: 'Proxy Logs', url: '/proxy-logs', icon: Network },
-  { title: 'Audit Logs', url: '/audit-logs', icon: ScrollText },
+  {
+    label: 'More',
+    items: [
+      {
+        title: 'All platform tools',
+        url: '/tools',
+        icon: Boxes,
+        activeWhen: isPlatformToolsRoute,
+      },
+    ],
+  },
 ]
 
 // Full grouped settings tree — mirrors SettingsLayout
 interface SettingsGroupDef {
   label: string
-  items: { title: string; url: string; icon: LucideIcon }[]
+  items: PlatformNavItem[]
 }
-// Settings drill-down only contains items NOT already surfaced in the
-// main app sidebar (Platform / Storage / AI / Source sections in
-// `navWorkflow`). Anything reachable from the root sidebar is omitted
-// here to avoid duplicate entry points.
+// Settings drill-down contains instance configuration rather than runtime
+// tools, which live on the All platform tools page.
 const settingsGroups: SettingsGroupDef[] = [
   {
     label: 'General',
@@ -178,7 +176,12 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
-      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
+      {
+        title: 'Teams',
+        url: '/settings/teams',
+        icon: UsersRound,
+        featureKey: 'teams',
+      },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
@@ -198,8 +201,18 @@ const settingsGroups: SettingsGroupDef[] = [
         url: '/settings/request-timeouts',
         icon: Clock,
       },
-      { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
-      { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
+      {
+        title: 'Worker Nodes',
+        url: '/settings/nodes',
+        icon: Network,
+        featureKey: 'multi-node-worker-join',
+      },
+      {
+        title: 'Plugins',
+        url: '/settings/plugins',
+        icon: Puzzle,
+        featureKey: 'plugin-system',
+      },
     ],
   },
   {
@@ -233,14 +246,49 @@ const AI_MODE_PREFIXES = [
   '/mcp-servers',
   '/ai-workflows',
 ]
-const aiNavItems: { title: string; url: string; icon: LucideIcon }[] = [
-  { title: 'Providers', url: '/ai-gateway', icon: Sparkles },
-  { title: 'Usage', url: '/ai-gateway/usage', icon: BarChart3 },
-  { title: 'Activity', url: '/ai-gateway/activity', icon: Activity },
-  { title: 'Setup', url: '/ai-gateway/setup', icon: Terminal },
-  { title: 'Chats', url: '/chat', icon: MessageSquare },
-  { title: 'Workflows', url: '/ai-workflows', icon: Bot },
-  { title: 'Skills', url: '/skills', icon: Wand2 },
+const aiNavItems: PlatformNavItem[] = [
+  {
+    title: 'Providers',
+    url: '/ai-gateway',
+    icon: Sparkles,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Usage',
+    url: '/ai-gateway/usage',
+    icon: BarChart3,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Activity',
+    url: '/ai-gateway/activity',
+    icon: Activity,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Setup',
+    url: '/ai-gateway/setup',
+    icon: Terminal,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Chats',
+    url: '/chat',
+    icon: MessageSquare,
+    featureKey: 'ai-chat',
+  },
+  {
+    title: 'Workflows',
+    url: '/ai-workflows',
+    icon: Bot,
+    featureKey: 'ai-agents-workflows',
+  },
+  {
+    title: 'Skills',
+    url: '/skills',
+    icon: Wand2,
+    featureKey: 'ai-foundation-api-tools',
+  },
   { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
 ]
 
@@ -465,7 +513,13 @@ function NavSection({
   siblingUrls,
 }: {
   label: string
-  items: { title: string; url: string; icon: LucideIcon }[]
+  items: {
+    title: string
+    url: string
+    icon: LucideIcon
+    activeWhen?: (pathname: string) => boolean
+    featureKey?: string
+  }[]
   // URLs of items in OTHER sections that share the sidebar. Used so a
   // parent-like url (e.g. `/settings`) doesn't light up when a more
   // specific sibling (`/settings/keys`) in a different section matches.
@@ -504,7 +558,8 @@ function NavSection({
       </SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => {
-          const isActive = item.url === activeUrl
+          const isActive =
+            item.activeWhen?.(location.pathname) ?? item.url === activeUrl
           return (
             <SidebarMenuItem key={item.title}>
               <SidebarMenuButton
@@ -518,6 +573,12 @@ function NavSection({
                 <Link to={item.url}>
                   <item.icon />
                   {!compact && <span>{item.title}</span>}
+                  {!compact && (
+                    <FeatureMaturityBadge
+                      featureKey={item.featureKey}
+                      compact
+                    />
+                  )}
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -759,7 +820,7 @@ function NavUser() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Default workspace nav (root /, /sandboxes, /monitoring, plugins, …).
+// Default workspace nav (root /, /sandboxes, /proxy, plugins, …).
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface NavProps {
@@ -840,17 +901,14 @@ function DefaultNav({
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
 
-  // Split flat items from grouped items. Items with subItems render as
-  // their own labeled sub-section (parent title becomes the group
-  // label, children become flat links). Items without subItems stay in
-  // the main "Platform" group at the top.
-  const flatItems = navWorkflow.filter((it) => !it.subItems?.length)
-  const grouped = navWorkflow.filter((it) => it.subItems?.length)
   const { navItems: extraNavItems } = useConsoleExtensions()
-  const canViewAuditLogs = useCanViewAuditLogs()
-  const observabilityItems = canViewAuditLogs
-    ? navObservability
-    : navObservability.filter((it) => it.url !== '/audit-logs')
+  const platformUrls = useMemo(
+    () =>
+      primaryPlatformGroups.flatMap((group) =>
+        group.items.map((item) => item.url)
+      ),
+    []
+  )
 
   return (
     <>
@@ -860,15 +918,16 @@ function DefaultNav({
           onReturn={onReturnToProject}
         />
       )}
-      <NavSection label="Platform" items={flatItems} />
-      {grouped.map((group) => (
+      {primaryPlatformGroups.map((group) => (
         <NavSection
-          key={group.title}
-          label={group.title}
-          items={group.subItems!}
+          key={group.label}
+          label={group.label}
+          items={group.items}
+          siblingUrls={platformUrls.filter(
+            (url) => !group.items.some((item) => item.url === url)
+          )}
         />
       ))}
-      <NavSection label="Observe" items={observabilityItems} />
       <NavPlugins items={pluginItems} />
       <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
@@ -940,94 +999,64 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface ProjectNavItem {
-  title: string
-  url: string
-  icon: LucideIcon
-  subItems?: { title: string; url: string; icon: LucideIcon }[]
-  // When true, clicking the row navigates to `url`; the chevron is the
-  // only affordance that opens the drill-down submenu.
-  navigateOnClick?: boolean
+type ProjectNavItem = ProjectToolItem
+
+interface ProjectNavGroup {
+  label: string
+  items: ProjectNavItem[]
 }
 
-const projectBaseNav: ProjectNavItem[] = [
-  { title: 'Overview', url: 'project', icon: Home },
-  { title: 'Deployments', url: 'deployments', icon: GitBranch },
-  { title: 'Environments', url: 'environments', icon: Layers },
+// The permanent sidebar is intentionally short and task-first. These are the
+// destinations operators reach for every day, and each one opens the data in a
+// single click. Everything else remains visible in the grouped tools menu
+// below, without replacing the sidebar or hiding behind route-driven state.
+const projectPrimaryGroups: ProjectNavGroup[] = [
   {
-    title: 'Analytics',
-    url: 'analytics',
-    icon: BarChart3,
-    navigateOnClick: true,
-    subItems: [
-      { title: 'Overview', url: 'analytics', icon: BarChart3 },
-      { title: 'Visitors', url: 'analytics/visitors', icon: Users },
-      { title: 'Pages', url: 'analytics/pages', icon: FileText },
-      { title: 'AI Agents', url: 'analytics/ai-agents', icon: Bot },
-      { title: 'Funnels', url: 'analytics/funnels', icon: Filter },
-      { title: 'Session Replays', url: 'analytics/replays', icon: Play },
-      { title: 'API Traffic', url: 'analytics/api-traffic', icon: Server },
-      { title: 'Speed', url: 'speed', icon: Zap },
-      { title: 'Revenue', url: 'revenue', icon: CreditCard },
-    ],
-  },
-  { title: 'Databases', url: 'storage', icon: Database },
-  {
-    title: 'Environment Variables',
-    url: 'environment-variables',
-    icon: KeyRound,
-  },
-  { title: 'Feature Flags', url: 'flags', icon: Flag },
-  { title: 'Domains', url: 'domains', icon: Globe },
-  { title: 'Git', url: 'git', icon: GitFork },
-  { title: 'Build & Deploy', url: 'build', icon: Settings2 },
-  { title: 'Logs', url: 'runtime', icon: ScrollText },
-  {
-    title: 'OpenTelemetry',
-    url: 'observe',
-    icon: Radio,
-    navigateOnClick: true,
-    subItems: [
-      { title: 'Observe', url: 'observe', icon: Eye },
-      { title: 'Traces', url: 'traces', icon: Network },
-      { title: 'AI Traces', url: 'ai-gateway?tab=activity', icon: Bot },
-      { title: 'Metrics', url: 'metrics', icon: LineChart },
-      { title: 'Logs', url: 'telemetry-logs', icon: ScrollText },
-      { title: 'Error Tracking', url: 'errors', icon: ShieldAlert },
+    label: 'Project',
+    items: [
+      { title: 'Overview', url: 'project', icon: Home },
+      { title: 'Deployments', url: 'deployments', icon: GitBranch },
     ],
   },
   {
-    title: 'Monitoring',
-    url: 'monitors',
-    icon: Gauge,
-    navigateOnClick: true,
-    subItems: [
-      { title: 'Uptime', url: 'monitors', icon: Activity },
-      { title: 'Request Logs', url: 'request-logs', icon: Rss },
-      { title: 'AI Crawlers', url: 'ai-crawlers', icon: Bot },
+    label: 'Data',
+    items: [
+      {
+        title: 'Analytics',
+        url: 'analytics',
+        icon: BarChart3,
+        featureKey: 'web-analytics',
+      },
+      {
+        title: 'Errors',
+        url: 'errors',
+        icon: ShieldAlert,
+        featureKey: 'error-tracking',
+      },
+      {
+        title: 'Traces',
+        url: 'traces',
+        icon: Network,
+        featureKey: 'otel-traces-metrics',
+      },
+      { title: 'Logs', url: 'runtime', icon: ScrollText },
+      { title: 'Databases', url: 'storage', icon: Database },
     ],
   },
-  { title: 'AI Workflows', url: 'agents', icon: Workflow },
   {
-    title: 'Settings',
-    url: 'settings',
-    icon: Settings,
-    subItems: [
-      { title: 'General', url: 'settings/general', icon: SlidersHorizontal },
-      { title: 'Secrets', url: 'settings/secrets', icon: FileLock2 },
-      { title: 'Security', url: 'settings/security', icon: Shield },
-      { title: 'Access', url: 'settings/access', icon: Users },
-      { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
-      { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
-      { title: 'Skills', url: 'settings/skills', icon: Wand2 },
-      { title: 'MCP Servers', url: 'settings/mcp-servers', icon: Server },
-      { title: 'Alert Rules', url: 'errors/alert-rules', icon: AlarmClock },
+    label: 'Configure',
+    items: [
+      { title: 'Environments', url: 'environments', icon: Layers },
+      { title: 'Domains', url: 'domains', icon: Globe },
+      { title: 'Git', url: 'git', icon: GitFork },
+      { title: 'Build & Deploy', url: 'build', icon: Settings2 },
+      { title: 'Project settings', url: 'settings', icon: Settings },
     ],
   },
 ]
 
 function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
-  const { isMinimal, isMobile } = useSidebar()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
   const setup = useProjectSetup(project)
   const remainingSteps = setup.steps.filter((step) => !step.done)
@@ -1044,7 +1073,10 @@ function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
               tooltip={`Project setup — ${setup.completedCount}/${setup.totalCount}`}
               className="justify-center"
             >
-              <Link to={`/projects/${project.slug}/setup`}>
+              <Link
+                to={`/projects/${project.slug}/setup`}
+                onClick={() => isMobile && setOpenMobile(false)}
+              >
                 <BadgeCheck />
               </Link>
             </SidebarMenuButton>
@@ -1054,65 +1086,34 @@ function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
     )
   }
 
-  const visibleSteps = remainingSteps.slice(0, 2)
-  const hiddenCount = remainingSteps.length - visibleSteps.length
-
   return (
-    <SidebarGroup className="py-0 pb-2">
-      <div className="overflow-hidden rounded-lg border border-sidebar-border bg-sidebar-accent/30">
-        <Link
-          to={`/projects/${project.slug}/setup`}
-          className="group block px-3 py-2.5 transition-colors hover:bg-sidebar-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
+    <SidebarGroup className="py-0 pb-1">
+      <Link
+        to={`/projects/${project.slug}/setup`}
+        onClick={() => isMobile && setOpenMobile(false)}
+        className="group rounded-md px-2 py-2 transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
+      >
+        <div className="flex items-center gap-2">
+          <BadgeCheck className="size-4 shrink-0 text-primary" />
+          <span className="flex-1 text-sm font-medium">Finish setup</span>
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {setup.completedCount}/{setup.totalCount}
+          </span>
+        </div>
+        <div
+          className="mt-1.5 h-0.5 w-full overflow-hidden rounded-full bg-sidebar-border"
+          role="progressbar"
+          aria-label={`${project.name} setup progress`}
+          aria-valuemin={0}
+          aria-valuemax={setup.totalCount}
+          aria-valuenow={setup.completedCount}
         >
-          <div className="flex items-center gap-2">
-            <BadgeCheck className="size-4 shrink-0 text-primary" />
-            <span className="flex-1 text-sm font-medium">Project setup</span>
-            <span className="text-xs tabular-nums text-muted-foreground">
-              {setup.completedCount}/{setup.totalCount}
-            </span>
-            <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-          </div>
           <div
-            className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sidebar-border"
-            role="progressbar"
-            aria-label={`${project.name} setup progress`}
-            aria-valuemin={0}
-            aria-valuemax={setup.totalCount}
-            aria-valuenow={setup.completedCount}
-          >
-            <div
-              className="h-full rounded-full bg-primary transition-all duration-500"
-              style={{ width: `${setup.percent}%` }}
-            />
-          </div>
-        </Link>
-        <ul role="list" className="border-t border-sidebar-border p-1.5">
-          {visibleSteps.map((step) => (
-            <li key={step.id}>
-              <Link
-                to={step.href}
-                className="group flex items-center gap-2 rounded-md px-1.5 py-2 text-xs transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-              >
-                <step.icon className="size-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
-                <span className="min-w-0 flex-1 leading-tight">
-                  {step.title}
-                </span>
-                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-              </Link>
-            </li>
-          ))}
-          {hiddenCount > 0 && (
-            <li>
-              <Link
-                to={`/projects/${project.slug}/setup`}
-                className="block rounded-md px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-              >
-                +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
-              </Link>
-            </li>
-          )}
-        </ul>
-      </div>
+            className="h-full rounded-full bg-primary transition-all duration-500"
+            style={{ width: `${setup.percent}%` }}
+          />
+        </div>
+      </Link>
     </SidebarGroup>
   )
 }
@@ -1123,21 +1124,32 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   })
   const { projectNavEntries } = usePluginsContext()
   const location = useLocation()
-  const { isMinimal, isMobile } = useSidebar()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const items = useMemo<ProjectNavItem[]>(() => {
-    const settingsIdx = projectBaseNav.length - 1
-    const pluginItems: ProjectNavItem[] = projectNavEntries.map((e) => ({
-      title: e.label,
-      url: e.path,
-      icon: resolvePluginIcon(e.icon),
-    }))
-    return [
-      ...projectBaseNav.slice(0, settingsIdx),
-      ...pluginItems,
-      projectBaseNav[settingsIdx],
-    ]
-  }, [projectNavEntries])
+  const pluginItems = useMemo<ProjectNavItem[]>(
+    () =>
+      projectNavEntries.map((entry) => ({
+        title: entry.label,
+        url: entry.path,
+        icon: resolvePluginIcon(entry.icon),
+      })),
+    [projectNavEntries]
+  )
+  const availableTools = useMemo(
+    () => [...flattenProjectTools(projectToolGroups), ...pluginItems],
+    [pluginItems]
+  )
+  const { pinnedUrls } = usePinnedProjectTools(
+    slug,
+    availableTools.map((tool) => tool.url)
+  )
+  const toolByUrl = useMemo(
+    () => new Map(availableTools.map((tool) => [tool.url, tool])),
+    [availableTools]
+  )
+  const pinnedItems = pinnedUrls
+    .map((url) => toolByUrl.get(url))
+    .filter((tool): tool is ProjectToolItem => tool !== undefined)
 
   const activeRoute = useMemo(() => {
     if (!project) return ''
@@ -1147,65 +1159,13 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     return parts.slice(slugIdx + 1).join('/')
   }, [location.pathname, project])
 
-  // Drill-down state: null = root project nav; string = title of the
-  // parent whose sub-items are showing. Initialised lazily from the
-  // current route so a deep link lands inside the right sub-view, but
-  // we never re-derive afterwards — Back must always return to root,
-  // even though the URL is still a sub-route.
-  // Match a sub-item to the current route. Prefix-aware so a deeper route
-  // (e.g. `analytics/ai-agents/all`) still resolves to its section's sub-item
-  // (`analytics/ai-agents`), not just an exact match.
-  const matchesSubRoute = (subUrl: string, route: string) =>
-    route === subUrl || route.startsWith(`${subUrl}/`)
-
-  const findDrillParent = (route: string) =>
-    projectBaseNav.find((it) =>
-      it.subItems?.some((s) => matchesSubRoute(s.url, route))
-    )?.title ?? null
-
-  const [drilledTo, setDrilledTo] = useState<string | null>(() =>
-    activeRoute ? findDrillParent(activeRoute) : null
-  )
-
-  // On a hard refresh the `useState` initializer above runs before `project`
-  // has loaded, so `activeRoute` is empty and `drilledTo` stays null — leaving
-  // the sidebar on the root nav even though the URL is a deep sub-route. Re-sync
-  // exactly once, the first time `activeRoute` becomes available, so a refreshed
-  // deep link (e.g. /analytics/ai-agents) expands the right section. We gate on
-  // a ref so this never fires again on later route changes — that would fight
-  // the Back arrow, which intentionally collapses to root while staying on the
-  // sub-route URL.
-  const didSyncDrillRef = useRef(false)
-  useEffect(() => {
-    if (didSyncDrillRef.current || !activeRoute) return
-    didSyncDrillRef.current = true
-    const parent = findDrillParent(activeRoute)
-    // Reconcile the async project lookup with the route-derived initial view.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (parent) setDrilledTo(parent)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRoute])
-
-  // The single most-specific nav URL that the current route falls under. Among
-  // all candidate URLs whose path the route matches (exactly or as a prefix),
-  // the LONGEST one wins — so `analytics/ai-agents/all` highlights
-  // `analytics/ai-agents`, not the shorter `analytics` Overview.
-  // NOTE: must stay ABOVE the `if (!project)` early return — it's a hook.
-  const bestMatchUrl = useMemo(() => {
-    const candidates = projectBaseNav.flatMap((it) => [
-      it.url,
-      ...(it.subItems?.map((s) => s.url) ?? []),
-    ])
-    let best: string | null = null
-    for (const c of candidates) {
-      const pathOnly = c.split('?')[0]
-      if (matchesSubRoute(pathOnly, activeRoute)) {
-        if (best === null || pathOnly.length > best.length) best = pathOnly
-      }
-    }
-    return best
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRoute, projectBaseNav])
+  const pinnedActiveUrl = pinnedItems.find((item) => {
+    const route = item.url.split('?')[0]
+    return activeRoute === route || activeRoute.startsWith(`${route}/`)
+  })?.url
+  const primaryActiveUrl = pinnedActiveUrl
+    ? null
+    : resolveProjectPrimaryRoute(activeRoute)
 
   if (!project) {
     return (
@@ -1215,57 +1175,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
     )
   }
 
-  const isActive = (url: string) => {
-    const pathOnly = url.split('?')[0]
-    if (pathOnly === 'project')
-      return activeRoute === '' || activeRoute === 'project'
-    if (pathOnly === 'environments')
-      return activeRoute.startsWith('environments')
-    return pathOnly === bestMatchUrl
-  }
-  const isParentActive = (item: ProjectNavItem) =>
-    !!item.subItems?.some((s) => isActive(s.url))
-
-  // Drill-down sub-view: show only the children of `drilledTo`.
-  if (drilledTo) {
-    const parent = items.find((it) => it.title === drilledTo)
-    if (parent?.subItems?.length) {
-      return (
-        <>
-          <SwapHeader
-            title={parent.title}
-            onBack={() => setDrilledTo(null)}
-            backLabel={`Back to ${project.name}`}
-          />
-          <SidebarGroup className="pt-0">
-            <SidebarMenu>
-              {parent.subItems.map((sub) => {
-                const active = isActive(sub.url)
-                return (
-                  <SidebarMenuItem key={sub.url}>
-                    <SidebarMenuButton
-                      asChild
-                      tooltip={compact ? sub.title : undefined}
-                      className={cn(
-                        compact ? 'justify-center' : 'justify-start',
-                        active &&
-                          'bg-sidebar-accent text-sidebar-accent-foreground'
-                      )}
-                    >
-                      <Link to={`/projects/${project.slug}/${sub.url}`}>
-                        <sub.icon />
-                        {!compact && <span>{sub.title}</span>}
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                )
-              })}
-            </SidebarMenu>
-          </SidebarGroup>
-        </>
-      )
-    }
-  }
+  const toolsActive = isProjectToolsRoute(activeRoute) && !pinnedActiveUrl
 
   return (
     <>
@@ -1275,21 +1185,21 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         backLabel="Back to menu"
       />
       <ProjectSetupNavItem project={project} />
-      <SidebarGroup className="pt-0">
-        <SidebarMenu>
-          {items.map((item) => {
-            const active = isActive(item.url) || isParentActive(item)
-            const hasSub = !!item.subItems?.length
-            const splitRow = hasSub && item.navigateOnClick
-            return (
-              <SidebarMenuItem
-                key={item.title}
-                data-tour={item.url.split('?')[0]}
-              >
-                {splitRow ? (
+      {projectPrimaryGroups.map((group) => (
+        <SidebarGroup key={group.label} className="py-1">
+          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+            {group.label}
+          </SidebarGroupLabel>
+          <SidebarMenu>
+            {group.items.map((item) => {
+              const active = primaryActiveUrl === item.url.split('?')[0]
+              return (
+                <SidebarMenuItem
+                  key={item.url}
+                  data-tour={item.url.split('?')[0]}
+                >
                   <SidebarMenuButton
                     asChild
-                    onClick={() => setDrilledTo(item.title)}
                     tooltip={compact ? item.title : undefined}
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
@@ -1297,56 +1207,112 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
                         'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
-                    <Link to={`/projects/${project.slug}/${item.url}`}>
+                    <Link
+                      to={`/projects/${project.slug}/${item.url}`}
+                      onClick={() => isMobile && setOpenMobile(false)}
+                    >
                       <item.icon />
+                      {!compact && <span>{item.title}</span>}
                       {!compact && (
-                        <>
-                          <span className="flex-1 text-left">{item.title}</span>
-                          <ChevronRight className="size-4 text-muted-foreground" />
-                        </>
+                        <FeatureMaturityBadge
+                          featureKey={item.featureKey}
+                          compact
+                        />
                       )}
                     </Link>
                   </SidebarMenuButton>
-                ) : hasSub ? (
-                  <SidebarMenuButton
-                    onClick={() => setDrilledTo(item.title)}
-                    tooltip={compact ? item.title : undefined}
-                    className={cn(
-                      compact ? 'justify-center' : 'justify-start',
-                      active &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
-                    )}
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
+      {pinnedItems.length > 0 && (
+        <SidebarGroup className="py-1">
+          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+            Pinned
+          </SidebarGroupLabel>
+          <SidebarMenu>
+            {pinnedItems.map((item) => (
+              <SidebarMenuItem key={item.url}>
+                <SidebarMenuButton
+                  asChild
+                  tooltip={compact ? item.title : undefined}
+                  className={cn(
+                    compact ? 'justify-center' : 'justify-start',
+                    pinnedActiveUrl === item.url &&
+                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                  )}
+                >
+                  <Link
+                    to={
+                      item.url.startsWith('/')
+                        ? item.url
+                        : `/projects/${project.slug}/${item.url}`
+                    }
+                    onClick={() => isMobile && setOpenMobile(false)}
                   >
                     <item.icon />
+                    {!compact && <span>{item.title}</span>}
                     {!compact && (
-                      <>
-                        <span className="flex-1 text-left">{item.title}</span>
-                        <ChevronRight className="size-4 text-muted-foreground" />
-                      </>
+                      <FeatureMaturityBadge
+                        featureKey={item.featureKey}
+                        compact
+                      />
                     )}
-                  </SidebarMenuButton>
-                ) : (
-                  <SidebarMenuButton
-                    asChild
-                    tooltip={compact ? item.title : undefined}
-                    className={cn(
-                      compact ? 'justify-center' : 'justify-start',
-                      active &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
-                    )}
-                  >
-                    <Link to={`/projects/${project.slug}/${item.url}`}>
-                      <item.icon />
-                      {!compact && <span>{item.title}</span>}
-                    </Link>
-                  </SidebarMenuButton>
-                )}
+                  </Link>
+                </SidebarMenuButton>
               </SidebarMenuItem>
-            )
-          })}
+            ))}
+          </SidebarMenu>
+        </SidebarGroup>
+      )}
+      <SidebarGroup className="py-1">
+        <SidebarMenu>
+          <SidebarMenuItem data-tour="all-tools">
+            <ProjectToolsMenu
+              slug={project.slug}
+              active={toolsActive}
+              compact={compact}
+              onNavigate={() => setOpenMobile(false)}
+            />
+          </SidebarMenuItem>
         </SidebarMenu>
       </SidebarGroup>
     </>
+  )
+}
+
+function ProjectToolsMenu({
+  slug,
+  active,
+  compact,
+  onNavigate,
+}: {
+  slug: string
+  active: boolean
+  compact: boolean
+  onNavigate: () => void
+}) {
+  return (
+    <SidebarMenuButton
+      asChild
+      tooltip={compact ? 'All project tools' : undefined}
+      className={cn(
+        compact ? 'justify-center' : 'justify-start',
+        active && 'bg-sidebar-accent text-sidebar-accent-foreground'
+      )}
+    >
+      <Link to={`/projects/${slug}/tools`} onClick={onNavigate}>
+        <Boxes />
+        {!compact && (
+          <>
+            <span className="flex-1 text-left">All project tools</span>
+            <ChevronRight className="size-4 text-muted-foreground" />
+          </>
+        )}
+      </Link>
+    </SidebarMenuButton>
   )
 }
 

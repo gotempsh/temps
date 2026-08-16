@@ -117,6 +117,16 @@ pub enum ApiToolError {
         operation_id: String,
     },
 
+    /// The operation cannot be safely constrained to the caller's project scope.
+    #[error(
+        "Operation '{operation_id}' is not available from a project-scoped AI chat \
+         because it does not expose a project selector."
+    )]
+    UnscopedOperation {
+        /// The operation that was called.
+        operation_id: String,
+    },
+
     /// The requested `operation_id` does not exist in the read-only index.
     #[error(
         "Operation '{operation_id}' was not found in the read-only API index. \

@@ -74,6 +74,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`kv`](#kv) - KV store commands (coming soon)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
@@ -3378,6 +3379,58 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--offset <n>` | Page offset | - | No |
 | `--json` | Output in JSON format | - | No |
 
+## `facets`
+
+Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
+
+**Subcommands:**
+
+- `list` (`ls`) - List registered span attribute facets
+- `create` - Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+- `remove` (`rm`) - Remove a registered facet, freeing its slot for reuse
+- `retry` - Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+### `facets list` (alias: `ls`)
+
+List registered span attribute facets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets create`
+
+Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets remove` (alias: `rm`)
+
+Remove a registered facet, freeing its slot for reuse
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `facets retry`
+
+Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `otel-forward`
 
 Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
@@ -4684,6 +4737,7 @@ Show proxy log details
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Proxy log ID | - | Yes |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs by-request`
@@ -4695,6 +4749,7 @@ Get proxy log by request ID
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--request-id <id>` | Request ID | - | No |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs stats`
@@ -5389,6 +5444,9 @@ View project analytics
 - `api-overview` - Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
 - `api-routes` - Show top API routes by request count from /api-analytics/routes
 - `api-callers` - Show top API callers by client IP from /api-analytics/callers
+- `api-ip` - Show routes called by one client IP with latency and error analytics
+- `api-path` - Show client IPs calling one path with latency and error analytics
+- `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 
 ### `analytics overview` (alias: `o`)
@@ -5523,6 +5581,9 @@ Show top API routes by request count from /api-analytics/routes
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of routes to return (default: 20, max: 100) | - | No |
 | `--offset <n>` | Number of ranked routes to skip (default: 0) | - | No |
+| `--sort-by <metric>` | Sort by requests, latency_avg, or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics api-callers`
@@ -5538,6 +5599,66 @@ Show top API callers by client IP from /api-analytics/callers
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of callers to return (default: 20, max: 100) | - | No |
 | `--offset <n>` | Number of ranked callers to skip (default: 0) | - | No |
+| `--sort-by <metric>` | Sort by requests or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-ip`
+
+Show routes called by one client IP with latency and error analytics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--page <n>` | Page number | `1` | No |
+| `--sort-by <metric>` | Sort by requests, latency_avg, or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-path`
+
+Show client IPs calling one path with latency and error analytics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--page <n>` | Page number | `1` | No |
+| `--sort-by <metric>` | Sort by requests or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-query`
+
+Run a typed multi-dimensional API traffic aggregation
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group-by <dimensions>` | Comma-separated dimensions (omit for one overall rollup) | - | No |
+| `--metrics <metrics>` | Comma-separated metrics (e.g. requests,error_rate,latency_p95) | - | Yes |
+| `--filter <dimension:operator:value>` | Repeatable filter (operators: eq, not_eq, contains, starts_with, in) | `` | No |
+| `--sort-by <field>` | Requested dimension or metric to sort by | - | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--page <n>` | Page number | `1` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics api-summary`

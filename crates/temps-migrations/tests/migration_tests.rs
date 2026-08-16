@@ -4,6 +4,140 @@ use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
 use temps_migrations::Migrator;
 
+async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'env_vars' \
+               AND column_name = 'include_in_preview'"
+                .to_string(),
+        ))
+        .await?
+        .expect("env_vars.include_in_preview metadata exists");
+    Ok(row.try_get("", "column_default")?)
+}
+
+async fn env_var_preview_value(db: &DatabaseConnection, id: i32) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT include_in_preview FROM env_vars WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .expect("migration fixture env var exists");
+    Ok(row.try_get("", "include_in_preview")?)
+}
+
+async fn project_secret_preview_value(db: &DatabaseConnection, id: i32) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT include_in_preview FROM secrets WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .expect("migration fixture project secret exists");
+    Ok(row.try_get("", "include_in_preview")?)
+}
+
+async fn project_secret_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'secrets' \
+               AND column_name = 'include_in_preview'"
+                .to_string(),
+        ))
+        .await?
+        .expect("secrets.include_in_preview metadata exists");
+    Ok(row.try_get("", "column_default")?)
+}
+
+#[tokio::test]
+async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping test_preview_inclusion_default_migration_up_and_down: external database configured"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping test_preview_inclusion_default_migration_up_and_down: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260815_000001_default_preview_inclusion_off";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(env_var_preview_default(&db).await?, "true");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
+    db.execute_unprepared(
+        "SET session_replication_role = replica; \
+         INSERT INTO env_vars \
+             (id, project_id, key, value, created_at, updated_at) \
+         VALUES \
+             (987654, 987654, 'LEGACY_SECRET', 'encrypted', NOW(), NOW()); \
+         INSERT INTO secrets \
+             (id, project_id, key, value, include_in_preview, created_at, updated_at) \
+         VALUES \
+             (987654, 987654, 'LEGACY_FILE_SECRET', 'encrypted', TRUE, NOW(), NOW()), \
+             (987655, 987654, 'OPTED_OUT_FILE_SECRET', 'encrypted', FALSE, NOW(), NOW()); \
+         SET session_replication_role = origin;",
+    )
+    .await?;
+    assert!(env_var_preview_value(&db, 987654).await?);
+    assert!(project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(env_var_preview_default(&db).await?, "false");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
+    assert!(!env_var_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(env_var_preview_default(&db).await?, "true");
+    assert_eq!(project_secret_preview_default(&db).await?, "false");
+    assert!(env_var_preview_value(&db, 987654).await?);
+    assert!(project_secret_preview_value(&db, 987654).await?);
+    assert!(!project_secret_preview_value(&db, 987655).await?);
+
+    Ok(())
+}
+
 /// True when an external database is configured. CI can only *empty* an env
 /// var per matrix entry, not unset it, so empty counts as "not configured" —
 /// otherwise the skip-guards below would fire in the dedicated migrations

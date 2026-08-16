@@ -49,6 +49,7 @@ Show proxy log details
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Proxy log ID | - | Yes |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs by-request`
@@ -60,6 +61,7 @@ Get proxy log by request ID
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--request-id <id>` | Request ID | - | No |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs stats`

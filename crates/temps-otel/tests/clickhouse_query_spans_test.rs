@@ -119,6 +119,7 @@ async fn setup() -> Option<Harness> {
         ClickHouseOtelConfig::new(&url, "spans_query_test", "default", "test"),
         inner,
         Arc::new(temps_core::FixedRetentionResolver),
+        None,
     );
     Some((storage, probe, Box::new(container)))
 }

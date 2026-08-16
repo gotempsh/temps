@@ -1143,9 +1143,13 @@ pub async fn update_environment_settings(
     Extension(metadata): Extension<RequestMetadata>,
     Json(settings): Json<UpdateEnvironmentSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
+    project_permission_guard!(
+        auth,
+        EnvironmentsWrite,
+        project_id,
+        state.project_access_checker
+    );
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
@@ -2273,6 +2277,19 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
+
+    #[test]
+    fn environment_settings_write_uses_project_scoped_permission_guard() {
+        let source = include_str!("handler.rs");
+        let handler = source
+            .split("pub async fn update_environment_settings")
+            .nth(1)
+            .and_then(|tail| tail.split("// Get project details for audit log").next())
+            .expect("update_environment_settings source is present");
+
+        assert!(handler.contains("project_permission_guard!("));
+        assert!(!handler.contains("project_access_guard!("));
+    }
 
     struct RequireDeletionVerification;
 

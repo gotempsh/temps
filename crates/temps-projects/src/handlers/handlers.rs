@@ -627,7 +627,7 @@ pub async fn create_project(
 /// Fails the request on an infrastructure error rather than falling back
 /// to an unfiltered list — a checker that can't answer must not silently
 /// widen what a user sees.
-async fn resolve_hidden_projects(
+pub(super) async fn resolve_hidden_projects(
     state: &Arc<AppState>,
     auth: &temps_auth::context::AuthContext,
 ) -> Result<Vec<i32>, Problem> {
@@ -2086,6 +2086,7 @@ pub async fn create_project_from_template(
                     .git_provider_manager
                     .create_repository_and_push_template(
                         connection_id,
+                        auth.user_id(),
                         repository_name,
                         request.repository_owner.as_deref(),
                         Some(&format!("Created from template: {}", template.name)),

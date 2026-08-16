@@ -2634,6 +2634,11 @@ impl From<NodeError> for Problem {
                     .with_title("Insufficient Compatible Nodes")
                     .with_detail(error.to_string())
             }
+            NodeError::PlacementConstraintsUnsatisfied { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Placement Constraints Unsatisfied")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)

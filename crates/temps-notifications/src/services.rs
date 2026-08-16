@@ -17,6 +17,7 @@ use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
 };
+use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
     notification_preferences, notification_providers, notifications, roles, user_roles, users,
@@ -246,6 +247,46 @@ pub struct WebhookProvider {
     /// Request timeout in seconds. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+async fn validate_webhook_url(url: &str) -> Result<()> {
+    let parsed = validate_external_url(url)
+        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    }
+    Ok(())
+}
+
+async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Client> {
+    let parsed = validate_external_url(url)
+        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+        })?;
+        let addrs = resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+        builder = builder.resolve_to_addrs(domain, &addrs);
+    }
+
+    Ok(builder.build()?)
 }
 
 /// Cloudflare Email Sending provider.
@@ -1225,8 +1266,7 @@ impl NotificationProvider for WebhookProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         // Validate webhook URL with full SSRF protection (blocks private IPs,
         // loopback, cloud metadata, link-local, etc.)
-        temps_core::url_validation::validate_external_url(&self.url)
-            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", self.url, e))?;
+        validate_webhook_url(&self.url).await?;
 
         // Validate HTTP method
         let method = self.method.to_uppercase();
@@ -1241,9 +1281,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Build the payload with all notification data. `_`-prefixed keys are
         // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
@@ -1297,9 +1335,7 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Send a test payload
         let test_payload = serde_json::json!({
@@ -3194,7 +3230,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_ssrf_allows_public_https() {
-        let mut webhook = create_webhook("https://hooks.example.com/webhook");
+        // Use a public literal so this validation test stays deterministic in
+        // offline CI while domain-based targets exercise DNS validation.
+        let mut webhook = create_webhook("https://93.184.216.34/webhook");
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let result = webhook.initialize(db).await;
         assert!(result.is_ok(), "Must allow public HTTPS URLs");

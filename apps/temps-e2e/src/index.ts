@@ -414,7 +414,7 @@ program
 program
   .command('pg-upgrade-scenario')
   .description(
-    'Real Postgres major-version upgrade (16 → 17): provision a service pinned to postgres:16-bookworm, deploy a db-probe app, write 5 marker rows, trigger the upgrade, poll through all phases to completed, and assert the marker rows survived via the read-only data-browser API (not /probe) -- proves the actual pg_dumpall → psql restore path, not just that the status field flipped',
+    'Real Postgres major-version upgrade (17 → 18): provision a service pinned to gotempsh/postgres-walg:17-bookworm, deploy a db-probe app, write 5 marker rows, trigger the upgrade, poll through all phases to completed, and assert the marker rows survived via the read-only data-browser API (not /probe) -- proves the actual pg_dumpall → psql restore path, not just that the status field flipped',
   )
   .option('--registry <host:port>', 'registry to push the db-probe image to (or $TEMPS_E2E_REGISTRY)')
   .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')

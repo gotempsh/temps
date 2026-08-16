@@ -879,19 +879,19 @@ impl ParameterStrategy for MinioParameterStrategy {
             );
         }
 
-        // Auto-generate access_key if not provided
+        // Never fall back to MinIO's well-known root credentials.
         if is_empty_value(params.get("access_key")) {
             params.insert(
                 "access_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_access_key()),
             );
         }
 
-        // Auto-generate secret_key if not provided
+        // Generate an independent secret for every managed instance.
         if is_empty_value(params.get("secret_key")) {
             params.insert(
                 "secret_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_secret_key()),
             );
         }
 
@@ -940,13 +940,13 @@ impl ParameterStrategy for MinioParameterStrategy {
             "properties": {
                 "access_key": {
                     "type": "string",
-                    "description": "Access key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
                 },
                 "secret_key": {
                     "type": "string",
-                    "description": "Secret key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
                 },
                 "port": {
                     "type": "integer",
@@ -1772,6 +1772,43 @@ mod tests {
             err.contains("container_name"),
             "error should mention 'container_name', got: {err}"
         );
+    }
+
+    #[test]
+    fn minio_generates_unique_s3_style_credentials() {
+        let strategy = MinioParameterStrategy;
+        let mut first = HashMap::new();
+        let mut second = HashMap::new();
+
+        strategy
+            .auto_generate_missing(&mut first)
+            .expect("first MinIO credentials should generate");
+        strategy
+            .auto_generate_missing(&mut second)
+            .expect("second MinIO credentials should generate");
+
+        let first_access = first
+            .get("access_key")
+            .and_then(JsonValue::as_str)
+            .expect("access key should be generated");
+        let first_secret = first
+            .get("secret_key")
+            .and_then(JsonValue::as_str)
+            .expect("secret key should be generated");
+        assert_ne!(first_access, "minioadmin");
+        assert_ne!(first_secret, "minioadmin");
+        assert_eq!(first_access.len(), 20);
+        assert_eq!(first_secret.len(), 40);
+        assert!(first_access
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit()));
+        assert!(first_secret
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '+'
+                || character == '/'));
+        assert_ne!(first.get("access_key"), second.get("access_key"));
+        assert_ne!(first.get("secret_key"), second.get("secret_key"));
     }
 
     #[test]

@@ -1309,70 +1309,31 @@ pub async fn login(
                     .with_detail("Invalid email or password."))
             }
             crate::auth_service::UserAuthError::MfaRequiredForRole { user_id, role } => {
+                // This branch is reached after a valid password for an elevated
+                // account, so do not start MFA enrollment or disclose setup
+                // material here. Enrollment must happen from an already
+                // authenticated/trusted path; otherwise a stolen password could
+                // claim attacker-controlled MFA and complete admin login. Return
+                // the same response as invalid credentials to avoid making the
+                // role/MFA policy observable to password-guessing callers.
                 warn!(
                     user_id,
                     role = %role,
                     email = %login_email,
-                    "Starting required MFA enrollment for role"
+                    "Blocking password login for role requiring pre-enrolled MFA"
                 );
-                let setup = state.user_service.setup_mfa(user_id).await.map_err(|error| {
-                    error!(user_id, error = %error, "Failed to prepare resumable MFA enrollment");
-                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("MFA Enrollment Failed")
-                        .with_detail("Could not start MFA enrollment. Please try again.")
-                })?;
-                let mfa_token = state.auth_service.create_mfa_session(user_id).await.map_err(|error| {
-                    error!(user_id, error = %error, "Failed to create MFA enrollment challenge");
-                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("MFA Enrollment Failed")
-                        .with_detail("Could not start MFA enrollment. Please try again.")
-                })?;
-                let encrypted_token = state.cookie_crypto.encrypt(&mfa_token).map_err(|error| {
-                    error!(user_id, error = %error, "Failed to encrypt MFA enrollment challenge");
-                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("MFA Enrollment Failed")
-                        .with_detail("Could not start MFA enrollment. Please try again.")
-                })?;
-                let mfa_cookie = Cookie::build(("mfa_session", encrypted_token))
-                    .http_only(true)
-                    .path("/")
-                    .max_age(cookie::time::Duration::minutes(5))
-                    .same_site(cookie::SameSite::Strict)
-                    .secure(metadata.is_secure)
-                    .build();
-                let cookie_header = mfa_cookie.to_string().parse().map_err(|error| {
-                    error!(user_id, error = %error, "Failed to create MFA enrollment cookie");
-                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                        .with_title("MFA Enrollment Failed")
-                        .with_detail("Could not start MFA enrollment. Please try again.")
-                })?;
-                let mut headers = HeaderMap::new();
-                headers.insert(SET_COOKIE, cookie_header);
-
-                record_pending_login(
+                record_login_failure(
                     state.as_ref(),
                     &metadata,
-                    user_id,
-                    "password-mfa-enrollment-pending",
+                    Some(user_id),
+                    &login_email,
+                    "password",
+                    "mfa_required_for_role",
                 )
                 .await;
-
-                Ok((
-                    headers,
-                    Json(AuthResponse {
-                        success: false,
-                        message: "Multi-factor authentication setup required".to_string(),
-                        user_id: Some(user_id),
-                        mfa_required: false,
-                        mfa_enrollment_required: true,
-                        mfa_setup: Some(MfaSetupResponse {
-                            secret_key: setup.secret_key,
-                            qr_code: setup.qr_code,
-                            recovery_codes: setup.recovery_codes,
-                        }),
-                        password_change_required: false,
-                    }),
-                ))
+                Err(problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Credentials")
+                    .with_detail("Invalid email or password."))
             }
             _ => {
                 // Log the real error server-side (email is PII but legitimate

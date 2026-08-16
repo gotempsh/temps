@@ -76,6 +76,28 @@ impl std::fmt::Debug for VerifyLocalImageJob {
     }
 }
 
+fn normalize_image_id(id: &str) -> String {
+    id.strip_prefix("sha256:").unwrap_or(id).to_lowercase()
+}
+
+fn image_ids_match(actual_id: &str, expected_id: &str) -> bool {
+    let actual_normalized = normalize_image_id(actual_id);
+    let expected_normalized = normalize_image_id(expected_id);
+
+    if actual_normalized.is_empty() || expected_normalized.is_empty() {
+        return false;
+    }
+    if expected_normalized.len() == 12
+        && expected_normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        actual_normalized.starts_with(&expected_normalized)
+    } else {
+        actual_normalized == expected_normalized
+    }
+}
+
 impl VerifyLocalImageJob {
     pub fn new(
         job_id: String,
@@ -172,20 +194,14 @@ impl WorkflowTask for VerifyLocalImageJob {
         let image_id = image_inspect.id.clone().unwrap_or_default();
         let size_bytes = image_inspect.size.unwrap_or(0) as u64;
 
-        // Optionally verify the image ID matches what we expect
+        // Verify the image ID still matches the image that was imported for this deployment.
+        // Docker tags are mutable and shared across the daemon, so a mismatch means deploying
+        // by this tag could run a different image with this deployment's configuration.
         if let Some(ref expected_id) = self.expected_image_id {
-            // Normalize both IDs for comparison (strip sha256: prefix if present)
-            let normalize_id =
-                |id: &str| -> String { id.strip_prefix("sha256:").unwrap_or(id).to_lowercase() };
-
-            let actual_normalized = normalize_id(&image_id);
-            let expected_normalized = normalize_id(expected_id);
-
-            if actual_normalized != expected_normalized {
+            if !image_ids_match(&image_id, expected_id) {
                 let error_msg = format!(
-                    "Image ID mismatch for '{}': expected '{}', found '{}'. Refusing to deploy a changed local image.",
-                    self.image_ref,
-                    expected_id, image_id
+                    "Image ID mismatch for local image '{}': expected '{}', found '{}'. Refusing to deploy mutable tag.",
+                    self.image_ref, expected_id, image_id
                 );
                 error!("{}", error_msg);
                 self.log(LogLevel::Error, &format!("❌ {}", error_msg))
@@ -238,6 +254,31 @@ impl WorkflowTask for VerifyLocalImageJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_image_ids_match_full_ids() {
+        assert!(image_ids_match(
+            "sha256:abcdef1234567890",
+            "sha256:abcdef1234567890"
+        ));
+    }
+
+    #[test]
+    fn test_image_ids_match_expected_short_id() {
+        assert!(image_ids_match("sha256:abcdef1234567890", "abcdef123456"));
+    }
+
+    #[test]
+    fn test_image_ids_match_detects_mismatch() {
+        assert!(!image_ids_match("sha256:abcdef1234567890", "123456abcdef"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "a"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "not-hex-id!!"));
+        assert!(!image_ids_match(
+            "sha256:abcdef1234567890",
+            "sha256:abcdef1234560000"
+        ));
+        assert!(!image_ids_match("", ""));
+    }
 
     #[test]
     fn test_extract_tag_with_tag() {
@@ -324,6 +365,7 @@ mod tests {
         assert!(result
             .message
             .as_deref()
-            .is_some_and(|message| message.contains("Refusing to deploy a changed local image")));
+            .is_some_and(|message| message.contains("Image ID mismatch")
+                && message.contains("Refusing to deploy mutable tag")));
     }
 }

@@ -3803,7 +3803,7 @@ export type CreateEnvironmentRequest = {
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
     /**
-     * Include this environment variable in preview environments (default: true)
+     * Include this environment variable in preview environments (default: false)
      */
     include_in_preview?: boolean;
     /**
@@ -3836,6 +3836,17 @@ export type CreateExternalServiceRequest = {
      */
     topology?: string;
     version?: string | null;
+};
+
+/**
+ * Request body for registering a new facet.
+ */
+export type CreateFacetRequest = {
+    /**
+     * The OTel attribute key to facet (e.g. `enduser.id`, `galachain.contract`).
+     * Must be non-empty, ≤200 characters, and not already registered.
+     */
+    attribute_key: string;
 };
 
 export type CreateFlagRequest = {
@@ -4289,7 +4300,7 @@ export type CreateProjectRequest = {
 export type CreateProjectSecretRequest = {
     environment_ids?: Array<number>;
     /**
-     * Include this secret in preview environments.
+     * Include this secret in preview environments (default: false).
      */
     include_in_preview?: boolean;
     /**
@@ -7751,6 +7762,53 @@ export type ExternalServiceSummary = {
     service_type: string;
 };
 
+/**
+ * Which storage engine a facet was created against. A deployment only ever
+ * runs one backend at a time (see `plugin.rs`'s storage selection), but
+ * stamping it on each row keeps the status fields unambiguous.
+ */
+export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Public representation of a registered span attribute facet.
+ */
+export type FacetInfo = {
+    /**
+     * The OTel attribute key, e.g. `enduser.id` or `galachain.contract`.
+     */
+    attribute_key: string;
+    backend: FacetBackendKind;
+    created_at: string;
+    /**
+     * Populated when `status = failed`, explaining why.
+     */
+    error_message?: string | null;
+    /**
+     * Rows backfilled so far. Only meaningful for the `timescaledb` backend
+     * — the `clickhouse` backend's mutation doesn't expose a row count
+     * until it's done, so this stays 0 there even while running.
+     */
+    rows_backfilled: number;
+    /**
+     * The slot column index 1..=20 (`facet_attr_N`).
+     */
+    slot: number;
+    status: FacetStatus;
+};
+
+/**
+ * Backfill/delete-clear lifecycle for a facet. See the module docs for how
+ * the poller advances a facet through these states.
+ */
+export type FacetStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deleting';
+
+/**
+ * Response body for facet list.
+ */
+export type FacetsResponse = {
+    data: Array<FacetInfo>;
+};
+
 export type FailureReportPreviewResponse = {
     error_message?: string | null;
     failed_job_type: string;
@@ -7766,6 +7824,13 @@ export type FailureReportPreviewResponse = {
      * opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
      */
     reporting_enabled: boolean;
+};
+
+export type FeatureMaturity = {
+    docs_path: string;
+    key: string;
+    maturity: Maturity;
+    reason: string;
 };
 
 export type FieldResponse = {
@@ -8012,7 +8077,7 @@ export type GatewayStatus = {
     host_port?: number | null;
     /**
      * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
      */
     image?: string | null;
     /**
@@ -10189,6 +10254,8 @@ export type ManualAction = {
  * When a manual action needs to happen relative to migration
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
+
+export type Maturity = 'stable' | 'beta' | 'experimental';
 
 export type McpDefinitionResponse = {
     config: {
@@ -13919,6 +13986,11 @@ export type ReadRowsQuery = {
      * Sort order (asc/desc)
      */
     sort_order?: string | null;
+};
+
+export type ReassignCustomDomainRequest = {
+    target_environment_id: number;
+    target_project_id: number;
 };
 
 /**
@@ -19153,12 +19225,14 @@ export type UpdateEnvironmentSettingsRequest = {
     sse_idle_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
+     * Send an empty object to clear the environment-level override.
      * Same key with array value -> OR, different keys -> AND.
      * Example: `{"region": ["us", "asia"], "gpu": "true"}`
      */
     target_labels?: unknown;
     /**
-     * Optional list of node IDs to deploy to (overrides project-level setting)
+     * Optional list of node IDs to deploy to (overrides project-level setting).
+     * Send an empty list to clear the environment-level override.
      */
     target_nodes?: Array<number> | null;
     /**
@@ -19752,7 +19826,7 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
      */
     image: string;
 };
@@ -36125,6 +36199,168 @@ export type UpdateDashboardResponses = {
 
 export type UpdateDashboardResponse = UpdateDashboardResponses[keyof UpdateDashboardResponses];
 
+export type ListFacetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type ListFacetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListFacetsError = ListFacetsErrors[keyof ListFacetsErrors];
+
+export type ListFacetsResponses = {
+    /**
+     * Registered facets
+     */
+    200: FacetsResponse;
+};
+
+export type ListFacetsResponse = ListFacetsResponses[keyof ListFacetsResponses];
+
+export type CreateFacetData = {
+    body: CreateFacetRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/facets';
+};
+
+export type CreateFacetErrors = {
+    /**
+     * Validation error
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Already registered or capacity exceeded
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateFacetError = CreateFacetErrors[keyof CreateFacetErrors];
+
+export type CreateFacetResponses = {
+    /**
+     * Facet registered
+     */
+    201: FacetInfo;
+};
+
+export type CreateFacetResponse = CreateFacetResponses[keyof CreateFacetResponses];
+
+export type DeleteFacetData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}';
+};
+
+export type DeleteFacetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteFacetError = DeleteFacetErrors[keyof DeleteFacetErrors];
+
+export type DeleteFacetResponses = {
+    /**
+     * Facet deleted
+     */
+    204: void;
+};
+
+export type DeleteFacetResponse = DeleteFacetResponses[keyof DeleteFacetResponses];
+
+export type RetryFacetBackfillData = {
+    body?: never;
+    path: {
+        /**
+         * The OTel attribute key (URL-encoded)
+         */
+        key: string;
+    };
+    query?: never;
+    url: '/otel/facets/{key}/retry';
+};
+
+export type RetryFacetBackfillErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Facet not found
+     */
+    404: ProblemDetails;
+    /**
+     * Facet is not in a failed state
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryFacetBackfillError = RetryFacetBackfillErrors[keyof RetryFacetBackfillErrors];
+
+export type RetryFacetBackfillResponses = {
+    /**
+     * Backfill retry scheduled
+     */
+    200: FacetInfo;
+};
+
+export type RetryFacetBackfillResponse = RetryFacetBackfillResponses[keyof RetryFacetBackfillResponses];
+
 export type QueryGenaiTracesData = {
     body?: never;
     path?: never;
@@ -36926,6 +37162,10 @@ export type QueryTraceSummariesData = {
          * Filter by deployment ID
          */
         deployment_id?: number;
+        /**
+         * Filter by span attributes as comma-separated key=value pairs, e.g. "gen_ai.system=openai,gen_ai.request.model=gpt-4"
+         */
+        attributes?: string;
         /**
          * Filter by span name pattern (ILIKE)
          */
@@ -38081,6 +38321,42 @@ export type GetProjectBySlugResponses = {
 };
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
+
+export type GetVisibleCustomDomainByHostnameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/projects/custom-domains/by-host/{hostname}';
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Project access denied
+     */
+    403: unknown;
+    /**
+     * Domain is not assigned to a project
+     */
+    404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+    /**
+     * Custom domain assignment retrieved
+     */
+    200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
 
 export type CreateProjectFromTemplateData = {
     body: CreateProjectFromTemplateRequest;
@@ -47842,6 +48118,54 @@ export type WorkflowDryRunResponses = {
 
 export type WorkflowDryRunResponse = WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
 
+export type ReassignProjectCustomDomainData = {
+    body: ReassignCustomDomainRequest;
+    path: {
+        /**
+         * Current project ID
+         */
+        source_project_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/projects/{source_project_id}/custom-domains/{domain_id}/assignment';
+};
+
+export type ReassignProjectCustomDomainErrors = {
+    /**
+     * Target environment does not belong to the target project
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Write access required for both projects
+     */
+    403: unknown;
+    /**
+     * Custom domain not found
+     */
+    404: unknown;
+    /**
+     * Domain assignment changed; refresh and retry
+     */
+    409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+    /**
+     * Domain assignment updated atomically
+     */
+    200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse = ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -51611,6 +51935,33 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/platform/feature-maturity';
+};
+
+export type GetFeatureMaturityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+    /**
+     * Feature maturity registry for this build
+     */
+    200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse = GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
 
 export type ListSnapshotsData = {
     body?: never;

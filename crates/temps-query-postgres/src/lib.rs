@@ -15,6 +15,7 @@ use tokio_postgres::{types::ToSql, Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, warn};
 
+#[cfg(test)]
 const FILTER_WHERE_PLACEHOLDER: &str = "status = 'active' AND created_at > '2025-01-01'";
 
 /// Server-side ceiling for the introspection paths that take no `QueryOptions`
@@ -26,6 +27,7 @@ const FILTER_WHERE_PLACEHOLDER: &str = "status = 'active' AND created_at > '2025
 /// scan. Ten seconds is far more than an honest count needs and short enough
 /// that a pile of them cannot hold the pool.
 const DEFAULT_COUNT_TIMEOUT_MS: u64 = 10_000;
+const MAX_QUERY_LIMIT: usize = 100;
 
 /// Escape a SQL identifier by doubling any internal double-quote characters.
 /// Prevents identifier injection when used inside `"..."` quoting.
@@ -252,6 +254,23 @@ fn starts_with_sql_keyword(input: &str, keyword: &str) -> bool {
 }
 
 impl PostgresSource {
+    /// Raw SQL fragments cannot be safely validated with a denylist because
+    /// PostgreSQL's parser remains the final authority. Accept only an absent
+    /// or empty filter object until the API has a typed, parameterized DSL.
+    fn validate_filters(filters: Option<&serde_json::Value>) -> Result<()> {
+        match filters {
+            None => Ok(()),
+            Some(value) if value.as_object().is_some_and(|object| object.is_empty()) => Ok(()),
+            Some(_) => Err(DataError::InvalidQuery(
+                "PostgreSQL data browsing does not accept raw SQL filters".to_string(),
+            )),
+        }
+    }
+
+    fn clamp_limit(limit: Option<usize>) -> usize {
+        limit.unwrap_or(MAX_QUERY_LIMIT).min(MAX_QUERY_LIMIT)
+    }
+
     /// Reject a database name that isn't a plausible PostgreSQL identifier.
     ///
     /// The typed `Config` above already makes injection impossible; this
@@ -1030,6 +1049,7 @@ impl PostgresSource {
     /// Return the byte length of a PostgreSQL dollar-quote delimiter at the
     /// start of `sql`. Tags follow unquoted identifier rules, except that `$`
     /// is not permitted inside the tag.
+    #[cfg(test)]
     fn dollar_quote_delimiter_len(sql: &str) -> Option<usize> {
         let after_dollar = sql.strip_prefix('$')?;
         if after_dollar.starts_with('$') {
@@ -1062,6 +1082,7 @@ impl PostgresSource {
     /// Ambiguous backslash-escaped quotes in ordinary strings are rejected so
     /// validation is independent of the server's `standard_conforming_strings`
     /// setting.
+    #[cfg(test)]
     fn strip_sql_string_literals(sql: &str) -> Result<String> {
         let mut result = String::with_capacity(sql.len());
         let mut position = 0;
@@ -1248,6 +1269,7 @@ impl PostgresSource {
     /// validation to prevent SQL injection. The denylist catches known attack
     /// patterns while structural checks block injection vectors like subqueries,
     /// UNION, and function calls that could bypass simple pattern matching.
+    #[cfg(test)]
     fn validate_sql(sql: &str) -> Result<()> {
         let sql_trimmed = sql.trim();
 
@@ -2093,6 +2115,8 @@ impl Queryable for PostgresSource {
         let columns = self.query_columns(schema_name, entity_name).await?;
 
         let start = std::time::Instant::now();
+        Self::validate_filters(filters.as_ref())?;
+        let schema = self.get_schema(container_path, entity_name).await?;
 
         // Build SQL query
         let mut sql = format!(
@@ -2100,16 +2124,6 @@ impl Queryable for PostgresSource {
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
-
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
 
         // Add ORDER BY
         if let Some(sort_by) = &options.sort_by {
@@ -2127,21 +2141,23 @@ impl Queryable for PostgresSource {
             // resting on that.
             let sort_by = sort_by.trim();
             Self::validate_sort_field(sort_by)?;
+            if !schema.fields.iter().any(|field| field.name == sort_by) {
+                return Err(DataError::InvalidQuery(format!(
+                    "Sort field '{}' is not present in table '{}.{}'",
+                    sort_by, schema_name, entity_name
+                )));
+            }
             let sort_order = match options.sort_order.as_deref() {
                 Some("desc") | Some("DESC") => "DESC",
                 _ => "ASC",
             };
             // Quote the column name to handle camelCase identifiers correctly
-            let quoted_sort = if sort_by.starts_with('"') && sort_by.ends_with('"') {
-                sort_by.to_string() // Already quoted
-            } else {
-                format!("\"{}\"", sort_by)
-            };
+            let quoted_sort = format!("\"{}\"", escape_ident(sort_by));
             sql.push_str(&format!(" ORDER BY {} {}", quoted_sort, sort_order));
         }
 
         // Add LIMIT and OFFSET
-        let limit = options.limit.unwrap_or(100);
+        let limit = Self::clamp_limit(options.limit);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
         let sql = with_wire_row_budget(&sql, &columns, options.budget)?;
@@ -2267,9 +2283,6 @@ impl Queryable for PostgresSource {
         }
         let (data_rows, truncated) = bounded.into_parts();
 
-        // Get schema from first row or from table schema
-        let schema = self.get_schema(container_path, entity_name).await?;
-
         let execution_ms = start.elapsed().as_millis() as u64;
         let row_count = data_rows.len();
 
@@ -2302,22 +2315,13 @@ impl Queryable for PostgresSource {
         }
 
         let schema_name = &container_path.segments[1];
+        Self::validate_filters(filters.as_ref())?;
 
-        let mut sql = format!(
+        let sql = format!(
             "SELECT COUNT(*) FROM \"{}\".\"{}\"",
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
-
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
 
         let client = &self.client;
         let _timeout_guard = self.query_timeout_lock.lock().await;
@@ -2489,25 +2493,8 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "title": "PostgreSQL Query Filters",
-            "description": "Filter data using SQL WHERE clause syntax",
-            "properties": {
-                "where": {
-                    "type": "string",
-                    "title": "WHERE Clause",
-                    "description": "SQL WHERE clause (without 'WHERE' keyword). Example: status = 'active' AND created_at > '2025-01-01'",
-                    "examples": [
-                        "status = 'active'",
-                        "created_at > '2025-01-01'",
-                        "age >= 18 AND country = 'US'",
-                        "name LIKE '%test%'",
-                        "id IN (1, 2, 3)"
-                    ],
-                    // UI hints embedded as custom properties
-                    "x-ui-widget": "textarea",
-                    "x-ui-placeholder": FILTER_WHERE_PLACEHOLDER,
-                    "x-ui-rows": 3
-                }
-            },
+            "description": "Raw SQL filters are disabled. Use sorting and pagination to browse data safely.",
+            "properties": {},
             "additionalProperties": false
         })
     }
@@ -3701,6 +3688,21 @@ mod tests {
         assert_sql_allowed("description = 'drop this item'");
         assert_sql_allowed("name = 'select the best option'");
         assert_sql_allowed("note = 'please delete me'");
+    }
+
+    #[test]
+    fn raw_filter_objects_are_rejected_before_query_construction() {
+        let filters = serde_json::json!({"where": "status = 'active'"});
+        assert!(PostgresSource::validate_filters(Some(&filters)).is_err());
+        assert!(PostgresSource::validate_filters(None).is_ok());
+        assert!(PostgresSource::validate_filters(Some(&serde_json::json!({}))).is_ok());
+    }
+
+    #[test]
+    fn query_limit_is_capped() {
+        assert_eq!(PostgresSource::clamp_limit(None), MAX_QUERY_LIMIT);
+        assert_eq!(PostgresSource::clamp_limit(Some(25)), 25);
+        assert_eq!(PostgresSource::clamp_limit(Some(10_000)), MAX_QUERY_LIMIT);
     }
 
     // ── Sort field validation tests ──────────────────────────────────

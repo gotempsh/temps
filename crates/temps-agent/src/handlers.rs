@@ -937,7 +937,12 @@ pub async fn get_container_info(
         .get_container_info(&container_id)
         .await
     {
-        Ok(info) => AgentResponse::ok(info).into_response(),
+        Ok(info) => match managed_container_detail(info) {
+            Some(info) => AgentResponse::ok(info).into_response(),
+            None => {
+                error_response(StatusCode::NOT_FOUND, "Container not found".into()).into_response()
+            }
+        },
         Err(e) => {
             tracing::error!(container_id = %container_id, "Failed to get info: {}", e);
             error_response(
@@ -949,22 +954,94 @@ pub async fn get_container_info(
     }
 }
 
-/// List all containers on this worker node
+fn is_temps_managed_container(container: &temps_deployer::ContainerInfo) -> bool {
+    container
+        .labels
+        .get("sh.temps.managed")
+        .is_some_and(|value| value == "true")
+}
+
+fn managed_container_detail(
+    mut container: temps_deployer::ContainerInfo,
+) -> Option<temps_deployer::ContainerInfo> {
+    if !is_temps_managed_container(&container) {
+        return None;
+    }
+    container.environment_vars.clear();
+    Some(container)
+}
+
+fn managed_container_inventory(
+    containers: Vec<temps_deployer::ContainerInfo>,
+) -> Vec<temps_deployer::ContainerInfo> {
+    containers
+        .into_iter()
+        .filter(is_temps_managed_container)
+        .map(|mut container| {
+            container.environment_vars.clear();
+            container
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn container(name: &str, managed_label: Option<&str>) -> temps_deployer::ContainerInfo {
+        let mut info = temps_deployer::ContainerInfo {
+            container_name: name.to_string(),
+            ..Default::default()
+        };
+        if let Some(value) = managed_label {
+            info.labels
+                .insert("sh.temps.managed".to_string(), value.to_string());
+        }
+        info.environment_vars
+            .insert("DATABASE_URL".to_string(), "postgres://secret".to_string());
+        info
+    }
+
+    #[test]
+    fn inventory_only_returns_managed_containers_without_environment_secrets() {
+        let inventory = managed_container_inventory(vec![
+            container("unmanaged", None),
+            container("false-label", Some("false")),
+            container("managed", Some("true")),
+        ]);
+
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].container_name, "managed");
+        assert!(inventory[0].environment_vars.is_empty());
+    }
+
+    #[test]
+    fn detail_policy_rejects_unmanaged_and_redacts_managed_containers() {
+        assert!(managed_container_detail(container("unmanaged", None)).is_none());
+        let managed = managed_container_detail(container("managed", Some("true")))
+            .expect("managed container remains visible");
+        assert!(managed.environment_vars.is_empty());
+    }
+}
+
+/// List Temps-managed containers on this worker node without environment variables.
 #[utoipa::path(
     tag = "Containers",
     get,
     path = "/agent/containers",
     responses(
-        (status = 200, description = "List of containers", body = AgentResponse<Vec<temps_deployer::ContainerInfo>>),
+        (status = 200, description = "List of Temps-managed containers with environment variables redacted", body = AgentResponse<Vec<temps_deployer::ContainerInfo>>),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Failed to list containers")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_containers(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
-    tracing::debug!("Listing containers");
+    tracing::debug!("Listing Temps-managed containers");
     match state.container_deployer.list_containers().await {
-        Ok(containers) => AgentResponse::ok(containers).into_response(),
+        Ok(containers) => {
+            AgentResponse::ok(managed_container_inventory(containers)).into_response()
+        }
         Err(e) => {
             tracing::error!("Failed to list containers: {}", e);
             error_response(

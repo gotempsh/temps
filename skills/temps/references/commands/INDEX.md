@@ -37,6 +37,7 @@ syntax may have changed.
 - [`errors`](errors.md)
 - [`metrics`](metrics.md)
 - [`traces`](traces.md)
+- [`facets`](facets.md)
 - [`otel-forward`](otel-forward.md)
 - [`kv`](kv.md)
 - [`flags`](flags.md)

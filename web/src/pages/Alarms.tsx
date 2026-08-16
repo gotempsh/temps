@@ -96,7 +96,7 @@ function scopeLabel(alarm: AlarmResponse): string {
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
-export function Alarms() {
+export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
   usePageTitle('Alarms')
@@ -120,7 +120,7 @@ export function Alarms() {
       const raw = searchParams.get('project_id')
       const n = raw ? Number(raw) : NaN
       return Number.isFinite(n) ? n : null
-    },
+    }
   )
   const [status, setStatus] = useState<string>(ALL)
   const [severity, setSeverity] = useState<string>(ALL)
@@ -128,24 +128,32 @@ export function Alarms() {
   const [page, setPage] = useState(1)
 
   const { data: projectsData, isLoading: projectsLoading } = useQuery(
-    getProjectsOptions({ query: { per_page: 100 } }),
+    getProjectsOptions({ query: { per_page: 100 } })
   )
-  const projects = projectsData?.projects ?? []
+  const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
+  const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
+  const hasProject = effectiveProjectId != null
+  const projectPath = { project_id: effectiveProjectId ?? 0 }
 
-  // Default to the first project once the list loads.
-  useEffect(() => {
-    if (selectedProjectId == null && projects.length > 0) {
-      setSelectedProjectId(projects[0].id)
-    }
-  }, [projects, selectedProjectId])
-
-  // Reset to the first page whenever filters or the project change.
-  useEffect(() => {
+  const selectProject = (projectId: number) => {
+    setSelectedProjectId(projectId)
     setPage(1)
-  }, [selectedProjectId, status, severity, alarmType])
+  }
 
-  const hasProject = selectedProjectId != null
-  const projectPath = { project_id: selectedProjectId ?? 0 }
+  const selectStatus = (value: string) => {
+    setStatus(value)
+    setPage(1)
+  }
+
+  const selectSeverity = (value: string) => {
+    setSeverity(value)
+    setPage(1)
+  }
+
+  const selectAlarmType = (value: string) => {
+    setAlarmType(value)
+    setPage(1)
+  }
 
   const { data: summary } = useQuery({
     ...getProjectAlarmsSummaryOptions({ path: projectPath }),
@@ -190,7 +198,8 @@ export function Alarms() {
       toast.success('Alarm acknowledged')
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to acknowledge: ${err.message}`),
+    onError: (err: Error) =>
+      toast.error(`Failed to acknowledge: ${err.message}`),
   })
 
   const resolve = useMutation({
@@ -245,17 +254,26 @@ export function Alarms() {
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
-          <p className="text-sm text-muted-foreground">
-            Firing history across metrics, containers, uptime, and databases —
-            acknowledge or resolve from one place.
-          </p>
-        </div>
+      <div
+        className={cn(
+          'flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between',
+          embedded && 'justify-end sm:justify-end'
+        )}
+      >
+        {!embedded && (
+          <div className="flex flex-col gap-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
+            <p className="text-sm text-muted-foreground">
+              Firing history across metrics, containers, uptime, and databases —
+              acknowledge or resolve from one place.
+            </p>
+          </div>
+        )}
         <Select
-          value={selectedProjectId != null ? String(selectedProjectId) : undefined}
-          onValueChange={(v) => setSelectedProjectId(Number(v))}
+          value={
+            effectiveProjectId != null ? String(effectiveProjectId) : undefined
+          }
+          onValueChange={(v) => selectProject(Number(v))}
           disabled={projectsLoading || projects.length === 0}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
@@ -279,7 +297,9 @@ export function Alarms() {
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 {c.label}
               </p>
-              <p className={`mt-1 text-2xl font-semibold tabular-nums ${c.tone}`}>
+              <p
+                className={`mt-1 text-2xl font-semibold tabular-nums ${c.tone}`}
+              >
                 {c.value}
               </p>
             </CardContent>
@@ -291,7 +311,7 @@ export function Alarms() {
       <Card>
         <CardContent className="p-3">
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <Select value={status} onValueChange={setStatus}>
+            <Select value={status} onValueChange={selectStatus}>
               <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Status" />
               </SelectTrigger>
@@ -303,7 +323,7 @@ export function Alarms() {
               </SelectContent>
             </Select>
 
-            <Select value={severity} onValueChange={setSeverity}>
+            <Select value={severity} onValueChange={selectSeverity}>
               <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
@@ -317,7 +337,7 @@ export function Alarms() {
 
             <Select
               value={alarmType}
-              onValueChange={setAlarmType}
+              onValueChange={selectAlarmType}
               disabled={typeOptions.length === 0}
             >
               <SelectTrigger className="w-full sm:w-[200px]">
@@ -419,7 +439,7 @@ export function Alarms() {
                     data-alarm-id={alarm.id}
                     className={cn(
                       deepLinkAlarmId === alarm.id &&
-                        'bg-primary/5 ring-1 ring-inset ring-primary/40',
+                        'bg-primary/5 ring-1 ring-inset ring-primary/40'
                     )}
                   >
                     <TableCell>{severityBadge(alarm.severity)}</TableCell>
@@ -456,7 +476,7 @@ export function Alarms() {
                             onClick={() =>
                               acknowledge.mutate({
                                 path: {
-                                  project_id: selectedProjectId ?? 0,
+                                  project_id: effectiveProjectId ?? 0,
                                   alarm_id: alarm.id,
                                 },
                               })
@@ -474,7 +494,7 @@ export function Alarms() {
                             onClick={() =>
                               resolve.mutate({
                                 path: {
-                                  project_id: selectedProjectId ?? 0,
+                                  project_id: effectiveProjectId ?? 0,
                                   alarm_id: alarm.id,
                                 },
                               })

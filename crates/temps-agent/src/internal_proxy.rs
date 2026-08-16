@@ -42,17 +42,20 @@
 //! via Docker. The only callers are processes inside the overlay
 //! network, which is precisely the trust boundary we want.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
+use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::route_store::{RouteEntry, SharedRouteStore};
@@ -80,10 +83,59 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// connect failure before returning 502.
 const MAX_RETRIES: usize = 3;
 
+/// Caller identity is derived from Docker's current network attachments. Keep
+/// the acceptance window short so a recycled bridge IP cannot retain the
+/// previous container's project identity.
+const IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const IDENTITY_MAX_AGE: Duration = Duration::from_secs(3);
+const IDENTITY_INSPECTION_PROJECT_BURST: usize = 16;
+const IDENTITY_INSPECTION_PROJECT_REFILL: usize = 8;
+const IDENTITY_INSPECTION_REFILL_INTERVAL: Duration = Duration::from_millis(125);
+const IDENTITY_INSPECTION_PROJECT_CONCURRENCY: usize = 2;
+const IDENTITY_INSPECTION_GLOBAL_CONCURRENCY: usize = 32;
+const IDENTITY_INSPECTION_QUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+const IDENTITY_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
+
+struct CallerIdentitySnapshot {
+    identities: HashMap<IpAddr, String>,
+    refreshed_at: Instant,
+}
+
+impl CallerIdentitySnapshot {
+    fn new(identities: HashMap<IpAddr, String>) -> Self {
+        Self {
+            identities,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.identities.clear();
+    }
+}
+
+struct InspectionQuota {
+    tokens: Arc<Semaphore>,
+    concurrency: Arc<Semaphore>,
+}
+
+impl InspectionQuota {
+    fn new() -> Self {
+        Self {
+            tokens: Arc::new(Semaphore::new(IDENTITY_INSPECTION_PROJECT_BURST)),
+            concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_PROJECT_CONCURRENCY)),
+        }
+    }
+}
+
 /// Shared HTTP client + route store for the proxy's request handler.
 struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
+    docker: bollard::Docker,
+    inspection_quotas: Arc<RwLock<HashMap<i32, Arc<InspectionQuota>>>>,
+    inspection_concurrency: Arc<Semaphore>,
+    caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
 }
 
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
@@ -96,6 +148,7 @@ pub async fn spawn(
     bridge_ip: IpAddr,
     port: u16,
     store: SharedRouteStore,
+    docker: bollard::Docker,
     shutdown: Arc<Notify>,
 ) -> std::io::Result<()> {
     let addr = SocketAddr::new(bridge_ip, port);
@@ -111,11 +164,93 @@ pub async fn spawn(
         .build()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let state = Arc::new(ProxyState { client, store });
+    let initial_identities = load_source_identities(&docker)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::new(initial_identities)));
+    let inspection_quotas = Arc::new(RwLock::new(HashMap::new()));
+    let state = Arc::new(ProxyState {
+        client,
+        store,
+        docker: docker.clone(),
+        inspection_quotas: Arc::clone(&inspection_quotas),
+        inspection_concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_GLOBAL_CONCURRENCY)),
+        caller_identities: Arc::clone(&caller_identities),
+    });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
+    let identity_shutdown = Arc::clone(&shutdown);
     tokio::spawn(async move {
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        loop {
+            let options = bollard::query_parameters::EventsOptionsBuilder::new().build();
+            let mut events = docker.events(Some(options));
+            let mut interval = tokio::time::interval(IDENTITY_REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let reconnect = loop {
+                tokio::select! {
+                    _ = identity_shutdown.notified() => return,
+                    _ = interval.tick() => {
+                        refresh_source_identities(&docker, &caller_identities).await;
+                    }
+                    event = events.next() => match event {
+                        Some(Ok(event)) if identity_event_requires_refresh(&event) => {
+                            // Invalidate before reloading so an IP released by
+                            // this event cannot retain its old project identity.
+                            caller_identities.write().clear();
+                            refresh_source_identities(&docker, &caller_identities).await;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            caller_identities.write().clear();
+                            warn!(%error, "Docker event stream failed; denying workload traffic until reconnect");
+                            break true;
+                        }
+                        None => {
+                            caller_identities.write().clear();
+                            warn!("Docker event stream ended; denying workload traffic until reconnect");
+                            break true;
+                        }
+                    }
+                }
+            };
+
+            if reconnect {
+                tokio::select! {
+                    _ = identity_shutdown.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        }
+    });
+
+    let budget_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(IDENTITY_INSPECTION_REFILL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = budget_shutdown.notified() => return,
+                _ = interval.tick() => {
+                    let quotas = inspection_quotas.read().values().cloned().collect::<Vec<_>>();
+                    for quota in quotas {
+                        let missing = IDENTITY_INSPECTION_PROJECT_BURST
+                            .saturating_sub(quota.tokens.available_permits());
+                        quota.tokens.add_permits(
+                            missing.min(IDENTITY_INSPECTION_PROJECT_REFILL),
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             shutdown.notified().await;
             info!("internal edge proxy shutting down");
         });
@@ -154,6 +289,14 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
+    if !caller_may_access_route(&state, req.extensions(), &entry).await {
+        warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
+        return error_body(
+            StatusCode::FORBIDDEN,
+            "internal route is not accessible from this workload",
+        );
+    }
+
     if entry.backends.is_empty() {
         warn!(%host, "host has no backends");
         return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
@@ -173,6 +316,197 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     }
 
     proxy_with_retries(&state, &entry, req).await
+}
+
+async fn caller_may_access_route(
+    state: &ProxyState,
+    extensions: &axum::http::Extensions,
+    entry: &RouteEntry,
+) -> bool {
+    let Some(route_project_id) = entry.project_id else {
+        // Legacy or malformed snapshots without project metadata are not
+        // safe to expose through the workload-to-workload proxy.
+        return false;
+    };
+    let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
+        return false;
+    };
+    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
+        return false;
+    };
+    // Reject cross-project callers from memory before they can consume any
+    // Docker inspection capacity.
+    if !state
+        .store
+        .container_id_has_project(&container_id, route_project_id)
+    {
+        return false;
+    }
+    if !source_container_is_current(state, peer.ip(), &container_id, route_project_id).await {
+        return false;
+    }
+    true
+}
+
+/// Verify the cached candidate against Docker's current running-container and
+/// network state. A bounded token bucket prevents workload traffic from
+/// amplifying without limit into Docker-daemon API calls; exhausted requests
+/// fail closed.
+async fn source_container_is_current(
+    state: &ProxyState,
+    source_ip: IpAddr,
+    container_id: &str,
+    project_id: i32,
+) -> bool {
+    use bollard::query_parameters::InspectContainerOptions;
+
+    let quota = inspection_quota(state, project_id);
+    let project_slot = Arc::clone(&quota.concurrency).try_acquire_owned().ok();
+    let Some(_project_slot) = project_slot else {
+        return false;
+    };
+    let token = Arc::clone(&quota.tokens).try_acquire_owned().ok();
+    let Some(token) = token else {
+        return false;
+    };
+    token.forget();
+
+    let global_slot = tokio::time::timeout(
+        IDENTITY_INSPECTION_QUEUE_TIMEOUT,
+        Arc::clone(&state.inspection_concurrency).acquire_owned(),
+    )
+    .await;
+    let Ok(Ok(_global_slot)) = global_slot else {
+        return false;
+    };
+
+    let inspected = tokio::time::timeout(
+        IDENTITY_INSPECTION_TIMEOUT,
+        state
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>),
+    )
+    .await;
+    let Ok(Ok(inspected)) = inspected else {
+        return false;
+    };
+    if inspected.state.and_then(|container| container.running) != Some(true) {
+        return false;
+    }
+    let Some(networks) = inspected
+        .network_settings
+        .and_then(|settings| settings.networks)
+    else {
+        return false;
+    };
+    let owns_source_ip = networks.values().any(|endpoint| {
+        [
+            endpoint.ip_address.as_deref(),
+            endpoint.global_ipv6_address.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .any(|address| address == source_ip)
+    });
+    owns_source_ip
+}
+
+fn inspection_quota(state: &ProxyState, project_id: i32) -> Arc<InspectionQuota> {
+    if let Some(quota) = state.inspection_quotas.read().get(&project_id).cloned() {
+        return quota;
+    }
+    state
+        .inspection_quotas
+        .write()
+        .entry(project_id)
+        .or_insert_with(|| Arc::new(InspectionQuota::new()))
+        .clone()
+}
+
+/// Resolve the peer address through the local Docker daemon. The daemon's
+/// network attachment state is the authority for which container owns an IP;
+/// route destination addresses are not caller identity and may be hostnames or
+/// shared node addresses.
+fn candidate_container_id(
+    caller_identities: &RwLock<CallerIdentitySnapshot>,
+    source_ip: IpAddr,
+) -> Option<String> {
+    let snapshot = caller_identities.read();
+    if snapshot.refreshed_at.elapsed() > IDENTITY_MAX_AGE {
+        return None;
+    }
+    snapshot.identities.get(&source_ip).cloned()
+}
+
+fn identity_event_requires_refresh(event: &bollard::models::EventMessage) -> bool {
+    use bollard::models::EventMessageTypeEnum;
+
+    let identity_action = matches!(
+        event.action.as_deref(),
+        Some("start" | "stop" | "die" | "kill" | "destroy" | "connect" | "disconnect")
+    );
+    identity_action
+        && matches!(
+            event.typ,
+            Some(EventMessageTypeEnum::CONTAINER | EventMessageTypeEnum::NETWORK)
+        )
+}
+
+async fn refresh_source_identities(
+    docker: &bollard::Docker,
+    caller_identities: &RwLock<CallerIdentitySnapshot>,
+) {
+    match load_source_identities(docker).await {
+        Ok(snapshot) => {
+            *caller_identities.write() = CallerIdentitySnapshot::new(snapshot);
+        }
+        Err(error) => {
+            caller_identities.write().clear();
+            warn!(%error, "failed to refresh internal proxy caller identities; denying workload traffic");
+        }
+    }
+}
+
+async fn load_source_identities(
+    docker: &bollard::Docker,
+) -> Result<HashMap<IpAddr, String>, bollard::errors::Error> {
+    use bollard::query_parameters::ListContainersOptions;
+
+    let containers = docker
+        .list_containers(Some(ListContainersOptions {
+            all: false,
+            ..Default::default()
+        }))
+        .await?;
+
+    let mut identities = HashMap::new();
+    for container in containers {
+        let Some(container_id) = container.id else {
+            continue;
+        };
+        let Some(networks) = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+        else {
+            continue;
+        };
+        for endpoint in networks.values() {
+            for address in [
+                endpoint.ip_address.as_deref(),
+                endpoint.global_ipv6_address.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(ip) = address.parse::<IpAddr>() {
+                    identities.insert(ip, container_id.clone());
+                }
+            }
+        }
+    }
+    Ok(identities)
 }
 
 /// True if the client requested a protocol upgrade. We check both the
@@ -637,4 +971,121 @@ fn error_body(status: StatusCode, message: &str) -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_store::{RouteBackend, RouteEntry, RouteStore};
+    use std::path::PathBuf;
+
+    fn route(host: &str, project_id: i32, container_id: &str) -> RouteEntry {
+        RouteEntry {
+            host: host.to_string(),
+            backends: vec![RouteBackend {
+                address: format!("{container_id}:3000"),
+                container_id: Some(container_id.to_string()),
+                container_name: None,
+            }],
+            deployment_id: Some(project_id * 10),
+            project_id: Some(project_id),
+            environment_id: Some(project_id * 100),
+        }
+    }
+
+    #[test]
+    fn caller_policy_allows_same_project_container() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let target = route("prod.alpha.temps.local", 42, "container-alpha");
+        store.apply_snapshot(1, vec![target.clone()]);
+
+        assert!(store.container_id_has_project("container-alpha", 42));
+    }
+
+    #[test]
+    fn caller_policy_blocks_cross_project_container() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let attacker = route("prod.attacker.temps.local", 7, "container-attacker");
+        let victim = route("prod.victim.temps.local", 42, "container-victim");
+        store.apply_snapshot(1, vec![attacker, victim.clone()]);
+
+        assert!(!store.container_id_has_project("container-attacker", 42));
+    }
+
+    #[test]
+    fn caller_policy_blocks_unknown_container() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let target = route("prod.alpha.temps.local", 42, "container-alpha");
+        store.apply_snapshot(1, vec![target.clone()]);
+
+        assert!(!store.container_id_has_project("unknown", 42));
+    }
+
+    #[test]
+    fn caller_identity_lookup_is_memory_only_and_fails_closed() {
+        let identities = RwLock::new(CallerIdentitySnapshot::new(HashMap::from([(
+            "172.20.1.10".parse().unwrap(),
+            "container-alpha".to_string(),
+        )])));
+
+        assert_eq!(
+            candidate_container_id(&identities, "172.20.1.10".parse().unwrap()).as_deref(),
+            Some("container-alpha")
+        );
+        assert!(candidate_container_id(&identities, "172.20.1.99".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn caller_identity_lookup_rejects_stale_or_cleared_snapshots() {
+        let source_ip = "172.20.1.10".parse().unwrap();
+        let identities = RwLock::new(CallerIdentitySnapshot {
+            identities: HashMap::from([(source_ip, "departed-container".to_string())]),
+            refreshed_at: Instant::now() - IDENTITY_MAX_AGE - Duration::from_millis(1),
+        });
+
+        assert!(candidate_container_id(&identities, source_ip).is_none());
+
+        let mut snapshot = identities.write();
+        snapshot.refreshed_at = Instant::now();
+        snapshot.clear();
+        drop(snapshot);
+        assert!(candidate_container_id(&identities, source_ip).is_none());
+    }
+
+    #[test]
+    fn identity_events_refresh_only_for_network_ownership_changes() {
+        use bollard::models::EventMessageTypeEnum;
+
+        let mut event = bollard::models::EventMessage {
+            typ: Some(EventMessageTypeEnum::CONTAINER),
+            action: Some("start".to_string()),
+            ..Default::default()
+        };
+        assert!(identity_event_requires_refresh(&event));
+
+        event.action = Some("health_status: healthy".to_string());
+        assert!(!identity_event_requires_refresh(&event));
+
+        event.typ = Some(EventMessageTypeEnum::NETWORK);
+        event.action = Some("disconnect".to_string());
+        assert!(identity_event_requires_refresh(&event));
+    }
+
+    #[test]
+    fn inspection_quotas_are_bounded_and_project_local() {
+        let project_a = InspectionQuota::new();
+        let project_b = InspectionQuota::new();
+
+        for _ in 0..IDENTITY_INSPECTION_PROJECT_BURST {
+            project_a.tokens.try_acquire().unwrap().forget();
+        }
+        assert!(project_a.tokens.try_acquire().is_err());
+        assert!(project_b.tokens.try_acquire().is_ok());
+
+        let first = project_a.concurrency.try_acquire().unwrap();
+        let second = project_a.concurrency.try_acquire().unwrap();
+        assert!(project_a.concurrency.try_acquire().is_err());
+        drop((first, second));
+        assert!(project_a.concurrency.try_acquire().is_ok());
+    }
 }

@@ -288,7 +288,7 @@ export function ProvidersManagement() {
   }
 
   const handleEdit = (provider: ExtendedNotificationProvider) => {
-    navigate(`/monitoring/providers/edit/${provider.id}`)
+    navigate(`/settings/notifications/${provider.id}`)
   }
 
   const handleToggleEnabled = async (
@@ -344,7 +344,7 @@ export function ProvidersManagement() {
             the `N` shortcut is registered exactly once either way. */}
         {hasProviders && (
           <CreateActionButton
-            onClick={() => navigate('/monitoring/providers/add')}
+            onClick={() => navigate('/settings/notifications/new')}
             label="Add Provider"
           />
         )}
@@ -357,7 +357,7 @@ export function ProvidersManagement() {
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
             <CreateActionButton
-              onClick={() => navigate('/monitoring/providers/add')}
+              onClick={() => navigate('/settings/notifications/new')}
               label="Add Provider"
             />
           }

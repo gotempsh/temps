@@ -21,6 +21,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
+  Boxes,
   Check,
   ChevronsUpDown,
   Clock,
@@ -30,7 +31,7 @@ import {
   Moon,
   Play,
   Plus,
-  Settings,
+  Settings2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
@@ -39,8 +40,8 @@ import { toast } from 'sonner'
 interface EnvironmentHeaderBarProps {
   environment: EnvironmentResponse
   project: ProjectResponse
-  activeView: string
-  onViewChange: (view: string) => void
+  activeView: 'containers' | 'settings'
+  onViewChange: (view: 'containers' | 'settings') => void
   environments?: EnvironmentResponse[]
   onEnvironmentChange?: (id: number) => void
   onCreateEnvironment?: () => void
@@ -118,8 +119,6 @@ export function EnvironmentHeaderBar({
     }),
     enabled: !!environment.current_deployment_id,
   })
-
-  const inSettings = activeView === 'settings'
 
   const statusTone = isSleeping
     ? 'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-500/10 dark:text-amber-400 dark:ring-amber-500/30'
@@ -268,92 +267,100 @@ export function EnvironmentHeaderBar({
           </div>
 
           <div className="flex items-center gap-2">
-            {inSettings ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => onViewChange('containers')}
-              >
-                Done
-              </Button>
-            ) : (
-              <>
-                {isOnDemand &&
-                  (isSleeping ? (
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={wakeMutation.isPending}
-                      onClick={() =>
-                        wakeMutation.mutate({
-                          path: {
-                            project_id: environment.project_id,
-                            env_id: environment.id,
-                          },
-                        })
-                      }
-                    >
-                      {wakeMutation.isPending ? (
-                        <Loader2 className="mr-1.5 size-4 animate-spin" />
-                      ) : (
-                        <Play className="mr-1.5 size-4" />
-                      )}
-                      Wake up
-                    </Button>
+            {isOnDemand &&
+              (isSleeping ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={wakeMutation.isPending}
+                  onClick={() =>
+                    wakeMutation.mutate({
+                      path: {
+                        project_id: environment.project_id,
+                        env_id: environment.id,
+                      },
+                    })
+                  }
+                >
+                  {wakeMutation.isPending ? (
+                    <Loader2 className="mr-1.5 size-4 animate-spin" />
                   ) : (
-                    <TooltipProvider>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            disabled={sleepMutation.isPending}
-                            onClick={() =>
-                              sleepMutation.mutate({
-                                path: {
-                                  project_id: environment.project_id,
-                                  env_id: environment.id,
-                                },
-                              })
-                            }
-                          >
-                            {sleepMutation.isPending ? (
-                              <Loader2 className="mr-1.5 size-4 animate-spin" />
-                            ) : (
-                              <Moon className="mr-1.5 size-4" />
-                            )}
-                            Sleep now
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>
-                          Put this environment to sleep
-                        </TooltipContent>
-                      </Tooltip>
-                    </TooltipProvider>
-                  ))}
+                    <Play className="mr-1.5 size-4" />
+                  )}
+                  Wake up
+                </Button>
+              ) : (
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
                         type="button"
                         variant="outline"
-                        size="icon"
-                        className="size-9"
-                        aria-label="Environment settings"
-                        onClick={() => onViewChange('settings')}
+                        size="sm"
+                        disabled={sleepMutation.isPending}
+                        onClick={() =>
+                          sleepMutation.mutate({
+                            path: {
+                              project_id: environment.project_id,
+                              env_id: environment.id,
+                            },
+                          })
+                        }
                       >
-                        <Settings className="size-4" aria-hidden="true" />
+                        {sleepMutation.isPending ? (
+                          <Loader2 className="mr-1.5 size-4 animate-spin" />
+                        ) : (
+                          <Moon className="mr-1.5 size-4" />
+                        )}
+                        Sleep now
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>Environment settings</TooltipContent>
+                    <TooltipContent>
+                      Put this environment to sleep
+                    </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
-              </>
-            )}
+              ))}
           </div>
         </div>
+
+        <nav
+          aria-label={`${environment.name} environment views`}
+          className="flex items-center gap-1 border-t border-neutral-950/10 pt-2 dark:border-white/10"
+        >
+          <button
+            type="button"
+            onClick={() => onViewChange('containers')}
+            aria-current={activeView === 'containers' ? 'page' : undefined}
+            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
+              activeView === 'containers'
+                ? 'text-neutral-950 dark:text-white'
+                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
+            }`}
+          >
+            <Boxes className="size-4" aria-hidden="true" />
+            Containers
+            {activeView === 'containers' && (
+              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => onViewChange('settings')}
+            aria-current={activeView === 'settings' ? 'page' : undefined}
+            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
+              activeView === 'settings'
+                ? 'text-neutral-950 dark:text-white'
+                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
+            }`}
+          >
+            <Settings2 className="size-4" aria-hidden="true" />
+            Environment settings
+            {activeView === 'settings' && (
+              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
+            )}
+          </button>
+        </nav>
       </div>
     </div>
   )

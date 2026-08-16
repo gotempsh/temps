@@ -282,9 +282,11 @@ macro_rules! project_access_guard {
 ///    out).
 /// 4. Otherwise, `checker.effective_project_permissions(user_id, project_id)`
 ///    is consulted:
-///    - `Ok(None)` → unrestricted from this checker's perspective (no plugin
-///      registered, or the project has no team grants) — the instance-wide
-///      result from step 1 stands.
+///    - `Ok(None)` → no permission-specific opinion, so the guard falls back
+///      to `checker.user_can_access_project(user_id, project_id)` to preserve
+///      the coarse team-membership check for existing checker implementations.
+///      If that coarse check allows, the instance-wide result from step 1
+///      stands; if it denies, this guard returns 403.
 ///    - `Ok(Some(perms))` → the permission must be present in `perms`, else
 ///      403. An empty `perms` denies every project-scoped permission.
 ///    - `Err(_)` → fail-closed, 500. Never a silent allow.
@@ -327,8 +329,49 @@ macro_rules! project_permission_guard {
                             .effective_project_permissions(__user_id, $project_id)
                             .await
                         {
-                            // No opinion from this checker — instance-wide result stands.
-                            Ok(None) => {}
+                            // No permission-specific opinion from this checker —
+                            // preserve the legacy coarse project-access check so
+                            // existing ProjectAccessChecker implementations that only
+                            // implement user_can_access_project() cannot be bypassed.
+                            Ok(None) => {
+                                match __checker
+                                    .user_can_access_project(__user_id, $project_id)
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        return Err(temps_core::error_builder::ErrorBuilder::new(
+                                            ::axum::http::StatusCode::FORBIDDEN,
+                                        )
+                                        .type_("https://temps.sh/probs/project-access-denied")
+                                        .title("Project Access Denied")
+                                        .detail(
+                                            "Your team membership does not include access to \
+                                             this project",
+                                        )
+                                        .build());
+                                    }
+                                    Err(__e) => {
+                                        ::tracing::error!(
+                                            project_id = $project_id,
+                                            user_id = __user_id,
+                                            error = %__e,
+                                            "ProjectAccessChecker::user_can_access_project \
+                                             infrastructure failure after no \
+                                             permission-specific opinion — denying access"
+                                        );
+                                        return Err(temps_core::error_builder::ErrorBuilder::new(
+                                            ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        )
+                                        .type_("https://temps.sh/probs/project-access-check-failed")
+                                        .title("Project Access Check Failed")
+                                        .detail(
+                                            "Could not verify project access; please try again",
+                                        )
+                                        .build());
+                                    }
+                                }
+                            }
                             Ok(Some(__perms)) => {
                                 let __required =
                                     $crate::permissions::Permission::$permission.to_string();
@@ -440,7 +483,10 @@ macro_rules! permission_check {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use async_trait::async_trait;
     use axum::response::IntoResponse;
@@ -896,6 +942,48 @@ mod tests {
         assert!(
             result.is_ok(),
             "Ok(None) must fall through to the instance-wide result"
+        );
+    }
+
+    struct LegacyDenyChecker {
+        user_can_access_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for LegacyDenyChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.user_can_access_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_guard_preserves_legacy_coarse_project_denial() {
+        // A checker compiled before effective_project_permissions() existed only
+        // implements user_can_access_project(). The default permission-specific
+        // response is Ok(None), but project_permission_guard! must still invoke
+        // the legacy coarse access check and deny if it denies.
+        let auth = user_auth(Role::User);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let checker: Arc<dyn ProjectAccessChecker> = Arc::new(LegacyDenyChecker {
+            user_can_access_calls: Arc::clone(&calls),
+        });
+
+        let result = run_permission_guard(&auth, 1, Some(checker)).await;
+        let err = result.expect_err("legacy coarse project denial must still deny");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/project-access-denied")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "project_permission_guard! must fall back to user_can_access_project() on Ok(None)"
         );
     }
 

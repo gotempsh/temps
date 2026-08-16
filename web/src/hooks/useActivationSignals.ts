@@ -8,11 +8,18 @@ import {
   listBackupSchedulesOptions,
   listDnsProvidersOptions,
   listUsersOptions,
+  getAiProviderStatusOptions,
+  listApiKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
+import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 
 export interface ActivationSignals {
+  /** Dedicated active admin key has authenticated an external AI harness */
+  aiHarnessConfigured: boolean
+  /** Active provider can power Temps' built-in chat and AI features */
+  aiProviderConfigured: boolean
   /** Git provider connected and active */
   gitConnected: boolean
   /** At least one active wildcard domain in the database */
@@ -38,7 +45,7 @@ export interface ActivationSignals {
   totalCount: number
 }
 
-const TOTAL = 9
+const TOTAL = 10
 
 export function useActivationSignals(): ActivationSignals {
   const { data: settings, isLoading: settingsLoading } = useSettings()
@@ -84,11 +91,24 @@ export function useActivationSignals(): ActivationSignals {
     retry: false,
   })
 
+  const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
+    useQuery({
+      ...getAiProviderStatusOptions(),
+      retry: false,
+    })
+
+  const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
+    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
+    retry: false,
+  })
+
   // TEMP: pretend nothing is set up yet, for building the first-run
   // experience. See lib/devSimulate.ts. Placed after all hooks so hook order
   // stays stable.
   if (SIMULATE_EMPTY_INSTALL) {
     return {
+      aiHarnessConfigured: false,
+      aiProviderConfigured: false,
       gitConnected: false,
       wildcardDomainReady: false,
       hasProject: false,
@@ -113,23 +133,27 @@ export function useActivationSignals(): ActivationSignals {
     !servicesLoading &&
     !backupSchedulesLoading &&
     !dnsProvidersLoading &&
-    !usersLoading
+    !usersLoading &&
+    !aiProviderStatusLoading &&
+    !apiKeysLoading
+
+  const aiProviderConfigured = aiProviderStatus?.configured === true
+  const aiHarnessConfigured =
+    getAiHarnessStatus(apiKeysData?.api_keys) === 'connected'
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0
 
   const wildcardDomainReady =
-    domainsData?.domains?.some(
-      (d) => d.is_wildcard && d.status === 'active'
-    ) ?? false
+    domainsData?.domains?.some((d) => d.is_wildcard && d.status === 'active') ??
+    false
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
 
   const externalUrlSet = !!settings?.external_url
 
   const notificationsConfigured =
-    Array.isArray(providersData) &&
-    providersData.some((p) => p.enabled)
+    Array.isArray(providersData) && providersData.some((p) => p.enabled)
 
   const hasDatabase = (servicesData?.length ?? 0) > 0
 
@@ -142,6 +166,7 @@ export function useActivationSignals(): ActivationSignals {
   const teamInvited = (usersData?.length ?? 0) > 1
 
   const completed = [
+    aiHarnessConfigured,
     gitConnected,
     wildcardDomainReady,
     hasProject,
@@ -154,6 +179,8 @@ export function useActivationSignals(): ActivationSignals {
   ].filter(Boolean).length
 
   return {
+    aiHarnessConfigured,
+    aiProviderConfigured,
     gitConnected,
     wildcardDomainReady,
     hasProject,
