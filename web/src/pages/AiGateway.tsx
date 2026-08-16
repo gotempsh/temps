@@ -152,7 +152,7 @@ import {
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
 // instead of the API's detail message.
-function providerModelErrorMessage(error: unknown): string {
+function apiErrorMessage(error: unknown): string {
   if (error && typeof error === 'object' && 'detail' in error) {
     const detail = (error as { detail?: unknown }).detail
     if (typeof detail === 'string' && detail.length > 0) return detail
@@ -303,7 +303,7 @@ function AiSummaryDefaultsCard({
     },
     onError: (error) =>
       toast.error('Could not save AI summary defaults', {
-        description: String(error),
+        description: apiErrorMessage(error),
       }),
   })
 
@@ -432,7 +432,7 @@ function ProviderKeyModelDetail({
     },
     onError: (error) =>
       toast.error('Model refresh failed', {
-        description: providerModelErrorMessage(error),
+        description: apiErrorMessage(error),
       }),
   })
   const addMutation = useMutation({
@@ -449,7 +449,7 @@ function ProviderKeyModelDetail({
     },
     onError: (error) =>
       toast.error('Could not add model', {
-        description: providerModelErrorMessage(error),
+        description: apiErrorMessage(error),
       }),
   })
   const updateMutation = useMutation({
@@ -462,7 +462,7 @@ function ProviderKeyModelDetail({
     onSuccess: () => queryClient.invalidateQueries({ queryKey }),
     onError: (error) =>
       toast.error('Could not update model', {
-        description: providerModelErrorMessage(error),
+        description: apiErrorMessage(error),
       }),
   })
   const defaultMutation = useMutation({
@@ -478,7 +478,7 @@ function ProviderKeyModelDetail({
     },
     onError: (error) =>
       toast.error('Could not set default model', {
-        description: providerModelErrorMessage(error),
+        description: apiErrorMessage(error),
       }),
   })
   const deleteMutation = useMutation({
@@ -490,7 +490,7 @@ function ProviderKeyModelDetail({
     onSuccess: () => queryClient.invalidateQueries({ queryKey }),
     onError: (error) =>
       toast.error('Could not delete model', {
-        description: providerModelErrorMessage(error),
+        description: apiErrorMessage(error),
       }),
   })
 
@@ -4191,7 +4191,7 @@ export function AiGatewayPage() {
     },
     onError: (error) =>
       toast.error('Some gateway model catalogs could not be refreshed', {
-        description: String(error),
+        description: apiErrorMessage(error),
       }),
   })
 
@@ -4328,7 +4328,9 @@ export function AiGatewayPage() {
       setTestingKeyId(null)
     },
     onError: (err) => {
-      toast.error('Failed to test provider key', { description: String(err) })
+      toast.error('Failed to test provider key', {
+        description: apiErrorMessage(err),
+      })
       setTestingKeyId(null)
     },
   })

@@ -182,6 +182,7 @@ impl ProviderModelService {
         display_name: Option<&str>,
     ) -> Result<ai_provider_models::Model, AiGatewayError> {
         let model_id = validate_model_id(model_id)?;
+        let display_name = display_name.map(validate_display_name).transpose()?;
         let _ = self.keys.get_by_id(provider_key_id).await?;
         let existing = ai_provider_models::Entity::find()
             .filter(ai_provider_models::Column::ProviderKeyId.eq(provider_key_id))
@@ -199,19 +200,23 @@ impl ProviderModelService {
             // Row already exists but was disabled/unavailable (e.g. left over
             // from a refresh, or manually disabled): re-enable it instead of
             // erroring, since the row is otherwise indistinguishable to the
-            // caller from "model not yet added".
+            // caller from "model not yet added". Mark it manual so the next
+            // refresh() doesn't zero out is_available again if the provider's
+            // discovery response happens to omit this model that time --
+            // that's the same reason the fresh-insert branch below is manual.
             let mut active: ai_provider_models::ActiveModel = model.into();
             active.is_enabled = Set(true);
             active.is_available = Set(true);
+            active.source = Set(MODEL_SOURCE_MANUAL.to_string());
             if let Some(name) = display_name {
-                active.display_name = Set(name.trim().to_string());
+                active.display_name = Set(name.to_string());
             }
             return Ok(active.update(self.db.as_ref()).await?);
         }
         Ok(ai_provider_models::ActiveModel {
             provider_key_id: Set(provider_key_id),
             model_id: Set(model_id.to_string()),
-            display_name: Set(display_name.unwrap_or(model_id).trim().to_string()),
+            display_name: Set(display_name.unwrap_or(model_id).to_string()),
             source: Set(MODEL_SOURCE_MANUAL.to_string()),
             is_available: Set(true),
             is_enabled: Set(true),
@@ -309,6 +314,19 @@ fn validate_model_id(model_id: &str) -> Result<&str, AiGatewayError> {
     Ok(model_id)
 }
 
+fn validate_display_name(display_name: &str) -> Result<&str, AiGatewayError> {
+    let display_name = display_name.trim();
+    if display_name.is_empty()
+        || display_name.len() > 255
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(AiGatewayError::Validation {
+            message: "Display name must contain 1-255 non-control characters".to_string(),
+        });
+    }
+    Ok(display_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,11 +399,13 @@ mod tests {
 
     #[tokio::test]
     async fn add_manual_reenables_existing_disabled_row_instead_of_erroring() {
+        let mut reenabled = model("claude-haiku-4-5", true, true);
+        reenabled.source = MODEL_SOURCE_MANUAL.to_string();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![provider_key(2)]])
                 .append_query_results([vec![model("claude-haiku-4-5", false, false)]])
-                .append_query_results([vec![model("claude-haiku-4-5", true, true)]])
+                .append_query_results([vec![reenabled]])
                 .into_connection(),
         );
         let encryption = Arc::new(
@@ -401,6 +421,25 @@ mod tests {
             .expect("re-adding a disabled model should re-enable it");
         assert!(result.is_enabled);
         assert!(result.is_available);
+        // Marked manual so the next refresh() doesn't re-disable it if that
+        // refresh's discovery response happens to omit this model again.
+        assert_eq!(result.source, MODEL_SOURCE_MANUAL);
+    }
+
+    #[test]
+    fn manual_display_name_is_trimmed_and_validated() {
+        assert_eq!(
+            validate_display_name("  Claude Haiku (fast)  ").unwrap(),
+            "Claude Haiku (fast)"
+        );
+        assert!(matches!(
+            validate_display_name("\n"),
+            Err(AiGatewayError::Validation { .. })
+        ));
+        assert!(matches!(
+            validate_display_name(&"x".repeat(256)),
+            Err(AiGatewayError::Validation { .. })
+        ));
     }
 
     #[tokio::test]
