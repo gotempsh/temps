@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a pull_request-triggered workflow caches with Swatinem/rust-cache
-without a `save-if` guard.
+"""Fail when PR or tag-only workflows can write unusable cache entries.
 
 Why this exists: an unguarded Swatinem/rust-cache step in a workflow that
 runs on pull_request writes one copy of the cache per open PR ref. The
@@ -13,10 +12,9 @@ cargo-audit job, network-kernel-tests.yml's unit job) -- this check exists
 so a third occurrence fails CI instead of silently degrading every
 pipeline for days before someone notices.
 
-The fix is always the same: add `save-if: ${{ github.ref ==
-'refs/heads/main' }}` (or `save-if: false` for jobs that intentionally
-only ever read a cache another job writes, e.g. starters.yml's matrix
-jobs) to the step's `with:` block.
+The fix for PR workflows is to save only from main. The release workflow is
+tag-only, so it must be entirely read-only: tag-scoped entries cannot be read
+by main or by later tags.
 """
 
 import re
@@ -24,6 +22,7 @@ import sys
 from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+RELEASE_WORKFLOW = WORKFLOWS_DIR / "release.yml"
 
 
 def workflow_triggers_on_pull_request(text: str) -> bool:
@@ -74,6 +73,60 @@ def find_unguarded_cache_steps(text: str) -> list[int]:
     return violations
 
 
+def find_release_cache_writes(text: str) -> list[int]:
+    """Return lines that can write Actions caches from the tag-only release."""
+    lines = text.splitlines()
+    violations = []
+
+    for i, line in enumerate(lines):
+        # The combined action restores during the step and saves at job exit.
+        # Tag-only workflows must use actions/cache/restore instead.
+        if re.search(r"^\s*(?:-\s+)?uses:\s*actions/cache(?:/save)?@", line):
+            violations.append(i + 1)
+
+        # A BuildKit GHA export is also a tag-scoped Actions cache write.
+        cache_to = re.match(r"^(\s*)cache-to:\s*(.*)$", line)
+        if cache_to:
+            value = cache_to.group(2)
+            block_indent = len(cache_to.group(1))
+            for following in lines[i + 1 :]:
+                if not following.strip():
+                    continue
+                indent = len(following) - len(following.lstrip(" "))
+                if indent <= block_indent:
+                    break
+                value += "\n" + following
+            if "type=gha" in value:
+                violations.append(i + 1)
+
+        if not re.search(r"^\s*(?:-\s+)?uses:\s*Swatinem/rust-cache", line):
+            continue
+
+        step_indent = None
+        for k in range(i, -1, -1):
+            match = re.match(r"^(\s*)-\s", lines[k])
+            if match:
+                step_indent = len(match.group(1))
+                break
+        if step_indent is None:
+            step_indent = len(line) - len(line.lstrip(" "))
+
+        block_end = len(lines)
+        for j in range(i + 1, len(lines)):
+            if not lines[j].strip():
+                continue
+            indent = len(lines[j]) - len(lines[j].lstrip(" "))
+            if indent <= step_indent:
+                block_end = j
+                break
+
+        block = "\n".join(lines[i:block_end])
+        if not re.search(r"^\s*save-if:\s*(?:false|\$\{\{\s*false\s*\}\})\s*$", block, re.MULTILINE):
+            violations.append(i + 1)
+
+    return violations
+
+
 def main() -> int:
     failures = []
     for wf in sorted(WORKFLOWS_DIR.glob("*.yml")):
@@ -94,7 +147,20 @@ def main() -> int:
             print(f"  {f}", file=sys.stderr)
         return 1
 
-    print("OK: all pull_request-triggered Swatinem/rust-cache steps are save-if guarded.")
+    release_text = RELEASE_WORKFLOW.read_text()
+    release_failures = find_release_cache_writes(release_text)
+    if release_failures:
+        print(
+            "Cache write(s) in tag-only release workflow -- use "
+            "`actions/cache/restore`, set `Swatinem/rust-cache` to "
+            "`save-if: false`, and remove BuildKit `type=gha` exports:",
+            file=sys.stderr,
+        )
+        for line_no in release_failures:
+            print(f"  .github/workflows/release.yml:{line_no}", file=sys.stderr)
+        return 1
+
+    print("OK: PR caches are guarded and the tag-only release cache is read-only.")
     return 0
 
 

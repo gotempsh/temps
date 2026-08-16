@@ -1,6 +1,7 @@
 name: Release
 
-# GHA cache is read-only here (`cache-from` without `cache-to`).
+# Actions cache is read-only here (`cache-from` without `cache-to`, explicit
+# `actions/cache/restore`, and `Swatinem/rust-cache` with saving disabled).
 #
 # GitHub scopes Actions cache *writes* to the ref that produced them, and
 # scopes *reads* to the current ref plus the default branch. This workflow
@@ -90,8 +91,8 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      - name: Cache Bun dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore Bun dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -149,6 +150,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: linux-amd64-release
+          save-if: false
 
       - name: Download web dist artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -217,6 +219,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: linux-arm64-release
+          save-if: false
 
       - name: Download web dist artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -292,6 +295,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: darwin-amd64-release
+          save-if: false
 
       - name: Install system dependencies
         run: brew install protobuf
@@ -367,6 +371,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: darwin-arm64-release
+          save-if: false
 
       - name: Build release binary
         run: cargo build --release --bin temps --target aarch64-apple-darwin
@@ -865,6 +870,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: sandbox-image-builder
+          save-if: false
 
       - name: Build helpers (print_dockerfile + print_bundle)
         # Single source of truth: same examples the runtime ships use of.
