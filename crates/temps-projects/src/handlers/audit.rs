@@ -332,6 +332,7 @@ mod tests {
                 memory_limit: None,
                 performance_metrics_enabled: None,
                 compose_configuration_updated: Some(true),
+                image_retention_hours: None,
             },
         };
 

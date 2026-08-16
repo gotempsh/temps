@@ -43,6 +43,8 @@ pub struct PruneStats {
     pub space_reclaimed_mb: u64,
 }
 
+type DeploymentImageReference = (i32, i32, i32, Option<String>, chrono::DateTime<chrono::Utc>);
+
 /// Default Docker client implementation using the Docker daemon
 #[derive(Clone)]
 pub struct DefaultDockerClient;
@@ -167,22 +169,6 @@ impl DockerClient for DefaultDockerClient {
                 }
             }
             Err(e) => Err(format!("Failed to prune build cache: {}", e)),
-        }
-    }
-
-    async fn remove_image(&self, image_name: &str) -> Result<(), String> {
-        use bollard::query_parameters::RemoveImageOptionsBuilder;
-        use bollard::Docker;
-
-        let docker = Docker::connect_with_unix_defaults()
-            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
-
-        // No `force`: see the safety note on the trait method.
-        let options = RemoveImageOptionsBuilder::default().build();
-
-        match docker.remove_image(image_name, Some(options), None).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Failed to remove image '{}': {}", image_name, e)),
         }
     }
 }
@@ -511,9 +497,12 @@ impl DockerCleanupService {
     ///    the local Docker daemon, so it only considers deployments whose containers
     ///    live on the control plane.
     ///
-    /// Only Temps-managed local tags are considered; registry images are left to
-    /// Docker's normal cache policy. Docker removal is non-forced, so an image still
-    /// referenced by any container is retained as a final safety net.
+    /// The newest `keep_recent_deployment_images` deployment rows in each
+    /// project+environment are retained as a rollback floor, and each pass removes at
+    /// most `max_deployment_images_per_run` candidates, oldest first. Only
+    /// Temps-managed local tags are considered; registry images are left to Docker's
+    /// normal cache policy. Docker removal is non-forced, so an image still referenced
+    /// by any container is retained as a final safety net.
     async fn prune_old_deployment_images(&self) {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
         use temps_entities::{deployments, environments, projects};
@@ -553,34 +542,27 @@ impl DockerCleanupService {
         // Only the five columns the policy actually needs. Selecting the full
         // model here would pull `deployment_config`, `context_vars`,
         // `commit_json` and `metadata` for every deployment ever created.
-        let mut deployment_rows: Vec<(
-            i32,
-            i32,
-            i32,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-        )> =
-            match deployments::Entity::find()
-                .select_only()
-                .column(deployments::Column::Id)
-                .column(deployments::Column::ProjectId)
-                .column(deployments::Column::EnvironmentId)
-                .column(deployments::Column::ImageName)
-                .column(deployments::Column::CreatedAt)
-                .filter(deployments::Column::ImageName.is_not_null())
-                .into_tuple()
-                .all(self.db.as_ref())
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    error!(
-                        "Failed to query deployment images for retention cleanup: {}",
-                        e
-                    );
-                    return;
-                }
-            };
+        let mut deployment_rows: Vec<DeploymentImageReference> = match deployments::Entity::find()
+            .select_only()
+            .column(deployments::Column::Id)
+            .column(deployments::Column::ProjectId)
+            .column(deployments::Column::EnvironmentId)
+            .column(deployments::Column::ImageName)
+            .column(deployments::Column::CreatedAt)
+            .filter(deployments::Column::ImageName.is_not_null())
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!(
+                    "Failed to query deployment images for retention cleanup: {}",
+                    e
+                );
+                return;
+            }
+        };
 
         if deployment_rows.is_empty() {
             debug!("No deployment images recorded; nothing to prune");
@@ -625,7 +607,7 @@ impl DockerCleanupService {
         // policy, keep the newest N deployment images for every
         // project+environment. Sort newest-first before counting so every
         // image referenced by a recent deployment is protected.
-        deployment_rows.sort_by(|left, right| right.4.cmp(&left.4));
+        deployment_rows.sort_by_key(|row| std::cmp::Reverse(row.4));
         let mut recent_by_scope: HashMap<(i32, i32), u64> = HashMap::new();
         for (_, project_id, environment_id, image_name, _) in &deployment_rows {
             let seen = recent_by_scope
@@ -724,10 +706,7 @@ impl DockerCleanupService {
             .into_iter()
             .filter_map(|(name, eligible)| {
                 eligible.then(|| {
-                    let oldest = oldest_reference_by_image
-                        .get(&name)
-                        .copied()
-                        .unwrap_or(now);
+                    let oldest = oldest_reference_by_image.get(&name).copied().unwrap_or(now);
                     (name, oldest)
                 })
             })
@@ -1254,11 +1233,24 @@ mod tests {
         // history of any project that does not deploy over a long weekend.
         assert_eq!(service.default_image_retention_hours, 336);
         assert!(service.image_retention_enabled);
+        assert_eq!(service.keep_recent_deployment_images, 5);
+        assert_eq!(service.max_deployment_images_per_run, 500);
         assert_eq!(
             service.default_image_retention_hours,
             temps_core::ImageRetentionSettings::default().default_hours,
             "service default must track the settings default"
         );
+    }
+
+    #[test]
+    fn test_cleanup_limits_are_configurable() {
+        let service =
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
+                .with_keep_recent_deployment_images(10)
+                .with_max_deployment_images_per_run(50);
+
+        assert_eq!(service.keep_recent_deployment_images, 10);
+        assert_eq!(service.max_deployment_images_per_run, 50);
     }
 
     #[test]

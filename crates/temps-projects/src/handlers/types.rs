@@ -1242,6 +1242,8 @@ mod tests {
             ))
         );
         assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
+
     #[test]
     fn image_retention_patch_distinguishes_omitted_null_and_value() {
         let omitted: UpdateProjectSettingsRequest = serde_json::from_str("{}").unwrap();

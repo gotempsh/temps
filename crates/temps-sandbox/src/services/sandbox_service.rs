@@ -3173,6 +3173,7 @@ mod storage_cleanup_tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            image_retention_hours: None,
         }
     }
 

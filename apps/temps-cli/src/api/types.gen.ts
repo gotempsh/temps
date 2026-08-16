@@ -1377,6 +1377,13 @@ export type AppSettings = {
     edge_target?: string | null;
     external_url?: string | null;
     /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
+    /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
      * server (deployer, agent, remote service client). Strictly opt-in for
      * operators running self-signed control plane / worker certs on a trusted
@@ -1499,6 +1506,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Deployment-image retention policy. No sensitive content, passed through
+     * as-is so the settings UI can show and edit the system-wide default.
+     */
+    image_retention: ImageRetentionSettings;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
@@ -9091,6 +9103,28 @@ export type HttpChallengeDebugResponse = {
 };
 
 /**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
+export type ImageRetentionSettings = {
+    /**
+     * Default hours to keep a built deployment image when the owning project
+     * has no `image_retention_hours` override. Valid range 1..=8760.
+     */
+    default_hours?: number;
+    /**
+     * Whether the nightly pass removes expired deployment images at all.
+     * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+     */
+    enabled?: boolean;
+};
+
+/**
  * Platform-specific credentials for accessing the source system.
  *
  * For platforms like Vercel and Railway, this contains the API token.
@@ -13154,6 +13188,11 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
     /**
      * Authoritative repository visibility. A missing connection alone does
      * not imply that an incompletely configured repository is public.
@@ -19532,6 +19571,16 @@ export type UpdateProjectSettingsRequest = {
      */
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * How long (hours) to retain built Docker images before nightly cleanup removes them.
+     * Set to null to use the system default. Valid range: 1–8760.
+     *
+     * Omitting the key leaves the current value unchanged; sending an explicit
+     * `null` clears the per-project override. `skip_serializing_if` keeps the
+     * round-trip honest — re-serializing a request that omitted the key must
+     * not emit `"image_retention_hours": null`, which would mean "reset".
+     */
+    image_retention_hours?: number | null;
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;

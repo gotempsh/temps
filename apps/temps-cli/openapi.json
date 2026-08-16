@@ -2824,6 +2824,18 @@
               "null"
             ]
           },
+          "image_retention": {
+            "default": {
+              "default_hours": 336,
+              "enabled": true
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ImageRetentionSettings",
+                "description": "Retention policy for locally-built deployment images. Modeled as a\nsettings row (not an env var) per CLAUDE.md so an operator can change\nthe system-wide default at runtime without restarting the binary.\nIndividual projects override it via `projects.image_retention_hours`."
+              }
+            ]
+          },
           "insecure_tls": {
             "default": false,
             "description": "Skip TLS certificate verification on outbound HTTP clients built by the\nserver (deployer, agent, remote service client). Strictly opt-in for\noperators running self-signed control plane / worker certs on a trusted\ninternal network. Worker→control-plane traffic that traverses the public\ninternet must keep this `false` — otherwise a MitM steals the join token.",
@@ -3080,6 +3092,10 @@
               "null"
             ]
           },
+          "image_retention": {
+            "$ref": "#/components/schemas/ImageRetentionSettings",
+            "description": "Deployment-image retention policy. No sensitive content, passed through\nas-is so the settings UI can show and edit the system-wide default."
+          },
           "insecure_tls": {
             "type": "boolean"
           },
@@ -3181,7 +3197,8 @@
           "ai_chat_limits",
           "request_timeouts",
           "connection_limits",
-          "self_update"
+          "self_update",
+          "image_retention"
         ],
         "type": "object"
       },
@@ -19610,6 +19627,26 @@
         ],
         "type": "object"
       },
+      "ImageRetentionSettings": {
+        "description": "System-wide retention policy for locally-built deployment images.\n\nThe nightly cleanup removes a Temps-built image only once *every*\ndeployment that references it is older than the owning project's retention\nwindow. Deleting an image makes rollback/promotion to that deployment\nimpossible, so the default is deliberately generous: it is a rollback\nwindow, not a cache TTL.",
+        "properties": {
+          "default_hours": {
+            "default": 336,
+            "description": "Default hours to keep a built deployment image when the owning project\nhas no `image_retention_hours` override. Valid range 1..=8760.",
+            "example": 336,
+            "format": "int64",
+            "maximum": 8760,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "description": "Whether the nightly pass removes expired deployment images at all.\nDisabling it keeps every built image forever (the pre-0.1 behaviour).",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "ImportCredentials": {
         "description": "Platform-specific credentials for accessing the source system.\n\nFor platforms like Vercel and Railway, this contains the API token.\nFor self-hosted platforms like Coolify and Dokploy, this also contains\nthe `base_url` of the instance.\n\nLocal importers (Docker) can use `ImportCredentials::none()`.",
         "properties": {
@@ -28662,6 +28699,14 @@
           "id": {
             "format": "int32",
             "type": "integer"
+          },
+          "image_retention_hours": {
+            "description": "Hours to retain built Docker images before nightly cleanup. Null = use the\nsystem-wide default from settings.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "is_public_repo": {
             "description": "Authoritative repository visibility. A missing connection alone does\nnot imply that an incompletely configured repository is public.",
@@ -42899,6 +42944,14 @@
             ]
           },
           "git_provider_connection_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "image_retention_hours": {
+            "description": "How long (hours) to retain built Docker images before nightly cleanup removes them.\nSet to null to use the system default. Valid range: 1–8760.\n\nOmitting the key leaves the current value unchanged; sending an explicit\n`null` clears the per-project override. `skip_serializing_if` keeps the\nround-trip honest — re-serializing a request that omitted the key must\nnot emit `\"image_retention_hours\": null`, which would mean \"reset\".",
             "format": "int32",
             "type": [
               "integer",

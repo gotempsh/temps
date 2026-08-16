@@ -4553,6 +4553,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial excludedServices patch");
@@ -4601,6 +4602,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial relaxedCapabilityServices patch");
@@ -4657,6 +4659,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
@@ -4709,6 +4712,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("unrelated excludedServices patch");
@@ -4782,6 +4786,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("relaxedCapabilityServices patch for a real non-database service");
@@ -4850,6 +4855,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5800,6 +5806,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update_project_settings should succeed");

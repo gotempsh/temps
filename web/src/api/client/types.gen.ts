@@ -8088,8 +8088,8 @@ export type GatewayStatus = {
      */
     host_port?: number | null;
     /**
-     * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
+     * Image reference the container was created with (e.g. an immutable
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
      */
     image?: string | null;
     /**
@@ -9102,6 +9102,15 @@ export type HttpChallengeDebugResponse = {
     validation_url?: string | null;
 };
 
+/**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
 export type ImageRetentionSettings = {
     /**
      * Default hours to keep a built deployment image when the owning project
@@ -12835,7 +12844,7 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned per Temps release.
+     * Docker image reference for the gateway. Pinned by digest per Temps release.
      * Operators can override this to test a custom build.
      */
     image?: string;
@@ -13179,6 +13188,11 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
     /**
      * Authoritative repository visibility. A missing connection alone does
      * not imply that an incompletely configured repository is public.
@@ -19557,6 +19571,16 @@ export type UpdateProjectSettingsRequest = {
      */
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * How long (hours) to retain built Docker images before nightly cleanup removes them.
+     * Set to null to use the system default. Valid range: 1–8760.
+     *
+     * Omitting the key leaves the current value unchanged; sending an explicit
+     * `null` clears the per-project override. `skip_serializing_if` keeps the
+     * round-trip honest — re-serializing a request that omitted the key must
+     * not emit `"image_retention_hours": null`, which would mean "reset".
+     */
+    image_retention_hours?: number | null;
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
@@ -19851,7 +19875,8 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
+     * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+     * Empty resets to default.
      */
     image: string;
 };
@@ -48100,10 +48125,6 @@ export type ReassignProjectCustomDomainData = {
 
 export type ReassignProjectCustomDomainErrors = {
     /**
-     * Target environment does not belong to the target project
-     */
-    400: unknown;
-    /**
      * Unauthorized
      */
     401: unknown;
@@ -48112,7 +48133,7 @@ export type ReassignProjectCustomDomainErrors = {
      */
     403: unknown;
     /**
-     * Custom domain not found
+     * Custom domain or target environment not found in the authorized project scopes
      */
     404: unknown;
     /**
