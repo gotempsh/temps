@@ -130,7 +130,9 @@ pub struct Model {
     /// Falls back to `null` summary gracefully when no AI provider is configured.
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// How long (in hours) to retain built Docker images before the nightly
-    /// cleanup removes them. NULL means use the system default (48 hours).
+    /// cleanup removes them. NULL means use the system default, sourced from
+    /// `AppSettings.image_retention.default_hours` (336 hours / 14 days
+    /// out of the box).
     pub image_retention_hours: Option<i32>,
 }
 

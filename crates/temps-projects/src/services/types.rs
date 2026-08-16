@@ -88,7 +88,8 @@ pub struct Project {
     /// project.
     pub cross_project_trace_sharing: bool,
     /// How long (hours) to retain built Docker images before nightly cleanup.
-    /// None = use system default (48 h).
+    /// None = use the system default (336 h / 14 days out of the box, from
+    /// `AppSettings.image_retention.default_hours`).
     pub image_retention_hours: Option<i32>,
 }
 

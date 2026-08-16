@@ -43,8 +43,6 @@ pub struct PruneStats {
     pub space_reclaimed_mb: u64,
 }
 
-type DeploymentImageReference = (i32, i32, i32, Option<String>, chrono::DateTime<chrono::Utc>);
-
 /// Default Docker client implementation using the Docker daemon
 #[derive(Clone)]
 pub struct DefaultDockerClient;
@@ -418,23 +416,6 @@ impl DockerCleanupService {
         image_name.starts_with("temps-") && !image_name.contains('/')
     }
 
-    fn record_image_retention_eligibility(
-        candidates: &mut HashMap<String, bool>,
-        image_name: &str,
-        referenced_at: chrono::DateTime<chrono::Utc>,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) {
-        if !Self::is_temps_managed_image(image_name) {
-            return;
-        }
-
-        let reference_is_expired = referenced_at < cutoff;
-        candidates
-            .entry(image_name.to_string())
-            .and_modify(|eligible| *eligible &= reference_is_expired)
-            .or_insert(reference_is_expired);
-    }
-
     /// Mark an image as permanently protected, whatever its age.
     ///
     /// Used for images we cannot rebuild (uploaded tarballs, external
@@ -504,99 +485,30 @@ impl DockerCleanupService {
     /// normal cache policy. Docker removal is non-forced, so an image still referenced
     /// by any container is retained as a final safety net.
     async fn prune_old_deployment_images(&self) {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-        use temps_entities::{deployments, environments, projects};
-
         if !self.image_retention_enabled {
             debug!("Deployment image retention is disabled; skipping");
             return;
         }
 
-        // Per-project retention overrides. Small table, fetched once so the
-        // deployment scan below does not need to join (or carry) project rows.
-        let retention_by_project: HashMap<i32, i64> = match projects::Entity::find()
-            .select_only()
-            .column(projects::Column::Id)
-            .column(projects::Column::ImageRetentionHours)
-            .into_tuple::<(i32, Option<i32>)>()
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(id, hours)| {
-                    (
-                        id,
-                        hours
-                            .map(i64::from)
-                            .unwrap_or(self.default_image_retention_hours),
-                    )
-                })
-                .collect(),
-            Err(e) => {
-                error!("Failed to query project retention overrides: {}", e);
-                return;
-            }
-        };
-
-        // Only the five columns the policy actually needs. Selecting the full
-        // model here would pull `deployment_config`, `context_vars`,
-        // `commit_json` and `metadata` for every deployment ever created.
-        let mut deployment_rows: Vec<DeploymentImageReference> = match deployments::Entity::find()
-            .select_only()
-            .column(deployments::Column::Id)
-            .column(deployments::Column::ProjectId)
-            .column(deployments::Column::EnvironmentId)
-            .column(deployments::Column::ImageName)
-            .column(deployments::Column::CreatedAt)
-            .filter(deployments::Column::ImageName.is_not_null())
-            .into_tuple()
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!(
-                    "Failed to query deployment images for retention cleanup: {}",
-                    e
-                );
-                return;
-            }
-        };
-
-        if deployment_rows.is_empty() {
-            debug!("No deployment images recorded; nothing to prune");
-            return;
-        }
-
-        let now = chrono::Utc::now();
-        let mut candidates: HashMap<String, bool> = HashMap::new();
-        let mut oldest_reference_by_image = HashMap::new();
-        for (_, project_id, _, image_name, created_at) in &deployment_rows {
-            let Some(image_name) = image_name.as_deref() else {
-                continue;
+        // Eligibility (and the oldest reference per image, used to order
+        // removal) is computed inside Postgres via GROUP BY rather than by
+        // pulling every deployment row into the process: this table only
+        // grows, and the previous implementation loaded the full history —
+        // one row per deployment ever created — into a `Vec` on every nightly
+        // run. Only distinct `image_name`s come back to the app, which is
+        // bounded by how many images actually exist, not by deployment count.
+        let (mut candidates, oldest_reference_by_image) =
+            match self.expired_image_candidates().await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "Could not compute deployment image retention eligibility; \
+                         skipping image retention this run"
+                    );
+                    return;
+                }
             };
-            let retention_hours = retention_by_project
-                .get(project_id)
-                .copied()
-                .unwrap_or(self.default_image_retention_hours);
-            let cutoff = now - chrono::Duration::hours(retention_hours);
-
-            Self::record_image_retention_eligibility(
-                &mut candidates,
-                image_name,
-                *created_at,
-                cutoff,
-            );
-            if Self::is_temps_managed_image(image_name) {
-                oldest_reference_by_image
-                    .entry(image_name.to_string())
-                    .and_modify(|oldest: &mut chrono::DateTime<chrono::Utc>| {
-                        *oldest = (*oldest).min(*created_at);
-                    })
-                    .or_insert(*created_at);
-            }
-        }
 
         if candidates.is_empty() {
             debug!("No Temps-managed deployment images to consider");
@@ -605,20 +517,26 @@ impl DockerCleanupService {
 
         // Preserve main's rollback floor from #645: regardless of the age
         // policy, keep the newest N deployment images for every
-        // project+environment. Sort newest-first before counting so every
-        // image referenced by a recent deployment is protected.
-        deployment_rows.sort_by_key(|row| std::cmp::Reverse(row.4));
-        let mut recent_by_scope: HashMap<(i32, i32), u64> = HashMap::new();
-        for (_, project_id, environment_id, image_name, _) in &deployment_rows {
-            let seen = recent_by_scope
-                .entry((*project_id, *environment_id))
-                .or_default();
-            if *seen < self.keep_recent_deployment_images {
-                if let Some(image_name) = image_name.as_deref() {
-                    Self::protect_image(&mut candidates, image_name);
+        // project+environment. Computed via a window function so the result
+        // is bounded by (project, environment) pairs × N, not by total
+        // deployment history.
+        match self
+            .recently_protected_image_names(self.keep_recent_deployment_images)
+            .await
+        {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut candidates, name);
                 }
             }
-            *seen += 1;
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not determine recently-deployed images; skipping image \
+                     retention this run to avoid removing a rollback target"
+                );
+                return;
+            }
         }
 
         // Protect images that cannot be rebuilt from source.
@@ -646,25 +564,13 @@ impl DockerCleanupService {
             }
         }
 
-        // Protect whatever each environment is currently serving.
-        match environments::Entity::find()
-            .select_only()
-            .column(environments::Column::CurrentDeploymentId)
-            .filter(environments::Column::CurrentDeploymentId.is_not_null())
-            .into_tuple::<Option<i32>>()
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(current_ids) => {
-                let active: std::collections::HashSet<i32> =
-                    current_ids.into_iter().flatten().collect();
-                for (deployment_id, _, _, image_name, _) in &deployment_rows {
-                    if !active.contains(deployment_id) {
-                        continue;
-                    }
-                    if let Some(image_name) = image_name.as_deref() {
-                        Self::protect_image(&mut candidates, image_name);
-                    }
+        // Protect whatever each environment is currently serving. Bounded by
+        // environment count via a direct join rather than a scan of
+        // deployment history.
+        match self.actively_served_image_names().await {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut candidates, name);
                 }
             }
             Err(e) => {
@@ -706,7 +612,10 @@ impl DockerCleanupService {
             .into_iter()
             .filter_map(|(name, eligible)| {
                 eligible.then(|| {
-                    let oldest = oldest_reference_by_image.get(&name).copied().unwrap_or(now);
+                    let oldest = oldest_reference_by_image
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_else(chrono::Utc::now);
                     (name, oldest)
                 })
             })
@@ -749,6 +658,130 @@ impl DockerCleanupService {
         } else {
             info!("✅ Removed {} expired deployment images", removed);
         }
+    }
+
+    /// Per-image eligibility and oldest reference, computed inside Postgres.
+    ///
+    /// An image is eligible for removal only when **every** deployment row
+    /// referencing it is older than its owning project's retention window
+    /// (`BOOL_AND`), so an image reused by a newer rollback or promotion
+    /// survives. The per-project override is applied via `COALESCE` in the
+    /// same query rather than fetched separately. Grouping happens in SQL so
+    /// only one row per distinct `image_name` crosses into the process,
+    /// bounded by how many images exist rather than by how many deployments
+    /// have ever referenced one.
+    async fn expired_image_candidates(
+        &self,
+    ) -> Result<
+        (
+            HashMap<String, bool>,
+            HashMap<String, chrono::DateTime<chrono::Utc>>,
+        ),
+        sea_orm::DbErr,
+    > {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let rows = self
+            .db
+            .as_ref()
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                SELECT
+                    d.image_name,
+                    BOOL_AND(
+                        d.created_at < NOW() - (
+                            COALESCE(p.image_retention_hours, $1) * INTERVAL '1 hour'
+                        )
+                    ) AS all_expired,
+                    MIN(d.created_at) AS oldest_reference
+                FROM deployments d
+                JOIN projects p ON p.id = d.project_id
+                WHERE d.image_name IS NOT NULL
+                  AND d.image_name LIKE 'temps-%'
+                  AND d.image_name NOT LIKE '%/%'
+                GROUP BY d.image_name
+                "#,
+                vec![self.default_image_retention_hours.into()],
+            ))
+            .await?;
+
+        let mut candidates = HashMap::new();
+        let mut oldest_reference_by_image = HashMap::new();
+        for row in rows {
+            let image_name: String = row.try_get("", "image_name")?;
+            let all_expired: bool = row.try_get("", "all_expired")?;
+            let oldest_reference: chrono::DateTime<chrono::Utc> =
+                row.try_get("", "oldest_reference")?;
+            oldest_reference_by_image.insert(image_name.clone(), oldest_reference);
+            candidates.insert(image_name, all_expired);
+        }
+
+        Ok((candidates, oldest_reference_by_image))
+    }
+
+    /// Image names among the newest `keep_recent` deployments for each
+    /// project+environment scope, via a window function. Bounded by
+    /// (project, environment) pairs × `keep_recent`, not total deployment
+    /// history.
+    async fn recently_protected_image_names(
+        &self,
+        keep_recent: u64,
+    ) -> Result<Vec<String>, sea_orm::DbErr> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let rows = self
+            .db
+            .as_ref()
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                SELECT image_name
+                FROM (
+                    SELECT
+                        image_name,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY project_id, environment_id
+                            ORDER BY created_at DESC
+                        ) AS rn
+                    FROM deployments
+                    WHERE image_name IS NOT NULL
+                ) ranked
+                WHERE rn <= $1
+                "#,
+                vec![(keep_recent as i64).into()],
+            ))
+            .await?;
+
+        rows.into_iter()
+            .map(|row| row.try_get::<String>("", "image_name"))
+            .collect()
+    }
+
+    /// Image names for whatever each environment is currently serving.
+    /// Bounded by environment count via a direct join, not deployment
+    /// history size.
+    async fn actively_served_image_names(&self) -> Result<Vec<String>, sea_orm::DbErr> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let rows = self
+            .db
+            .as_ref()
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                r#"
+                SELECT DISTINCT d.image_name
+                FROM environments e
+                JOIN deployments d ON d.id = e.current_deployment_id
+                WHERE e.current_deployment_id IS NOT NULL
+                  AND d.image_name IS NOT NULL
+                "#,
+            ))
+            .await?;
+
+        rows.into_iter()
+            .map(|row| row.try_get::<String>("", "image_name"))
+            .collect()
     }
 
     /// Image names that must never be pruned because Temps cannot rebuild them:
@@ -1284,85 +1317,32 @@ mod tests {
         assert_eq!(huge.effective_default_hours(), 8760);
     }
 
-    #[test]
-    fn test_newer_reference_preserves_reused_image() {
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::hours(48);
-        let mut candidates = HashMap::new();
-
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut candidates,
-            "temps-demo:42",
-            now - chrono::Duration::hours(72),
-            cutoff,
-        );
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut candidates,
-            "temps-demo:42",
-            now - chrono::Duration::hours(1),
-            cutoff,
-        );
-
-        assert_eq!(candidates.get("temps-demo:42"), Some(&false));
-    }
-
-    #[test]
-    fn test_only_temps_managed_local_images_become_candidates() {
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::hours(48);
-        let mut candidates = HashMap::new();
-
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut candidates,
-            "ghcr.io/example/temps-demo:42",
-            now - chrono::Duration::hours(72),
-            cutoff,
-        );
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut candidates,
-            "nginx:latest",
-            now - chrono::Duration::hours(72),
-            cutoff,
-        );
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut candidates,
-            "temps-demo:42",
-            now - chrono::Duration::hours(72),
-            cutoff,
-        );
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates.get("temps-demo:42"), Some(&true));
-    }
-
     /// An uploaded image has no source to rebuild from. Pruning it is data
     /// loss: rollback and promotion both hard-fail with "image no longer
     /// exists locally" and there is no way to get it back.
+    ///
+    /// Eligibility itself (newer-reference-preserves-reused-image, the
+    /// temps-managed filter) is now computed inside Postgres by
+    /// `expired_image_candidates` and exercised end-to-end in
+    /// `test_prune_old_deployment_images_end_to_end` below; this test only
+    /// covers `protect_image`'s order-independence against an
+    /// already-recorded entry, which is still pure Rust.
     #[test]
     fn test_protection_beats_expiry_regardless_of_order() {
-        let now = chrono::Utc::now();
-        let cutoff = now - chrono::Duration::hours(336);
         let uploaded = "temps-demo-prod:upload-1750000000";
 
-        // Protect first, then record an expired reference.
+        // Protect first, then simulate an already-recorded expired entry.
         let mut protect_first = HashMap::new();
         DockerCleanupService::protect_image(&mut protect_first, uploaded);
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut protect_first,
-            uploaded,
-            now - chrono::Duration::days(400),
-            cutoff,
-        );
+        protect_first
+            .entry(uploaded.to_string())
+            .and_modify(|eligible| *eligible &= true)
+            .or_insert(true);
         assert_eq!(protect_first.get(uploaded), Some(&false));
 
-        // Record an expired reference first, then protect.
+        // Simulate an already-recorded expired entry first, then protect.
         let mut record_first = HashMap::new();
-        DockerCleanupService::record_image_retention_eligibility(
-            &mut record_first,
-            uploaded,
-            now - chrono::Duration::days(400),
-            cutoff,
-        );
+        record_first.insert(uploaded.to_string(), true);
         assert_eq!(
             record_first.get(uploaded),
             Some(&true),
@@ -1606,5 +1586,194 @@ mod tests {
             "an image still referenced by a container must be retained, not untagged \
              underneath the service running it"
         );
+    }
+
+    async fn cleanup_integration_tests_available() -> bool {
+        std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some()
+            || tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+    }
+
+    /// End-to-end proof that `prune_old_deployment_images` — specifically the
+    /// three SQL queries added to bound the previously-unbounded deployment
+    /// scan (`expired_image_candidates`, `recently_protected_image_names`,
+    /// `actively_served_image_names`) — wires up correctly against a real
+    /// database and reaches the same decisions the old in-memory logic did.
+    /// Skips gracefully when Docker/Postgres is unavailable (no `#[ignore]`,
+    /// per project policy).
+    #[tokio::test]
+    async fn test_prune_old_deployment_images_end_to_end() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use chrono::{Duration, Utc};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+        use temps_entities::preset::Preset;
+        use temps_entities::upstream_config::UpstreamList;
+        use temps_entities::{deployments, environments, projects};
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping retention integration test");
+            return Ok(());
+        }
+
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+
+        // Project with a tight 1-hour override so "old" only needs to be a
+        // couple of hours in the past, keeping the fixture data small.
+        let project = projects::ActiveModel {
+            name: Set("Retention Test Project".to_string()),
+            slug: Set("retention-test-project".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            preset: Set(Preset::Dockerfile),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            image_retention_hours: Set(Some(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test".to_string()),
+            host: Set("retention-test.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            current_deployment_id: Set(None),
+            subdomain: Set("retention-test.example.com".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let old = now - Duration::hours(72);
+        let insert_deployment = |image_name: &str,
+                                 created_at: chrono::DateTime<Utc>,
+                                 metadata: deployments::DeploymentMetadata,
+                                 slug: String| {
+            deployments::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                slug: Set(slug),
+                state: Set("success".to_string()),
+                image_name: Set(Some(image_name.to_string())),
+                metadata: Set(Some(metadata)),
+                created_at: Set(created_at),
+                updated_at: Set(created_at),
+                ..Default::default()
+            }
+        };
+
+        // Expired, unreferenced elsewhere: must be removed.
+        let expired = insert_deployment(
+            "temps-retention-test:expired",
+            old,
+            deployments::DeploymentMetadata::default(),
+            "expired-deployment".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        // Same image referenced by both an old and a recent deployment: the
+        // recent reference must protect it even though the old one alone
+        // would be expired (BOOL_AND semantics in `expired_image_candidates`).
+        insert_deployment(
+            "temps-retention-test:reused",
+            old,
+            deployments::DeploymentMetadata::default(),
+            "reused-old-ref".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+        insert_deployment(
+            "temps-retention-test:reused",
+            now,
+            deployments::DeploymentMetadata::default(),
+            "reused-new-ref".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        // Uploaded (unrebuildable) image, expired by age: must never be
+        // removed regardless of the age rule.
+        let uploaded_metadata = deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.internal/uploaded:1".to_string()),
+            ..Default::default()
+        };
+        insert_deployment(
+            "temps-retention-test:uploaded",
+            old,
+            uploaded_metadata,
+            "uploaded-deployment".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        // Expired but currently the active deployment for the environment:
+        // must be protected by `actively_served_image_names`.
+        let active = insert_deployment(
+            "temps-retention-test:active",
+            old,
+            deployments::DeploymentMetadata::default(),
+            "active-deployment".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+        let mut environment_update: environments::ActiveModel = environment.clone().into();
+        environment_update.current_deployment_id = Set(Some(active.id));
+        environment_update.update(db.as_ref()).await?;
+
+        // A non-Temps-managed image name, expired: must never become a
+        // candidate at all (filtered by the `temps-%` / no-slash predicate).
+        insert_deployment(
+            "nginx:latest",
+            old,
+            deployments::DeploymentMetadata::default(),
+            "external-image-deployment".to_string(),
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        let docker = Arc::new(RecordingDockerClient::default());
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(0)
+            .with_max_deployment_images_per_run(500)
+            .with_image_retention(&temps_core::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 336,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        let removed = docker.removed_sorted();
+        assert_eq!(
+            removed,
+            vec!["temps-retention-test:expired".to_string()],
+            "only the unreferenced expired image should be removed; reused, \
+             uploaded, actively-served and non-Temps images must all survive"
+        );
+
+        // Sanity: the deployment row we inserted for the expired image is
+        // still there — only the Docker image would have been removed, not
+        // the deployment history record itself.
+        let still_present = deployments::Entity::find_by_id(expired.id)
+            .one(db.as_ref())
+            .await?;
+        assert!(
+            still_present.is_some(),
+            "pruning must never delete the deployment row, only the image"
+        );
+
+        Ok(())
     }
 }

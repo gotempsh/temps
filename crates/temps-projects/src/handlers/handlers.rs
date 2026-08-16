@@ -1068,6 +1068,20 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // Capture the pre-update retention window only when it's actually
+    // changing, so an unrelated settings save (slug, attack mode, ...)
+    // doesn't pay for an extra read.
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+        state
+            .project_service
+            .get_project(project_id)
+            .await
+            .ok()
+            .and_then(|project| project.image_retention_hours)
+    } else {
+        None
+    };
+
     let updated_project = state
         .project_service
         .update_project_settings(
@@ -1113,6 +1127,7 @@ pub async fn update_project_settings(
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
+        previous_image_retention_hours,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {

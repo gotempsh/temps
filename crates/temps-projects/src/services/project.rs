@@ -5822,6 +5822,89 @@ mod tests {
         );
     }
 
+    /// `ImageRetentionSettings::effective_default_hours` clamps an
+    /// out-of-range *global* default instead of failing (see
+    /// `test_out_of_range_operator_setting_is_clamped` in
+    /// `docker_cleanup_service`). The *per-project* override validated here
+    /// is a different, intentional behavior: it rejects rather than clamps,
+    /// because it comes straight from an operator-typed API/CLI/form value
+    /// rather than a settings row an admin edited once.
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_out_of_range_image_retention_hours() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Retention Validation Project".to_string()),
+            slug: Set("retention-validation-project".to_string()),
+            repo_name: Set("retention-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let update_with_hours = |hours: i32| {
+            project_service.update_project_settings(
+                inserted_project.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,              // cross_project_trace_sharing
+                None,              // error_source_context_enabled
+                None,              // error_source_root
+                None,              // ai_api_traffic_summary_enabled
+                Some(Some(hours)), // image_retention_hours
+            )
+        };
+
+        let below_range = update_with_hours(0).await;
+        assert!(
+            matches!(below_range, Err(ProjectError::InvalidInput(_))),
+            "0 hours must be rejected, not clamped"
+        );
+
+        let above_range = update_with_hours(8761).await;
+        assert!(
+            matches!(above_range, Err(ProjectError::InvalidInput(_))),
+            "8761 hours must be rejected, not clamped"
+        );
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.image_retention_hours, None,
+            "a rejected update must never reach the database"
+        );
+    }
+
     #[tokio::test]
     async fn test_update_git_settings_normalizes_blank_directory() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
