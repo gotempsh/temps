@@ -16,7 +16,7 @@ Deployments, Analytics, Session Replay, Error Tracking, Uptime-Monitoring, Trans
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[Website](https://temps.sh) · [Dokumentation](https://temps.sh/docs) · [Schnellstart](https://temps.sh/docs/introduction) · [Diskussionen](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
+[Website](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_de) · [Dokumentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_de) · [Schnellstart](https://temps.sh/docs/introduction?utm_source=github&utm_medium=repo&utm_content=header_de) · [Diskussionen](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | Deutsch | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -253,7 +253,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Getestet auf:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Läuft auch auf macOS
 
-Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betreibt Temps für dich auf verwalteter Infrastruktur.
+Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_de) betreibt Temps für dich auf verwalteter Infrastruktur.
 
 ---
 
@@ -303,7 +303,7 @@ Du willst keinen Server verwalten? [Temps Cloud](https://temps.sh/pricing) betre
 
 **Wo die Alternativen punkten.** Coolify und Dokploy bieten One-Click-Template-Bibliotheken (280+ Apps bei Coolify), die Temps noch nicht hat, und beide haben deutlich größere Communities — allein Coolify zählt über 56k GitHub-Sterne, während Temps das jüngste Projekt auf dieser Liste ist. Kamal ist die einfachere Wahl, wenn du nur Zero-Downtime-Docker-Deploys per CLI willst. Vercel und die anderen Managed-Plattformen bieten dir ein globales Edge-Netzwerk, Edge Functions und DDoS-Absorption, mit denen ein einzelner VPS nicht mithalten kann — und sie betreiben die Infrastruktur für dich, was echten Mehrwert bedeutet, wenn du dich nie um einen Server kümmern willst.
 
-Ausführliche, regelmäßig aktualisierte Vergleiche: [temps.sh/compare](https://temps.sh/compare)
+Ausführliche, regelmäßig aktualisierte Vergleiche: [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_de)
 
 ---
 
@@ -416,6 +416,6 @@ Doppelt lizenziert unter [MIT](LICENSE-MIT) oder [Apache 2.0](LICENSE).
 
 <div align="center">
 
-[temps.sh](https://temps.sh) | [Dokumentation](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+[temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_de) | [Dokumentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_de) | [GitHub](https://github.com/gotempsh/temps)
 
 </div>

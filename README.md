@@ -5,7 +5,7 @@
   <img alt="Stop paying for 7 SaaS tools: Vercel, Sentry, PostHog, Pingdom, Resend, E2B and Datadog, replaced by one self-hosted Temps binary" src="assets/hero/stop-paying-light.svg" width="700">
 </picture>
 
-[Website](https://temps.sh) · [Docs](https://temps.sh/docs) · [Discussions](https://github.com/gotempsh/temps/discussions)
+[Website](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_en) · [Docs](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_en) · [Discussions](https://github.com/gotempsh/temps/discussions)
 
 </div>
 
@@ -237,7 +237,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS
 
-Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing) runs Temps for you on managed infrastructure.
+Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_en) runs Temps for you on managed infrastructure.
 
 ---
 
@@ -287,7 +287,7 @@ Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing) runs Temp
 
 **Where the alternatives win.** Coolify and Dokploy have one-click template libraries (280+ apps on Coolify) that Temps doesn't have yet, and both have far larger communities — Coolify alone has 56k+ GitHub stars, while Temps is the newest project on this list. Kamal is the simpler choice if all you want is zero-downtime Docker deploys driven from a CLI. Vercel and the other managed platforms give you a global edge network, edge functions, and DDoS absorption that a single VPS can't match — and they run the infrastructure for you, which is real value if you never want to think about a server.
 
-Detailed, regularly updated comparisons: [temps.sh/compare](https://temps.sh/compare)
+Detailed, regularly updated comparisons: [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_en)
 
 ---
 
@@ -405,7 +405,7 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
 
 <div align="center">
 
-[temps.sh](https://temps.sh) | [Documentation](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+[temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_en) | [Documentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_en) | [GitHub](https://github.com/gotempsh/temps)
 
 English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
