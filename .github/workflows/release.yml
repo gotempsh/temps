@@ -4,11 +4,13 @@ name: Release
 # `actions/cache/restore`, and `Swatinem/rust-cache` with saving disabled).
 #
 # GitHub scopes Actions cache *writes* to the ref that produced them, and
-# scopes *reads* to the current ref plus the default branch. This workflow
-# only ever runs on a tag ref — either the `push: tags:` trigger below, or
+# scopes *reads* to the current ref plus the default branch. Publishing runs
+# execute on a tag ref — either the `push: tags:` trigger below, or
 # `workflow_dispatch --ref <tag>` from `nightly-release.yml`. A cache written
 # on a tag is therefore readable by exactly one thing: another run on that
-# same tag, which never happens.
+# same tag, which normally never happens. Manual branch dry-runs follow the
+# same restore-only policy so this workflow cannot unexpectedly consume the
+# shared cache budget.
 #
 # So every byte `cache-to: type=gha,mode=max` wrote here was unreadable, and
 # it was not free: the repo cache is a single 10GB LRU pool. One nightly run
@@ -717,6 +719,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -772,9 +776,9 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.title=Temps
             org.opencontainers.image.description=Open-source platform for deploying and managing applications
-          # Read-only on purpose — see the "GHA cache is read-only here" note
-          # at the top of this file. This workflow only ever runs on tag refs,
-          # whose cache scope nothing else can read.
+          # Read-only on purpose — see the "Actions cache is read-only here" note
+          # at the top of this file. Publishing runs use tag refs whose cache
+          # scope nothing else can read; manual dry-runs follow the same policy.
           cache-from: type=gha
 
   create-docker-manifest:
@@ -967,9 +971,13 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          cache-image: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1036,7 +1044,7 @@ jobs:
             org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
             org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime)
           # Read-only: `sandbox-images-beta.yml` populates this scope from
-          # `main`, where it is readable by every ref. See the "GHA cache is
+          # `main`, where it is readable by every ref. See the "Actions cache is
           # read-only here" note at the top of this file.
           cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
 
@@ -1055,9 +1063,13 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          cache-image: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
